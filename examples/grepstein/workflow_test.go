@@ -26,13 +26,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/antflydb/antfly/go/pkg/sources"
 )
 
 type roundTrip func(*http.Request) (*http.Response, error)
@@ -149,6 +148,9 @@ func TestGCSCreateOnlyRetriesVerifyExistingObject(t *testing.T) {
 		if r.URL.Host != "storage.googleapis.com" {
 			t.Fatal("credential destination changed")
 		}
+		if requests == 1 {
+			return response(404, ""), nil
+		}
 		if r.Method == "POST" {
 			if r.URL.Query().Get("ifGenerationMatch") != "0" {
 				t.Fatal("upload may overwrite originals")
@@ -162,71 +164,13 @@ func TestGCSCreateOnlyRetriesVerifyExistingObject(t *testing.T) {
 		return response(200, fmt.Sprintf(`{"generation":"42","size":%q,"md5Hash":%q}`, fmt.Sprint(len(data)), checksum)), nil
 	})}
 	object, err := putGCS(client, "private-bucket", "objects/key.txt", "text/plain", bytes.NewReader(data), int64(len(data)), sum)
-	if err != nil || object.Generation != "42" || requests != 2 {
+	if err != nil || object.Generation != "42" || requests != 3 {
 		t.Fatalf("retry: %v %v", object, err)
 	}
 	bad = true
 	if _, err = putGCS(client, "private-bucket", "objects/key.txt", "text/plain", bytes.NewReader(data), int64(len(data)), sum); err == nil {
 		t.Fatal("accepted different remote bytes")
 	}
-}
-
-func TestCloudProjectionPublishesTextAndUsesExistingSourceJobs(t *testing.T) {
-	root := t.TempDir()
-	dir := filepath.Join(root, "doj-01-a")
-	os.Mkdir(dir, 0700)
-	page := grepPage{Item: sources.Item{Path: "doj-01/source/page-0000001.txt"}, Content: "native artifact bytes\n"}
-	data, _ := json.Marshal(page)
-	os.WriteFile(filepath.Join(dir, "page.json"), data, 0600)
-	uploaded := 0
-	client := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
-		uploaded++
-		if r.Method != "POST" || !strings.HasPrefix(r.URL.Query().Get("name"), "grep/v1/revision/doj-01-a/") {
-			t.Fatal("unscoped projection")
-		}
-		body, _ := io.ReadAll(r.Body)
-		if string(body) != page.Content {
-			t.Fatal("projection rewrote extracted text")
-		}
-		digest := md5.Sum(body)
-		return response(200, fmt.Sprintf(`{"generation":"42","size":%q,"md5Hash":%q}`, fmt.Sprint(len(body)), base64.StdEncoding.EncodeToString(digest[:]))), nil
-	})}
-	plan := filepath.Join(t.TempDir(), "jobs.json")
-	if err := publishGrepProjectionWithClient(client, root, "revision", "derived", "connection-id", "grepstein_pages", plan); err != nil {
-		t.Fatal(err)
-	}
-	var jobs []cloudSourceJob
-	if err := readCorpusJSON(plan, &jobs); err != nil {
-		t.Fatal(err)
-	}
-	if uploaded != 1 || len(jobs) != 1 || jobs[0].Mode != "source" || jobs[0].SourceConfig["permission_ttl_seconds"] != float64(86400) {
-		t.Fatal("Cloud catalog must be owned by scheduled source jobs")
-	}
-	// Exercise the actual acquisition contract: a syntactically valid plan
-	// must enumerate authoritatively before Colony may publish its catalog.
-	listing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		prefix, _ := jobs[0].SourceConfig["prefix"].(string)
-		if r.URL.Query().Get("prefix") != prefix {
-			t.Error("wrong projection prefix")
-		}
-		json.NewEncoder(w).Encode(map[string]any{"items": []any{map[string]any{
-			"name": prefix + page.Item.Path, "generation": "42", "size": fmt.Sprint(len(page.Content)), "contentType": "text/plain",
-		}}})
-	}))
-	defer listing.Close()
-	connector := sources.GoogleConnector{ProviderName: sources.ProviderGCS, APIBase: listing.URL, HTTPClient: listing.Client()}
-	config, err := json.Marshal(jobs[0].SourceConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inventory, err := connector.Enumerate(context.Background(), sources.Request{Mode: sources.ImportModeSource, SourceNamespace: "job/test", Config: config})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !inventory.Authoritative || len(inventory.Objects) != 1 {
-		t.Fatal("Cloud projection must yield a complete inventory eligible for catalog and permission lease publication")
-	}
-
 }
 
 func TestCloudJobsRecoverLostCreateResponseAndKeepPolicy(t *testing.T) {
@@ -263,35 +207,6 @@ func TestCloudJobsRecoverLostCreateResponseAndKeepPolicy(t *testing.T) {
 	job.SourceConfig = map[string]any{"bucket": "changed"}
 	if err := reconcileCloudJobs(server.Client(), server.URL, "management-token", []cloudSourceJob{job}); err == nil {
 		t.Fatal("changed acquisition scope was silently reused")
-	}
-}
-
-func TestSnapshotReadsAreRevisionAndContentBound(t *testing.T) {
-	root := t.TempDir()
-	text := "one page\n"
-	digest := sha256.Sum256([]byte(text))
-	page := grepPage{Item: sources.Item{Path: "page.txt", Revision: "artifact-42", SourceKind: "gcs", Metadata: map[string]any{"content_sha256": fmt.Sprintf("%x", digest)}}, Content: text}
-	raw, _ := json.Marshal(page)
-	os.WriteFile(filepath.Join(root, "page.json"), raw, 0600)
-	config, _ := json.Marshal(grepSnapshotConfig{root, "snapshot-42"})
-	request := sources.Request{SourceNamespace: "job/identity", Config: config}
-	connector := snapshotConnector{}
-	inventory, err := connector.Enumerate(context.Background(), request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	item := inventory.Objects[0]
-	if _, err = connector.Read(context.Background(), request, item); err != nil {
-		t.Fatal(err)
-	}
-	if err = connector.ValidateAbsentSources(context.Background(), request, []string{item.ID}); err == nil {
-		t.Fatal("present page was authorized for deletion")
-	}
-	page.Content = "changed"
-	raw, _ = json.Marshal(page)
-	os.WriteFile(filepath.Join(root, "page.json"), raw, 0600)
-	if _, err = connector.Read(context.Background(), request, item); err == nil {
-		t.Fatal("snapshot corruption accepted")
 	}
 }
 
@@ -361,18 +276,9 @@ func TestCompleteReadinessRequiresEveryShardAndServingMilestone(t *testing.T) {
 		t.Fatal("terminal provider failure was hidden")
 	}
 }
-func TestStoredSnapshotCannotBeReusedAfterCorruption(t *testing.T) {
-	current, existing := t.TempDir(), t.TempDir()
-	os.WriteFile(filepath.Join(current, "page.json"), []byte("expected"), 0600)
-	os.WriteFile(filepath.Join(existing, "page.json"), []byte("changed"), 0600)
-	if err := verifySnapshot(current, existing); err == nil {
-		t.Fatal("stored corruption accepted")
-	}
-}
-
 func TestOriginalPDFProxyConservesRangeAndCredentialBoundaries(t *testing.T) {
 	t.Setenv("ANTFLY_API_KEY", "read-key")
-	source := "s3://private-originals/objects/sha256/" + strings.Repeat("a", 64) + ".pdf#page=3"
+	source := "gs://private-originals/objects/sha256/" + strings.Repeat("a", 64) + ".pdf?generation=123#page=3"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer read-key" {
 			t.Error("missing Antfly authentication")
@@ -383,7 +289,7 @@ func TestOriginalPDFProxyConservesRangeAndCredentialBoundaries(t *testing.T) {
 	reads := 0
 	storage := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
 		reads++
-		if r.URL.Host != "storage.googleapis.com" || r.Header.Get("Authorization") != "" || r.Header.Get("Range") != "bytes=0-4" {
+		if r.URL.Host != "storage.googleapis.com" || r.Header.Get("Authorization") != "" || r.Header.Get("Range") != "bytes=0-4" || r.URL.Query().Get("generation") != "123" {
 			t.Fatal("PDF credential or range boundary changed")
 		}
 		result := response(206, "%PDF-")
@@ -454,19 +360,106 @@ func TestVertexOCRProfilePinsModelAndCompatibleLocation(t *testing.T) {
 	var producer struct {
 		Config struct {
 			OCR struct {
-				Config struct {
+				Reader struct {
 					Model     string `json:"model"`
 					Location  string `json:"location"`
 					MaxTokens int    `json:"max_tokens"`
-				} `json:"config"`
+				} `json:"reader"`
 			} `json:"ocr"`
 		} `json:"config"`
 	}
 	if err := json.Unmarshal([]byte(units["producer_json"].(string)), &producer); err != nil {
 		t.Fatal(err)
 	}
-	reader := producer.Config.OCR.Config
+	reader := producer.Config.OCR.Reader
 	if reader.Model != "gemini-3.8-flash" || reader.Location != "global" || reader.MaxTokens != 32768 {
 		t.Fatalf("OCR profile must persist its model, location and output budget: %+v", reader)
+	}
+}
+
+func TestNativeOriginalLocatorsRequireAnExactGenerationAndBucket(t *testing.T) {
+	base := "gs://private-originals/objects/sha256/" + strings.Repeat("a", 64) + ".pdf"
+	for _, suffix := range []string{"", "?generation=", "?generation=0", "?generation=01", "?generation=18446744073709551616", "?generation=1&generation=2", "?generation=1&token=secret", "?generation=%31", "?generation=+1"} {
+		u, err := url.Parse(base + suffix)
+		if err == nil && validOriginalLocator(u, "private-originals") {
+			t.Fatalf("unsafe locator accepted: %s", suffix)
+		}
+	}
+	u, _ := url.Parse(base + "?generation=1793305553268935#page=42")
+	if !validOriginalLocator(u, "private-originals") || validOriginalLocator(u, "other-bucket") {
+		t.Fatal("generation or bucket boundary lost")
+	}
+}
+
+func TestSourceConnectionIsNativeProducerConfiguration(t *testing.T) {
+	for _, readerConfig := range []string{"", "lightonocr-reader.example.json"} {
+		t.Run("reader="+readerConfig, func(t *testing.T) {
+			indexes, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, "", readerConfig, false, false, corpusIndexOptions{SourceConnection: "cloud-gcs-originals"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			enrichments := indexes[corpusTextIndex].(map[string]any)["enrichments"].([]any)
+			raw := enrichments[0].(map[string]any)["producer_json"].(string)
+			var producer map[string]any
+			if err := json.Unmarshal([]byte(raw), &producer); err != nil {
+				t.Fatal(err)
+			}
+			config := producer["config"].(map[string]any)
+			if config["credentials"] != "cloud-gcs-originals" {
+				t.Fatal("source connection not passed to native extraction")
+			}
+			ocr, present := config["ocr"]
+			if readerConfig == "" {
+				if present {
+					t.Fatal("unconfigured OCR must be omitted from native extraction")
+				}
+			} else {
+				options, ok := ocr.(map[string]any)
+				if !ok || options["mode"] != "auto" || options["reader"] == nil {
+					t.Fatal("configured OCR reader was lost when selecting the source connection")
+				}
+			}
+		})
+	}
+}
+
+func TestGCSPublicationResumeVerifiesWithoutRetransmission(t *testing.T) {
+	client := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+		if r.Method != "GET" {
+			t.Fatal("existing verified object was retransmitted")
+		}
+		return response(200, `{"generation":"42","size":"4","md5Hash":"expected"}`), nil
+	})}
+	if _, err := putGCS(client, "bucket", "objects/hash.pdf", "application/pdf", nil, 4, "expected"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := putGCS(client, "bucket", "objects/hash.pdf", "application/pdf", nil, 5, "expected"); err == nil {
+		t.Fatal("reused object with different size")
+	}
+}
+
+func TestNativeGrepUsesExtractionUnitsWithoutReingestion(t *testing.T) {
+	raw, err := json.Marshal(nativeGrepConfig("http://127.0.0.1:8080/db/v1", "corpus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config struct {
+		Tables []struct {
+			Table   string
+			Streams []struct {
+				Artifact, Index, Field string
+				Default                bool
+			}
+		}
+	}
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Tables) != 1 || config.Tables[0].Table != "corpus" {
+		t.Fatal("binding must target original corpus")
+	}
+	streams := config.Tables[0].Streams
+	if len(streams) != 2 || streams[0].Artifact != corpusUnits || !streams[0].Default || streams[1].Default {
+		t.Fatal("default lexical evidence must be nonoverlapping native units")
 	}
 }

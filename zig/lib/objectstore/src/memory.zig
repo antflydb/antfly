@@ -222,10 +222,14 @@ pub const MemoryClient = struct {
             .size = @intCast(object.body.len),
             .etag = try alloc.dupe(u8, object.etag),
         };
+        errdefer parts[0].deinit(alloc);
+        const etag = try alloc.dupe(u8, object.etag);
+        errdefer alloc.free(etag);
+        const content_type = if (object.content_type) |value| try alloc.dupe(u8, value) else null;
         return .{
-            .etag = try alloc.dupe(u8, object.etag),
+            .etag = etag,
             .content_length = @intCast(object.body.len),
-            .content_type = if (object.content_type) |value| try alloc.dupe(u8, value) else null,
+            .content_type = content_type,
             .parts = parts,
         };
     }
@@ -234,16 +238,25 @@ pub const MemoryClient = struct {
         self.recordOperation();
         const object_map = self.buckets.getPtr(bucket) orelse return error.FileNotFound;
         const object = object_map.getPtr(key) orelse return error.FileNotFound;
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        const etag = try alloc.dupe(u8, object.etag);
+        errdefer alloc.free(etag);
+        const checksum = try alloc.dupe(u8, object.etag);
+        errdefer alloc.free(checksum);
+        const content_type = if (object.content_type) |value| try alloc.dupe(u8, value) else null;
         return .{
-            .bucket = try alloc.dupe(u8, bucket),
-            .key = try alloc.dupe(u8, key),
-            .etag = try alloc.dupe(u8, object.etag),
+            .bucket = owned_bucket,
+            .key = owned_key,
+            .etag = etag,
             .checksum = .{
                 .algorithm = .sha256_hex,
-                .value = try alloc.dupe(u8, object.etag),
+                .value = checksum,
             },
             .content_length = @intCast(object.body.len),
-            .content_type = if (object.content_type) |value| try alloc.dupe(u8, value) else null,
+            .content_type = content_type,
         };
     }
 
@@ -314,7 +327,9 @@ pub const MemoryClient = struct {
                         truncated = true;
                         break;
                     }
-                    try prefixes.append(alloc, try alloc.dupe(u8, common_prefix));
+                    const owned_prefix = try alloc.dupe(u8, common_prefix);
+                    errdefer alloc.free(owned_prefix);
+                    try prefixes.append(alloc, owned_prefix);
                     count += 1;
                     last_cursor_key = key;
                     continue;
@@ -324,22 +339,29 @@ pub const MemoryClient = struct {
                 truncated = true;
                 break;
             }
-            try out.append(alloc, .{
+            var entry: types.ListEntry = .{
                 .key = try alloc.dupe(u8, key),
-                .etag = try alloc.dupe(u8, object.etag),
                 .size = @intCast(object.body.len),
-            });
+            };
+            errdefer entry.deinit(alloc);
+            entry.etag = try alloc.dupe(u8, object.etag);
+            try out.append(alloc, entry);
             count += 1;
             last_cursor_key = key;
         }
         std.mem.sort(types.ListEntry, out.items, {}, lessEntry);
+        const cursor = if (truncated and last_cursor_key != null) try alloc.dupe(u8, last_cursor_key.?) else null;
+        errdefer if (cursor) |value| alloc.free(value);
+        const owned_entries = try out.toOwnedSlice(alloc);
+        errdefer {
+            for (owned_entries) |*entry| entry.deinit(alloc);
+            alloc.free(owned_entries);
+        }
+        const owned_prefixes = try prefixes.toOwnedSlice(alloc);
         return .{
-            .entries = try out.toOwnedSlice(alloc),
-            .common_prefixes = try prefixes.toOwnedSlice(alloc),
-            .next_continuation_token = if (truncated and last_cursor_key != null)
-                try alloc.dupe(u8, last_cursor_key.?)
-            else
-                null,
+            .entries = owned_entries,
+            .common_prefixes = owned_prefixes,
+            .next_continuation_token = cursor,
         };
     }
 
@@ -440,6 +462,52 @@ fn containsPrefix(prefixes: []const []u8, needle: []const u8) bool {
         if (std.mem.eql(u8, prefix, needle)) return true;
     }
     return false;
+}
+
+test "memory listings release partial entries prefixes and cursors on every allocation failure" {
+    const Check = struct {
+        fn run(a: Allocator, recursive: bool) !void {
+            var memory = MemoryClient.init(std.testing.allocator);
+            defer memory.deinit();
+            var backing = memory.client();
+            try backing.makeBucket("db");
+            for ([_][]const u8{ "a/first", "a/second", "b/third" }) |key| {
+                var result = try backing.putObject("db", key, "body", .{});
+                result.deinit(std.testing.allocator);
+            }
+            var client = backing;
+            client.allocator = a;
+            var page = try client.listObjects("db", .{ .max_keys = 1, .recursive = recursive });
+            defer page.deinit(a);
+            try std.testing.expect(page.next_continuation_token != null);
+        }
+    };
+    for ([_]bool{ false, true }) |recursive| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{recursive});
+}
+
+test "memory metadata and part attributes release every partial allocation" {
+    const Check = struct {
+        fn run(a: Allocator, attributes: bool) !void {
+            var memory = MemoryClient.init(std.testing.allocator);
+            defer memory.deinit();
+            var backing = memory.client();
+            try backing.makeBucket("db");
+            var result = try backing.putObject("db", "body", "payload", .{ .content_type = "application/json" });
+            defer result.deinit(std.testing.allocator);
+            var client = backing;
+            client.allocator = a;
+            if (attributes) {
+                var meta = try client.getObjectAttributes("db", "body");
+                defer meta.deinit(a);
+                try std.testing.expectEqual(@as(usize, 1), meta.parts.len);
+            } else {
+                var meta = try client.statObject("db", "body");
+                defer meta.deinit(a);
+                try std.testing.expectEqualStrings("application/json", meta.content_type.?);
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |attributes| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{attributes});
 }
 
 test "memory client supports put get stat list and delete" {

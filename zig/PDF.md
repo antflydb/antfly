@@ -52,8 +52,8 @@ ones.
 | `ANTFLY_ENRICHMENT_PDF_SHARED_WINDOW_MAX_PAGES` | 32 | Clamped to 1..128; widens shared render windows only, never a model batch |
 | `ANTFLY_INFERENCE_READ_BATCH_SIZE` (inference) | 8 | Clamped to 1..64; `1` publishes `serial_compatibility`. Shared by the Florence executor and the capability resolver |
 | `ANTFLY_INFERENCE_READ_PROFILE` (inference) | off | Per-page render and OCR batch profile events |
-| OCR `render_dpi` / `render_resolution` | 150 / `"requested_dpi"` | `"model_input"` is an explicit opt-in |
-| OCR `max_rendered_pixels` / `max_rendered_dimension` | 40,000,000 / 4096 | Per-page spatial caps |
+| OCR `render.dpi` / `render.resolution` | 150 / `"requested_dpi"` | `"model_input"` is an explicit opt-in |
+| OCR `render.max_pixels` / `render.max_dimension` | 40,000,000 / 4096 | Per-page spatial caps |
 | Read endpoint images per request (inference) | 64 | Aggregate downloaded input is capped by `ANTFLY_INFERENCE_READ_BATCH_BYTES` (default 256 MiB); decoded-pixel admission also applies. See [`pkg/inference/BATCHING.md`](pkg/inference/BATCHING.md#readerocr-batching) |
 | PDF render lane (`threaded_io_limits.zig`) | 4 workers, queue 8 | 512 MiB window scratch, 2 MiB retained scratch per worker |
 | Lazy PNG representation encode (`encodeParallel`) | 8 jobs | Also capped by the PDF render lane's concurrent capacity; each job holds an admitted scratch grant |
@@ -70,7 +70,7 @@ ones.
 
 ## Quality-preserving rendering and scratch admission
 
-`ocr.render_resolution` defaults to `"requested_dpi"`: render at `render_dpi`
+`ocr.render.resolution` defaults to `"requested_dpi"`: render at `render.dpi`
 subject to the declared spatial caps, then apply the model's preprocessing.
 The explicit `"model_input"` policy permits direct rendering near the model's
 preferred input dimensions. It is an opt-in quality/performance tradeoff, not
@@ -1133,8 +1133,9 @@ caches between threads; changing page or chunk artifact keys.
 ## Current implementation
 
 - Document extraction marks PDF pages with missing or low-quality embedded text
-  `pending_ocr`; born-digital pages that pass quality checks never enter the
-  render scheduler.
+  `pending_ocr` when the `ocr` block names a reader or generator, and
+  `ocr_not_configured` otherwise; born-digital pages that pass quality checks
+  never enter the render scheduler.
 - One heap-owned PDF OCR coordinator lives for the whole document operation.
   Its `PdfRenderSession` discovers the page tree once and refreshes an
   immutable `RenderForkTemplate`; each render worker instantiates a private
@@ -1206,7 +1207,7 @@ The implementation must preserve the following invariants:
 ### 1. Inspect the document and select OCR candidates
 
 Embedded text extraction produces stable page units. OCR candidates are page
-metadata (`unit_index`, `page_number`, embedded `OcrQuality`, `force_ocr`)
+metadata (`unit_index`, `page_number`, embedded `TextQuality`, `force_ocr`)
 chosen by `ocr_mode` and quality, not rendered bytes. Sparse candidate lists
 (for example pages 1, 5, and 19) keep their original unit positions.
 
@@ -1373,8 +1374,7 @@ or a foreground failure.
 The public `execution` policy carries `batch_items`, `batch_bytes`, and
 `max_document_pages`; per-index embedding policy lives under
 `execution.embedding`. OCR render geometry is part of the document-extraction
-`ocr` config (`render_dpi`, `render_resolution`, `max_rendered_pixels`,
-`max_rendered_dimension`). Render concurrency, in-flight pixels and bytes,
+`ocr.render` config (`dpi`, `resolution`, `max_pixels`, `max_dimension`). Render concurrency, in-flight pixels and bytes,
 prefetch, and shared-window width are operator-only environment settings; they
 are not part of the public API. Every value and its clamp is listed under
 [Limits and defaults](#limits-and-defaults).
@@ -1890,3 +1890,225 @@ removing this lease.
 - Whether the attempt spool should eventually use a compact versioned binary
   unit codec instead of JSON after corpus measurements quantify serialization
   CPU and temporary storage size.
+
+### Native semantic replacements
+
+Native extraction retains decoded glyph runs unchanged. Each effective
+`/ActualText` scope owns one semantic span, its enclosing source run interval
+(including zero-glyph scopes), explicit glyph membership, and a constant-space summary of glyph, vector, and image
+paint evidence. Nested Forms inherit active scopes and graphics state. Image
+eligibility uses transformed bounds without decoding pixels. Page and visible
+eligibility are evaluated per paint before bounds are unioned; unknown paint
+extents remain conservative. Stroke joins and device hairlines do not receive
+an underestimated path-only bound.
+Visibility retains zero-opacity ancestry across nested transparency groups
+separately from each render group's compositing alpha. Nonzero group opacity
+does not become invisible through multiplication or quantization underflow.
+
+Structure-backed replacements resolve container-scoped MCIDs through a lazy
+ParentTree number-tree index. Parsed metadata and validated number-tree nodes
+are cached per Reader; render forks own independent caches.
+Changing either decode limit releases the structure metadata cache; an identical
+limit update preserves it. Subsequent lookups rebuild under the current limits,
+including recovery from a previously exhausted metadata allowance.
+Container arrays, ancestor decisions, stream container keys, and decoded owner
+text are reused within each page. MCIDs, number-tree keys, Limits endpoints,
+and root type names use the same bounded, memoized resolver for direct and
+indirect values. Unassigned ParentTree slots treat direct and indirect null
+equally; parent links still require real structure elements. Named property
+lookups at BDC remain logarithmic. Sparse scopes select names through a shared
+dictionary index; dense scopes reuse its sorted order in one pass.
+Named replacement strings decode only when selected. Direct dictionaries larger than 96 encoded bytes in
+indirect property tables retain source locations rather than their strings, so
+an oversized unselected replacement cannot exhaust a selected sibling's parsing
+allowance. Locations carry the source object identity and byte range, including
+inside encrypted or compressed objects, and remain valid after frame eviction.
+Tiny dictionaries use a bounded inline projection to avoid per-value resolver
+and cache overhead in dense tables. A bounded page-local cache shares each decoded string, including
+indirect values; overridden replacement values are never decoded or resolved.
+Indirect resource and property dictionaries are retained once per page. Form
+records borrow their raw strings, and property-name indexes are sorted once per
+dictionary. Repeated Form scopes cannot multiply a shared replacement's storage.
+The resource cache retains recognized resource fields and only MCID/ActualText
+from property dictionaries. Metadata parsing skips unknown values without allocating
+their strings or object graphs, while preserving token validation and depth limits.
+Temporary per-object parsing and retained metadata share one live-byte ceiling,
+with separate cumulative-allocation allowances. Required fields from indirect resources retain only a small source
+reference for Properties; the optional table is projected on first selected use.
+Inherited direct resources retain their parent reference as a source locator,
+so their Properties values are also deferred until selected. Only Parent and
+Resources fields are parsed during resource inheritance; unrelated parent data
+is skipped. Inheritance traversal is depth-bounded. Direct table retention that
+exceeds its allowance becomes an invalid optional value, diagnosed only if used.
+Indirect property tables and dictionaries are resolved only when a selected
+scope needs them; overridden scopes do not read their object streams.
+Fonts, graphics states, and color spaces share the projected resource root.
+The syntax scanner transfers owned tokens through lookahead and into objects,
+avoiding a second full payload allocation while an object stream remains decoded.
+Compressed object headers validate increasing offsets and parse integer pairs
+without object lookahead. Each object scanner is bounded by the next offset,
+so lookahead cannot materialize an adjacent object's payload.
+Cache entries reserve capacity before parsing. Successful projections and
+deterministic failures then commit without allocating; a saturated cache rejects
+a new entry before spending work on metadata it cannot retain. Property-name
+index caches also reserve capacity before allocating and sorting shared indexes,
+then commit without allocation. Their in-place introsort polls cancellation and
+charges comparison work without a second index-sized buffer; a heapsort
+fallback bounds worst-case work and smaller-partition recursion bounds stack
+space.
+Metadata resolution uses a byte-budgeted LRU of decoded object-stream frames
+and validated offset indexes per page. Frame records, lookup storage, indexes,
+and payloads count against the retained/live allowance; codec scratch has a
+separate per-decode cumulative allowance. Stable frame records keep active
+parsers pinned while allocation pressure evicts only enough unpinned least
+recently used data. Required font/dependency reads share this cache, so a small
+descriptor container does not evict a reusable resource container when both fit.
+Lookup-table growth cannot reenter eviction on that table; verified allocation
+quota failures can evict before retrying index reservation. Genuine backing OOM
+is never retried as an admission failure.
+Decoded frames and projected object graphs move between accounting ledgers
+without copying or charging backing live bytes twice. Admission is preflighted
+against known minimum storage and the remaining cumulative allowance. A required
+read can parse a completed decode transiently if retention adoption fails; it
+does not discard that buffer and reinflate the container. When admission fails
+before decoding, required reads use the ordinary bounded uncached path. Private
+retention outcomes remain distinct from configured decoder limits: output-limit
+errors, actual decoder working-set errors, cancellation, and malformed input
+propagate immediately. Optional property reads retain their quota/fallback
+policy. Eviction never refunds cumulative allocation charges.
+Metadata scanning polls cancellation throughout tokens, strings, whitespace,
+comments, and skipped compound values. Stream-boundary searches for indirect
+lengths are a recovery path: valid indirect lengths are resolved first and
+seek directly to the declared payload end, preserving embedded endstream data.
+Length-reference chains and scalar parsing are depth-bounded. Dependency paths
+survive container reads so reentrant cycles are rejected. Ordinary stream
+lengths may be compressed; an object stream's own length remains uncompressed.
+Validated indirect lengths are normalized to integers in the owned header,
+avoiding repeated reference lookups and allocations during payload reads without
+increasing Object storage. Recovery searches use bounded chunks with marker
+overlap. Native text extraction classifies XObjects in a single dictionary pass.
+Only PDF Forms proceed to payload validation and decoding. Images, PostScript
+XObjects (both Subtype PS and Form/Subtype2 PS), and other ignored subtypes stop
+at the stream header, without resolving lengths, decoding length containers, or
+inspecting payload boundaries. Header views retain classification and the
+structure-presence marker, carry no payload range, and cannot be decoded.
+Dictionary order does not affect classification: unused fields are skipped,
+while allocating Form-only fields stay as source offsets until classification
+is complete, including an optional late Subtype2 PS. Form resource dictionaries
+are traversed once into at most five required fields. Required resource tables
+retain a bounded index of at most eight short names, with source spans for
+compound entries. Larger tables and long names fall back to a single source
+span; unselected tables cannot grow retained metadata merely through entry
+count. When content selects a large table, font, XObject, and graphics-state
+collectors retain only referenced entries, including escaped PDF names. Common
+indexed tables consume opaque values and comments once; large-table fallback
+trades a later bounded scan for constant initial index storage. Color-space
+resolution batches content-selected names and discovers alias/default-space
+dependencies in breadth-first frontiers. Each frontier collects misses from the
+normal classifier and loads them in one source scan. Completed roots leave the
+work list, so source-scan count depends on dependency depth rather than alias
+count; cycles retain the classifier's existing depth bound. Incomplete roots
+cannot publish a color selection, and tint/range materialization waits until
+their dependencies are available. Only requested entries and missing-name results enter a
+page-local lookup cache; unused names and definitions are scanned without being
+allocated. Stable lookup records keyed by source object and span let Forms share
+those results without borrowing dictionary storage from a Form scope. Common
+direct dictionaries use a scoped lookup. Image resource-dependency and decode
+lookups use the same interface, with bounded decoded-frame reuse when no native
+page cache is active and a scoped encryption registry. Interrupted scans do not
+publish negative results, and discovery state is cleared on every exit. Owned
+projected entries transfer into the lookup cache without a second deep copy.
+Indirect tables use the same projections.
+Properties retain their separate optional-metadata limits and lazy lookup.
+Collectors resolve entries only after determining which names the content uses.
+Source views preserve their owning object's identity so encrypted nested values
+are decrypted exactly once, including values inside compressed object streams.
+PDF Forms continue through ordinary length validation and decoding without
+reparsing the whole header.
+
+Annotation coverage inspects normal-appearance headers (including named states)
+without resolving payload lengths. Rendering resolves and validates the actual
+appearance stream. Tagged-text metadata resolution likewise returns header-only
+stream views for StructParents lookup. These probes cannot consume decoder
+allowances merely because a stream length lives in a large object stream.
+
+ICC color-space probes use a projected header containing only N, Alternate, and
+Range. Native classification, component counts, shading, mask ranges, and image
+alternate-space decoding never resolve ICC stream lengths or read ICC payloads.
+Encrypted retained header values are decrypted without registering a payload
+range. Header-only objects cannot be passed to payload decoders; ordinary stream
+and payload reads remain strict. OOM, cancellation, and
+exhausted work still propagate; payload readers remain strict.
+Numeric lookahead propagates
+cancellation and work exhaustion rather than treating them as end-of-input.
+Ordinary object reads also poll the Reader cancellation probe when no shared
+metadata work allowance is active.
+A page-local work allowance of 16 times
+the working-set byte limit (at least 1 MiB, at most 2 GiB) charges scanned bytes,
+token traversal, and property-index comparisons independently of allocations.
+Exhaustion is sticky; optional failures are memoized while cancellation and
+backing OOM remain retryable.
+Selected missing or malformed property dictionaries retain native glyph text and
+report incomplete ActualText, including when selected optional metadata exceeds
+a decode or allocation allowance. Actual allocator failures and cancellation
+propagate; overridden scopes do not report irrelevant metadata errors. Cache
+allocations classify quota failures at their own boundary and consume rejection
+state during recovery. Caller allocation failures never use ambient cache flags,
+so a previous optional quota rejection cannot turn a later OOM into page loss.
+UTF-16 text-string BOM detection precedes payload-length validation, so odd or
+truncated replacements use the same explicit fallback as invalid surrogate pairs.
+Optional null ActualText, MCID, Pg, and Stm values behave like omitted entries.
+Known current-page references preserve identity without cloning page resources.
+Retained structure metadata and page-local structure lookup allocations share
+one live-byte allowance. ParentTree bindings are checked against the owner's declared
+content. An outer replacement wins over its descendants; repeated MCIDs owned
+by the same replacement merge paint evidence and emit text once, preserving
+unrelated interleaved runs. Glyph selection and span propagation remain linear
+even when enclosing source intervals overlap.
+
+Structure lookup has explicit byte, cumulative-allocation, work, and recursion
+limits and polls cancellation. Metadata object parsing is depth-limited before
+recursive syntax expansion. Missing/cyclic links, mismatched content, dangling
+marked-content scopes, malformed inline replacements, cross-page replacements, and unsupported OBJR content
+preserve native fallback and set `actual_text_incomplete`; document semantic
+coverage becomes partial. Page references retained in the shared immutable
+page index distinguish pages even when they reuse the same content stream.
+
+Layout consumes each replacement once. Entry and exit glyphs preserve spacing
+at scope boundaries; unpositioned or multiline replacements fence geometric
+reordering at their authored source slot. Blocks and regions consume semantic
+spans directly rather than rescanning replacement bytes for every covered
+source run. Unknown bounds produce text and diagnostics without invented
+geometry. `source_run_count` and `emitted_run_count` count original glyph runs;
+`outside_page_spans`, `invisible_spans`, and `unpositioned_spans` separately
+report nonempty semantic replacements. Empty replacements intentionally delete
+their covered glyph text. Extraction identity and unit fingerprints version the
+resulting text, geometry, and diagnostics together.
+
+Native text scanners frame inline-image payloads before interpreting content
+operators. Raw rows use exact dimensions, component counts, sample depth, and
+row padding; ASCIIHex, ASCII85, RunLength, LZW, and JPEG use their outer codec
+boundaries. Flate framing discards decoded bytes through a fixed history window
+with cancellation and a 64 MiB work ceiling. No pixel plane is materialized.
+The same framing protects font/resource discovery and marked-content scopes.
+Unsupported or ambiguous boundaries (including unfiltered named color spaces
+and CCITT without a supported framing path) fail with
+`UnsupportedPdfInlineImage`; truncated payloads fail with
+`InvalidPdfInlineImage`. Native completion remains false on such failures;
+encoded pixels are never guessed to be text. Native rendering explicitly
+rejects inline images rather than silently omitting them; the existing platform
+compatibility backend may render them where available. Other hosts report
+unsupported rendering. This does not add inline pixels to the native raster IR.
+
+Canonical ActualText tracking retains an active-scope bit across content
+streams, so sibling replacements do not rescan the marked-content stack.
+Overridden scopes retain only lightweight stack frames; their replacement
+strings are not resolved, decoded, or copied. Canonical Form decoding inherits
+that suppression while retaining raw glyph fallback until the outer scope
+closes.
+Cancellation is polled during canonical decoding and resource discovery.
+Empty replacements bridge spacing only along a deleted glyph sequence on the
+same line; unrelated line/column boundaries and empty vector labels retain the
+surviving text's layout context. Page/clip intersections exclude every glyph
+when empty, including unknown glyph extents. Degenerate rectangular subpaths
+do not establish fill visibility or enlarge clip bounds.

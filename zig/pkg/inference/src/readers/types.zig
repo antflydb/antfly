@@ -60,8 +60,25 @@ pub const Result = struct {
     regions: []Region = &.{},
     structured: ?StructuredValue = null,
     allocator: std.mem.Allocator,
+    lifetime: ?struct { context: *anyopaque, release: *const fn (*anyopaque) void, detach_preparation: ?*const fn (*anyopaque) void = null } = null,
+
+    pub fn detachPreparation(self: *Result) void {
+        if (self.lifetime) |*owner| if (owner.detach_preparation) |detach| {
+            detach(owner.context);
+            owner.detach_preparation = null;
+        };
+    }
 
     pub fn deinit(self: *Result) void {
+        if (self.lifetime) |owner| {
+            self.lifetime = null;
+            owner.release(owner.context);
+            self.text = &.{};
+            self.fields = &.{};
+            self.regions = &.{};
+            self.structured = null;
+            return;
+        }
         self.allocator.free(self.text);
         for (self.fields) |*field| field.deinit(self.allocator);
         if (self.fields.len > 0) self.allocator.free(self.fields);
@@ -70,6 +87,15 @@ pub const Result = struct {
         if (self.structured) |*value| value.deinit(self.allocator);
     }
 };
+
+/// Resolve an omitted output budget from the selected model, bounded by serving
+/// policy. Preserve explicit requests so validation can reject excess values.
+/// Non-generative readers have no completion budget.
+pub fn resolveOutputTokens(requested: ?usize, model_default: ?usize, ceiling: ?usize) ?usize {
+    if (requested) |value| return value;
+    const value = model_default orelse return null;
+    return if (ceiling) |limit| @min(value, limit) else value;
+}
 
 pub const ReadOptions = struct {
     prompt: ?[]const u8 = null,

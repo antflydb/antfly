@@ -225,21 +225,30 @@ def test_single_process_servers_release_requested_port_when_spawn_fails(
 
 
 @pytest.mark.parametrize(
-    ("server_type", "pgwire"),
+    ("server_type", "pgwire", "metrics"),
     (
-        (PublicAntflyServer, False),
-        (StandaloneAntflyServer, False),
-        (StandaloneAntflyServer, True),
+        (PublicAntflyServer, False, False),
+        (StandaloneAntflyServer, False, False),
+        (StandaloneAntflyServer, True, False),
+        (StandaloneAntflyServer, False, True),
+        (StandaloneAntflyServer, True, True),
     ),
 )
-def test_single_process_pause_retains_listener_port(server_type: type, pgwire: bool):
+def test_single_process_pause_retains_listener_port(
+    server_type: type, pgwire: bool, metrics: bool
+):
     server = object.__new__(server_type)
     server.proc = None
     server.port_reservations = LoopbackPortReservations()
     server.port = server.port_reservations.reserve()
     if server_type is StandaloneAntflyServer:
         server.pgwire_port = server.port_reservations.reserve() if pgwire else None
-    ports = (server.port, server.pgwire_port) if pgwire else (server.port,)
+        server.health_port = server.port_reservations.reserve() if metrics else None
+    ports = (server.port,)
+    if pgwire:
+        ports += (server.pgwire_port,)
+    if metrics:
+        ports += (server.health_port,)
     for port in ports:
         server.port_reservations.release(port)
 

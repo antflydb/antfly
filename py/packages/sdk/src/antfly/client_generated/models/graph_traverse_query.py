@@ -17,9 +17,11 @@ class GraphTraverseQuery:
     """
     Attributes:
         index (str):
-        traverse (GraphTraversal): Breadth-first traversal with request-wide deduplication by exact table-qualified node
-            identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a
-            reciprocal edge.
+        traverse (GraphTraversal): Breadth-first traversal by exact table-qualified node identity. With include_paths,
+            visited state and deduplication are independent per start node, preserving paths between roots and overlapping
+            root provenance. The first node in each path identifies its root. Without include_paths, result nodes are
+            deduplicated across starts. Direction defaults to `out`; use `both` to traverse a relationship as undirected
+            without storing a reciprocal edge.
     """
 
     index: str

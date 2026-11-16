@@ -119,6 +119,8 @@ fn compiledBackendAttachContext(
         .model_dir = pipeline.model_dir,
         .artifact_dir = pipeline.artifact_dir,
         .pjrt_client = pipeline.pjrt_client,
+        .pjrt_admission = if (@hasField(@TypeOf(pipeline.*), "pjrt_admission")) pipeline.pjrt_admission else null,
+        .pjrt_plugin_path = if (@hasField(@TypeOf(pipeline.*), "pjrt_plugin_path")) pipeline.pjrt_plugin_path else null,
         .session = pipeline.session,
         .gpt_config = pipeline.gpt_config,
         .kv_dtype = pipeline.kv_dtype,
@@ -767,12 +769,17 @@ pub fn graphForwardCompiledModelOutput(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) !?model_runtime.ModelOutput {
-    _ = batch;
     const backend = pipeline.compiled_partition_backend orelse return null;
     if (pipeline.compiled_attachment_target != .whole_model) return null;
     const backend_def = compiledBackendDefinition(backend) orelse return null;
     if (backend_def.model_runtime_strategy == .none) return null;
-    const execute_direct = backend_def.execute_model_forward_output_direct orelse return null;
+    const execute_direct = backend_def.execute_model_forward_output_direct orelse {
+        // Graph-backed runtimes expose host logits through the regular model
+        // forward hook. They still satisfy the output API used by generation;
+        // only resident backends need a dedicated direct-output hook.
+        const logits = try graphForwardCompiledModelLast(pipeline, cache, input_ids, batch, seq_len, decode_context) orelse return null;
+        return .{ .logits = logits };
+    };
 
     const attention_mode = cacheAttentionMode(decode_context);
     const attach_context = compiledBackendAttachContext(pipeline, backend, attention_mode);

@@ -14,7 +14,7 @@ export type InputGroupProps = HTMLAttributes<HTMLDivElement>;
 export const InputGroup = ({ className, ...props }: InputGroupProps) => (
   <div
     className={cn(
-      "flex w-full flex-col rounded-none border-(length:--border-width) border-input bg-transparent",
+      "flex w-full flex-col rounded-md border-(length:--border-width) border-input bg-transparent",
       "transition-[border-color,box-shadow] focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/30",
       className
     )}

@@ -91,15 +91,12 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
                   <Input placeholder="http://localhost:8082/db/v1" {...field} />
                 </FormControl>
                 <FormDescription>
-                  Current:{" "}
-                  <code className="text-xs bg-muted px-1 py-0.5 rounded-none">{apiUrl}</code>
+                  Current: <code className="text-xs bg-muted px-1 py-0.5 rounded-sm">{apiUrl}</code>
                 </FormDescription>
                 <FormDescription className="text-xs">
-                  Examples: <code className="bg-muted px-1 py-0.5 rounded-none">/db/v1</code>{" "}
+                  Examples: <code className="bg-muted px-1 py-0.5 rounded-sm">/db/v1</code>{" "}
                   (default),{" "}
-                  <code className="bg-muted px-1 py-0.5 rounded-none">
-                    http://server:8082/db/v1
-                  </code>
+                  <code className="bg-muted px-1 py-0.5 rounded-sm">http://server:8082/db/v1</code>
                 </FormDescription>
               </FormItem>
             )}
@@ -116,14 +113,14 @@ export function SettingsDialog({ trigger }: SettingsDialogProps = {}) {
                 </FormControl>
                 <FormDescription>
                   Current:{" "}
-                  <code className="text-xs bg-muted px-1 py-0.5 rounded-none">
+                  <code className="text-xs bg-muted px-1 py-0.5 rounded-sm">
                     {effectiveInferenceApiUrl}
                   </code>
                 </FormDescription>
                 <FormDescription className="text-xs">
-                  Examples: <code className="bg-muted px-1 py-0.5 rounded-none">/ai/v1</code>{" "}
+                  Examples: <code className="bg-muted px-1 py-0.5 rounded-sm">/ai/v1</code>{" "}
                   (default),{" "}
-                  <code className="bg-muted px-1 py-0.5 rounded-none">
+                  <code className="bg-muted px-1 py-0.5 rounded-sm">
                     https://antfly.company.com/ai/v1
                   </code>
                 </FormDescription>

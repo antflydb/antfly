@@ -56,7 +56,7 @@ func newWorkspaceRunnerFixture(t *testing.T) *workspaceRunnerFixture {
 			return 200, map[string]any{"historyId": "20", "history": []any{}}
 		case "/gmail/messages/message1":
 			f.bodies++
-			return 200, map[string]any{"id": "message1", "labelIds": []string{"INBOX"}, "payload": map[string]any{"mimeType": "multipart/mixed", "parts": []any{
+			return 200, map[string]any{"id": "message1", "historyId": "10", "labelIds": []string{"INBOX"}, "payload": map[string]any{"mimeType": "multipart/mixed", "parts": []any{
 				map[string]any{"partId": "0", "mimeType": "text/plain", "body": map[string]any{"data": base64.RawURLEncoding.EncodeToString([]byte("body"))}},
 				map[string]any{"partId": "1", "filename": "notes.txt", "mimeType": "text/plain", "body": map[string]any{"attachmentId": "attachment1", "size": 5}},
 			}}}
@@ -105,7 +105,7 @@ func TestWorkspaceRunnerConsentExpansionRetainsProgressAndBaseline(t *testing.T)
 			require.Equal(t, 1, f.listings)
 			require.Equal(t, 1, f.bodies)
 			require.Equal(t, 1, f.attachments)
-			require.Equal(t, 1, f.extractions)
+			require.Equal(t, 0, f.extractions, "native source acquisition does not run attachment extractors")
 			require.NoError(t, loadJSON(path, &state, 256<<20))
 			require.NotNil(t, state.Published)
 			require.Nil(t, state.Pending)
@@ -118,7 +118,7 @@ func TestWorkspaceRunnerConsentExpansionRetainsProgressAndBaseline(t *testing.T)
 			require.Equal(t, 1, f.listings)
 			require.Equal(t, 1, f.bodies)
 			require.Equal(t, 1, f.attachments)
-			require.Equal(t, 1, f.extractions)
+			require.Equal(t, 0, f.extractions, "native source acquisition does not run attachment extractors")
 			connection.Services = []string{"drive"}
 			f.runner.Profile.Connections["docs"] = connection
 			require.ErrorIs(t, f.runner.Sync(t.Context()), ErrInvalidInput, "selected-service loss must still fail live authorization")
@@ -162,7 +162,7 @@ func TestWorkspaceRunnerPinnedIdentityStillFencesDrift(t *testing.T) {
 			require.Equal(t, before, after, "unproven drift must leave the pinned checkpoint intact")
 			require.Equal(t, 1, f.listings)
 			require.Equal(t, 1, f.attachments)
-			require.Equal(t, 1, f.extractions)
+			require.Equal(t, 0, f.extractions, "native source acquisition does not run attachment extractors")
 		})
 	}
 }

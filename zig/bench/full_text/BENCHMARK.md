@@ -44,7 +44,7 @@ historical evidence rather than a current performance claim. Since then, the
 Zig implementation has gained block-max metadata, Block-Max WAND, postings
 `advanceTo`, cross-segment global top-k collection, deleted-document filtering,
 position-decoding avoidance for ranking-only queries, and an embedded
-`search-benchmark-game` adapter. A new verified baseline has since been
+`search-benchmark-game` adapter ([`search-benchmark-game/engines`](search-benchmark-game/engines)). A new verified baseline has since been
 established (see [Search Execution Architecture](../../FULL_TEXT.md#search-execution-architecture)); it
 supersedes the ratio above for any public comparison.
 

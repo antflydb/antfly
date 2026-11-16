@@ -1251,3 +1251,41 @@ Copyright (c) 2005-2008, The Android Open Source Project.
 See [source notices](zig/lib/audio/src/aacplus/SOURCE_NOTICES.md) and
 [port details](zig/lib/audio/src/aacplus/PORTING.md). No C/C++ codec build or
 runtime codec library is used.
+
+## shadcn/ui components
+
+The components in `ts/packages/design-system/src/components/ui` derive from
+[shadcn/ui](https://github.com/shadcn-ui/ui), and the state variants and
+utilities in `ts/packages/design-system/src/theme.css` are copied from `shadcn/tailwind.css` 4.23.0. They
+retain their MIT license.
+
+```text
+MIT License
+
+Copyright (c) 2023 shadcn
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## Aeonik fonts
+
+The Aeonik font files in `ts/packages/design-system/src/fonts/aeonik` are third-party material and are
+not licensed under the Apache-2.0 license of `@antfly/design-system`. Their embedded metadata
+names Mark Bloom and Joe Leadbeater as copyright holders and "This Is Our Shop
+EULA" as the license.

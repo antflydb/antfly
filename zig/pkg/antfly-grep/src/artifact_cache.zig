@@ -17,6 +17,10 @@
 //! collisions, concurrent replacements and corrupt records harmless misses.
 const std = @import("std");
 const A = std.mem.Allocator;
+// Serialize read/choose/publish within a process for the same bucket. Readers
+// stay lock-free; checksums still turn cross-process races into safe misses.
+// Fixed stripes bound synchronization state independently of cache contents.
+var bucket_writers: [64]std.Io.Mutex = @splat(.init);
 // One lazy inventory avoids dozens of negative legacy probes per new key.
 // New-format writers never create legacy names; a new invocation rechecks.
 pub const LegacyPresence = struct {
@@ -41,7 +45,7 @@ pub const LegacyPresence = struct {
 // Bucket headers are contiguous: one read probes every way, followed by
 // one bounded payload read. Small fixed slots bound allocation and disk size;
 // large artifacts use compact atomic buckets to avoid allocated sparse gaps.
-// No shared lock, descriptor cache, mmap, directory scan or startup sweep.
+// Readers need no lock, descriptor cache, mmap, directory scan or startup sweep.
 // A checksum covers identity + length + age + body; racing/torn in-place
 // writes can evict or miss, but cannot turn one key's payload into another's.
 pub const Cache = struct {
@@ -168,6 +172,14 @@ pub const Cache = struct {
     pub fn store(self: Cache, a: A, io: std.Io, key: [32]u8, body: []const u8) void {
         std.debug.assert(self.ways <= max_ways and self.limit >= header_size);
         if (body.len > self.limit - header_size) return;
+        var stripe = std.hash.Wyhash.init(0);
+        stripe.update(self.directory);
+        stripe.update(self.namespace);
+        const bucket = std.mem.readInt(u16, key[0..2], .little) % self.buckets;
+        stripe.update(std.mem.asBytes(&bucket));
+        const mutex = &bucket_writers[stripe.final() % bucket_writers.len];
+        mutex.lockUncancelable(io);
+        defer mutex.unlock(io);
         if (self.limit > 4096) return self.storePacked(a, io, key, body);
         std.Io.Dir.cwd().createDirPath(io, self.directory) catch return;
         const name = self.path(a, key) catch return;
@@ -461,6 +473,15 @@ test "concurrent bucket readers never observe another identity's payload" {
     for (threads[0..started]) |thread| thread.join();
     started = 0;
     try std.testing.expect(!failed.load(.monotonic));
+    // Four keys fit the four ways: same-process writers must retain every one,
+    // rather than racing to choose and overwrite the same formerly empty way.
+    for (1..5) |id| {
+        var key: [32]u8 = @splat(0);
+        key[31] = @intCast(id);
+        const body = cache.load(std.testing.allocator, io, key) orelse return error.MissingConcurrentCacheEntry;
+        defer std.testing.allocator.free(body);
+        for (body) |byte| try std.testing.expectEqual(@as(u8, @intCast(id)), byte);
+    }
 }
 
 test "large artifact buckets pack bodies without sparse slot gaps" {

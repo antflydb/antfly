@@ -211,9 +211,17 @@ pub const PublicationGuard = struct {
     ptr: *anyopaque,
     check_fn: *const fn (*anyopaque, []const u8) anyerror!void,
     prepare_fn: *const fn (*anyopaque, []const u8) anyerror!?head_coordination.Fence,
+    upload_fn: ?*const fn (*anyopaque, []const u8) anyerror!?head_coordination.Fence = null,
 
     pub fn check(self: PublicationGuard, namespace: []const u8) !void {
         try self.check_fn(self.ptr, namespace);
+    }
+
+    /// Non-authoritative identity for immutable upload scoping and manifest
+    /// stamping. Cutover MUST still call preparePublication and fenced CAS.
+    pub fn uploadFence(self: PublicationGuard, namespace: []const u8) !?head_coordination.Fence {
+        if (self.upload_fn) |upload| return upload(self.ptr, namespace);
+        return self.preparePublication(namespace);
     }
 
     /// Renews ownership and returns the proof that the progress backend must
@@ -240,6 +248,7 @@ pub const HeldLease = struct {
             .ptr = self,
             .check_fn = checkPublication,
             .prepare_fn = preparePublication,
+            .upload_fn = uploadFence,
         };
     }
 
@@ -301,6 +310,14 @@ pub const HeldLease = struct {
     fn erasedMaintenanceCheckpoint(ptr: *anyopaque) !void {
         const self: *HeldLease = @ptrCast(@alignCast(ptr));
         try self.renewIfNeeded();
+    }
+
+    fn uploadFence(ptr: *anyopaque, namespace: []const u8) !?head_coordination.Fence {
+        const self: *HeldLease = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, namespace, self.namespace)) return error.WorkLeaseNamespaceMismatch;
+        if (self.released) return error.WorkLeaseLost;
+        try self.renewIfNeeded();
+        return .{ .owner_id = self.owner_id, .fencing_token = self.acquisition.fencing_token };
     }
 
     fn preparePublication(ptr: *anyopaque, namespace: []const u8) !?head_coordination.Fence {

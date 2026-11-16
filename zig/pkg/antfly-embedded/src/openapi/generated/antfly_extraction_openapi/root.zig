@@ -3,6 +3,7 @@
 
 pub const types = @import("types.zig");
 
+pub const AudioReadOptions = types.AudioReadOptions;
 pub const DocumentSource = types.DocumentSource;
 pub const ExtractionAttributeGroup = types.ExtractionAttributeGroup;
 pub const ExtractionAttributeLabel = types.ExtractionAttributeLabel;

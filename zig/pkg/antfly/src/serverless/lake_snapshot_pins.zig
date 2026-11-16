@@ -78,7 +78,7 @@ pub const Store = struct {
                 const path = try self.key(a, "pins", snapshot);
                 defer a.free(path);
                 var client = self.client;
-                var result = client.putObject(self.bucket, path, bytes, .{ .if_none_match = previous == null, .if_match_etag = if (previous) |value| value.metadata.etag orelse return error.MissingObjectEtag else null, .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
+                var result = client.compareAndPut(self.bucket, path, bytes, if (previous) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
                     error.PreconditionFailed, error.ObjectAlreadyExists => continue,
                     else => return err,
                 };

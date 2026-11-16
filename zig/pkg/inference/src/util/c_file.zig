@@ -127,6 +127,7 @@ pub fn mappedSliceOffset(full: []const u8, slice: []const u8) ?usize {
 pub const MmapRegion = struct {
     data: []align(std.heap.page_size_min) u8,
     fd: std.posix.fd_t,
+    owns_fd: bool = true,
     /// Whether deinit should evict clean pages from the kernel page cache.
     /// Model stores default to the historical memory-conservative behavior;
     /// CUDA full-residency admission can explicitly retain the cache so a
@@ -158,6 +159,17 @@ pub const MmapRegion = struct {
         return .{ .data = mapped, .fd = fd };
     }
 
+    /// Map an acquisition-owned descriptor without reopening a pathname.
+    /// The caller retains the file until the borrowed mapping is unmapped.
+    pub fn initFromFile(file: std.Io.File, max_bytes: usize) !MmapRegion {
+        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
+        const size = try fileSizeFromFd(file.handle);
+        if (size == 0) return error.EmptyFile;
+        if (size > max_bytes) return error.FileTooLarge;
+        const mapped = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
+        return .{ .data = mapped, .fd = file.handle, .owns_fd = false, .discard_on_deinit = false };
+    }
+
     /// Hint sequential access for the first `len` bytes (the header region).
     /// Only the header is read sequentially; the rest of the file (tensor data)
     /// is left with default advice so the kernel doesn't eagerly page in
@@ -186,6 +198,46 @@ pub const MmapRegion = struct {
     pub fn adviseBytesSequential(bytes: []const u8) void {
         if (bytes.len == 0) return;
         advise(@constCast(bytes.ptr), bytes.len, .sequential);
+    }
+
+    /// A consumer-scoped hint, never a prefetch or an allocation. The mapping
+    /// owner must outlive the scope. Reject unrelated/owned buffers so advice
+    /// cannot alter allocator pages. Call only after workspace admission.
+    pub const SequentialRead = struct {
+        bytes: []const u8 = &.{},
+
+        pub fn begin(mapping: ?[]const u8, bytes: []const u8) SequentialRead {
+            const source = mapping orelse return .{};
+            const start = @intFromPtr(bytes.ptr);
+            const base = @intFromPtr(source.ptr);
+            if (bytes.len == 0 or start < base) return .{};
+            const offset = start - base;
+            if (offset > source.len or bytes.len > source.len - offset) return .{};
+            adviseBytesSequential(bytes);
+            return .{ .bytes = bytes };
+        }
+
+        pub fn deinit(self: *SequentialRead) void {
+            adviseBytesRandom(self.bytes);
+            self.bytes = &.{};
+        }
+    };
+
+    /// Restore sparse inference access after a bounded scan of borrowed mmap
+    /// bytes. Like the sequential hint, this cannot fail the owning operation.
+    pub fn adviseBytesRandom(bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        advise(@constCast(bytes.ptr), bytes.len, .random);
+    }
+
+    /// Release this process's clean file-backed pages after a completed copy.
+    /// The caller must prove the slice belongs to an mmap and wait for every
+    /// asynchronous reader. The mapping and shared file cache remain valid;
+    /// subsequent readers simply fault the original bytes back in.
+    pub fn adviseBytesDontNeed(bytes: []const u8) void {
+        if (comptime !supports_posix_file_advice) return;
+        if (bytes.len == 0) return;
+        advise(@constCast(bytes.ptr), bytes.len, .dont_need);
     }
 
     /// Release clean pages for a consumed file-backed range. The mapping stays
@@ -239,7 +291,7 @@ pub const MmapRegion = struct {
                 c.POSIX_FADV_DONTNEED,
             );
         }
-        closeFd(fd);
+        if (self.owns_fd) closeFd(fd);
         self.* = undefined;
     }
 };
@@ -317,6 +369,25 @@ pub fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
     defer closeFd(fd);
 
     return try fileSizeFromFd(fd);
+}
+
+/// Content identity without mapping a large artifact/plugin into host memory.
+/// Callers admitting this cold-path operation need only a bounded read buffer.
+pub fn sha256File(allocator: std.mem.Allocator, path: []const u8) ![32]u8 {
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
+    defer allocator.free(path_z);
+    const fd = try openReadOnlyZ(path_z);
+    defer closeFd(fd);
+    var buffer: [64 * 1024]u8 = undefined;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var offset: u64 = 0;
+    while (true) {
+        const n = try readAt(fd, &buffer, offset);
+        if (n == 0) break;
+        hash.update(buffer[0..n]);
+        offset = try std.math.add(u64, offset, n);
+    }
+    return hash.finalResult();
 }
 
 pub const FileIdentity = struct {
@@ -888,4 +959,49 @@ test "prefetchFile reads every byte with bounded workers" {
             try std.testing.expectEqual(std.math.clamp(workers, 1, 8), result.workers);
         }
     }
+}
+
+test "retained ONNX borrowed graph mappings leave acquisition handles open" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "graph", .data = "graph bytes" });
+    const file = try tmp.dir.openFile(io, "graph", .{});
+    defer file.close(io);
+    var mapping = try MmapRegion.initFromFile(file, 1024);
+    try std.testing.expectEqualStrings("graph bytes", mapping.data);
+    mapping.deinit();
+    var bytes: [11]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, bytes.len), try file.readPositionalAll(io, &bytes, 0));
+    try std.testing.expectEqualStrings("graph bytes", &bytes);
+    try std.testing.expectError(error.FileTooLarge, MmapRegion.initFromFile(file, 3));
+}
+
+test "consumer sequential advice is confined to the selected mapping span" {
+    var region = try mmapTempCopy(std.testing.allocator, "native-cpu-sequential-scan", "checkpoint selected tensor trailing tensor");
+    defer region.deinit();
+    region.adviseRandom();
+    var scan = MmapRegion.SequentialRead.begin(region.data, region.data[11..26]);
+    try std.testing.expectEqualSlices(u8, "selected tensor", scan.bytes);
+    scan.deinit();
+    scan.deinit();
+    try std.testing.expectEqual(@as(usize, 0), scan.bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), MmapRegion.SequentialRead.begin(null, region.data).bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), MmapRegion.SequentialRead.begin(region.data, "heap allocation").bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), MmapRegion.SequentialRead.begin(region.data[11..26], region.data[11..27]).bytes.len);
+    try std.testing.expectEqualSlices(u8, "checkpoint selected tensor trailing tensor", region.data);
+}
+
+test "Gemma4 CUDA uploaded mapping advice preserves unaligned bytes and neighboring tensors" {
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, 16384);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i * 37);
+    var region = try mmapTempCopy(a, "uploaded-mapping", bytes);
+    defer region.deinit();
+    MmapRegion.adviseBytesDontNeed(region.data[13..8197]);
+    MmapRegion.adviseBytesDontNeed(&.{});
+    try std.testing.expectEqualSlices(u8, bytes, region.data);
+    MmapRegion.adviseBytesDontNeed(region.data);
+    try std.testing.expectEqualSlices(u8, bytes, region.data);
 }

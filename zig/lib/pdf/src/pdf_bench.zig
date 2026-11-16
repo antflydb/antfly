@@ -39,6 +39,17 @@ pub fn main(init: std.process.Init) !void {
         return BenchError.InvalidArguments;
     };
 
+    if (std.mem.eql(u8, subcommand, "sampling-report")) {
+        const path = args.next() orelse return BenchError.InvalidArguments;
+        const dpi = std.math.cast(u16, try parseIterations(args.next(), 150)) orelse return BenchError.InvalidArguments;
+        const iterations = try parseIterations(args.next(), 3);
+        if (dpi == 0 or iterations == 0) return BenchError.InvalidArguments;
+        const output_prefix = args.next();
+        if (args.next() != null) return BenchError.InvalidArguments;
+        try samplingReport(alloc, path, dpi, iterations, output_prefix);
+        return;
+    }
+
     if (std.mem.eql(u8, subcommand, "render-window") or std.mem.eql(u8, subcommand, "render-compare")) {
         const path = args.next() orelse return BenchError.InvalidArguments;
         const dimension = try parseIterations(args.next(), 0);
@@ -85,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (std.mem.eql(u8, subcommand, "dump-text")) {
+    if (std.mem.eql(u8, subcommand, "dump-text") or std.mem.eql(u8, subcommand, "dump-analysis")) {
         const path = args.next() orelse {
             printUsage(argv0);
             return BenchError.InvalidArguments;
@@ -94,7 +105,12 @@ pub fn main(init: std.process.Init) !void {
             printUsage(argv0);
             return BenchError.InvalidArguments;
         };
-        try dumpText(alloc, path, output_path);
+        const policy = if (args.next()) |name|
+            std.meta.stringToEnum(pdf.reader.TextExtractionPolicy, name) orelse return BenchError.InvalidArguments
+        else
+            .page;
+        if (args.next() != null) return BenchError.InvalidArguments;
+        try dumpExtraction(alloc, path, output_path, policy, std.mem.eql(u8, subcommand, "dump-analysis"));
         return;
     }
 
@@ -107,12 +123,52 @@ fn printUsage(argv0: []const u8) void {
         \\usage:
         \\  {s} suite <pdf-path> [iterations]
         \\  {s} extract-text <pdf-path> [iterations]
+        \\  {s} sampling-report <pdf-path> [dpi=150] [iterations=3] [output-prefix]
         \\  {s} render-first-page <pdf-path> [iterations]
         \\  {s} render-pages <pdf-path> [dpi]
         \\  {s} render-window <pdf-path> [model-image-dimension (0=requested DPI)] [scratch-bytes (0=estimate)]
-        \\  {s} dump-text <pdf-path> <output-path>
+        \\  {s} dump-text <pdf-path> <output-path> [source|page|visible]
+        \\  {s} dump-analysis <pdf-path> <output-json-path> [source|page|visible]
         \\
-    , .{ argv0, argv0, argv0, argv0, argv0, argv0 });
+    , .{ argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0 });
+}
+
+/// Deterministic CPU render/encode comparison; reader accuracy and HTTP/GPU
+/// latency are deliberately measured separately using the exported PNGs.
+fn samplingReport(alloc: std.mem.Allocator, path: []const u8, dpi: u16, iterations: usize, output_prefix: ?[]const u8) !void {
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_pdf_input_bytes));
+    defer alloc.free(bytes);
+    var parsed = try pdf.reader.Reader.init(alloc, bytes);
+    defer parsed.deinit();
+    var source_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &source_hash, .{});
+    for ([_]pdf.ImageSamplingPolicy{ .auto, .pdf, .smooth }) |sampling| {
+        var warm = try pdf.renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &parsed, 1, dpi, 40_000_000, 4096, sampling.profile());
+        defer warm.deinit(alloc);
+        var expected: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(warm.png, &expected, .{});
+        var elapsed: u64 = 0;
+        for (0..iterations) |_| {
+            const started = monotonicNowNs();
+            var page = try pdf.renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &parsed, 1, dpi, 40_000_000, 4096, sampling.profile());
+            elapsed += monotonicNowNs() - started;
+            defer page.deinit(alloc);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(page.png, &digest, .{});
+            if (!std.mem.eql(u8, &expected, &digest)) return error.NonDeterministicRender;
+        }
+        if (output_prefix) |prefix| {
+            const filename = try std.fmt.allocPrint(alloc, "{s}-{s}.png", .{ prefix, @tagName(sampling) });
+            defer alloc.free(filename);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = filename, .data = warm.png });
+        }
+        const report = try std.json.Stringify.valueAlloc(alloc, .{ .source = path, .source_sha256 = std.fmt.bytesToHex(source_hash, .lower), .page = 1, .sampling = sampling, .quality = warm.quality, .dpi = dpi, .effective_dpi = warm.effective_dpi, .width = warm.width, .height = warm.height, .png_bytes = warm.png.len, .png_sha256 = std.fmt.bytesToHex(expected, .lower), .iterations = iterations, .mean_render_encode_ms = @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(iterations)) / std.time.ns_per_ms }, .{});
+        defer alloc.free(report);
+        std.debug.print("{s}\n", .{report});
+    }
 }
 
 /// Exercise one prepared, directly retained raster using the same estimated
@@ -234,27 +290,76 @@ fn renderAllPages(alloc: std.mem.Allocator, path: []const u8, dpi: u16) !void {
 /// here the first per-page error propagates so a corrupt page surfaces as a
 /// nonzero exit and no output file instead of silently missing text. Uses the
 /// production page-text/region API, with no OCR or raster rendering.
-fn dumpText(alloc: std.mem.Allocator, path: []const u8, output_path: []const u8) !void {
+fn dumpExtraction(alloc: std.mem.Allocator, path: []const u8, output_path: []const u8, policy: pdf.reader.TextExtractionPolicy, structured: bool) !void {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_pdf_input_bytes));
     defer alloc.free(bytes);
-
     var parsed = try pdf.reader.Reader.init(alloc, bytes);
     defer parsed.deinit();
-
+    parsed.text_extraction_policy = policy;
     const page_count = try parsed.pageCount();
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(alloc);
-
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    if (structured) {
+        try out.writer.writeAll("{\"policy\":");
+        try std.json.Stringify.value(policy, .{}, &out.writer);
+        try out.writer.writeAll(",\"pages\":[");
+    }
     for (1..page_count + 1) |page_num| {
         var analysis = try parsed.extractPageTextAnalysisAlloc(page_num);
         defer analysis.deinit(alloc);
-        try out.appendSlice(alloc, analysis.text);
+        if (structured) {
+            if (page_num > 1) try out.writer.writeByte(',');
+            try dumpPageAnalysis(alloc, &out.writer, page_num, &analysis);
+        } else try out.writer.writeAll(analysis.text);
     }
+    if (structured) try out.writer.writeAll("]}\n");
+    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = output_path, .data = out.written() });
+}
 
-    try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = output_path, .data = out.items });
+fn dumpPageAnalysis(alloc: std.mem.Allocator, writer: *std.Io.Writer, page_num: usize, analysis: *const pdf.reader.PageTextAnalysis) !void {
+    const blocks = try pdf.text_structure.blocksFromAnalysisAlloc(alloc, analysis.text, analysis.runs, analysis.semantic_spans, .{});
+    defer alloc.free(blocks);
+    try writer.writeAll("{\"page\":");
+    try std.json.Stringify.value(page_num, .{}, writer);
+    try writer.writeAll(",\"text\":");
+    try std.json.Stringify.value(analysis.text, .{}, writer);
+    try writer.writeAll(",\"diagnostics\":");
+    try std.json.Stringify.value(analysis.diagnostics, .{}, writer);
+    try writer.writeAll(",\"outline_fallback\":");
+    try std.json.Stringify.value(analysis.outline_fallback, .{}, writer);
+    try writer.writeAll(",\"has_nontext_visual\":");
+    try std.json.Stringify.value(analysis.has_nontext_visual, .{}, writer);
+    try writer.writeAll(",\"has_unrendered_annotations\":");
+    try std.json.Stringify.value(analysis.has_unrendered_annotations, .{}, writer);
+    try writer.writeAll(",\"blocks\":");
+    try std.json.Stringify.value(blocks, .{}, writer);
+    try writer.writeAll(",\"semantic_spans\":");
+    try std.json.Stringify.value(analysis.semantic_spans, .{}, writer);
+    try writer.writeAll(",\"runs\":[");
+    for (analysis.runs, 0..) |run, index| {
+        if (index > 0) try writer.writeByte(',');
+        const box = run.bounds();
+        try std.json.Stringify.value(.{
+            .text = run.text,
+            .span = run.output_span,
+            .semantic_span_index = if (run.semantic_span_index == std.math.maxInt(usize)) null else @as(?usize, run.semantic_span_index),
+            .raw_text = run.raw_text,
+            .render_mode = run.render_mode,
+            .fill_alpha = run.alpha,
+            .stroke_alpha = run.stroke_alpha,
+            .group_alpha = run.group_alpha,
+            .ancestor_groups_visible = run.ancestor_groups_visible,
+            .bbox = if (box) |b| @as(?[4]f64, .{ b.min_x, b.min_y, b.max_x, b.max_y }) else null,
+            .font_size = @abs(run.font_size) * @sqrt(run.c * run.c + run.d * run.d),
+            .source_font_size = run.font_size,
+            .bold = run.bold,
+            .italic = run.italic,
+            .paint_order = run.paint_order,
+        }, .{}, writer);
+    }
+    try writer.writeAll("]}");
 }
 
 fn timeExtractText(

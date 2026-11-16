@@ -37,7 +37,7 @@ func (c *CollaborationConnector) workspaceSelection(ctx context.Context, r Reque
 	tokens := map[string]string{"config": workspaceSelectionKey(r), "hydration": c.hydrationSelection(r)}
 	config.tokens = tokens
 	baseline := c.Baseline
-	delta := baseline != nil && baseline.Authoritative && baseline.ProviderState["config"] == tokens["config"] && (c.ContentStore == nil || baseline.ProviderState["hydration"] == tokens["hydration"]) && !r.Preview && len(r.RetrySourceKeys) == 0
+	delta := baseline != nil && baseline.Authoritative && baseline.ProviderState["config"] == tokens["config"] && ((!c.NativeAttachments && c.ContentStore == nil) || baseline.ProviderState["hydration"] == tokens["hydration"]) && !r.Preview && len(r.RetrySourceKeys) == 0
 	removed := map[string]bool{}
 	if delta {
 		var refs []collaborationRef

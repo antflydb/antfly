@@ -20,25 +20,58 @@ const media = @import("antfly_media");
 const providers = @import("media_chunking_audio.zig");
 pub const Index = union(enum) {
     mp3: audio.mp3.pure_zig.WindowIndex,
-    flac: audio.flac.WindowIndex,
-    opus: audio.opus.WindowIndex,
+    flac: @import("media_flac_seek.zig").Index,
+    opus: @import("media_opus_seek.zig").Index,
     vorbis: audio.vorbis.WindowIndex,
-    webm: audio.webm.WindowIndex,
+    webm: audio.webm.WindowIndexFor(@import("media_opus_seek.zig").Index),
+    pub const Admission = @import("media_opus_seek.zig").Admission;
     pub fn init(a: std.mem.Allocator, bytes: []const u8, max_frames: usize) !Index {
+        return initAdmitted(a, bytes, max_frames, null);
+    }
+    pub fn initAdmitted(a: std.mem.Allocator, bytes: []const u8, max_frames: usize, admission: ?Admission) !Index {
         const format = audio.detectFormat(bytes) orelse return error.UnsupportedAudioFormat;
         if (format == .ogg or format == .opus) {
-            var streams = try audio.ogg.parsePacketStreamsAlloc(a, bytes);
+            const Progressive = @import("media_opus_seek.zig").Index;
+            const owner = try Progressive.create(admission);
+            var initial = Progressive{ .owner = owner };
+            var release_owner = true;
+            defer if (release_owner) initial.deinit();
+            const arena = owner.arena.allocator();
+            var streams = try audio.ogg.parsePacketStreamsAlloc(arena, bytes);
             defer streams.deinit();
             if (streams.streams.len != 1) return error.UnsupportedStreamingAudioProfile;
+            const sequence = &streams.streams[0];
+            if (sequence.packets.len == 0) return error.UnsupportedAudioFormat;
+            return switch (try audio.ogg.sniffFirstPacket(sequence.packets[0].bytes)) {
+                .opus => blk: {
+                    owner.demuxed = try audio.opus.takeOggPacketsAlloc(arena, sequence);
+                    try Progressive.finish(owner, max_frames);
+                    release_owner = false;
+                    break :blk .{ .opus = initial };
+                },
+                .vorbis => blk: {
+                    const index = try audio.vorbis.WindowIndex.initPackets(a, sequence.packets, max_frames);
+                    // Packet parsing was admitted, but Vorbis owns its independent
+                    // metadata and coded bytes after construction.
+                    break :blk .{ .vorbis = index };
+                },
+                else => error.UnsupportedAudioFormat,
+            };
         }
         return switch (format) {
             .mp3 => .{ .mp3 = try audio.mp3.pure_zig.WindowIndex.init(a, bytes, max_frames) },
-            .flac => .{ .flac = try audio.flac.WindowIndex.init(a, bytes, max_frames) },
-            .webm => .{ .webm = try audio.webm.WindowIndex.init(a, bytes, max_frames) },
-            .ogg, .opus => switch (try audio.ogg.sniffCodec(a, bytes)) {
-                .opus => .{ .opus = try audio.opus.WindowIndex.init(a, bytes, max_frames) },
-                .vorbis => .{ .vorbis = try audio.vorbis.WindowIndex.init(a, bytes, max_frames) },
-                else => error.UnsupportedAudioFormat,
+            .flac => .{ .flac = try @import("media_flac_seek.zig").Index.init(bytes, max_frames, admission) },
+            .webm => blk: {
+                const Progressive = @import("media_opus_seek.zig").Index;
+                const owner = try Progressive.create(admission);
+                // The returned codec (or retained_owner for Vorbis) takes
+                // this reference; failures release all admitted metadata.
+                var initial = Progressive{ .owner = owner };
+                errdefer initial.deinit();
+                var index = try audio.webm.WindowIndexFor(Progressive).initWithBuilder(owner.arena.allocator(), bytes, max_frames, Progressive.Builder{ .owner = owner });
+                if (index.codec == .vorbis) index.retained_owner = initial else initial.deinit();
+                Progressive.refreshBytes(owner);
+                break :blk .{ .webm = index };
             },
             else => error.UnsupportedAudioFormat,
         };
@@ -64,13 +97,14 @@ pub const Index = union(enum) {
     }
     pub fn samples(self: Index) usize {
         return switch (self) {
+            inline .opus, .flac => |index| index.samples(),
             inline else => |index| index.samples,
         };
     }
     pub fn rate(self: Index) u32 {
         return switch (self) {
             .mp3 => |index| index.sample_rate,
-            .flac => |index| index.info.sample_rate,
+            .flac => |index| index.rate(),
             .opus => 48000,
             .vorbis => |index| index.demuxed.headers.identification.sample_rate,
             .webm => |index| index.sample_rate,
@@ -81,12 +115,28 @@ pub const Reader = struct {
     index: *const Index,
     source: ?*media.source.Source = null,
     bytes: []const u8 = &.{},
+    lane: u1 = 0,
+    fork_allocator: ?std.mem.Allocator = null,
     control: @import("../execution_control.zig").InferenceExecutionControl = .{},
     pub fn provider(self: *Reader) providers.Provider {
-        return .{ .context = self, .samples = self.index.samples(), .sample_rate = self.index.rate(), .read = read };
+        return .{ .context = self, .samples = self.index.samples(), .sample_rate = self.index.rate(), .read = read, .fork = fork };
+    }
+    fn fork(raw: *anyopaque, a: std.mem.Allocator) !providers.Fork {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        const copy = try a.create(Reader);
+        copy.* = self.*;
+        copy.lane = 1;
+        copy.fork_allocator = a;
+        return .{ .provider = copy.provider(), .context = copy, .destroy = destroyFork };
+    }
+    fn destroyFork(raw: *anyopaque) void {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        self.fork_allocator.?.destroy(self);
     }
     fn read(raw: *anyopaque, a: std.mem.Allocator, first: usize, last: usize) !providers.Lease {
         const self: *Reader = @ptrCast(@alignCast(raw));
+        const lane = @import("media_opus_seek.zig").Lane.enter(self.lane);
+        defer lane.deinit();
         try self.control.check();
         const check = self.control.imageWorkControl();
         const scope = audio.work_control.Scope.enter(.{ .context = check.context, .check_fn = check.check_fn });
@@ -111,43 +161,7 @@ pub const Reader = struct {
                 try index.visitWindow(a, first, last, .{ .context = &capture, .write = Capture.write });
                 if (capture.at != samples.len) return error.IncompleteAudioStream;
             },
-            .flac => |*index| {
-                var lo: usize = 0;
-                var hi = index.frames.len;
-                while (lo < hi) {
-                    const mid = lo + (hi - lo) / 2;
-                    const frame = index.frames[mid];
-                    if (frame.first + frame.samples <= first) lo = mid + 1 else hi = mid;
-                }
-                var copied: usize = 0;
-                for (index.frames[lo..]) |frame| {
-                    if (frame.first >= last) break;
-                    try self.control.check();
-                    const owned = if (self.source != null) try a.alloc(u8, frame.bytes) else null;
-                    defer if (owned) |value| a.free(value);
-                    const encoded = if (owned) |out| blk: {
-                        var at: usize = 0;
-                        while (at < out.len) {
-                            var lease = try self.source.?.read(frame.offset + at, @min(out.len - at, self.source.?.limits.max_read_bytes));
-                            defer lease.deinit();
-                            if (lease.bytes.len == 0) return error.UnexpectedEof;
-                            @memcpy(out[at..][0..lease.bytes.len], lease.bytes);
-                            at += lease.bytes.len;
-                        }
-                        break :blk out;
-                    } else self.bytes[frame.offset..][0..frame.bytes];
-                    var decoded = try index.decodeFrame(a, encoded);
-                    defer decoded.deinit();
-                    if (decoded.consumed != frame.bytes or decoded.frame_samples != frame.samples or decoded.channels != index.info.channels or decoded.sample_rate != index.info.sample_rate) return error.InvalidAudioWindow;
-                    const start = first -| frame.first;
-                    const stop = @min(frame.samples, last - frame.first);
-                    for (start..stop) |i| {
-                        samples[copied] = mono(decoded.samples[i * decoded.channels ..][0..decoded.channels]);
-                        copied += 1;
-                    }
-                }
-                if (copied != samples.len) return error.IncompleteAudioStream;
-            },
+            .flac => |*index| try index.read(a, first, last, samples, self.source, self.bytes, self.control),
         }
         return .{ .pcm = .{ .samples = samples, .sample_rate = self.index.rate() }, .owned = samples };
     }
@@ -212,7 +226,8 @@ test "benchmark media seek windows and AAC metadata" {
         defer index.deinit();
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        const cached = try index.copy(arena.allocator());
+        var cached = try index.copy(arena.allocator());
+        defer cached.deinit();
         const cold = std.Io.Clock.awake.now(io).toNanoseconds() - started;
         var times: [2]i128 = undefined;
         var checksums: [2]f64 = @splat(0);
@@ -274,4 +289,82 @@ test "benchmark media seek windows and AAC metadata" {
     }
     try std.testing.expectEqual(checksum[0], checksum[1]);
     std.debug.print("AAC_INDEX pages=1000 baseline_ns={d} cached_ns={d} cold_build_and_copy_ns={d}\n", .{ times[0], times[1], cold_ns });
+}
+
+test "model aware media WebM admission rejects before parsing or copying packets" {
+    const Deny = struct {
+        calls: usize = 0,
+        fn acquire(raw: *anyopaque, _: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.OutOfMemory;
+        }
+    };
+    var deny: Deny = .{};
+    // This has the WebM signature but no valid EBML payload. Admission must
+    // reject it before the parser can report its invalid container contents.
+    try std.testing.expectError(error.OutOfMemory, Index.initAdmitted(std.testing.allocator, &.{ 0x1a, 0x45, 0xdf, 0xa3, 0xff }, 1000, .{ .context = &deny, .acquire = Deny.acquire }));
+    try std.testing.expectEqual(@as(usize, 1), deny.calls);
+}
+
+test "model aware media WebM owners roll back every failed admission during construction" {
+    const a = std.testing.allocator;
+    const audio_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/codec-corpus/tone-stereo.opus", a, .limited(1024 * 1024));
+    defer a.free(audio_bytes);
+    var ogg = try audio.ogg.parsePacketsAlloc(a, audio_bytes);
+    defer ogg.deinit();
+    const packets = try a.alloc([]const u8, ogg.packets.len - 2);
+    defer a.free(packets);
+    for (packets, ogg.packets[2..]) |*out, packet| out.* = packet.bytes;
+    const bytes = try audio.webm.buildOpusTestFileAlloc(a, ogg.packets[0].bytes, packets);
+    defer a.free(bytes);
+    const memory = @import("../runtime/tier/memory.zig");
+    const Quota = struct {
+        controller: memory.AdmissionController = .{},
+        calls: usize = 0,
+        fail_at: ?usize = null,
+        fn acquire(raw: *anyopaque, size: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.fail_at) |limit| if (self.calls >= limit) return error.OutOfMemory;
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = 64 * 1024 * 1024 }, .{ .host_scratch_bytes = size }, false);
+        }
+    };
+    var quota: Quota = .{};
+    var index = try Index.initAdmitted(a, bytes, 100000, .{ .context = &quota, .acquire = Quota.acquire });
+    var cloned = try index.copy(a);
+    index.deinit();
+    const calls = quota.calls;
+    cloned.deinit();
+    try std.testing.expectEqual(@as(usize, 0), quota.controller.snapshot().hostTotalBytes());
+    for (1..calls + 1) |failure| {
+        var failed = Quota{ .fail_at = failure };
+        try std.testing.expectError(error.OutOfMemory, Index.initAdmitted(a, bytes, 100000, .{ .context = &failed, .acquire = Quota.acquire }));
+        try std.testing.expectEqual(@as(usize, 0), failed.controller.snapshot().hostTotalBytes());
+    }
+}
+
+test "model aware media Ogg admission precedes packet parsing and chained streams fall back" {
+    const Denied = struct {
+        fn acquire(_: *anyopaque, _: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
+            return error.OutOfMemory;
+        }
+    };
+    var context: u8 = 0;
+    try std.testing.expectError(error.OutOfMemory, Index.initAdmitted(std.testing.allocator, "OggS", 100000, .{ .context = &context, .acquire = Denied.acquire }));
+    const a = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/codec-corpus/tone-stereo.opus", a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    const chained = try std.mem.concat(a, u8, &.{ bytes, bytes });
+    defer a.free(chained);
+    // Use a different logical-stream serial in the second stream.
+    var offset = bytes.len;
+    while (offset < chained.len) {
+        chained[offset + 14] ^= 1;
+        const segments = chained[offset + 26];
+        var payload: usize = 0;
+        for (chained[offset + 27 ..][0..segments]) |size| payload += size;
+        offset += 27 + @as(usize, segments) + payload;
+    }
+    try std.testing.expectError(error.UnsupportedStreamingAudioProfile, Index.init(a, chained, 100000));
 }

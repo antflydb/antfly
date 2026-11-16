@@ -475,7 +475,7 @@ test "external lake overlapping text generations share every physical segment on
     try std.testing.expectEqual(reserved, cache.bytes);
 }
 
-test "external lake inventory reclamation preserves live legacy and unfenced attempts" {
+test "external lake inventory reclamation preserves live and outside-fence attempts" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("fenced-inventory-reclamation");
     defer directory.cleanup();
@@ -594,12 +594,12 @@ test "external lake global frontier compact coverage survives absent inventory a
     try std.testing.expectEqual(null, try stream.next());
 }
 
-test "external lake global frontier retained compacted roots detect v10 and v11 before serving and GC" {
+test "external lake global frontier retained serving roots reject obsolete versions before serving and GC" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
-    var directory = try local.common_test_directory.TestDirectory.init("legacy-compact-version");
+    var directory = try local.common_test_directory.TestDirectory.init("obsolete-serving-version");
     defer directory.cleanup();
     var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
     defer fs.deinit();
@@ -611,11 +611,10 @@ test "external lake global frontier retained compacted roots detect v10 and v11 
         var upload = try store.putWithCancellation(try std.json.Stringify.valueAlloc(ca, child, .{}), .none);
         defer upload.deinit(a);
         const chunk: @import("lake_index_aggregate_artifact.zig").ChunkRef = .{ .artifact_id = upload.artifact_id, .checksum = upload.checksum, .byte_len = upload.byte_len };
-        const decoded = try text.loadRootDirectoryAuto(ca, store, chunk, .none, null);
-        try std.testing.expectEqual(version, decoded.metadata_version);
+        try std.testing.expectError(error.InvalidNativeLakeTextCorpus, text.loadRootDirectory(ca, store, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = chunk.artifact_id, .checksum = chunk.checksum, .byte_len = chunk.byte_len }, .none, null));
         child.version = text.metadata_version;
-        child.compacted = chunk;
-        _ = try text.servingRoot(ca, store, child, .none, null);
+        child.serving = chunk;
+        try std.testing.expectError(error.InvalidNativeLakeTextCorpus, text.servingRoot(ca, store, child, .none, null));
         var parent = try store.putWithCancellation(try std.json.Stringify.valueAlloc(ca, child, .{}), .none);
         defer parent.deinit(a);
         var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 1, .authority = undefined, .store = store, .identity = @splat(1), .context = .{}, .audit_only = true, .token = @splat(1), .remaining_reads = 16 * 1024 * 1024 };
@@ -624,8 +623,7 @@ test "external lake global frontier retained compacted roots detect v10 and v11 
             while (keys.next()) |key| a.free(key.*);
             collector.marked.deinit(a);
         }
-        try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = parent.artifact_id, .checksum = parent.checksum, .byte_len = parent.byte_len });
-        try std.testing.expect(collector.marked.contains(upload.artifact_id));
+        try std.testing.expectError(error.InvalidNativeLakeTextCorpus, collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = parent.artifact_id, .checksum = parent.checksum, .byte_len = parent.byte_len }));
     }
 }
 
@@ -672,4 +670,57 @@ test "external lake global frontier GC upgrades maintenance and already marked m
         try std.testing.expectEqual(remaining, collector.remaining_reads);
         try std.testing.expectEqual(@as(u32, 2), collector.marked.count());
     }
+}
+
+test "external lake bounded window profiles stored highlight consumer owns output across cursor teardown and allocation faults" {
+    const a = std.testing.allocator;
+    const Column = local.section_source_column;
+    const Search = local.storage_db_query_search_exec;
+    const body = try a.alloc(u8, 8192);
+    defer a.free(body);
+    @memset(body, '.');
+    @memcpy(body[4092..][0.."é needle running".len], "é needle running");
+    var memory = local.segment.MemorySegmentSink.init(a);
+    defer memory.deinit();
+    var sink = memory.sink();
+    var writer = try Column.Writer.init(a, &sink);
+    defer writer.deinit();
+    try writer.add(0, .{ .string = body }, &.{&local.search_analysis.default_analyzer});
+    try std.testing.expect(try writer.finish());
+    const view = try local.segment_source.View.init(.{ .contiguous = memory.out.items }, 0, memory.out.items.len);
+    const Run = struct {
+        fn run(alloc: std.mem.Allocator, source: local.segment_source.View, text: []const u8) !void {
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            const queries = [_]Search.HighlightQuery{
+                .{ .query = .{ .match = .{ .field = "body", .text = "needle" } }, .text_analysis = .{}, .runtime_schema = .{ .full_text_documents = &.{.{ .name = "_default", .fields = &.{.{ .path = "body", .emitted_name = "body", .analyzer = "standard" }} }} } },
+                .{ .query = .{ .prefix = .{ .field = "body", .prefix = "run" } }, .text_analysis = .{}, .runtime_schema = .{ .full_text_documents = &.{.{ .name = "_default", .fields = &.{.{ .path = "body", .emitted_name = "body", .analyzer = "standard" }} }} } },
+            };
+            var prepared = try Search.PreparedHighlights.init(alloc, .{ .fields = &.{"body"}, .max_fragments = 1, .fragment_size = 64 }, &queries);
+            defer prepared.deinit();
+            var output: Search.PreparedHighlights.Accumulator = .{};
+            defer output.deinit(alloc);
+            {
+                var cursor = Column.Cursor.init(try Column.Reader.init(alloc, source));
+                defer cursor.deinit();
+                const value = (try cursor.text(0)).?;
+                try std.testing.expect(try prepared.appendStoredSourceField(alloc, sa, &output, null, "body", value));
+            }
+            var reference: local.storage_db_types.SearchHit = .{ .id = try alloc.dupe(u8, "row") };
+            defer reference.deinit(alloc);
+            var parsed: std.json.Value = .{ .object = .empty };
+            try parsed.object.put(sa, "body", .{ .string = text });
+            try prepared.attachValue(alloc, sa, &reference, parsed);
+            const expected = try std.json.Stringify.valueAlloc(alloc, reference.highlights, .{});
+            defer alloc.free(expected);
+            const found = try std.json.Stringify.valueAlloc(alloc, output.fields.items, .{});
+            defer alloc.free(found);
+            try std.testing.expectEqualStrings(expected, found);
+            try std.testing.expectEqual(@as(usize, 1), output.fields.items.len);
+        }
+    };
+    try Run.run(a, view, body);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ view, body });
 }

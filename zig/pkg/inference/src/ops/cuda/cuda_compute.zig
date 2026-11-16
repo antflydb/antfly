@@ -77,10 +77,15 @@ pub const CudaTensor = struct {
     // Constant snapshots bypass the temporary pool. The last borrower owns
     // both the direct allocation and its retained shared-admission lease.
     model_constant: bool = false,
+    gemma4_projector_constant: bool = false,
     model_constant_lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
 
     buffer: buffer_mod.DeviceBuffer,
     bf16_mirror: buffer_mod.DeviceBuffer = .{},
+    /// Exact Q8_1 representation of an immutable RMS output. Views resolve
+    /// through resident_parent instead of copying this validity bit.
+    q8_1_mirror: buffer_mod.DeviceBuffer = .{},
+    q8_1_mirror_valid: bool = false,
     /// Stable page-locked storage used by repeated training-input uploads.
     /// Keeping the source alive lets cuMemcpyHtoDAsync remain asynchronous;
     /// compiled training steps synchronize before the next overwrite.
@@ -94,6 +99,7 @@ pub const CudaTensor = struct {
     owns_buffer: bool = true,
     owns_tc_quant: bool = true,
     owns_bf16_mirror: bool = true,
+    owns_q8_1_mirror: bool = true,
     owns_training_upload_host: bool = true,
     owns_shape: bool = true,
     owned_by_tensor: bool = true,
@@ -467,6 +473,7 @@ pub const CapabilityProfile = enum {
     gliner25_boundary,
     gliner25_modern_bert,
     florence2,
+    whisper,
     gemma4,
     gemma4_training,
     qwen3_embedding,
@@ -480,9 +487,9 @@ pub const CapabilityProfile = enum {
 /// CudaCompute initialization; this rejects architectures whose numeric path
 /// cannot run on the selected GPU at all.
 pub fn profileSupportsDevice(profile: CapabilityProfile, compute_major: i32, compute_minor: i32) bool {
-    _ = compute_minor;
     return switch (profile) {
         .embedding_gemma2, .lightonocr3 => compute_major >= 8,
+        .whisper => compute_major > 7 or (compute_major == 7 and compute_minor >= 5),
         else => true,
     };
 }
@@ -510,7 +517,7 @@ fn jitModelProfile(profile: CapabilityProfile) kernels_mod.JitModelProfile {
         .deberta_reranker => .deberta_reranker,
         .gliner2, .gliner2_training, .gliner25_boundary => .gliner2,
         .gliner25_modern_bert => .laya,
-        .florence2 => .florence2,
+        .florence2, .whisper => .florence2,
         .gemma4, .gemma4_training, .embedding_gemma2 => .gemma4,
         .qwen3_embedding => .qwen3_embedding,
         .qwen3_vl_generation, .lightonocr3 => .qwen3_vl_generation,
@@ -899,6 +906,7 @@ const CudaDispatchEntry = struct {
 };
 
 const CudaDispatchStats = struct {
+    enabled: bool = false,
     route_counts: [cuda_dispatch_route_count]u64 = @as([cuda_dispatch_route_count]u64, @splat(0)),
     entries: std.ArrayListUnmanaged(CudaDispatchEntry) = .empty,
     dropped_entries: u64 = 0,
@@ -921,7 +929,7 @@ const CudaDispatchStats = struct {
         tc_pack_bytes: usize,
     ) void {
         self.route_counts[@backingInt(route)] += 1;
-        if (!cudaDispatchStatsEnabled()) return;
+        if (!self.enabled) return;
         for (self.entries.items) |*entry| {
             if (entry.matches(op, quant, route, epilogue, fallback, rows, in_dim, out_dim)) {
                 entry.calls += 1;
@@ -1005,7 +1013,7 @@ const CudaDispatchStats = struct {
     }
 
     fn printIfEnabled(self: *const CudaDispatchStats, q4_census_enabled: bool) void {
-        if (!cudaDispatchStatsEnabled() and !q4_census_enabled) return;
+        if (!self.enabled and !q4_census_enabled) return;
         std.debug.print("ANTFLY_CUDA_DISPATCH_STATS {{\"routes\":{{", .{});
         inline for (@typeInfo(CudaDispatchRoute).@"enum".field_names, 0..) |reflected_name, i| {
             if (i != 0) std.debug.print(",", .{});
@@ -1198,6 +1206,8 @@ pub const RuntimeStats = struct {
     quant_kernel_fallback_tensor_core_repack_required: usize = 0,
     quant_kernel_fallback_unsupported: usize = 0,
     h2d_bytes: usize = 0,
+    gemma4_mapped_upload_chunks: usize = 0,
+    gemma4_ple_host_weight_bytes: usize = 0,
     d2h_bytes: usize = 0,
     download_events: usize = 0,
     download_event_bytes: usize = 0,
@@ -1291,6 +1301,8 @@ pub const RuntimeStats = struct {
     from_float32_calls: usize = 0,
     from_float32_bytes: usize = 0,
     to_float32_calls: usize = 0,
+    gliner_label_gru_calls: usize = 0,
+    gliner_label_gru_no_residual_calls: usize = 0,
     to_float32_bytes: usize = 0,
     training_input_uploads: usize = 0,
     training_input_upload_bytes: usize = 0,
@@ -1325,6 +1337,7 @@ pub const RuntimeStats = struct {
     launch_linear_qkv: usize = 0,
     deberta_fused_attention_calls: usize = 0,
     deberta_fused_attention_fallbacks: usize = 0,
+    deberta_stream_f32_attention_calls: usize = 0,
     deberta_stream_f16_attention_calls: usize = 0,
     deberta_stream_f16_attention_fallbacks: usize = 0,
     deberta_stream_f16_staging_calls: usize = 0,
@@ -1349,6 +1362,8 @@ pub const RuntimeStats = struct {
     launch_qwen3vl_mrope: usize = 0,
     launch_qwen3vl_vision_rope: usize = 0,
     launch_attention: usize = 0,
+    gemma4_vision_norm_rope_calls: usize = 0,
+    gemma4_vision_f16_calls: usize = 0,
     launch_qwen3vl_vision_attention: usize = 0,
     launch_attention_gqa_decode: usize = 0,
     launch_attention_gqa_decode_generated: usize = 0,
@@ -1507,6 +1522,8 @@ pub const RuntimeStats = struct {
     f16_cublaslt_fallbacks: usize = 0,
     f16_scalar_linear_calls: usize = 0,
     rms_norm_bf16_mirror_hits: usize = 0,
+    rms_norm_q8_1_mirror_produces: usize = 0,
+    rms_norm_q8_1_mirror_hits: usize = 0,
     pinned_bulk_downloads: usize = 0,
     qkv_fallback_unsupported: usize = 0,
     qkv_kernel_unavailable: usize = 0,
@@ -2210,7 +2227,7 @@ const OcrTempScanProfile = struct {
     const Sample = struct { wall: u64, cpu: ?u64 };
     enabled: bool = false,
     sections: [4]Section = .{ .{}, .{}, .{}, .{} },
-    lock_sequences: [2]std.atomic.Value(u64) = .{ std.atomic.Value(u64).init(0), std.atomic.Value(u64).init(0) },
+    lock_sequences: [2]platform.atomic.Value(u64) = .{ platform.atomic.Value(u64).init(0), platform.atomic.Value(u64).init(0) },
 
     fn begin(self: *@This(), section: usize) ?Sample {
         if (!self.enabled) return null;
@@ -2280,6 +2297,123 @@ pub const CudaCompute = struct {
         return adjusted;
     }
 
+    pub fn lightOnBf16VisionEnabled(cb: *const ops.ComputeBackend) bool {
+        if (cb.kind() != .cuda) return false;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.capability_profile == .lightonocr3 and self.lighton_precision == .bf16_vision and
+            !self.resident_training_cache and self.lazy_host_store == null and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and
+            @import("lighton_vision_bf16.zig").deviceSupported(lightOnDevice(self)) and self.cublaslt != null;
+    }
+
+    pub fn lightOnVisionBf16ToF32(cb: *const ops.ComputeBackend, input: CT) !?CT {
+        if (!lightOnBf16VisionEnabled(cb)) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const tensor = tensorFromCt(input);
+        if (tensor.dtype == .f32) return null;
+        if (tensor.dtype != .bf16 or tensor.quant_type != null or tensor.strict_resident_training) return error.UnsupportedTensorType;
+        if (tensor.elem_count == 0 or tensor.buffer.ptr == 0 or tensor.buffer.len < try checkedMul(tensor.elem_count, 2)) return error.InvalidShape;
+        const shape = try dupeShape(self.allocator, tensor.shape);
+        errdefer self.allocator.free(shape);
+        var data = try allocDeviceBuffer(self, try checkedMul(tensor.elem_count, 4));
+        errdefer releaseDeviceBuffer(self, &data);
+        try self.scalar_clamp_kernel.widen16Bit(&self.ctx, tensor.buffer.ptr, data.ptr, tensor.elem_count, true);
+        return createTensor(self, data, shape, tensor.elem_count);
+    }
+
+    pub fn lightOnBf16VisionBlock(cb: *const ops.ComputeBackend, input_ct: CT, weights: [12]CT, positions: []const u32, rows: usize, hidden: usize, intermediate: usize, batch: usize, eps: f32, theta: f32) !?CT {
+        if (!lightOnBf16VisionEnabled(cb)) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const compact = @import("lighton_vision_bf16.zig");
+        _ = try compact.Layout.init(rows, hidden, intermediate, 0);
+        if (!compact.validRowGeometry(rows, batch) or positions.len != try checkedMul(rows, 2)) return error.InvalidShape;
+        if (!std.math.isFinite(eps) or eps <= 0 or !std.math.isFinite(theta) or theta <= 0) return error.InvalidShape;
+        const input = tensorFromCt(input_ct);
+        if (input.strict_resident_training or input.quant_type != null or (input.dtype != .f32 and input.dtype != .bf16)) return error.UnsupportedTensorType;
+        const count = try checkedMul(rows, hidden);
+        try ensureCount(input, count);
+        if (input.buffer.ptr == 0 or input.buffer.len < try checkedMul(count, input.dtype.byteSize())) return error.InvalidShape;
+        var w: [12]buffer_mod.DeviceBuffer = undefined;
+        var needs_bias_pack = false;
+        const weight_counts = [_]usize{ hidden, hidden, 3 * hidden * hidden, 3 * hidden, hidden * hidden, hidden, hidden, hidden, hidden * intermediate, intermediate, intermediate * hidden, hidden };
+        for (weights, 0..) |weight, index| {
+            const tensor = tensorFromCt(weight);
+            if (tensor.quant_type != null or tensor.strict_resident_training) return error.UnsupportedTensorType;
+            try ensureCount(tensor, weight_counts[index]);
+            const norm = index == 0 or index == 1 or index == 6 or index == 7;
+            if (norm) {
+                try ensureF32(tensor);
+                try ensureCount(tensor, hidden);
+                w[index] = tensor.buffer;
+            } else if (tensor.dtype == .bf16) {
+                w[index] = tensor.buffer;
+            } else {
+                // BF16 checkpoint biases are expanded by the general weight
+                // loader. This profile explicitly rounds any F32 bias once.
+                if (index != 3 and index != 5 and index != 9 and index != 11) return error.UnsupportedTensorType;
+                try ensureF32(tensor);
+                needs_bias_pack = true;
+                w[index] = tensor.buffer;
+            }
+        }
+        if (self.embedding_gemma2_cudnn_unavailable) return error.CudnnFailure;
+        if (self.embedding_gemma2_cudnn == null) self.embedding_gemma2_cudnn = try cudnn_sdpa_mod.Module.init(self.ctx.stream);
+        const attention = &self.embedding_gemma2_cudnn.?;
+        const key = cudnn_sdpa_mod.Key{ .batch = batch, .q_heads = hidden / 64, .kv_heads = hidden / 64, .sequence = rows / batch, .dim = 64, .scale = 0.125, .ocr_vision = true, .dtype = .bf16 };
+        const workspace_bytes = (try attention.workspaceBytesFor(key)) orelse return error.CudnnFailure;
+        if (workspace_bytes > try @import("vision_memory_contract.zig").vendorWorkspaceLimit(rows, hidden)) return null;
+        // Retain the existing vendor-workspace admission and retirement
+        // policy; encoder temporaries create no additional retained pool.
+        if (self.run_budget) |budget| {
+            const limit = budget.limits.scratch_limit_bytes;
+            const growth = workspace_bytes -| self.embedding_gemma2_cudnn_attention_scratch.buffer.len;
+            if (limit != 0 and growth > limit -| budget.scratchTotalBytes()) return error.MemoryBudgetExceeded;
+        }
+        const vendor_workspace = try self.embedding_gemma2_cudnn_attention_scratch.acquire(&self.ctx, workspace_bytes);
+        const layout = try compact.Layout.init(rows, hidden, intermediate, 0);
+        var arena = try allocDeviceBuffer(self, layout.bytes);
+        defer releaseDeviceBuffer(self, &arena);
+        // Bias conversion is part of this block's checked working set. It
+        // creates no model-lifetime cache or unowned retained reservation.
+        const bias_counts = [_]usize{ hidden * 3, hidden, intermediate, hidden };
+        const bias_indices = [_]usize{ 3, 5, 9, 11 };
+        var bias_bytes: usize = 0;
+        for (bias_counts) |bias_count| bias_bytes = try std.math.add(usize, bias_bytes, try checkedMul(bias_count, 2));
+        var bias_pack = if (needs_bias_pack) try allocDeviceBuffer(self, bias_bytes) else buffer_mod.DeviceBuffer{};
+        defer releaseDeviceBuffer(self, &bias_pack);
+        var converted = buffer_mod.DeviceBuffer{};
+        defer releaseDeviceBuffer(self, &converted);
+        const source = if (input.dtype == .bf16) input.buffer else compact_input: {
+            converted = try allocDeviceBuffer(self, try checkedMul(count, 2));
+            break :compact_input converted;
+        };
+        const cached = try cachedLightOnMropePositions(self, positions);
+        var position_buffer = cached orelse try allocDeviceBuffer(self, try checkedMul(positions.len, 4));
+        defer if (cached == null) releaseDeviceBuffer(self, &position_buffer);
+        const shape = try allocShape2(self.allocator, rows, hidden);
+        errdefer self.allocator.free(shape);
+        var output = try allocDeviceBuffer(self, try checkedMul(count, 2));
+        errdefer releaseDeviceBuffer(self, &output);
+        // After uploads/launches, all temporaries remain alive until a drain
+        // on failure. A failed reduced-precision block cannot fall back.
+        errdefer self.ctx.synchronize() catch {};
+        var bias_offset: usize = 0;
+        for (bias_indices, bias_counts) |index, bias_count| {
+            const tensor = tensorFromCt(weights[index]);
+            if (tensor.dtype == .f32) {
+                try ensureCount(tensor, bias_count);
+                if (tensor.buffer.ptr == 0 or tensor.buffer.len < try checkedMul(bias_count, 4)) return error.InvalidShape;
+                const destination = buffer_mod.DeviceBuffer{ .ptr = bias_pack.ptr + bias_offset, .len = bias_count * 2, .borrowed = true };
+                try self.kernels.launchF32ToBf16(&self.ctx, destination, tensor.buffer, bias_count);
+                w[index] = destination;
+            }
+            bias_offset += bias_count * 2;
+        }
+        if (input.dtype == .f32) try self.kernels.launchF32ToBf16(&self.ctx, converted, input.buffer, count);
+        if (cached == null) try copyFromHostTracked(self, position_buffer, std.mem.sliceAsBytes(positions));
+        try self.lighton_vision_bf16.block(&self.ctx, &self.cublaslt.?, attention, key, arena, layout, cublasLtWorkspace(self), .{ .input = source, .output = output, .weights = w, .positions = position_buffer, .rows = rows, .hidden = hidden, .intermediate = intermediate, .batch = batch, .epsilon = eps, .theta = theta, .attention_workspace = vendor_workspace, .fused_mlp = self.lighton_fused_vision_mlp_enabled });
+        return createTensorWithDType(self, output, shape, count, .bf16);
+    }
+
     /// Fuse only the existing F32 split/RoPE and BF16 cuDNN input boundary.
     /// QKV GEMM, its bias, attention precision, and output projection are unchanged.
     pub fn lightOnVisionAttention(cb: *const ops.ComputeBackend, packed_ct: CT, positions: []const u32, batch: usize, rows: usize, heads: usize, dim: usize, theta: f32) !?CT {
@@ -2289,7 +2423,7 @@ pub const CudaCompute = struct {
             self.ctx.info.compute_major < 8 or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
             !platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_VISION_CUDNN") or dim != 64 or
             (heads != 12 and heads != 16) or batch == 0 or batch > (if (self.lighton_wide_microbatches) @as(usize, 16) else 8)) return null;
-        if (rows == 0 or rows % batch != 0 or rows / batch > 4096 or positions.len != try checkedMul(rows, 2) or
+        if (rows == 0 or rows % batch != 0 or rows / batch > cudnn_sdpa_mod.max_ocr_vision_sequence or positions.len != try checkedMul(rows, 2) or
             !std.math.isFinite(theta) or theta <= 0) return error.InvalidShape;
         const input = tensorFromCt(packed_ct);
         if (input.strict_resident_training) return null;
@@ -2311,6 +2445,8 @@ pub const CudaCompute = struct {
         hidden: usize,
         vocab: usize,
         drained: bool = false,
+        head_partial: buffer_mod.DeviceBuffer = .{},
+        head_indices: buffer_mod.DeviceBuffer = .{},
 
         pub fn deinit(burst: *@This()) void {
             // Cancellation and encoding failures must retain the token bank
@@ -2319,7 +2455,50 @@ pub const CudaCompute = struct {
             const cb = burst.owner.computeBackend();
             cb.free(burst.bank);
             releaseDeviceBuffer(burst.owner, &burst.suppress);
+            releaseDeviceBuffer(burst.owner, &burst.head_partial);
+            releaseDeviceBuffer(burst.owner, &burst.head_indices);
             burst.* = undefined;
+        }
+        pub fn projectArgmax(burst: *@This(), hidden: CT, head: CT, step: usize) !void {
+            if (step >= burst.steps) return error.InvalidShape;
+            const self = burst.owner;
+            const cb = self.computeBackend();
+            const input = tensorFromCt(hidden);
+            const weight = tensorFromCt(head);
+            const fused = @import("lighton_head.zig");
+            if (!self.lighton_fused_head_disabled and fused.supported(self.ctx.info.compute_major, self.ctx.info.compute_minor, burst.rows, burst.hidden, burst.vocab) and
+                weight.dtype == .bf16 and weight.quant_type == null and !weight.strict_resident_training and
+                !input.strict_resident_training and !self.resident_training_cache and self.lazy_host_store == null and
+                !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
+            {
+                try ensureF32(input);
+                try ensureCount(input, try checkedMul(burst.rows, burst.hidden));
+                try ensureCount(weight, try checkedMul(burst.hidden, burst.vocab));
+                const bytes = try checkedMul(try checkedMul(burst.rows, fused.tiles), 4);
+                // Ordinary admitted temporary allocations, retained only for
+                // this burst. Allocation pressure takes the dense fallback.
+                if (burst.head_partial.ptr == 0) burst.head_partial = allocDeviceBuffer(self, bytes) catch .{};
+                if (burst.head_partial.ptr != 0 and burst.head_indices.ptr == 0)
+                    burst.head_indices = allocDeviceBuffer(self, bytes) catch .{};
+                if (burst.head_partial.ptr != 0 and burst.head_indices.ptr != 0) {
+                    const bank = tensorFromCt(burst.bank).buffer;
+                    const output_bytes = burst.rows * @sizeOf(u32);
+                    const request = fused.Request{ .input = input.buffer, .weight = weight.buffer, .partial = burst.head_partial, .indices = burst.head_indices, .suppress = burst.suppress, .output = .{ .ptr = bank.ptr + step * output_bytes, .len = output_bytes }, .rows = burst.rows, .suppress_count = burst.suppress_count };
+                    try fused.validate(request);
+                    burst.drained = false;
+                    try self.lighton_head.run(&self.ctx, request);
+                    self.stats.launch_argmax += 1;
+                    return;
+                }
+                // No fused launch has consumed these buffers if allocation
+                // was declined. Let the ordinary cache reclaim them before
+                // the dense fallback needs its larger logits allocation.
+                releaseDeviceBuffer(self, &burst.head_partial);
+                releaseDeviceBuffer(self, &burst.head_indices);
+            }
+            const logits = try cb.linearNoBias(hidden, head, burst.rows, burst.hidden, burst.vocab);
+            defer cb.free(logits);
+            try burst.argmax(logits, step);
         }
         pub fn argmax(burst: *@This(), logits: CT, step: usize) !void {
             if (step >= burst.steps) return error.InvalidShape;
@@ -2351,9 +2530,28 @@ pub const CudaCompute = struct {
             // immutable model embedding outlive every consumer on this stream.
             return (try embeddingLookupTensor(burst.owner, burst.embedding_weight, @ptrCast(&ids), burst.rows, burst.hidden)) orelse error.UnsupportedOperation;
         }
+        pub fn beginRead(burst: *@This(), count: usize) !?@import("burst_readback.zig").Pending {
+            if (count != try checkedMul(burst.steps, burst.rows)) return error.InvalidShape;
+            const self = burst.owner;
+            if (self.capability_profile != .lightonocr3 or cudaPinnedScalarDownloadsDisabled() or
+                self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
+            const pending = try self.lighton_burst_readback.begin(&self.ctx, tensorFromCt(burst.bank).buffer, try checkedMul(count, @sizeOf(u32)));
+            if (pending != null) {
+                if (burst.steps == 1) self.lighton_packed_async_downloads += 1 else self.lighton_async_burst_downloads += 1;
+                self.stats.d2h_bytes += count * @sizeOf(u32);
+            }
+            return pending;
+        }
+        pub fn noteReadCompleted(burst: *@This(), before_launches: usize) void {
+            burst.drained = true;
+            if (burst.owner.ctx.stats.kernel_launches > before_launches) {
+                if (burst.steps == 1) burst.owner.lighton_packed_async_interleavings += 1 else burst.owner.lighton_async_burst_interleavings += 1;
+            }
+        }
         pub fn read(burst: *@This(), output: []u32) !void {
             if (output.len != try checkedMul(burst.steps, burst.rows)) return error.InvalidShape;
             try copyToHostTrackedAndSync(burst.owner, tensorFromCt(burst.bank).buffer, std.mem.sliceAsBytes(output));
+            if (burst.steps == 1) burst.owner.lighton_packed_sync_downloads += 1;
             burst.drained = true;
         }
         pub fn noteCompleted(burst: *const @This()) void {
@@ -2364,13 +2562,320 @@ pub const CudaCompute = struct {
         }
     };
 
+    /// Graph execution is authorized only by an exclusive reader epoch. The
+    /// shared session backend never infers ownership from a request pointer.
+    pub fn lightOnDecodeGraphEnabled(cb: *const ops.ComputeBackend) bool {
+        if (cb.kind() != .cuda) return false;
+        const self: *const CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lightOnGraphDecision() == .enabled;
+    }
+
+    fn lightOnGraphDecision(self: *const CudaCompute) @import("lighton_device_policy.zig").GraphDecision {
+        if (!self.lighton_decode_graph_enabled) return .operator_disabled;
+        if (self.capability_profile != .lightonocr3) return .model_unsupported;
+        if (self.ctx.info.compute_major < 8) return .compute_unsupported;
+        if (self.ctx.info.driver_version < 13000) return .driver_unsupported;
+        if (self.lighton_bf16_decode_outputs or self.lighton_bf16_projection_outputs) return .arithmetic_not_capturable;
+        if (!self.lighton_attention_enabled) return .attention_disabled;
+        if (!self.lighton_batched_kv_write_enabled) return .kv_write_disabled;
+        if (!self.lighton_recurrent_batch_enabled) return .recurrent_batch_disabled;
+        if (!self.lighton_ffn_block_enabled) return .ffn_block_disabled;
+        if (!self.lighton_ffn_bf16_inputs) return .ffn_inputs_disabled;
+        if (!self.lighton_state_pool_enabled) return .state_pool_disabled;
+        if (self.cublaslt == null or self.cublaslt.?.allocator == null) return .cublaslt_unavailable;
+        if (self.cublaslt.?.plan_cache_capacity < 64) return .plan_cache_too_small;
+        if (self.lighton_gemm_bucket_rows or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+            self.resident_training_cache or self.lazy_host_store != null) return .execution_not_capturable;
+        return .enabled;
+    }
+    /// The epoch caller owns execution and has retired its decoder graph.
+    pub fn prepareLightOnMatmulFrame(cb: *const ops.ComputeBackend) !void {
+        if (cb.kind() != .cuda) return;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.capability_profile != .lightonocr3 or self.ctx.debug_graph_capture_active or self.debug_cuda_graph_capture_active) return;
+        if (self.lighton_decode_graph.graph != null) return error.InvalidExecutionPlan;
+        if (self.cublaslt) |*blas| _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
+    }
+
+    pub fn endLightOnDecodeGraphEpoch(cb: *const ops.ComputeBackend, epoch: u64) void {
+        if (cb.kind() != .cuda or epoch == 0) return;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const owner = &self.lighton_decode_graph;
+        while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer owner.mutex.unlock();
+        if (owner.epoch_id != epoch) return;
+        owner.clear(&self.ctx) catch {};
+        owner.epoch_id = 0;
+    }
+    pub fn invalidateLightOnDecodeGraph(cb: *const ops.ComputeBackend) void {
+        if (cb.kind() != .cuda) return;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.lighton_decode_graph_enabled) self.lighton_decode_graph.invalidate(&self.ctx);
+    }
+    pub fn lightOnGraphWeightPointer(cb: *const ops.ComputeBackend, weight: CT) ?driver_mod.CUdeviceptr {
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const tensor = tensorFromCt(weight);
+        if (tensor.dtype != .bf16 or tensor.quant_type != null or tensor.strict_resident_training or tensor.owns_buffer or
+            residentTensorForSlot(self, tensor) != tensor)
+        {
+            if (self.lighton_decode_graph.weight_declines_logged < 2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+                self.lighton_decode_graph.weight_declines_logged += 1;
+                std.debug.print("LIGHTONOCR3 cuda_model_graph_weight_decline bf16={d} quantized={d} training={d} owns_buffer={d} exact_resident={d}\n", .{ @intFromBool(tensor.dtype == .bf16), @intFromBool(tensor.quant_type != null), @intFromBool(tensor.strict_resident_training), @intFromBool(tensor.owns_buffer), @intFromBool(residentTensorForSlot(self, tensor) == tensor) });
+            }
+            return null;
+        }
+        return tensor.buffer.ptr;
+    }
+    pub fn lightOnGraphWorkspacePointer(cb: *const ops.ComputeBackend) driver_mod.CUdeviceptr {
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return cublasLtWorkspace(self).ptr;
+    }
+    pub fn lightOnGraphStateOwned(cb: *const ops.ComputeBackend, state: *const @import("lighton_recurrent.zig").State) bool {
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const eligible = state.ctx == &self.ctx and state.initialized and !state.failed and
+            state.release_context == @as(*anyopaque, @ptrCast(self)) and state.release_buffer == &recycleLightOnStateBuffer and
+            state.recurrent.ptr != 0 and state.history[0].ptr != 0 and state.history[1].ptr != 0;
+        if (!eligible and self.lighton_decode_graph.state_declines_logged == 0 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+            self.lighton_decode_graph.state_declines_logged += 1;
+            std.debug.print("LIGHTONOCR3 cuda_model_graph_state_decline ctx={d} initialized={d} failed={d} release_owner={d} release_callback={d} buffers={d}\n", .{ @intFromBool(state.ctx == &self.ctx), @intFromBool(state.initialized), @intFromBool(state.failed), @intFromBool(state.release_context == @as(*anyopaque, @ptrCast(self))), @intFromBool(state.release_buffer == &recycleLightOnStateBuffer), @intFromBool(state.recurrent.ptr != 0 and state.history[0].ptr != 0 and state.history[1].ptr != 0) });
+        }
+        return eligible;
+    }
+    pub fn lightOnGraphKvWords(cb: *const ops.ComputeBackend, storage: *kv_storage_runtime.KvStorageRuntime, sequence: kv_storage_runtime.SequenceId, future_tokens: usize, layer_indices: []const usize, words: []u64) !usize {
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const hook = storage.device_write_hook orelse return error.InvalidPagedKvState;
+        if (hook.vtable != &CudaKvDeviceStorage.hook_vtable or storage.storage.config.dtype != .f16)
+            return error.InvalidPagedKvState;
+        if (storage.storage.config.sliding_window_size) |window|
+            if (future_tokens > window) return error.InvalidPagedKvState;
+        const device: *CudaKvDeviceStorage = @ptrCast(@alignCast(hook.ctx));
+        if (device.compute != self or words.len < layer_indices.len * 3 + 1) return error.InvalidPagedKvState;
+        words[0] = @intFromPtr(device);
+        var count: usize = 1;
+        for (layer_indices) |index| {
+            const key = try device.layerKey(sequence, index);
+            const layer = device.layers.getPtr(key) orelse return error.InvalidPagedKvState;
+            if (layer.compressed_format != cuda_kv_format_f16 or layer.value_format != cuda_kv_value_format_f16 or layer.k.ptr == 0 or layer.v.ptr == 0)
+                return error.InvalidPagedKvState;
+            words[count..][0..3].* = .{ layer.k.ptr, layer.v.ptr, layer.capacity_tokens };
+            count += 3;
+        }
+        return count;
+    }
+    pub const LightOnGraphClaim = struct {
+        compute: *CudaCompute,
+        future_tokens: usize,
+        pub fn deinit(self: *@This()) void {
+            self.compute.lighton_decode_graph.active = false;
+            self.compute.execution_scope = null;
+            self.compute.lighton_decode_graph.mutex.unlock();
+        }
+        pub fn burst(self: *@This(), embedding: CT, vocab: usize) !LightOnTokenBurst {
+            const owner = &self.compute.lighton_decode_graph;
+            if (vocab != owner.vocab) return error.InvalidShape;
+            const shape = try allocShape2(self.compute.allocator, 2, owner.rows);
+            errdefer self.compute.allocator.free(shape);
+            const bank = try createTensorWithDType(self.compute, owner.bank(), shape, 2 * owner.rows, .i32);
+            tensorFromCt(bank).owns_buffer = false;
+            return .{ .owner = self.compute, .bank = bank, .embedding_weight = embedding, .suppress = .{}, .suppress_count = 0, .rows = owner.rows, .steps = 2, .hidden = owner.hidden, .vocab = vocab };
+        }
+        pub fn projectHead(self: *@This(), cb: *const ops.ComputeBackend, input_ct: CT, weight: CT) !CT {
+            const owner = &self.compute.lighton_decode_graph;
+            std.debug.assert(cb.ptr == @as(*anyopaque, @ptrCast(self.compute)));
+            if (owner.head.ptr == 0 or self.compute.execution_scope == null)
+                return cb.linearNoBias(input_ct, weight, owner.rows, owner.hidden, owner.vocab);
+            const scope = self.compute.execution_scope.?;
+            scope.output_ptr = owner.head.ptr;
+            scope.output_bytes = owner.head.len;
+            scope.output_active = true;
+            scope.output_taken = false;
+            defer scope.output_active = false;
+            const output = try cb.linearNoBias(input_ct, weight, owner.rows, owner.hidden, owner.vocab);
+            if (!scope.output_taken) {
+                cb.free(output);
+                return error.InvalidExecutionPlan;
+            }
+            return output;
+        }
+        pub fn setInput(self: *@This(), input_ct: CT) !void {
+            const owner = &self.compute.lighton_decode_graph;
+            const source = tensorFromCt(input_ct);
+            try ensureF32(source);
+            try ensureCount(source, owner.rows * owner.hidden);
+            try copyFromDeviceTracked(self.compute, owner.input(), source.buffer, source.elem_count * 4);
+        }
+        pub fn input(self: *@This()) !CT {
+            const owner = &self.compute.lighton_decode_graph;
+            const shape = try allocShape2(self.compute.allocator, owner.rows, owner.hidden);
+            errdefer self.compute.allocator.free(shape);
+            const tensor = try createTensor(self.compute, owner.input(), shape, owner.rows * owner.hidden);
+            tensorFromCt(tensor).owns_buffer = false;
+            return tensor;
+        }
+        pub fn beginStep(self: *@This(), step: usize) void {
+            self.compute.lighton_decode_graph.capture_step = @intCast(step);
+        }
+        pub fn advance(self: *@This()) !void {
+            const owner = &self.compute.lighton_decode_graph;
+            try self.compute.lighton_attention.advanceGraph(&self.compute.ctx, owner.positions().ptr, owner.counter().ptr, @intCast(owner.rows * 3));
+        }
+        pub fn run(self: *@This(), context: *anyopaque, callback: *const fn (*anyopaque, *@This()) anyerror!void) !void {
+            const compute = self.compute;
+            const owner = &compute.lighton_decode_graph;
+            if (owner.phase == .replay) {
+                try compute.ctx.launchGraph(owner.graph);
+                owner.replays += 1;
+                owner.wide_replays += @intFromBool(owner.rows > 64);
+                owner.max_replay_rows = @max(owner.max_replay_rows, owner.rows);
+                if (owner.progress == 2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+                    std.debug.print("LIGHTONOCR3 cuda_model_graph_first_replay_rows={d} capture={d}\n", .{ owner.rows, owner.captures });
+                return;
+            }
+            const phase = owner.phase;
+            if (phase == .disabled) return error.InvalidExecutionPlan;
+            var scope = @import("execution_arena.zig").Scope{ .plan = owner.plan.?, .base = if (phase == .capture) owner.arena.ptr else 0 };
+            const capture = phase == .capture;
+            var capture_active = false;
+            errdefer {
+                std.log.warn("LightOn decoder graph aborted: phase={s} event={d}/{d}", .{ @tagName(phase), scope.cursor, owner.plan.?.event_count });
+                compute.execution_scope = null;
+                owner.active = false;
+                if (capture_active) {
+                    if (compute.ctx.endStreamCapture()) |g| compute.ctx.destroyGraph(g) else |_| {}
+                }
+                owner.disabled_epoch = owner.epoch_id;
+                owner.clear(&compute.ctx) catch {};
+            }
+            if (capture) {
+                try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+                capture_active = true;
+            }
+            const h2d = compute.stats.h2d_bytes;
+            const d2h = compute.stats.d2h_bytes;
+            const attention_calls = compute.lighton_attention.calls;
+            const ragged_calls = compute.lighton_recurrent.ragged_batch_calls;
+            if (phase == .learn or capture) compute.execution_scope = &scope;
+            owner.active = true;
+            callback(context, self) catch |failure| {
+                std.log.warn("LightOn decoder graph forward failed: phase={s} error={s}", .{ @tagName(phase), @errorName(failure) });
+                return failure;
+            };
+            owner.active = false;
+            compute.execution_scope = null;
+            if (compute.lighton_recurrent.ragged_batch_calls - ragged_calls != owner.expected_ragged_packets)
+                return error.InvalidExecutionPlan;
+            if (owner.expected_ragged_packets != 0 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+                std.debug.print("LIGHTONOCR3 cuda_model_graph_recorded_ragged_packets={d} rows={d}\n", .{ owner.expected_ragged_packets, owner.rows });
+            if (phase == .learn) {
+                if (!owner.plan.?.finishNoOutput() or compute.stats.h2d_bytes != h2d or compute.stats.d2h_bytes != d2h or compute.lighton_attention.calls - attention_calls != owner.expected_attention_calls) {
+                    std.log.warn("LightOn decoder graph plan declined: allocations={d} events={d} peak={d} h2d={d} d2h={d}", .{ owner.plan.?.count, owner.plan.?.event_count, owner.plan.?.peak, compute.stats.h2d_bytes - h2d, compute.stats.d2h_bytes - d2h });
+                    owner.disabled_epoch = owner.epoch_id;
+                    owner.phase = .disabled;
+                } else owner.phase = .capture;
+            } else if (capture) {
+                const matches = scope.valid and scope.cursor == owner.plan.?.event_count and compute.stats.h2d_bytes == h2d and compute.stats.d2h_bytes == d2h and compute.lighton_attention.calls - attention_calls == owner.expected_attention_calls;
+                const graph = try compute.ctx.endStreamCapture();
+                capture_active = false;
+                defer compute.ctx.destroyGraph(graph);
+                if (!matches) return error.InvalidExecutionPlan;
+                owner.graph = try compute.ctx.instantiateGraph(graph);
+                try compute.ctx.launchGraph(owner.graph);
+                owner.captures += 1;
+                owner.phase = .replay;
+            } else owner.phase = .learn;
+        }
+        pub fn read(self: *@This(), burst_value: *LightOnTokenBurst, tokens: []u32) !void {
+            const owner = &self.compute.lighton_decode_graph;
+            if (tokens.len != 2 * owner.rows) return error.InvalidShape;
+            var host: [768]u32 = undefined;
+            const bytes = owner.progress_offset + 4 - owner.bank_offset;
+            const source = buffer_mod.DeviceBuffer{ .ptr = owner.bank().ptr, .len = bytes, .borrowed = true };
+            try copyToHostTrackedAndSync(self.compute, source, std.mem.sliceAsBytes(host[0 .. bytes / 4]));
+            burst_value.drained = true;
+            const expected = try std.math.add(u32, owner.progress, 2);
+            if (host[(owner.progress_offset - owner.bank_offset) / 4] != expected) return error.InvalidExecutionPlan;
+            const position_offset = (owner.positions_offset - owner.bank_offset) / 4;
+            for (owner.next_positions[0 .. owner.rows * 3], 0..) |position, i|
+                if (host[position_offset + i] != try std.math.add(u32, position, 2)) return error.InvalidExecutionPlan;
+            @memcpy(tokens, host[0..tokens.len]);
+            try owner.notePair();
+        }
+        pub fn noteKvTokens(self: *@This(), storage: *kv_storage_runtime.KvStorageRuntime, max_tokens: usize) void {
+            const hook = storage.device_write_hook orelse return;
+            if (hook.vtable != &CudaKvDeviceStorage.hook_vtable) return;
+            const device: *CudaKvDeviceStorage = @ptrCast(@alignCast(hook.ctx));
+            if (device.compute != self.compute) return;
+            var it = device.layers.iterator();
+            while (it.next()) |entry| entry.value_ptr.token_count = @max(entry.value_ptr.token_count, max_tokens);
+        }
+    };
+    pub fn beginLightOnDecodeGraph(cb: *const ops.ComputeBackend, epoch: u64, key: []const u64, positions: []const u32, rows: usize, hidden: usize, vocab: usize, future_tokens: usize, attention_layers: usize, recurrent_layers: usize) !?LightOnGraphClaim {
+        if (!lightOnDecodeGraphEnabled(cb) or epoch == 0 or rows < 2 or rows > (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64) or vocab == 0 or future_tokens == 0 or future_tokens > @import("lighton_attention.zig").max_native_context_tokens or positions.len != rows * 3 or (hidden != 1024 and hidden != 2560)) return null;
+        if (rows > 64 and rows % 64 == 1) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (rows > 64 and !self.lighton_ragged_recurrent_enabled) return null;
+        if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return null;
+        const owner = &self.lighton_decode_graph;
+        while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
+        var claimed = false;
+        defer if (!claimed) owner.mutex.unlock();
+        if (owner.disabled_epoch == epoch) return null;
+        if (owner.epoch_id != epoch or !owner.matches(key, positions)) {
+            if (owner.resets_logged < 12 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+                var mismatch: usize = 0;
+                while (mismatch < @min(owner.key.len, key.len) and owner.key[mismatch] == key[mismatch]) : (mismatch += 1) {}
+                std.debug.print("LIGHTONOCR3 cuda_model_graph_reset phase={s} old_epoch={d} epoch={d} old_words={d} words={d} first_word={d} old_value={d} value={d} positions_equal={d} invalidations={d} progress={d}\n", .{
+                    @tagName(owner.phase),                                    owner.epoch_id,                               epoch,                                                                                                                    owner.key.len,       key.len,        mismatch,
+                    if (mismatch < owner.key.len) owner.key[mismatch] else 0, if (mismatch < key.len) key[mismatch] else 0, @intFromBool(positions.len == owner.rows * 3 and std.mem.eql(u32, owner.next_positions[0 .. owner.rows * 3], positions)), owner.invalidations, owner.progress,
+                });
+                owner.resets_logged += 1;
+            }
+            owner.reset(&self.ctx, key, positions, rows, hidden, vocab) catch |err| switch (err) {
+                error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.CudaMemoryLimitExceeded => {
+                    owner.admission_denials += 1;
+                    return null;
+                },
+                else => return err,
+            };
+            owner.epoch_id = epoch;
+        }
+        if (owner.phase == .disabled) return null;
+        if (owner.phase == .capture) owner.reserveArena(&self.ctx) catch |err| switch (err) {
+            error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.CudaMemoryLimitExceeded => {
+                owner.admission_denials += 1;
+                owner.phase = .disabled;
+                return null;
+            },
+            else => return err,
+        };
+        try self.lighton_attention.init(&self.ctx);
+        if (owner.phase != .replay) {
+            owner.progress = 0;
+            @memcpy(owner.base_positions[0..positions.len], positions);
+            @memcpy(owner.next_positions[0..positions.len], positions);
+            try copyFromHostTracked(self, owner.positions(), std.mem.sliceAsBytes(positions));
+            const zero = [_]u32{0};
+            try copyFromHostTracked(self, owner.counter(), std.mem.sliceAsBytes(&zero));
+        }
+        // Ensure the owned cohort can retain its warmed plans. Prefill shape
+        // diversity may exhaust the cache between otherwise valid epochs.
+        if (owner.phase == .warm) if (self.cublaslt) |*blas| {
+            _ = try blas.reserveTensorCorePlanSlots(&self.ctx, 64);
+        };
+        owner.future_tokens = future_tokens;
+        owner.expected_attention_calls = try checkedMul(try checkedMul(2, attention_layers), (rows + 63) / 64);
+        owner.expected_ragged_packets = if (rows > 64) try checkedMul(try checkedMul(2, recurrent_layers), (rows + 63) / 64) else 0;
+        claimed = true;
+        return .{ .compute = self, .future_tokens = future_tokens };
+    }
+
     pub fn beginLightOnTokenBurst(cb: *const ops.ComputeBackend, embedding_weight: CT, rows: usize, steps: usize, hidden: usize, vocab: usize, suppress_ids: []const i32) !?LightOnTokenBurst {
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (self.capability_profile != .lightonocr3 or self.lazy_host_store != null or self.resident_training_cache or
             self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
-            self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1 or
-            rows == 0 or rows > 64 or steps < 2 or steps > 8 or (hidden != 1024 and hidden != 2560) or
+            !lightOnDevice(self).tensorCores() or
+            rows == 0 or rows > 128 or steps == 0 or steps > 8 or (hidden != 1024 and hidden != 2560) or
             vocab == 0 or vocab > std.math.maxInt(i32) or
             self.kernels.embedding_lookup_i32_bf16_weight_f32 == null or
             (if (suppress_ids.len == 0) self.kernels.argmax_rows_f32 == null else self.kernels.argmax_rows_suppress_f32 == null)) return null;
@@ -2401,7 +2906,147 @@ pub const CudaCompute = struct {
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         return self.lighton_ffn_block_enabled and self.capability_profile == .lightonocr3 and
             !self.resident_training_cache and self.lazy_host_store == null and
-            !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active;
+            ((!self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active) or lightOnOwnedDecodeCapture(self));
+    }
+
+    pub fn lightOnProjectionResidualEnabled(cb: *const ops.ComputeBackend) bool {
+        if (!lightOnFfnBlockEnabled(cb)) return false;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.cublaslt != null and cudaCublasLtEnabled() and
+            !self.lighton_bf16_decode_outputs and !self.lighton_bf16_projection_outputs and
+            lightOnDevice(self).portableKernels();
+    }
+
+    /// Keep the ordinary GEMM algorithm and combine its separately rounded
+    /// F32 bias and residual additions. Bias epilogues select slower GEMMs for
+    /// the large vision shapes on SM12.1.
+    pub fn lightOnVisionOutputResidual(cb: *const ops.ComputeBackend, input_ct: CT, weight_ct: CT, bias_ct: CT, residual_ct: CT, rows: usize, hidden: usize) !?CT {
+        if (cb.kind() != .cuda) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.capability_profile != .lightonocr3 or !self.lighton_fused_vision_qkv_enabled or
+            self.resident_training_cache or self.lazy_host_store != null or self.lighton_precision != .f32 or
+            self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+            !lightOnDevice(self).portableKernels() or
+            !cudaCublasLtEnabled() or self.cublaslt == null or self.cublaslt_bf16_tuning_profile != .off or
+            rows < 256 or rows > 65536 or (hidden != 768 and hidden != 1024)) return null;
+        const input = tensorFromCt(input_ct);
+        const weight = tensorFromCt(weight_ct);
+        const bias = tensorFromCt(bias_ct);
+        const residual = tensorFromCt(residual_ct);
+        if (weight.dtype != .bf16 or weight.quant_type != null or input.strict_resident_training or
+            weight.strict_resident_training or bias.strict_resident_training or residual.strict_resident_training) return null;
+        try ensureF32(input);
+        try ensureF32(bias);
+        try ensureF32(residual);
+        const count = try checkedMul(rows, hidden);
+        const tensors = [_]*const CudaTensor{ input, weight, bias, residual };
+        const counts = [_]usize{ count, try checkedMul(hidden, hidden), hidden, count };
+        for (tensors, counts, 0..) |tensor, n, i| {
+            try ensureCount(tensor, n);
+            if (tensor.buffer.ptr == 0 or tensor.buffer.len < try checkedMul(n, if (i == 1) @as(usize, 2) else 4)) return error.InvalidShape;
+        }
+        const staged = (try stageBf16ActivationForCublasLt(self, input, rows, hidden)) orelse return null;
+        const output = try self.allocLightOnF32Tensor(rows, hidden);
+        errdefer cb.free(output);
+        errdefer self.ctx.synchronize() catch {};
+        try self.lighton_vision_fused.init(&self.ctx);
+        self.cublaslt.?.matmulBf16WeightF32Out(&self.ctx, tensorFromCt(output).buffer, staged, weight.buffer, cublasLtWorkspace(self), rows, hidden, hidden) catch |err| switch (err) {
+            error.CublasLtUnsupported => {
+                cb.free(output);
+                return null;
+            },
+            else => return err,
+        };
+        try self.lighton_vision_fused.residual(&self.ctx, .{ tensorFromCt(output).buffer.ptr, tensorFromCt(output).buffer.ptr, bias.buffer.ptr, residual.buffer.ptr }, @intCast(count), @intCast(hidden));
+        self.stats.bf16_cublaslt_linear_calls += 1;
+        self.lighton_vision_output_residual_calls += 1;
+        return output;
+    }
+
+    fn allocLightOnF32Tensor(self: *CudaCompute, rows: usize, width: usize) !CT {
+        const shape = try allocShape2(self.allocator, rows, width);
+        errdefer self.allocator.free(shape);
+        var output = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, width), 4));
+        errdefer releaseDeviceBuffer(self, &output);
+        return createTensor(self, output, shape, rows * width);
+    }
+
+    pub const LightOnAttentionInputs = struct { query: CT, key: CT, gate: CT };
+
+    pub fn lightOnAttentionInputs(cb: *const ops.ComputeBackend, query_gate: CT, key: CT, query_weight: CT, key_weight: CT, positions: []const u32, rows: usize, query_heads: usize, key_heads: usize) !?LightOnAttentionInputs {
+        if (!lightOnProjectionResidualEnabled(cb) or rows == 0 or rows > 8192 or
+            !((query_heads == 8 and key_heads == 2) or (query_heads == 16 and key_heads == 4))) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (positions.len != rows * 3) return error.InvalidShape;
+        const inputs = [_]*const CudaTensor{ tensorFromCt(query_gate), tensorFromCt(key), tensorFromCt(query_weight), tensorFromCt(key_weight) };
+        const counts = [_]usize{ rows * query_heads * 512, rows * key_heads * 256, 256, 256 };
+        for (inputs, counts) |input, count| {
+            if (input.strict_resident_training or input.dtype != .f32 or input.quant_type != null) return null;
+            try ensureCount(input, count);
+            if (input.buffer.ptr == 0 or input.buffer.len < count * 4) return error.InvalidShape;
+        }
+        // Reuse the existing admitted position cache (or graph-owned positions).
+        // A declined cache uses the ordinary unfused path without new storage.
+        const position_buffer = (try cachedLightOnMropePositions(self, positions)) orelse return null;
+        const q_count = rows * query_heads * 256;
+        const k_count = rows * key_heads * 256;
+        const query = try self.allocLightOnF32Tensor(rows, query_heads * 256);
+        errdefer cb.free(query);
+        const output_key = try self.allocLightOnF32Tensor(rows, key_heads * 256);
+        errdefer cb.free(output_key);
+        const gate = try self.allocLightOnF32Tensor(rows, query_heads * 256);
+        errdefer cb.free(gate);
+        errdefer self.ctx.synchronize() catch {};
+        try self.lighton_attention_inputs.run(&self.ctx, .{
+            .query_gate = inputs[0].buffer,
+            .key = inputs[1].buffer,
+            .query_weight = inputs[2].buffer,
+            .key_weight = inputs[3].buffer,
+            .positions = position_buffer,
+            .query_out = tensorFromCt(query).buffer,
+            .key_out = tensorFromCt(output_key).buffer,
+            .gate_out = tensorFromCt(gate).buffer,
+            .rows = rows,
+            .query_heads = query_heads,
+            .key_heads = key_heads,
+            .theta = 10000000,
+            .frequency_scale = 1,
+            .epsilon = 1e-6,
+        });
+        std.debug.assert(tensorFromCt(query).elem_count == q_count and tensorFromCt(output_key).elem_count == k_count);
+        return .{ .query = query, .key = output_key, .gate = gate };
+    }
+
+    /// Fuse only the F32 attention output projection's final residual add.
+    /// The existing norm, BF16 GEMM input and recurrent/KV state are unchanged.
+    pub fn lightOnProjectionResidual(cb: *const ops.ComputeBackend, input_ct: CT, weight_ct: CT, residual_ct: CT, rows: usize, in_dim: usize, hidden: usize) !?CT {
+        if (!lightOnProjectionResidualEnabled(cb) or rows == 0 or rows > 8192 or
+            !((hidden == 1024 and in_dim == 2048) or (hidden == 2560 and in_dim == 4096))) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const input = tensorFromCt(input_ct);
+        const weight = tensorFromCt(weight_ct);
+        const residual = tensorFromCt(residual_ct);
+        if (weight.dtype != .bf16 or weight.quant_type != null or input.strict_resident_training or
+            weight.strict_resident_training or residual.strict_resident_training) return null;
+        try ensureF32(input);
+        try ensureF32(residual);
+        try ensureCount(input, try checkedMul(rows, in_dim));
+        try ensureCount(weight, try checkedMul(hidden, in_dim));
+        try ensureCount(residual, try checkedMul(rows, hidden));
+        if (input.buffer.ptr == 0 or weight.buffer.ptr == 0 or residual.buffer.ptr == 0 or
+            input.buffer.len < try checkedMul(try checkedMul(rows, in_dim), 4) or
+            weight.buffer.len < try checkedMul(try checkedMul(hidden, in_dim), 2) or
+            residual.buffer.len < try checkedMul(try checkedMul(rows, hidden), 4)) return error.InvalidShape;
+        const staged = (try stageBf16ActivationForCublasLt(self, input, rows, in_dim)) orelse return null;
+        const shape = try allocShape2(self.allocator, rows, hidden);
+        errdefer self.allocator.free(shape);
+        var output = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, hidden), 4));
+        errdefer releaseDeviceBuffer(self, &output);
+        errdefer self.ctx.synchronize() catch {};
+        try self.cublaslt.?.matmulBf16WeightResidualF32Out(&self.ctx, output, staged, weight.buffer, residual.buffer, cublasLtWorkspace(self), rows, in_dim, hidden);
+        self.stats.bf16_cublaslt_linear_calls += 1;
+        self.lighton_projection_residual_calls += 1;
+        return createTensor(self, output, shape, rows * hidden);
     }
 
     pub const LightOnFfnBlockRequest = struct {
@@ -2421,7 +3066,7 @@ pub const CudaCompute = struct {
         const rows = request.rows;
         const hidden = request.hidden;
         const intermediate = request.intermediate;
-        if (self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1 or
+        if (!lightOnDevice(self).portableKernels() or
             !cudaCublasLtEnabled() or self.cublaslt == null or self.lighton_bf16_decode_outputs or
             rows == 0 or rows > 8192 or
             !((hidden == 1024 and intermediate == 3584) or (hidden == 2560 and intermediate == 9216))) return null;
@@ -2461,10 +3106,97 @@ pub const CudaCompute = struct {
         return try lightOnFfnBf16Down(self, .{ .separate = .{ .gate = gate, .up = up } }, weights[2], rows, hidden, intermediate, input);
     }
 
+    /// Interpolate the resident learned-position table directly into patch
+    /// embeddings. F32 output and merge-major align-corners geometry match
+    /// the host projector; no table download or per-image offset upload.
+    pub fn lightOnVisionPositions(cb: *const ops.ComputeBackend, input_ct: CT, table_ct: CT, grid_x: usize, grid_y: usize, merge: usize, side: usize, dim: usize) !?CT {
+        if (cb.kind() != .cuda) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.capability_profile != .lightonocr3 or !lightOnDevice(self).portableKernels() or
+            self.lazy_host_store != null or self.resident_training_cache or
+            self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+            (dim != 768 and dim != 1024) or merge != 2 or side != 48 or
+            grid_x < 2 or grid_y < 2 or grid_x % merge != 0 or grid_y % merge != 0 or
+            grid_x > 16384 or grid_y > 16384 or grid_x > 16384 / grid_y) return null;
+        const input = tensorFromCt(input_ct);
+        const table = tensorFromCt(table_ct);
+        if (input.strict_resident_training or table.strict_resident_training or table.quant_type != null or
+            (table.dtype != .f32 and table.dtype != .bf16)) return null;
+        try ensureF32(input);
+        const count = try checkedMul(try checkedMul(grid_x, grid_y), dim);
+        try ensureCount(input, count);
+        try ensureCount(table, try checkedMul(try checkedMul(side, side), dim));
+        if (table.shape.len != 2 or table.shape[0] != @as(i64, @intCast(side * side)) or table.shape[1] != @as(i64, @intCast(dim)) or
+            input.buffer.len < count * 4 or table.buffer.len < table.elem_count * table.dtype.byteSize()) return error.InvalidTensorShape;
+        try self.lighton_vision_fused.init(&self.ctx);
+        const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(grid_x * grid_y), @intCast(dim) })).?;
+        errdefer cb.free(output);
+        try self.lighton_vision_fused.learnedPositions(&self.ctx, .{ tensorFromCt(output).buffer.ptr, input.buffer.ptr, table.buffer.ptr }, @intCast(grid_x), @intCast(grid_y), @intCast(merge), @intCast(side), @intCast(dim), table.dtype == .bf16);
+        return output;
+    }
+
+    /// Projectors consume this resolved policy instead of rereading opt-in flags.
+    pub fn lightOnVisionQkvEnabled(self: *const CudaCompute) bool {
+        return self.capability_profile == .lightonocr3 and
+            self.lighton_fused_vision_qkv_enabled and lightOnDevice(self).portableKernels();
+    }
+
+    pub fn lightOnVisionMlpEnabled(self: *const CudaCompute) bool {
+        return self.capability_profile == .lightonocr3 and
+            self.lighton_fused_vision_mlp_enabled and lightOnDevice(self).portableKernels();
+    }
+
+    /// Keep layer-norm output compact until the existing QKV GEMM. The
+    /// projection, bias, residual and downstream attention retain F32 policy.
+    pub fn lightOnVisionNormQkv(cb: *const ops.ComputeBackend, input_ct: CT, weights: [4]CT, rows: usize, dim: usize, eps: f32) !?CT {
+        if (cb.kind() != .cuda) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (!self.lightOnVisionQkvEnabled() or
+            self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+            self.resident_training_cache or self.lazy_host_store != null or self.lighton_bf16_projection_outputs or
+            (dim != 768 and dim != 1024) or rows < 256 or rows > 65536 or
+            !cudaCublasLtEnabled() or self.cublaslt == null or self.cublaslt_bf16_tuning_profile != .off) return null;
+        if (!std.math.isFinite(eps) or eps <= 0) return error.InvalidTensorShape;
+        const input = tensorFromCt(input_ct);
+        if (input.strict_resident_training) return null;
+        try ensureF32(input);
+        try ensureCount(input, try checkedMul(rows, dim));
+        const tensors = [_]*const CudaTensor{ tensorFromCt(weights[0]), tensorFromCt(weights[1]), tensorFromCt(weights[2]), tensorFromCt(weights[3]) };
+        const counts = [_]usize{ dim, dim, 3 * dim * dim, 3 * dim };
+        for (tensors, counts, 0..) |tensor, count, i| {
+            if (tensor.strict_resident_training) return null;
+            if (i == 2) {
+                if (tensor.quant_type != null or tensor.dtype != .bf16) return null;
+            } else try ensureF32(tensor);
+            try ensureCount(tensor, count);
+        }
+        try self.lighton_vision_fused.init(&self.ctx);
+        var normalized = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, dim), 2));
+        defer releaseDeviceBuffer(self, &normalized);
+        const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(3 * dim) })).?;
+        errdefer cb.free(output);
+        try self.lighton_vision_fused.norm(&self.ctx, .{ normalized.ptr, input.buffer.ptr, tensors[0].buffer.ptr, tensors[1].buffer.ptr }, @intCast(rows), @intCast(dim), eps);
+        const blas = &self.cublaslt.?;
+        blas.matmulBf16WeightBiasF32Out(&self.ctx, tensorFromCt(output).buffer, normalized, tensors[2].buffer, tensors[3].buffer, cublasLtWorkspace(self), rows, dim, 3 * dim) catch |err| switch (err) {
+            error.CublasLtUnsupported => {
+                cb.free(output);
+                return null;
+            },
+            else => return err,
+        };
+        self.stats.launch_norm += 1;
+        self.stats.launch_norm_layer += 1;
+        self.stats.launch_linear += 1;
+        self.stats.bf16_cublaslt_linear_calls += 1;
+        self.lighton_vision_norm_qkv_calls += 1;
+        self.lighton_vision_bias_epilogue_calls += 1;
+        return output;
+    }
+
     pub fn lightOnVisionMlp(cb: *const ops.ComputeBackend, input_ct: CT, weights: [6]CT, rows: usize, dim: usize, hidden: usize, eps: f32) !?CT {
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        if (self.capability_profile != .lightonocr3 or !self.lighton_fused_vision_mlp_enabled or self.ctx.info.compute_major < 8 or
+        if (!self.lightOnVisionMlpEnabled() or
             self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or rows == 0 or rows > 65536 or
             !((dim == 768 and hidden == 3072) or (dim == 1024 and hidden == 4096)) or
             !cudaCublasLtEnabled() or self.cublaslt == null or self.cublaslt_bf16_tuning_profile != .off) return null;
@@ -2485,8 +3217,6 @@ pub const CudaCompute = struct {
         try self.lighton_vision_fused.init(&self.ctx);
         var normalized = try allocDeviceBuffer(self, count * 2);
         defer releaseDeviceBuffer(self, &normalized);
-        var projected = try allocDeviceBuffer(self, wide * 4);
-        defer releaseDeviceBuffer(self, &projected);
         var activated = try allocDeviceBuffer(self, wide * 2);
         defer releaseDeviceBuffer(self, &activated);
         const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(dim) })).?;
@@ -2494,22 +3224,32 @@ pub const CudaCompute = struct {
         const dst = tensorFromCt(output).buffer;
         const blas = &(self.cublaslt orelse return null);
         try self.lighton_vision_fused.norm(&self.ctx, .{ normalized.ptr, input.buffer.ptr, tensors[0].buffer.ptr, tensors[1].buffer.ptr }, @intCast(rows), @intCast(dim), eps);
-        blas.matmulBf16WeightF32Out(&self.ctx, projected, normalized, tensors[2].buffer, cublasLtWorkspace(self), rows, dim, hidden) catch |err| switch (err) {
-            error.CublasLtUnsupported => {
-                cb.free(output);
-                return null;
-            },
-            else => return err,
-        };
-        try self.lighton_vision_fused.gelu(&self.ctx, .{ activated.ptr, projected.ptr, tensors[3].buffer.ptr }, @intCast(wide), @intCast(hidden));
-        blas.matmulBf16WeightF32Out(&self.ctx, dst, activated, tensors[4].buffer, cublasLtWorkspace(self), rows, hidden, dim) catch |err| switch (err) {
-            error.CublasLtUnsupported => {
-                cb.free(output);
-                return null;
-            },
-            else => return err,
-        };
-        try self.lighton_vision_fused.residual(&self.ctx, .{ dst.ptr, dst.ptr, tensors[5].buffer.ptr, input.buffer.ptr }, @intCast(count), @intCast(dim));
+        if (@import("lighton_vision_gemm.zig").supported(self.ctx.info.compute_major, self.ctx.info.compute_minor, rows, dim, hidden)) {
+            try self.lighton_vision_up.run(&self.ctx, .{ .input = normalized, .weight = tensors[2].buffer, .bias = tensors[3].buffer, .output = activated, .rows = rows, .hidden = dim, .wide = hidden, .round_before_gelu = false });
+        } else {
+            var projected = try allocDeviceBuffer(self, wide * 4);
+            defer releaseDeviceBuffer(self, &projected);
+            blas.matmulBf16WeightF32Out(&self.ctx, projected, normalized, tensors[2].buffer, cublasLtWorkspace(self), rows, dim, hidden) catch |err| switch (err) {
+                error.CublasLtUnsupported => {
+                    cb.free(output);
+                    return null;
+                },
+                else => return err,
+            };
+            try self.lighton_vision_fused.gelu(&self.ctx, .{ activated.ptr, projected.ptr, tensors[3].buffer.ptr }, @intCast(wide), @intCast(hidden));
+        }
+        if (@import("lighton_vision_gemm.zig").supportedDown(self.ctx.info.compute_major, self.ctx.info.compute_minor, rows, dim, hidden, false)) {
+            try self.lighton_vision_down.run(&self.ctx, .{ .input = activated, .weight = tensors[4].buffer, .bias = tensors[5].buffer, .residual = input.buffer, .output = dst, .rows = rows, .hidden = dim, .wide = hidden, .bf16_io = false });
+        } else {
+            blas.matmulBf16WeightF32Out(&self.ctx, dst, activated, tensors[4].buffer, cublasLtWorkspace(self), rows, hidden, dim) catch |err| switch (err) {
+                error.CublasLtUnsupported => {
+                    cb.free(output);
+                    return null;
+                },
+                else => return err,
+            };
+            try self.lighton_vision_fused.residual(&self.ctx, .{ dst.ptr, dst.ptr, tensors[5].buffer.ptr, input.buffer.ptr }, @intCast(count), @intCast(dim));
+        }
         self.lighton_vision_fused.calls += 1;
         return output;
     }
@@ -2575,8 +3315,8 @@ pub const CudaCompute = struct {
     pub fn lightOnInputProjections(cb: *const ops.ComputeBackend, input_ct: CT, weights: [4]CT, rows: usize, hidden: usize, mixed_dim: usize, z_dim: usize, heads: usize) !?[4]CT {
         if (!lightOnProjectionFusionEnabled(cb)) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        if (self.lazy_host_store != null or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
-            self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1 or
+        if (self.lazy_host_store != null or ((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self)) or
+            !lightOnDevice(self).portableKernels() or
             rows == 0 or rows > 8192 or !((hidden == 1024 and mixed_dim == 6144 and z_dim == 2048 and heads == 16) or
             (hidden == 2560 and mixed_dim == 8192 and z_dim == 4096 and heads == 32)) or
             !cudaCublasLtEnabled() or self.cublaslt == null) return null;
@@ -2601,7 +3341,7 @@ pub const CudaCompute = struct {
             const bytes = try checkedMul(try checkedMul(total_width, hidden), 2);
             var lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null;
             if (self.ctx.video_cache_budget.admission) |policy|
-                lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = bytes }, policy.check_live_memory) catch return null;
+                lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_weight_bytes = bytes }, policy.check_live_memory) catch return null;
             var storage = buffer_mod.DeviceBuffer.alloc(&self.ctx, bytes) catch {
                 if (lease) |*active| active.release();
                 return null;
@@ -2798,7 +3538,7 @@ pub const CudaCompute = struct {
         if (cb.kind() != .cuda) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
         if (!self.lighton_recurrent_batch_enabled or self.capability_profile != .lightonocr3 or states.len < 2 or states.len > 64) return null;
-        if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return error.CudaGraphCaptureUnsafeTempAlloc;
+        if (((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self))) return error.CudaGraphCaptureUnsafeTempAlloc;
         if (request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4 or
             request.key_heads != 16 or (request.value_heads != 16 and request.value_heads != 32)) return null;
         if (!std.math.isFinite(request.eps) or request.eps <= 0) return error.InvalidTensorShape;
@@ -2905,8 +3645,8 @@ pub const CudaCompute = struct {
     pub fn qwen35LinearCoreRaggedBatch(cb: *const ops.ComputeBackend, states: []const *@import("lighton_recurrent.zig").State, lengths: []const usize, request: anytype) !?CT {
         if (!lightOnRaggedCoreEnabled(cb) or states.len < 2 or states.len > 128) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        if (states.len > 64 and (!self.lighton_physical128_enabled or self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1)) return null;
-        if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return error.CudaGraphCaptureUnsafeTempAlloc;
+        if (states.len > 64 and !self.lighton_physical128_enabled) return null;
+        if (((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self))) return error.CudaGraphCaptureUnsafeTempAlloc;
         if (lengths.len != states.len) return error.InvalidTensorShape;
         if (request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4 or
             request.key_heads != 16 or (request.value_heads != 16 and request.value_heads != 32)) return null;
@@ -2962,14 +3702,14 @@ pub const CudaCompute = struct {
         defer if (conv) |tensor| cb.free(tensor);
         const core = if (only_decode) null else try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(width) });
         defer if (core) |tensor| cb.free(tensor);
-        // Validate and prepare the entire claim above before either packet
-        // may update state. Dense projections retain all 128 rows; stateful
-        // kernels keep their already-qualified 64-page ABI and F32 arithmetic.
-        for (states) |state| state.failed = true;
+        var packets: [2]@import("lighton_recurrent.zig").RaggedParams = undefined;
+        var packet_rows: [2]u32 = @splat(0);
+        var packet_scratch: [2]usize = @splat(0);
+        var packet_count: usize = 0;
         var first: usize = 0;
         var row_offset: usize = 0;
         while (first < states.len) {
-            const end = @min(first + 64, states.len);
+            const end: usize = @min(first + 64, states.len);
             var group_rows: usize = 0;
             for (lengths[first..end]) |length| group_rows += length;
             var params = @import("lighton_recurrent.zig").RaggedParams{ .base = .{
@@ -2997,9 +3737,33 @@ pub const CudaCompute = struct {
                 params.base.pages[index] = .{ .history = state.history[0].ptr, .next_history = state.history[1].ptr, .state = state.recurrent.ptr };
                 offset += n;
             }
-            try self.lighton_recurrent.runRaggedWithDecodeFusion(&self.ctx, &params, @intCast(group_rows), fused_decode);
+            packets[packet_count] = params;
+            packet_rows[packet_count] = @intCast(group_rows);
+            packet_count += 1;
             row_offset += group_rows;
             first = end;
+        }
+        var workspace_bytes: usize = 0;
+        if (!only_decode) {
+            try self.lighton_recurrent.configureBf16Prefill(&self.ctx, platform.env.getenv("ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY"));
+            if (self.lighton_recurrent.bf16_prefill) |*prefill| {
+                if (!fused_decode) return error.LightOnPrefillRequiresFusedDecode;
+                for (packets[0..packet_count], 0..) |*params, index| {
+                    packet_scratch[index] = try prefill.workspaceBytes(params);
+                    workspace_bytes = @max(workspace_bytes, packet_scratch[index]);
+                }
+            }
+        }
+        // The extra working set has an independent retained lease. One
+        // stream-ordered buffer serves both packets and survives GPU consumers.
+        // Admission/ABI/shape failures above have not consumed any page state.
+        const workspace = if (workspace_bytes != 0)
+            try self.lighton_recurrent.bf16_prefill.?.reserve(&self.ctx, workspace_bytes)
+        else
+            buffer_mod.DeviceBuffer{};
+        for (states) |state| state.failed = true;
+        for (packets[0..packet_count], packet_rows[0..packet_count], packet_scratch[0..packet_count]) |*params, count, required| {
+            try self.lighton_recurrent.runRaggedWithPrefill(&self.ctx, params, count, fused_decode, workspace.ptr, if (required != 0) workspace_bytes else 0);
         }
         for (states) |state| {
             std.mem.swap(buffer_mod.DeviceBuffer, &state.history[0], &state.history[1]);
@@ -3094,6 +3858,74 @@ pub const CudaCompute = struct {
         return output;
     }
 
+    fn canBorrowLightOnRecurrentWeight(self: *CudaCompute, tensor: *const CudaTensor) bool {
+        return self.lighton_shared_recurrent_weights_enabled and self.capability_profile == .lightonocr3 and
+            self.lazy_host_store == null and !self.resident_training_cache and !tensor.strict_resident_training and
+            tensor.dtype == .f32 and !tensor.owns_buffer and residentTensorForSlot(self, tensor) == tensor;
+    }
+
+    /// Pack a fresh pooled state without adding bytes or cache entries for
+    /// its views. Existing independent states retain their storage contract.
+    fn preparePackedLightOnRecurrentState(self: *CudaCompute, state: *@import("lighton_recurrent.zig").State, weights: [4]CT, weight_counts: [4]usize, channels: usize, vh: usize) !bool {
+        if (state.packed_storage.ptr != 0 or state.history[0].ptr != 0 or state.history[1].ptr != 0 or state.recurrent.ptr != 0) return false;
+        for (state.weights) |weight| if (weight.ptr != 0) return false;
+        if (!lightOnStatePoolEnabled(self)) return false;
+        const history_bytes = try checkedMul(channels, 4 * @sizeOf(f32));
+        const recurrent_bytes = try checkedMul(try checkedMul(vh, 128 * 128), @sizeOf(f32));
+        var bytes = try checkedAdd(try checkedMul(history_bytes, 2), recurrent_bytes);
+        var borrowed: [4]bool = undefined;
+        var sources: [4]driver_mod.CUdeviceptr = undefined;
+        for (weights, weight_counts, &borrowed, &sources) |weight, count, *borrow, *source| {
+            const tensor = tensorFromCt(weight);
+            borrow.* = self.canBorrowLightOnRecurrentWeight(tensor);
+            source.* = tensor.buffer.ptr;
+            if (!borrow.*) bytes = try checkedAdd(bytes, try checkedMul(count, @sizeOf(f32)));
+        }
+        var storage = try allocLightOnStateBuffer(self, bytes);
+        errdefer {
+            // An accepted widening/copy must drain before a failed unpublished
+            // owner can be freed. Failure never publishes partial descriptors.
+            self.ctx.synchronize() catch {};
+            storage.free(&self.ctx);
+        }
+        const history = [_]buffer_mod.DeviceBuffer{
+            .{ .ptr = storage.ptr, .len = history_bytes, .borrowed = true },
+            .{ .ptr = storage.ptr + history_bytes, .len = history_bytes, .borrowed = true },
+        };
+        const recurrence = buffer_mod.DeviceBuffer{ .ptr = storage.ptr + 2 * history_bytes, .len = recurrent_bytes, .borrowed = true };
+        var offset = 2 * history_bytes + recurrent_bytes;
+        var snapshots: [4]buffer_mod.DeviceBuffer = undefined;
+        var ownership: [4]bool = undefined;
+        var borrow_count: usize = 0;
+        for (weights, weight_counts, borrowed, &snapshots, &ownership) |weight, count, borrow, *snapshot, *owned| {
+            const tensor = tensorFromCt(weight);
+            owned.* = !borrow;
+            if (borrow) {
+                snapshot.* = tensor.buffer;
+                borrow_count += 1;
+                continue;
+            }
+            const weight_bytes = try checkedMul(count, @sizeOf(f32));
+            snapshot.* = .{ .ptr = storage.ptr + offset, .len = weight_bytes, .borrowed = true };
+            if (tensor.dtype == .f32) {
+                try copyFromDeviceTracked(self, snapshot.*, tensor.buffer, weight_bytes);
+            } else {
+                try self.scalar_clamp_kernel.widen16Bit(&self.ctx, tensor.buffer.ptr, snapshot.ptr, count, tensor.dtype == .bf16);
+            }
+            offset += weight_bytes;
+        }
+        std.debug.assert(offset == storage.len);
+        state.packed_storage = storage;
+        state.history = history;
+        state.recurrent = recurrence;
+        state.weights = snapshots;
+        state.owns_weights = ownership;
+        state.weight_sources = sources;
+        self.lighton_shared_recurrent_weight_borrows += borrow_count;
+        self.lighton_packed_state_calls += 1;
+        return true;
+    }
+
     fn prepareLightOnRecurrentState(self: *CudaCompute, state: *@import("lighton_recurrent.zig").State, weights: [4]CT, weight_counts: [4]usize, kh: usize, vh: usize, pre_admitted: bool) !void {
         if (lightOnStatePoolEnabled(self)) {
             state.release_context = self;
@@ -3114,6 +3946,7 @@ pub const CudaCompute = struct {
             state.key_heads = kh;
             state.value_heads = vh;
         }
+        if (try self.preparePackedLightOnRecurrentState(state, weights, weight_counts, channels, vh)) return;
         // Persistent state bypasses scratch arenas and oversized temporary reuse.
         // DeviceBuffer admission charges every physical allocation to this session.
         state.ctx = &self.ctx;
@@ -3128,11 +3961,7 @@ pub const CudaCompute = struct {
             const tensor = tensorFromCt(weight);
             // Resident scalar/vector weights are immutable and model-owned.
             // A page state cannot outlive this same model's CUDA context.
-            if (self.lighton_shared_recurrent_weights_enabled and self.capability_profile == .lightonocr3 and
-                self.lazy_host_store == null and !self.resident_training_cache and !tensor.strict_resident_training and
-                tensor.dtype == .f32 and !tensor.owns_buffer and
-                residentTensorForSlot(self, tensor) == tensor)
-            {
+            if (self.canBorrowLightOnRecurrentWeight(tensor)) {
                 state.weights[i] = tensor.buffer;
                 state.owns_weights[i] = false;
                 state.weight_sources[i] = tensor.buffer.ptr;
@@ -3149,6 +3978,42 @@ pub const CudaCompute = struct {
             state.weights[i] = owned;
             state.weight_sources[i] = tensor.buffer.ptr;
         }
+    }
+
+    /// GLiDE's four independent DeltaNet projections consume the same input.
+    /// Stage it once without concatenating weights or changing GEMM arithmetic.
+    pub fn glideDeltaProjections(cb: *const ops.ComputeBackend, input_ct: CT, weights: [4]CT, rows: usize, hidden: usize) !?[4]CT {
+        if (cb.kind() != .cuda) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (!self.glide_cuda or self.strict_f32_weights or self.cublaslt == null or
+            rows < 256 or rows > 16384 or (hidden != 1024 and hidden != 2048) or
+            self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+            platform.env.getenvBool("ANTFLY_GLIDE_CUDA_DISABLE_SHARED_PROJECTIONS")) return null;
+        const input = tensorFromCt(input_ct);
+        try ensureF32(input);
+        try ensureCount(input, rows * hidden);
+        if (input.buffer.ptr == 0 or input.buffer.len < rows * hidden * 4) return error.InvalidShape;
+        const widths = [_]usize{ 6144, 2048, 16, 16 };
+        for (weights, widths) |weight_ct, width| {
+            const weight = tensorFromCt(weight_ct);
+            if (weight.quant_type != null or weight.dtype != .f16) return null;
+            try ensureCount(weight, hidden * width);
+            if (weight.buffer.ptr == 0 or weight.buffer.len < hidden * width * 2) return error.InvalidShape;
+        }
+        var staged = try allocDeviceBuffer(self, rows * hidden * 2);
+        defer releaseDeviceBuffer(self, &staged);
+        var result: [4]CT = undefined;
+        var initialized: usize = 0;
+        errdefer for (result[0..initialized]) |value| cb.free(value);
+        try self.kernels.launchF32ToF16(&self.ctx, staged, input.buffer, rows * hidden);
+        for (weights, widths, &result) |weight, width, *out| {
+            out.* = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(width) })).?;
+            initialized += 1;
+            try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, tensorFromCt(out.*).buffer, staged, tensorFromCt(weight).buffer, cublasLtWorkspace(self), rows, hidden, width);
+            self.stats.f16_cublaslt_linear_calls += 1;
+        }
+        self.stats.f16_cublaslt_activation_staging_calls += 1;
+        return result;
     }
 
     pub fn qwen35LinearCore(cb: *const ops.ComputeBackend, state: *@import("lighton_recurrent.zig").State, request: anytype) !?CT {
@@ -3186,6 +4051,16 @@ pub const CudaCompute = struct {
         if (state.ctx) |ctx| {
             if (ctx != &self.ctx or state.key_heads != kh or state.value_heads != vh) return error.InvalidTensorShape;
         }
+        const glide_chunk = self.glide_cuda and !self.strict_f32_weights and !state.initialized and n >= 256 and kh == 16 and vh == 16 and
+            !platform.env.getenvBool("ANTFLY_GLIDE_CUDA_DISABLE_CHUNK_CORE");
+        const consume_mixed = if (@hasField(@TypeOf(request), "glide_consume_mixed")) request.glide_consume_mixed else false;
+        if (glide_chunk and consume_mixed) {
+            const source = tensorFromCt(request.mixed).buffer;
+            for (inputs[1..] ++ weights) |input| {
+                const other = tensorFromCt(input).buffer;
+                if (source.ptr < other.ptr + other.len and other.ptr < source.ptr + counts[0] * 4) return error.InvalidTensorShape;
+            }
+        }
         if (request.destination) |destination| {
             const tensor = tensorFromCt(destination);
             try ensureF32(tensor);
@@ -3208,10 +4083,13 @@ pub const CudaCompute = struct {
         const conv_shape = [_]i32{ @intCast(n), @intCast(channels) };
         const conv = (try allocUninitF32ShapeOp(self, &conv_shape)).?;
         defer cb.free(conv);
-        const core = (try allocUninitF32ShapeOp(self, &shape)).?;
-        defer cb.free(core);
+        // Chunk preparation consumes the cached gates before the scan writes
+        // raw output. The per-head finishing norm reads all its values before
+        // writing them, so these three stages can share the destination.
+        const core = if (glide_chunk) output else (try allocUninitF32ShapeOp(self, &shape)).?;
+        defer if (core != output) cb.free(core);
         state.failed = true;
-        try self.lighton_recurrent.run(&self.ctx, .{
+        const pointers = [14]driver_mod.CUdeviceptr{
             tensorFromCt(request.mixed).buffer.ptr, state.weights[0].ptr,
             state.history[0].ptr,                   state.history[1].ptr,
             tensorFromCt(conv).buffer.ptr,          tensorFromCt(request.beta).buffer.ptr,
@@ -3219,7 +4097,39 @@ pub const CudaCompute = struct {
             state.weights[2].ptr,                   state.recurrent.ptr,
             tensorFromCt(core).buffer.ptr,          tensorFromCt(request.z).buffer.ptr,
             state.weights[3].ptr,                   tensorFromCt(output).buffer.ptr,
-        }, n, kh, vh, state.initialized, request.eps, self.lighton_cached_recurrent_gates, self.capability_profile == .lightonocr3 and self.lighton_parallel_prefix);
+        };
+        if (glide_chunk) {
+            const layout = try @import("glide_delta.zig").layout(n, vh);
+            // Only GLiDE's private caller grants consumption of this projected
+            // input. Prefix convolution finishes reading it on ctx.stream
+            // before chunk preparation reuses its storage. Other callers keep
+            // the ordinary immutable-input contract and separately owned arena.
+            const reuse_mixed = consume_mixed and layout.total <= counts[0] * 4;
+            var arena = if (reuse_mixed)
+                debertaWorkspaceRegion(tensorFromCt(request.mixed).buffer, 0, layout.total)
+            else
+                try allocDeviceBuffer(self, layout.total);
+            defer if (!reuse_mixed) releaseDeviceBuffer(self, &arena);
+            var regions: [5]buffer_mod.DeviceBuffer = undefined;
+            for (&regions, layout.offsets, layout.sizes) |*region, offset, size| region.* = debertaWorkspaceRegion(arena, offset, size);
+            try self.lighton_recurrent.prepareGlide(&self.ctx, pointers, n, vh);
+            try self.glide_delta.run(&self.ctx, .{
+                .conv = pointers[4],
+                .gates = pointers[13],
+                .w = regions[0].ptr,
+                .attention = regions[1].ptr,
+                .scaled_k = regions[2].ptr,
+                .u = regions[3].ptr,
+                .decay = regions[4].ptr,
+                .state = pointers[9],
+                .out = pointers[10],
+                .tokens = @intCast(n),
+                .heads = @intCast(vh),
+            });
+            try self.lighton_recurrent.finishGlide(&self.ctx, pointers, n, vh, request.eps);
+        } else {
+            try self.lighton_recurrent.run(&self.ctx, pointers, n, kh, vh, state.initialized, request.eps, self.lighton_cached_recurrent_gates, self.capability_profile == .lightonocr3 and (self.lighton_parallel_prefix or self.glide_cuda));
+        }
         std.mem.swap(buffer_mod.DeviceBuffer, &state.history[0], &state.history[1]);
         state.initialized = true;
         state.failed = false;
@@ -3247,6 +4157,13 @@ pub const CudaCompute = struct {
 
     /// Laya parity requires FP32 execution even for reduced-storage source tensors.
     strict_f32_weights: bool = false,
+    glide_cuda: bool = false,
+    /// Artifact-qualified specialty span models retain FP32 attention even
+    /// when global diagnostic environment switches request reduced precision.
+    qualified_span_fp32: bool = false,
+    /// Exact original Decide identity; independent of other GLiNER profiles.
+    qualified_decide_fp32: bool = false,
+    qualified_decide_q8: bool = false,
     laya_optimizations: bool = false,
     gliner_encoder_attention: bool = false,
     gliner_mixed_attention: bool = false,
@@ -3258,9 +4175,29 @@ pub const CudaCompute = struct {
     resident_training_cache: bool = false,
     allocator: std.mem.Allocator,
     capability_profile: ?CapabilityProfile = null,
+    gemma4_raw_q4_prefill: bool = false,
+    gemma4_ple_host_lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
+    gemma4_ple_host_enabled: bool = false,
+    gemma4_ple_host: buffer_mod.MappedHostBuffer = .{},
+    gemma4_request_replay_capacity: ?usize = null,
+    gemma4_request_replay_disabled: bool = false,
+    gemma4_dense_qualified: bool = false,
+    gemma4_e4b_sm89_qualified: bool = false,
+    gemma4_chunked_upload: bool = false,
+    gemma4_temp_lru: bool = false,
+    gemma4_projector_cache_enabled: bool = false,
+    gemma4_projector_weights: std.StringHashMapUnmanaged(*CudaTensor) = .empty,
+    gemma4_projector_weight_bytes: usize = 0,
+    gemma4_projector_weight_count: usize = 0,
+    gemma4_projector_weight_hits: usize = 0,
+    gemma4_projector_weight_misses: usize = 0,
     ctx: context_mod.CudaContext,
     scalar_clamp_kernel: @import("scalar_clamp.zig").Kernel = .{},
     florence_fused: @import("florence_fused.zig").Module = .{},
+    whisper_cuda: @import("whisper_cuda.zig").Module = .{},
+    whisper_f16_weights_enabled: bool = true,
+    whisper_stats: [2]ops.WhisperLogitsStatsRaw = undefined,
+    whisper_stats_valid: [2]bool = .{ false, false },
     florence_fused_depthwise_enabled: bool = false,
     ocr_retained_cache_bytes: usize = 0,
     ocr_retained_cache_lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
@@ -3272,6 +4209,17 @@ pub const CudaCompute = struct {
     lighton_norm_weight_cache_hits: usize = 0,
     lighton_norm_weight_cache_misses: usize = 0,
     lighton_vision_fused: @import("lighton_vision.zig").Module = .{},
+    lighton_vision_up: @import("lighton_vision_gemm.zig").Module = .{},
+    lighton_vision_down: @import("lighton_vision_gemm.zig").DownModule = .{},
+    lighton_head: @import("lighton_head.zig").Module = .{},
+    lighton_fused_head_disabled: bool = false,
+    lighton_precision: @import("lighton_vision_bf16.zig").Precision = .f32,
+    lighton_vision_bf16: @import("lighton_vision_bf16.zig").Module = .{},
+    lighton_attention_inputs: @import("lighton_attention_inputs.zig").Module = .{},
+    glide_attention: @import("glide_attention.zig").Module = .{},
+    glide_delta: @import("glide_delta.zig").Module = .{},
+    glide_activation: @import("glide_activation.zig").Module = .{},
+    glide_request_shape: ?[3]usize = null,
     florence_bart_ffn_enabled: bool = false,
     florence_bart_ffn_calls: usize = 0,
     florence_fused_append_enabled: bool = false,
@@ -3282,13 +4230,17 @@ pub const CudaCompute = struct {
     lighton_recurrent: @import("lighton_recurrent.zig").Module = .{},
     lighton_attention: @import("lighton_attention.zig").Module = .{},
     lighton_attention_enabled: bool = false,
-    lighton_attention_chunk128: bool = false,
+    lighton_attention_chunk128: ?bool = null,
     lighton_batched_kv_write_enabled: bool = false,
     lighton_gemm_bucket_rows: bool = false,
     lighton_bf16_decode_outputs: bool = false,
     // Experimental BF16 projection boundary for both prefix and decode rows.
     // Tensor ABI and recurrent state remain F32; this is not full BF16 execution.
     lighton_bf16_projection_outputs: bool = false,
+    lighton_vision_bias_epilogue_calls: usize = 0,
+    lighton_projection_residual_calls: usize = 0,
+    lighton_vision_output_residual_calls: usize = 0,
+    lighton_vision_norm_qkv_calls: usize = 0,
     lighton_bf16_prefill_ffn: bool = false,
     lighton_bf16_prefill_ffn_calls: usize = 0,
     lighton_fused_ffn: bool = false,
@@ -3303,13 +4255,13 @@ pub const CudaCompute = struct {
     lighton_activation: @import("lighton_activation.zig").Module = .{},
     lighton_fused_ffn_calls: usize = 0,
     ocr_pinned_inputs_enabled: bool = false,
-    ocr_pinned_input_host: buffer_mod.HostBuffer = .{},
-    ocr_pinned_input_offset: usize = 0,
-    ocr_pinned_input_lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
+    ocr_pinned_input: @import("pinned_input_arena.zig").Arena = .{},
     ocr_pinned_input_uploads: usize = 0,
     ocr_pinned_input_wraps: usize = 0,
     ocr_pinned_metadata_enabled: bool = false,
     ocr_pinned_metadata_uploads: usize = 0,
+    ocr_pinned_metadata_event_uploads: usize = 0,
+    ocr_pinned_metadata_arena: @import("pinned_input_arena.zig").Arena = .{},
     lighton_cached_mrope_enabled: bool = false,
     lighton_mrope_cache_device: buffer_mod.DeviceBuffer = .{},
     lighton_mrope_cache_host: std.ArrayListUnmanaged(u32) = .empty,
@@ -3332,6 +4284,10 @@ pub const CudaCompute = struct {
     lighton_shared_recurrent_weights_enabled: bool = false,
     lighton_state_pool_hits: usize = 0,
     lighton_state_pool_misses: usize = 0,
+    lighton_deferred_buffer_reuses: usize = 0,
+    lighton_deferred_buffer_reused_bytes: usize = 0,
+    lighton_deferred_state_reuses: usize = 0,
+    lighton_packed_state_calls: usize = 0,
     lighton_state_pool_releases: std.atomic.Value(usize) = .init(0),
     lighton_shared_recurrent_weight_borrows: usize = 0,
     lighton_parallel_prefix: bool = false,
@@ -3370,9 +4326,13 @@ pub const CudaCompute = struct {
     lazy_access_epoch: u64 = 1,
     decoder_runtime_linear_slots: std.AutoHashMapUnmanaged(usize, CudaDecoderRuntimeLinearSlot) = .empty,
     decoder_runtime_rms_norm_slots: std.AutoHashMapUnmanaged(usize, CudaDecoderRuntimeRmsNormSlot) = .empty,
+    rms_q8_1_missing_reported: bool = false,
     decoder_runtime_next_dynamic_slot: usize = 1,
     decoder_runtime_family_state: CudaDecoderRuntimeFamilyState = .{},
     run_budget: ?*run_memory.RunBudget = null,
+    /// Execution scope distinguishes decode cohorts from prefill matrices.
+    cooperative_decode_rows: usize = 0,
+    cooperative_owner: @import("../execution_scope.zig").OwnerState = .{},
     dense_stream_entries: std.ArrayListUnmanaged(DenseStreamEntry) = .empty,
     dense_stream_epoch: u64 = 1,
     dense_host_prefetch_entries: std.StringHashMapUnmanaged(*DenseHostPrefetchEntry) = .{},
@@ -3380,13 +4340,14 @@ pub const CudaCompute = struct {
     dense_host_prefetch_initialized: bool = false,
     dense_host_prefetch_epoch: u64 = 1,
     temp_buffer_mutex: std.atomic.Mutex = .unlocked,
-    temp_buffers: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
+    temp_buffers: @import("buffer_cache.zig").Cache(buffer_mod.DeviceBuffer) = .empty,
     temp_pinned_slots: std.ArrayListUnmanaged(TempPinnedSlot) = .empty,
     temp_arena_planner: execution_plan.TempArenaPlanner = .{},
     temp_arena_generation: u64 = 1,
     deferred_device_frees: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     deferred_device_free_bytes: usize = 0,
     temp_trace_seq: usize = 0,
+    runtime_policy: @import("runtime_policy.zig").Policy = .{},
     florence_tail_row_f32: ?CT = null,
     florence_tail_col_f32: ?CT = null,
     florence_tail_temporal_f32: ?CT = null,
@@ -3423,6 +4384,12 @@ pub const CudaCompute = struct {
     pinned_scalar_upload_ring: PinnedScalarUploadRing = .{},
     pinned_upload_arena: PinnedUploadArena = .{},
     pinned_scalar_download_buffer: PinnedScalarDownloadBuffer = .{},
+    lighton_burst_readback: @import("burst_readback.zig").Slot = .{},
+    lighton_async_burst_downloads: usize = 0,
+    lighton_async_burst_interleavings: usize = 0,
+    lighton_packed_async_downloads: usize = 0,
+    lighton_packed_async_interleavings: usize = 0,
+    lighton_packed_sync_downloads: usize = 0,
     pinned_bulk_download_buffer: buffer_mod.HostBuffer = .{},
     training_upload_generation: u64 = 0,
     async_i32_scalar_download: AsyncI32ScalarDownload = .{},
@@ -3476,7 +4443,10 @@ pub const CudaCompute = struct {
     embedding_gemma2_constant_misses: u64 = 0,
     audio_plans: @import("audio_execution_plan.zig").Cache = .{},
     audio_execution_active: bool = false,
-    audio_scope: ?*@import("audio_execution_plan.zig").Scope = null,
+    execution_scope: ?*@import("execution_arena.zig").Scope = null,
+    lighton_decode_graph: @import("lighton_decode_graph.zig").Module = .{},
+    lighton_decode_graph_enabled: bool = false,
+
     audio_arena_executes: u64 = 0,
     audio_graph_replays: u64 = 0,
     embedding_gemma2_execution: @import("embedding_gemma2_execution.zig").Cache = .{},
@@ -3549,11 +4519,13 @@ pub const CudaCompute = struct {
         return &self.ctx;
     }
 
-    pub const EmbeddingGemma2TrainingAllocationStats = struct {
+    pub const AllocationStats = struct {
         limit: usize,
         live: usize,
         peak: usize,
     };
+
+    pub const EmbeddingGemma2TrainingAllocationStats = AllocationStats;
 
     /// Applies to every physical DeviceBuffer owned by this CUDA context,
     /// including loaded base weights, BF16 mirrors, adapter state, tape, and
@@ -3564,9 +4536,16 @@ pub const CudaCompute = struct {
         try self.ctx.device_allocations.setLimit(bytes);
     }
 
-    pub fn embeddingGemma2TrainingAllocationStats(self: *CudaCompute) EmbeddingGemma2TrainingAllocationStats {
+    /// Physical owned CUDA buffers, including resident weights and cached
+    /// temporaries. Driver/library-private allocations require separate headroom.
+    /// Peak is the lifetime high-water mark of this compute context.
+    pub fn allocationStats(self: *CudaCompute) AllocationStats {
         const value = self.ctx.device_allocations.snapshot();
         return .{ .limit = value.limit, .live = value.live, .peak = value.peak };
+    }
+
+    pub fn embeddingGemma2TrainingAllocationStats(self: *CudaCompute) EmbeddingGemma2TrainingAllocationStats {
+        return self.allocationStats();
     }
 
     pub fn embeddingGemma2TrainingCublasLt(self: *CudaCompute) !*cublaslt_mod.CublasLt {
@@ -3775,16 +4754,26 @@ pub const CudaCompute = struct {
 
     pub fn configureEmbeddingGemma2Admission(self: *CudaCompute, admission: ?@import("video_cache_budget.zig").Admission) !void {
         if (!std.meta.eql(self.ctx.video_cache_budget.admission, admission)) {
+            // A pending reader owns this slot until its execution lane is
+            // reacquired. Policy replacement cannot destroy its live event.
+            if (self.lighton_burst_readback.busy) return error.ResourceTemporarilyUnavailable;
+            try self.lighton_burst_readback.clear(&self.ctx);
+            try self.ocr_pinned_metadata_arena.clear(&self.ctx);
+            try self.ocr_pinned_input.clear(&self.ctx);
+            self.lighton_decode_graph.invalidate(&self.ctx);
+            self.lighton_decode_graph.epoch_id = 0;
+            if (self.lighton_recurrent.bf16_prefill) |*prefill| try prefill.clearWorkspace(&self.ctx);
             try self.embedding_gemma2_execution.clear(self.allocator, &self.ctx);
             try self.embedding_gemma2_resize.clear(&self.ctx);
             try self.clearEmbeddingGemma2Constants(false);
+            if (self.capability_profile == .gemma4) try self.clearGemma4ProjectorWeights(false);
             if (self.capability_profile == .lightonocr3 or self.capability_profile == .florence2) {
                 // Idle allocations must retire under the policy that admitted
                 // them before their reservation moves to another controller.
                 while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
                 defer self.temp_buffer_mutex.unlock();
                 try synchronizeAndDrainDeferredDeviceFreesUnlocked(self);
-                for (self.temp_buffers.items) |*buffer| buffer.free(&self.ctx);
+                for (self.temp_buffers.buffers.items) |*buffer| buffer.free(&self.ctx);
                 self.temp_buffers.clearRetainingCapacity();
 
                 self.stats.temp_buffer_cached_bytes = 0;
@@ -3825,6 +4814,108 @@ pub const CudaCompute = struct {
         self.embedding_gemma2_constants.deinit(self.allocator);
         self.embedding_gemma2_constants = .empty;
         // Live detached borrowers keep their bytes/leases until release.
+    }
+
+    /// GLiDE has no cross-request KV state. Keep warm buffers for the current
+    /// geometry without accumulating the working sets of every past length.
+    /// Only idle owned storage is retired; weights and live tensors stay put.
+    pub fn prepareGlideRequest(self: *CudaCompute, shape: [3]usize) !void {
+        if (!self.glide_cuda or platform.env.getenvBool("ANTFLY_GLIDE_CUDA_RETAIN_SHAPES") or
+            self.resident_training_cache or self.execution_scope != null or
+            self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+            self.temp_arena_planner.active or self.temp_arena_planner.ready_for_capture or
+            cudaEffectiveTempSlotPeriod(self) != 0) return;
+        if (self.glide_request_shape) |previous| {
+            if (std.mem.eql(usize, &previous, &shape)) return;
+            while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.temp_buffer_mutex.unlock();
+            try synchronizeAndDrainDeferredDeviceFreesUnlocked(self);
+            for (self.temp_buffers.buffers.items) |*buffer| {
+                self.stats.temp_buffer_evictions += 1;
+                self.stats.device_free_calls += 1;
+                buffer.free(&self.ctx);
+            }
+            self.temp_buffers.clearRetainingCapacity();
+            self.stats.temp_buffer_cached_bytes = 0;
+        }
+        self.glide_request_shape = shape;
+    }
+
+    pub fn borrowGemma4ProjectorWeight(self: *CudaCompute, key: []const u8) !?CT {
+        if (!self.gemma4_projector_cache_enabled) return null;
+        const parent = self.gemma4_projector_weights.get(key) orelse {
+            self.gemma4_projector_weight_misses += 1;
+            return null;
+        };
+        self.gemma4_projector_weight_hits += 1;
+        return try borrowModelConstant(self, parent);
+    }
+
+    /// Retain the completed upload itself: no second GPU copy and no request
+    /// allocator ownership escapes. The map and each borrower hold a reference;
+    /// the last reference retires the allocation and its independent weight lease.
+    pub fn retainGemma4ProjectorWeight(self: *CudaCompute, key: []const u8, value: CT) void {
+        if (!self.gemma4_projector_cache_enabled or key.len > 384 or
+            self.gemma4_projector_weights.contains(key) or
+            self.resident_training_cache or self.execution_scope != null or
+            self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+            cudaEffectiveTempSlotPeriod(self) != 0) return;
+        const source = tensorFromCt(value);
+        if (!source.owned_by_tensor or !source.owns_buffer or source.buffer.borrowed or
+            source.resident_parent != null or source.resident_references != 1 or
+            source.model_constant or source.quant_type != null or
+            source.tc_quant != null or source.bf16_mirror.ptr != 0 or source.q8_1_mirror.ptr != 0 or
+            (source.dtype != .f32 and source.dtype != .f16 and source.dtype != .bf16)) return;
+        const bytes = std.math.mul(usize, source.elem_count, source.dtype.byteSize()) catch return;
+        const ceiling = 1024 * 1024 * 1024;
+        if (bytes == 0 or bytes != source.buffer.len or bytes != source.buffer.allocation_bytes or
+            source.buffer.allocation_token == null or self.gemma4_projector_weight_bytes > ceiling or
+            bytes > ceiling - self.gemma4_projector_weight_bytes or self.gemma4_projector_weight_count >= 2048) return;
+        var lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null;
+        if (self.ctx.video_cache_budget.admission) |admission| {
+            lease = admission.controller.tryAcquire(.gpu, admission.limits, .{ .backend_weight_bytes = bytes }, admission.check_live_memory) catch return;
+        }
+        var published = false;
+        defer if (!published) if (lease) |*held| held.release();
+        const name = self.allocator.dupe(u8, key) catch return;
+        defer if (!published) self.allocator.free(name);
+        self.gemma4_projector_weights.ensureUnusedCapacity(self.allocator, 1) catch return;
+        // Upload paths are already synchronous; keep the publication boundary
+        // explicit for transposes and future callers as well.
+        self.ctx.synchronize() catch return;
+        source.model_constant = true;
+        source.gemma4_projector_constant = true;
+        source.model_constant_lease = lease;
+        source.resident_references += 1;
+        self.gemma4_projector_weight_bytes += bytes;
+        self.gemma4_projector_weight_count += 1;
+        self.gemma4_projector_weights.putAssumeCapacityNoClobber(name, source);
+        published = true;
+        // A retained media tower replaces temporary weight storage. Bound the
+        // remaining idle pool too, rather than accumulating both full caches.
+        while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.temp_buffer_mutex.unlock();
+        const budget = cudaTempCacheBudgetBytes(self);
+        while (self.temp_buffers.bytes > budget) {
+            var idle = self.temp_buffers.orderedRemove(0);
+            self.stats.temp_buffer_evictions += 1;
+            self.stats.device_free_calls += 1;
+            idle.free(&self.ctx);
+        }
+    }
+
+    fn clearGemma4ProjectorWeights(self: *CudaCompute, context_destroyed: bool) !void {
+        if (self.gemma4_projector_weights.capacity() == 0) return;
+        if (!context_destroyed and self.gemma4_projector_weights.count() != 0) try self.ctx.synchronize();
+        var it = self.gemma4_projector_weights.iterator();
+        while (it.next()) |entry| {
+            if (context_destroyed) entry.value_ptr.*.buffer = .{};
+            freeTensor(self, entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.gemma4_projector_weights.deinit(self.allocator);
+        self.gemma4_projector_weights = .empty;
+        // Detached borrowers retain their own bytes and leases until release.
     }
 
     pub fn evictEmbeddingGemma2Caches(self: *CudaCompute) !void {
@@ -4251,6 +5342,7 @@ pub const CudaCompute = struct {
                 load_context,
             );
         kernels.qwen3vl_automatic_prefill = qwen3VlAutomaticPrefillForProfile(profile);
+        kernels.lighton_automatic_prefill = profile == .lightonocr3;
         errdefer {
             var kernels_mut = kernels;
             kernels_mut.unload(&ctx);
@@ -4270,6 +5362,7 @@ pub const CudaCompute = struct {
         if (profile == .lightonocr3) if (cublaslt) |*blas| try blas.setPlanCacheCapacity(platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES") orelse 1024);
         if (cublaslt) |*blas| blas.florence_canonical_f16_decode = profile == .florence2 and ctx.info.compute_major == 12 and ctx.info.compute_minor == 1 and
             platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_CANONICAL_DECODE_GEMM");
+        if (cublaslt) |*blas| blas.lighton_projection_profile = if (profile == .lightonocr3 and ctx.info.compute_major == 12 and ctx.info.compute_minor == 1) .sm121 else .off;
         if (cublaslt_bf16_tuning_profile != .off and cublaslt == null) {
             // An explicit env request fails closed; the promoted SM89 default
             // degrades to off so capability-only inits keep working without
@@ -4291,12 +5384,12 @@ pub const CudaCompute = struct {
         // ~100ms cuBLASLt library load should not tax every backend init
         // (parity harnesses construct dozens of CudaCompute instances).
         // The default-on Q4->BF16 prefill mirror only attaches to
-        // encoder.layer.* weights on the qualified target, so its warmup is
+        // encoder.layer.* weights with a compiled tensor-core route, so warmup is
         // scoped to the encoder profiles that carry them; profile-less
         // capability probes stay cold.
         const encoder_bf16_prefill_default = if (profile) |value| switch (value) {
             .bert_encoder, .deberta_reranker, .gliner2 => cudaBertQ4Bf16PrefillEnabled(
-                cudaQualifiedPerfTarget(ctx.info.compute_major, ctx.info.compute_minor),
+                cudaTensorCoreArtifactSupported(ctx.info.compute_major, ctx.info.compute_minor),
             ),
             else => false,
         } else false;
@@ -4314,13 +5407,12 @@ pub const CudaCompute = struct {
             // The pair-only E2B route uses checked-in, shape-specific AOT
             // artifacts rather than a production JIT route. Keep its explicit
             // candidate gate available in JIT mode, but retain the same target
-            // qualification and master-disable contract as bundled dispatch.
+            // execution-capability and master-disable contract as bundled dispatch.
             gates.e2b_pair_only = (GeneratedQ4_0Gates{
                 .e2b_pair_only = cudaQ4_0GeneratedE2BFfnPairOnlyEnabled(),
-            }).restrictToPromotedTarget(
+            }).restrictToExecutionSupport(
                 ctx.info.compute_major,
                 ctx.info.compute_minor,
-                platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_ALLOW_UNPROMOTED_GENERATED_KERNELS", false),
             ).e2b_pair_only;
             break :blk gates.withExplicitDisables();
         } else GeneratedQ4_0Gates.resolveForTarget(ctx.info.compute_major, ctx.info.compute_minor);
@@ -4336,47 +5428,54 @@ pub const CudaCompute = struct {
         if (profile == .florence2) if (cublaslt) |*blas| {
             blas.attention_plan_cache_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_CHANNEL_PLAN_CACHE");
         };
-        return .{
+        const lighton_device = @import("lighton_device_policy.zig").Device{ .major = ctx.info.compute_major, .minor = ctx.info.compute_minor, .driver_version = ctx.info.driver_version };
+        const lighton_auto = lighton_device.automatic(profile == .lightonocr3, cublaslt != null and cudaCublasLtEnabled(), null);
+        const result: CudaCompute = .{
             .allocator = allocator,
             .capability_profile = profile,
-            .lighton_attention_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_ATTENTION"),
-            .lighton_attention_chunk128 = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_ATTENTION_CHUNK128"),
-            .lighton_batched_kv_write_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_KV_WRITE"),
+            .gemma4_raw_q4_prefill = false,
+            .lighton_attention_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_ATTENTION", profile == .lightonocr3 and @import("lighton_attention.zig").packetSupported(ctx.info.compute_major, ctx.info.driver_version)),
+            .lighton_attention_chunk128 = if (platform.env.getenv("ANTFLY_CUDA_ENABLE_LIGHTON_ATTENTION_CHUNK128") != null) platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_ATTENTION_CHUNK128") else null,
+            .lighton_batched_kv_write_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_KV_WRITE", profile == .lightonocr3 and @import("lighton_attention.zig").packetSupported(ctx.info.compute_major, ctx.info.driver_version)),
             .lighton_gemm_bucket_rows = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_GEMM_BUCKET_ROWS"),
+            .lighton_fused_head_disabled = platform.env.getenvBool("ANTFLY_CUDA_DISABLE_LIGHTON_FUSED_HEAD"),
             .lighton_bf16_decode_outputs = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BF16_DECODE_OUTPUTS"),
             .lighton_bf16_projection_outputs = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PROJECTION_OUTPUTS"),
             .lighton_bf16_prefill_ffn = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PREFILL_FFN"),
+            .lighton_decode_graph_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH", profile == .lightonocr3),
             .lighton_fused_ffn = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_FFN"),
-            .lighton_ffn_bf16_inputs = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BF16_INPUTS"),
-            .lighton_ffn_block_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BLOCK"),
+            .lighton_ffn_bf16_inputs = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BF16_INPUTS", lighton_auto),
+            .lighton_ffn_block_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_FFN_BLOCK", lighton_auto),
 
             .lighton_physical128_enabled = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128"),
             .temp_scan_profile = .{ .enabled = platform.env.getenvBool("ANTFLY_CUDA_PROFILE_OCR_TEMP_SCANS") },
             .florence_fused_attention_inputs_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_ATTENTION_INPUTS"),
-            .lighton_fused_projections = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS"),
+            .lighton_fused_projections = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_PROJECTIONS", lighton_auto),
             .florence_grouped_channel_tc_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_GROUPED_CHANNEL_TC"),
             .lighton_wide_microbatches = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES"),
 
-            .ocr_pinned_metadata_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_OCR_PINNED_METADATA"),
-            .ocr_pinned_inputs_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_OCR_PINNED_INPUTS"),
-            .lighton_cached_mrope_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_CACHED_MROPE_POSITIONS"),
+            .ocr_pinned_metadata_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_OCR_PINNED_METADATA", profile == .lightonocr3),
+            .ocr_pinned_inputs_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_OCR_PINNED_INPUTS", profile == .lightonocr3),
+            .lighton_cached_mrope_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_CACHED_MROPE_POSITIONS", lighton_auto),
             .lighton_fused_batch_recurrent = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_BATCH_RECURRENT"),
             .lighton_prefix_batch_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_PREFIX"),
             .lighton_prefix_shared_qk_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_PREFIX_SHARED_QK"),
-            .lighton_state_pool_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_STATE_POOL"),
-            .lighton_shared_recurrent_weights_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_SHARED_RECURRENT_WEIGHTS"),
+            .lighton_state_pool_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_STATE_POOL", lighton_auto),
+            .lighton_shared_recurrent_weights_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_SHARED_RECURRENT_WEIGHTS", lighton_auto),
             .lighton_parallel_prefix = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_PARALLEL_PREFIX"),
-            .lighton_cached_recurrent_gates = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_CACHED_RECURRENT_GATES"),
-            .lighton_recurrent_batch_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_RECURRENT"),
-            .lighton_ragged_recurrent_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_RAGGED_RECURRENT"),
-            .lighton_fused_gdn_decode_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_GDN_DECODE"),
+            .lighton_cached_recurrent_gates = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_CACHED_RECURRENT_GATES", lighton_auto),
+            .lighton_recurrent_batch_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_RECURRENT", lighton_auto),
+            .lighton_ragged_recurrent_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_RAGGED_RECURRENT", lighton_auto),
+            .lighton_fused_gdn_decode_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_GDN_DECODE", lighton_auto),
             .florence_f16_weights_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_F16_WEIGHTS"),
+            .whisper_f16_weights_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_WHISPER_F16_WEIGHTS", true),
             .florence_channel_tc_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_CHANNEL_TC"),
             .florence_fused_bias_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_BIAS"),
             .florence_fused_depthwise_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_DEPTHWISE"),
-            .lighton_fused_vision_mlp_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_MLP"),
-            .lighton_fused_vision_qkv_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_QKV"),
-            .lighton_norm_weight_cache_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE"),
+            .lighton_precision = try @import("lighton_vision_bf16.zig").Precision.resolveWithAttention(platform.env.getenv("ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE"), platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_VISION_CUDNN", true)),
+            .lighton_fused_vision_mlp_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_MLP", lighton_auto),
+            .lighton_fused_vision_qkv_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_QKV", lighton_auto),
+            .lighton_norm_weight_cache_enabled = platform.env.getenvBoolDefault("ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE", profile == .lightonocr3),
 
             .florence_bart_ffn_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_BART_FFN"),
             .florence_fused_append_enabled = platform.env.getenvBool("ANTFLY_CUDA_ENABLE_FLORENCE_FUSED_KV_APPEND"),
@@ -4395,8 +5494,13 @@ pub const CudaCompute = struct {
             .tuned_route_gates = tuned_route_gates,
             .capture_gates = capture_gates,
             .temp_slot_config = CudaTempSlotConfig.resolve(capture_gates),
+            .runtime_policy = @import("runtime_policy.zig").Policy.resolve(),
+            .dispatch_stats = .{ .enabled = cudaDispatchStatsEnabled() },
             .runtime_jit_shape_gating = jit_config.mode.activates(),
         };
+        std.log.info("cuda_generated_q4_policy compute={d}.{d} portable_matmul_capable={} evidence_target=sm_89 mmv={} mm={} pair={}", .{ ctx.info.compute_major, ctx.info.compute_minor, quant_kernel_catalog.portableCudaDeviceSupported(ctx.info.compute_major, ctx.info.compute_minor), generated_q4_0_gates.mmv, generated_q4_0_gates.mm, generated_q4_0_gates.pair });
+        if (profile == .lightonocr3) std.log.info("lighton_cuda_policy compute={d}.{d} driver={d} automatic={} graph={s} specialized_kernels={}", .{ ctx.info.compute_major, ctx.info.compute_minor, ctx.info.driver_version, lighton_auto, @tagName(result.lightOnGraphDecision()), lighton_device.specializedKernels() });
+        return result;
     }
 
     pub fn create(allocator: std.mem.Allocator) !*CudaCompute {
@@ -4408,12 +5512,22 @@ pub const CudaCompute = struct {
     }
 
     pub fn deinit(self: *CudaCompute) void {
+        // The context owns final driver disposal, including transfer to failed-
+        // allocation quarantine. Keep its entry points alive through the host
+        // cleanup below, even after releaseResources retires the GPU wrapper.
+        defer self.ctx.deinit();
+        if (self.gemma4_projector_weight_count != 0) std.log.info("cuda_gemma4_projector_cache weights={d} bytes={d} hits={d} misses={d}", .{
+            self.gemma4_projector_weight_count, self.gemma4_projector_weight_bytes,
+            self.gemma4_projector_weight_hits,  self.gemma4_projector_weight_misses,
+        });
+        logGemma4GemmPlans(self);
+        logGemma4Memory(self);
         if ((self.capability_profile == .lightonocr3 or self.capability_profile == .florence2) and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
             const stats = self.snapshotStats();
             const physical = self.ctx.device_allocations.snapshot();
             std.debug.print("OCR_CUDA cache_budget_bytes={d} deferred_budget_bytes={d} retained_budget_bytes={d}\n", .{ cudaTempCacheBudgetBytes(self), cudaDeferredFreeBudgetBytes(self), self.ocr_retained_cache_bytes });
             std.debug.print("OCR_CUDA temp_hits={d} temp_misses={d} temp_evictions={d} temp_cached_bytes={d} temp_cached_buffers={d} forced_drains={d} physical_live_bytes={d} physical_peak_bytes={d} physical_limit_bytes={d}\n", .{
-                stats.temp_buffer_hits, stats.temp_buffer_misses, stats.temp_buffer_evictions, stats.temp_buffer_cached_bytes, self.temp_buffers.items.len, stats.deferred_free_forced_drains, physical.live, physical.peak, physical.limit,
+                stats.temp_buffer_hits, stats.temp_buffer_misses, stats.temp_buffer_evictions, stats.temp_buffer_cached_bytes, self.temp_buffers.buffers.items.len, stats.deferred_free_forced_drains, physical.live, physical.peak, physical.limit,
             });
         }
         self.audio_plans.clear();
@@ -4421,6 +5535,7 @@ pub const CudaCompute = struct {
             self.embedding_gemma2_resize.clear(&self.ctx) catch break :failed true;
             self.embedding_gemma2_execution.clear(self.allocator, &self.ctx) catch break :failed true;
             self.clearEmbeddingGemma2Constants(false) catch break :failed true;
+            self.clearGemma4ProjectorWeights(false) catch break :failed true;
             break :failed false;
         };
         if (self.lighton_bf16_decode_scratch.ptr != 0) {
@@ -4443,11 +5558,22 @@ pub const CudaCompute = struct {
         if (self.capability_profile == .florence2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("FLORENCE2 cuda_bart_ffn_calls={d}\n", .{self.florence_bart_ffn_calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
-            std.debug.print("LIGHTONOCR3 cuda_fused_vision_mlp_calls={d}\n", .{self.lighton_vision_fused.calls});
+            std.debug.print("LIGHTONOCR3 cuda_fused_vision_mlp_calls={d} cuda_vision_up_gemm_calls={d}\n", .{ self.lighton_vision_fused.calls, self.lighton_vision_up.calls + self.lighton_vision_bf16.up.calls });
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_bf16_vision_blocks={d} precision_profile={s}\n", .{ self.lighton_vision_bf16.blocks, @tagName(self.lighton_precision) });
+        std.debug.print("LIGHTONOCR3 cuda_attention_input_fusions={d}\n", .{self.lighton_attention_inputs.calls});
+        std.debug.print("LIGHTONOCR3 cuda_projection_residual_calls={d}\n", .{self.lighton_projection_residual_calls});
+        std.debug.print("LIGHTONOCR3 cuda_vision_output_residual_calls={d}\n", .{self.lighton_vision_output_residual_calls});
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_vision_bias_epilogue_calls={d}\n", .{self.lighton_vision_bias_epilogue_calls});
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_vision_norm_qkv_calls={d}\n", .{self.lighton_vision_norm_qkv_calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_norm_weight_cache_hits={d} cuda_norm_weight_cache_misses={d}\n", .{ self.lighton_norm_weight_cache_hits, self.lighton_norm_weight_cache_misses });
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_fused_vision_qkv_calls={d}\n", .{self.lighton_vision_fused.qkv_calls});
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_vision_position_calls={d}\n", .{self.lighton_vision_fused.position_calls});
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_ffn_bf16_input_calls={d} cuda_ffn_separate_calls={d} cuda_ffn_block_calls={d}\n", .{ self.lighton_activation.calls, self.lighton_activation.separate_calls, self.lighton_activation.norm_calls });
         if (self.temp_scan_profile.enabled) {
@@ -4458,10 +5584,28 @@ pub const CudaCompute = struct {
             std.debug.print("OCR_CUDA temp_lock_diagnostic_interval=1024 alloc_ops={d} alloc_samples={d} alloc_cpu_samples={d} alloc_cpu_ns={d} alloc_wall_ns={d} release_ops={d} release_samples={d} release_cpu_samples={d} release_cpu_ns={d} release_wall_ns={d}\n", .{ alloc_lock.operations, alloc_lock.samples, alloc_lock.cpu_samples, alloc_lock.cpu_ns, alloc_lock.wall_ns, release_lock.operations, release_lock.samples, release_lock.cpu_samples, release_lock.cpu_ns, release_lock.wall_ns });
             std.debug.print("OCR_CUDA temp_scan_diagnostic_interval=1024 alloc_ops={d} alloc_samples={d} alloc_cpu_samples={d} alloc_cpu_ns={d} alloc_wall_ns={d} alloc_entries={d} release_ops={d} release_samples={d} release_cpu_samples={d} release_cpu_ns={d} release_wall_ns={d} release_entries={d}\n", .{ search.operations, search.samples, search.cpu_samples, search.cpu_ns, search.wall_ns, search.entries, release.operations, release.samples, release.cpu_samples, release.cpu_ns, release.wall_ns, release.entries });
         }
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_model_graph_captures={d} cuda_model_graph_replays={d} cuda_model_graph_admission_denials={d} cuda_model_graph_wide_replays={d} cuda_model_graph_max_replay_rows={d}\n", .{ self.lighton_decode_graph.captures, self.lighton_decode_graph.replays, self.lighton_decode_graph.admission_denials, self.lighton_decode_graph.wide_replays, self.lighton_decode_graph.max_replay_rows });
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_model_graph_enabled={d} state_pool={d} lazy={d} training={d}\n", .{ @intFromBool(self.lighton_decode_graph_enabled), @intFromBool(self.lighton_state_pool_enabled), @intFromBool(self.lazy_host_store != null), @intFromBool(self.resident_training_cache) });
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_fused_head_calls={d}\n", .{self.lighton_head.calls});
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_vision_down_gemm_calls={d}\n", .{self.lighton_vision_down.calls + self.lighton_vision_bf16.down.calls});
+        self.lighton_decode_graph.invalidate(&self.ctx);
         self.lighton_activation.deinit(&self.ctx);
+        self.lighton_vision_bf16.deinit(&self.ctx);
+        self.lighton_attention_inputs.deinit(&self.ctx);
+        self.glide_attention.deinit(&self.ctx);
+        self.glide_delta.deinit(&self.ctx);
+        self.glide_activation.deinit(&self.ctx);
         self.lighton_vision_fused.deinit(&self.ctx);
+        self.lighton_head.deinit(&self.ctx);
+        self.lighton_vision_up.deinit(&self.ctx);
+        self.lighton_vision_down.deinit(&self.ctx);
 
         self.florence_fused.deinit(&self.ctx);
+        self.whisper_cuda.deinit(&self.ctx);
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_cached_gate_single_calls={d} cuda_cached_gate_batch_calls={d}\n", .{ self.lighton_recurrent.cached_single_calls, self.lighton_recurrent.cached_batch_calls });
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
@@ -4472,9 +5616,17 @@ pub const CudaCompute = struct {
             std.debug.print("LIGHTONOCR3 cuda_prefix_shared_qk_calls={d}\n", .{self.lighton_recurrent.prefix_shared_qk_calls});
             std.debug.print("LIGHTONOCR3 cuda_ragged_batch_calls={d} cuda_ragged_query_rows={d}\n", .{ self.lighton_recurrent.ragged_batch_calls, self.lighton_recurrent.ragged_query_rows });
             std.debug.print("LIGHTONOCR3 cuda_state_pool_hits={d} cuda_state_pool_misses={d} cuda_state_pool_releases={d} cuda_shared_recurrent_weight_borrows={d}\n", .{ self.lighton_state_pool_hits, self.lighton_state_pool_misses, self.lighton_state_pool_releases.load(.monotonic), self.lighton_shared_recurrent_weight_borrows });
+            std.debug.print("LIGHTONOCR3 cuda_deferred_buffer_reuses={d} cuda_deferred_buffer_reused_bytes={d} cuda_deferred_state_reuses={d}\n", .{ self.lighton_deferred_buffer_reuses, self.lighton_deferred_buffer_reused_bytes, self.lighton_deferred_state_reuses });
         }
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("LIGHTONOCR3 cuda_packed_state_calls={d} cuda_rms_norm_bf16_mirror_hits={d} activation_mirror_hits={d}\n", .{ self.lighton_packed_state_calls, self.stats.rms_norm_bf16_mirror_hits, self.stats.bf16_cublaslt_activation_mirror_hits });
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_fused_gdn_decode_calls={d} cuda_fused_gdn_decode_pages={d}\n", .{ self.lighton_recurrent.fused_decode_calls, self.lighton_recurrent.fused_decode_pages });
+        if (self.lighton_recurrent.bf16_prefill) |prefill| {
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) if (prefill.attention) |fast| std.debug.print("LIGHTONOCR3 cuda_native_prefill_attention_calls={d} plans={d} metadata_slots={d} slot_reuses={d}\n", .{ fast.calls, fast.plans, @import("lighton_prefill_attention.zig").metadata_slots, fast.slot_reuses });
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+                std.debug.print("LIGHTONOCR3 cuda_bf16_recurrent_prefill_calls={d} workspace_peak={d}\n", .{ prefill.calls, prefill.workspace_peak });
+        }
         self.lighton_recurrent.deinit(&self.ctx);
         if (self.florence_cudnn_conv) |*module| {
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("FLORENCE2 cuda_conv_cudnn_calls={d}\n", .{module.calls});
@@ -4499,13 +5651,17 @@ pub const CudaCompute = struct {
         self.lighton_attention.deinit(&self.ctx);
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
             std.debug.print("LIGHTONOCR3 cuda_bucketed_linear_calls={d}\n", .{self.stats.bf16_bucketed_linear_calls});
+            if (self.cublaslt) |*blas| std.debug.print("LIGHTONOCR3 cuda_canonical_gdn_calls={d} plans={d}\n", .{ blas.canonical_gdn_calls, blas.canonical_gdn_plans });
+            std.debug.print("LIGHTONOCR3 cuda_async_burst_downloads={d} cuda_async_burst_interleavings={d}\n", .{ self.lighton_async_burst_downloads, self.lighton_async_burst_interleavings });
+            std.debug.print("LIGHTONOCR3 cuda_packed_async_downloads={d} cuda_packed_async_interleavings={d} cuda_packed_sync_downloads={d}\n", .{ self.lighton_packed_async_downloads, self.lighton_packed_async_interleavings, self.lighton_packed_sync_downloads });
+            if (self.cublaslt) |*blas| std.debug.print("LIGHTONOCR3 cuda_lighton_projection_probe_calls={d} plans={d}\n", .{ blas.lighton_projection_probe_calls, blas.lighton_projection_probe_plans });
             std.debug.print("LIGHTONOCR3 cuda_bf16_decode_output_calls={d}\n", .{self.stats.bf16_decode_output_calls});
             std.debug.print("LIGHTONOCR3 cuda_bf16_prefill_ffn_calls={d}\n", .{self.lighton_bf16_prefill_ffn_calls});
             std.debug.print("LIGHTONOCR3 cuda_fused_ffn_calls={d} paired_weights={d}\n", .{ self.lighton_fused_ffn_calls, self.lighton_gate_up_cache.count() });
-            if (self.cublaslt) |*blas| std.debug.print("LIGHTONOCR3 cuda_gemm_plans={d} capacity={d} hits={d} misses={d} uncached={d} tuning_declines={d} scalar_calls={d}\n", .{
-                blas.tensor_core_plans.count(),      blas.plan_cache_capacity, blas.plan_cache_hits,
-                blas.plan_cache_misses,              blas.uncached_plans,      self.stats.bf16_cublaslt_tuning_api_fallbacks,
-                self.stats.bf16_scalar_linear_calls,
+            if (self.cublaslt) |*blas| std.debug.print("LIGHTONOCR3 cuda_gemm_plans={d} capacity={d} hits={d} misses={d} uncached={d} tuning_declines={d} scalar_calls={d} refreshes={d}\n", .{
+                blas.tensor_core_plans.count(),      blas.plan_cache_capacity,  blas.plan_cache_hits,
+                blas.plan_cache_misses,              blas.uncached_plans,       self.stats.bf16_cublaslt_tuning_api_fallbacks,
+                self.stats.bf16_scalar_linear_calls, blas.plan_cache_refreshes,
             });
         }
         if (self.capability_profile == .florence2 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
@@ -4515,6 +5671,8 @@ pub const CudaCompute = struct {
             std.debug.print("OCR_CUDA pinned_metadata_uploads={d} mrope_cache_hits={d} mrope_cache_uploads={d}\n", .{ self.ocr_pinned_metadata_uploads, self.lighton_mrope_cache_hits, self.lighton_mrope_cache_uploads });
         if ((self.capability_profile == .lightonocr3 or self.capability_profile == .florence2) and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("OCR_CUDA pinned_input_uploads={d} pinned_input_wraps={d}\n", .{ self.ocr_pinned_input_uploads, self.ocr_pinned_input_wraps });
+        if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+            std.debug.print("OCR_CUDA pinned_metadata_event_uploads={d} pinned_metadata_event_wraps={d} pinned_metadata_scalar_wrap_syncs={d}\n", .{ self.ocr_pinned_metadata_event_uploads, self.ocr_pinned_metadata_arena.wraps, self.stats.pinned_scalar_upload_wrap_syncs });
         self.dispatch_stats.printIfEnabled(self.q4_route_census_enabled);
         self.dispatch_stats.deinit(self.allocator);
         deinitProfilePool(self);
@@ -4565,7 +5723,9 @@ pub const CudaCompute = struct {
         self.debug_cuda_decode_scalars.free(&self.ctx);
         self.pinned_scalar_upload_ring.host.free(&self.ctx);
         self.pinned_upload_arena.host.free(&self.ctx);
-        self.ocr_pinned_input_host.free(&self.ctx);
+        self.ocr_pinned_metadata_arena.deinit(&self.ctx);
+        self.ocr_pinned_input.deinit(&self.ctx);
+        self.lighton_burst_readback.deinit(&self.ctx);
         self.pinned_scalar_download_buffer.host.free(&self.ctx);
         self.pinned_bulk_download_buffer.free(&self.ctx);
         if (self.async_i32_scalar_download.in_use and self.async_i32_scalar_download.event != null) {
@@ -4588,7 +5748,7 @@ pub const CudaCompute = struct {
         self.temp_pinned_slots.deinit(self.allocator);
         self.temp_arena_planner.deinit(self.allocator);
         self.generated_gqa_score_prework_templates.deinit(self.allocator);
-        for (self.temp_buffers.items) |*buffer| buffer.free(&self.ctx);
+        for (self.temp_buffers.buffers.items) |*buffer| buffer.free(&self.ctx);
         self.temp_buffers.deinit(self.allocator);
 
         if (self.deferred_device_frees.items.len != 0) {
@@ -4645,11 +5805,14 @@ pub const CudaCompute = struct {
             self.cublaslt = null;
         }
         self.kernels.unload(&self.ctx);
+        // Resident views and graph executables are gone. Keep host ownership
+        // through that boundary, then transfer any uncertain drain/free.
+        self.gemma4_ple_host.retire(&self.ctx);
+        if (self.gemma4_ple_host_lease) |*lease| lease.release();
+        self.gemma4_ple_host_lease = null;
         self.ctx.releaseResources();
         if (self.ocr_retained_cache_lease) |*lease| lease.release();
         self.ocr_retained_cache_lease = null;
-        if (self.ocr_pinned_input_lease) |*lease| lease.release();
-        self.ocr_pinned_input_lease = null;
         if (self.lighton_mrope_cache_lease) |*lease| lease.release();
         self.lighton_mrope_cache_lease = null;
         for (self.lighton_projection_leases.items) |*lease| lease.release();
@@ -4662,10 +5825,10 @@ pub const CudaCompute = struct {
         self.lighton_bf16_decode_lease = null;
         if (retained_cleanup_failed) {
             self.clearEmbeddingGemma2Constants(true) catch {};
+            self.clearGemma4ProjectorWeights(true) catch {};
             self.embedding_gemma2_execution.releaseAfterContextDestroyed(self.allocator);
             self.embedding_gemma2_resize.releaseAfterContextDestroyed(&self.ctx);
         }
-        self.ctx.driver.deinit();
     }
 
     pub const AttentionMatchProfile = struct {
@@ -4747,6 +5910,70 @@ pub const CudaCompute = struct {
         return .{ .ptr = self, .vtable = &scoped_run_budget_vtable };
     }
 
+    /// The caller owns the model mutex for setup and every compute/cleanup
+    /// step. Unlike a whole-request scoped handle, deinit does not mutate the
+    /// shared binding while a different request may be executing.
+    /// Numerical qualification belongs to the resident backend inventory.
+    /// Geometry alone cannot qualify a dense/BF16 or differently quantized head.
+    pub fn cooperativeDecodeBatchRows(self: *const CudaCompute, tied: bool) usize {
+        const embedding = self.resident_weights.getPtr("model.embed_tokens.weight") orelse
+            self.resident_weights.getPtr("model.language_model.embed_tokens.weight") orelse
+            self.resident_weights.getPtr("token_embd.weight");
+        const output = if (tied) embedding else self.resident_weights.getPtr("lm_head.weight") orelse
+            self.resident_weights.getPtr("model.lm_head.weight") orelse
+            self.resident_weights.getPtr("output.weight") orelse embedding;
+        const head = output orelse return 1;
+        if (!isKnownQuant(head, .Q6_K) or !self.tuned_route_gates.q6_k_lm_head_q8_1) return 1;
+        var q4_backbone = false;
+        var weights = self.resident_weights.valueIterator();
+        while (weights.next()) |weight| if (isKnownQuant(weight, .Q4_0)) {
+            q4_backbone = true;
+            break;
+        };
+        if (!q4_backbone or self.kernels.linear_q6_k_q8_1_f32_tile8_e4b == null) return 1;
+        return 2;
+    }
+
+    pub fn computeBackendWithStepRunBudget(self: *CudaCompute, budget: *run_memory.RunBudget, owner: u64) ops.ComputeBackend {
+        return .{ .ptr = self, .vtable = &vtable, .execution_budget = budget, .execution_budget_bind = &bindStepRunBudget, .execution_owner = owner, .execution_batch_rows = &setCooperativeDecodeRows, .execution_batch_drain = &drainCooperativeDecode, .execution_enter = &enterExecutionOwner, .execution_cleanup = &cleanupExecutionOwner, .execution_release = &releaseExecutionOwner };
+    }
+
+    fn setCooperativeDecodeRows(raw: *anyopaque, rows: usize) void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        std.debug.assert(rows == 0 or rows == 2);
+        // A cohort touched both requests' backend metadata. The next single
+        // owner must enter through the normal transition contract, even when
+        // it was the leader of this cohort. Ordinary singleton reuses remain
+        // unchanged. Called after the scope's confirmed stream drain.
+        if (rows == 0 and self.cooperative_decode_rows != 0) self.cooperative_owner.cleanup();
+        self.cooperative_decode_rows = rows;
+    }
+
+    fn drainCooperativeDecode(raw: *anyopaque) !void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        try self.ctx.synchronize();
+    }
+
+    fn enterExecutionOwner(raw: *anyopaque, owner: u64) !void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        try self.cooperative_owner.enter(owner, raw, &beginRequest);
+    }
+
+    fn releaseExecutionOwner(raw: *anyopaque, owner: u64) void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        self.cooperative_owner.release(owner);
+    }
+
+    fn cleanupExecutionOwner(raw: *anyopaque, _: u64) void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        self.cooperative_owner.cleanup();
+    }
+
+    fn bindStepRunBudget(raw: *anyopaque, budget: ?*run_memory.RunBudget) void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        self.configureRunBudget(budget);
+    }
+
     pub fn deviceMemoryInfo(self: *CudaCompute) !context_mod.DeviceMemoryInfo {
         return self.ctx.memoryInfo();
     }
@@ -4768,6 +5995,7 @@ pub const CudaCompute = struct {
             .gliner25_boundary => self.kernels.hasGliner25InferencePrimitives(),
             .gliner25_modern_bert => self.kernels.hasLayaPrimitives() and self.kernels.gliner_encoder_attention_f32 != null,
             .florence2 => self.kernels.hasFlorence2Primitives(),
+            .whisper => profileSupportsDevice(.whisper, self.ctx.info.compute_major, self.ctx.info.compute_minor) and self.kernels.hasFlorence2Primitives() and self.kernels.gliner_encoder_attention_tc_f16 != null,
             .gemma4 => self.kernels.hasQuantMatmulMvpPrimitives() and
                 self.kernels.hasBf16WeightPrimitives() and
                 (self.kernels.hasGemma4DecoderPrimitives() or cudaAllowHostAttentionFallback()),
@@ -4783,16 +6011,104 @@ pub const CudaCompute = struct {
         };
     }
 
+    pub fn configureGemma4Dense(self: *CudaCompute, qualified: bool, e4b: bool) !void {
+        self.gemma4_dense_qualified = qualified;
+        self.gemma4_ple_host_enabled = qualified and e4b and @import("ple_host.zig").requested();
+        self.gemma4_e4b_sm89_qualified = qualified and e4b and self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9;
+        self.gemma4_chunked_upload = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_CHUNKED_UPLOAD", true);
+        self.gemma4_temp_lru = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_TEMP_LRU", true);
+        self.gemma4_projector_cache_enabled = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PROJECTOR_CACHE", true);
+        self.gemma4_raw_q4_prefill = qualified and cudaTensorCoreQuantRequested() and
+            self.kernels.linear_gemma4_q4_0_bf16_raw != null and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_RAW_Q4_PREFILL", self.gemma4_e4b_sm89_qualified);
+        // Model-scoped defaults: unrelated decoder/encoder profiles retain
+        // their existing selection, as do explicit diagnostic overrides.
+        if (!self.gemma4_e4b_sm89_qualified) return;
+        // Diverse prompt lengths need distinct shape/alignment descriptors.
+        // Once a small cache fills, uncached projections rediscover their
+        // algorithm in every layer. Retain a bounded larger set without
+        // evicting descriptors that a captured/asynchronous caller may borrow.
+        if (self.cublaslt) |*blas| try blas.setPlanCacheCapacity(
+            platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES") orelse 1024,
+        );
+        if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_Q4_0_CUBLAS_PREFILL") == null)
+            self.tuned_route_gates.q4_0_cublas_prefill = true;
+        // The qualified 80-token audio prompt benefits below the general
+        // 128-row threshold. Singleton decode retains its GEMV contract.
+        if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_Q4_0_CUBLAS_PREFILL_MIN_ROWS") == null)
+            self.tuned_route_gates.q4_0_cublas_prefill_min_rows = 64;
+        if (self.kernels.gqa_prefill_profile == .automatic)
+            self.kernels.gqa_prefill_profile = .flash_f16_sm89;
+        // Split attention avoids serial per-key decode at long contexts. Its
+        // F16 storage and exact E4B geometry are checked again at dispatch.
+        if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT") == null)
+            self.kernels.e4b_f16_warp_split_enabled = self.kernels.gqa_attention_decode_f16_warp_stage1_f32 != null;
+        if (self.runtime_policy.split_attention == null) self.runtime_policy.split_attention = true;
+        if (self.runtime_policy.split_attention_chunk == null) self.runtime_policy.split_attention_chunk = 64;
+        // Exact-size reuse prevents small decoder temporaries from occupying
+        // the much larger buffers needed by the next prefill chunk. Keep the
+        // existing byte ceiling while admitting more small cached buffers.
+        if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_TEMP_STABLE_REUSE") == null)
+            self.runtime_policy.stable_temp_reuse = true;
+        if (self.runtime_policy.max_temp_buffers == null) self.runtime_policy.max_temp_buffers = 2048;
+        if (self.kernels.gqa_score_prework_mode == .automatic)
+            self.kernels.gqa_score_prework_mode = .disabled;
+        std.log.info("cuda_gemma4_e4b_policy raw_q4={} cublas_prefill={} cublas_min_rows={d} prefill={s} decode_scores={s} decode_consumer={s} warp_split={}", .{
+            self.gemma4_raw_q4_prefill,              self.tuned_route_gates.q4_0_cublas_prefill,    self.tuned_route_gates.q4_0_cublas_prefill_min_rows,
+            self.kernels.gqa_prefill_profile.name(), @tagName(self.kernels.gqa_score_prework_mode), self.kernels.gqa_score_prework_consumer_mode.name(),
+            self.kernels.e4b_f16_warp_split_enabled,
+        });
+    }
+
+    /// Only the serialized, request-owned generation path calls this after
+    /// rendering the full multimodal prompt. Explicit diagnostic capacity wins.
+    /// The same bound is installed in NativeDecodeState before any KV write.
+    /// allow_default additionally requires the caller's pure-greedy contract.
+    pub fn configureGemma4RequestReplayCapacity(cb: *const ops.ComputeBackend, prompt: usize, output: usize, allow_default: bool) !?usize {
+        if (cb.kind() != .cuda or cb.execution_owner != 0) return null;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        const explicit_mode = platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY") != null;
+        if (!self.gemma4_e4b_sm89_qualified or (explicit_mode and !cudaDecodeGraphReplayEnabled()) or
+            (!explicit_mode and (!allow_default or
+                !cuda_artifact.hasBf16WmmaCodeFor(self.ctx.info.compute_major, self.ctx.info.compute_minor) or
+                !self.capture_gates.persistent_replay or !self.capture_gates.device_scalars or
+                (!self.temp_slot_config.autoplan_enabled and self.temp_slot_config.configured_period == 0))) or
+            !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_ADAPTIVE_REPLAY_CAPACITY", true) or
+            platform.env.getenv("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") != null or
+            self.resident_training_cache or self.execution_scope != null or
+            self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
+        self.gemma4_request_replay_disabled = false;
+        const capacity = gemma4RequestReplayCapacity(prompt, output) orelse {
+            // Automatic promotion is bounded, including explicit "auto".
+            // Only required replay fails closed outside the qualified envelope.
+            if (cudaDecodeGraphReplayMode() == .required) return error.CudaGraphReplayRequired;
+            // An explicit automatic policy otherwise still reaches the graph
+            // probes through the architecture's process setting. Without the
+            // bounded KV reserve, force this request to stay eager as it grows.
+            self.gemma4_request_replay_disabled = explicit_mode;
+            return null;
+        };
+        self.gemma4_request_replay_capacity = capacity;
+        return capacity;
+    }
+
+    pub fn gemma4SharedKvPrefillEnabled(cb: *const ops.ComputeBackend) bool {
+        if (cb.kind() != .cuda) return false;
+        const self: *const CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_SHARED_KV_PREFILL", self.gemma4_e4b_sm89_qualified);
+    }
+
     pub fn requireProfile(self: *CudaCompute, profile: CapabilityProfile) !void {
         if (!self.supportsProfile(profile)) return error.CudaKernelUnavailable;
         if (profile == .lightonocr3) try self.lighton_recurrent.init(&self.ctx);
+        if (profile == .whisper) try self.whisper_cuda.init(&self.ctx);
     }
 
     pub fn snapshotStats(self: *const CudaCompute) RuntimeStats {
         var stats = self.stats;
         stats.kernel_launches = self.ctx.stats.kernel_launches;
         stats.stream_syncs = self.ctx.stats.stream_syncs;
-        for (self.temp_buffers.items) |buffer| {
+        for (self.temp_buffers.buffers.items) |buffer| {
             stats.temp_buffer_cached_bytes += buffer.len;
         }
         for (self.temp_pinned_slots.items) |slot| {
@@ -5527,6 +6843,10 @@ pub const CudaCompute = struct {
             return self.insertWeightFromTensor(owned_key, &converted);
         }
         if (loaded.quantized_storage) |storage| {
+            if (self.gemma4_ple_host_enabled and !self.resident_training_cache and
+                storage.shape.len == 2 and storage.shape[0] > 0 and storage.shape[1] > 0 and
+                @import("ple_host.zig").eligible(owned_key, @intCast(storage.shape[0]), @intCast(storage.shape[1]), storage.tensor_type))
+                return self.insertGemma4PleHostWeight(owned_key, storage);
             if (cudaShouldDequantizeQ4_0MatrixWeightToBf16OnUpload(owned_key, storage)) {
                 return self.insertBf16WeightFromQuantizedStorage(owned_key, storage);
             }
@@ -5561,9 +6881,10 @@ pub const CudaCompute = struct {
             errdefer self.allocator.free(shape);
             var device = try allocDeviceBuffer(self, storage.raw_bytes.len);
             errdefer device.free(&self.ctx);
-            try copyFromHostTracked(self, device, storage.raw_bytes);
+            try copyMappedWeightFromHostTracked(self, device, storage.raw_bytes, if (storage.raw_mmap_backed) storage.raw_mmap_source_bytes else null);
             const gliner_f16 = self.gliner_q8_f16_mirrors and canUseF16TensorCoreWeights(self) and
-                glinerQ8ProjectionWeight(self.gliner_encoder_attention, owned_key, loaded);
+                (glinerQ8ProjectionWeight(self.gliner_encoder_attention, owned_key, loaded) or
+                    decideDebertaQ8ProjectionWeight(self.qualified_decide_q8, owned_key, loaded));
             var tc_quant = if (gliner_f16) null else try self.prepareTensorCoreQuantOnUpload(storage.tensor_type, storage.shape, device, storage.raw_bytes);
             errdefer if (tc_quant) |*packed_quant| releaseDeviceBuffer(self, &packed_quant.buffer);
             var gliner_mirror = buffer_mod.DeviceBuffer{};
@@ -5645,12 +6966,34 @@ pub const CudaCompute = struct {
         if (loaded.tensor.dtype == .bf16 and loaded.tensor.shape.len >= 2) {
             return self.insertBf16WeightFromTensor(owned_key, &loaded.tensor);
         }
+        // Whisper checkpoints commonly store FP32 matrices. Keep the dense
+        // projections and embedding table in FP16, with FP32 accumulation and
+        // logits; norms, biases and convolution filters retain FP32 storage.
+        if (self.capability_profile == .whisper and loaded.tensor.shape.len == 2 and
+            std.mem.endsWith(u8, owned_key, ".weight") and canUseF16TensorCoreWeights(self) and
+            self.whisper_f16_weights_enabled)
+        {
+            if (loaded.tensor.dtype == .f16) return self.insertF16WeightFromTensor(owned_key, &loaded.tensor);
+            if (loaded.tensor.dtype != .f32) return error.UnsupportedTensorType;
+            const values = loaded.tensor.asFloat32();
+            const half = try self.allocator.alloc(f16, values.len);
+            defer self.allocator.free(half);
+            for (values, half) |value, *out| {
+                out.* = @floatCast(value);
+                if (!std.math.isFinite(out.*)) return error.InvalidModelWeights;
+            }
+            var tensor = loaded.tensor;
+            tensor.dtype = .f16;
+            tensor.data = std.mem.sliceAsBytes(half);
+            return self.insertF16WeightFromTensor(owned_key, &tensor);
+        }
         // Keep matrix-shaped FP16 GGUF tensors in their native representation
         // only when the complete tensor-core route is available. Rank-one
         // parameters intentionally continue through F32: norms, biases, and
         // scalar graph operators retain their existing numerical behavior.
         if (loaded.tensor.dtype == .f16 and loaded.tensor.shape.len >= 2 and
             (cudaShouldKeepF16WeightOnDevice(owned_key) or
+                cudaShouldKeepGemma4PleF16(self, owned_key, &loaded.tensor) or
                 (self.capability_profile == .florence2 and self.florence_f16_weights_enabled and
                     cudaShouldKeepFlorenceF16Weight(owned_key, loaded.tensor.shape.len))) and
             canUseF16TensorCoreWeights(self))
@@ -5669,6 +7012,33 @@ pub const CudaCompute = struct {
             return self.insertWeightFromTensor(owned_key, &converted);
         }
         try self.insertWeightFromTensor(owned_key, &loaded.tensor);
+    }
+
+    fn insertGemma4PleHostWeight(self: *CudaCompute, owned_key: []const u8, storage: weight_source_mod.QuantizedStorage) !void {
+        if (self.gemma4_ple_host.host.ptr != null or self.resident_weights.contains(owned_key)) return error.InvalidCudaState;
+        const count = try elementCountFromShape(storage.shape);
+        const expected = gguf_tensor_types.byteLen(storage.tensor_type, &.{ @intCast(storage.shape[0]), @intCast(storage.shape[1]) }) orelse return error.InvalidShape;
+        if (storage.raw_bytes.len != expected) return error.InvalidShape;
+        const shape = try self.allocator.dupe(i64, storage.shape);
+        errdefer self.allocator.free(shape);
+        try self.resident_weights.ensureUnusedCapacity(self.allocator, 1);
+        const mapped = try buffer_mod.MappedHostBuffer.allocAdmitted(&self.ctx, storage.raw_bytes.len, &self.gemma4_ple_host_lease);
+        // Own the original quantized bytes independently of the temporary
+        // native session. Existing device-token gathers need no host readback.
+        @memcpy(mapped.host.bytes(), storage.raw_bytes);
+        self.resident_weights.putAssumeCapacityNoClobber(owned_key, .{
+            .buffer = mapped.view(),
+            .dtype = .u8,
+            .shape = shape,
+            .elem_count = count,
+            .quant_type = storage.tensor_type,
+            .owns_buffer = false,
+            .owns_shape = false,
+            .owned_by_tensor = false,
+        });
+        self.gemma4_ple_host = mapped;
+        self.stats.gemma4_ple_host_weight_bytes = storage.raw_bytes.len;
+        std.log.info("cuda_gemma4_ple_placement storage=mapped_host bytes={d}", .{storage.raw_bytes.len});
     }
 
     fn prepareTensorCoreQuantOnUpload(
@@ -5692,6 +7062,9 @@ pub const CudaCompute = struct {
         const q4_0_tc = known == .Q4_0 and self.tuned_route_gates.q4_0_tc_hmma_prefill;
         if (q4_0_tc) {
             if (!isQ4_0TcHmmaShape(in_dim, out_dim)) return null;
+            // The raw-layout kernel consumes the original resident bytes.
+            // Keep the packed compatibility route when its optional symbol is absent.
+            if (self.gemma4_raw_q4_prefill) return null;
         } else if (!(isTensorCoreQuantLinearShape(in_dim, out_dim) or (known == .Q8_0 and isGliner1BQ8LinearShape(in_dim, out_dim)))) {
             return null;
         }
@@ -5778,6 +7151,32 @@ pub const CudaCompute = struct {
         };
     }
 
+    /// GLiDE owns one dense device copy and no training/decode mirrors. Consume
+    /// the key on every path, including allocation failures before upload.
+    pub fn insertGlideWeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
+        errdefer self.allocator.free(owned_key);
+        if (!self.glide_cuda or (tensor.dtype != .f32 and tensor.dtype != .f16 and tensor.dtype != .bf16)) return error.UnsupportedTensorType;
+        const count = try elementCountFromShape(tensor.shape);
+        if (tensor.data.len != try checkedMul(count, tensor.dtype.byteSize())) return error.InvalidShape;
+        const shape = try self.allocator.dupe(i64, tensor.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, tensor.data.len);
+        errdefer device.free(&self.ctx);
+        try copyFromHostTracked(self, device, tensor.data);
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        try self.resident_weights.put(self.allocator, owned_key, .{
+            .buffer = device,
+            .dtype = tensor.dtype,
+            .shape = shape,
+            .elem_count = count,
+            .quant_type = null,
+            .owns_buffer = false,
+            .owns_shape = false,
+            .owned_by_tensor = false,
+        });
+        self.stats.resident_weight_bytes += tensor.data.len;
+    }
+
     pub fn insertBf16WeightFromTensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
         // This API consumes the key on every path. Keeping ownership here
         // makes loader error handling unambiguous and avoids both early-path
@@ -5827,6 +7226,30 @@ pub const CudaCompute = struct {
             .owns_shape = false,
             .owned_by_tensor = false,
         });
+    }
+
+    /// Copy a projector tensor without changing its precision. Linear weights
+    /// may stay compact; norms and other F32 consumers pass only F32 tensors.
+    pub fn uploadProjectorWeight(self: *CudaCompute, tensor: *const tensor_mod.Tensor) !CT {
+        const element_bytes: usize = switch (tensor.dtype) {
+            .f16, .bf16 => 2,
+            .f32 => 4,
+            else => return error.UnsupportedTensorType,
+        };
+        const count = try elementCountFromShape(tensor.shape);
+        if (tensor.data.len != try checkedMul(count, element_bytes)) return error.InvalidShape;
+        const shape = try dupeShape(self.allocator, tensor.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, tensor.data.len);
+        errdefer releaseDeviceBuffer(self, &device);
+        var scan = c_file.MmapRegion.SequentialRead.begin(tensor.mmap_source_bytes, tensor.data);
+        defer scan.deinit();
+        try copyFromHostTracked(self, device, tensor.data);
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        // Projector weights remain mapped for lazy lookup, but this completed
+        // upload no longer needs their clean host pages resident as a duplicate.
+        c_file.MmapRegion.adviseBytesDontNeed(scan.bytes);
+        return createTensorWithDType(self, device, shape, count, tensor.dtype);
     }
 
     /// Upload compact F16/BF16 weights and widen exactly on device. The caller owns
@@ -6450,6 +7873,7 @@ const CudaKvDeviceStorage = struct {
     }
 
     fn blockTableUploadBlockCount(
+        self: *const CudaKvDeviceStorage,
         token_count: usize,
         page_size_tokens: u16,
         logical_blocks: []const kv_block_mod.KvBlockId,
@@ -6457,7 +7881,7 @@ const CudaKvDeviceStorage = struct {
         const needed_blocks = try neededBlockCount(token_count, page_size_tokens);
         if (needed_blocks == 0) return 0;
         if (logical_blocks.len < needed_blocks) return error.InvalidPagedKvState;
-        const forced_tokens = cudaDebugGraphForcedKvReplayCapacityTokens() orelse return needed_blocks;
+        const forced_tokens = cudaDebugGraphForcedKvReplayCapacityTokens(self.compute) orelse return needed_blocks;
         const forced_blocks = try neededBlockCount(@max(token_count, forced_tokens), page_size_tokens);
         if (forced_blocks == 0 or logical_blocks.len < forced_blocks) return needed_blocks;
         return @max(needed_blocks, forced_blocks);
@@ -6486,7 +7910,7 @@ const CudaKvDeviceStorage = struct {
         token_count: usize,
         page_size_tokens: u16,
     ) !void {
-        const upload_blocks = try blockTableUploadBlockCount(@max(token_count, layer.reserved_capacity_tokens), page_size_tokens, logical_blocks);
+        const upload_blocks = try self.blockTableUploadBlockCount(@max(token_count, layer.reserved_capacity_tokens), page_size_tokens, logical_blocks);
         if (upload_blocks == 0) return;
         const block_table_bytes = try checkedMul(upload_blocks, @sizeOf(kv_block_mod.KvBlockId));
         const signature = blockTableSignature(logical_blocks, upload_blocks, page_size_tokens);
@@ -6581,7 +8005,7 @@ const CudaKvDeviceStorage = struct {
 
         const required_capacity = if (compressed_format != null and write.logical_blocks != null and write.page_size_tokens != 0) blk: {
             const logical_blocks = write.logical_blocks.?;
-            const upload_blocks = try blockTableUploadBlockCount(@max(write.total_token_count, write.device_capacity_tokens), write.page_size_tokens, logical_blocks);
+            const upload_blocks = try self.blockTableUploadBlockCount(@max(write.total_token_count, write.device_capacity_tokens), write.page_size_tokens, logical_blocks);
             break :blk try physicalCapacityTokens(logical_blocks, upload_blocks, write.page_size_tokens);
             // F32 KV is contiguous and does not derive its device allocation from
             // reserved logical blocks, so honor the explicit replay reserve here.
@@ -6589,7 +8013,7 @@ const CudaKvDeviceStorage = struct {
             break :blk try uncompressedCudaKvRequiredCapacity(
                 write.total_token_count,
                 cudaDebugGraphPersistentReplayEnabled(self.compute),
-                cudaDebugGraphForcedKvReplayCapacityTokens(),
+                cudaDebugGraphForcedKvReplayCapacityTokens(self.compute),
             );
         } else if (cudaDebugGraphPersistentReplayEnabled(self.compute))
             try std.math.add(usize, write.total_token_count, 256)
@@ -6625,7 +8049,7 @@ const CudaKvDeviceStorage = struct {
             layer.capacity_tokens = new_capacity;
         }
         if (cudaDebugGraphPersistentReplayEnabled(self.compute) and self.compute.debug_cuda_graph_capture_active) {
-            const replay_capacity = if (cudaDebugGraphForcedKvReplayCapacityTokens()) |forced|
+            const replay_capacity = if (cudaDebugGraphForcedKvReplayCapacityTokens(self.compute)) |forced|
                 @min(layer.capacity_tokens, forced)
             else
                 layer.capacity_tokens;
@@ -6798,6 +8222,7 @@ const CudaKvDeviceStorage = struct {
 
     fn releaseSequence(ctx: *anyopaque, sequence_id: kv_storage_runtime.SequenceId) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        if (self.compute.lighton_decode_graph_enabled) self.compute.lighton_decode_graph.invalidate(&self.compute.ctx);
         if (self.match_binding) |binding| if (binding.sequence == sequence_id) {
             binding.deinit();
             self.allocator.destroy(binding);
@@ -6825,6 +8250,7 @@ const CudaKvDeviceStorage = struct {
         retained_token_count: usize,
     ) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        if (self.compute.lighton_decode_graph_enabled) self.compute.lighton_decode_graph.invalidate(&self.compute.ctx);
         self.revision = std.math.add(u64, self.revision, 1) catch std.math.maxInt(u64);
         // A completed lookahead forward may be rolled back within its exact
         // tail. Never revive a failed forward or cross evicted/fitted history.
@@ -6845,10 +8271,13 @@ const CudaKvDeviceStorage = struct {
         }
     }
 
-    fn hookDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    fn hookDeinit(ctx: *anyopaque, _: std.mem.Allocator) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        // The hook belongs to the model's CUDA allocator, while its enclosing
+        // KV runtime can use a distinct admitted request allocator.
+        const owner = self.allocator;
         self.deinit();
-        allocator.destroy(self);
+        owner.destroy(self);
     }
 
     fn cloneExactPrefix(
@@ -7013,6 +8442,13 @@ fn cudaDequantizeQ4_0MatrixWeightsToBf16OnUpload() bool {
     return load_plan.dequantizeQ4_0ToBf16();
 }
 
+fn cudaShouldKeepGemma4PleF16(self: *const CudaCompute, name: []const u8, tensor: *const tensor_mod.Tensor) bool {
+    return self.gemma4_e4b_sm89_qualified and tensor.dtype == .f16 and
+        tensor.shape.len == 2 and tensor.shape[0] == 10752 and tensor.shape[1] == 2560 and
+        isPleModelProjectionWeightName(name) and !cudaPleModelProjectionBf16OnUpload() and
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_F16", true);
+}
+
 fn cudaPleModelProjectionBf16OnUpload() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16", false);
 }
@@ -7082,14 +8518,6 @@ fn cudaDeviceMirrorDequantEnabled() bool {
 
 fn cudaRmsNormBf16MirrorEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_RMS_NORM_BF16_MIRROR", false);
-}
-
-fn cudaCublasLtWorkspaceBytes() usize {
-    const workspace_mb = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CUBLASLT_WORKSPACE_MB") orelse
-        platform.env.getenvUsize("ANTFLY_CUDA_CUBLASLT_WORKSPACE_MB") orelse
-        platform.env.getenvUsize("TERMITE_CUDA_CUBLASLT_WORKSPACE_MB") orelse
-        0;
-    return std.math.mul(usize, workspace_mb, 1024 * 1024) catch 0;
 }
 
 const cuda_kv_format_polar4: u32 = 0;
@@ -7212,10 +8640,16 @@ fn warmupCublasLtBf16(cublaslt: *cublaslt_mod.CublasLt, ctx: *context_mod.CudaCo
     defer weight.free(ctx);
     var dst = buffer_mod.DeviceBuffer.alloc(ctx, rows * dim * @sizeOf(f32)) catch return;
     defer dst.free(ctx);
-    // Inputs stay uninitialized: the result is discarded, only the library
-    // load and heuristic init matter.
+    // Even discarded warmup outputs must consume initialized inputs. This
+    // path also runs before a specialty session installs its FP32 policy.
+    // Drain async copies and matmul before stack storage or buffers retire,
+    // including a partial-copy or heuristic failure.
+    defer ctx.synchronize() catch {};
+    const zeros: [dim * dim]u16 = @splat(0);
+    const zero_bytes = std.mem.asBytes(&zeros);
+    input.copyFromHost(ctx, zero_bytes[0..input.len]) catch return;
+    weight.copyFromHost(ctx, zero_bytes) catch return;
     cublaslt.matmulBf16WeightF32Out(ctx, dst, input, weight, .{}, rows, dim, dim) catch return;
-    ctx.driver.check(ctx.driver.fns.cuStreamSynchronize(ctx.stream)) catch {};
 }
 
 fn cudaShouldDequantizeWeightOnUpload(name: []const u8, storage: weight_source_mod.QuantizedStorage) bool {
@@ -7251,12 +8685,14 @@ fn cudaHybridQ4Bf16WeightsEnabled() bool {
     return load_plan.retainQ4_0Bf16Mirror();
 }
 
-// Qualified-performance target: production parity and performance evidence
-// for the default-on BF16 prefill mirrors and fused DeBERTa attention is
-// exact to NVIDIA L4 / SM89 (see models/gliner2/CUDA.md). Other architectures keep
-// the conservative route by default and opt in through the env switches.
-fn cudaQualifiedPerfTarget(compute_major: i32, compute_minor: i32) bool {
-    return compute_major == 8 and compute_minor == 9;
+fn lightOnDevice(self: *const CudaCompute) @import("lighton_device_policy.zig").Device {
+    return .{ .major = self.ctx.info.compute_major, .minor = self.ctx.info.compute_minor, .driver_version = self.ctx.info.driver_version };
+}
+
+// Compiled tensor-core capability, rather than the benchmark machine,
+// controls automatic encoder mirrors and materialized attention.
+fn cudaTensorCoreArtifactSupported(compute_major: i32, compute_minor: i32) bool {
+    return compute_major >= 8 and cuda_artifact.hasBf16WmmaCodeFor(compute_major, compute_minor);
 }
 
 fn cudaBertQ4Bf16PrefillEnabled(default_on: bool) bool {
@@ -7268,14 +8704,13 @@ fn cudaBertQ4Bf16PrefillEnabled(default_on: bool) bool {
 // only costs generated prefill routes, never correctness). The attach
 // decision itself must go through cudaShouldAttachBf16MirrorToQ4Weight,
 // which also requires the BF16 fast path to exist on the device and applies
-// the qualified-target default.
+// the compiled-artifact capability.
 fn cudaQ4WeightBf16MirrorPolicyEnabled(name: []const u8, storage: weight_source_mod.QuantizedStorage, bert_default_on: bool) bool {
     // Encoder prefill has M=batch*sequence rows, so dequantizing the static
     // Q4_0 projection once on upload and dispatching the existing BF16
     // cuBLASLt path is materially faster than repeatedly running the scalar
     // SIMT Q4 kernel. Keep decoder behavior opt-in, and enable the
-    // device-resident BERT/XLM-R profile by default only on the qualified
-    // target.
+    // device-resident BERT/XLM-R profile when its tensor-core artifact exists.
     const bert_encoder_weight = std.mem.startsWith(u8, name, "encoder.layer.");
     if (!cudaHybridQ4Bf16WeightsEnabled() and
         !(bert_encoder_weight and cudaBertQ4Bf16PrefillEnabled(bert_default_on)))
@@ -7307,7 +8742,7 @@ fn cudaShouldAttachBf16MirrorToQ4Weight(
     return cudaQ4WeightBf16MirrorPolicyEnabled(
         name,
         storage,
-        cudaQualifiedPerfTarget(self.ctx.info.compute_major, self.ctx.info.compute_minor),
+        cudaTensorCoreArtifactSupported(self.ctx.info.compute_major, self.ctx.info.compute_minor),
     );
 }
 
@@ -7482,6 +8917,43 @@ fn glinerQ8EncoderWeight(enabled: bool, name: []const u8, loaded: *const weight_
 
 fn glinerQ8ProjectionWeight(enabled: bool, name: []const u8, loaded: *const weight_source_mod.LoadedWeight) bool {
     return std.mem.startsWith(u8, name, "model.layers.") and glinerQ8EncoderWeight(enabled, name, loaded);
+}
+
+fn decideDebertaQ8ProjectionWeight(enabled: bool, name: []const u8, loaded: *const weight_source_mod.LoadedWeight) bool {
+    if (!enabled) return false;
+    const storage = loaded.quantized_storage orelse return false;
+    if (knownQuantTensorType(storage.tensor_type) != .Q8_0 or storage.shape.len != 2) return false;
+    const prefix = "encoder.layer.";
+    if (!std.mem.startsWith(u8, name, prefix)) return false;
+    const suffix_start = std.mem.indexOfScalarPos(u8, name, prefix.len, '.') orelse return false;
+    const layer = std.fmt.parseInt(u32, name[prefix.len..suffix_start], 10) catch return false;
+    if (layer >= 24) return false;
+    const suffix = name[suffix_start..];
+    const shape: []const i64 = if (std.mem.eql(u8, suffix, ".intermediate.dense.weight")) &.{ 4096, 1024 } else if (std.mem.eql(u8, suffix, ".output.dense.weight")) &.{ 1024, 4096 } else if (std.mem.eql(u8, suffix, ".attention.self.query_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.self.key_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.self.value_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.self.pos_query_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.self.pos_key_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.output.dense.weight")) &.{ 1024, 1024 } else return false;
+    return std.mem.eql(i64, storage.shape, shape);
+}
+
+test "Decide Q8 projection mirrors bind exact encoder roles" {
+    var loaded = weight_source_mod.LoadedWeight{
+        .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = "", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false },
+        .quantized = true,
+        .quantized_storage = .{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = &.{}, .shape = &.{ 1024, 1024 }, .allocator = std.testing.allocator },
+    };
+    try std.testing.expect(decideDebertaQ8ProjectionWeight(true, "encoder.layer.23.attention.self.query_proj.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(false, "encoder.layer.0.attention.self.query_proj.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "encoder.layer.24.attention.self.query_proj.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "embeddings.word_embeddings.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "classifier.0.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
+    loaded.quantized_storage.?.shape = &.{ 1024, 4096 };
+    try std.testing.expect(decideDebertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
+    loaded.quantized_storage.?.tensor_type = .{ .known = .Q4_0 };
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
 }
 
 /// Bounded host staging: the largest 1B projection needs 26.25 MiB of half
@@ -7766,16 +9238,45 @@ fn provisionKvDeviceWriteHook(ctx: *anyopaque, storage: *kv_storage_runtime.KvSt
     storage.setDeviceWriteHook(device_storage.hook());
 }
 
+fn logGemma4GemmPlans(self: *const CudaCompute) void {
+    if (self.gemma4_e4b_sm89_qualified) if (self.cublaslt) |*blas| std.log.info("cuda_gemma4_gemm_plans count={d} capacity={d} hits={d} misses={d} uncached={d}", .{
+        blas.tensor_core_plans.count(), blas.plan_cache_capacity, blas.plan_cache_hits,
+        blas.plan_cache_misses,         blas.uncached_plans,
+    });
+}
+
+fn logGemma4Memory(self: *CudaCompute) void {
+    if (self.capability_profile != .gemma4 or !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_GEMMA4_MEMORY_STATS")) return;
+    const physical = self.ctx.device_allocations.snapshot();
+    var pinned: usize = 0;
+    for (self.temp_pinned_slots.items) |slot| pinned +|= slot.buffer.allocation_bytes;
+    std.log.info("cuda_gemma4_memory device_live={d} device_peak={d} device_weights={d} host_ple={d} projector={d} idle_temp={d} pinned_temp={d} deferred={d}", .{
+        physical.live,                           physical.peak,                      self.stats.resident_weight_bytes,
+        self.stats.gemma4_ple_host_weight_bytes, self.gemma4_projector_weight_bytes, self.temp_buffers.bytes,
+        pinned,                                  self.deferred_device_free_bytes,
+    });
+}
+
 fn beginRequest(ctx: *anyopaque) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    self.cooperative_owner.reset();
+    logGemma4Memory(self);
+    // Opt-in request-boundary observations also work for supervisors that
+    // terminate a worker without running model destructors. Counters describe
+    // completed previous requests and never alter descriptor ownership.
+    if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_GEMMA4_PLAN_CACHE_STATS")) logGemma4GemmPlans(self);
     // A graph launch may still reference its captured temporary addresses.
     // Establish stream completion before destroying execs or recycling any
     // pinned slot at a request boundary. This is normally already satisfied
     // by token readback, but making it explicit keeps the ownership invariant
     // independent of sampling and response plumbing.
     if (self.ctx.debug_graph_capture_active) return error.InvalidCudaState;
+    self.lighton_decode_graph.invalidate(&self.ctx);
+    self.lighton_decode_graph.epoch_id = 0;
     try synchronizeAndDrainDeferredDeviceFrees(self);
     try resetDebugCudaGraphRequestState(self);
+    self.gemma4_request_replay_capacity = null;
+    self.gemma4_request_replay_disabled = false;
     if (self.temp_slot_config.autoplan_enabled or
         platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET", false))
     {
@@ -7814,10 +9315,16 @@ fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
         }
     }
     if (cuda_tensor.owns_bf16_mirror) releaseDeviceBuffer(self, &cuda_tensor.bf16_mirror);
+    if (cuda_tensor.owns_q8_1_mirror) releaseDeviceBuffer(self, &cuda_tensor.q8_1_mirror);
     if (cuda_tensor.owns_training_upload_host) cuda_tensor.training_upload_host.free(&self.ctx);
     if (cuda_tensor.model_constant) {
-        self.embedding_gemma2_constant_bytes -= cuda_tensor.elem_count * @sizeOf(f32);
-        self.embedding_gemma2_constant_count -= 1;
+        if (cuda_tensor.gemma4_projector_constant) {
+            self.gemma4_projector_weight_bytes -= cuda_tensor.elem_count * cuda_tensor.dtype.byteSize();
+            self.gemma4_projector_weight_count -= 1;
+        } else {
+            self.embedding_gemma2_constant_bytes -= cuda_tensor.elem_count * @sizeOf(f32);
+            self.embedding_gemma2_constant_count -= 1;
+        }
         cuda_tensor.buffer.free(&self.ctx);
         if (cuda_tensor.model_constant_lease) |*lease| lease.release();
     } else if (cuda_tensor.owns_buffer) releaseDeviceBuffer(self, &cuda_tensor.buffer);
@@ -7839,6 +9346,10 @@ fn freeCudaTensorStorageUncached(self: *CudaCompute, cuda_tensor: *CudaTensor) v
     if (cuda_tensor.owns_bf16_mirror and cuda_tensor.bf16_mirror.ptr != 0) {
         self.stats.device_free_calls += 1;
         cuda_tensor.bf16_mirror.free(&self.ctx);
+    }
+    if (cuda_tensor.owns_q8_1_mirror and cuda_tensor.q8_1_mirror.ptr != 0) {
+        self.stats.device_free_calls += 1;
+        cuda_tensor.q8_1_mirror.free(&self.ctx);
     }
     if (cuda_tensor.owns_training_upload_host) cuda_tensor.training_upload_host.free(&self.ctx);
     if (cuda_tensor.owns_buffer and cuda_tensor.buffer.ptr != 0) {
@@ -8318,8 +9829,31 @@ fn getDenseStreamWeight(self: *CudaCompute, name: []const u8) !?*CudaTensor {
     return try streamDenseWeightFromRange(self, name, range);
 }
 
+// Bound transient host residency while uploading a large mapped weight. In
+// particular, E4B's gather table is 2.3 GB: one pageable H2D transfer otherwise
+// faults that entire range alongside its full device allocation. Every slice
+// completes before its clean PTEs are discarded; file-cache bytes stay valid.
+const gemma4_mapped_upload_chunk_bytes: usize = 32 * 1024 * 1024;
+fn copyMappedWeightFromHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []const u8, mapping: ?[]const u8) !void {
+    if (bytes.len > device.len) return error.InvalidCudaState;
+    const proven_mapping = if (mapping) |full| c_file.mappedSliceOffset(full, bytes) != null else false;
+    if (self.capability_profile != .gemma4 or !self.gemma4_chunked_upload or !proven_mapping or bytes.len <= gemma4_mapped_upload_chunk_bytes)
+        return copyFromHostTracked(self, device, bytes);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const count = @min(gemma4_mapped_upload_chunk_bytes, bytes.len - offset);
+        const slice = bytes[offset..][0..count];
+        const view = buffer_mod.DeviceBuffer{ .ptr = device.ptr + offset, .len = count, .borrowed = true };
+        try copyFromHostTracked(self, view, slice);
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        c_file.MmapRegion.adviseBytesDontNeed(slice);
+        self.stats.gemma4_mapped_upload_chunks += 1;
+        offset += count;
+    }
+}
+
 fn copyFromHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []const u8) !void {
-    if (self.audio_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
+    if (self.execution_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
     if (self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) {
         self.debug_cuda_graph_capture_disabled = true;
         std.log.warn("cuda_graph_capture_probe: unsafe_h2d_copy bytes={d} disabled=1", .{bytes.len});
@@ -8329,6 +9863,18 @@ fn copyFromHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, byte
         (self.capability_profile == .lightonocr3 or self.capability_profile == .florence2) and
         bytes.len > 0 and bytes.len <= 64 * 1024)
     {
+        // A separately admitted arena retires only its queued copies. Small
+        // staging wraps must not drain later encoder/decoder work on SM121.
+        // Host-admission denial retains the ordinary ring/arena fallback.
+        const event_eligible = if (bytes.len <= pinned_scalar_upload_slot_size) !cudaPinnedScalarUploadsDisabled() else !cudaPinnedUploadArenaDisabled();
+        if (event_eligible and self.capability_profile == .lightonocr3 and
+            try self.ocr_pinned_metadata_arena.upload(&self.ctx, device, bytes))
+        {
+            self.stats.h2d_bytes += bytes.len;
+            self.ocr_pinned_metadata_uploads += 1;
+            self.ocr_pinned_metadata_event_uploads += 1;
+            return;
+        }
         // Pageable CUDA uploads can wait for preceding stream work. Retain a
         // private pinned copy until the ring/arena is safely synchronized and
         // reused, so caller-owned stack/heap data may retire immediately.
@@ -8369,10 +9915,10 @@ fn cudaAsyncI32ScalarDownloadStagingEnabled(self: *const CudaCompute) bool {
 
 // Resolved once at CudaCompute.init: the SM89-promoted decode/prefill tuning
 // battery frozen from the gemma4-e2b-sm89-flash-splitk-v1 execution profile.
-// Every route here is exact-output (bit-identical to its fallback) and keeps
-// its shape/quant eligibility guard at the dispatch site; only the meaning of
-// an UNSET environment variable depends on the compute capability. Explicit
-// env values keep working in both directions on every target.
+// Each route retains its shape/quantization and kernel-availability checks.
+// Unset settings follow compiled hardware capability; explicit settings
+// continue to override in both directions. Generated AOT kernels have their
+// own artifact target checks independent of these portable routes.
 pub const CudaTunedRouteGates = struct {
     linear_q8_1_dp4a: bool = false,
     qkv_q8_1_dp4a: bool = false,
@@ -8389,21 +9935,20 @@ pub const CudaTunedRouteGates = struct {
     q6_k_lm_head_q8_1: bool = false,
     lm_head_q8_1_argmax: bool = false,
     async_i32_download_staging: bool = false,
-    // Opt-in (default off, never auto-promoted): route Q4_0 prefill projections
-    // through the W4A16 tensor-core (tc_hmma) kernel, and fuse gate+up into a
-    // single concatenated cuBLASLt GEMM. Kept out of promotedDefaultsForTarget
-    // so they can be A/B'd against the cuBLASLt-BF16 mirror before promotion.
+    // W4A16 prefill follows compiled tensor-core capability and preserves
+    // BF16 mirror precedence. The separate bounded expansion and paired-GEMM
+    // experiments remain explicit choices.
     q4_0_tc_hmma_prefill: bool = false,
     /// Opt-in bounded, per-projection BF16 expansion. Reuses the temporary
     /// pool rather than retaining a dense copy of every model weight.
     q4_0_cublas_prefill: bool = false,
+    q4_0_cublas_prefill_min_rows: usize = 128,
     fused_gate_up_bf16: bool = false,
 
-    /// Defaults when every env variable is unset. The promoted battery is
-    /// default-on only on compute capability 8.9 (the qualified L4 target);
-    /// every other target keeps the historical opt-in defaults.
-    fn promotedDefaultsForTarget(compute_major: i32, compute_minor: i32) CudaTunedRouteGates {
-        if (compute_major != 8 or compute_minor != 9) return .{};
+    /// Defaults follow the compiled tensor-core capability. Each dispatch
+    /// retains its exact shape/quantization and kernel-availability checks.
+    fn defaultsForDevice(compute_major: i32, compute_minor: i32) CudaTunedRouteGates {
+        if (!cudaTensorCoreArtifactSupported(compute_major, compute_minor)) return .{};
         return .{
             .linear_q8_1_dp4a = true,
             .qkv_q8_1_dp4a = true,
@@ -8429,7 +9974,7 @@ pub const CudaTunedRouteGates = struct {
     }
 
     fn resolveForTarget(compute_major: i32, compute_minor: i32) CudaTunedRouteGates {
-        const defaults = promotedDefaultsForTarget(compute_major, compute_minor);
+        const defaults = defaultsForDevice(compute_major, compute_minor);
         const env = platform.env;
         return .{
             .linear_q8_1_dp4a = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A", defaults.linear_q8_1_dp4a),
@@ -8448,23 +9993,24 @@ pub const CudaTunedRouteGates = struct {
             .lm_head_q8_1_argmax = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LM_HEAD_Q8_1_ARGMAX", defaults.lm_head_q8_1_argmax),
             .async_i32_download_staging = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_ASYNC_I32_DOWNLOAD_STAGING", defaults.async_i32_download_staging),
             .q4_0_cublas_prefill = env.getenvBool("ANTFLY_INFERENCE_CUDA_Q4_0_CUBLAS_PREFILL"),
+            .q4_0_cublas_prefill_min_rows = @max(@as(usize, 2), env.getenvUsize("ANTFLY_INFERENCE_CUDA_Q4_0_CUBLAS_PREFILL_MIN_ROWS") orelse 128),
             .q4_0_tc_hmma_prefill = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_TC_HMMA_PREFILL", defaults.q4_0_tc_hmma_prefill),
             .fused_gate_up_bf16 = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_FUSED_GATE_UP_BF16", defaults.fused_gate_up_bf16),
         };
     }
 };
 
-// Resolved once at CudaCompute.init: the SM89-promoted graph-capture extras
+// Resolved once at CudaCompute.init: portable graph-capture settings
 // from the same tuned execution profile. These only change behavior on code
-// paths that are separately gated on graph capture/replay being requested and
+// paths that are separately gated on capture support and
 // batch-1 decode; the env variables keep overriding in both directions.
 pub const CudaCaptureGateConfig = struct {
     persistent_replay: bool = false,
     update_exec: bool = false,
     device_scalars: bool = false,
 
-    fn promotedDefaultsForTarget(compute_major: i32, compute_minor: i32) CudaCaptureGateConfig {
-        if (compute_major != 8 or compute_minor != 9) return .{};
+    fn defaultsForDevice(compute_major: i32, compute_minor: i32) CudaCaptureGateConfig {
+        if (!cudaTensorCoreArtifactSupported(compute_major, compute_minor)) return .{};
         return .{
             .persistent_replay = true,
             .update_exec = true,
@@ -8473,7 +10019,7 @@ pub const CudaCaptureGateConfig = struct {
     }
 
     fn resolveForTarget(compute_major: i32, compute_minor: i32) CudaCaptureGateConfig {
-        const defaults = promotedDefaultsForTarget(compute_major, compute_minor);
+        const defaults = defaultsForDevice(compute_major, compute_minor);
         const env = platform.env;
         return .{
             .persistent_replay = env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY", defaults.persistent_replay),
@@ -8510,6 +10056,7 @@ const TestEnvGuard = struct {
 };
 
 const tuned_route_gate_test_env_names = [_][:0]const u8{
+    "ANTFLY_INFERENCE_CUDA_Q4_0_CUBLAS_PREFILL_MIN_ROWS",
     "ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_DP4A",
     "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_DP4A",
     "ANTFLY_INFERENCE_CUDA_Q4_0_QKV_Q8_1_TILE8",
@@ -8533,8 +10080,12 @@ const capture_gate_test_env_names = [_][:0]const u8{
     "ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS",
 };
 
-test "CUDA tuned route gates promote the SM89 battery only on compute 8.9" {
-    const promoted = CudaTunedRouteGates.promotedDefaultsForTarget(8, 9);
+test "CUDA tuned route gates select only compiled tensor core capabilities" {
+    const promoted = CudaTunedRouteGates.defaultsForDevice(8, 9);
+    if (!cudaTensorCoreArtifactSupported(8, 9)) {
+        try std.testing.expect(std.meta.eql(CudaTunedRouteGates{}, promoted));
+        return;
+    }
     try std.testing.expect(promoted.linear_q8_1_dp4a);
     try std.testing.expect(promoted.qkv_q8_1_dp4a);
     try std.testing.expect(promoted.qkv_q8_1_tile8);
@@ -8555,19 +10106,12 @@ test "CUDA tuned route gates promote the SM89 battery only on compute 8.9" {
     // F32-reference token match).
     try std.testing.expect(promoted.q4_0_tc_hmma_prefill);
 
-    // Every other compute capability keeps the historical opt-in defaults.
-    try std.testing.expect(std.meta.eql(
-        CudaTunedRouteGates{},
-        CudaTunedRouteGates.promotedDefaultsForTarget(8, 6),
-    ));
-    try std.testing.expect(std.meta.eql(
-        CudaTunedRouteGates{},
-        CudaTunedRouteGates.promotedDefaultsForTarget(9, 0),
-    ));
-    try std.testing.expect(std.meta.eql(
-        CudaTunedRouteGates{},
-        CudaTunedRouteGates.promotedDefaultsForTarget(7, 5),
-    ));
+    for ([_][2]i32{ .{ 8, 0 }, .{ 8, 6 }, .{ 8, 9 }, .{ 9, 0 }, .{ 12, 1 } }) |cc| {
+        const defaults = CudaTunedRouteGates.defaultsForDevice(cc[0], cc[1]);
+        try std.testing.expectEqual(cudaTensorCoreArtifactSupported(cc[0], cc[1]), defaults.linear_q8_1_dp4a);
+        try std.testing.expectEqual(cudaTensorCoreArtifactSupported(cc[0], cc[1]), defaults.q4_0_tc_hmma_prefill);
+    }
+    try std.testing.expect(std.meta.eql(CudaTunedRouteGates{}, CudaTunedRouteGates.defaultsForDevice(7, 5)));
     try std.testing.expect(!(CudaTunedRouteGates{}).linear_q8_1_dp4a);
     try std.testing.expectEqual(@as(usize, 8192), (CudaTunedRouteGates{}).linear_q8_1_tile4_w8_min_in_dim);
 }
@@ -8589,13 +10133,13 @@ test "CUDA tuned route gates keep env overrides working in both directions" {
         guarded += 1;
     }
 
-    // Unset: the promoted SM89 defaults apply on 8.9, historical defaults elsewhere.
+    // Unset defaults follow compiled capability on every target.
     try std.testing.expect(std.meta.eql(
-        CudaTunedRouteGates.promotedDefaultsForTarget(8, 9),
+        CudaTunedRouteGates.defaultsForDevice(8, 9),
         CudaTunedRouteGates.resolveForTarget(8, 9),
     ));
     try std.testing.expect(std.meta.eql(
-        CudaTunedRouteGates{},
+        CudaTunedRouteGates.defaultsForDevice(8, 6),
         CudaTunedRouteGates.resolveForTarget(8, 6),
     ));
 
@@ -8610,33 +10154,28 @@ test "CUDA tuned route gates keep env overrides working in both directions" {
     try std.testing.expect(!sm89_overridden.q6_k_lm_head_q8_1);
     try std.testing.expectEqual(@as(usize, 8192), sm89_overridden.linear_q8_1_tile4_w8_min_in_dim);
     // Untouched knobs keep their promoted defaults.
-    try std.testing.expect(sm89_overridden.pair_q8_1_dp4a);
-    try std.testing.expect(sm89_overridden.async_i32_download_staging);
+    try std.testing.expectEqual(cudaTensorCoreArtifactSupported(8, 9), sm89_overridden.pair_q8_1_dp4a);
+    try std.testing.expectEqual(cudaTensorCoreArtifactSupported(8, 9), sm89_overridden.async_i32_download_staging);
 
-    // Explicit 1 still opts in on non-promoted targets.
+    // Explicit 1 still requests a route independently of automatic defaults.
     try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_Q4_0_PAIR_Q8_1_DP4A", "1", 1));
     try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W8", "1", 1));
     const sm86_overridden = CudaTunedRouteGates.resolveForTarget(8, 6);
     try std.testing.expect(sm86_overridden.pair_q8_1_dp4a);
     try std.testing.expect(sm86_overridden.linear_q8_1_tile4_w8);
     try std.testing.expect(!sm86_overridden.linear_q8_1_dp4a);
-    try std.testing.expect(!sm86_overridden.gated_down_q8_1_dp4a);
+    try std.testing.expectEqual(cudaTensorCoreArtifactSupported(8, 6), sm86_overridden.gated_down_q8_1_dp4a);
     try std.testing.expectEqual(@as(usize, 8192), sm86_overridden.linear_q8_1_tile4_w8_min_in_dim);
 }
 
-test "CUDA capture gates promote SM89 defaults with bidirectional env overrides" {
-    try std.testing.expect(std.meta.eql(
-        CudaCaptureGateConfig{ .persistent_replay = true, .update_exec = true, .device_scalars = true },
-        CudaCaptureGateConfig.promotedDefaultsForTarget(8, 9),
-    ));
-    try std.testing.expect(std.meta.eql(
-        CudaCaptureGateConfig{},
-        CudaCaptureGateConfig.promotedDefaultsForTarget(8, 6),
-    ));
-    try std.testing.expect(std.meta.eql(
-        CudaCaptureGateConfig{},
-        CudaCaptureGateConfig.promotedDefaultsForTarget(9, 0),
-    ));
+test "CUDA capture defaults follow compiled capability with bidirectional overrides" {
+    for ([_][2]i32{ .{ 7, 5 }, .{ 8, 0 }, .{ 8, 9 }, .{ 9, 0 }, .{ 12, 1 } }) |cc| {
+        const defaults = CudaCaptureGateConfig.defaultsForDevice(cc[0], cc[1]);
+        const supported = cudaTensorCoreArtifactSupported(cc[0], cc[1]);
+        try std.testing.expectEqual(supported, defaults.persistent_replay);
+        try std.testing.expectEqual(supported, defaults.update_exec);
+        try std.testing.expectEqual(supported, defaults.device_scalars);
+    }
 
     const allocator = std.testing.allocator;
     var guards: [capture_gate_test_env_names.len]TestEnvGuard = undefined;
@@ -8648,11 +10187,11 @@ test "CUDA capture gates promote SM89 defaults with bidirectional env overrides"
     }
 
     try std.testing.expect(std.meta.eql(
-        CudaCaptureGateConfig.promotedDefaultsForTarget(8, 9),
+        CudaCaptureGateConfig.defaultsForDevice(8, 9),
         CudaCaptureGateConfig.resolveForTarget(8, 9),
     ));
     try std.testing.expect(std.meta.eql(
-        CudaCaptureGateConfig{},
+        CudaCaptureGateConfig.defaultsForDevice(8, 6),
         CudaCaptureGateConfig.resolveForTarget(8, 6),
     ));
 
@@ -8661,11 +10200,11 @@ test "CUDA capture gates promote SM89 defaults with bidirectional env overrides"
     const sm89 = CudaCaptureGateConfig.resolveForTarget(8, 9);
     try std.testing.expect(!sm89.persistent_replay);
     try std.testing.expect(sm89.update_exec);
-    try std.testing.expect(sm89.device_scalars);
+    try std.testing.expectEqual(cudaTensorCoreArtifactSupported(8, 9), sm89.device_scalars);
     const sm86 = CudaCaptureGateConfig.resolveForTarget(8, 6);
     try std.testing.expect(!sm86.persistent_replay);
     try std.testing.expect(sm86.update_exec);
-    try std.testing.expect(!sm86.device_scalars);
+    try std.testing.expectEqual(cudaTensorCoreArtifactSupported(8, 6), sm86.device_scalars);
 }
 
 fn cudaQ4_0DecodeTile8GlobalEnabled() bool {
@@ -8757,10 +10296,9 @@ pub const GeneratedQ4_0Gates = struct {
             .exact_ffn_candidates = cudaQ4_0GeneratedExactFfnCandidatesEnabled(),
             .e2b_pair_only = cudaQ4_0GeneratedE2BFfnPairOnlyEnabled(),
         };
-        return requested.restrictToPromotedTarget(
+        return requested.restrictToExecutionSupport(
             compute_major,
             compute_minor,
-            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_ALLOW_UNPROMOTED_GENERATED_KERNELS", false),
         ).withMasterDisable(platform.env.getenvBoolDefault(
             "ANTFLY_INFERENCE_CUDA_DISABLE_GENERATED_Q4_0",
             false,
@@ -8812,13 +10350,12 @@ pub const GeneratedQ4_0Gates = struct {
         };
     }
 
-    fn restrictToPromotedTarget(
+    fn restrictToExecutionSupport(
         self: GeneratedQ4_0Gates,
         compute_major: i32,
         compute_minor: i32,
-        allow_unpromoted: bool,
     ) GeneratedQ4_0Gates {
-        if (allow_unpromoted or quant_kernel_catalog.targetForComputeCapability(compute_major, compute_minor) != null) {
+        if (quant_kernel_catalog.portableCudaDeviceSupported(compute_major, compute_minor)) {
             return self;
         }
         return allDisabled();
@@ -8864,7 +10401,7 @@ fn runtimeJitShapeAllowsForCompute(
     );
 }
 
-test "generated Q4 routes require promoted CUDA target evidence" {
+test "generated CUDA Q4 routes follow execution capability without a benchmark target bypass" {
     const requested = GeneratedQ4_0Gates{
         .mmv = true,
         .mm = true,
@@ -8875,9 +10412,9 @@ test "generated Q4 routes require promoted CUDA target evidence" {
         .exact_ffn_candidates = true,
         .e2b_pair_only = true,
     };
-    try std.testing.expect(std.meta.eql(requested, requested.restrictToPromotedTarget(8, 9, false)));
+    for ([_][2]i32{ .{ 7, 5 }, .{ 8, 0 }, .{ 8, 9 }, .{ 9, 0 }, .{ 12, 1 } }) |cc| try std.testing.expect(std.meta.eql(requested, requested.restrictToExecutionSupport(cc[0], cc[1])));
 
-    const blocked = requested.restrictToPromotedTarget(8, 0, false);
+    const blocked = requested.restrictToExecutionSupport(7, 0);
     try std.testing.expect(!blocked.mmv);
     try std.testing.expect(!blocked.mm);
     try std.testing.expect(!blocked.pair);
@@ -8887,7 +10424,7 @@ test "generated Q4 routes require promoted CUDA target evidence" {
     try std.testing.expect(!blocked.exact_ffn_candidates);
     try std.testing.expect(!blocked.e2b_pair_only);
 
-    try std.testing.expect(std.meta.eql(requested, requested.restrictToPromotedTarget(9, 0, true)));
+    try std.testing.expect(std.meta.eql(requested, requested.restrictToExecutionSupport(9, 0)));
 }
 
 test "generated Q4 routes are opt in and master disable wins" {
@@ -9108,7 +10645,7 @@ test "generated CUDA FFN catalog resolves by shape and target" {
     try std.testing.expect(wrong_rows.route == null);
     try std.testing.expectEqual(@as(usize, 1), wrong_rows.attempts);
     try std.testing.expectEqual(@as(usize, 1), wrong_rows.misses);
-    try std.testing.expect(generatedQ4_0CatalogFfnRoute(true, true, true, 1, 1536, 6144, .gelu_new, 8, 0).route == null);
+    try std.testing.expect(generatedQ4_0CatalogFfnRoute(true, true, true, 1, 1536, 6144, .gelu_new, 8, 0).route != null);
     try std.testing.expect(generatedQ4_0CatalogFfnRoute(false, true, true, 1, 2560, 10240, .gelu_new, 8, 9).route != null);
     const disabled_pair = generatedQ4_0CatalogFfnRoute(true, false, true, 1, 1536, 6144, .gelu_new, 8, 9);
     try std.testing.expect(disabled_pair.route == null);
@@ -9527,39 +11064,18 @@ fn copyFromPinnedUploadArena(self: *CudaCompute, device: buffer_mod.DeviceBuffer
     return true;
 }
 
-const ocr_pinned_input_capacity: usize = 32 * 1024 * 1024;
+const ocr_pinned_input_capacity = @import("pinned_input_arena.zig").capacity;
 
 fn copyFromPinnedOcrInputArena(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []const u8) !bool {
     if (!self.ocr_pinned_inputs_enabled or
         (self.capability_profile != .lightonocr3 and self.capability_profile != .florence2) or
         self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
         bytes.len <= pinned_upload_arena_capacity or bytes.len > ocr_pinned_input_capacity) return false;
-    if (self.ocr_pinned_input_host.ptr == null) {
-        var lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null;
-        if (self.ctx.video_cache_budget.admission) |policy|
-            lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .host_scratch_bytes = ocr_pinned_input_capacity }, policy.check_live_memory) catch return false;
-        const host = buffer_mod.HostBuffer.alloc(&self.ctx, ocr_pinned_input_capacity) catch {
-            if (lease) |*active| active.release();
-            return false;
-        };
-        self.ocr_pinned_input_host = host;
-        self.ocr_pinned_input_lease = lease;
-    }
-    var start = std.mem.alignForward(usize, self.ocr_pinned_input_offset, pinned_upload_arena_alignment);
-    if (start > ocr_pinned_input_capacity - bytes.len) {
-        // All enqueued transfers must finish before any pinned source bytes
-        // can be reused; the caller's original image/features may retire now.
-        try synchronizeAndDrainDeferredDeviceFrees(self);
-        self.stats.upload_syncs += 1;
-        self.ocr_pinned_input_wraps += 1;
-        start = 0;
-    }
-    const slot = self.ocr_pinned_input_host.bytes()[start..][0..bytes.len];
-    @memcpy(slot, bytes);
-    try device.copyFromHost(&self.ctx, slot);
+    const wraps = self.ocr_pinned_input.wraps;
+    if (!try self.ocr_pinned_input.upload(&self.ctx, device, bytes)) return false;
     self.stats.h2d_bytes += bytes.len;
     self.ocr_pinned_input_uploads += 1;
-    self.ocr_pinned_input_offset = start + bytes.len;
+    self.ocr_pinned_input_wraps += self.ocr_pinned_input.wraps - wraps;
     return true;
 }
 
@@ -9648,7 +11164,7 @@ fn flushDeferredDecodeScalarUpload(self: *CudaCompute) !void {
 }
 
 fn copyToHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
-    if (self.audio_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
+    if (self.execution_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
     if (self.debug_cuda_graph_capture_active) {
         self.debug_cuda_graph_capture_disabled = true;
         std.log.warn("cuda_graph_capture_probe: unsafe_d2h_copy bytes={d} disabled=1", .{bytes.len});
@@ -9684,7 +11200,7 @@ fn copyToPinnedScalarDownloadAndSync(self: *CudaCompute, device: buffer_mod.Devi
 }
 
 fn copyToHostTrackedAndSync(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
-    if (self.audio_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
+    if (self.execution_scope) |scope| if (scope.base != 0) return error.CudaGraphCaptureUnsafeHostCopy;
     const tried_pinned_scalar_download = pinnedScalarDownloadEligible(self, bytes);
     if (try copyToPinnedScalarDownloadAndSync(self, device, bytes)) return;
     if (tried_pinned_scalar_download) self.stats.pinned_scalar_download_fallbacks += 1;
@@ -10000,15 +11516,15 @@ fn cudaDebertaMaterializedWorkspaceLimitBytes(self: *const CudaCompute) usize {
 }
 
 fn debertaMaterializedAutoTarget(compute_major: i32, compute_minor: i32) bool {
-    // Current production evidence is exact to NVIDIA L4 / SM89. Keep other
-    // architectures available through explicit diagnostic mode only.
-    return cudaQualifiedPerfTarget(compute_major, compute_minor);
+    // Select from compiled tensor-core capability. Per-call shape, scratch,
+    // and library checks still decide whether materialized execution fits.
+    return cudaTensorCoreArtifactSupported(compute_major, compute_minor);
 }
 
 /// Materialized DeBERTa attention follows the same schedule as the fast CPU
 /// encoder path: QK^T, QKr^T, and KQr^T are tensor-core GEMMs; a generated
 /// kernel gathers relative-position diagonals and applies softmax; P*V is the
-/// fourth GEMM. The auto dispatcher promotes it only for its qualified B4+
+/// fourth GEMM. The auto dispatcher selects it only within its bounded B4+
 /// S128..256 envelope; explicit mode remains available for diagnostics.
 fn tryDebertaMaterializedAttentionF16(
     self: *CudaCompute,
@@ -10096,7 +11612,16 @@ fn tryDebertaMaterializedAttentionF16(
 // BF16 mirror, return the mirror when the matmul is prefill-shaped
 // (rows > 1) so cuBLASLt handles it; decode (rows == 1) stays on the
 // native Q4/F32 kernels.
+/// A multi-row matrix is still decoding only while its execution scope says
+/// so. Keep output-head eligibility identical for sampled and greedy paths.
+fn cudaQuantizedDecodeRowsEligible(rows: usize, cohort_rows: usize) bool {
+    return rows == 1 or (cohort_rows > 1 and rows == cohort_rows);
+}
+
 fn weightBf16MirrorForRows(self: *const CudaCompute, weight: *const CudaTensor, rows: usize) ?buffer_mod.DeviceBuffer {
+    // A decode cohort retains singleton quantized math. Two rows alone do
+    // not authorize prefill mirrors or their different arithmetic.
+    if (self.cooperative_decode_rows != 0) return null;
     if (!self.bf16_mirror_row_selector.accepts(rows)) return null;
     if (weight.bf16_mirror.ptr == 0) return null;
     if (weight.bf16_mirror.len < weight.elem_count * @sizeOf(u16)) return null;
@@ -10104,7 +11629,7 @@ fn weightBf16MirrorForRows(self: *const CudaCompute, weight: *const CudaTensor, 
 }
 
 fn cublasLtWorkspace(self: *CudaCompute) buffer_mod.DeviceBuffer {
-    const bytes = cudaCublasLtWorkspaceBytes();
+    const bytes = self.runtime_policy.workspace_bytes;
     if (bytes == 0) return .{};
     return self.cublaslt_workspace_scratch.acquire(&self.ctx, bytes) catch .{};
 }
@@ -10407,16 +11932,15 @@ fn embeddingGemma2Attention(
             shape.head_dim == 256 and shape.seq <= 8192 and shape.batch >= 1 and
             (shape.seq == 512 or @as(usize, shape.batch) * shape.seq >= 1024) and
             try embeddingGemma2TextCudnn(self, module, out, q, k, v, shape, sequence_lengths)) return;
-        // WMMA fragment element ownership used for in-register alpha scaling
-        // is qualified on SM89. Other SM80+ devices retain the exact warp
-        // route until hardware differential evidence establishes their map.
-        if (self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and
+        // The online output accumulator uses the documented PTX MMA layout,
+        // so eligibility follows the bundled BF16 instructions, not GPU names.
+        if (self.ctx.info.compute_major >= 8 and
             cuda_artifact.hasBf16WmmaCodeFor(self.ctx.info.compute_major, self.ctx.info.compute_minor))
             return module.launchLocalFlashAttention(&self.ctx, out, q, k, v, mask, shape);
         module.noteAttentionFallback();
         return module.launchAttention(&self.ctx, out, q, k, v, mask, shape);
     }
-    // The resident SM89 kernel implements the global layers' exact MQA
+    // The resident BF16 kernel implements the global layers' exact MQA
     // geometry as well as the sliding layers' GQA geometry. At 512 tokens its
     // radius-zero mode covers the full sequence without materializing scores.
     if (embeddingGemma2GlobalFlashEligible(
@@ -10433,7 +11957,7 @@ fn embeddingGemma2Attention(
 }
 
 fn embeddingGemma2GlobalFlashEligible(compute_major: i32, compute_minor: i32, has_wmma_artifact: bool, shape: embedding_gemma2_cuda.Attention) bool {
-    return compute_major == 8 and compute_minor == 9 and has_wmma_artifact and
+    return compute_major >= 8 and compute_minor >= 0 and has_wmma_artifact and
         shape.seq == 512 and shape.q_heads == 4 and shape.kv_heads == 1 and
         shape.head_dim == 512 and shape.local_radius == 0;
 }
@@ -10513,11 +12037,70 @@ fn lightOnFfnBf16Down(self: *CudaCompute, sources: LightOnActivationSources, dow
     return createTensor(self, output, shape, rows * hidden);
 }
 
+fn glideGatedFfnNoBias(self: *CudaCompute, request: *const ops.GatedFfnNoBiasRequest) !?CT {
+    if (!self.glide_cuda or self.strict_f32_weights or self.cublaslt == null or
+        platform.env.getenvBool("ANTFLY_GLIDE_CUDA_DISABLE_TILED_FFN") or
+        request.activation != .silu or request.rows == 0 or request.rows > 40000 or
+        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
+    const rows = request.rows;
+    const hidden = request.hidden_size;
+    const intermediate = request.intermediate_size;
+    if (!((hidden == 1024 and intermediate == 3584) or (hidden == 2048 and intermediate == 6144))) return null;
+    const input = tensorFromCt(request.input);
+    try ensureF32(input);
+    const input_count = try checkedMul(rows, hidden);
+    try ensureCount(input, input_count);
+    if (input.buffer.ptr == 0 or input.buffer.len < input_count * 4) return error.InvalidShape;
+    const gate = tensorFromCt(request.gate_weight);
+    const up = tensorFromCt(request.up_weight);
+    const down = tensorFromCt(request.down_weight);
+    const weight_count = hidden * intermediate;
+    for ([_]*const CudaTensor{ gate, up, down }) |weight| {
+        if (weight.quant_type != null or weight.dtype != .f16) return null;
+        try ensureCount(weight, weight_count);
+        if (weight.buffer.ptr == 0 or weight.buffer.len < weight_count * 2) return error.InvalidShape;
+    }
+    // Scratch is bounded by a row tile, independent of packed batch length.
+    // Gate/up share one input conversion and the F32 activation never escapes.
+    // Larger decoder weights exceed L4's cache; larger row tiles amortize
+    // their reads while keeping the activation workspace explicitly bounded.
+    const configured_tile = platform.env.getenvUsize("ANTFLY_GLIDE_CUDA_FFN_TILE_ROWS") orelse 4096;
+    if (configured_tile == 0 or configured_tile > 4096) return error.InvalidShape;
+    const tile = @min(rows, configured_tile);
+    var staged = try allocDeviceBuffer(self, tile * hidden * 2);
+    defer releaseDeviceBuffer(self, &staged);
+    var gate_values = try allocDeviceBuffer(self, tile * intermediate * 4);
+    defer releaseDeviceBuffer(self, &gate_values);
+    var up_values = try allocDeviceBuffer(self, tile * intermediate * 4);
+    defer releaseDeviceBuffer(self, &up_values);
+    var activated = try allocDeviceBuffer(self, tile * intermediate * 2);
+    defer releaseDeviceBuffer(self, &activated);
+    const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(rows), @intCast(hidden) })).?;
+    errdefer freeTensor(self, output);
+    const workspace = cublasLtWorkspace(self);
+    var first: usize = 0;
+    while (first < rows) : (first += tile) {
+        const count = @min(tile, rows - first);
+        const source = debertaWorkspaceRegion(input.buffer, first * hidden * 4, count * hidden * 4);
+        const target = debertaWorkspaceRegion(tensorFromCt(output).buffer, first * hidden * 4, count * hidden * 4);
+        try self.kernels.launchF32ToF16(&self.ctx, staged, source, count * hidden);
+        try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, gate_values, staged, gate.buffer, workspace, count, hidden, intermediate);
+        try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, up_values, staged, up.buffer, workspace, count, hidden, intermediate);
+        try self.glide_activation.run(&self.ctx, .{ activated.ptr, gate_values.ptr, up_values.ptr }, @intCast(count * intermediate));
+        try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, target, activated, down.buffer, workspace, count, intermediate, hidden);
+        self.stats.f16_cublaslt_activation_staging_calls += 1;
+        self.stats.f16_cublaslt_linear_calls += 3;
+        self.stats.launch_elementwise += 1;
+    }
+    return output;
+}
+
 fn lightOnGatedFfnNoBias(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequest) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.glide_cuda) return glideGatedFfnNoBias(self, request);
     if ((!self.lighton_fused_ffn and !self.lighton_ffn_bf16_inputs) or self.capability_profile != .lightonocr3 or
         self.lazy_host_store != null or // Paired source addresses must remain immutable.
-        self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1 or
+        !lightOnDevice(self).portableKernels() or
         request.rows == 0 or request.rows > 8192 or request.activation != .silu or
         self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
     const rows = request.rows;
@@ -10565,9 +12148,12 @@ fn lightOnGatedFfnNoBias(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequ
         try self.lighton_gate_up_leases.ensureUnusedCapacity(self.allocator, 1);
         const half_bytes = try checkedMul(weight_count, 2);
         const bytes = try checkedMul(half_bytes, 2);
+        // These immutable model-lifetime copies are derived weights. Their
+        // device/combined admission remains mandatory, while the scratch
+        // sublimit is reserved for independently admitted working memory.
         var lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null;
         if (self.ctx.video_cache_budget.admission) |policy|
-            lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_scratch_bytes = bytes }, policy.check_live_memory) catch return null;
+            lease = policy.controller.tryAcquire(.gpu, policy.limits, .{ .backend_weight_bytes = bytes }, policy.check_live_memory) catch return null;
         var combined = buffer_mod.DeviceBuffer.alloc(&self.ctx, bytes) catch {
             if (lease) |*active| active.release();
             return null;
@@ -10609,7 +12195,7 @@ fn lightOnGatedFfnNoBias(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequ
 fn tryLightOnBf16DecodeOutput(self: *CudaCompute, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) bool {
     if ((!self.lighton_bf16_decode_outputs and !self.lighton_bf16_projection_outputs) or self.capability_profile != .lightonocr3 or
         self.lazy_host_store != null or self.resident_training_cache or
-        self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1 or rows == 0 or rows > (if (self.lighton_bf16_projection_outputs) @as(usize, 8192) else 64) or
+        !lightOnDevice(self).tensorCores() or rows == 0 or rows > (if (self.lighton_bf16_projection_outputs) @as(usize, 8192) else 64) or
         self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return false;
     const count = checkedMul(rows, out_dim) catch return false;
     const bytes = checkedMul(count, 2) catch return false;
@@ -10761,7 +12347,7 @@ fn tryCublasLtBf16InputGradient(
 
 fn lightOnGemmPhysicalRows(self: *const CudaCompute, rows: usize) usize {
     if (!self.lighton_gemm_bucket_rows or self.capability_profile != .lightonocr3 or
-        self.ctx.info.compute_major != 12 or self.ctx.info.compute_minor != 1 or rows < 2 or rows > 64 or
+        rows < 2 or rows > 64 or
         self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return rows;
     var bucket: usize = 2;
     while (bucket < rows) bucket *= 2;
@@ -10797,7 +12383,10 @@ fn tryCublasLtBf16Linear(
         break :pad scratch;
     } else (try stageBf16ActivationForCublasLt(self, input, rows, in_dim)) orelse return false;
     const workspace = cublasLtWorkspace(self);
-    if (!runCublasLtBf16Matmul(self, dst, input_bf16, weight, workspace, physical_rows, in_dim, out_dim)) return false;
+    if (!runCublasLtBf16Matmul(self, dst, input_bf16, weight, workspace, physical_rows, in_dim, out_dim)) {
+        if (lightOnOwnedDecodeCapture(self)) return error.CudaGraphCaptureUnsafeMatmulPlan;
+        return false;
+    }
     if (physical_rows != rows) self.stats.bf16_bucketed_linear_calls += 1;
     self.stats.bf16_cublaslt_linear_calls += 1;
     return true;
@@ -10983,9 +12572,19 @@ fn tryCublasLtF32Linear(
     if (self.ctx.info.compute_major < 8) return false;
     // Laya keeps FP32 weights resident, including short encoder sequences.
     // Its wide projections benefit from cuBLASLt below the general 128-row gate.
-    if ((!self.strict_f32_weights and rows < 128) or in_dim < 64 or out_dim < 64) return false;
+    // E4B's short prefills and audio input projection also retain F32 weights.
+    // Keep singleton decode on its tiled GEMV path; SGEMM preserves F32 operands.
+    const short_gemma_prefill = self.gemma4_e4b_sm89_qualified and rows > 1;
+    if ((!self.strict_f32_weights and !short_gemma_prefill and rows < 128) or in_dim < 64 or out_dim < 64) return false;
     const blas = &(self.cublaslt orelse return false);
-    blas.matmulF32WeightF32Out(&self.ctx, dst, input, weight, rows, in_dim, out_dim) catch return false;
+    // Zero-workspace plans exclude the faster strict FP32 SGEMM schedules on
+    // GB10. Reuse one bounded buffer, included in specialty request admission.
+    // Allocation failure keeps the existing zero-workspace correctness path.
+    const workspace = if (self.qualified_span_fp32 or self.qualified_decide_fp32)
+        self.cublaslt_workspace_scratch.acquire(&self.ctx, @import("../../models/gliner_specialty_qualification.zig").cuda_matmul_workspace_bytes) catch buffer_mod.DeviceBuffer{}
+    else
+        buffer_mod.DeviceBuffer{};
+    blas.matmulF32WeightF32OutWithWorkspace(&self.ctx, dst, input, weight, workspace, rows, in_dim, out_dim) catch return false;
     return true;
 }
 
@@ -11036,26 +12635,21 @@ fn tryCublasLtF16Qkv(
     return true;
 }
 
-const default_max_temp_buffers = 256;
 const default_temp_arena_admission_budget_bytes: usize = 512 * 1024 * 1024;
 
 fn cudaTempCacheMaxBuffers(self: *const CudaCompute) usize {
-    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MAX_BUFFERS") orelse
-        if (self.resident_training_cache) @as(usize, 4096) else default_max_temp_buffers;
+    return self.runtime_policy.bufferLimit(self.resident_training_cache);
 }
 
 fn cudaTempCacheConfiguredBytes(self: *const CudaCompute) usize {
-    // Resident training revisits large, exact-size transaction buffers. Keep
-    // enough idle storage to reuse them across accumulation/update boundaries.
-    // All retained allocations remain charged to the owner's physical ceiling;
-    // allocDeviceBuffer reclaims idle entries before retrying a bounded miss.
-    const mb = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_CACHE_MB") orelse
-        if (self.resident_training_cache) @as(usize, 2048) else 1024;
-    return std.math.mul(usize, mb, 1024 * 1024) catch 0;
+    return self.runtime_policy.cacheBytes(self.resident_training_cache);
 }
 
 fn cudaTempCacheBudgetBytes(self: *const CudaCompute) usize {
-    const configured = cudaTempCacheConfiguredBytes(self);
+    var configured = cudaTempCacheConfiguredBytes(self);
+    if (self.capability_profile == .gemma4 and self.gemma4_projector_cache_enabled and
+        self.gemma4_projector_weight_bytes != 0 and self.runtime_policy.temp_cache_mb == null)
+        configured = @min(configured, 512 * 1024 * 1024);
     return if (self.ocr_temp_cache_budget_bytes) |ceiling| @min(configured, ceiling) else configured;
 }
 
@@ -11161,14 +12755,6 @@ fn cudaDeferredFreeBudgetBytes(self: *const CudaCompute) usize {
     return if (self.ocr_deferred_free_budget_bytes) |ceiling| @min(configured, ceiling) else configured;
 }
 
-fn cudaTempTraceEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_TEMP_TRACE", false);
-}
-
-fn cudaTempTraceLimit() usize {
-    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_TRACE_LIMIT") orelse 4096;
-}
-
 fn cudaTempTraceSkip() usize {
     return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_TRACE_SKIP") orelse 0;
 }
@@ -11193,6 +12779,16 @@ fn cudaDecodeGraphReplayMode() CudaDecodeGraphReplayMode {
 
 fn cudaDecodeGraphReplayEnabled() bool {
     return cudaDecodeGraphReplayMode() != .off;
+}
+
+// A request-local reservation is installed only by the serialized fresh-
+// generation path. Automatic replay can decline the request; explicit off
+// and required policies retain their existing contracts.
+fn cudaRequestDecodeGraphReplayMode(self: *const CudaCompute) CudaDecodeGraphReplayMode {
+    if (self.gemma4_request_replay_disabled) return .off;
+    if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY") != null)
+        return cudaDecodeGraphReplayMode();
+    return if (self.gemma4_e4b_sm89_qualified and self.gemma4_request_replay_capacity != null) .auto else .off;
 }
 
 const max_temp_pinned_slots = 16_384;
@@ -11286,14 +12882,40 @@ fn cudaMtpMaskedSelectHiddenFusionEnabled() bool {
 }
 
 fn cudaDebugGraphPersistentReplayEnabled(self: *const CudaCompute) bool {
-    return cudaDecodeGraphReplayEnabled() or
+    if (self.gemma4_request_replay_disabled) return false;
+    return (cudaRequestDecodeGraphReplayMode(self) != .off) or
         self.capture_gates.persistent_replay or
         (cudaMtpTargetReplayEnabled() and cudaMtpUnsafeTargetReplayEnabled());
 }
 
-fn cudaDebugGraphForcedKvReplayCapacityTokens() ?usize {
-    const forced = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse return null;
-    return if (forced == 0) null else forced;
+// This initial envelope covers the qualified short-text, page, 2K and media
+// requests, including their EOS quality probes. Longer requests keep the
+// existing capacity policy until they have their own replay qualification.
+fn gemma4RequestReplayCapacity(prompt: usize, output: usize) ?usize {
+    if (prompt == 0 or output == 0 or output > 512) return null;
+    const total = std.math.add(usize, prompt, output) catch return null;
+    if (total > 4096) return null;
+    return std.mem.alignForward(usize, total, 16);
+}
+
+test "Gemma4 CUDA request replay capacity covers the admitted decode tail" {
+    try std.testing.expectEqual(@as(?usize, 288), gemma4RequestReplayCapacity(32, 256));
+    try std.testing.expectEqual(@as(?usize, 560), gemma4RequestReplayCapacity(419, 128));
+    try std.testing.expectEqual(@as(?usize, 1840), gemma4RequestReplayCapacity(1775, 64));
+    try std.testing.expectEqual(@as(?usize, 352), gemma4RequestReplayCapacity(278, 64));
+    try std.testing.expectEqual(@as(?usize, 144), gemma4RequestReplayCapacity(80, 64));
+    try std.testing.expectEqual(@as(?usize, 4096), gemma4RequestReplayCapacity(4095, 1));
+    try std.testing.expect(gemma4RequestReplayCapacity(4096, 1) == null);
+    try std.testing.expect(gemma4RequestReplayCapacity(1, 513) == null);
+    try std.testing.expect(gemma4RequestReplayCapacity(0, 64) == null);
+    try std.testing.expect(gemma4RequestReplayCapacity(32, 0) == null);
+    try std.testing.expect(gemma4RequestReplayCapacity(std.math.maxInt(usize), 64) == null);
+}
+
+fn cudaDebugGraphForcedKvReplayCapacityTokens(self: *const CudaCompute) ?usize {
+    if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY")) |forced|
+        return if (forced == 0) null else forced;
+    return self.gemma4_request_replay_capacity;
 }
 
 pub fn cudaDecodeProfileEnabled() bool {
@@ -11514,7 +13136,7 @@ fn beginDecodeProfile(self: *CudaCompute, category: CudaDecodeProfileCategory, r
 fn beginPrefillProfile(self: *CudaCompute, category: ?CudaPrefillProfileCategory, rows: usize) ?CudaPrefillProfileScope {
     const resolved_category = category orelse return null;
     if (rows <= 1) return null;
-    if (!cudaPrefillOpProfileEnabled()) return null;
+    if (!self.runtime_policy.prefill_profile) return null;
     if (self.debug_cuda_graph_capture_active) return null;
     const slot = acquireProfileSlot(self) orelse return null;
     return .{ .compute = self, .category = resolved_category, .slot = slot };
@@ -11565,6 +13187,7 @@ test "CUDA op-profile pool free-stack, drain no-op, and category mapping" {
     var compute: CudaCompute = undefined;
 
     compute.temp_scan_profile = .{};
+    compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     compute.lighton_fused_vision_qkv_enabled = false;
     compute.lighton_ragged_recurrent_enabled = false;
     compute.lighton_ffn_bf16_inputs = false;
@@ -11574,7 +13197,7 @@ test "CUDA op-profile pool free-stack, drain no-op, and category mapping" {
     compute.ocr_temp_cache_budget_bytes = null;
 
     compute.ocr_deferred_free_budget_bytes = null;
-    compute.audio_scope = null;
+    compute.execution_scope = null;
     compute.audio_execution_active = false;
     compute.embedding_gemma2_constant_generation = 0;
     compute.allocator = std.testing.allocator;
@@ -11631,38 +13254,40 @@ fn prefillProfileCategoryForLinearNoBias(weight: *const CudaTensor, rows: usize,
 }
 
 fn cudaDebugGraphCaptureDeviceScalarsEnabled(self: *const CudaCompute) bool {
-    return cudaDecodeGraphReplayEnabled() or
+    if (self.gemma4_request_replay_disabled) return false;
+    return (cudaRequestDecodeGraphReplayMode(self) != .off) or
         self.capture_gates.device_scalars or
         (cudaMtpTargetReplayEnabled() and cudaMtpUnsafeTargetReplayEnabled());
 }
 
-fn cudaTurboquantSplitAttentionEnabled() bool {
-    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION", false);
-}
-
 // Eager launches cover this sequence, not every other page in the pool.
 // Graphs with device-updated lengths must still cover their reserved capacity.
-fn cudaSplitAttentionCapacity(logical_tokens: usize, physical_tokens: usize, dynamic_length: bool) usize {
-    return if (dynamic_length) @max(logical_tokens, physical_tokens) else logical_tokens;
+// E4B replay warmup must use that same capacity so its scratch trace is stable.
+fn cudaSplitAttentionCapacity(logical_tokens: usize, physical_tokens: usize, dynamic_length: bool, replay_planned: bool) usize {
+    return if (dynamic_length or replay_planned) @max(logical_tokens, physical_tokens) else logical_tokens;
 }
 
 test "LightOnOCR3 CUDA split attention plans logical context and preserves graph capacity" {
-    try std.testing.expectEqual(@as(usize, 662), cudaSplitAttentionCapacity(662, 65536, false));
-    try std.testing.expectEqual(@as(usize, 65536), cudaSplitAttentionCapacity(662, 65536, true));
-    try std.testing.expectEqual(@as(usize, 1024), cudaSplitAttentionCapacity(1024, 512, true));
-}
-
-fn cudaTurboquantSplitAttentionChunkSize() usize {
-    return platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TURBOQUANT_SPLIT_ATTENTION_CHUNK") orelse 128;
+    try std.testing.expectEqual(@as(usize, 662), cudaSplitAttentionCapacity(662, 65536, false, false));
+    try std.testing.expectEqual(@as(usize, 65536), cudaSplitAttentionCapacity(662, 65536, true, false));
+    try std.testing.expectEqual(@as(usize, 1024), cudaSplitAttentionCapacity(1024, 512, true, false));
+    // E4B warmup must allocate exactly the scratch used during capture, even
+    // before device scalars exist and while the prefix fits in one chunk.
+    const warmup = cudaSplitAttentionCapacity(46, 544, false, true);
+    const capture = cudaSplitAttentionCapacity(49, 544, true, true);
+    try std.testing.expectEqual(@as(usize, 544), warmup);
+    try std.testing.expectEqual(warmup, capture);
+    try std.testing.expectEqual(@as(usize, 8), (@min(warmup, 512) + 63) / 64);
+    try std.testing.expectEqual(@as(usize, 5), (capture + 127) / 128);
 }
 
 fn cudaDebugGraphAutoAdvanceDecodeScalarsEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_AUTO_ADVANCE_SCALARS", true);
 }
 
-fn cudaDebugGraphCaptureAllowUnpinned() bool {
+fn cudaDebugGraphCaptureAllowUnpinned(self: *const CudaCompute) bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED", false) or
-        (cudaDecodeGraphReplayEnabled() and cudaTempStableReuseEnabled());
+        ((cudaRequestDecodeGraphReplayMode(self) != .off) and cudaTempStableReuseEnabled());
 }
 
 fn cudaDebugGraphCaptureTensorTraceEnabled() bool {
@@ -11703,11 +13328,11 @@ fn traceCudaTempAlloc(
     requested_len: usize,
     buffer: buffer_mod.DeviceBuffer,
 ) void {
-    if (!cudaTempTraceEnabled()) return;
-    const skip = cudaTempTraceSkip();
+    if (!self.runtime_policy.trace) return;
+    const skip = self.runtime_policy.trace_skip;
     if (seq < skip) return;
     const trace_seq = seq - skip;
-    const limit = cudaTempTraceLimit();
+    const limit = self.runtime_policy.trace_limit;
     if (trace_seq >= limit) return;
     if (trace_seq == 0) {
         std.log.info(
@@ -11716,7 +13341,7 @@ fn traceCudaTempAlloc(
                 skip,
                 limit,
                 cudaTempCacheBudgetBytes(self) / (1024 * 1024),
-                cudaTempStableReuseEnabled(),
+                self.runtime_policy.stable_temp_reuse,
                 cudaEffectiveTempSlotPeriod(self),
                 cudaEffectiveTempSlotSkip(self),
             },
@@ -11724,7 +13349,7 @@ fn traceCudaTempAlloc(
     }
     std.log.info(
         "cuda_temp_trace: seq={d} trace_seq={d} event={s} requested={d} buffer_len={d} ptr=0x{x} cache_count={d}",
-        .{ seq, trace_seq, event, requested_len, buffer.len, buffer.ptr, self.temp_buffers.items.len },
+        .{ seq, trace_seq, event, requested_len, buffer.len, buffer.ptr, self.temp_buffers.buffers.items.len },
     );
     if (trace_seq + 1 == limit) {
         std.log.info("cuda_temp_trace: limit_reached limit={d}", .{limit});
@@ -11740,7 +13365,7 @@ fn ensureTempPinnedSlots(self: *CudaCompute, period: usize) !void {
 }
 
 fn findExactTempBufferIndex(self: *const CudaCompute, len: usize) ?usize {
-    for (self.temp_buffers.items, 0..) |buffer, i| {
+    for (self.temp_buffers.buffers.items, 0..) |buffer, i| {
         if (buffer.len == len) return i;
     }
     return null;
@@ -11826,11 +13451,11 @@ fn recycleTempPinnedSlotsUnlocked(self: *CudaCompute) !void {
     const cache_budget = cudaTempCacheBudgetBytes(self);
     const max_buffers = cudaTempCacheMaxBuffers(self);
     var cached_bytes: usize = 0;
-    for (self.temp_buffers.items) |cached| cached_bytes +|= cached.len;
+    for (self.temp_buffers.buffers.items) |cached| cached_bytes +|= cached.len;
     for (self.temp_pinned_slots.items) |*slot| {
         if (slot.buffer.ptr != 0) {
             var buffer = slot.buffer;
-            if (self.temp_buffers.items.len < max_buffers and
+            if (self.temp_buffers.buffers.items.len < max_buffers and
                 buffer.len <= cache_budget and
                 cached_bytes <= cache_budget - buffer.len)
             {
@@ -12115,6 +13740,7 @@ test "CUDA greedy graph output borrows only the prepared replay slot" {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -12124,7 +13750,7 @@ test "CUDA greedy graph output borrows only the prepared replay slot" {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -12153,6 +13779,7 @@ test "CUDA greedy graph output lease remains armed for retry and consumes on ten
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -12162,7 +13789,7 @@ test "CUDA greedy graph output lease remains armed for retry and consumes on ten
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -12194,9 +13821,16 @@ test "CUDA greedy graph output lease remains armed for retry and consumes on ten
 
 fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (len == 0) return .{};
-    if (self.audio_scope) |scope| if (scope.base != 0) return .{ .ptr = try scope.allocate(len), .len = len, .borrowed = true };
+    if (self.execution_scope) |scope| {
+        if (scope.output_active and scope.output_ptr != 0 and len == scope.output_bytes) {
+            if (scope.output_taken) return error.InvalidExecutionPlan;
+            scope.output_taken = true;
+            return .{ .ptr = scope.output_ptr, .len = len, .borrowed = true };
+        }
+        if (scope.base != 0) return .{ .ptr = try scope.allocate(len), .len = len, .borrowed = true };
+    }
     var result = try allocDeviceBufferOrdinary(self, len);
-    if (self.audio_scope) |scope| {
+    if (self.execution_scope) |scope| {
         result.len = len;
         scope.plan.allocate(len, result.ptr);
     }
@@ -12227,11 +13861,11 @@ fn allocDeviceBufferOrdinary(self: *CudaCompute, len: usize) !buffer_mod.DeviceB
         std.log.warn("cuda_graph_capture_probe: unpinned_temp_during_capture seq={d} bytes={d} disabled=1", .{ seq, len });
         return error.CudaGraphCaptureUnsafeTempAlloc;
     }
-    const stable_reuse = self.resident_training_cache or cudaTempStableReuseEnabled();
+    const stable_reuse = self.resident_training_cache or self.runtime_policy.stable_temp_reuse;
     var best_index: ?usize = null;
     var best_len: usize = std.math.maxInt(usize);
     const scan_sample = self.temp_scan_profile.begin(0);
-    for (self.temp_buffers.items, 0..) |buffer, i| {
+    for (self.temp_buffers.buffers.items, 0..) |buffer, i| {
         if (stable_reuse) {
             if (buffer.len == len) {
                 best_index = i;
@@ -12244,7 +13878,7 @@ fn allocDeviceBufferOrdinary(self: *CudaCompute, len: usize) !buffer_mod.DeviceB
         }
     }
     if (scan_sample) |sample| {
-        const visited = if (best_index) |i| (if (self.temp_buffers.items[i].len == len) i + 1 else self.temp_buffers.items.len) else self.temp_buffers.items.len;
+        const visited = if (best_index) |i| (if (self.temp_buffers.buffers.items[i].len == len) i + 1 else self.temp_buffers.buffers.items.len) else self.temp_buffers.buffers.items.len;
         self.temp_scan_profile.end(0, sample, visited);
     }
     if (best_index) |i| {
@@ -12257,6 +13891,11 @@ fn allocDeviceBufferOrdinary(self: *CudaCompute, len: usize) !buffer_mod.DeviceB
         self.debug_cuda_graph_capture_disabled = true;
         std.log.warn("cuda_graph_capture_probe: unsafe_temp_alloc seq={d} bytes={d} disabled=1", .{ seq, len });
         return error.CudaGraphCaptureUnsafeTempAlloc;
+    }
+    if (takeLightOnDeferredBufferUnlocked(self, len, stable_reuse)) |buffer| {
+        self.stats.temp_buffer_hits += 1;
+        traceCudaTempAlloc(self, seq, "alloc_hit", len, buffer);
+        return buffer;
     }
     self.stats.temp_buffer_misses += 1;
     const buffer = buffer_mod.DeviceBuffer.alloc(&self.ctx, len) catch |err| {
@@ -12271,7 +13910,7 @@ fn allocDeviceBufferOrdinary(self: *CudaCompute, len: usize) !buffer_mod.DeviceB
                     // Another CUDA owner may consume physical VRAM even when
                     // our quota has room. Reclaim idle buffers until allocation
                     // succeeds; keep active and graph-pinned buffers intact.
-                    if (self.temp_buffers.items.len == 0) return error.ResourceLimitExceeded;
+                    if (self.temp_buffers.buffers.items.len == 0) return error.ResourceLimitExceeded;
                     var idle = self.temp_buffers.pop().?;
                     self.stats.temp_buffer_evictions += 1;
                     self.stats.device_free_calls += 1;
@@ -12310,16 +13949,62 @@ fn lightOnStatePoolEnabled(self: *const CudaCompute) bool {
         (self.ctx.video_cache_budget.admission == null or self.ocr_retained_cache_lease != null);
 }
 
+/// The caller holds temp_buffer_mutex. These owned allocations are still
+/// charged to the original retained reservation and physical owner. As with
+/// ordinary-cache hits, their old and new GPU users share ctx.stream, so FIFO
+/// ordering permits reuse without a host wait or an intervening cuMemFree.
+fn takeLightOnDeferredBufferUnlocked(self: *CudaCompute, len: usize, exact: bool) ?buffer_mod.DeviceBuffer {
+    if (len == 0 or self.deferred_device_frees.items.len == 0 or
+        (self.capability_profile != .lightonocr3 and !(self.capability_profile == .gliner25_modern_bert and self.glide_cuda)) or
+        self.lazy_host_store != null or self.resident_training_cache or self.execution_scope != null or
+        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
+        !cudaDeferredFreeEnabled()) return null;
+    const deferred_budget = cudaDeferredFreeBudgetBytes(self);
+    // A queue still at its drain threshold may have failed synchronization;
+    // it must retain the original conservative allocation/free behavior.
+    if (deferred_budget == 0 or self.deferred_device_free_bytes >= deferred_budget or
+        cudaTempCacheBudgetBytes(self) == 0 or cudaTempCacheMaxBuffers(self) == 0 or
+        (self.ctx.video_cache_budget.admission != null and self.ocr_retained_cache_lease == null)) return null;
+    var best_index: ?usize = null;
+    var best_len: usize = std.math.maxInt(usize);
+    for (self.deferred_device_frees.items, 0..) |buffer, i| {
+        // Borrowed views, partial extents and untracked allocations cannot
+        // become independently owned tensors or per-page recurrent state.
+        if (buffer.ptr == 0 or buffer.borrowed or buffer.allocation_bytes == 0 or buffer.allocation_bytes != buffer.len or
+            buffer.len < len or (exact and buffer.len != len)) continue;
+        if (buffer.len < best_len) {
+            best_index = i;
+            best_len = buffer.len;
+            if (buffer.len == len) break;
+        }
+    }
+    if (best_index) |i| {
+        const buffer = self.deferred_device_frees.swapRemove(i);
+        std.debug.assert(buffer.len <= self.deferred_device_free_bytes);
+        self.deferred_device_free_bytes -= buffer.len;
+        self.lighton_deferred_buffer_reuses += 1;
+        self.lighton_deferred_buffer_reused_bytes +|= buffer.len;
+        return buffer;
+    }
+    return null;
+}
+
 fn allocLightOnStateBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
     if (!lightOnStatePoolEnabled(self)) return buffer_mod.DeviceBuffer.alloc(&self.ctx, len);
     {
         while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.temp_buffer_mutex.unlock();
-        for (self.temp_buffers.items, 0..) |buffer, i| {
+        for (self.temp_buffers.buffers.items, 0..) |buffer, i| {
             if (buffer.len != len or buffer.borrowed or (buffer.allocation_bytes != 0 and buffer.allocation_bytes != len)) continue;
 
             const reused = self.temp_buffers.swapRemove(i);
             self.lighton_state_pool_hits += 1;
+            self.stats.temp_buffer_hits += 1;
+            return reused;
+        }
+        if (takeLightOnDeferredBufferUnlocked(self, len, true)) |reused| {
+            self.lighton_state_pool_hits += 1;
+            self.lighton_deferred_state_reuses += 1;
             self.stats.temp_buffer_hits += 1;
             return reused;
         }
@@ -12331,6 +14016,7 @@ fn allocLightOnStateBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuf
 fn recycleLightOnStateBuffer(context: *anyopaque, buffer: *buffer_mod.DeviceBuffer) void {
     if (buffer.ptr == 0) return;
     const self: *CudaCompute = @ptrCast(@alignCast(context));
+    if (self.lighton_decode_graph_enabled) self.lighton_decode_graph.invalidate(&self.ctx);
     if (self.lighton_state_pool_enabled and self.capability_profile == .lightonocr3 and
         cudaTempCacheBudgetBytes(self) != 0 and
         (self.ctx.video_cache_budget.admission == null or self.ocr_retained_cache_lease != null))
@@ -12344,7 +14030,11 @@ fn recycleLightOnStateBuffer(context: *anyopaque, buffer: *buffer_mod.DeviceBuff
 
 fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) void {
     if (buffer.ptr == 0) return;
-    if (self.audio_scope) |scope| {
+    if (self.execution_scope) |scope| {
+        if (buffer.borrowed and buffer.ptr == scope.output_ptr) {
+            buffer.* = .{};
+            return;
+        }
         if (scope.base == 0) scope.release(buffer.ptr) else if (scope.owns(buffer.ptr)) {
             scope.release(buffer.ptr);
             buffer.* = .{};
@@ -12357,14 +14047,35 @@ fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) voi
     if (self.temp_scan_profile.enabled) self.temp_scan_profile.sections[3].operations += 1;
     if (lock_sample) |sample| self.temp_scan_profile.end(3, sample, 0);
     if (releasePinnedTempSlot(self, buffer)) return;
+    if (buffer.borrowed) {
+        buffer.* = .{};
+        return;
+    }
     if (buffer.allocation_bytes != 0) buffer.len = buffer.allocation_bytes;
     const cache_budget = cudaTempCacheBudgetBytes(self);
     const max_buffers = cudaTempCacheMaxBuffers(self);
-    var cached_bytes: usize = 0;
     const sample = self.temp_scan_profile.begin(1);
-    for (self.temp_buffers.items) |cached| cached_bytes += cached.len;
-    if (sample) |started| self.temp_scan_profile.end(1, started, self.temp_buffers.items.len);
-    if (self.temp_buffers.items.len < max_buffers and buffer.len <= cache_budget and cached_bytes <= cache_budget - buffer.len) {
+    // Exact-size hits use orderedRemove and append on return, so index zero
+    // is the least recently used idle buffer. Retaining old geometries forever
+    // can otherwise force every operation of a new workload to allocate/free.
+    // Keep the same byte/count ceilings and the existing deferred-free owner.
+    if (self.capability_profile == .gemma4 and self.gemma4_temp_lru and self.runtime_policy.stable_temp_reuse and
+        !self.resident_training_cache and self.execution_scope == null and
+        !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and
+        !self.temp_arena_planner.observing and !self.temp_arena_planner.active and
+        !self.temp_arena_planner.ready_for_capture and cudaEffectiveTempSlotPeriod(self) == 0 and
+        buffer.len <= cache_budget and max_buffers != 0)
+    {
+        while (self.temp_buffers.buffers.items.len != 0 and
+            (self.temp_buffers.buffers.items.len >= max_buffers or self.temp_buffers.bytes > cache_budget - buffer.len))
+        {
+            var oldest = self.temp_buffers.orderedRemove(0);
+            evictTempBufferUnlocked(self, &oldest);
+        }
+    }
+    const cached_bytes = self.temp_buffers.bytes;
+    if (sample) |started| self.temp_scan_profile.end(1, started, 0);
+    if (self.temp_buffers.buffers.items.len < max_buffers and buffer.len <= cache_budget and cached_bytes <= cache_budget - buffer.len) {
         self.temp_buffers.append(self.allocator, buffer.*) catch {
             self.stats.temp_buffer_evictions += 1;
             self.stats.device_free_calls += 1;
@@ -12404,7 +14115,7 @@ fn evictTempBufferUnlocked(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer)
 fn borrowModelConstant(self: *CudaCompute, parent: *CudaTensor) !CT {
     const shape = try self.allocator.dupe(i64, parent.shape);
     errdefer self.allocator.free(shape);
-    const result = try createTensor(self, parent.buffer, shape, parent.elem_count);
+    const result = try createTensorWithDType(self, parent.buffer, shape, parent.elem_count, parent.dtype);
     const tensor = tensorFromCt(result);
     tensor.owns_buffer = false;
     tensor.resident_parent = parent;
@@ -12481,6 +14192,9 @@ fn borrowedSlotTensor(tensor: *const CudaTensor) CudaTensor {
     borrowed.owns_buffer = false;
     borrowed.owns_tc_quant = false;
     borrowed.owns_bf16_mirror = false;
+    borrowed.q8_1_mirror = .{};
+    borrowed.q8_1_mirror_valid = false;
+    borrowed.owns_q8_1_mirror = false;
     borrowed.owns_training_upload_host = false;
     borrowed.owns_shape = false;
     borrowed.owned_by_tensor = false;
@@ -12519,7 +14233,7 @@ fn decoderRuntimeSlotPinsBuffer(self: *const CudaCompute, buffer: buffer_mod.Dev
 }
 
 fn cudaTensorDeviceBytes(tensor: *const CudaTensor) usize {
-    const mirror_bytes = tensor.bf16_mirror.len;
+    const mirror_bytes = tensor.bf16_mirror.len + tensor.q8_1_mirror.len;
     if (tensor.quant_type) |quant_type| {
         const block_size = gguf_tensor_types.bytesPerBlock(quant_type) orelse return tensor.buffer.len + mirror_bytes;
         const values_per_block = gguf_tensor_types.valuesPerBlock(quant_type) orelse return tensor.buffer.len + mirror_bytes;
@@ -12802,6 +14516,7 @@ fn testAcquiredWeightHandle(allocator: std.mem.Allocator) !void {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -12811,7 +14526,7 @@ fn testAcquiredWeightHandle(allocator: std.mem.Allocator) !void {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -12948,29 +14663,36 @@ fn debugProfileCheckpoint(ctx: *anyopaque, label: []const u8, layer: usize) void
     );
 }
 
+fn debugCudaGraphReplayRequested(ctx: *anyopaque) bool {
+    const self: *const CudaCompute = @ptrCast(@alignCast(ctx));
+    return self.gemma4_e4b_sm89_qualified and self.gemma4_request_replay_capacity != null and
+        cudaRequestDecodeGraphReplayMode(self) != .off;
+}
+
 fn debugCudaGraphCaptureBegin(ctx: *anyopaque, label: []const u8) !bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.gemma4_request_replay_disabled) return false;
     if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
     if (self.debug_cuda_graph_capture_inhibit_once) {
         self.debug_cuda_graph_capture_inhibit_once = false;
         return false;
     }
     if (self.debug_cuda_graph_capture_disabled) {
-        if (cudaDecodeGraphReplayMode() == .required) return error.CudaGraphReplayRequired;
+        if (cudaRequestDecodeGraphReplayMode(self) == .required) return error.CudaGraphReplayRequired;
         return false;
     }
-    if (cudaEffectiveTempSlotPeriod(self) == 0 and !cudaDebugGraphCaptureAllowUnpinned()) {
+    if (cudaEffectiveTempSlotPeriod(self) == 0 and !cudaDebugGraphCaptureAllowUnpinned(self)) {
         if (self.temp_slot_config.autoplan_enabled and !self.temp_arena_planner.disabled) {
-            if (self.temp_arena_planner.captureWarmupExhausted() and cudaDecodeGraphReplayMode() == .required) {
+            if (self.temp_arena_planner.captureWarmupExhausted() and cudaRequestDecodeGraphReplayMode(self) == .required) {
                 return error.CudaGraphReplayRequired;
             }
             return false;
         }
-        if (cudaDecodeGraphReplayMode() == .required) return error.CudaGraphReplayRequired;
+        if (cudaRequestDecodeGraphReplayMode(self) == .required) return error.CudaGraphReplayRequired;
         return false;
     }
     if (self.temp_slot_config.autoplan_enabled and !self.temp_arena_planner.ready_for_capture) {
-        if (self.temp_arena_planner.captureWarmupExhausted() and cudaDecodeGraphReplayMode() == .required) {
+        if (self.temp_arena_planner.captureWarmupExhausted() and cudaRequestDecodeGraphReplayMode(self) == .required) {
             return error.CudaGraphReplayRequired;
         }
         return false;
@@ -12982,7 +14704,7 @@ fn debugCudaGraphCaptureBegin(ctx: *anyopaque, label: []const u8) !bool {
     // the autoplan branches above fail closed with CudaGraphReplayRequired.
     if (self.temp_trace_seq < min_alloc_seq) return false;
     if (self.debug_cuda_decode_scalars_host_valid and self.debug_cuda_decode_scalars_host[4] != 0) {
-        if (cudaDecodeGraphReplayMode() == .required) return error.CudaGraphReplayRequired;
+        if (cudaRequestDecodeGraphReplayMode(self) == .required) return error.CudaGraphReplayRequired;
         return false;
     }
     const active_slot_idx = self.debug_cuda_graph_prepared_slot orelse 0;
@@ -13075,7 +14797,7 @@ fn debugCudaGraphPrepareDecodeScalars(
             "required-splitk-online-sm89"
         else
             "splitk-online-sm89";
-        const replay_capacity = cudaDebugGraphForcedKvReplayCapacityTokens() orelse {
+        const replay_capacity = cudaDebugGraphForcedKvReplayCapacityTokens(self) orelse {
             std.log.err(
                 "cuda_gqa_decode_profile: status=rejected profile={s} reason=missing-forced-replay-capacity",
                 .{splitk_profile_name},
@@ -13274,6 +14996,7 @@ test "split-K replay rejection cannot leave a prepared graph or stale scalars" {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -13283,7 +15006,7 @@ test "split-K replay rejection cannot leave a prepared graph or stale scalars" {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -13336,6 +15059,7 @@ test "CUDA persistent buffer reallocation invalidates graph pointers and rejects
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -13345,7 +15069,7 @@ test "CUDA persistent buffer reallocation invalidates graph pointers and rejects
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -13380,6 +15104,7 @@ test "clearing CUDA graph capture state removes stale disabled latch" {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -13389,7 +15114,7 @@ test "clearing CUDA graph capture state removes stale disabled latch" {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -13410,6 +15135,7 @@ test "CUDA graph request reset clears stale capture and scalar state" {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -13419,7 +15145,7 @@ test "CUDA graph request reset clears stale capture and scalar state" {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -13458,6 +15184,7 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -13467,7 +15194,7 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.resident_training_cache = false;
@@ -13497,7 +15224,7 @@ test "CUDA request reset clears pinned temp slot ABI mappings" {
 
     try std.testing.expectEqual(@as(usize, 0), self.temp_trace_seq);
     try std.testing.expectEqual(@as(u64, 2), self.temp_arena_generation);
-    try std.testing.expectEqual(@as(usize, 2), self.temp_buffers.items.len);
+    try std.testing.expectEqual(@as(usize, 2), self.temp_buffers.buffers.items.len);
     for (self.temp_pinned_slots.items) |slot| {
         try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), slot.buffer.ptr);
         try std.testing.expectEqual(@as(usize, 0), slot.requested_len);
@@ -13903,7 +15630,7 @@ fn debugCudaGraphPrepareReplayInput(
 
     const capture_possible = self.temp_slot_config.configured_period != 0 or
         self.temp_slot_config.autoplan_enabled or
-        cudaDebugGraphCaptureAllowUnpinned();
+        cudaDebugGraphCaptureAllowUnpinned(self);
     const attention_topology = generatedGqaAttentionTopology(self, kv_seq_len);
     self.debug_cuda_graph_prepared_attention_topology = attention_topology;
     const replay_key = cudaGraphReplayKeyForDecodeSchedule(self, label, kv_seq_len);
@@ -14643,7 +16370,7 @@ fn audioBufferView(buffer: buffer_mod.DeviceBuffer, offset: usize, bytes: usize)
 }
 fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or self.audio_execution_active or self.audio_scope != null or inputs.len == 0 or inputs.len > 20 or try self.ctx.streamCaptureActive()) return null;
+    if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_graph or self.audio_execution_active or self.execution_scope != null or inputs.len == 0 or inputs.len > 20 or try self.ctx.streamCaptureActive()) return null;
     self.audio_execution_active = true;
     defer self.audio_execution_active = false;
     var hash = std.hash.Wyhash.init(key);
@@ -14688,16 +16415,16 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         var scope = plan_mod.Scope{ .plan = plan };
         const h2d_before = self.stats.h2d_bytes;
         const d2h_before = self.stats.d2h_bytes;
-        self.audio_scope = &scope;
+        self.execution_scope = &scope;
         const out = run(context, canonical[0..canonical_count]) catch |err| {
-            self.audio_scope = null;
+            self.execution_scope = null;
             if (err == error.Cancelled or err == error.Timeout) {
                 std.heap.c_allocator.destroy(plan);
                 entry.plan = null;
             } else entry.disabled = true;
             return err;
         };
-        self.audio_scope = null;
+        self.execution_scope = null;
         if (!plan.finish(tensorFromCt(out).buffer.ptr) or self.stats.h2d_bytes != h2d_before or self.stats.d2h_bytes != d2h_before) entry.disabled = true;
         return out;
     }
@@ -14760,9 +16487,9 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         };
         const h2d_before = self.stats.h2d_bytes;
         const d2h_before = self.stats.d2h_bytes;
-        self.audio_scope = &scope;
+        self.execution_scope = &scope;
         const result = run(context, stable[0..count]) catch |err| {
-            self.audio_scope = null;
+            self.execution_scope = null;
             if (capture) {
                 if (self.ctx.endStreamCapture()) |g| self.ctx.destroyGraph(g) else |_| {}
             }
@@ -14772,7 +16499,7 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
             if (!capture and err != error.AudioPlanChanged and err != error.CudaGraphCaptureUnsafeHostCopy) return err;
             return null;
         };
-        self.audio_scope = null;
+        self.execution_scope = null;
         const result_tensor = tensorFromCt(result);
         const matches = self.stats.h2d_bytes == h2d_before and self.stats.d2h_bytes == d2h_before and scope.valid and scope.cursor == plan.event_count and result_tensor.buffer.ptr == scope.base + plan.allocations[plan.output].offset;
         result_tensor.owns_buffer = false;
@@ -14815,11 +16542,12 @@ fn audioBatchLayoutsEnabledOp(ctx: *anyopaque) bool {
 }
 fn audioLogMelEnabledOp(ctx: *anyopaque) bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    return self.capability_profile == .embedding_gemma2 and self.embedding_gemma2_policy.audio_frontend_fused;
+    return (self.capability_profile == .embedding_gemma2 and self.embedding_gemma2_policy.audio_frontend_fused) or
+        (self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_AUDIO_LOGMEL_FUSED", true));
 }
 fn audioLogMelOp(ctx: *anyopaque, pcm: CT, plan: CT, mask: CT, frames: usize, hop: usize, floor: f32) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    if (self.capability_profile != .embedding_gemma2 or !self.embedding_gemma2_policy.audio_frontend_fused) return null;
+    if (!audioLogMelEnabledOp(ctx)) return null;
     const x = tensorFromCt(pcm);
     const p = tensorFromCt(plan);
     const m = tensorFromCt(mask);
@@ -15046,6 +16774,7 @@ test "Gemma 4 audio CUDA hooks decline pre-Ampere before touching tensors" {
     var self: CudaCompute = undefined;
 
     self.temp_scan_profile = .{};
+    self.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     self.lighton_fused_vision_qkv_enabled = false;
     self.lighton_ragged_recurrent_enabled = false;
     self.lighton_ffn_bf16_inputs = false;
@@ -15055,7 +16784,7 @@ test "Gemma 4 audio CUDA hooks decline pre-Ampere before touching tensors" {
     self.ocr_temp_cache_budget_bytes = null;
 
     self.ocr_deferred_free_budget_bytes = null;
-    self.audio_scope = null;
+    self.execution_scope = null;
     self.audio_execution_active = false;
     self.embedding_gemma2_constant_generation = 0;
     self.ctx.info.compute_major = 7;
@@ -15213,6 +16942,140 @@ fn createTensorWithDTypeAndBf16Mirror(
     return tensor;
 }
 
+fn borrowRmsQ8Mirror(tensor: *const CudaTensor, rows: usize, in_dim: usize) ?buffer_mod.DeviceBuffer {
+    if (rows != 1 or in_dim != 2560 or tensor.elem_count != 2560 or tensor.buffer.len < 2560 * @sizeOf(f32) or tensor.dtype != .f32 or tensor.quant_type != null) return null;
+    var current = tensor;
+    while (true) {
+        if (current.q8_1_mirror_valid and current.q8_1_mirror.ptr != 0 and current.q8_1_mirror.len >= 80 * 36) return current.q8_1_mirror;
+        const parent = current.resident_parent orelse return null;
+        // Only an unchanged full-buffer reshape can borrow this layout. A
+        // slice must not silently reinterpret the original row's Q8 groups.
+        if (parent.buffer.ptr != tensor.buffer.ptr or parent.elem_count != tensor.elem_count) return null;
+        current = parent;
+    }
+}
+
+fn invalidateRmsQ8Mirror(tensor: *CudaTensor) void {
+    tensor.q8_1_mirror_valid = false;
+    // Keep the owned allocation until normal tensor teardown. Its stream-
+    // ordered consumers may still be in flight when a later write is queued.
+    if (tensor.resident_parent) |parent| invalidateRmsQ8Mirror(parent);
+}
+
+const PreparedQ8Input = struct {
+    buffer: buffer_mod.DeviceBuffer,
+    owned: bool,
+
+    fn deinit(self: *@This(), compute: *CudaCompute) void {
+        if (self.owned) releaseDeviceBuffer(compute, &self.buffer);
+    }
+};
+
+fn prepareQ8Input(self: *CudaCompute, input: *const CudaTensor, rows: usize, in_dim: usize) !PreparedQ8Input {
+    if (borrowRmsQ8Mirror(input, rows, in_dim)) |mirror| {
+        if (self.stats.rms_norm_q8_1_mirror_hits == 0)
+            std.log.info("cuda_rms_q8_1_mirror: consumer=active rows=1 dim=2560 cached_quantization=exact", .{});
+        self.stats.rms_norm_q8_1_mirror_hits += 1;
+        return .{ .buffer = mirror, .owned = false };
+    }
+    const bytes = try checkedMul(try checkedMul(rows, in_dim / 32), 36);
+    var buffer = try allocDeviceBuffer(self, bytes);
+    errdefer releaseDeviceBuffer(self, &buffer);
+    try self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, buffer, input.buffer, rows, in_dim);
+    return .{ .buffer = buffer, .owned = true };
+}
+
+fn tryRmsQ8Mirror(
+    self: *CudaCompute,
+    operation: kernels_mod.KernelModule.RmsQ8Operation,
+    device: buffer_mod.DeviceBuffer,
+    shape: []i64,
+    input: *const CudaTensor,
+    weight: *const CudaTensor,
+    residual: ?*const CudaTensor,
+    scalar: ?*const CudaTensor,
+    dim: usize,
+    eps: f32,
+) !?CT {
+    if (dim != 2560 or input.elem_count != dim or self.capability_profile != .gemma4 or
+        self.ctx.info.compute_major < 8 or !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_RMS_Q8_1_MIRROR", false)) return null;
+    if (!self.kernels.hasRmsQ8Mirror2560(operation)) {
+        if (!self.rms_q8_1_missing_reported) {
+            self.rms_q8_1_missing_reported = true;
+            std.log.warn("cuda_rms_q8_1_mirror: requested=1 active=0 reason=kernel_unavailable operation={s}", .{@tagName(operation)});
+        }
+        return null;
+    }
+    var mirror = allocDeviceBuffer(self, 80 * 36) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc => return null,
+        else => return err,
+    };
+    var mirror_owned = true;
+    defer if (mirror_owned) releaseDeviceBuffer(self, &mirror);
+    self.kernels.launchRmsQ8Mirror2560(&self.ctx, operation, device, mirror, input.buffer, weight.buffer, if (residual) |value| value.buffer else .{}, if (scalar) |value| value.buffer else .{}, eps) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => return null,
+        else => return err,
+    };
+    const output = try createTensor(self, device, shape, input.elem_count);
+    const tensor = tensorFromCt(output);
+    tensor.q8_1_mirror = mirror;
+    tensor.q8_1_mirror_valid = true;
+    mirror_owned = false;
+    if (self.stats.rms_norm_q8_1_mirror_produces == 0)
+        std.log.info("cuda_rms_q8_1_mirror: producer=active rows=1 dim=2560 f32_output=retained q8_1=exact tiled_ctas=10", .{});
+    self.stats.rms_norm_q8_1_mirror_produces += 1;
+    self.stats.launch_norm += 1;
+    switch (operation) {
+        .norm => self.stats.launch_norm_rms += 1,
+        .add => {
+            self.stats.launch_norm_rms_add += 1;
+            self.stats.rms_norm_add_fused += 1;
+        },
+        .add_scale => {
+            self.stats.launch_norm_rms_add_output_scale += 1;
+            self.stats.rms_norm_add_output_scale_fused += 1;
+        },
+    }
+    return output;
+}
+
+test "CUDA RMS Q8 mirror views follow owner validity and preserve allocation accounting" {
+    var shape = [_]i64{ 1, 2560 };
+    var owner = CudaTensor{
+        .buffer = .{ .ptr = 0x10000, .len = 2560 * @sizeOf(f32) },
+        .dtype = .f32,
+        .shape = &shape,
+        .elem_count = 2560,
+        .q8_1_mirror = .{ .ptr = 0x20000, .len = 80 * 36 },
+        .q8_1_mirror_valid = true,
+    };
+    var view = CudaTensor{
+        .buffer = owner.buffer,
+        .dtype = .f32,
+        .shape = &shape,
+        .elem_count = 2560,
+        .resident_parent = &owner,
+        .owns_buffer = false,
+    };
+    try std.testing.expectEqual(owner.q8_1_mirror.ptr, borrowRmsQ8Mirror(&view, 1, 2560).?.ptr);
+    try std.testing.expect(borrowRmsQ8Mirror(&view, 2, 1280) == null);
+    view.buffer.ptr += 4;
+    try std.testing.expect(borrowRmsQ8Mirror(&view, 1, 2560) == null);
+    view.buffer.ptr -= 4;
+    view.elem_count -= 1;
+    try std.testing.expect(borrowRmsQ8Mirror(&view, 1, 2560) == null);
+    view.elem_count += 1;
+    invalidateRmsQ8Mirror(&view);
+    try std.testing.expect(!owner.q8_1_mirror_valid);
+    try std.testing.expect(borrowRmsQ8Mirror(&view, 1, 2560) == null);
+    // Invalidation cannot recycle storage used by earlier stream consumers.
+    try std.testing.expectEqual(@as(u64, 0x20000), owner.q8_1_mirror.ptr);
+    try std.testing.expectEqual(@as(usize, 2560 * @sizeOf(f32) + 80 * 36), cudaTensorDeviceBytes(&owner));
+    const borrowed = borrowedSlotTensor(&owner);
+    try std.testing.expectEqual(@as(u64, 0), borrowed.q8_1_mirror.ptr);
+    try std.testing.expect(!borrowed.owns_q8_1_mirror and !borrowed.q8_1_mirror_valid);
+}
+
 fn convertDTypeOp(ctx: *anyopaque, tensor_ct: CT, target: ops.GraphDType) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const tensor = tensorFromCt(tensor_ct);
@@ -15284,6 +17147,7 @@ fn trainingOverwriteF32Op(ctx: *anyopaque, tensor_ct: CT, data: []const f32, sha
     if (tensor.training_upload_generation == self.training_upload_generation) {
         return error.TrainingUploadStillPending;
     }
+    invalidateRmsQ8Mirror(tensor);
     const data_bytes = std.mem.sliceAsBytes(data);
     if (tensor.training_upload_host.len != data_bytes.len) {
         tensor.training_upload_host.free(&self.ctx);
@@ -15320,6 +17184,7 @@ fn trainingAccumulateF32Op(ctx: *anyopaque, accum_ct: CT, grad_ct: CT, elem_coun
     try ensureF32(accum);
     try ensureF32(grad);
     if (elem_count != accum.elem_count or elem_count != grad.elem_count) return error.InvalidShape;
+    invalidateRmsQ8Mirror(accum);
     try self.kernels.launchTrainingAccumulateF32(&self.ctx, accum.buffer, grad.buffer, elem_count, scale, first);
 }
 
@@ -15339,6 +17204,9 @@ fn trainingAdamWManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingAdamWBatc
             input.elem_count != m.elem_count or
             input.elem_count != v.elem_count) return error.InvalidShape;
         if (input.bias_correction1 <= 0.0 or input.bias_correction2 <= 0.0) return error.InvalidOptimizerState;
+        invalidateRmsQ8Mirror(weight);
+        invalidateRmsQ8Mirror(m);
+        invalidateRmsQ8Mirror(v);
         try self.kernels.launchTrainingAdamWF32(
             &self.ctx,
             weight.buffer,
@@ -16239,6 +18107,7 @@ fn copyRows2DOp(
     if (src_offset > src_tensor.buffer.len or src_bytes > src_tensor.buffer.len - src_offset) return error.InvalidShape;
     const dst_buffer = buffer_mod.DeviceBuffer{ .ptr = dst_tensor.buffer.ptr + dst_offset, .len = dst_bytes };
     const src_buffer = buffer_mod.DeviceBuffer{ .ptr = src_tensor.buffer.ptr + src_offset, .len = src_bytes };
+    invalidateRmsQ8Mirror(dst_tensor);
     if (src_size == dst_size) try copyFromDeviceTracked(self, dst_buffer, src_buffer, dst_bytes) else {
         const module = try self.embeddingGemma2Module();
         try module.launchF32ToBf16(&self.ctx, dst_buffer, src_buffer, @intCast(count));
@@ -16975,13 +18844,18 @@ fn cudaDisableFusedQkv() bool {
     return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_FUSED_QKV", false);
 }
 
-// Default-on only where the fused kernel's parity gate has run (L4/SM89);
-// other architectures keep the reference elementwise kernel unless the env
-// switch forces the fused route.
+// Retain the compiled-capability policy for general encoders. Original FP32
+// specialty checkpoints also use the fused F32 kernel on qualified GB10/SM121,
+// including portable PTX builds without tensor-core artifacts.
+fn debertaFusedF32Default(qualified_span_fp32: bool, major: i32, minor: i32) bool {
+    return cudaTensorCoreArtifactSupported(major, minor) or
+        (qualified_span_fp32 and major == 12 and minor == 1);
+}
+
 fn cudaDebertaFusedAttentionEnabled(self: *const CudaCompute) bool {
     return platform.env.getenvBoolDefault(
         "ANTFLY_CUDA_DEBERTA_FUSED_ATTENTION",
-        cudaQualifiedPerfTarget(self.ctx.info.compute_major, self.ctx.info.compute_minor),
+        debertaFusedF32Default(self.qualified_span_fp32, self.ctx.info.compute_major, self.ctx.info.compute_minor),
     );
 }
 
@@ -17005,6 +18879,31 @@ fn parseCudaDebertaAttentionMode(value: []const u8) ?CudaDebertaAttentionMode {
 const CudaDebertaInvalidModeWarning = struct {
     var emitted = std.atomic.Value(bool).init(false);
 };
+
+fn debertaAttentionExecutionMode(qualified_span_fp32: bool, qualified_decide_fp32: bool, requested: CudaDebertaAttentionMode) CudaDebertaAttentionMode {
+    return if (qualified_span_fp32 or qualified_decide_fp32) .fused_f32 else requested;
+}
+
+test "qualified FP32 attention policy cannot be overridden by reduced precision diagnostics" {
+    inline for (std.meta.tags(CudaDebertaAttentionMode)) |mode| {
+        try std.testing.expectEqual(CudaDebertaAttentionMode.fused_f32, debertaAttentionExecutionMode(true, false, mode));
+        try std.testing.expectEqual(CudaDebertaAttentionMode.fused_f32, debertaAttentionExecutionMode(false, true, mode));
+        try std.testing.expectEqual(mode, debertaAttentionExecutionMode(false, false, mode));
+    }
+    // The generated-auto path additionally requires .auto; the qualified
+    // effective mode is never .auto even if its environment flag is enabled.
+    try std.testing.expect(debertaAttentionExecutionMode(true, false, .auto) != .auto);
+    try std.testing.expect(debertaAttentionExecutionMode(false, true, .auto) != .auto);
+    try std.testing.expect(debertaFusedF32Default(true, 12, 1));
+    // General encoders keep main's compiled-artifact policy on every target;
+    // specialty's GB10 exception must not depend on a BF16 tensor-core image.
+    for ([_][2]i32{ .{ 8, 0 }, .{ 8, 6 }, .{ 8, 9 }, .{ 12, 1 } }) |cc| {
+        const supported = cudaTensorCoreArtifactSupported(cc[0], cc[1]);
+        try std.testing.expectEqual(supported, debertaFusedF32Default(false, cc[0], cc[1]));
+        try std.testing.expectEqual(supported or (cc[0] == 12 and cc[1] == 1), debertaFusedF32Default(true, cc[0], cc[1]));
+    }
+    try std.testing.expect(!debertaFusedF32Default(true, 7, 0));
+}
 
 fn cudaDebertaAttentionMode() CudaDebertaAttentionMode {
     if (platform.env.getenv("ANTFLY_INFERENCE_CUDA_DEBERTA_ATTENTION_MODE")) |value| {
@@ -17154,6 +19053,10 @@ fn uploadTempI64(self: *CudaCompute, data: []const i64) !buffer_mod.DeviceBuffer
 
 fn uploadCachedAttentionMaskI64(self: *CudaCompute, data: []const i64) !buffer_mod.DeviceBuffer {
     const bytes = try checkedMul(data.len, @sizeOf(i64));
+    // Growth can free the old device allocation before a new allocation fails.
+    // Invalidate before acquiring so retries cannot reuse its stale host tag.
+    if (self.attention_mask_scratch.buffer.len < bytes)
+        self.attention_mask_cache_host.clearRetainingCapacity();
     const device = try self.attention_mask_scratch.acquire(&self.ctx, bytes);
     // Compare against the retained host copy byte-for-byte: a 64-bit hash
     // alone would silently reuse a stale device mask on collision, and the
@@ -17523,8 +19426,11 @@ fn glinerLabelGruCombined(ctx: *anyopaque, request: *const ops.GlinerLabelGruCom
         gh_tensor.buffer,
         request.num_labels,
         request.hidden_size,
+        request.add_residual,
     );
     self.stats.launch_other += 1;
+    self.stats.gliner_label_gru_calls += 1;
+    if (!request.add_residual) self.stats.gliner_label_gru_no_residual_calls += 1;
     return try createTensor(self, device, shape, label_count);
 }
 
@@ -17693,7 +19599,7 @@ fn q4_0CublasPrefillEligible(
     out_dim: usize,
 ) bool {
     const elements = std.math.mul(usize, in_dim, out_dim) catch return false;
-    return self.tuned_route_gates.q4_0_cublas_prefill and rows >= 128 and
+    return self.tuned_route_gates.q4_0_cublas_prefill and rows >= @max(@as(usize, 2), self.tuned_route_gates.q4_0_cublas_prefill_min_rows) and
         !self.kernels.attention_match_repeat and isKnownQuant(weight, .Q4_0) and
         self.cublaslt != null and self.kernels.dequant_q4_0_bf16 != null and
         !self.ctx.debug_graph_capture_active and !self.debug_cuda_graph_capture_active and
@@ -17701,9 +19607,16 @@ fn q4_0CublasPrefillEligible(
 }
 
 // W4A16 Q4_0 tensor-core prefill route. Returns true if it consumed the launch
-// (packed weight present + kernel launched); false to fall through to the
+// (qualified raw or packed weight + kernel launched); false to fall through to the
 // standard dispatch (mirror/cuBLASLt/SIMT). Only fires for rows > 1: decode
 // GEMVs keep the tuned fast Q4_0 kernels.
+fn hasQ4_0TcPrefillWeight(self: *const CudaCompute, weight: *const CudaTensor) bool {
+    if (tcQuantBuffer(weight, .q4_0_hmma) != null) return true;
+    return self.gemma4_raw_q4_prefill and isKnownQuant(weight, .Q4_0) and
+        weight.shape.len == 2 and weight.shape[0] > 0 and weight.shape[1] > 0 and
+        isQ4_0TcHmmaShape(@intCast(weight.shape[1]), @intCast(weight.shape[0]));
+}
+
 fn launchQ4_0TcHmmaNoBias(
     self: *CudaCompute,
     variant: kernels_mod.QMatmulVariant,
@@ -17727,6 +19640,11 @@ fn launchQ4_0TcHmmaNoBias(
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_0, .dense_lt, .none, .none, rows, in_dim, out_dim, weight_bytes);
             return true;
         }
+    }
+    if (self.gemma4_raw_q4_prefill and isKnownQuant(weight, .Q4_0) and isQ4_0TcHmmaShape(in_dim, out_dim)) {
+        try self.kernels.launchLinearGemma4Q4RawBf16F32(&self.ctx, dst, input.buffer, weight.buffer, rows, in_dim, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_0, .q4_tc_hmma, .none, .none, rows, in_dim, out_dim, 0);
+        return true;
     }
     const packed_buffer = tcQuantBuffer(weight, .q4_0_hmma) orelse return false;
     // Prefer the BF16-fragment kernel: bf16 has f32's exponent range, so it
@@ -17883,7 +19801,7 @@ fn simtQMatmulFallbackVariant(variant: kernels_mod.QMatmulVariant) kernels_mod.Q
 // resident tensor used by identity checks, embeddings or task heads.
 fn boundaryMixedWeight(self: *CudaCompute, weight: *const CudaTensor) ?CudaTensor {
     const boundary = self.gliner_boundary_inference and self.gliner_mixed_attention and weight.dtype == .f32;
-    const q8 = self.gliner_q8_f16_mirrors and self.gliner_encoder_attention and isKnownQuant(weight, .Q8_0);
+    const q8 = self.gliner_q8_f16_mirrors and (self.gliner_encoder_attention or self.qualified_decide_q8) and isKnownQuant(weight, .Q8_0);
     if (!boundary and !q8) return null;
     const mirror = self.gliner_boundary_f16_mirrors.get(weight.buffer.ptr) orelse return null;
     var view = weight.*;
@@ -17893,6 +19811,9 @@ fn boundaryMixedWeight(self: *CudaCompute, weight: *const CudaTensor) ?CudaTenso
     view.tc_quant = null;
     view.owns_tc_quant = false;
     view.bf16_mirror = .{};
+    view.q8_1_mirror = .{};
+    view.q8_1_mirror_valid = false;
+    view.owns_q8_1_mirror = false;
     view.owns_bf16_mirror = false;
     view.owns_buffer = false;
     view.owns_shape = false;
@@ -17904,6 +19825,7 @@ test "GLiNER Decide CUDA Q8 execution mirror is a borrowed dense view" {
     var compute: CudaCompute = undefined;
 
     compute.temp_scan_profile = .{};
+    compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     compute.lighton_fused_vision_qkv_enabled = false;
     compute.lighton_ragged_recurrent_enabled = false;
     compute.lighton_ffn_bf16_inputs = false;
@@ -17913,13 +19835,14 @@ test "GLiNER Decide CUDA Q8 execution mirror is a borrowed dense view" {
     compute.ocr_temp_cache_budget_bytes = null;
 
     compute.ocr_deferred_free_budget_bytes = null;
-    compute.audio_scope = null;
+    compute.execution_scope = null;
     compute.audio_execution_active = false;
     compute.embedding_gemma2_constant_generation = 0;
     compute.allocator = std.testing.allocator;
     compute.gliner_boundary_inference = false;
     compute.gliner_mixed_attention = false;
     compute.gliner_encoder_attention = true;
+    compute.qualified_decide_q8 = false;
     compute.gliner_q8_f16_mirrors = true;
     compute.gliner_boundary_f16_mirrors = .{};
     defer compute.gliner_boundary_f16_mirrors.deinit(std.testing.allocator);
@@ -17979,6 +19902,17 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
         self.dispatch_stats.note(self.allocator, .linear, .q4_0, .q4_simt, .bias, .none, rows, in_dim, out_dim, 0);
         return result;
     }
+    if (self.capability_profile == .whisper and rows == 1 and isF16Weight(weight_tensor)) {
+        const shape = try allocShape2(self.allocator, rows, out_dim);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, try checkedMul(out_dim, @sizeOf(f32)));
+        errdefer releaseDeviceBuffer(self, &device);
+        try self.whisper_cuda.init(&self.ctx);
+        try self.whisper_cuda.gemvF16(&self.ctx, device.ptr, input_tensor.buffer.ptr, weight_tensor.buffer.ptr, bias_tensor.buffer.ptr, @intCast(in_dim), @intCast(out_dim), false);
+        self.stats.launch_linear += 1;
+        self.dispatch_stats.note(self.allocator, .linear, .f16, .dense_cuda, .bias, .none, rows, in_dim, out_dim, 0);
+        return createTensor(self, device, shape, out_dim);
+    }
     if (isF16Weight(weight_tensor)) {
         if (self.capability_profile == .florence2 and self.florence_fused_bias_enabled and
             self.florence_f16_weights_enabled and rows >= 2 and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
@@ -18011,6 +19945,34 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
         return result;
     }
     if (isBf16Weight(weight_tensor)) {
+        // Vision QKV and output projections already round their inputs to
+        // BF16 and accumulate into F32. Keep those boundaries while applying
+        // their F32 bias in the GEMM epilogue instead of a second matrix pass.
+        if (self.capability_profile == .lightonocr3 and self.lighton_fused_vision_qkv_enabled and
+            (in_dim == 768 or in_dim == 1024) and (out_dim == in_dim or out_dim == 3 * in_dim) and
+            rows >= 256 and rows <= 65536 and self.cublaslt_bf16_tuning_profile == .off and
+            !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
+        {
+            if (try stageBf16ActivationForCublasLt(self, input_tensor, rows, in_dim)) |staged| {
+                const blas = &(self.cublaslt orelse return error.InvalidCudaState);
+                var device = try allocDeviceBuffer(self, try checkedMul(try checkedMul(rows, out_dim), 4));
+                errdefer releaseDeviceBuffer(self, &device);
+                const shape = try allocShape2(self.allocator, rows, out_dim);
+                errdefer self.allocator.free(shape);
+                if (blas.matmulBf16WeightBiasF32Out(&self.ctx, device, staged, weight_tensor.buffer, bias_tensor.buffer, cublasLtWorkspace(self), rows, in_dim, out_dim)) |_| {
+                    self.lighton_vision_bias_epilogue_calls += 1;
+                    self.dispatch_stats.note(self.allocator, .linear, .bf16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
+                    return try createTensor(self, device, shape, rows * out_dim);
+                } else |err| switch (err) {
+                    error.CublasLtUnsupported => {
+                        releaseDeviceBuffer(self, &device);
+                        self.allocator.free(shape);
+                    },
+                    else => return err,
+                }
+            }
+        }
+
         const result = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
         errdefer freeTensor(ctx, result);
         const result_tensor = tensorFromCt(result);
@@ -18177,6 +20139,11 @@ fn linearRelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
             try self.kernels.launchLinearQ4KBiasReluTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
             self.dispatch_stats.note(self.allocator, .linear_relu, .q4_k, .q4_simt, .bias_relu, tcUnavailableReason(), rows, in_dim, out_dim, 0);
         }
+    } else if (self.qualified_span_fp32 and self.kernels.add_bias_relu_rows_f32 != null and
+        try tryCublasLtF32Linear(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim))
+    {
+        try self.kernels.launchAddBiasReluRowsF32(&self.ctx, device, bias_tensor.buffer, rows, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear_relu, .f32, .dense_lt, .bias_relu, .none, rows, in_dim, out_dim, 0);
     } else {
         try self.kernels.launchLinearBiasReluTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
         self.dispatch_stats.note(self.allocator, .linear_relu, .f32, .f32_cuda, .bias_relu, .none, rows, in_dim, out_dim, 0);
@@ -18189,6 +20156,21 @@ fn linearGelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
+    if (self.capability_profile == .whisper and rows == 1 and isF16Weight(weight_tensor)) {
+        const bias_tensor = tensorFromCt(bias);
+        try ensureF32(input_tensor);
+        try ensureF32(bias_tensor);
+        try ensureCount(input_tensor, in_dim);
+        try ensureCount(weight_tensor, try checkedMul(in_dim, out_dim));
+        try ensureCount(bias_tensor, out_dim);
+        const out = (try allocUninitF32ShapeOp(ctx, &.{ 1, @intCast(out_dim) })).?;
+        errdefer freeTensor(ctx, out);
+        try self.whisper_cuda.init(&self.ctx);
+        try self.whisper_cuda.gemvF16(&self.ctx, tensorFromCt(out).buffer.ptr, input_tensor.buffer.ptr, weight_tensor.buffer.ptr, bias_tensor.buffer.ptr, @intCast(in_dim), @intCast(out_dim), true);
+        self.stats.launch_linear += 1;
+        self.dispatch_stats.note(self.allocator, .linear_gelu, .f16, .dense_cuda, .bias_gelu, .none, rows, in_dim, out_dim, 0);
+        return out;
+    }
     if (boundaryMixedWeight(self, weight_tensor) != null) return null;
     const bias_tensor = tensorFromCt(bias);
     const q8_variant = if (isKnownQuant(weight_tensor, .Q8_0)) mxbaiQ8Variant(rows, in_dim, out_dim) else null;
@@ -18235,6 +20217,10 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
     if (boundaryMixedWeight(self, weight_tensor) != null) return null;
+    // The encoder composes plain linear + residual layer norm when declined.
+    // Its strict FP32 cuBLASLt projection is much faster than the small fused
+    // SIMT projection for these wide FFN output matrices, without extra storage.
+    if ((self.qualified_span_fp32 or self.qualified_decide_fp32) and weight_tensor.quant_type == null) return null;
     const bias_tensor = tensorFromCt(bias);
     const residual_tensor = tensorFromCt(residual);
     try ensureF32(input_tensor);
@@ -18281,7 +20267,7 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
 fn tryLaunchLinearQ4_0Q8_1Dp4a(
     self: *CudaCompute,
     device: buffer_mod.DeviceBuffer,
-    input: buffer_mod.DeviceBuffer,
+    input: *const CudaTensor,
     weight: buffer_mod.DeviceBuffer,
     rows: usize,
     in_dim: usize,
@@ -18294,15 +20280,12 @@ fn tryLaunchLinearQ4_0Q8_1Dp4a(
     const q8_bytes = try checkedMul(q8_blocks, 36);
     if (q8_bytes == 0) return false;
 
-    var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-        error.CudaGraphCaptureUnsafeTempAlloc => return false,
+    var prepared = prepareQ8Input(self, input, rows, in_dim) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc, error.CudaKernelUnavailable, error.InvalidCudaState => return false,
         else => return err,
     };
-    defer releaseDeviceBuffer(self, &q8_input);
-    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input, rows, in_dim) catch |err| switch (err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => return false,
-        else => return err,
-    };
+    defer prepared.deinit(self);
+    const q8_input = prepared.buffer;
     var launched_tile8 = false;
     var prefill_variant: kernels_mod.Q4_0Q8_1PrefillRowsVariant = .none;
     if (cudaQ4_0LinearQ8_1Tile8Enabled()) tile8_linear: {
@@ -18337,7 +20320,7 @@ fn tryLaunchLinearQ4_0PairQ8_1Dp4a(
     self: *CudaCompute,
     device_a: buffer_mod.DeviceBuffer,
     device_b: buffer_mod.DeviceBuffer,
-    input: buffer_mod.DeviceBuffer,
+    input: *const CudaTensor,
     weight_a: buffer_mod.DeviceBuffer,
     weight_b: buffer_mod.DeviceBuffer,
     rows: usize,
@@ -18351,15 +20334,12 @@ fn tryLaunchLinearQ4_0PairQ8_1Dp4a(
     const q8_bytes = try checkedMul(q8_blocks, 36);
     if (q8_bytes == 0) return false;
 
-    var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-        error.CudaGraphCaptureUnsafeTempAlloc => return false,
+    var prepared = prepareQ8Input(self, input, rows, in_dim) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc, error.CudaKernelUnavailable, error.InvalidCudaState => return false,
         else => return err,
     };
-    defer releaseDeviceBuffer(self, &q8_input);
-    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input, rows, in_dim) catch |err| switch (err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => return false,
-        else => return err,
-    };
+    defer prepared.deinit(self);
+    const q8_input = prepared.buffer;
     var prefill_variant: kernels_mod.Q4_0Q8_1PrefillRowsVariant = .none;
     if (cudaQ4_0PairQ8_1Tile8Enabled()) {
         self.kernels.launchLinearQ4_0PairNoBiasQ8_1Tile8F32(&self.ctx, device_a, device_b, q8_input, weight_a, weight_b, rows, in_dim, out_dim) catch |err| switch (err) {
@@ -18389,7 +20369,7 @@ fn tryLaunchLinearQ4_0QkvQ8_1Dp4a(
     q_device: buffer_mod.DeviceBuffer,
     k_device: buffer_mod.DeviceBuffer,
     v_device: buffer_mod.DeviceBuffer,
-    input: buffer_mod.DeviceBuffer,
+    input: *const CudaTensor,
     q_weight: buffer_mod.DeviceBuffer,
     k_weight: buffer_mod.DeviceBuffer,
     v_weight: buffer_mod.DeviceBuffer,
@@ -18405,15 +20385,12 @@ fn tryLaunchLinearQ4_0QkvQ8_1Dp4a(
     const q8_bytes = try checkedMul(q8_blocks, 36);
     if (q8_bytes == 0) return false;
 
-    var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-        error.CudaGraphCaptureUnsafeTempAlloc => return false,
+    var prepared = prepareQ8Input(self, input, rows, in_dim) catch |err| switch (err) {
+        error.CudaGraphCaptureUnsafeTempAlloc, error.CudaKernelUnavailable, error.InvalidCudaState => return false,
         else => return err,
     };
-    defer releaseDeviceBuffer(self, &q8_input);
-    self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input, rows, in_dim) catch |err| switch (err) {
-        error.CudaKernelUnavailable, error.InvalidCudaState => return false,
-        else => return err,
-    };
+    defer prepared.deinit(self);
+    const q8_input = prepared.buffer;
     var prefill_variant: kernels_mod.Q4_0Q8_1PrefillRowsVariant = .none;
     if (cudaQ4_0QkvQ8_1Tile8Enabled(self)) {
         if (cudaQ4_0QkvQ8_1Tile8W8Enabled(in_dim)) {
@@ -18581,7 +20558,7 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
     var prefill_profile_scope = beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
     const bf16_mirror = weightBf16MirrorForRows(self, weight_tensor, rows);
-    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, bf16_mirror != null) and
+    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill and self.cooperative_decode_rows == 0, rows, bf16_mirror != null) and
         try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device, input_tensor, weight_tensor, rows, in_dim, out_dim))
     {
         // W4A16 tensor-core prefill route (default on SM89). It DEFERS to the
@@ -18597,8 +20574,19 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
             self.stats.bf16_scalar_linear_calls += 1;
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
         }
+    } else if (self.capability_profile == .whisper and rows == 1 and isF16Weight(weight_tensor)) {
+        try self.whisper_cuda.init(&self.ctx);
+        try self.whisper_cuda.gemvF16(&self.ctx, device.ptr, input_tensor.buffer.ptr, weight_tensor.buffer.ptr, 0, @intCast(in_dim), @intCast(out_dim), false);
+        self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
     } else if (isF16Weight(weight_tensor)) {
-        if (try tryCublasLtF16Linear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim)) {
+        // The QAT checkpoint stores this projection in F16 already. Decode
+        // widens each weight exactly while retaining F32 inputs, accumulation,
+        // and the original reduction order. Only prefill rounds activations.
+        if (self.gemma4_e4b_sm89_qualified and rows == 1 and in_dim == 2560 and out_dim == 10752) {
+            try self.kernels.launchLinearF16WeightF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+            self.stats.f16_scalar_linear_calls += 1;
+            self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
+        } else if (try tryCublasLtF16Linear(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim)) {
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
         } else {
             self.stats.f16_cublaslt_fallbacks += 1;
@@ -18606,7 +20594,7 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
             self.stats.f16_scalar_linear_calls += 1;
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
         }
-    } else if (rows == 1 and weight_tensor.quant_type == null and weight_tensor.dtype == .f32 and
+    } else if (cudaQuantizedDecodeRowsEligible(rows, self.cooperative_decode_rows) and weight_tensor.quant_type == null and weight_tensor.dtype == .f32 and
         weight_tensor.bf16_mirror.ptr != 0 and
         weight_tensor.bf16_mirror.len >= weight_tensor.elem_count * @sizeOf(u16))
     {
@@ -18643,7 +20631,7 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
                         .grid = .{ (rows * out_dim + 255) / 256, 1, 1 },
                         .block = .{ 256, 1, 1 },
                     };
-                    if (try tryLaunchLinearQ4_0Q8_1Dp4a(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
+                    if (try tryLaunchLinearQ4_0Q8_1Dp4a(self, device, input_tensor, weight_tensor.buffer, rows, in_dim, out_dim)) {
                         route = if (cudaQ4_0LinearQ8_1Tile8Enabled()) .{
                             .kernel_id = "termite_linear_q4_0_q8_1_f32_tile8",
                             .grid = .{ (out_dim + 7) / 8, rows, 1 },
@@ -18806,8 +20794,9 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
                     // Full-logits lm-head fast path: Q8_1 activations + DP4A,
                     // same math as the greedy argmax kernels. Feeds sampled
                     // decoding, which needs the whole distribution.
-                    if (rows == 1 and in_dim == 2560 and out_dim >= 32768 and out_dim % 8 == 0 and cudaQ6KLmHeadQ8_1Enabled(self)) q6_q8_blk: {
-                        var q8_input = allocDeviceBuffer(self, (in_dim / 32) * 36) catch |err| switch (err) {
+                    if (cudaQuantizedDecodeRowsEligible(rows, self.cooperative_decode_rows) and in_dim == 2560 and out_dim >= 32768 and out_dim % 8 == 0 and cudaQ6KLmHeadQ8_1Enabled(self)) q6_q8_blk: {
+                        const row_bytes = (in_dim / 32) * 36;
+                        var q8_input = allocDeviceBuffer(self, try checkedMul(rows, row_bytes)) catch |err| switch (err) {
                             error.CudaGraphCaptureUnsafeTempAlloc => break :q6_q8_blk,
                             else => return err,
                         };
@@ -18816,10 +20805,17 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
                             error.CudaKernelUnavailable, error.InvalidCudaState => break :q6_q8_blk,
                             else => return err,
                         };
-                        self.kernels.launchLinearQ6KQ8_1F32Tile8E4B(&self.ctx, device, q8_input, weight_tensor.buffer, in_dim, out_dim) catch |err| switch (err) {
-                            error.CudaKernelUnavailable, error.InvalidCudaState => break :q6_q8_blk,
-                            else => return err,
-                        };
+                        // The sampled path needs every logit. Reuse the exact
+                        // singleton Q8_1 head for each row; only the projection
+                        // tail is split, while the decoder backbone stays fused.
+                        for (0..rows) |row| {
+                            const output_row = buffer_mod.DeviceBuffer{ .ptr = device.ptr + row * out_dim * @sizeOf(f32), .len = out_dim * @sizeOf(f32) };
+                            const input_row = buffer_mod.DeviceBuffer{ .ptr = q8_input.ptr + row * row_bytes, .len = row_bytes };
+                            self.kernels.launchLinearQ6KQ8_1F32Tile8E4B(&self.ctx, output_row, input_row, weight_tensor.buffer, in_dim, out_dim) catch |err| switch (err) {
+                                error.CudaKernelUnavailable, error.InvalidCudaState => break :q6_q8_blk,
+                                else => return err,
+                            };
+                        }
                         self.dispatch_stats.note(self.allocator, .linear_no_bias, .q6_k, .q6_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
                         self.stats.launch_linear += 1;
                         return createTensor(self, device, shape, out_count);
@@ -19234,6 +21230,9 @@ fn linearNoBiasArgmaxLastRowSuppressTensor(ctx: *anyopaque, input: CT, weight: C
                 .ptr = input_tensor.buffer.ptr + last_row_bytes,
                 .len = row_bytes,
             };
+            last_row_tensor.q8_1_mirror = .{};
+            last_row_tensor.q8_1_mirror_valid = false;
+            last_row_tensor.owns_q8_1_mirror = false;
             last_row_tensor.shape = last_row_shape[0..];
             last_row_tensor.elem_count = in_dim;
             last_row_tensor.owns_buffer = false;
@@ -19522,25 +21521,17 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             self.kernels.hasGemma4A4BExactLmHeadPrimitive();
         const launched_q8_1 = if (cudaQ6KLmHeadQ8_1Enabled(self) or generated_q8_1_candidate) blk: {
             if (rows != 1 or in_dim % 256 != 0) break :blk false;
-            const q8_row_blocks = in_dim / 32;
-            const q8_blocks = checkedMul(rows, q8_row_blocks) catch break :blk false;
-            const q8_bytes = checkedMul(q8_blocks, 36) catch break :blk false;
-            var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-                error.CudaGraphCaptureUnsafeTempAlloc => {
+            const q8_blocks = checkedMul(rows, in_dim / 32) catch break :blk false;
+            _ = checkedMul(q8_blocks, 36) catch break :blk false;
+            var prepared = prepareQ8Input(self, input_tensor, rows, in_dim) catch |err| switch (err) {
+                error.CudaGraphCaptureUnsafeTempAlloc, error.CudaKernelUnavailable, error.InvalidCudaState => {
                     if (generated_q8_1_candidate) self.stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks += 1;
                     break :blk false;
                 },
                 else => return err,
             };
-            defer releaseDeviceBuffer(self, &q8_input);
-
-            self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
-                error.CudaKernelUnavailable, error.InvalidCudaState => {
-                    if (generated_q8_1_candidate) self.stats.lm_head_argmax_generated_q6_k_q8_1_fallbacks += 1;
-                    break :blk false;
-                },
-                else => return err,
-            };
+            defer prepared.deinit(self);
+            const q8_input = prepared.buffer;
 
             const launched_generated = if (generated_q8_1_candidate) generated: {
                 self.kernels.launchLinearQ6KQ8_1GeneratedArgmaxRowsTile8F32(
@@ -20147,10 +22138,10 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
     // attached, defer to the individual linearNoBias path (which routes Q4_0
     // prefill through tc_hmma). When a mirror IS present, keep the fused
     // BF16-mirror triple (cuBLASLt is faster + equal quality).
-    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, use_hybrid_bf16) and
-        tcQuantBuffer(q_weight_tensor, .q4_0_hmma) != null and
-        tcQuantBuffer(k_weight_tensor, .q4_0_hmma) != null and
-        tcQuantBuffer(v_weight_tensor, .q4_0_hmma) != null) return null;
+    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill and self.cooperative_decode_rows == 0, rows, use_hybrid_bf16) and
+        hasQ4_0TcPrefillWeight(self, q_weight_tensor) and
+        hasQ4_0TcPrefillWeight(self, k_weight_tensor) and
+        hasQ4_0TcPrefillWeight(self, v_weight_tensor)) return null;
     const q_weight_bf16 = if (use_hybrid_bf16) q_mirror.? else q_weight_tensor.buffer;
     const k_weight_bf16 = if (use_hybrid_bf16) k_mirror.? else k_weight_tensor.buffer;
     const v_weight_bf16 = if (use_hybrid_bf16) v_mirror.? else v_weight_tensor.buffer;
@@ -20244,7 +22235,7 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
             q_device,
             k_device,
             v_device,
-            input_tensor.buffer,
+            input_tensor,
             q_weight_tensor.buffer,
             k_weight_tensor.buffer,
             v_weight_tensor.buffer,
@@ -20719,9 +22710,9 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
     var prefill_profile_scope = beginPrefillProfile(self, if (use_bf16) .bf16_pair else if (use_q4_0) .q4_pair else null, rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
 
-    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, use_hybrid_bf16) and
-        tcQuantBuffer(weight_a_tensor, .q4_0_hmma) != null and
-        tcQuantBuffer(weight_b_tensor, .q4_0_hmma) != null and
+    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill and self.cooperative_decode_rows == 0, rows, use_hybrid_bf16) and
+        hasQ4_0TcPrefillWeight(self, weight_a_tensor) and
+        hasQ4_0TcPrefillWeight(self, weight_b_tensor) and
         try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device_a, input_tensor, weight_a_tensor, rows, in_dim, out_dim) and
         try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device_b, input_tensor, weight_b_tensor, rows, in_dim, out_dim))
     {
@@ -20806,7 +22797,7 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
             self,
             device_a,
             device_b,
-            input_tensor.buffer,
+            input_tensor,
             weight_a_tensor.buffer,
             weight_b_tensor.buffer,
             rows,
@@ -21029,7 +23020,7 @@ fn linearNoBiasPairActivationQ4_0(
     try ensureF32(input_tensor);
     try ensureF32Bf16OrQuantized(weight_gate_tensor);
     try ensureF32Bf16OrQuantized(weight_up_tensor);
-    if (rows != 1) return null;
+    if (!cudaQuantizedDecodeRowsEligible(rows, self.cooperative_decode_rows)) return null;
     if (!isKnownQuant(weight_gate_tensor, .Q4_0) or !isKnownQuant(weight_up_tensor, .Q4_0)) return null;
     const input_expected = try checkedMul(rows, in_dim);
     if (input_tensor.elem_count != input_expected) return error.InvalidShape;
@@ -21053,19 +23044,12 @@ fn linearNoBiasPairActivationQ4_0(
         .block = .{ 128, 1, 1 },
     };
     if (cudaQ4_0PairActivationQ8_1Dp4aEnabled(self)) q8_1_blk: {
-        const row_blocks = in_dim / 32;
-        const q8_blocks = try checkedMul(rows, row_blocks);
-        const q8_bytes = try checkedMul(q8_blocks, 36);
-        var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-            error.CudaGraphCaptureUnsafeTempAlloc => break :q8_1_blk,
+        var prepared = prepareQ8Input(self, input_tensor, rows, in_dim) catch |err| switch (err) {
+            error.CudaGraphCaptureUnsafeTempAlloc, error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
             else => return err,
         };
-        defer releaseDeviceBuffer(self, &q8_input);
-
-        self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
-            error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
-            else => return err,
-        };
+        defer prepared.deinit(self);
+        const q8_input = prepared.buffer;
         if (cudaQ4_0PairActivationQ8_1Tile8Enabled()) {
             self.kernels.launchLinearQ4_0PairActivationQ8_1Tile8F32(
                 &self.ctx,
@@ -21496,6 +23480,39 @@ fn layerNorm(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 
+fn whisperAllocLikeF32(self: *CudaCompute, input: *const CudaTensor) !CT {
+    const shape = try dupeShape(self.allocator, input.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, try checkedMul(input.elem_count, @sizeOf(f32)));
+    errdefer releaseDeviceBuffer(self, &device);
+    return createTensor(self, device, shape, input.elem_count);
+}
+
+fn whisperAddLayerNormSum(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?ops.AddLayerNormSumResult {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.capability_profile != .whisper) return null;
+    const at = tensorFromCt(a);
+    const bt = tensorFromCt(b);
+    const gt = tensorFromCt(gamma);
+    const wt = tensorFromCt(beta);
+    try ensureF32(at);
+    try ensureF32(bt);
+    try ensureF32(gt);
+    try ensureF32(wt);
+    if (dim == 0 or at.elem_count == 0 or at.elem_count % dim != 0 or at.elem_count != bt.elem_count or !sameShape(at.shape, bt.shape)) return error.InvalidShape;
+    if (!std.math.isFinite(eps) or eps <= 0) return error.InvalidShape;
+    try ensureCount(gt, dim);
+    try ensureCount(wt, dim);
+    const sum = try whisperAllocLikeF32(self, at);
+    errdefer freeTensor(ctx, sum);
+    const normed = try whisperAllocLikeF32(self, at);
+    errdefer freeTensor(ctx, normed);
+    try self.whisper_cuda.init(&self.ctx);
+    try self.whisper_cuda.addNormSum(&self.ctx, .{ tensorFromCt(normed).buffer.ptr, tensorFromCt(sum).buffer.ptr, at.buffer.ptr, bt.buffer.ptr, gt.buffer.ptr, wt.buffer.ptr }, @intCast(at.elem_count / dim), @intCast(dim), eps);
+    self.stats.launch_norm += 1;
+    return .{ .sum = sum, .normed = normed };
+}
+
 fn addLayerNorm(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const a_tensor = tensorFromCt(a);
@@ -21542,6 +23559,7 @@ fn rmsNorm(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerro
     errdefer device.free(&self.ctx);
     var norm_profile_scope = beginPrefillProfile(self, .norm, input_tensor.elem_count / dim);
     defer if (norm_profile_scope) |*scope| scope.end();
+    if (try tryRmsQ8Mirror(self, .norm, device, shape, input_tensor, weight_tensor, null, null, dim, eps)) |result| return result;
     if (input_tensor.elem_count / dim > 1 and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
         var bf16_mirror = allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
         if (bf16_mirror.ptr != 0) {
@@ -21621,6 +23639,7 @@ fn rmsNormAddOutputScaleTensor(ctx: *anyopaque, input: CT, weight: CT, residual:
     errdefer device.free(&self.ctx);
     var norm_profile_scope = beginPrefillProfile(self, .norm, input_tensor.elem_count / dim);
     defer if (norm_profile_scope) |*scope| scope.end();
+    if (try tryRmsQ8Mirror(self, .add_scale, device, shape, input_tensor, weight_tensor, residual_tensor, scalar_tensor, dim, eps)) |result| return result;
     self.kernels.launchRmsNormAddOutputScaleF32(
         &self.ctx,
         device,
@@ -21665,6 +23684,7 @@ fn rmsNormAddTensor(ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: u
     errdefer device.free(&self.ctx);
     var norm_profile_scope = beginPrefillProfile(self, .norm, input_tensor.elem_count / dim);
     defer if (norm_profile_scope) |*scope| scope.end();
+    if (try tryRmsQ8Mirror(self, .add, device, shape, input_tensor, weight_tensor, residual_tensor, null, dim, eps)) |result| return result;
     if (input_tensor.elem_count / dim > 1 and cudaRmsNormBf16MirrorEnabled() and cudaCublasLtEnabled() and self.ctx.info.compute_major >= 8 and self.cublaslt != null) {
         var bf16_mirror = allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(u16)) catch buffer_mod.DeviceBuffer{};
         if (bf16_mirror.ptr != 0) {
@@ -22072,9 +24092,55 @@ fn addBiasRowsConsume(ctx: *anyopaque, input: CT, bias: CT, rows: usize, out_dim
     try ensureF32(bias_tensor);
     if (input_tensor.elem_count != try checkedMul(rows, out_dim)) return error.InvalidShape;
     if (bias_tensor.elem_count != out_dim) return error.InvalidShape;
+    invalidateRmsQ8Mirror(input_tensor);
     try self.kernels.launchAddBiasRowsF32(&self.ctx, input_tensor.buffer, bias_tensor.buffer, rows, out_dim);
     self.stats.launch_elementwise += 1;
     return input;
+}
+
+test "CUDA RMS Q8 consumed bias invalidates owner and sibling views before launch" {
+    var shape = [_]i64{ 1, 2560 };
+    var bias_shape = [_]i64{2560};
+    var owner = CudaTensor{
+        .buffer = .{ .ptr = 0x10000, .len = 2560 * @sizeOf(f32) },
+        .dtype = .f32,
+        .shape = &shape,
+        .elem_count = 2560,
+        .q8_1_mirror = .{ .ptr = 0x20000, .len = 80 * 36 },
+        .q8_1_mirror_valid = true,
+    };
+    var first_view = CudaTensor{
+        .buffer = owner.buffer,
+        .dtype = .f32,
+        .shape = &shape,
+        .elem_count = 2560,
+        .resident_parent = &owner,
+        .owns_buffer = false,
+    };
+    var consumed_view = first_view;
+    consumed_view.resident_parent = &first_view;
+    const sibling_view = first_view;
+    var bias = CudaTensor{
+        // Inject a launch-validation failure after logical shape validation.
+        // No context/driver is initialized or GPU work performed in this test.
+        .buffer = .{ .ptr = 0x30000, .len = @sizeOf(f32) },
+        .dtype = .f32,
+        .shape = &bias_shape,
+        .elem_count = 2560,
+    };
+    var compute: CudaCompute = undefined;
+    compute.kernels = .{};
+    try std.testing.expect(borrowRmsQ8Mirror(&consumed_view, 1, 2560) != null);
+    try std.testing.expect(borrowRmsQ8Mirror(&sibling_view, 1, 2560) != null);
+    try std.testing.expectError(error.InvalidShape, addBiasRowsConsume(&compute, @ptrCast(&consumed_view), @ptrCast(&bias), 1, 2559));
+    try std.testing.expect(owner.q8_1_mirror_valid);
+    try std.testing.expectError(error.InvalidCudaState, addBiasRowsConsume(&compute, @ptrCast(&consumed_view), @ptrCast(&bias), 1, 2560));
+    try std.testing.expect(!owner.q8_1_mirror_valid);
+    try std.testing.expect(borrowRmsQ8Mirror(&consumed_view, 1, 2560) == null);
+    try std.testing.expect(borrowRmsQ8Mirror(&sibling_view, 1, 2560) == null);
+    // Invalidation must retain allocation used by already queued consumers.
+    try std.testing.expectEqual(@as(u64, 0x20000), owner.q8_1_mirror.ptr);
+    try std.testing.expectEqual(@as(usize, 80 * 36), owner.q8_1_mirror.len);
 }
 
 fn multiply(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
@@ -22420,19 +24486,12 @@ fn linearNoBiasActivationSliceLastDim(
 
     var used_q8_1_dp4a = false;
     if (cudaQ4_0ActivationSliceQ8_1Dp4aEnabled(self)) q8_1_blk: {
-        const row_blocks = in_dim / 32;
-        const q8_blocks = try checkedMul(rows, row_blocks);
-        const q8_bytes = try checkedMul(q8_blocks, 36);
-        var q8_input = allocDeviceBuffer(self, q8_bytes) catch |err| switch (err) {
-            error.CudaGraphCaptureUnsafeTempAlloc => break :q8_1_blk,
+        var prepared = prepareQ8Input(self, input_tensor, rows, in_dim) catch |err| switch (err) {
+            error.CudaGraphCaptureUnsafeTempAlloc, error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
             else => return err,
         };
-        defer releaseDeviceBuffer(self, &q8_input);
-
-        self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, q8_input, input_tensor.buffer, rows, in_dim) catch |err| switch (err) {
-            error.CudaKernelUnavailable, error.InvalidCudaState => break :q8_1_blk,
-            else => return err,
-        };
+        defer prepared.deinit(self);
+        const q8_input = prepared.buffer;
         self.kernels.launchLinearQ4_0ActivationSliceLastDimQ8_1Tile4F32(
             &self.ctx,
             device,
@@ -22776,8 +24835,7 @@ fn silu(ctx: *anyopaque, input: CT) anyerror!CT {
     return createTensor(self, device, shape, input_tensor.elem_count);
 }
 fn layaWarpEligible(self: *const CudaCompute, batch: usize, seq: usize, dim: usize) bool {
-    return self.laya_optimizations and self.ctx.info.compute_major == 8 and
-        self.ctx.info.compute_minor == 9 and batch >= 2 and seq > 0 and seq <= 512 and
+    return self.laya_optimizations and batch >= 2 and seq > 0 and seq <= 512 and
         (dim == 64 or dim == 128) and self.kernels.laya_attention_warp_f32 != null;
 }
 
@@ -22840,6 +24898,7 @@ test "GLiNER Decide CUDA Q8 long-context attention requires complete supported m
     var compute: CudaCompute = undefined;
 
     compute.temp_scan_profile = .{};
+    compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     compute.lighton_fused_vision_qkv_enabled = false;
     compute.lighton_ragged_recurrent_enabled = false;
     compute.lighton_ffn_bf16_inputs = false;
@@ -22849,7 +24908,7 @@ test "GLiNER Decide CUDA Q8 long-context attention requires complete supported m
     compute.ocr_temp_cache_budget_bytes = null;
 
     compute.ocr_deferred_free_budget_bytes = null;
-    compute.audio_scope = null;
+    compute.execution_scope = null;
     compute.audio_execution_active = false;
     compute.embedding_gemma2_constant_generation = 0;
     compute.gliner_encoder_attention = true;
@@ -23085,9 +25144,10 @@ fn tryReducedVisionCudnnInput(
         };
     }
     const cudnn = &self.embedding_gemma2_cudnn.?;
-    const use_f16 = self.capability_profile == .florence2;
-    const key = cudnn_sdpa_mod.Key{ .batch = batch, .q_heads = num_heads, .kv_heads = num_heads, .sequence = seq_len, .dim = head_dim, .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))), .ocr_vision = self.capability_profile == .lightonocr3, .florence_vision = use_f16, .dtype = if (use_f16) .f16 else .bf16 };
+    const use_f16 = self.capability_profile == .florence2 or self.capability_profile == .whisper;
+    const key = cudnn_sdpa_mod.Key{ .batch = batch, .q_heads = num_heads, .kv_heads = num_heads, .sequence = seq_len, .dim = head_dim, .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))), .ocr_vision = self.capability_profile == .lightonocr3, .florence_vision = self.capability_profile == .florence2, .whisper_encoder = self.capability_profile == .whisper, .dtype = if (use_f16) .f16 else .bf16 };
     const workspace_bytes = (try cudnn.workspaceBytesFor(key)) orelse return null;
+    if (self.capability_profile == .lightonocr3 and workspace_bytes > try @import("vision_memory_contract.zig").vendorWorkspaceLimit(try checkedMul(batch, seq_len), try checkedMul(num_heads, head_dim))) return null;
     const count = try checkedMul(batch, try checkedMul(seq_len, try checkedMul(num_heads, head_dim)));
     const activation_bytes = try checkedMul(count, @sizeOf(u16));
     var cursor: usize = 0;
@@ -23119,9 +25179,10 @@ fn tryReducedVisionCudnnInput(
     if (rotary_qkv) |rotary| {
         if (use_f16 or packed_qkv != null) return error.InvalidShape;
         try self.lighton_vision_fused.init(&self.ctx);
-        var position_buffer = try allocDeviceBuffer(self, try checkedMul(rotary.positions.len, @sizeOf(u32)));
-        defer releaseDeviceBuffer(self, &position_buffer);
-        try copyFromHostTracked(self, position_buffer, std.mem.sliceAsBytes(rotary.positions));
+        const cached_positions = try cachedLightOnMropePositions(self, rotary.positions);
+        var position_buffer = cached_positions orelse try allocDeviceBuffer(self, try checkedMul(rotary.positions.len, @sizeOf(u32)));
+        defer if (cached_positions == null) releaseDeviceBuffer(self, &position_buffer);
+        if (cached_positions == null) try copyFromHostTracked(self, position_buffer, std.mem.sliceAsBytes(rotary.positions));
         try self.lighton_vision_fused.qkvRope(&self.ctx, .{ q_bf16.ptr, k_bf16.ptr, v_bf16.ptr, rotary.qkv.buffer.ptr, position_buffer.ptr }, @intCast(batch * seq_len), @intCast(num_heads), @intCast(head_dim), rotary.theta);
     } else if (packed_qkv) |packed_input| {
         if (!use_f16) return error.InvalidShape;
@@ -23176,6 +25237,7 @@ fn preprocessEmbeddingGemma2ImagePatchesIntoOp(ctx: *anyopaque, destination_ct: 
     const count = try checkedMul(rows, 768);
     if (offset > destination.elem_count or count > destination.elem_count - offset) return error.InvalidShape;
     const output: buffer_mod.DeviceBuffer = .{ .ptr = destination.buffer.ptr + offset * 4, .len = count * 4 };
+    invalidateRmsQ8Mirror(destination);
     const result = (try preprocessEmbeddingGemma2Patches(self, rgb, null, width, height, stride, target_width, target_height, output)) orelse return false;
     freeTensor(self, result);
     self.embedding_gemma2_patch_rows_written += rows;
@@ -23734,11 +25796,31 @@ fn sdpaQwen3VlVision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize
     try ensureCount(k_tensor, count);
     try ensureCount(v_tensor, count);
 
+    // Whisper uses FP16 attention operands, matching its resident matrices.
+    // Prefer fused vendor SDPA; the existing tiled FP16 kernel is the bounded
+    // fallback when cuDNN is absent. Never route speech through BF16 vision.
+    if (self.capability_profile == .whisper and head_dim == 64 and seq_len <= 1500) {
+        if (platform.env.getenvBoolDefault("ANTFLY_CUDA_WHISPER_CUDNN", true)) {
+            if (try tryReducedVisionCudnn(self, q_tensor, k_tensor, v_tensor, batch, seq_len, num_heads, head_dim)) |result| return result;
+        }
+        const shape = try dupeShape(self.allocator, q_tensor.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+        errdefer releaseDeviceBuffer(self, &device);
+        const mask = try self.allocator.alloc(i64, try checkedMul(batch, seq_len));
+        defer self.allocator.free(mask);
+        @memset(mask, 1);
+        const mask_device = try uploadCachedAttentionMaskI64(self, mask);
+        try self.kernels.launchGlinerEncoderAttentionTcF16(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim, seq_len);
+        self.stats.launch_attention += 1;
+        return createTensor(self, device, shape, count);
+    }
+
     // Qwen3.5 OCR vision uses the same noncausal BSHD/64-head-dimension
     // contract as the existing cuDNN BF16 vision route. Keep it opt-in until
     // full-checkpoint quality and throughput have both been qualified.
     if (self.capability_profile == .lightonocr3 and head_dim == 64 and
-        (num_heads == 12 or num_heads == 16) and batch >= 1 and batch <= (if (self.lighton_wide_microbatches) @as(usize, 16) else 8) and seq_len <= 4096 and
+        (num_heads == 12 or num_heads == 16) and batch >= 1 and batch <= (if (self.lighton_wide_microbatches) @as(usize, 16) else 8) and seq_len <= cudnn_sdpa_mod.max_ocr_vision_sequence and
         platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_VISION_CUDNN") and
         !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
     {
@@ -23773,6 +25855,33 @@ fn sdpaQwen3VlVision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize
     return createTensor(self, device, shape, count);
 }
 
+fn gemma4VisionNormRope(ctx: *anyopaque, input: CT, weight: CT, params: ops.VisionNormRopeParams) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!self.gemma4_e4b_sm89_qualified or self.kernels.gemma4_vision_norm_rope_f32 == null or
+        !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VISION_NORM_ROPE", true)) return null;
+    if (params.hidden != 768 or params.head_dim != 64 or params.rows == 0 or params.rows > 4 * 3136 or
+        params.stride != 0 or params.start != 0 or params.rotate != 1 or params.weighted != 1 or params.cached_rotary != 0 or
+        params.grid_x == 0 or params.grid_y == 0 or
+        @as(u64, params.grid_x) * params.grid_y > 3136 or
+        params.rows % (@as(u64, params.grid_x) * params.grid_y) != 0 or
+        params.rows / (@as(u64, params.grid_x) * params.grid_y) > 4 or
+        !std.math.isFinite(params.eps) or params.eps <= 0 or
+        !std.math.isFinite(params.theta) or params.theta <= 0 or !std.math.isFinite(params.scale)) return null;
+    const source = tensorFromCt(input);
+    const w = tensorFromCt(weight);
+    if (source.dtype != .f32 or source.quant_type != null or w.dtype != .f32 or w.quant_type != null) return null;
+    const count = try checkedMul(params.rows, params.hidden);
+    try ensureCount(source, count);
+    try ensureCount(w, 64);
+    const shape = try dupeShape(self.allocator, source.shape);
+    errdefer self.allocator.free(shape);
+    var output = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+    errdefer releaseDeviceBuffer(self, &output);
+    try self.kernels.launchGemma4VisionNormRope(&self.ctx, output, source.buffer, w.buffer, params.rows, params.grid_x, params.grid_y, params.eps, params.theta, params.scale);
+    self.stats.gemma4_vision_norm_rope_calls += 1;
+    return createTensor(self, output, shape, count);
+}
+
 fn sdpaGemma4Vision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     // Reuse the full-precision encoder kernel's warp-reduced scores. The
@@ -23794,7 +25903,28 @@ fn sdpaGemma4Vision(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, batch: usize,
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    try self.kernels.launchGlinerEncoderAttentionF32(&self.ctx, device, q.buffer, k.buffer, v.buffer, .{}, batch, seq_len, num_heads, head_dim, seq_len);
+    // E4B uses a 12x64 bidirectional vision tower. Its normalized operands
+    // fit FP16; keep accumulation/output in F32 and retain the exact F32
+    // fallback for other towers, old artifacts and explicit rollbacks.
+    if (self.gemma4_e4b_sm89_qualified and batch <= 4 and seq_len <= 3136 and
+        num_heads == 12 and head_dim == 64 and self.kernels.gliner_encoder_attention_tc_f16 != null and
+        platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VISION_F16", true))
+    {
+        const mask = try self.allocator.alloc(i64, batch * seq_len);
+        defer self.allocator.free(mask);
+        @memset(mask, 1);
+        const mask_device = try uploadCachedAttentionMaskI64(self, mask);
+        if (seq_len >= 2048 and self.kernels.gemma4_vision_attention_registers != null and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_VISION_REGISTER_ATTENTION", true))
+        {
+            try self.kernels.launchGemma4VisionRegisterAttention(&self.ctx, device, q.buffer, k.buffer, v.buffer, mask_device, batch, seq_len);
+        } else {
+            try self.kernels.launchGlinerEncoderAttentionTcF16(&self.ctx, device, q.buffer, k.buffer, v.buffer, mask_device, batch, seq_len, num_heads, head_dim, seq_len);
+        }
+        self.stats.gemma4_vision_f16_calls += 1;
+    } else {
+        try self.kernels.launchGlinerEncoderAttentionF32(&self.ctx, device, q.buffer, k.buffer, v.buffer, .{}, batch, seq_len, num_heads, head_dim, seq_len);
+    }
     self.stats.launch_attention += 1;
     return createTensor(self, device, shape, count);
 }
@@ -24493,7 +26623,7 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
     ) != null;
     if (!self.kernels.gqaSplitkOnlineDecodeProfileSelected() and
         !score_prework_selected and
-        cudaTurboquantSplitAttentionEnabled() and
+        self.runtime_policy.splitAttentionEnabled(self.capability_profile == .lightonocr3 and !self.resident_training_cache and self.lazy_host_store == null, self.ctx.info.compute_major) and
         batch == 1 and
         attention.query_sequence_len == 1 and
         bias_mode == 0 and
@@ -24501,13 +26631,14 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
         (paged.format == cuda_kv_format_polar4 or paged.format == cuda_kv_format_f16) and
         paged.base_key_row_bytes == paged.key_row_bytes)
     split_attention_blk: {
-        const configured_chunk_size = cudaTurboquantSplitAttentionChunkSize();
+        const configured_chunk_size = self.runtime_policy.splitAttentionChunk(self.capability_profile == .lightonocr3);
         if (configured_chunk_size == 0) break :split_attention_blk;
         const warp_f16 = self.kernels.e4bF16WarpSplitSelected(num_heads, num_kv_heads, head_dim, paged.format, layer.value_format);
         const full_capacity = cudaSplitAttentionCapacity(
             attention.kv_sequence_len,
             layer.capacity_tokens,
             decode_scalars.ptr != 0 or self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active,
+            warp_f16 and cudaDebugGraphPersistentReplayEnabled(self),
         );
         // The F16 warp kernel partitions the visible window from its first
         // key. Keep this capacity fixed across graph replays as the prefix
@@ -24578,6 +26709,31 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
             _ = kv_count;
             return createTensor(self, device, shape, q_count);
         }
+    }
+    // Optional mixed-precision library only. Retain the original default,
+    // decode kernels, and unsupported storage/layout routes. KV suffixes have
+    // already been appended exactly once; failures here fail the claim.
+    if (self.capability_profile == .lightonocr3 and batch == 1 and
+        attention.query_sequence_len >= 2 and attention.query_sequence_len <= 4096 and
+        attention.kv_sequence_len <= 4096 and attention.total_sequence_len == attention.kv_sequence_len and
+        attention.kv_position_offset == 0 and attention.sliding_window == 0 and
+        mask_len == 0 and bias_mode == 0 and head_dim == 256 and
+        ((num_heads == 8 and num_kv_heads == 2) or (num_heads == 16 and num_kv_heads == 4)) and
+        paged.page_size_tokens == 16 and paged.format == cuda_kv_format_f16 and
+        layer.value_format == cuda_kv_value_format_f16 and
+        paged.key_row_bytes == h_kv * 2 and paged.base_key_row_bytes == h_kv * 2 and paged.v_row_stride == h_kv * 2 and
+        !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
+    {
+        if (self.lighton_recurrent.bf16_prefill) |*prefill| if (prefill.attention) |*fast| {
+            try fast.reserve(&self.ctx);
+            try self.kernels.launchF32ToF16(&self.ctx, fast.query(), q_tensor.buffer, q_count);
+            const block_count = (attention.kv_sequence_len + 15) / 16;
+            if (logical_blocks.len < block_count) return error.InvalidPagedKvState;
+            try fast.run(&self.ctx, device, layer.k, layer.v, attention.query_sequence_len, attention.kv_sequence_len, num_heads, num_kv_heads, logical_blocks[0..block_count], layer.k.len / (16 * h_kv * 2));
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_prefill_fast += 1;
+            return createTensor(self, device, shape, q_count);
+        };
     }
     const launch_result = try self.kernels.launchGqaAttentionDecodeTurboquantF32(
         &self.ctx,
@@ -25001,11 +27157,12 @@ fn gqaAttentionMatch(self: *CudaCompute, owner: *CudaKvDeviceStorage, binding: *
 // mutable per-sequence upload table used by the singleton fallback.
 fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention: ops.AttentionContext, views: []const ops.KvBatchView, heads: usize, kv_heads: usize, dim: usize) !?CT {
     if (!self.lighton_attention_enabled or self.capability_profile != .lightonocr3 or
+        !@import("lighton_attention.zig").packetSupported(self.ctx.info.compute_major, self.ctx.info.driver_version) or
         attention.query_sequence_len != 1 or attention.skip_kv_write or
         attention.sliding_window != 0 or attention.attn_or_mask != null or attention.attention_sink.hasMetadata() or
         views.len < 2 or views.len > 64 or dim != 256 or
         !((heads == 8 and kv_heads == 2) or (heads == 16 and kv_heads == 4)) or
-        self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) return null;
+        ((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self))) return null;
     const module = @import("lighton_attention.zig");
     const storage = views[0].kv_storage orelse return null;
     if (storage.storage.config.dtype != .f16 or storage.storage.config.page_size_tokens == 0) return null;
@@ -25027,22 +27184,28 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
             (view.per_item_kv_position_offset orelse attention.kv_position_offset) != 0) return null;
         const tokens = view.per_item_kv_len orelse attention.kv_sequence_len;
         const total = view.per_item_total_len orelse attention.total_sequence_len;
-        if (tokens == 0 or tokens > 1024 or tokens != total) return null;
+        if (tokens == 0 or tokens != total) return null;
         // The manager view and the physical storage allocator need not issue
         // the same block IDs. Read the authoritative table used by KV writes;
         // copy it now because the storage helper reuses one scratch array.
         const blocks = try storage.logicalBlocksWithReservations(view.kv_cache.sequence_id);
-        const count = std.math.divCeil(usize, tokens, params.page_size) catch return error.InvalidPagedKvState;
-        if (count > 64 or blocks.len < count) return null;
+        const count = if (self.lighton_decode_graph.active)
+            blocks.len
+        else
+            std.math.divCeil(usize, tokens, params.page_size) catch return error.InvalidPagedKvState;
+        if (blocks.len < count) return null;
         for (views[0..i]) |prior| if (prior.kv_cache.sequence_id == view.kv_cache.sequence_id) return error.InvalidPagedKvBatch;
-        params.pages[i].tokens = @intCast(tokens);
-        params.pages[i].query_position = @intCast(total - 1);
-        params.pages[i].block_count = @intCast(count);
-        @memcpy(params.pages[i].blocks[0..count], blocks[0..count]);
+        if (!params.appendPage(i, tokens, total - 1, blocks[0..count])) return null;
         max_tokens = @max(max_tokens, tokens);
     }
-    const chunk_size: usize = if (self.lighton_attention_chunk128) 128 else 32;
-    params.chunks = @intCast((max_tokens + chunk_size - 1) / chunk_size);
+    const chunk128 = module.useChunk128(self.lighton_attention_chunk128, heads);
+    const chunk_size: usize = if (chunk128) 128 else 32;
+    const planned_tokens = if (self.lighton_decode_graph.active) self.lighton_decode_graph.future_tokens else max_tokens;
+    params.chunks = @intCast((planned_tokens + chunk_size - 1) / chunk_size);
+    if (self.lighton_decode_graph.active) {
+        params.graph_progress = self.lighton_decode_graph.counter().ptr;
+        params.graph_step = self.lighton_decode_graph.capture_step;
+    }
     // Allocate and qualify the module before the first KV mutation. Physical
     // buffers use the existing budgeted temporary pool and retire on this stream.
     try self.lighton_attention.init(&self.ctx);
@@ -25070,14 +27233,14 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         for (views, params.pages[0..views.len], 0..) |view, page, i| {
             const table = storage.blockTable(view.kv_cache.sequence_id) orelse return error.InvalidPagedKvState;
             if ((page.tokens - 1) / params.page_size < table.shared_prefix_blocks) break :direct false;
-            for (page.blocks[0..page.block_count]) |block_id| {
+            for (params.blockIds(page)) |block_id| {
                 if ((@as(usize, block_id) + 1) * params.page_size > existing.capacity_tokens) break :direct false;
             }
-            const tail_block = page.blocks[(page.tokens - 1) / params.page_size];
+            const tail_block = params.blockIds(page)[(page.tokens - 1) / params.page_size];
             // Do not overwrite any block another live page may still read.
             for (params.pages[0..views.len], 0..) |other, j| {
                 if (i == j) continue;
-                for (other.blocks[0..other.block_count]) |block_id| if (block_id == tail_block) break :direct false;
+                for (params.blockIds(other)) |block_id| if (block_id == tail_block) break :direct false;
             }
         }
         for ([_]*const CudaTensor{ qt, kt, vt }) |source| {
@@ -25097,6 +27260,8 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
         break :direct true;
     };
     if (!direct_suffix) {
+        if (self.lighton_decode_graph.active and self.lighton_decode_graph.phase != .warm)
+            return error.CudaGraphCaptureUnsafeKvWrite;
         for (views, 0..) |view, i| {
             const tokens = params.pages[i].tokens;
             try storage.writeLayerKvSuffixDevice(.{
@@ -25117,13 +27282,13 @@ fn tryLightOnBatchedAttention(self: *CudaCompute, q: CT, k: CT, v: CT, attention
     if (layer.compressed_format != cuda_kv_format_f16 or layer.value_format != cuda_kv_value_format_f16 or
         layer.key_row_bytes != kv_width * 2 or layer.value_row_bytes != kv_width * 2 or
         layer.capacity_tokens > std.math.maxInt(u32) / kv_width) return error.InvalidPagedKvState;
-    for (params.pages[0..views.len]) |page| for (page.blocks[0..page.block_count]) |block_id| {
+    for (params.pages[0..views.len]) |page| for (params.blockIds(page)) |block_id| {
         if ((@as(usize, block_id) + 1) * params.page_size > layer.capacity_tokens) return error.InvalidPagedKvState;
     };
     params.k = layer.k.ptr;
     params.v = layer.v.ptr;
     params.capacity = @intCast(layer.capacity_tokens);
-    try self.lighton_attention.run(&self.ctx, &params, self.lighton_attention_chunk128);
+    try self.lighton_attention.run(&self.ctx, &params, chunk128);
     self.stats.device_kv_batch_steps += 1;
     self.stats.device_kv_batch_items += views.len;
     self.stats.device_kv_successes += 1;
@@ -25255,8 +27420,11 @@ fn crossAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []con
     const k_tensor = tensorFromCt(k_ct);
     const v_tensor = tensorFromCt(v_ct);
     try ensureF32(q_tensor);
-    try ensureF32(k_tensor);
-    try ensureF32(v_tensor);
+    const half_kv = self.capability_profile == .whisper and k_tensor.dtype == .f16 and v_tensor.dtype == .f16;
+    if (!half_kv) {
+        try ensureF32(k_tensor);
+        try ensureF32(v_tensor);
+    }
     const hidden = try checkedMul(num_heads, head_dim);
     const q_count = try checkedMul(try checkedMul(batch, dec_seq), hidden);
     const kv_count = try checkedMul(try checkedMul(batch, enc_seq), hidden);
@@ -25271,7 +27439,17 @@ fn crossAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []con
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, q_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    if (self.capability_profile == .florence2 and self.florence_fused_cross_enabled and
+    if (self.capability_profile == .whisper and head_dim == 64 and batch > 0 and batch <= 8 and
+        dec_seq > 0 and dec_seq <= 448 and enc_seq > 0 and enc_seq <= 1500)
+    {
+        try self.whisper_cuda.init(&self.ctx);
+        const splits = (enc_seq + 127) / 128;
+        var partial = try allocDeviceBuffer(self, try checkedMul(try checkedMul(q_count / 64, splits), 66 * @sizeOf(f32)));
+        defer releaseDeviceBuffer(self, &partial);
+        try self.whisper_cuda.crossAttention(&self.ctx, device.ptr, partial.ptr, q_tensor.buffer.ptr, k_tensor.buffer.ptr, v_tensor.buffer.ptr, mask_device.ptr, @intCast(batch), @intCast(dec_seq), @intCast(enc_seq), @intCast(num_heads), half_kv);
+    } else if (half_kv) {
+        return error.UnsupportedOperation;
+    } else if (self.capability_profile == .florence2 and self.florence_fused_cross_enabled and
         self.ctx.info.compute_major >= 8 and !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active and
         batch > 0 and batch <= 64 and dec_seq == 1 and enc_seq > 0 and enc_seq <= 1024 and
         num_heads == 12 and head_dim == 64 and mask_device.ptr == 0)
@@ -25311,12 +27489,14 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
     try ensureCount(k_r_tensor, rel_count);
     if (mask.len < try checkedMul(batch, seq_len)) return error.InvalidShape;
 
-    const mask_device = try uploadTempI64(self, mask);
+    const mask_device = try uploadCachedAttentionMaskI64(self, mask);
     const shape = try dupeShape(self.allocator, q_tensor.shape);
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    const attention_mode = cudaDebertaAttentionMode();
+    // Both immutable FP32 profiles must bypass automatic half-precision
+    // attention: the 128-token transition can change Decide classifications.
+    const attention_mode = debertaAttentionExecutionMode(self.qualified_span_fp32, self.qualified_decide_fp32 or self.qualified_decide_q8, cudaDebertaAttentionMode());
     if ((attention_mode == .generated_tc or (attention_mode == .auto and cudaDebertaGeneratedTcAutoEnabled())) and seq_len <= 256 and head_dim == 64) {
         const requested_variant = cudaDebertaGeneratedTcVariant();
         const launched_m32 = if (requested_variant != .m16)
@@ -25373,11 +27553,9 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
         }
         self.stats.deberta_generated_tc_attention_fallbacks += 1;
     }
-    // Qualification on SM89/L4 shows the cuBLASLt materialized schedule is
-    // the best current B4+ production route. Do not generalize that evidence
-    // to other tensor-core generations; explicit mode remains available for
-    // collecting qualification data there. Workspace admission inside the
-    // route falls through to bounded fused attention before allocating.
+    // Select the bounded tensor-core schedule wherever its artifact exists.
+    // Workspace admission falls through to bounded fused attention before
+    // allocating; benchmark coverage does not act as a hardware allowlist.
     const auto_materialized_f16 = attention_mode == .auto and
         debertaMaterializedAutoTarget(self.ctx.info.compute_major, self.ctx.info.compute_minor) and
         batch >= 4 and seq_len >= 128 and seq_len <= 256 and head_dim == 64;
@@ -25419,6 +27597,34 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
             }
         }
         self.stats.deberta_stream_f16_attention_fallbacks += 1;
+    }
+    // The L4-qualified original Decide route keeps attention entirely FP32.
+    // Missing symbols in older CUDA images retain the existing fused fallback.
+    if ((self.qualified_decide_fp32 or self.qualified_decide_q8) and self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and
+        (attention_mode == .auto or attention_mode == .fused_f32) and head_dim == 64 and seq_len <= 512)
+    {
+        const launched = self.kernels.launchDebertaAttentionStreamF32(
+            &self.ctx,
+            device,
+            q_tensor.buffer,
+            k_tensor.buffer,
+            v_tensor.buffer,
+            q_r_tensor.buffer,
+            k_r_tensor.buffer,
+            mask_device,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable => false,
+            else => return err,
+        };
+        if (launched) {
+            self.stats.deberta_stream_f32_attention_calls += 1;
+            self.stats.launch_attention += 1;
+            return createTensor(self, device, shape, count);
+        }
     }
     if (cudaDebertaFusedAttentionEnabled(self) and seq_len <= 512) {
         const launched = self.kernels.launchDebertaAttentionFusedF32(
@@ -25703,6 +27909,8 @@ fn trainingRuntimeStatsOp(ctx: *anyopaque) ops.TrainingRuntimeStats {
         .download_last_bytes = @intCast(stats.download_last_bytes),
         .download_previous_bytes = @intCast(stats.download_previous_bytes),
         .to_float32_calls = @intCast(stats.to_float32_calls),
+        .gliner_label_gru_calls = @intCast(stats.gliner_label_gru_calls),
+        .gliner_label_gru_no_residual_calls = @intCast(stats.gliner_label_gru_no_residual_calls),
         .download_alloc_calls = @intCast(stats.download_alloc_calls),
         .stream_synchronizations = @intCast(stats.stream_syncs),
         .upload_synchronizations = @intCast(stats.upload_syncs),
@@ -26107,8 +28315,103 @@ fn tokenGridConv2d(
     errdefer self.allocator.free(out_shape);
     return createTensor(self, out_device, out_shape, out_count);
 }
-fn conv1d(_: *anyopaque, _: CT, _: CT, _: CT, _: usize, _: usize, _: usize, _: usize, _: usize, _: usize, _: usize) anyerror!CT {
-    return unsupportedCt();
+fn whisperPrepareCrossKvOp(ctx: *anyopaque, k: CT, v: CT) anyerror!?ops.LinearNoBiasPairResult {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.capability_profile != .whisper or !self.whisper_f16_weights_enabled) return null;
+    const kt = tensorFromCt(k);
+    const vt = tensorFromCt(v);
+    try ensureF32(kt);
+    try ensureF32(vt);
+    if (!sameShape(kt.shape, vt.shape) or kt.elem_count != vt.elem_count) return error.InvalidShape;
+    var outputs: [2]CT = undefined;
+    var built: usize = 0;
+    errdefer for (outputs[0..built]) |out| freeTensor(ctx, out);
+    for ([_]*const CudaTensor{ kt, vt }, 0..) |source, i| {
+        const shape = try dupeShape(self.allocator, source.shape);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, try checkedMul(source.elem_count, @sizeOf(f16)));
+        errdefer releaseDeviceBuffer(self, &device);
+        try self.kernels.launchF32ToF16(&self.ctx, device, source.buffer, source.elem_count);
+        const out = try createTensor(self, device, shape, source.elem_count);
+        tensorFromCt(out).dtype = .f16;
+        outputs[i] = out;
+        built += 1;
+    }
+    return .{ .first = outputs[0], .second = outputs[1] };
+}
+
+fn whisperLogitsStatsEncodeOp(ctx: *anyopaque, logits: CT, params: *const ops.WhisperLogitsParams, suppress: []const i32) anyerror!bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (params.mode != 0 or params.stats_slot >= 2) return false;
+    const slot = params.stats_slot;
+    self.whisper_stats_valid[slot] = false;
+    const tensor = tensorFromCt(logits);
+    try ensureF32(tensor);
+    try ensureCount(tensor, params.out_dim);
+    if (params.out_dim == 0 or suppress.len != params.suppress_count) return error.InvalidShape;
+    var result = try allocDeviceBuffer(self, @sizeOf(ops.WhisperLogitsStatsRaw));
+    defer releaseDeviceBuffer(self, &result);
+    const blocks = (@as(usize, params.out_dim) + 2047) / 2048;
+    var partial = try allocDeviceBuffer(self, try checkedMul(blocks, @sizeOf(ops.WhisperLogitsStatsRaw)));
+    defer releaseDeviceBuffer(self, &partial);
+    var suppressed = try allocDeviceBuffer(self, try checkedMul(suppress.len, @sizeOf(i32)));
+    defer releaseDeviceBuffer(self, &suppressed);
+    // All allocations and copies belong to the admitted request. The compact
+    // readback is synchronous on CUDA; no frame or host pointer outlives it.
+    errdefer self.ctx.synchronize() catch {};
+    try suppressed.copyFromHost(&self.ctx, std.mem.sliceAsBytes(suppress));
+    try self.whisper_cuda.init(&self.ctx);
+    try self.whisper_cuda.logitsStats(&self.ctx, result.ptr, partial.ptr, tensor.buffer.ptr, suppressed.ptr, params.*);
+    try result.copyToHost(&self.ctx, std.mem.asBytes(&self.whisper_stats[slot]));
+    try self.ctx.synchronize();
+    self.whisper_stats_valid[slot] = true;
+    return true;
+}
+
+fn whisperLogitsStatsReadOp(ctx: *anyopaque, slot: usize, out: *ops.WhisperLogitsStatsRaw) bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (slot >= 2 or !self.whisper_stats_valid[slot]) return false;
+    out.* = self.whisper_stats[slot];
+    self.whisper_stats_valid[slot] = false;
+    return true;
+}
+
+fn conv1dIm2colOp(ctx: *anyopaque, input: CT, batch: usize, channels: usize, time: usize, kernel: usize, stride: usize, padding: usize, time_major: bool) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const tensor = tensorFromCt(input);
+    try ensureF32(tensor);
+    if (batch == 0 or channels == 0 or time == 0 or kernel == 0 or stride == 0) return error.InvalidShape;
+    const padded = try std.math.add(usize, time, try checkedMul(2, padding));
+    if (padded < kernel) return error.InvalidShape;
+    const out_time = (padded - kernel) / stride + 1;
+    const rows = try checkedMul(batch, out_time);
+    const cols = try checkedMul(channels, kernel);
+    const count = try checkedMul(rows, cols);
+    if (count > std.math.maxInt(u32) - 255 or stride > std.math.maxInt(u32) or time > std.math.maxInt(i32) or padded > std.math.maxInt(i32)) return error.InvalidShape;
+    try ensureCount(tensor, try checkedMul(try checkedMul(batch, channels), time));
+    const shape = try allocShape2(self.allocator, rows, cols);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+    errdefer device.free(&self.ctx);
+    try self.whisper_cuda.init(&self.ctx);
+    try self.whisper_cuda.unfold(&self.ctx, device.ptr, tensor.buffer.ptr, @intCast(channels), @intCast(time), @intCast(kernel), @intCast(stride), @intCast(padding), @intCast(out_time), time_major, @intCast(count));
+    return createTensor(self, device, shape, count);
+}
+
+fn conv1d(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize) anyerror!CT {
+    if (stride == 0 or kernel_size == 0 or time_steps == 0) return error.InvalidShape;
+    const padded = try std.math.add(usize, time_steps, try checkedMul(2, padding));
+    if (padded < kernel_size) return error.InvalidShape;
+    // NCHW with height one has exactly the Conv1d channel-major layout.
+    // Relabel the result; no host copy or change to convolution semantics.
+    const result = try conv2d(ctx, input, weight, bias, batch, in_channels, out_channels, 1, time_steps, 1, kernel_size, 1, stride, 0, padding, 1);
+    errdefer freeTensor(ctx, result);
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const tensor = tensorFromCt(result);
+    const shape = try self.allocator.dupe(i64, &.{ @as(i64, @intCast(batch)), @as(i64, @intCast(out_channels)), tensor.shape[3] });
+    self.allocator.free(tensor.shape);
+    tensor.shape = shape;
+    return result;
 }
 fn tryFlorenceCudnnConv(self: *CudaCompute, output: buffer_mod.DeviceBuffer, input: *const CudaTensor, weight: *const CudaTensor, bias: *const CudaTensor, key: @import("cudnn_conv.zig").Key) !bool {
     if (!key.eligible() or self.florence_cudnn_conv_unavailable) return false;
@@ -26248,7 +28551,19 @@ fn rope(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: u
 // at every attention block, forcing the CPU to wait for preceding GPU work.
 const lighton_mrope_position_capacity: usize = 2 * 16 * 4096;
 
+fn lightOnOwnedDecodeCapture(self: *const CudaCompute) bool {
+    return self.lighton_decode_graph.active and self.lighton_decode_graph.epoch_id != 0 and
+        self.execution_scope != null and self.execution_scope.?.base != 0 and self.ctx.debug_graph_capture_active;
+}
+
 fn cachedLightOnMropePositions(self: *CudaCompute, positions: []const u32) !?buffer_mod.DeviceBuffer {
+    if (self.lighton_decode_graph.active) {
+        const owner = &self.lighton_decode_graph;
+        if (positions.len != owner.rows * 3) return error.InvalidShape;
+        for (positions, owner.next_positions[0..positions.len]) |position, base|
+            if (position != try std.math.add(u32, base, owner.capture_step)) return error.InvalidExecutionPlan;
+        return owner.positions();
+    }
     if (!self.lighton_cached_mrope_enabled or self.capability_profile != .lightonocr3 or
         self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active or
         positions.len == 0 or positions.len > lighton_mrope_position_capacity) return null;
@@ -26915,7 +29230,7 @@ fn decoderRuntimePrepareLinearSlot(
     in_dim: usize,
     out_dim: usize,
 ) !void {
-    try ensureF32Bf16OrQuantized(weight);
+    try ensureF32F16Bf16OrQuantized(weight);
     try ensureLogicalWeightCount(weight, try checkedMul(out_dim, in_dim));
     if (bias) |bias_tensor| {
         try ensureF32(bias_tensor);
@@ -27045,6 +29360,35 @@ fn decoderRuntimeApplyLinearPairOp(ctx: *anyopaque, request: *const ops.DecoderR
     var profile_scope = beginDecodeProfile(self, .ffn_gate_up, rows);
     defer if (profile_scope) |*scope| scope.end();
     return try linearNoBiasPair(ctx, request.input, &slot_a.weight, &slot_b.weight, rows, request.in_dim, request.out_dim);
+}
+
+fn whisperLinearQkvInto(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.capability_profile != .whisper or request.in_dim == 0 or request.q_out_dim != request.in_dim or request.kv_out_dim != request.in_dim) return null;
+    if (try decoderRuntimeInputRows(request.input, request.in_dim) != 1) return null;
+    const q = self.decoder_runtime_linear_slots.getPtr(request.q_slot) orelse return null;
+    const k = self.decoder_runtime_linear_slots.getPtr(request.k_slot) orelse return null;
+    const v = self.decoder_runtime_linear_slots.getPtr(request.v_slot) orelse return null;
+    for ([_]@TypeOf(q){ q, k, v }) |slot| {
+        if (slot.in_dim != request.in_dim or slot.out_dim != request.in_dim or !isF16Weight(&slot.weight)) return null;
+    }
+    const input = tensorFromCt(request.input);
+    const kt = tensorFromCt(k_out);
+    const vt = tensorFromCt(v_out);
+    try ensureF32(input);
+    try ensureF32(kt);
+    try ensureF32(vt);
+    try ensureCount(kt, request.in_dim);
+    try ensureCount(vt, request.in_dim);
+    if (kt.buffer.ptr == vt.buffer.ptr or input.buffer.ptr == kt.buffer.ptr or input.buffer.ptr == vt.buffer.ptr) return error.InvalidShape;
+    const out = (try allocUninitF32ShapeOp(ctx, &.{ 1, @intCast(request.in_dim) })).?;
+    errdefer freeTensor(ctx, out);
+    try self.whisper_cuda.init(&self.ctx);
+    try self.whisper_cuda.qkvF16(&self.ctx, .{ tensorFromCt(out).buffer.ptr, kt.buffer.ptr, vt.buffer.ptr, input.buffer.ptr, q.weight.buffer.ptr, k.weight.buffer.ptr, v.weight.buffer.ptr, if (q.bias) |bias| bias.buffer.ptr else 0, if (k.bias) |bias| bias.buffer.ptr else 0, if (v.bias) |bias| bias.buffer.ptr else 0 }, @intCast(request.in_dim));
+    self.stats.decoder_runtime_linear_apply_hits += 3;
+    self.stats.decoder_runtime_linear_qkv_apply_hits += 1;
+    self.stats.launch_linear += 1;
+    return out;
 }
 
 fn decoderRuntimeApplyLinearQkvOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearQkvRequest) anyerror!?ops.LinearNoBiasTripleResult {
@@ -28953,7 +31297,258 @@ fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
     };
 }
 
+/// GLiDE's encoder projects packed rows, then reuses the existing local/global
+/// ModernBERT kernels independently for each row. A pruned query is staged at
+/// its original position, preserving the same local-window semantics.
+fn glideEncoderSegmentAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.SegmentAttention) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!self.glide_cuda or request.head_dim != 64) return null;
+    const r = request.*;
+    if (r.queries == 0 or r.keys == 0 or r.num_heads == 0 or
+        r.ranges.len != try checkedMul(r.queries, 6) or
+        r.query_positions.len != r.queries or r.key_positions.len != r.keys) return error.InvalidShape;
+    const width = try checkedMul(r.num_heads, 64);
+    if (width > std.math.maxInt(i32) or r.queries > std.math.maxInt(i32) or r.keys > std.math.maxInt(i32)) return error.InvalidShape;
+    for ([_]CT{ q, k, v }, [_]usize{ r.queries, r.keys, r.keys }) |input, rows| {
+        const count = try checkedMul(rows, width);
+        try ensureF32(tensorFromCt(input));
+        try ensureCount(tensorFromCt(input), count);
+        if (tensorFromCt(input).buffer.ptr == 0 or tensorFromCt(input).buffer.len < try checkedMul(count, 4)) return error.InvalidShape;
+    }
+    // Validate every row before submitting any work. General tree masks keep
+    // the existing fallback; the encoder's row layout is contiguous.
+    var first: usize = 0;
+    while (first < r.queries) {
+        const ranges = r.ranges[first * 6 ..][0..6];
+        for (0..3) |i| if (ranges[i * 2] > ranges[i * 2 + 1] or ranges[i * 2 + 1] > r.keys) return error.InvalidShape;
+        if (ranges[0] >= ranges[1] or ranges[1] > r.keys) return error.InvalidShape;
+        if (ranges[2] != ranges[3] or ranges[4] != ranges[5]) return null;
+        var end = first + 1;
+        while (end < r.queries and std.mem.eql(u32, ranges, r.ranges[end * 6 ..][0..6])) : (end += 1) {}
+        const length = ranges[1] - ranges[0];
+        if (length > 8192) return null;
+        if (end - first != length and end - first != 1) return null;
+        for (r.key_positions[ranges[0]..ranges[1]], 0..) |position, i| if (position != i) return error.InvalidShape;
+        for (r.query_positions[first..end], 0..) |position, i| {
+            if (position < 0 or position >= length) return error.InvalidShape;
+            if (end - first != 1 and position != i) return error.InvalidShape;
+        }
+        first = end;
+    }
+    const output = (try allocUninitF32ShapeOp(self, &.{ @intCast(r.queries), @intCast(width) })).?;
+    errdefer freeTensor(self, output);
+    first = 0;
+    while (first < r.queries) {
+        const ranges = r.ranges[first * 6 ..][0..6];
+        var end = first + 1;
+        while (end < r.queries and std.mem.eql(u32, ranges, r.ranges[end * 6 ..][0..6])) : (end += 1) {}
+        const length = ranges[1] - ranges[0];
+        const q_view = try sliceRows2DOp(self, q, first, end - first, width);
+        defer freeTensor(self, q_view);
+        const k_view = try sliceRows2DOp(self, k, ranges[0], length, width);
+        defer freeTensor(self, k_view);
+        const v_view = try sliceRows2DOp(self, v, ranges[0], length, width);
+        defer freeTensor(self, v_view);
+        const pruned = end - first != length;
+        const row_query = if (pruned) (try allocUninitF32ShapeOp(self, &.{ @intCast(length), @intCast(width) })).? else q_view;
+        defer if (pruned) freeTensor(self, row_query);
+        const readout: usize = @intCast(r.query_positions[first]);
+        if (pruned) {
+            try self.kernels.launchFillF32(&self.ctx, tensorFromCt(row_query).buffer, length * width, 0);
+            const target = debertaWorkspaceRegion(tensorFromCt(row_query).buffer, readout * width * 4, width * 4);
+            try copyFromDeviceTracked(self, target, tensorFromCt(q_view).buffer, width * 4);
+        }
+        const mask = try self.allocator.alloc(i64, length);
+        defer self.allocator.free(mask);
+        @memset(mask, 1);
+        const result = try encoderLocalAttention(self, row_query, k_view, v_view, mask, 1, length, r.num_heads, 64, @min(r.window, length));
+        defer freeTensor(self, result);
+        const bytes = (end - first) * width * 4;
+        const target = debertaWorkspaceRegion(tensorFromCt(output).buffer, first * width * 4, bytes);
+        const source = debertaWorkspaceRegion(tensorFromCt(result).buffer, if (pruned) readout * width * 4 else 0, bytes);
+        try copyFromDeviceTracked(self, target, source, bytes);
+        first = end;
+    }
+    return output;
+}
+
+const GlideDenseLayout = struct {
+    offsets: [6]usize,
+    sizes: [6]usize,
+    total: usize,
+    tile: usize,
+    padded_keys: usize,
+};
+fn glideDenseLayout(heads: usize, kv_heads: usize, keys: usize, queries: usize, limit: usize) !?GlideDenseLayout {
+    // Aligned K/V leading dimensions admit tensor-core GEMMs even for odd
+    // prompt lengths. Padding never participates in the softmax denominator.
+    const padded_keys = (try std.math.add(usize, keys, 15)) & ~@as(usize, 15);
+    const kv = try checkedMul(try checkedMul(kv_heads, padded_keys), 512);
+    const fixed = try checkedMul(kv, 2);
+    if (fixed >= limit) return null;
+    const per_query = try checkedMul(heads, try std.math.add(usize, 1536, try checkedMul(padded_keys, 6)));
+    // Reserve alignment slop for six independently aligned regions.
+    if (limit - fixed <= 1536) return null;
+    // Compact K/V and smaller long-prompt score tiles reduce cache pressure.
+    // Shorter contexts retain larger GEMMs to amortize launch overhead.
+    const tile_limit: usize = if (keys <= 3072) 256 else 128;
+    const tile = @min(@min(queries, tile_limit), (limit - fixed - 1536) / per_query);
+    if (tile == 0) return null;
+    const q = try checkedMul(try checkedMul(heads, tile), 512);
+    const scores = try checkedMul(try checkedMul(heads, tile), padded_keys);
+    var result = GlideDenseLayout{ .offsets = undefined, .sizes = .{ q, kv, kv, scores * 4, scores * 2, q * 2 }, .total = 0, .tile = tile, .padded_keys = padded_keys };
+    for (&result.offsets, result.sizes) |*offset, size| {
+        result.total = std.mem.alignForward(usize, result.total, 256);
+        offset.* = result.total;
+        result.total = try std.math.add(usize, result.total, size);
+    }
+    return result;
+}
+
+fn glideDenseAttention(self: *CudaCompute, q: CT, k: CT, v: CT, output: CT, request: *const ops.SegmentAttentionGrouped) !bool {
+    if (self.cublaslt == null or self.strict_f32_weights or platform.env.getenvBool("ANTFLY_GLIDE_CUDA_NO_DENSE_ATTENTION")) return false;
+    const a = request.visibility;
+    // The dense tiles cover a single contiguous bidirectional row. General
+    // disjoint visibility stays on the streaming kernel without an N^2 mask.
+    var maximum: usize = 0;
+    var row: usize = 0;
+    while (row < a.queries) {
+        const ranges = a.ranges[row * 6 ..][0..6];
+        if (ranges[0] == ranges[1] or ranges[2] != ranges[3] or ranges[4] != ranges[5]) return false;
+        var end = row + 1;
+        while (end < a.queries and std.mem.eql(u32, ranges, a.ranges[end * 6 ..][0..6])) : (end += 1) {}
+        const layout = (try glideDenseLayout(a.num_heads, request.num_kv_heads, ranges[1] - ranges[0], end - row, request.workspace_limit_bytes)) orelse return false;
+        maximum = @max(maximum, layout.total);
+        row = end;
+    }
+    var arena = try allocDeviceBuffer(self, maximum);
+    defer releaseDeviceBuffer(self, &arena);
+    row = 0;
+    while (row < a.queries) {
+        const ranges = a.ranges[row * 6 ..][0..6];
+        var end = row + 1;
+        while (end < a.queries and std.mem.eql(u32, ranges, a.ranges[end * 6 ..][0..6])) : (end += 1) {}
+        const keys = ranges[1] - ranges[0];
+        const layout = (try glideDenseLayout(a.num_heads, request.num_kv_heads, keys, end - row, request.workspace_limit_bytes)).?;
+        var buffers: [6]buffer_mod.DeviceBuffer = undefined;
+        for (&buffers, layout.offsets, layout.sizes) |*buf, offset, size| buf.* = debertaWorkspaceRegion(arena, offset, size);
+        var p = @import("glide_attention.zig").DenseParams{
+            .q = tensorFromCt(q).buffer.ptr,
+            .k = tensorFromCt(k).buffer.ptr,
+            .v = tensorFromCt(v).buffer.ptr,
+            .out = tensorFromCt(output).buffer.ptr,
+            .qp = buffers[0].ptr,
+            .kp = buffers[1].ptr,
+            .vp = buffers[2].ptr,
+            .scores = buffers[3].ptr,
+            .probabilities = buffers[4].ptr,
+            .op = buffers[5].ptr,
+            .query_start = @intCast(row),
+            .key_start = ranges[0],
+            .queries = 0,
+            .keys = keys,
+            .heads = @intCast(a.num_heads),
+            .kv_heads = @intCast(request.num_kv_heads),
+            .scale = request.score_scale,
+            .padded_keys = @intCast(layout.padded_keys),
+        };
+        try self.glide_attention.dense(&self.ctx, 0, p);
+        var start = row;
+        while (start < end) : (start += layout.tile) {
+            if (request.control) |control| try control.check();
+            const count = @min(layout.tile, end - start);
+            p.query_start = @intCast(start);
+            p.queries = @intCast(count);
+            try self.glide_attention.dense(&self.ctx, 1, p);
+            // Query heads sharing one KV head are adjacent in the packed
+            // layout. Flatten them into GEMM rows so each KV matrix is stored
+            // once; score/output rows retain their original head order.
+            const group_rows = count * (a.num_heads / request.num_kv_heads);
+            const q_bytes = group_rows * 256 * 2;
+            const kv_bytes = layout.padded_keys * 256 * 2;
+            const score_bytes = group_rows * layout.padded_keys * 4;
+            const probability_bytes = score_bytes / 2;
+            const output_bytes = q_bytes * 2;
+            for (0..request.num_kv_heads) |head| {
+                const query = debertaWorkspaceRegion(buffers[0], head * q_bytes, q_bytes);
+                const key = debertaWorkspaceRegion(buffers[1], head * kv_bytes, kv_bytes);
+                const scores = debertaWorkspaceRegion(buffers[3], head * score_bytes, score_bytes);
+                try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, scores, query, key, cublasLtWorkspace(self), group_rows, 256, layout.padded_keys);
+            }
+            try self.glide_attention.dense(&self.ctx, 2, p);
+            for (0..request.num_kv_heads) |head| {
+                const probabilities = debertaWorkspaceRegion(buffers[4], head * probability_bytes, probability_bytes);
+                const value = debertaWorkspaceRegion(buffers[2], head * kv_bytes, kv_bytes);
+                const destination = debertaWorkspaceRegion(buffers[5], head * output_bytes, output_bytes);
+                try self.cublaslt.?.matmulF16WeightF32Out(&self.ctx, destination, probabilities, value, cublasLtWorkspace(self), group_rows, layout.padded_keys, 256);
+            }
+            try self.glide_attention.dense(&self.ctx, 3, p);
+        }
+        row = end;
+    }
+    return true;
+}
+
+fn glideSegmentAttentionGrouped(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.SegmentAttentionGrouped) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const a = request.visibility;
+    if (!self.glide_cuda) return null;
+    // This kernel implements global packed ranges, never causal or local masks.
+    if (a.head_dim != 256 or a.window != std.math.maxInt(u32) or request.metadata != null) return null;
+    if (a.queries == 0 or a.keys == 0 or a.num_heads == 0 or request.num_kv_heads == 0 or
+        a.num_heads % request.num_kv_heads != 0 or a.ranges.len != try checkedMul(a.queries, 6) or
+        !std.math.isFinite(request.score_scale)) return error.InvalidShape;
+    const work = try checkedMul(a.queries, a.num_heads);
+    if (work > std.math.maxInt(u32) - 3 or a.keys > std.math.maxInt(u32)) return error.InvalidShape;
+    for (0..a.queries) |row| {
+        var previous: u32 = 0;
+        for (0..3) |segment| {
+            const begin = a.ranges[row * 6 + segment * 2];
+            const end = a.ranges[row * 6 + segment * 2 + 1];
+            if (begin > end or end > a.keys) return error.InvalidShape;
+            if (begin != end) {
+                if (begin < previous) return error.InvalidShape;
+                previous = end;
+            }
+        }
+    }
+    const count = try checkedMul(work, 256);
+    const kv_count = try checkedMul(try checkedMul(a.keys, request.num_kv_heads), 256);
+    if (count > std.math.maxInt(u32) or kv_count > std.math.maxInt(u32) or
+        a.queries > std.math.maxInt(i32) or a.num_heads > std.math.maxInt(i32) / 256) return error.InvalidShape;
+    for ([_]CT{ q, k, v }, [_]usize{ count, kv_count, kv_count }) |input, expected| {
+        try ensureF32(tensorFromCt(input));
+        try ensureCount(tensorFromCt(input), expected);
+        if (tensorFromCt(input).buffer.ptr == 0 or tensorFromCt(input).buffer.len < try checkedMul(expected, 4)) return error.InvalidShape;
+    }
+    if (request.control) |control| try control.check();
+    const shape = [_]i32{ @intCast(a.queries), @intCast(a.num_heads * 256) };
+    const output = (try allocUninitF32ShapeOp(self, &shape)).?;
+    errdefer freeTensor(self, output);
+    if (try glideDenseAttention(self, q, k, v, output, request)) {
+        if (request.control) |control| try control.check();
+        return output;
+    }
+    const ranges = try uploadTempU32(self, a.ranges);
+    try self.glide_attention.run(&self.ctx, .{
+        .q = tensorFromCt(q).buffer.ptr,
+        .k = tensorFromCt(k).buffer.ptr,
+        .v = tensorFromCt(v).buffer.ptr,
+        .out = tensorFromCt(output).buffer.ptr,
+        .ranges = ranges.ptr,
+        .queries = @intCast(a.queries),
+        .heads = @intCast(a.num_heads),
+        .kv_heads = @intCast(request.num_kv_heads),
+        .scale = request.score_scale,
+    }, !self.strict_f32_weights);
+    self.stats.launch_other += 1;
+    if (request.control) |control| try control.check();
+    return output;
+}
+
 const vtable = ops.ComputeBackend.VTable{
+    .segmentAttention = &glideEncoderSegmentAttention,
+    .segmentAttentionGrouped = &glideSegmentAttentionGrouped,
     .backendKind = &backendKind,
     .modelConstant = &modelConstantOp,
     .audioFrontend = &audioFrontendOp,
@@ -28981,6 +31576,7 @@ const vtable = ops.ComputeBackend.VTable{
     .debugProfileCheckpoint = &debugProfileCheckpoint,
     .debugTimingSnapshot = &debugTimingSnapshotOp,
     .trainingRuntimeStats = &trainingRuntimeStatsOp,
+    .debugCudaGraphReplayRequested = &debugCudaGraphReplayRequested,
     .debugCudaGraphCaptureBegin = &debugCudaGraphCaptureBegin,
     .debugCudaGraphPrepareDecodeScalars = &debugCudaGraphPrepareDecodeScalars,
     .debugCudaTraceTensor = &debugCudaTraceTensor,
@@ -29044,6 +31640,7 @@ const vtable = ops.ComputeBackend.VTable{
     .decoderRuntimeApplyLinearArgmax = &decoderRuntimeApplyLinearArgmaxOp,
     .decoderRuntimeApplyLinearPair = &decoderRuntimeApplyLinearPairOp,
     .decoderRuntimeApplyLinearQkv = &decoderRuntimeApplyLinearQkvOp,
+    .decoderRuntimeApplyLinearQkvInto = &whisperLinearQkvInto,
     .decoderRuntimeApplyScaledAddScale = &decoderRuntimeApplyScaledAddScaleOp,
     .runGatedFfnResidual = &runGatedFfnResidualOp,
     .runGatedDecoderBlock = &runGatedDecoderBlockOp,
@@ -29061,6 +31658,7 @@ const vtable = ops.ComputeBackend.VTable{
     .layerNorm = &layerNorm,
     .layerNormBackward = &layerNormBackwardOp,
     .addLayerNorm = &addLayerNorm,
+    .addLayerNormSum = &whisperAddLayerNormSum,
     .rmsNorm = &rmsNorm,
     .rmsNormAddMultiplyScalarTensor = &rmsNormAddMultiplyScalarTensor,
     .rmsNormAddTensor = &rmsNormAddTensor,
@@ -29118,9 +31716,14 @@ const vtable = ops.ComputeBackend.VTable{
     .tokenGridConv2d = &tokenGridConv2d,
     .multiply = &multiply,
     .conv1d = &conv1d,
+    .conv1dIm2col = &conv1dIm2colOp,
+    .whisperPrepareCrossKv = &whisperPrepareCrossKvOp,
+    .whisperLogitsStatsEncode = &whisperLogitsStatsEncodeOp,
+    .whisperLogitsStatsRead = &whisperLogitsStatsReadOp,
     .conv2d = &conv2d,
     .rope = &rope,
     .mrope = &mrope,
+    .visionNormRope = &gemma4VisionNormRope,
     .visionRope = &visionRope,
     .ropeScaled = &ropeScaled,
     .ropePerItem = &ropePerItem,
@@ -29206,6 +31809,29 @@ const scoped_run_budget_vtable = blk: {
     break :blk copied;
 };
 
+test "generation cooperative CUDA handles bind budgets per step and retire without clearing a peer" {
+    var compute: CudaCompute = undefined;
+    compute.owned_by_backend = false;
+    compute.run_budget = null;
+    compute.lazy_device_budget_bytes = 0;
+    var first = run_memory.RunBudget.init(.{ .backend_limit_bytes = 1000 });
+    var second = run_memory.RunBudget.init(.{ .backend_limit_bytes = 2000 });
+    var a = compute.computeBackendWithStepRunBudget(&first, 1);
+    var b = compute.computeBackendWithStepRunBudget(&second, 2);
+    try std.testing.expect(compute.run_budget == null);
+    a.bindExecutionBudget();
+    try std.testing.expect(compute.run_budget == &first);
+    try std.testing.expectEqual(@as(usize, 1000), compute.lazy_device_budget_bytes);
+    a.clearExecutionBudget();
+    b.bindExecutionBudget();
+    a.deinit();
+    try std.testing.expect(compute.run_budget == &second);
+    try std.testing.expectEqual(@as(usize, 2000), compute.lazy_device_budget_bytes);
+    b.clearExecutionBudget();
+    b.deinit();
+    try std.testing.expect(compute.run_budget == null);
+}
+
 test "cuda compute vtable is type checked" {
     const backend_kind_fn: *const fn (*anyopaque) ops.BackendKind = &backendKind;
     const linear_fn: *const fn (*anyopaque, CT, CT, CT, usize, usize, usize) anyerror!CT = &linear;
@@ -29222,6 +31848,17 @@ test "cuda compute vtable is type checked" {
     _ = graph_prepare_input_fn;
     _ = graph_prepare_greedy_input_fn;
     _ = vtable;
+}
+
+test "CUDA KV hook teardown uses its allocation owner instead of the request allocator" {
+    const Bounded = @import("../../runtime/bounded_allocator.zig").BoundedAllocator;
+    var owner = Bounded{ .backing = std.testing.allocator, .limit = 4096 };
+    var request = Bounded{ .backing = std.testing.allocator, .limit = 4096 };
+    const hook = try CudaKvDeviceStorage.create(owner.allocator(), undefined, .f16);
+    try std.testing.expect(owner.live > 0);
+    hook.hook().deinit(request.allocator());
+    try std.testing.expectEqual(@as(usize, 0), owner.live);
+    try std.testing.expectEqual(@as(usize, 0), request.live);
 }
 
 test "cuda shape helpers reject incompatible shapes" {
@@ -29470,10 +32107,10 @@ test "deberta materialized workspace is aligned bounded and scales linearly with
     try std.testing.expect(b32.total_bytes >= b8.total_bytes * 4);
 }
 
-test "deberta materialized auto promotion is exact to qualified sm89" {
-    try std.testing.expect(debertaMaterializedAutoTarget(8, 9));
-    try std.testing.expect(!debertaMaterializedAutoTarget(8, 0));
-    try std.testing.expect(!debertaMaterializedAutoTarget(9, 0));
+test "deberta materialized auto selection follows compiled tensor core support" {
+    try std.testing.expectEqual(cuda_artifact.hasBf16WmmaCodeFor(8, 9), debertaMaterializedAutoTarget(8, 9));
+    try std.testing.expectEqual(cuda_artifact.hasBf16WmmaCodeFor(8, 0), debertaMaterializedAutoTarget(8, 0));
+    try std.testing.expectEqual(cuda_artifact.hasBf16WmmaCodeFor(9, 0), debertaMaterializedAutoTarget(9, 0));
 }
 
 test "deberta attention mode aliases select the advertised routes" {
@@ -30497,11 +33134,15 @@ test "attention match CUDA authoritative snapshot batches large half and float r
     }
 }
 
-test "EmbeddingGemma 2 global flash route is exact SM89 document geometry" {
+test "EmbeddingGemma 2 global flash route uses compiled BF16 support and exact document geometry" {
     const global = embedding_gemma2_cuda.Attention{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 1, .head_dim = 512, .local_radius = 0 };
     try std.testing.expect(embeddingGemma2GlobalFlashEligible(8, 9, true, global));
     try std.testing.expect(!embeddingGemma2GlobalFlashEligible(8, 9, false, global));
-    try std.testing.expect(!embeddingGemma2GlobalFlashEligible(8, 0, true, global));
+    for ([_][2]i32{ .{ 8, 0 }, .{ 8, 6 }, .{ 8, 9 }, .{ 9, 0 }, .{ 12, 1 } }) |cc| {
+        try std.testing.expect(embeddingGemma2GlobalFlashEligible(cc[0], cc[1], true, global));
+        try std.testing.expect(!embeddingGemma2GlobalFlashEligible(cc[0], cc[1], false, global));
+    }
+    try std.testing.expect(!embeddingGemma2GlobalFlashEligible(7, 5, true, global));
     try std.testing.expect(!embeddingGemma2GlobalFlashEligible(8, 9, true, .{ .batch = 32, .seq = 128, .q_heads = 4, .kv_heads = 1, .head_dim = 512, .local_radius = 0 }));
     try std.testing.expect(!embeddingGemma2GlobalFlashEligible(8, 9, true, .{ .batch = 32, .seq = 512, .q_heads = 4, .kv_heads = 2, .head_dim = 256, .local_radius = 0 }));
 }
@@ -31031,6 +33672,11 @@ test "embeddinggemma2 CUDA vision graphs replay fresh batches with bounded geome
         compute.ctx.synchronize() catch {};
         // Graphs must retire before their fixture weights.
         compute.embedding_gemma2_execution.clear(a, &compute.ctx) catch {};
+        // These resident slots alias the two fixture-owned allocations below.
+        // Model teardown owns every resident slot regardless of owns_buffer;
+        // detach the aliases before zero/ones free their shared storage.
+        var weights = compute.resident_weights.valueIterator();
+        while (weights.next()) |weight| weight.buffer = .{};
     }
     const host = try a.alloc(u16, 3072 * 768);
     defer a.free(host);
@@ -31151,6 +33797,7 @@ test "embeddinggemma2 CUDA model constants keep independent admission through bo
             var compute: CudaCompute = undefined;
 
             compute.temp_scan_profile = .{};
+            compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
             compute.lighton_fused_vision_qkv_enabled = false;
             compute.lighton_ragged_recurrent_enabled = false;
             compute.lighton_ffn_bf16_inputs = false;
@@ -31160,7 +33807,7 @@ test "embeddinggemma2 CUDA model constants keep independent admission through bo
             compute.ocr_temp_cache_budget_bytes = null;
 
             compute.ocr_deferred_free_budget_bytes = null;
-            compute.audio_scope = null;
+            compute.execution_scope = null;
             compute.audio_execution_active = false;
             compute.embedding_gemma2_constant_generation = 0;
             compute.allocator = a;
@@ -31240,6 +33887,7 @@ test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclam
     var compute: CudaCompute = undefined;
 
     compute.temp_scan_profile = .{};
+    compute.runtime_policy = @import("runtime_policy.zig").Policy.resolve();
     compute.lighton_fused_vision_qkv_enabled = false;
     compute.lighton_ragged_recurrent_enabled = false;
     compute.lighton_ffn_bf16_inputs = false;
@@ -31255,8 +33903,8 @@ test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclam
     try std.testing.expect(try audioExecutionOp(&compute, 0, undefined, undefined, undefined) == null);
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, compute.evictEmbeddingGemma2Caches());
     var plan: @import("audio_execution_plan.zig").Plan = undefined;
-    var scope = @import("audio_execution_plan.zig").Scope{ .plan = &plan, .base = 1 };
-    compute.audio_scope = &scope;
+    var scope = @import("execution_arena.zig").Scope{ .plan = &plan, .base = 1 };
+    compute.execution_scope = &scope;
     var bytes = [_]u8{0};
     try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyFromHostTracked(&compute, undefined, &bytes));
     try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyToHostTracked(&compute, undefined, &bytes));
@@ -31890,7 +34538,7 @@ test "LightOnOCR3 CUDA bucketed GEMM preserves logical rows and reuses bounded p
     const a = std.testing.allocator;
     var compute = try CudaCompute.init(a);
     defer compute.deinit();
-    if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+    if (!lightOnDevice(&compute).portableKernels()) return error.SkipZigTest;
     compute.capability_profile = .lightonocr3;
     compute.lighton_gemm_bucket_rows = true;
     const cb = compute.computeBackend();
@@ -31975,7 +34623,7 @@ test "LightOnOCR3 CUDA BF16 decode outputs match exact CPU rounding and retain w
     var compute = try CudaCompute.init(a);
     var owned = true;
     defer if (owned) compute.deinit();
-    if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+    if (!lightOnDevice(&compute).portableKernels()) return error.SkipZigTest;
     compute.capability_profile = .lightonocr3;
     compute.lighton_bf16_decode_outputs = true;
     compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 31 * 1024 * 1024, .scratch_limit_bytes = 31 * 1024 * 1024 }, .check_live_memory = false };
@@ -32034,7 +34682,7 @@ test "LightOnOCR3 CUDA BF16 prefix projection policy rounds exactly and preserve
     var compute = try CudaCompute.init(a);
     var owned = true;
     defer if (owned) compute.deinit();
-    if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+    if (!lightOnDevice(&compute).portableKernels()) return error.SkipZigTest;
     compute.capability_profile = .lightonocr3;
     compute.lighton_bf16_decode_outputs = false;
     compute.lighton_bf16_projection_outputs = true;
@@ -32151,7 +34799,7 @@ test "LightOnOCR3 CUDA fused BF16 FFN preserves separate projections and admits 
     var compute = try CudaCompute.init(a);
     var owned = true;
     defer if (owned) compute.deinit();
-    if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+    if (!lightOnDevice(&compute).portableKernels()) return error.SkipZigTest;
     compute.capability_profile = .lightonocr3;
     compute.lighton_fused_ffn = true;
     compute.lighton_ffn_bf16_inputs = false;
@@ -32175,7 +34823,7 @@ test "LightOnOCR3 CUDA fused BF16 FFN preserves separate projections and admits 
         try compute.ctx.synchronize();
         weights[index] = try cb.getWeight(name);
     }
-    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 13 * 1024 * 1024, .scratch_limit_bytes = 13 * 1024 * 1024 }, .check_live_memory = false };
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 13 * 1024 * 1024, .scratch_limit_bytes = 1024 * 1024 }, .check_live_memory = false };
     {
         const data = try a.alloc(f32, 129 * hidden);
         defer a.free(data);
@@ -32191,9 +34839,10 @@ test "LightOnOCR3 CUDA fused BF16 FFN preserves separate projections and admits 
                 try std.testing.expectEqual(@as(usize, 0), compute.lighton_gate_up_cache.count());
                 compute.kernels.activation_multiply_fused_gate_up_f32 = symbol;
                 try std.testing.expect((try cb.gatedFfnNoBias(&request)) == null);
-                try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+                try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
                 compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = 16 * 1024 * 1024;
-                compute.ctx.video_cache_budget.admission.?.limits.scratch_limit_bytes = 16 * 1024 * 1024;
+                // Immutable pair copies must fit the device envelope, not the
+                // independently bounded activation scratch sublimit.
             }
             const fused = (try cb.gatedFfnNoBias(&request)) orelse return error.UnsupportedOperation;
             defer cb.free(fused);
@@ -32212,7 +34861,8 @@ test "LightOnOCR3 CUDA fused BF16 FFN preserves separate projections and admits 
             const expected = try cb.toFloat32(separate, a);
             defer a.free(expected);
             for (actual, expected) |x, y| try std.testing.expectApproxEqAbs(y, x, 2e-4);
-            try std.testing.expectEqual(@as(usize, pair_bytes), controller.snapshot().backend_scratch_bytes);
+            try std.testing.expectEqual(@as(usize, pair_bytes), controller.snapshot().backend_weight_bytes);
+            try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
             var alternate = request;
             alternate.up_weight = weights[3];
             // Reusing a gate with another up source must reserve a new pair,
@@ -32227,7 +34877,7 @@ test "LightOnOCR3 CUDA fused BF16 FFN preserves separate projections and admits 
     try std.testing.expectEqual(@as(usize, 4), compute.lighton_fused_ffn_calls);
     compute.deinit();
     owned = false;
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
 }
 
 test "LightOnOCR3 CUDA Florence image prompt concat preserves distinct page boundaries and returned lifetime" {
@@ -32505,49 +35155,98 @@ test "LightOnOCR3 CUDA Florence fused DaViT MLP preserves exact GELU and residua
 test "LightOnOCR3 CUDA pinned OCR metadata owns queued host bytes across arena and ring wraps" {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var compute = try CudaCompute.init(a);
+    for ([_]bool{ false, true }) |allow_events| {
+        var controller = @import("../../runtime/tier/memory.zig").AdmissionController{};
+        var compute = try CudaCompute.init(a);
+        defer compute.deinit();
+        compute.capability_profile = .lightonocr3;
+        compute.ocr_pinned_metadata_enabled = true;
+        const capacity = @import("pinned_input_arena.zig").capacity;
+        const events = allow_events;
+        compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .host_limit_bytes = if (events) capacity else capacity - 1 }, .check_live_memory = false };
+        defer compute.ctx.video_cache_budget.admission = null;
+        if (events) compute.ocr_pinned_metadata_arena.offset = capacity - 256;
+        const small_count = pinned_scalar_upload_slot_count + 3;
+        var small = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, small_count * 4);
+        defer small.free(&compute.ctx);
+        for (0..small_count) |i| {
+            var value: u32 = @intCast(i * 17 + 31);
+            try copyFromHostTracked(&compute, .{ .ptr = small.ptr + i * 4, .len = 4 }, std.mem.asBytes(&value));
+            value = 0xdeadbeef;
+        }
+        const actual = try a.alloc(u32, small_count);
+        defer a.free(actual);
+        try small.copyToHost(&compute.ctx, std.mem.sliceAsBytes(actual));
+        try compute.ctx.synchronize();
+        for (actual, 0..) |v, i| try std.testing.expectEqual(@as(u32, @intCast(i * 17 + 31)), v);
+        const chunk = 64 * 1024;
+        const chunks = 35;
+        var bulk = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, chunk * chunks);
+        defer bulk.free(&compute.ctx);
+        const host = try a.alloc(u8, chunk);
+        defer a.free(host);
+        for (0..chunks) |i| {
+            @memset(host, @intCast(i + 1));
+            try copyFromHostTracked(&compute, .{ .ptr = bulk.ptr + i * chunk, .len = chunk }, host);
+            @memset(host, 0xff);
+        }
+        const received = try a.alloc(u8, chunk * chunks);
+        defer a.free(received);
+        try bulk.copyToHost(&compute.ctx, received);
+        try compute.ctx.synchronize();
+        for (0..chunks) |i| for (received[i * chunk ..][0..chunk]) |v| try std.testing.expectEqual(@as(u8, @intCast(i + 1)), v);
+        try std.testing.expectEqual(@as(usize, small_count + chunks), compute.ocr_pinned_metadata_uploads);
+        if (events) {
+            try std.testing.expectEqual(@as(usize, small_count + chunks), compute.ocr_pinned_metadata_event_uploads);
+            try std.testing.expect(compute.ocr_pinned_metadata_arena.wraps > 0);
+            try std.testing.expectEqual(@as(usize, 0), compute.stats.pinned_scalar_upload_wrap_syncs);
+            try std.testing.expectEqual(capacity, controller.snapshot().host_scratch_bytes);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), compute.ocr_pinned_metadata_event_uploads);
+            try std.testing.expect(compute.stats.pinned_scalar_upload_wrap_syncs > 0);
+            try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+        }
+        const before = compute.ocr_pinned_metadata_uploads;
+        compute.capability_profile = .embedding_gemma2;
+        try copyFromHostTracked(&compute, small, &.{ 1, 2, 3, 4 });
+        try compute.ctx.synchronize();
+        try std.testing.expectEqual(before, compute.ocr_pinned_metadata_uploads);
+        compute.ctx.debug_graph_capture_active = true;
+        try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyFromHostTracked(&compute, small, &.{ 1, 2, 3, 4 }));
+        compute.ctx.debug_graph_capture_active = false;
+        try compute.configureEmbeddingGemma2Admission(null);
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    }
+}
+test "LightOnOCR3 CUDA metadata upload rollbacks preserve copied bytes without allocating disabled staging" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
     defer compute.deinit();
+    if (!lightOnDevice(&compute).portableKernels()) return error.SkipZigTest;
     compute.capability_profile = .lightonocr3;
     compute.ocr_pinned_metadata_enabled = true;
-    const small_count = pinned_scalar_upload_slot_count + 3;
-    var small = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, small_count * 4);
-    defer small.free(&compute.ctx);
-    for (0..small_count) |i| {
-        var value: u32 = @intCast(i * 17 + 31);
-        try copyFromHostTracked(&compute, .{ .ptr = small.ptr + i * 4, .len = 4 }, std.mem.asBytes(&value));
-        value = 0xdeadbeef;
-    }
-    const actual = try a.alloc(u32, small_count);
-    defer a.free(actual);
-    try small.copyToHost(&compute.ctx, std.mem.sliceAsBytes(actual));
+    var device = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 256);
+    defer device.free(&compute.ctx);
+    const initial: [256]u8 = @splat(0x99);
+    try device.copyFromHost(&compute.ctx, &initial);
+    var small: [4]u8 = .{ 1, 2, 3, 4 };
+    var medium: [128]u8 = @splat(37);
+    try copyFromHostTracked(&compute, .{ .ptr = device.ptr + 16, .len = 4 }, &small);
+    try copyFromHostTracked(&compute, .{ .ptr = device.ptr + 64, .len = 128 }, &medium);
+    @memset(&small, 0xee);
+    @memset(&medium, 0xdd);
+    var got: [256]u8 = undefined;
+    try device.copyToHost(&compute.ctx, &got);
     try compute.ctx.synchronize();
-    for (actual, 0..) |v, i| try std.testing.expectEqual(@as(u32, @intCast(i * 17 + 31)), v);
-    const chunk = 64 * 1024;
-    const chunks = 35;
-    var bulk = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, chunk * chunks);
-    defer bulk.free(&compute.ctx);
-    const host = try a.alloc(u8, chunk);
-    defer a.free(host);
-    for (0..chunks) |i| {
-        @memset(host, @intCast(i + 1));
-        try copyFromHostTracked(&compute, .{ .ptr = bulk.ptr + i * chunk, .len = chunk }, host);
-        @memset(host, 0xff);
-    }
-    const received = try a.alloc(u8, chunk * chunks);
-    defer a.free(received);
-    try bulk.copyToHost(&compute.ctx, received);
-    try compute.ctx.synchronize();
-    for (0..chunks) |i| for (received[i * chunk ..][0..chunk]) |v| try std.testing.expectEqual(@as(u8, @intCast(i + 1)), v);
-    try std.testing.expectEqual(@as(usize, small_count + chunks), compute.ocr_pinned_metadata_uploads);
-    try std.testing.expect(compute.stats.pinned_scalar_upload_wrap_syncs > 0);
-    const before = compute.ocr_pinned_metadata_uploads;
-    compute.capability_profile = .embedding_gemma2;
-    try copyFromHostTracked(&compute, small, &.{ 1, 2, 3, 4 });
-    try compute.ctx.synchronize();
-    try std.testing.expectEqual(before, compute.ocr_pinned_metadata_uploads);
-    compute.ctx.debug_graph_capture_active = true;
-    defer compute.ctx.debug_graph_capture_active = false;
-    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyFromHostTracked(&compute, small, &.{ 1, 2, 3, 4 }));
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, got[16..20]);
+    for (got[64..192]) |value| try std.testing.expectEqual(@as(u8, 37), value);
+    for (got[0..16]) |value| try std.testing.expectEqual(@as(u8, 0x99), value);
+    for (got[20..64]) |value| try std.testing.expectEqual(@as(u8, 0x99), value);
+    for (got[192..]) |value| try std.testing.expectEqual(@as(u8, 0x99), value);
+    const expected: usize = @intFromBool(!cudaPinnedScalarUploadsDisabled()) + @as(usize, @intFromBool(!cudaPinnedUploadArenaDisabled()));
+    try std.testing.expectEqual(expected, compute.ocr_pinned_metadata_event_uploads);
+    try std.testing.expectEqual(expected, compute.ocr_pinned_metadata_uploads);
+    try std.testing.expectEqual(expected == 0, compute.ocr_pinned_metadata_arena.host.ptr == null);
 }
 
 test "LightOnOCR3 CUDA cached MROPE positions preserve content changes scratch isolation and admission" {
@@ -32915,7 +35614,7 @@ test "LightOnOCR3 CUDA fused recurrent input projections preserve four BF16 GEMM
     compute.capability_profile = .lightonocr3;
     compute.lighton_fused_projections = true;
     const cb = compute.computeBackend();
-    if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+    if (!lightOnDevice(&compute).portableKernels()) return error.SkipZigTest;
     for ([_][4]usize{ .{ 1024, 6144, 2048, 16 }, .{ 2560, 8192, 4096, 32 } }) |geometry| {
         const hidden = geometry[0];
         const widths = [4]usize{ geometry[1], geometry[2], geometry[3], geometry[3] };
@@ -32938,13 +35637,14 @@ test "LightOnOCR3 CUDA fused recurrent input projections preserve four BF16 GEMM
             const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(hidden) });
             defer cb.free(input);
             if (rows == 1) {
-                const retained = controller.snapshot().backend_scratch_bytes;
+                const retained = controller.snapshot().backend_weight_bytes;
                 compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 1, .scratch_limit_bytes = 1 }, .check_live_memory = false };
                 try std.testing.expect(try CudaCompute.lightOnInputProjections(&cb, input, weights, rows, hidden, widths[0], widths[1], widths[2]) == null);
-                try std.testing.expectEqual(retained, controller.snapshot().backend_scratch_bytes);
+                try std.testing.expectEqual(retained, controller.snapshot().backend_weight_bytes);
                 compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = 512 * 1024 * 1024;
-                compute.ctx.video_cache_budget.admission.?.limits.scratch_limit_bytes = 512 * 1024 * 1024;
+                compute.ctx.video_cache_budget.admission.?.limits.scratch_limit_bytes = 1024 * 1024;
             }
+            try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
             const outputs = (try CudaCompute.lightOnInputProjections(&cb, input, weights, rows, hidden, widths[0], widths[1], widths[2])).?;
             defer for (outputs) |output| cb.free(output);
             for (outputs, weights, widths) |output, weight, width| {
@@ -32989,10 +35689,10 @@ test "LightOnOCR3 CUDA fused recurrent input projections preserve four BF16 GEMM
     }
     try std.testing.expectEqual(@as(usize, 12), compute.lighton_fused_projection_calls);
     try std.testing.expectEqual(@as(usize, 4), compute.lighton_projection_cache.count());
-    try std.testing.expectEqual(@as(usize, (8224 * 1024 + 12352 * 2560) * 4), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, (8224 * 1024 + 12352 * 2560) * 4), controller.snapshot().backend_weight_bytes);
     compute.deinit();
     owned = false;
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
 }
 
 test "LightOnOCR3 CUDA prefills independent recurrent pages together without mixing state or widening limits" {
@@ -33294,13 +35994,13 @@ test "LightOnOCR3 CUDA admission bounds cached and direct physical allocations w
     try std.testing.expectError(error.CudaMemoryLimitExceeded, buffer_mod.DeviceBuffer.alloc(&compute.ctx, 128 * 1024));
     var idle = try allocDeviceBuffer(&compute, 4096);
     releaseDeviceBuffer(&compute, &idle);
-    try std.testing.expect(compute.temp_buffers.items.len > 0 or compute.deferred_device_frees.items.len > 0);
+    try std.testing.expect(compute.temp_buffers.buffers.items.len > 0 or compute.deferred_device_frees.items.len > 0);
     const replacement = @import("video_cache_budget.zig").Admission{ .controller = &replacement_controller, .limits = .{ .backend_limit_bytes = baseline_bytes + 512 * 1024, .combined_limit_bytes = baseline_bytes + 1024 * 1024 }, .check_live_memory = false };
     try compute.configureEmbeddingGemma2Admission(replacement);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(compute.ocr_retained_cache_bytes, replacement_controller.snapshot().backend_scratch_bytes);
     try std.testing.expect(compute.ocr_retained_cache_bytes > 0);
-    try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
     try std.testing.expectEqual(@as(usize, 0), compute.deferred_device_frees.items.len);
     const reservation = compute.ocr_retained_cache_bytes;
     try compute.configureEmbeddingGemma2Admission(replacement);
@@ -33363,7 +36063,7 @@ test "LightOnOCR3 CUDA fused vision MLP preserves the original BF16 boundaries a
         const db = try cb.fromFloat32(zero_values[0..dim]);
         defer cb.free(db);
         const weights = [_]CT{ nw, nb, up, ub, down, db };
-        for ([_]usize{ 129, 2592 }) |rows| {
+        for ([_]usize{ 129, 2592, 8192, 17280 }) |rows| {
             const input_values = try a.alloc(f32, rows * dim);
             defer a.free(input_values);
             for (input_values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.017) * 0.7;
@@ -33394,7 +36094,9 @@ test "LightOnOCR3 CUDA fused vision MLP preserves the original BF16 boundaries a
             compute.capability_profile = .lightonocr3;
             try std.testing.expectError(error.InvalidTensorShape, CudaCompute.lightOnVisionMlp(&cb, input, weights, rows, dim, hidden, 0));
         }
-        try std.testing.expectEqual(@as(usize, 2), compute.lighton_vision_fused.calls);
+        try std.testing.expectEqual(@as(usize, 4), compute.lighton_vision_fused.calls);
+        const expected_down_calls: usize = if (@import("lighton_vision_gemm.zig").supportedDown(compute.ctx.info.compute_major, compute.ctx.info.compute_minor, 8192, dim, hidden, false)) 2 else 0;
+        try std.testing.expectEqual(expected_down_calls, compute.lighton_vision_down.calls);
     }
 }
 
@@ -33465,22 +36167,129 @@ test "LightOnOCR3 CUDA Florence BART FFN fusion preserves exact GELU residual an
     try std.testing.expectEqual(@as(usize, 5), compute.florence_bart_ffn_calls);
 }
 
-test "LightOnOCR3 CUDA recurrent state recycling keeps independent cache admission and immutable resident weights" {
-    try checkLightOnStateRecycling();
+test "LightOnOCR3 CUDA deferred buffer reuse preserves queued bytes physical quota and operator rollback" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var controller = @import("../../runtime/tier/memory.zig").AdmissionController{};
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    if (!lightOnDevice(&compute).portableKernels()) return error.SkipZigTest;
+    compute.capability_profile = .lightonocr3;
+    compute.runtime_policy.temp_cache_mb = 1;
+    compute.runtime_policy.max_temp_buffers = 1;
+    compute.runtime_policy.stable_temp_reuse = false;
+    try compute.configureEmbeddingGemma2Admission(.{ .controller = &controller, .limits = .{ .backend_limit_bytes = 32 * 1024 * 1024, .scratch_limit_bytes = 32 * 1024 * 1024 }, .check_live_memory = false });
+    const retained = controller.snapshot().backend_scratch_bytes;
+    try std.testing.expect(retained != 0);
+    // Fill the single ordinary-cache slot. Reusing the deferred allocation
+    // must neither add a slot nor expand either admitted retention budget.
+    var idle = try allocDeviceBufferOrdinary(&compute, 1024);
+    releaseDeviceBuffer(&compute, &idle);
+    try std.testing.expectEqual(@as(usize, 1), compute.temp_buffers.buffers.items.len);
+    var before = try buffer_mod.HostBuffer.alloc(&compute.ctx, 4096);
+    defer before.free(&compute.ctx);
+    var after = try buffer_mod.HostBuffer.alloc(&compute.ctx, 4096);
+    defer after.free(&compute.ctx);
+    defer compute.ctx.synchronize() catch {};
+    var original = try allocDeviceBufferOrdinary(&compute, 4096);
+    defer releaseDeviceBuffer(&compute, &original);
+    const pointer = original.ptr;
+    const physical = compute.ctx.device_allocations.snapshot();
+    try compute.kernels.launchFillF32(&compute.ctx, original, 1024, 1.25);
+    // Pinned copies preserve the asynchronous stream ordering being tested.
+    try original.copyToHost(&compute.ctx, before.bytes());
+    releaseDeviceBuffer(&compute, &original);
+    if (!cudaDeferredFreeEnabled() or cudaDeferredFreeBudgetBytes(&compute) == 0) {
+        try std.testing.expectEqual(@as(usize, 0), compute.deferred_device_frees.items.len);
+        try std.testing.expectEqual(@as(usize, 0), compute.lighton_deferred_buffer_reuses);
+        try std.testing.expectEqual(physical.live - 4096, compute.ctx.device_allocations.snapshot().live);
+        for (std.mem.bytesAsSlice(f32, before.constBytes())) |value| try std.testing.expectEqual(@as(f32, 1.25), value);
+        return;
+    }
+    try std.testing.expectEqual(@as(usize, 4096), compute.deferred_device_free_bytes);
+    const allocations = compute.stats.device_alloc_calls;
+    const drains = compute.stats.deferred_free_drains;
+    const forced = compute.stats.deferred_free_forced_drains;
+    try compute.ctx.device_allocations.setLimit(physical.live);
+    defer compute.ctx.device_allocations.setLimit(physical.limit) catch {};
+    var reused = try allocDeviceBufferOrdinary(&compute, 2048);
+    defer releaseDeviceBuffer(&compute, &reused);
+    try std.testing.expectEqual(pointer, reused.ptr);
+    try std.testing.expectEqual(@as(usize, 4096), reused.allocation_bytes);
+    try std.testing.expectEqual(@as(usize, 0), compute.deferred_device_frees.items.len);
+    try std.testing.expectEqual(@as(usize, 0), compute.deferred_device_free_bytes);
+    try std.testing.expectEqual(@as(usize, 1), compute.lighton_deferred_buffer_reuses);
+    try std.testing.expectEqual(@as(usize, 4096), compute.lighton_deferred_buffer_reused_bytes);
+    try std.testing.expectEqual(allocations, compute.stats.device_alloc_calls);
+    try std.testing.expectEqual(drains, compute.stats.deferred_free_drains);
+    try std.testing.expectEqual(forced, compute.stats.deferred_free_forced_drains);
+    try std.testing.expectEqual(physical.live, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(retained, controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 1), compute.temp_buffers.buffers.items.len);
+    try compute.kernels.launchFillF32(&compute.ctx, reused, 512, -0.25);
+    try reused.copyToHost(&compute.ctx, after.bytes());
+    try compute.ctx.synchronize();
+    for (std.mem.bytesAsSlice(f32, before.constBytes())) |value| try std.testing.expectEqual(@as(f32, 1.25), value);
+    const result = std.mem.bytesAsSlice(f32, after.constBytes());
+    for (result[0..512]) |value| try std.testing.expectEqual(@as(f32, -0.25), value);
+    for (result[512..]) |value| try std.testing.expectEqual(@as(f32, 1.25), value);
+    releaseDeviceBuffer(&compute, &reused);
+    try compute.ctx.device_allocations.setLimit(physical.limit);
+    // Stable reuse retains exact extents rather than taking an oversized
+    // allocation, even when it remains available in the deferred queue.
+    compute.runtime_policy.stable_temp_reuse = true;
+    var exact = try allocDeviceBufferOrdinary(&compute, 2048);
+    defer releaseDeviceBuffer(&compute, &exact);
+    try std.testing.expect(exact.ptr != pointer);
+    try std.testing.expectEqual(@as(usize, 2048), exact.len);
+    try std.testing.expectEqual(@as(usize, 4096), compute.deferred_device_free_bytes);
+    try std.testing.expectEqual(@as(usize, 1), compute.lighton_deferred_buffer_reuses);
+    {
+        while (!compute.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer compute.temp_buffer_mutex.unlock();
+        compute.runtime_policy.max_temp_buffers = 0;
+        try std.testing.expect(takeLightOnDeferredBufferUnlocked(&compute, 4096, true) == null);
+        compute.runtime_policy.max_temp_buffers = 1;
+        compute.runtime_policy.temp_cache_mb = 0;
+        try std.testing.expect(takeLightOnDeferredBufferUnlocked(&compute, 4096, true) == null);
+        compute.runtime_policy.temp_cache_mb = 1;
+        const ceiling = compute.ocr_deferred_free_budget_bytes;
+        compute.ocr_deferred_free_budget_bytes = 4096;
+        try std.testing.expect(takeLightOnDeferredBufferUnlocked(&compute, 4096, true) == null);
+        compute.ocr_deferred_free_budget_bytes = 4095;
+        try std.testing.expect(takeLightOnDeferredBufferUnlocked(&compute, 4096, true) == null);
+        compute.ocr_deferred_free_budget_bytes = ceiling;
+    }
+    try std.testing.expectEqual(@as(usize, 4096), compute.deferred_device_free_bytes);
+    try std.testing.expectEqual(retained, controller.snapshot().backend_scratch_bytes);
 }
 
-fn checkLightOnStateRecycling() !void {
+test "LightOnOCR3 CUDA recurrent state recycling keeps independent cache admission and immutable resident weights" {
+    try checkLightOnStateRecycling(false);
+}
+
+test "LightOnOCR3 CUDA deferred state reuse preserves exact owners and independent admission" {
+    if (!cudaDeferredFreeEnabled() or cudaDeferredFreeConfiguredBytes() == 0) return error.SkipZigTest;
+    try checkLightOnStateRecycling(true);
+}
+
+fn checkLightOnStateRecycling(deferred_only: bool) !void {
     if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
     const a = std.testing.allocator;
     const recurrent = @import("lighton_recurrent.zig");
     const memory = @import("../../runtime/tier/memory.zig");
-    for ([_]usize{ 16, 32 }) |vh| {
+    for ([_]bool{ false, true }) |conv_bf16| for ([_]usize{ 16, 32 }) |vh| {
         var controller = memory.AdmissionController{};
         var compute = try CudaCompute.init(a);
         var owned = true;
         defer if (owned) compute.deinit();
+        if (deferred_only and !lightOnDevice(&compute).portableKernels()) return error.SkipZigTest;
         compute.capability_profile = .lightonocr3;
         compute.lighton_state_pool_enabled = true;
+        if (deferred_only) {
+            compute.runtime_policy.temp_cache_mb = 1;
+            compute.runtime_policy.max_temp_buffers = 1;
+        }
 
         compute.lighton_shared_recurrent_weights_enabled = true;
         const cb = compute.computeBackend();
@@ -33501,8 +36310,16 @@ fn checkLightOnStateRecycling() !void {
                 else => @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) / 64,
             };
             const shape = [_]i64{@intCast(count)};
-            const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(frozen[wi]), .dtype = .f32, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
-            try compute.insertWeightFromTensor(try a.dupe(u8, name), &tensor);
+            if (conv_bf16 and wi == 0) {
+                const bits = try a.alloc(u16, count);
+                defer a.free(bits);
+                for (bits, frozen[wi]) |*value, f| value.* = f32ToBf16BitsRoundNearestEven(f);
+                const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(bits), .dtype = .bf16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+                try compute.insertBf16WeightFromTensor(try a.dupe(u8, name), &tensor);
+            } else {
+                const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(frozen[wi]), .dtype = .f32, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+                try compute.insertWeightFromTensor(try a.dupe(u8, name), &tensor);
+            }
         }
         var weights: [4]CT = undefined;
         for (names, &weights) |name, *weight| weight.* = try cb.getWeight(name);
@@ -33510,18 +36327,65 @@ fn checkLightOnStateRecycling() !void {
         try compute.configureEmbeddingGemma2Admission(.{ .controller = &controller, .limits = .{ .backend_limit_bytes = baseline + 64 * 1024 * 1024, .scratch_limit_bytes = 256 * 1024 * 1024 }, .check_live_memory = false });
         const retained = controller.snapshot().backend_scratch_bytes;
         try std.testing.expect(retained != 0);
+        // A one-byte-short physical limit cannot publish any packed view or
+        // leave partial allocations behind. The retained cache charge survives.
+        const expected_bytes = 2 * c * 4 * 4 + vh * 128 * 128 * 4 + if (conv_bf16) counts[0] * 4 else @as(usize, 0);
+        const allocation_before = compute.ctx.device_allocations.snapshot();
+        try compute.ctx.device_allocations.setLimit(allocation_before.live + expected_bytes - 1);
+        var denied: recurrent.State = .{};
+        try std.testing.expectError(error.CudaMemoryLimitExceeded, compute.prepareLightOnRecurrentState(&denied, weights, counts, 16, vh, true));
+        try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), denied.packed_storage.ptr);
+        try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), denied.recurrent.ptr);
+        for (denied.history) |view| try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), view.ptr);
+        for (denied.weights) |view| try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), view.ptr);
+        denied.deinit();
+        try std.testing.expectEqual(allocation_before.live, compute.ctx.device_allocations.snapshot().live);
+        try std.testing.expectEqual(retained, controller.snapshot().backend_scratch_bytes);
+        try compute.ctx.device_allocations.setLimit(allocation_before.limit);
         var first: recurrent.State = .{};
         defer first.deinit();
         try compute.prepareLightOnRecurrentState(&first, weights, counts, 16, vh, false);
-        for (weights, first.weights, first.owns_weights) |source, weight, ownership| {
-            try std.testing.expectEqual(tensorFromCt(source).buffer.ptr, weight.ptr);
-            try std.testing.expect(!ownership);
+        for (weights, first.weights, first.owns_weights, 0..) |source, weight, ownership, wi| {
+            if (conv_bf16 and wi == 0) {
+                try std.testing.expect(ownership and weight.borrowed);
+                try std.testing.expect(weight.ptr != tensorFromCt(source).buffer.ptr);
+            } else {
+                try std.testing.expectEqual(tensorFromCt(source).buffer.ptr, weight.ptr);
+                try std.testing.expect(!ownership);
+            }
         }
+        try std.testing.expectEqual(expected_bytes, first.packed_storage.len);
         const first_buffers = [_]buffer_mod.DeviceBuffer{ first.history[0], first.history[1], first.recurrent };
+        const first_owner = first.packed_storage;
+        try std.testing.expect(first_owner.ptr != 0 and !first_owner.borrowed);
+        for (first_buffers) |view| {
+            try std.testing.expect(view.borrowed and view.allocation_bytes == 0);
+            try std.testing.expect(view.ptr >= first_owner.ptr and view.ptr + view.len <= first_owner.ptr + first_owner.len);
+        }
         for (first_buffers) |buffer| try compute.kernels.launchFillF32(&compute.ctx, buffer, buffer.len / 4, std.math.nan(f32));
         try compute.ctx.synchronize();
+        if (deferred_only) {
+            try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
+            var idle = try allocDeviceBufferOrdinary(&compute, 64);
+            releaseDeviceBuffer(&compute, &idle);
+            try std.testing.expectEqual(@as(usize, 1), compute.temp_buffers.buffers.items.len);
+            try std.testing.expect(cudaDeferredFreeBudgetBytes(&compute) > first_owner.len);
+        }
         const first_live = compute.ctx.device_allocations.snapshot().live;
+        const cached_before = compute.temp_buffers.buffers.items.len;
+        const releases_before = compute.lighton_state_pool_releases.load(.monotonic);
         first.deinit();
+        if (deferred_only) {
+            try std.testing.expectEqual(cached_before, compute.temp_buffers.buffers.items.len);
+            try std.testing.expectEqual(@as(usize, 1), compute.deferred_device_frees.items.len);
+            try std.testing.expectEqual(first_owner.len, compute.deferred_device_free_bytes);
+            for (compute.deferred_device_frees.items) |entry| {
+                try std.testing.expect(!entry.borrowed);
+                try std.testing.expectEqual(entry.len, entry.allocation_bytes);
+            }
+        } else try std.testing.expectEqual(cached_before + 1, compute.temp_buffers.buffers.items.len);
+        try std.testing.expectEqual(releases_before + 1, compute.lighton_state_pool_releases.load(.monotonic));
+        for (compute.temp_buffers.buffers.items) |entry| try std.testing.expect(!entry.borrowed);
         // The independent cache owner funds retired storage after the page's
         // own lease is gone. No allocation is freed or left unreserved.
         try std.testing.expectEqual(retained, controller.snapshot().backend_scratch_bytes);
@@ -33542,7 +36406,8 @@ fn checkLightOnStateRecycling() !void {
             try std.testing.expect(found);
             for (reused[0..i]) |prior| try std.testing.expect(prior.ptr != buffer.ptr);
         }
-        try std.testing.expect(compute.lighton_state_pool_hits >= 3);
+        try std.testing.expect(compute.lighton_state_pool_hits >= 1);
+        if (deferred_only) try std.testing.expectEqual(@as(usize, 1), compute.lighton_deferred_state_reuses);
         // Compare fresh execution from poisoned recycled storage with the
         // original independently allocated/cloned state, without changing math.
         compute.lighton_state_pool_enabled = false;
@@ -33585,13 +36450,14 @@ fn checkLightOnStateRecycling() !void {
             try std.testing.expectEqualSlices(u8, l, r);
         }
         // Failed states bypass retention, while borrowed model weights remain
-        // intact. Every buffer is independently freed exactly once.
+        // intact. The packed owner is freed exactly once; views never recycle.
         const before_failure = compute.ctx.device_allocations.snapshot().live;
-        var state_bytes: usize = 0;
-        for (reused) |buffer| state_bytes += buffer.len;
+        const state_bytes = actual.packed_storage.len;
+        const before_failed_releases = compute.lighton_state_pool_releases.load(.monotonic);
         actual.failed = true;
         actual.deinit();
         try std.testing.expectEqual(before_failure - state_bytes, compute.ctx.device_allocations.snapshot().live);
+        try std.testing.expectEqual(before_failed_releases, compute.lighton_state_pool_releases.load(.monotonic));
         reference.deinit();
         try std.testing.expectEqual(retained, controller.snapshot().backend_scratch_bytes);
         // Mutable external aliases must retain the old independent snapshot.
@@ -33638,7 +36504,7 @@ fn checkLightOnStateRecycling() !void {
         compute.deinit();
         owned = false;
         try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
-    }
+    };
 }
 
 test "LightOnOCR3 CUDA fused vision QKV preserves cuDNN inputs output and readonly packed storage" {
@@ -33647,6 +36513,7 @@ test "LightOnOCR3 CUDA fused vision QKV preserves cuDNN inputs output and readon
     var compute = try CudaCompute.init(a);
     defer compute.deinit();
     compute.capability_profile = .lightonocr3;
+    compute.lighton_cached_mrope_enabled = true;
     const cb = compute.computeBackend();
     for ([_]usize{ 768, 1024 }) |hidden| {
         for ([_]usize{ 1, 2 }) |batch| {
@@ -33686,6 +36553,34 @@ test "LightOnOCR3 CUDA fused vision QKV preserves cuDNN inputs output and readon
             const want = try cb.toFloat32(reference, a);
             defer a.free(want);
             try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+            // The fused path must share the content-checked position cache
+            // already used by unfused vision RoPE. No second upload is needed
+            // for an identical layer, even after generic scratch is overwritten.
+            _ = try uploadTempU32(&compute, &.{ 99, 88, 77 });
+            const hits = compute.lighton_mrope_cache_hits;
+            const h2d = compute.stats.h2d_bytes;
+            const repeated = (try tryReducedVisionCudnnInput(&compute, input, input, input, null, .{ .qkv = input, .positions = positions, .theta = 10000 }, batch, rows / batch, heads, 64)).?;
+            defer cb.free(repeated);
+            try std.testing.expectEqual(hits + 1, compute.lighton_mrope_cache_hits);
+            try std.testing.expectEqual(h2d, compute.stats.h2d_bytes);
+            const repeated_values = try cb.toFloat32(repeated, a);
+            defer a.free(repeated_values);
+            try std.testing.expectEqualSlices(f32, got, repeated_values);
+            positions[positions.len - 1] += 1;
+            const uploads = compute.lighton_mrope_cache_uploads;
+            const changed = (try tryReducedVisionCudnnInput(&compute, input, input, input, null, .{ .qkv = input, .positions = positions, .theta = 10000 }, batch, rows / batch, heads, 64)).?;
+            defer cb.free(changed);
+            try std.testing.expectEqual(uploads + 1, compute.lighton_mrope_cache_uploads);
+            compute.lighton_cached_mrope_enabled = false;
+            const uncached = (try tryReducedVisionCudnnInput(&compute, input, input, input, null, .{ .qkv = input, .positions = positions, .theta = 10000 }, batch, rows / batch, heads, 64)).?;
+            defer cb.free(uncached);
+            compute.lighton_cached_mrope_enabled = true;
+            const changed_values = try cb.toFloat32(changed, a);
+            defer a.free(changed_values);
+            const uncached_values = try cb.toFloat32(uncached, a);
+            defer a.free(uncached_values);
+            try std.testing.expectEqualSlices(f32, changed_values, uncached_values);
+            positions[positions.len - 1] -= 1;
             const unchanged = try cb.toFloat32(packed_input, a);
             defer a.free(unchanged);
             try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(unchanged));
@@ -33695,7 +36590,7 @@ test "LightOnOCR3 CUDA fused vision QKV preserves cuDNN inputs output and readon
             }
         }
     }
-    try std.testing.expectEqual(@as(usize, 4), compute.lighton_vision_fused.qkv_calls);
+    try std.testing.expectEqual(@as(usize, 16), compute.lighton_vision_fused.qkv_calls);
 }
 
 test "LightOnOCR3 CUDA fused FFN activation input preserves F32 outputs for independent and paired checkpoint projections" {
@@ -33706,7 +36601,7 @@ test "LightOnOCR3 CUDA fused FFN activation input preserves F32 outputs for inde
         for ([_]bool{ false, true }) |paired| {
             var compute = try CudaCompute.init(a);
             defer compute.deinit();
-            if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+            if (!lightOnDevice(&compute).portableKernels()) return error.SkipZigTest;
             compute.capability_profile = .lightonocr3;
             compute.lighton_fused_ffn = paired;
             compute.lighton_ffn_bf16_inputs = true;
@@ -33796,7 +36691,7 @@ fn checkLightOnFfnBlockPolicy(bf16_projections: bool, prefill_only: bool) !void 
         for ([_]f32{ 0, 1 }) |offset| {
             var compute = try CudaCompute.init(a);
             defer compute.deinit();
-            if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+            if (!lightOnDevice(&compute).portableKernels()) return error.SkipZigTest;
             compute.capability_profile = .lightonocr3;
             compute.lighton_fused_ffn = false;
             compute.lighton_ffn_block_enabled = true;
@@ -33909,7 +36804,7 @@ test "LightOnOCR3 CUDA token burst keeps dependent IDs on device and preserves s
         var compute = try CudaCompute.init(a);
         defer compute.deinit();
         compute.capability_profile = .lightonocr3;
-        if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+        if (!lightOnDevice(&compute).portableKernels()) return error.SkipZigTest;
         const cb = compute.computeBackend();
         const values = try a.alloc(f32, vocab * hidden);
         defer a.free(values);
@@ -33925,8 +36820,8 @@ test "LightOnOCR3 CUDA token burst keeps dependent IDs on device and preserves s
         try compute.ctx.synchronize();
         const weight = try cb.getWeight(tensor.name);
         defer cb.free(weight);
-        for ([_]usize{ 1, 7, 32, 64 }) |rows| {
-            for ([_]usize{ 2, 4, 8 }) |steps| {
+        for ([_]usize{ 1, 7, 32, 64, 65, 66, 96, 128 }) |rows| {
+            for ([_]usize{ 1, 2, 4, 8 }) |steps| {
                 for ([_]bool{ false, true }) |suppress| {
                     const ids: []const i32 = if (suppress) &[_]i32{ 5, 16 } else &[_]i32{};
                     var burst = (try CudaCompute.beginLightOnTokenBurst(&cb, weight, rows, steps, hidden, vocab, ids)) orelse return error.UnsupportedOperation;
@@ -33962,10 +36857,20 @@ test "LightOnOCR3 CUDA token burst keeps dependent IDs on device and preserves s
                     }
                     // Every dependent embedding ran without downloading IDs.
                     try std.testing.expectEqual(before, compute.stats.d2h_bytes);
-                    var got: [8 * 64]u32 = undefined;
+                    var got: [8 * 128]u32 = undefined;
                     try std.testing.expectError(error.InvalidShape, burst.read(got[0..0]));
-                    try burst.read(got[0 .. steps * rows]);
-                    try std.testing.expectEqual(syncs + 1, compute.stats.download_syncs);
+                    if (steps == 1 and !cudaPinnedScalarDownloadsDisabled()) {
+                        var pending = (try burst.beginRead(rows)) orelse return error.UnsupportedOperation;
+                        defer pending.deinit();
+                        const launches_before = compute.ctx.stats.kernel_launches;
+                        try pending.wait();
+                        try pending.copy(std.mem.sliceAsBytes(got[0..rows]));
+                        burst.noteReadCompleted(launches_before);
+                        try std.testing.expectEqual(syncs, compute.stats.download_syncs);
+                    } else {
+                        try burst.read(got[0 .. steps * rows]);
+                        try std.testing.expectEqual(syncs + 1, compute.stats.download_syncs);
+                    }
                     try std.testing.expectEqual(before + steps * rows * @sizeOf(u32), compute.stats.d2h_bytes);
                     try std.testing.expectEqualSlices(u32, expected, got[0 .. steps * rows]);
                     for (0..steps) |step| {
@@ -33984,6 +36889,7 @@ test "LightOnOCR3 CUDA token burst keeps dependent IDs on device and preserves s
             }
         }
         const launches = compute.ctx.stats.kernel_launches;
+        try std.testing.expect((try CudaCompute.beginLightOnTokenBurst(&cb, weight, 129, 2, hidden, vocab, &.{})) == null);
         compute.resident_training_cache = true;
         try std.testing.expect((try CudaCompute.beginLightOnTokenBurst(&cb, weight, 1, 2, hidden, vocab, &.{})) == null);
         compute.resident_training_cache = false;
@@ -33991,7 +36897,9 @@ test "LightOnOCR3 CUDA token burst keeps dependent IDs on device and preserves s
         try std.testing.expect((try CudaCompute.beginLightOnTokenBurst(&cb, weight, 1, 2, hidden, vocab, &.{})) == null);
         compute.debug_cuda_graph_capture_active = false;
         try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
-        try std.testing.expectEqual(@as(u64, 24), compute.lighton_cuda_burst_calls);
+        try std.testing.expectEqual(@as(u64, 64), compute.lighton_cuda_burst_calls);
+        try std.testing.expectEqual(@as(usize, if (cudaPinnedScalarDownloadsDisabled()) 0 else 16), compute.lighton_packed_async_downloads);
+        try std.testing.expectEqual(@as(usize, 0), compute.lighton_async_burst_downloads);
         try std.testing.expectEqual(@as(u64, 8), compute.lighton_cuda_burst_max_width);
         // Exceptional/canceled consumers can retire a live bank without a
         // readback: deinit drains its producer before recycling any storage.
@@ -34017,7 +36925,7 @@ test "LightOnOCR3 CUDA 128 page recurrent partitioning preserves both original 6
     for ([_]usize{ 16, 32 }) |vh| {
         var compute = try CudaCompute.init(a);
         defer compute.deinit();
-        if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+        if (!lightOnDevice(&compute).portableKernels()) return error.SkipZigTest;
         compute.capability_profile = .lightonocr3;
         compute.lighton_recurrent_batch_enabled = true;
         compute.lighton_ragged_recurrent_enabled = true;
@@ -34101,15 +37009,29 @@ test "LightOnOCR3 CUDA 128 page recurrent partitioning preserves both original 6
                 for (&states) |*state| try std.testing.expect(state.ctx == null);
                 // Poison the same independent storage before fresh execution,
                 // so untouched inactive history also has a strict bit oracle.
-                for (0..128) |index| for ([_]*recurrent.State{ &states[index], &references[index] }) |state| {
-                    try compute.prepareLightOnRecurrentState(state, weights, counts, 16, vh, false);
-                    for ([_]buffer_mod.DeviceBuffer{ state.history[0], state.history[1], state.recurrent }) |buffer|
-                        try compute.kernels.launchFillF32(&compute.ctx, buffer, buffer.len / 4, std.math.nan(f32));
-                };
+                for (0..128) |index| {
+                    compute.lighton_state_pool_enabled = true;
+                    try compute.prepareLightOnRecurrentState(&states[index], weights, counts, 16, vh, false);
+                    compute.lighton_state_pool_enabled = false;
+                    try compute.prepareLightOnRecurrentState(&references[index], weights, counts, 16, vh, false);
+                    for ([_]*recurrent.State{ &states[index], &references[index] }) |state| {
+                        for ([_]buffer_mod.DeviceBuffer{ state.history[0], state.history[1], state.recurrent }) |buffer|
+                            try compute.kernels.launchFillF32(&compute.ctx, buffer, buffer.len / 4, std.math.nan(f32));
+                    }
+                }
             }
             const before_groups = compute.lighton_recurrent.ragged_batch_calls;
+            compute.lighton_state_pool_enabled = true;
             const actual = (try CudaCompute.qwen35LinearCoreRaggedBatch(&cb, &pointers, &lengths, request)) orelse return error.UnsupportedOperation;
             defer cb.free(actual);
+            for (states) |state| {
+                try std.testing.expect(state.packed_storage.ptr != 0);
+                for ([_]buffer_mod.DeviceBuffer{ state.history[0], state.history[1], state.recurrent }) |view| {
+                    try std.testing.expect(view.borrowed and view.allocation_bytes == 0);
+                    try std.testing.expect(view.ptr >= state.packed_storage.ptr and view.ptr + view.len <= state.packed_storage.ptr + state.packed_storage.len);
+                }
+            }
+            compute.lighton_state_pool_enabled = false;
             try std.testing.expectEqual(before_groups + 2, compute.lighton_recurrent.ragged_batch_calls);
             const got = try cb.toFloat32(actual, a);
             defer a.free(got);
@@ -34223,4 +37145,2803 @@ test "LightOnOCR3 CUDA Florence canonical decode GEMM preserves row independence
     blas.florence_canonical_f16_decode = false;
     try std.testing.expectError(error.CublasLtUnsupported, blas.matmulF16WeightF32Out(&compute.ctx, alias, one, alias, .{}, 1, 768, 768));
     try std.testing.expectEqual(@as(usize, 1), blas.canonical_f16_declines);
+}
+
+test "LightOnOCR3 CUDA optional BF16 prefill scratch preserves admission across reuse and denial" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY") orelse return error.SkipZigTest;
+    const memory = @import("../../runtime/tier/memory.zig");
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+    var prefill = try @import("lighton_prefill.zig").Module.init(path);
+    defer prefill.deinit(&compute.ctx);
+    var controller = memory.AdmissionController{};
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 1023, .scratch_limit_bytes = 1023 }, .check_live_memory = false };
+    const before = compute.ctx.device_allocations.snapshot().live;
+    try std.testing.expectError(error.ResourceLimitExceeded, prefill.reserve(&compute.ctx, 1024));
+    try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), prefill.calls);
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = 1024;
+    compute.ctx.video_cache_budget.admission.?.limits.scratch_limit_bytes = 1024;
+    const full = try prefill.reserve(&compute.ctx, 1024);
+    const reused = try prefill.reserve(&compute.ctx, 512);
+    try std.testing.expectEqual(full.ptr, reused.ptr);
+    try std.testing.expectEqual(@as(usize, 1024), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(before + 1024, compute.ctx.device_allocations.snapshot().live);
+    try prefill.clearWorkspace(&compute.ctx);
+    try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), prefill.calls);
+}
+
+test "LightOnOCR3 CUDA decoder graph arena admission rejects partial allocations and releases every reservation" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const memory = @import("../../runtime/tier/memory.zig");
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    var controller = memory.AdmissionController{};
+    var owner = @import("lighton_decode_graph.zig").Module{};
+    defer owner.clear(&compute.ctx) catch {};
+    const positions = [_]u32{ 10, 20, 30, 40, 50, 60 };
+    const key = [_]u64{ 1, 2, 3 };
+    const bytes = 8960;
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{
+        .backend_limit_bytes = bytes - 1,
+        .host_limit_bytes = 16 * 1024 * 1024,
+        .scratch_limit_bytes = 16 * 1024 * 1024,
+    }, .check_live_memory = false };
+    const baseline = compute.ctx.device_allocations.snapshot().live;
+    try std.testing.expectError(error.ResourceLimitExceeded, owner.reset(&compute.ctx, &key, &positions, 2, 1024, 8));
+    try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = bytes;
+    try owner.reset(&compute.ctx, &key, &positions, 2, 1024, 8);
+    try std.testing.expectEqual(@as(usize, bytes), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expect(owner.matches(&key, &positions));
+    owner.plan.?.allocate(1024, 0x1000);
+    owner.plan.?.release(0x1000);
+    try std.testing.expect(owner.plan.?.finishNoOutput());
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = bytes + 1023;
+    // The arena fits on its own; the retained metadata lease occupies the
+    // missing byte, so this is a temporary denial rather than an oversized request.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, owner.reserveArena(&compute.ctx));
+    try std.testing.expectEqual(@as(usize, 0), owner.arena.ptr);
+    try std.testing.expectEqual(baseline + bytes, compute.ctx.device_allocations.snapshot().live);
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = bytes + 1024;
+    try owner.reserveArena(&compute.ctx);
+    const arena_pointer = owner.arena.ptr;
+    try owner.reserveArena(&compute.ctx);
+    try std.testing.expectEqual(arena_pointer, owner.arena.ptr);
+    try std.testing.expectEqual(@as(usize, bytes + 1024), controller.snapshot().backend_scratch_bytes);
+    try owner.notePair();
+    try std.testing.expect(!owner.matches(&key, &positions));
+    try owner.clear(&compute.ctx);
+    try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.key.len);
+}
+
+test "LightOnOCR3 CUDA wide graph head has independent admission and never enters the temporary cache" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const memory = @import("../../runtime/tier/memory.zig");
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    var controller = memory.AdmissionController{};
+    var owner = @import("lighton_decode_graph.zig").Module{};
+    defer owner.clear(&compute.ctx) catch {};
+    const positions: [384]u32 = @splat(10);
+    const key = [_]u64{ 1, 2, 3 };
+    const metadata_bytes = 527104;
+    const head_bytes = 128 * 8 * 4;
+    const total = metadata_bytes + head_bytes;
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{
+        .backend_limit_bytes = total - 1,
+        .host_limit_bytes = 16 * 1024 * 1024,
+        .scratch_limit_bytes = 16 * 1024 * 1024,
+    }, .check_live_memory = false };
+    const baseline = compute.ctx.device_allocations.snapshot().live;
+    // The second lease is denied; the preceding metadata allocation and both
+    // host reservations must be rolled back before conservative execution.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, owner.reset(&compute.ctx, &key, &positions, 128, 1024, 8));
+    try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.head.ptr);
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = total;
+    try owner.reset(&compute.ctx, &key, &positions, 128, 1024, 8);
+    try std.testing.expectEqual(@as(usize, head_bytes), owner.head.len);
+    try std.testing.expectEqual(@as(usize, metadata_bytes), owner.metadata.len);
+    try std.testing.expectEqual(@as(usize, total), controller.snapshot().backend_scratch_bytes);
+    const head_pointer = owner.head.ptr;
+    const cached = compute.temp_buffers.buffers.items.len;
+    for ([_]usize{ 0, 0x1000 }) |base| {
+        var scope = @import("execution_arena.zig").Scope{
+            .plan = owner.plan.?,
+            .base = base,
+            .output_ptr = owner.head.ptr,
+            .output_bytes = owner.head.len,
+            .output_active = true,
+        };
+        compute.execution_scope = &scope;
+        defer compute.execution_scope = null;
+        var output = try allocDeviceBuffer(&compute, head_bytes);
+        try std.testing.expect(output.borrowed and scope.output_taken);
+        try std.testing.expectEqual(head_pointer, output.ptr);
+        try std.testing.expectError(error.InvalidExecutionPlan, allocDeviceBuffer(&compute, head_bytes));
+        scope.output_active = false;
+        releaseDeviceBuffer(&compute, &output);
+        try std.testing.expectEqual(@as(usize, 0), output.ptr);
+        try std.testing.expectEqual(head_pointer, owner.head.ptr);
+        try std.testing.expectEqual(cached, compute.temp_buffers.buffers.items.len);
+        try std.testing.expectEqual(@as(usize, 0), owner.plan.?.event_count);
+        try std.testing.expectEqual(baseline + total, compute.ctx.device_allocations.snapshot().live);
+    }
+    try owner.clear(&compute.ctx);
+    try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "LightOnOCR3 CUDA bounded GEMM refresh drains at an exclusive boundary and refuses capture" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    const blas = if (compute.cublaslt) |*b| b else return error.CublasLtUnavailable;
+    try blas.setPlanCacheCapacity(4);
+    const width = 32;
+    var input = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 4 * width * 2);
+    defer input.free(&compute.ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, width * width * 2);
+    defer weight.free(&compute.ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 4 * width * 4);
+    defer output.free(&compute.ctx);
+    const inputs: [4 * width]u16 = @splat(0x3f80);
+    var weights: [width * width]u16 = @splat(0);
+    for (0..width) |i| weights[i * width + i] = 0x3f80;
+    try input.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&inputs));
+    try weight.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&weights));
+    for (1..5) |rows| try blas.matmulBf16WeightF32Out(&compute.ctx, output, input, weight, .{}, rows, width, width);
+    try std.testing.expectEqual(@as(usize, 4), blas.tensor_core_plans.count());
+    try std.testing.expect(!try blas.reserveTensorCorePlanSlots(&compute.ctx, 5));
+    try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+    try std.testing.expectError(error.CublasLtUnsupported, blas.reserveTensorCorePlanSlots(&compute.ctx, 1));
+    const graph = try compute.ctx.endStreamCapture();
+    compute.ctx.destroyGraph(graph);
+    try std.testing.expectEqual(@as(usize, 4), blas.tensor_core_plans.count());
+    try std.testing.expect(try blas.reserveTensorCorePlanSlots(&compute.ctx, 2));
+    try std.testing.expectEqual(@as(usize, 4), blas.plan_cache_capacity);
+    try std.testing.expectEqual(@as(usize, 0), blas.tensor_core_plans.count());
+    try std.testing.expectEqual(@as(usize, 1), blas.plan_cache_refreshes);
+    try blas.matmulBf16WeightF32Out(&compute.ctx, output, input, weight, .{}, 4, width, width);
+    try blas.matmulBf16WeightF32Out(&compute.ctx, output, input, weight, .{}, 4, width, width);
+    try std.testing.expectEqual(@as(usize, 1), blas.tensor_core_plans.count());
+    var actual: [4 * width]f32 = undefined;
+    try output.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+    try compute.ctx.synchronize();
+    for (actual) |value| try std.testing.expectEqual(@as(f32, 1), value);
+}
+
+test "LightOnOCR3 CUDA optional paged prefill owner admits host and GPU bytes before allocating and drains on clear" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const memory = @import("../../runtime/tier/memory.zig");
+    const module = @import("lighton_prefill_attention.zig");
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    const NoPlan = struct {
+        fn drop(value: ?*anyopaque) callconv(.c) void {
+            std.debug.assert(value == null);
+        }
+    };
+    var owner = module.Module{ .make_plan = undefined, .execute = undefined, .drop = NoPlan.drop };
+    defer owner.clear(&compute.ctx) catch {};
+    var controller = memory.AdmissionController{};
+    const gpu_bytes = 64 * 1024 * 1024 + 128 * 1024 + 4096 * 16 * 256 * 2 + 4096;
+    const host_bytes = 64 * (128 * 1024 + 4096) + 64 * 1024;
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{
+        .backend_limit_bytes = gpu_bytes - 1,
+        .host_limit_bytes = host_bytes,
+        .scratch_limit_bytes = gpu_bytes + host_bytes,
+    }, .check_live_memory = false };
+    const before = compute.ctx.device_allocations.snapshot().live;
+    try std.testing.expectError(error.ResourceLimitExceeded, owner.reserve(&compute.ctx));
+    try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    compute.ctx.video_cache_budget.admission.?.limits.backend_limit_bytes = gpu_bytes;
+    compute.ctx.video_cache_budget.admission.?.limits.host_limit_bytes = host_bytes - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, owner.reserve(&compute.ctx));
+    try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
+    compute.ctx.video_cache_budget.admission.?.limits.host_limit_bytes = host_bytes;
+    try owner.reserve(&compute.ctx);
+    const first = owner.device.ptr;
+    try owner.reserve(&compute.ctx);
+    try std.testing.expectEqual(first, owner.device.ptr);
+    try std.testing.expectEqual(before + gpu_bytes, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, gpu_bytes), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, host_bytes), controller.snapshot().host_scratch_bytes);
+    // Reuse every pinned slot repeatedly while GPU readers remain queued.
+    // Independent D2D snapshots catch overwrites of an earlier DMA source.
+    const turns = 3 * module.metadata_slots + 5;
+    var audit = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, (turns + 4) * 4);
+    defer audit.free(&compute.ctx);
+    const sentinels: [turns + 4]u32 = @splat(0x5a5a5a5a);
+    try audit.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&sentinels));
+    for (0..turns) |turn| {
+        const slot = try owner.acquireSlot(&compute.ctx);
+        try std.testing.expectEqual(turn % module.metadata_slots, slot);
+        try std.testing.expectError(error.InvalidExecutionPlan, owner.acquireSlot(&compute.ctx));
+        const host = owner.hostSlot(slot)[0..4];
+        std.mem.writeInt(u32, host[0..4], @intCast(turn + 1), .little);
+        try owner.device.copyFromHost(&compute.ctx, host);
+        try owner.finishSlotCopy(&compute.ctx, slot);
+        try std.testing.expectError(error.InvalidExecutionPlan, owner.finishSlotCopy(&compute.ctx, slot));
+        const result = compute.ctx.driver.fns.cuMemcpyDtoDAsync(audit.ptr + turn * 4, owner.device.ptr, 4, compute.ctx.stream);
+        try compute.ctx.driver.check(result);
+    }
+    var actual: [turns + 4]u32 = undefined;
+    try audit.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual));
+    try compute.ctx.synchronize();
+    for (0..turns) |turn| try std.testing.expectEqual(@as(u32, @intCast(turn + 1)), actual[turn]);
+    for (actual[turns..]) |guard| try std.testing.expectEqual(@as(u32, 0x5a5a5a5a), guard);
+    try std.testing.expectEqual(@as(usize, turns - module.metadata_slots), owner.slot_reuses);
+    try owner.clear(&compute.ctx);
+    audit.free(&compute.ctx);
+    try std.testing.expectEqual(before, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.device.ptr);
+    for (owner.copy_pending) |pending| try std.testing.expect(!pending);
+}
+
+test "LightOnOCR3 CUDA BF16 vision bias epilogue preserves F32 boundaries and read only inputs" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    try compute.requireProfile(.lightonocr3);
+    compute.capability_profile = .lightonocr3;
+    compute.lighton_fused_vision_qkv_enabled = true;
+    for ([_]usize{ 768, 1024 }) |dim| {
+        for ([_]usize{ 1, 3 }) |multiple| {
+            const rows = 257;
+            const columns = dim * multiple;
+            const weights = try a.alloc(u16, dim * columns);
+            defer a.free(weights);
+            for (weights, 0..) |*value, i| {
+                const f = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + i / dim) % 17)) - 8)) / 128;
+                value.* = f32ToBf16BitsRoundNearestEven(f);
+            }
+            const shape = [_]i64{ @intCast(columns), @intCast(dim) };
+            const name = try std.fmt.allocPrint(a, "bias-epilogue-{d}-{d}.weight", .{ dim, multiple });
+            defer a.free(name);
+            const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(weights), .dtype = .bf16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+            try compute.insertBf16WeightFromTensor(try a.dupe(u8, tensor.name), &tensor);
+            const weight = try cb.getWeight(tensor.name);
+            defer cb.free(weight);
+            const values = try a.alloc(f32, rows * dim);
+            defer a.free(values);
+            const biases = try a.alloc(f32, columns);
+            defer a.free(biases);
+            for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 29)) - 14)) / 32;
+            for (biases, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) / 16;
+            const input = try cb.fromFloat32Shape(values, &.{ rows, @intCast(dim) });
+            defer cb.free(input);
+            const bias = try cb.fromFloat32Shape(biases, &.{@intCast(columns)});
+            defer cb.free(bias);
+            const calls = compute.lighton_vision_bias_epilogue_calls;
+            const fused = try cb.linear(input, weight, bias, rows, dim, columns);
+            defer cb.free(fused);
+            try std.testing.expectEqual(calls + 1, compute.lighton_vision_bias_epilogue_calls);
+            const plain = try cb.linearNoBias(input, weight, rows, dim, columns);
+            defer cb.free(plain);
+            const got = try cb.toFloat32(fused, a);
+            defer a.free(got);
+            const want = try cb.toFloat32(plain, a);
+            defer a.free(want);
+            for (got, want, 0..) |actual, product, i| try std.testing.expectApproxEqAbs(product + biases[i % columns], actual, 2e-5);
+            // Sample independent scalar dot products, including both matrix
+            // tails; fixture operands are exactly representable BF16 values.
+            for ([_]usize{ 0, 17, rows - 1 }) |row| for ([_]usize{ 0, 19, columns - 1 }) |column| {
+                var sum: f32 = 0;
+                for (0..dim) |k| {
+                    const w: f32 = @bitCast(@as(u32, weights[column * dim + k]) << 16);
+                    sum += values[row * dim + k] * w;
+                }
+                try std.testing.expectApproxEqAbs(sum + biases[column], got[row * columns + column], 2e-5);
+            };
+            const unchanged_input = try cb.toFloat32(input, a);
+            defer a.free(unchanged_input);
+            const unchanged_bias = try cb.toFloat32(bias, a);
+            defer a.free(unchanged_bias);
+            try std.testing.expectEqualSlices(f32, values, unchanged_input);
+            try std.testing.expectEqualSlices(f32, biases, unchanged_bias);
+        }
+    }
+}
+
+test "LightOnOCR3 CUDA compact vision norm QKV preserves rounded normalization F32 projection and readonly inputs" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_]usize{ 768, 1024 }) |dim| {
+        var compute = try CudaCompute.init(a);
+        defer compute.deinit();
+        if (!lightOnDevice(&compute).portableKernels()) return error.SkipZigTest;
+        compute.capability_profile = .lightonocr3;
+        compute.lighton_fused_vision_qkv_enabled = true;
+        compute.lighton_bf16_projection_outputs = false;
+        compute.cublaslt_bf16_tuning_profile = .off;
+        const cb = compute.computeBackend();
+        const matrix = try a.alloc(u16, 3 * dim * dim);
+        defer a.free(matrix);
+        for (matrix, 0..) |*bits, i| bits.* = f32ToBf16BitsRoundNearestEven(@sin(@as(f32, @floatFromInt(i)) * 0.037) * 0.01);
+        const matrix_shape = [_]i64{ @intCast(3 * dim), @intCast(dim) };
+        const checkpoint = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(matrix), .dtype = .bf16, .shape = &matrix_shape, .name = "vision.norm_qkv.weight", .allocator = a, .owns_data = false, .owns_shape = false };
+        try compute.insertBf16WeightFromTensor(try a.dupe(u8, checkpoint.name), &checkpoint);
+        const weight = try cb.getWeight(checkpoint.name);
+        defer cb.free(weight);
+        const gamma_values = try a.alloc(f32, dim);
+        defer a.free(gamma_values);
+        const beta_values = try a.alloc(f32, dim);
+        defer a.free(beta_values);
+        const bias_values = try a.alloc(f32, 3 * dim);
+        defer a.free(bias_values);
+        for (gamma_values, 0..) |*v, i| v.* = 1 + @as(f32, @floatFromInt(i % 13)) / 64;
+        for (beta_values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) / 32;
+        for (bias_values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) / 128;
+        const gamma = try cb.fromFloat32(gamma_values);
+        defer cb.free(gamma);
+        const beta = try cb.fromFloat32(beta_values);
+        defer cb.free(beta);
+        const bias = try cb.fromFloat32(bias_values);
+        defer cb.free(bias);
+        const weights = [_]CT{ gamma, beta, weight, bias };
+        for ([_]usize{ 256, 2592 }) |rows| {
+            const values = try a.alloc(f32, rows * dim);
+            defer a.free(values);
+            for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.017) * 0.7;
+            const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(dim) });
+            defer cb.free(input);
+            const normalized = try cb.layerNorm(input, gamma, beta, dim, 1e-6);
+            defer cb.free(normalized);
+            const normalized_values = try cb.toFloat32(normalized, a);
+            defer a.free(normalized_values);
+            // The fused kernel must round exactly the same F32 norm values
+            // that the existing projection stages, including both matrix tails.
+            var compact = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, rows * dim * 2);
+            defer compact.free(&compute.ctx);
+            try compute.lighton_vision_fused.init(&compute.ctx);
+            try compute.lighton_vision_fused.norm(&compute.ctx, .{ compact.ptr, tensorFromCt(input).buffer.ptr, tensorFromCt(gamma).buffer.ptr, tensorFromCt(beta).buffer.ptr }, @intCast(rows), @intCast(dim), 1e-6);
+            const bits = try a.alloc(u16, rows * dim);
+            defer a.free(bits);
+            try compact.copyToHost(&compute.ctx, std.mem.sliceAsBytes(bits));
+            try compute.ctx.synchronize();
+            for (bits, normalized_values) |actual, expected| try std.testing.expectEqual(f32ToBf16BitsRoundNearestEven(expected), actual);
+            const reference = try cb.linear(normalized, weight, bias, rows, dim, 3 * dim);
+            defer cb.free(reference);
+            const casts = compute.stats.bf16_cublaslt_activation_staging_calls;
+            const calls = compute.lighton_vision_norm_qkv_calls;
+            const projected = (try CudaCompute.lightOnVisionNormQkv(&cb, input, weights, rows, dim, 1e-6)).?;
+            defer cb.free(projected);
+            try std.testing.expectEqual(tensor_mod.DType.f32, tensorFromCt(projected).dtype);
+            try std.testing.expectEqual(calls + 1, compute.lighton_vision_norm_qkv_calls);
+            try std.testing.expectEqual(casts, compute.stats.bf16_cublaslt_activation_staging_calls);
+            const expected = try cb.toFloat32(reference, a);
+            defer a.free(expected);
+            const actual = try cb.toFloat32(projected, a);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
+            const unchanged = try cb.toFloat32(input, a);
+            defer a.free(unchanged);
+            try std.testing.expectEqualSlices(f32, values, unchanged);
+            const launches = compute.ctx.stats.kernel_launches;
+            compute.capability_profile = .florence2;
+            try std.testing.expect(try CudaCompute.lightOnVisionNormQkv(&cb, input, weights, rows, dim, 1e-6) == null);
+            compute.capability_profile = .lightonocr3;
+            compute.resident_training_cache = true;
+            try std.testing.expect(try CudaCompute.lightOnVisionNormQkv(&cb, input, weights, rows, dim, 1e-6) == null);
+            compute.resident_training_cache = false;
+            try std.testing.expect(try CudaCompute.lightOnVisionNormQkv(&cb, input, weights, 255, dim, 1e-6) == null);
+            try std.testing.expectError(error.InvalidTensorShape, CudaCompute.lightOnVisionNormQkv(&cb, input, weights, rows, dim, 0));
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+        for ([_]CT{ gamma, beta, bias }, [_][]const f32{ gamma_values, beta_values, bias_values }) |source, expected| {
+            const actual = try cb.toFloat32(source, a);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(f32, expected, actual);
+        }
+        const unchanged_weight = try cb.toFloat32(weight, a);
+        defer a.free(unchanged_weight);
+        for (matrix, unchanged_weight) |bits, value| try std.testing.expectEqual(@as(u32, bits) << 16, @as(u32, @bitCast(value)));
+    }
+}
+
+test "LightOnOCR3 CUDA canonical GDN GEMM preserves exact rows and output bounds" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const blas = if (compute.cublaslt) |*value| value else return error.CublasLtUnavailable;
+    if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+    for ([_][2]usize{ .{ 1024, 6144 }, .{ 2560, 248320 } }) |geometry| {
+        const k = geometry[0];
+        const n = geometry[1];
+        const max_rows = 129;
+        const inputs = try a.alloc(u16, max_rows * k);
+        defer a.free(inputs);
+        const weights = try a.alloc(u16, n * k);
+        defer a.free(weights);
+        for (inputs, 0..) |*v, i| v.* = f32ToBf16BitsRoundNearestEven(@sin(@as(f32, @floatFromInt(i)) * 0.037) * 0.125);
+        for (weights, 0..) |*v, i| v.* = f32ToBf16BitsRoundNearestEven(@sin(@as(f32, @floatFromInt(i)) * 0.013) * 0.0625);
+        var input = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, inputs.len * 2);
+        defer input.free(&compute.ctx);
+        var weight = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, weights.len * 2);
+        defer weight.free(&compute.ctx);
+        var owner = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, (max_rows * n + 128) * 4);
+        defer owner.free(&compute.ctx);
+        var reference = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, max_rows * n * 4);
+        defer reference.free(&compute.ctx);
+        const output = buffer_mod.DeviceBuffer{ .ptr = owner.ptr + 256, .len = max_rows * n * 4 };
+        try input.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(inputs));
+        try weight.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(weights));
+        const host = try a.alloc(f32, max_rows * n + 128);
+        defer a.free(host);
+        const golden = try a.alloc(f32, max_rows * n);
+        defer a.free(golden);
+        const row_cases: []const usize = if (k == 1024) &.{ 63, 64, 65, 66, 85, 96, 127, 128, 129 } else &.{ 1, 7, 16, 21, 63, 64, 65, 66, 85, 96, 127, 128, 129 };
+        for (row_cases) |rows| {
+            blas.lighton_projection_profile = .off;
+            try blas.matmulBf16WeightF32Out(&compute.ctx, reference, input, weight, .{}, rows, k, n);
+            try reference.copyToHost(&compute.ctx, std.mem.sliceAsBytes(golden[0 .. rows * n]));
+            try compute.ctx.synchronize();
+            blas.lighton_projection_profile = .sm121;
+            const before = if (k == 1024) blas.canonical_gdn_calls else blas.lighton_projection_probe_calls;
+            try compute.kernels.launchFillF32(&compute.ctx, owner, host.len, 123.25);
+            try blas.matmulBf16WeightF32Out(&compute.ctx, output, input, weight, .{}, rows, k, n);
+            try owner.copyToHost(&compute.ctx, std.mem.sliceAsBytes(host));
+            try compute.ctx.synchronize();
+            const expected_probe = if (k == 1024) rows >= 65 and rows <= 128 else rows != 16 and rows <= 128;
+            try std.testing.expectEqual(before + @as(usize, @intFromBool(expected_probe)), if (k == 1024) blas.canonical_gdn_calls else blas.lighton_projection_probe_calls);
+            for (host[0..64]) |v| try std.testing.expectEqual(@as(f32, 123.25), v);
+            for (host[64 + rows * n ..]) |v| try std.testing.expectEqual(@as(f32, 123.25), v);
+            for (golden[0 .. rows * n], host[64..][0 .. rows * n]) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 2e-5);
+            for ([_]usize{ 0, rows - 1 }) |row| {
+                for ([_]usize{ 0, 31, n - 1 }) |col| {
+                    var expected: f64 = 0;
+                    for (0..k) |i| {
+                        const x: f32 = @bitCast(@as(u32, inputs[row * k + i]) << 16);
+                        const w: f32 = @bitCast(@as(u32, weights[col * k + i]) << 16);
+                        expected += @as(f64, x) * @as(f64, w);
+                    }
+                    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), host[64 + row * n + col], 2e-5);
+                }
+            }
+        }
+        const saved_input = try a.alloc(u16, inputs.len);
+        defer a.free(saved_input);
+        const saved_weight = try a.alloc(u16, weights.len);
+        defer a.free(saved_weight);
+        try input.copyToHost(&compute.ctx, std.mem.sliceAsBytes(saved_input));
+        try weight.copyToHost(&compute.ctx, std.mem.sliceAsBytes(saved_weight));
+        try compute.ctx.synchronize();
+        try std.testing.expectEqualSlices(u16, inputs, saved_input);
+        try std.testing.expectEqualSlices(u16, weights, saved_weight);
+        try std.testing.expect(blas.canonical_gdn_plans > 0);
+    }
+}
+test "LightOnOCR3 CUDA burst readback retains admission source and unique pending ownership across reuse and cancellation" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const readback = @import("burst_readback.zig");
+    const memory = @import("../../runtime/tier/memory.zig");
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    var controller = memory.AdmissionController{};
+    compute.ctx.video_cache_budget.admission = .{ .controller = &controller, .limits = .{
+        .host_limit_bytes = readback.capacity - 1,
+        .scratch_limit_bytes = readback.capacity,
+    }, .check_live_memory = false };
+    defer compute.ctx.video_cache_budget.admission = null;
+    const slot = &compute.lighton_burst_readback;
+    defer slot.deinit(&compute.ctx);
+    var source = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, readback.capacity + 256);
+    defer source.free(&compute.ctx);
+    try std.testing.expect((try slot.begin(&compute.ctx, source, readback.capacity)) == null);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    try std.testing.expect(slot.host.ptr == null and slot.event == null and !slot.busy);
+    compute.ctx.video_cache_budget.admission.?.limits.host_limit_bytes = readback.capacity;
+    var values: [readback.capacity / 4 + 64]u32 = undefined;
+    for (&values, 0..) |*value, i| value.* = @intCast(i * 31 + 7);
+    try source.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+    try std.testing.expect((try slot.begin(&compute.ctx, source, readback.capacity + 1)) == null);
+    try std.testing.expect((try slot.begin(&compute.ctx, source, 0)) == null);
+    try std.testing.expectError(error.InvalidShape, slot.begin(&compute.ctx, .{}, 4));
+    var pending = (try slot.begin(&compute.ctx, source, readback.capacity)) orelse return error.UnsupportedOperation;
+    try std.testing.expectEqual(@as(usize, readback.capacity), controller.snapshot().host_scratch_bytes);
+    try std.testing.expect((try slot.begin(&compute.ctx, source, 4)) == null);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, compute.configureEmbeddingGemma2Admission(null));
+    try std.testing.expectEqual(@as(usize, readback.capacity), controller.snapshot().host_scratch_bytes);
+    var got: [readback.capacity / 4 + 64]u32 = @splat(0xdeadbeef);
+    try std.testing.expectError(error.InvalidCudaState, pending.copy(std.mem.sliceAsBytes(got[32..][0 .. readback.capacity / 4])));
+    // A following independent phase may reuse source storage, but the prior
+    // readback's queued copy and completion event precede that later producer.
+    try compute.kernels.launchFillF32(&compute.ctx, source, source.len / 4, -91);
+    try pending.wait();
+    try pending.copy(std.mem.sliceAsBytes(got[32..][0 .. readback.capacity / 4]));
+    try std.testing.expectEqualSlices(u32, values[0 .. readback.capacity / 4], got[32..][0 .. readback.capacity / 4]);
+    for (got[0..32]) |guard| try std.testing.expectEqual(@as(u32, 0xdeadbeef), guard);
+    for (got[32 + readback.capacity / 4 ..]) |guard| try std.testing.expectEqual(@as(u32, 0xdeadbeef), guard);
+    var stale = pending;
+    pending.deinit();
+    const retained = slot.host.ptr;
+    var second = (try slot.begin(&compute.ctx, source, 4)) orelse return error.UnsupportedOperation;
+    try std.testing.expectEqual(retained, slot.host.ptr);
+    try std.testing.expectEqual(@as(usize, readback.capacity), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectError(error.InvalidCudaState, stale.copy(std.mem.sliceAsBytes(got[0 .. readback.capacity / 4])));
+    stale.deinit();
+    try std.testing.expect(slot.busy);
+    // Cancellation before wait drains before releasing the unique slot.
+    second.deinit();
+    try std.testing.expect(!slot.busy);
+    var third = (try slot.begin(&compute.ctx, source, 4)) orelse return error.UnsupportedOperation;
+    try third.wait();
+    try third.copy(std.mem.sliceAsBytes(got[0..1]));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -91))), got[0]);
+    third.deinit();
+    try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+    try std.testing.expect((try slot.begin(&compute.ctx, source, 4)) == null);
+    const graph = try compute.ctx.endStreamCapture();
+    compute.ctx.destroyGraph(graph);
+    try compute.configureEmbeddingGemma2Admission(null);
+    try std.testing.expect(slot.host.ptr == null and slot.event == null and !slot.busy);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    // Policy retirement must not reset generations and revive a copied old
+    // Pending value when a new host allocation starts its first read.
+    var fourth = (try slot.begin(&compute.ctx, source, 4)) orelse return error.UnsupportedOperation;
+    stale.deinit();
+    try std.testing.expect(slot.busy);
+    try std.testing.expectError(error.InvalidCudaState, stale.copy(std.mem.sliceAsBytes(got[0 .. readback.capacity / 4])));
+    try fourth.wait();
+    try fourth.copy(std.mem.sliceAsBytes(got[0..1]));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -91))), got[0]);
+    fourth.deinit();
+}
+
+test "cuda GLiNER GRU residual modes preserve cancellation-sensitive state on device" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const labels = [_]f32{ 16777216, -16777216, 2, -3, 0, 5 };
+    var gates: [18]f32 = @splat(0);
+    for (0..2) |row| for (0..3) |col| {
+        gates[row * 9 + 3 + col] = -100;
+        gates[row * 9 + 6 + col] = 0.25541282;
+    };
+    const label_ct = try cb.fromFloat32Shape(&labels, &.{ 2, 3 });
+    defer cb.free(label_ct);
+    const gi = try cb.fromFloat32Shape(&gates, &.{ 2, 9 });
+    defer cb.free(gi);
+    const zero_gates: [18]f32 = @splat(0);
+    const gh = try cb.fromFloat32Shape(&zero_gates, &.{ 2, 9 });
+    defer cb.free(gh);
+    const out = try cb.fromFloat32Shape(&labels, &.{ 2, 3 });
+    defer cb.free(out);
+    for ([_]bool{ false, true }) |add_residual| {
+        const before = cb.trainingRuntimeStats();
+        try compute.kernels.launchGlinerGruCombineF32(&compute.ctx, tensorFromCt(out).buffer, tensorFromCt(label_ct).buffer, tensorFromCt(gi).buffer, tensorFromCt(gh).buffer, 2, 3, add_residual);
+        try std.testing.expectEqual(before.d2h_bytes, cb.trainingRuntimeStats().d2h_bytes);
+        try std.testing.expectEqual(before.h2d_bytes, cb.trainingRuntimeStats().h2d_bytes);
+        const got = try cb.toFloat32(out, std.testing.allocator);
+        defer std.testing.allocator.free(got);
+        for (got, labels) |value, label| try std.testing.expectApproxEqAbs(@as(f32, 0.25) + (if (add_residual) label else 0), value, 0.000001);
+    }
+}
+
+test "cuda specialty FP32 fused attention preserves ragged full geometry and repeat stability" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const batch: usize = 8;
+    const heads: usize = 12;
+    const head_dim: usize = 64;
+    const hidden = heads * head_dim;
+    // The existing raw FP32 DeBERTa attention gate is 1e-4. Do not relax
+    // it to the downstream classifier's less strict accumulated-error gate.
+    const tolerance: f32 = 1e-4;
+    for ([_]usize{ 268, 512 }) |sequence| {
+        const count = batch * sequence * hidden;
+        const relative_count = (2 * sequence - 1) * hidden;
+        var inputs: [5]buffer_mod.DeviceBuffer = @splat(.{});
+        defer {
+            compute.ctx.synchronize() catch {};
+            for (&inputs) |*value| value.free(&compute.ctx);
+        }
+        for (&inputs, 0..) |*value, index| value.* = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, (if (index < 3) count else relative_count) * @sizeOf(f32));
+        var reference = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, count * @sizeOf(f32));
+        defer reference.free(&compute.ctx);
+        var fused = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, count * @sizeOf(f32));
+        defer fused.free(&compute.ctx);
+        var mask_device = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, batch * sequence * @sizeOf(i64));
+        defer mask_device.free(&compute.ctx);
+        const values = try a.alloc(f32, @max(count, relative_count));
+        defer a.free(values);
+        const expected = try a.alloc(f32, count);
+        defer a.free(expected);
+        const actual = try a.alloc(f32, count);
+        defer a.free(actual);
+        const first = try a.alloc(f32, count);
+        defer a.free(first);
+        const mask = try a.alloc(i64, batch * sequence);
+        defer a.free(mask);
+        // LCG inputs reproduce the standalone failure receipt exactly;
+        // sin/cos inputs independently cover structured attention scores.
+        for (0..2) |pattern| {
+            for (&inputs, 0..) |*input, index| {
+                const length = if (index < 3) count else relative_count;
+                var state: u32 = @intCast(101 + index * 31);
+                for (values[0..length], 0..) |*value, i| {
+                    value.* = if (pattern == 0) lcg: {
+                        state = state *% 1664525 +% 1013904223;
+                        break :lcg @floatCast((@as(f64, @floatFromInt(state >> 8)) / 16777216 * 2 - 1) * 4);
+                    } else trig: {
+                        const coordinate = @as(f32, @floatFromInt(i)) * 0.03125 + @as(f32, @floatFromInt(index)) * 0.171875;
+                        break :trig 2 * (@sin(coordinate) + @cos(coordinate * 0.4375));
+                    };
+                }
+                try input.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(values[0..length]));
+            }
+            const ragged_lengths = [_]usize{ sequence, sequence - 1, sequence / 2, 1, 0, sequence / 3, sequence - 7, sequence / 4 };
+            for (0..3) |mask_kind| {
+                for (0..batch) |item| for (0..sequence) |position| {
+                    mask[item * sequence + position] = @intFromBool(switch (mask_kind) {
+                        0 => true,
+                        1 => position < ragged_lengths[item],
+                        else => false,
+                    });
+                };
+                try mask_device.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(mask));
+                try compute.kernels.launchDebertaAttentionF32(&compute.ctx, reference, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], mask_device, batch, sequence, heads, head_dim);
+                try reference.copyToHost(&compute.ctx, std.mem.sliceAsBytes(expected));
+                try compute.ctx.synchronize();
+                for (0..5) |repeat| {
+                    try std.testing.expect(try compute.kernels.launchDebertaAttentionFusedF32(&compute.ctx, fused, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], mask_device, batch, sequence, heads, head_dim));
+                    try fused.copyToHost(&compute.ctx, std.mem.sliceAsBytes(actual));
+                    try compute.ctx.synchronize();
+                    for (expected, actual, 0..) |want, got, i| {
+                        try std.testing.expect(std.math.isFinite(want) and std.math.isFinite(got));
+                        try std.testing.expectApproxEqAbs(want, got, tolerance);
+                        const item = i / (sequence * hidden);
+                        if (mask_kind == 2 or (mask_kind == 1 and ragged_lengths[item] == 0)) {
+                            try std.testing.expectEqual(@as(f32, 0), want);
+                            try std.testing.expectEqual(@as(f32, 0), got);
+                        }
+                    }
+                    if (repeat == 0) @memcpy(first, actual) else try std.testing.expectEqualSlices(f32, first, actual);
+                }
+            }
+        }
+    }
+}
+
+test "LightOnOCR3 CUDA BF16 vision projection retains bias dtype, readonly inputs and alias guards across F32 plans" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    const blas = &(compute.cublaslt orelse return error.SkipZigTest);
+    const rows = 4;
+    const dim = 16;
+    const width = 32;
+    var x: [rows * dim]u16 = undefined;
+    var weight: [width * dim]u16 = undefined;
+    var bias: [width]u16 = undefined;
+    var bias_f32: [width]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) / 16)) >> 16);
+    for (&weight, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) / 32)) >> 16);
+    for (&bias, &bias_f32, 0..) |*v, *f, i| {
+        f.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 3)) - 1)) / 32;
+        v.* = @truncate(@as(u32, @bitCast(f.*)) >> 16);
+    }
+    const sizes = [_]usize{ @sizeOf(@TypeOf(x)), @sizeOf(@TypeOf(weight)), @sizeOf(@TypeOf(bias)), @sizeOf(@TypeOf(bias_f32)), rows * width * 2, rows * width * 4 };
+    var buffers: [6]buffer_mod.DeviceBuffer = @splat(.{});
+    defer {
+        compute.ctx.synchronize() catch {};
+        for (&buffers) |*item| item.free(&compute.ctx);
+    }
+    for (&buffers, sizes) |*item, bytes| item.* = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, bytes);
+    try buffers[0].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&x));
+    try buffers[1].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&weight));
+    try buffers[2].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&bias));
+    try buffers[3].copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&bias_f32));
+    for (0..2) |_| {
+        try blas.matmulBf16WeightBiasBf16Out(&compute.ctx, buffers[4], buffers[0], buffers[1], buffers[2], .{}, rows, dim, width);
+        try blas.matmulBf16WeightBiasF32Out(&compute.ctx, buffers[5], buffers[0], buffers[1], buffers[3], .{}, rows, dim, width);
+    }
+    var reduced: [rows * width]u16 = undefined;
+    var full: [rows * width]f32 = undefined;
+    try buffers[4].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&reduced));
+    try buffers[5].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&full));
+    try compute.ctx.synchronize();
+    for (0..rows) |row| for (0..width) |col| {
+        var expected = bias_f32[col];
+        for (0..dim) |k| expected += @as(f32, @bitCast(@as(u32, x[row * dim + k]) << 16)) * @as(f32, @bitCast(@as(u32, weight[col * dim + k]) << 16));
+        try std.testing.expectEqual(expected, full[row * width + col]);
+        try std.testing.expectEqual(expected, @as(f32, @bitCast(@as(u32, reduced[row * width + col]) << 16)));
+    };
+    const before = compute.ctx.stats.kernel_launches;
+    try std.testing.expectError(error.CublasLtUnsupported, blas.matmulBf16WeightBiasBf16Out(&compute.ctx, buffers[4], buffers[0], buffers[1], .{ .ptr = buffers[2].ptr, .len = sizes[2] - 1 }, .{}, rows, dim, width));
+    try std.testing.expectError(error.CublasLtUnsupported, blas.matmulBf16WeightBiasBf16Out(&compute.ctx, .{ .ptr = buffers[0].ptr, .len = sizes[4] }, buffers[0], buffers[1], buffers[2], .{}, rows, dim, width));
+    try std.testing.expectEqual(before, compute.ctx.stats.kernel_launches);
+    var actual_x: @TypeOf(x) = undefined;
+    var actual_weight: @TypeOf(weight) = undefined;
+    var actual_bias: @TypeOf(bias) = undefined;
+    try buffers[0].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual_x));
+    try buffers[1].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual_weight));
+    try buffers[2].copyToHost(&compute.ctx, std.mem.sliceAsBytes(&actual_bias));
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(u16, &x, &actual_x);
+    try std.testing.expectEqualSlices(u16, &weight, &actual_weight);
+    try std.testing.expectEqualSlices(u16, &bias, &actual_bias);
+}
+
+test "LightOnOCR3 CUDA attention projection residual preserves original F32 outputs readonly inputs and prelaunch bounds" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_][2]usize{ .{ 2048, 1024 }, .{ 4096, 2560 } }) |dims| {
+        const in_dim, const hidden = dims;
+        var compute = try CudaCompute.init(a);
+        defer compute.deinit();
+        compute.capability_profile = .lightonocr3;
+        compute.lighton_ffn_block_enabled = true;
+        compute.lighton_ffn_bf16_inputs = true;
+        compute.lighton_bf16_decode_outputs = false;
+        compute.lighton_bf16_projection_outputs = false;
+        const cb = compute.computeBackend();
+        const matrix = try a.alloc(u16, in_dim * hidden);
+        defer a.free(matrix);
+        for (matrix, 0..) |*value, i| value.* = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) / 1024)) >> 16);
+        const shape = [_]i64{ @intCast(hidden), @intCast(in_dim) };
+        const host_weight = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(matrix), .dtype = .bf16, .shape = &shape, .name = "projection-residual.weight", .allocator = a, .owns_data = false, .owns_shape = false };
+        try compute.insertBf16WeightFromTensor(try a.dupe(u8, host_weight.name), &host_weight);
+        try compute.ctx.synchronize();
+        const weight = try cb.getWeight(host_weight.name);
+        defer cb.free(weight);
+        for ([_]usize{ 1, 7, 21, 64, 85, 128, 256, 2316 }) |rows| {
+            const values = try a.alloc(f32, rows * in_dim);
+            defer a.free(values);
+            const prior = try a.alloc(f32, rows * hidden);
+            defer a.free(prior);
+            for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.013) * 0.1;
+            for (prior, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i)) * 0.017) * 0.3;
+            const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(in_dim) });
+            defer cb.free(input);
+            const residual = try cb.fromFloat32Shape(prior, &.{ @intCast(rows), @intCast(hidden) });
+            defer cb.free(residual);
+            const projected = try cb.linearNoBias(input, weight, rows, in_dim, hidden);
+            defer cb.free(projected);
+            const original = try cb.add(projected, residual);
+            defer cb.free(original);
+            const fused = (try CudaCompute.lightOnProjectionResidual(&cb, input, weight, residual, rows, in_dim, hidden)) orelse return error.TestUnexpectedResult;
+            defer cb.free(fused);
+            const expected = try cb.toFloat32(original, a);
+            defer a.free(expected);
+            const actual = try cb.toFloat32(fused, a);
+            defer a.free(actual);
+            for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-4);
+            const input_after = try cb.toFloat32(input, a);
+            defer a.free(input_after);
+            const residual_after = try cb.toFloat32(residual, a);
+            defer a.free(residual_after);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(input_after));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(prior), std.mem.sliceAsBytes(residual_after));
+            const launches = compute.ctx.stats.kernel_launches;
+            var truncated = tensorFromCt(residual).*;
+            truncated.buffer.len = rows * hidden * 4 - 4;
+            try std.testing.expectError(error.InvalidShape, CudaCompute.lightOnProjectionResidual(&cb, input, weight, @ptrCast(&truncated), rows, in_dim, hidden));
+            compute.resident_training_cache = true;
+            try std.testing.expect((try CudaCompute.lightOnProjectionResidual(&cb, input, weight, residual, rows, in_dim, hidden)) == null);
+            compute.resident_training_cache = false;
+            compute.lighton_bf16_projection_outputs = true;
+            try std.testing.expect((try CudaCompute.lightOnProjectionResidual(&cb, input, weight, residual, rows, in_dim, hidden)) == null);
+            compute.lighton_bf16_projection_outputs = false;
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+        try std.testing.expectEqual(@as(usize, 8), compute.lighton_projection_residual_calls);
+        const unchanged = try a.alloc(u16, matrix.len);
+        defer a.free(unchanged);
+        try tensorFromCt(weight).buffer.copyToHost(&compute.ctx, std.mem.sliceAsBytes(unchanged));
+        try compute.ctx.synchronize();
+        try std.testing.expectEqualSlices(u16, matrix, unchanged);
+    }
+}
+
+test "LightOnOCR3 CUDA fused attention inputs preserve original F32 partial Mrope gates and readonly inputs" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .lightonocr3;
+    compute.lighton_ffn_block_enabled = true;
+    compute.lighton_cached_mrope_enabled = true;
+    compute.lighton_bf16_decode_outputs = false;
+    compute.lighton_bf16_projection_outputs = false;
+    const cb = compute.computeBackend();
+    var norm_host: [256]f32 = undefined;
+    for (&norm_host, 0..) |*v, i| v.* = 1 + @sin(@as(f32, @floatFromInt(i)) * 0.2) * 0.2;
+    const norm = try cb.fromFloat32Shape(&norm_host, &.{256});
+    defer cb.free(norm);
+    for ([_][2]usize{ .{ 8, 2 }, .{ 16, 4 } }) |heads| {
+        for ([_]usize{ 1, 2, 7, 21, 85, 128, 662, 2316 }) |rows| {
+            const qh, const kh = heads;
+            const values = try a.alloc(f32, rows * qh * 512);
+            defer a.free(values);
+            const keys = try a.alloc(f32, rows * kh * 256);
+            defer a.free(keys);
+            const positions = try a.alloc(u32, rows * 3);
+            defer a.free(positions);
+            for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i % 65536)) * 0.013) * 3;
+            for (keys, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i % 65536)) * 0.017) * 2;
+            for (positions, 0..) |*v, i| v.* = @intCast((i * 17 + i / rows * 43) % 1024);
+            const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(qh * 512) });
+            defer cb.free(input);
+            const key = try cb.fromFloat32Shape(keys, &.{ @intCast(rows), @intCast(kh * 256) });
+            defer cb.free(key);
+            const split = try cb.splitPerHeadGate(input, rows, qh, 256);
+            defer cb.free(split.query);
+            defer cb.free(split.gate);
+            const q_flat = (try cb.reshape2d(split.query, rows * qh, 256)) orelse return error.TestUnexpectedResult;
+            defer cb.free(q_flat);
+            const k_flat = (try cb.reshape2d(key, rows * kh, 256)) orelse return error.TestUnexpectedResult;
+            defer cb.free(k_flat);
+            const q_norm = try cb.rmsNorm(q_flat, norm, 256, 1e-6);
+            defer cb.free(q_norm);
+            const k_norm = try cb.rmsNorm(k_flat, norm, 256, 1e-6);
+            defer cb.free(k_norm);
+            const q_reshaped = (try cb.reshape2d(q_norm, rows, qh * 256)) orelse return error.TestUnexpectedResult;
+            defer cb.free(q_reshaped);
+            const k_reshaped = (try cb.reshape2d(k_norm, rows, kh * 256)) orelse return error.TestUnexpectedResult;
+            defer cb.free(k_reshaped);
+            const q_rope = (try cb.partialMrope(q_reshaped, rows, qh, 256, 10000000, 1, positions, .{ 11, 11, 10 })) orelse return error.TestUnexpectedResult;
+            defer cb.free(q_rope);
+            const k_rope = (try cb.partialMrope(k_reshaped, rows, kh, 256, 10000000, 1, positions, .{ 11, 11, 10 })) orelse return error.TestUnexpectedResult;
+            defer cb.free(k_rope);
+            const sigmoid_expected = try cb.sigmoid(split.gate);
+            defer cb.free(sigmoid_expected);
+            const fused = (try CudaCompute.lightOnAttentionInputs(&cb, input, key, norm, norm, positions, rows, qh, kh)) orelse return error.TestUnexpectedResult;
+            defer cb.free(fused.query);
+            defer cb.free(fused.key);
+            defer cb.free(fused.gate);
+            for ([_]CT{ q_rope, k_rope, sigmoid_expected }, [_]CT{ fused.query, fused.key, fused.gate }) |original, actual| {
+                const expected = try cb.toFloat32(original, a);
+                defer a.free(expected);
+                const observed = try cb.toFloat32(actual, a);
+                defer a.free(observed);
+                for (expected, observed) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-4);
+            }
+            const input_after = try cb.toFloat32(input, a);
+            defer a.free(input_after);
+            const keys_after = try cb.toFloat32(key, a);
+            defer a.free(keys_after);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(input_after));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(keys), std.mem.sliceAsBytes(keys_after));
+            const launches = compute.ctx.stats.kernel_launches;
+            var truncated = tensorFromCt(input).*;
+            truncated.buffer.len = values.len * 4 - 4;
+            try std.testing.expectError(error.InvalidShape, CudaCompute.lightOnAttentionInputs(&cb, @ptrCast(&truncated), key, norm, norm, positions, rows, qh, kh));
+            try std.testing.expectError(error.InvalidShape, CudaCompute.lightOnAttentionInputs(&cb, input, key, norm, norm, positions[0 .. positions.len - 1], rows, qh, kh));
+            compute.resident_training_cache = true;
+            try std.testing.expect((try CudaCompute.lightOnAttentionInputs(&cb, input, key, norm, norm, positions, rows, qh, kh)) == null);
+            compute.resident_training_cache = false;
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 16), compute.lighton_attention_inputs.calls);
+    const norm_after = try cb.toFloat32(norm, a);
+    defer a.free(norm_after);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&norm_host), std.mem.sliceAsBytes(norm_after));
+}
+
+test "LightOnOCR3 CUDA vision output residual preserves original F32 biased projection and readonly inputs" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_]usize{ 768, 1024 }) |hidden| {
+        var compute = try CudaCompute.init(a);
+        defer compute.deinit();
+        compute.capability_profile = .lightonocr3;
+        compute.lighton_fused_vision_qkv_enabled = true;
+        compute.lighton_precision = .f32;
+        const cb = compute.computeBackend();
+        const matrix = try a.alloc(u16, hidden * hidden);
+        defer a.free(matrix);
+        for (matrix, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(@as(f32, @floatFromInt(@as(i32, @intCast(i % 31)) - 15)) / 1024)) >> 16);
+        const shape = [_]i64{ @intCast(hidden), @intCast(hidden) };
+        const host_weight = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(matrix), .dtype = .bf16, .shape = &shape, .name = "vision-output-residual.weight", .allocator = a, .owns_data = false, .owns_shape = false };
+        try compute.insertBf16WeightFromTensor(try a.dupe(u8, host_weight.name), &host_weight);
+        try compute.ctx.synchronize();
+        const weight = try cb.getWeight(host_weight.name);
+        defer cb.free(weight);
+        const bias_values = try a.alloc(f32, hidden);
+        defer a.free(bias_values);
+        for (bias_values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.07) * 0.15;
+        const bias = try cb.fromFloat32Shape(bias_values, &.{@intCast(hidden)});
+        defer cb.free(bias);
+        for ([_]usize{ 256, 432, 2316, 17280, 20736 }) |rows| {
+            const values = try a.alloc(f32, rows * hidden);
+            defer a.free(values);
+            const prior = try a.alloc(f32, values.len);
+            defer a.free(prior);
+            for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i % 65536)) * 0.013) * 0.3;
+            for (prior, 0..) |*v, i| v.* = @cos(@as(f32, @floatFromInt(i % 65536)) * 0.017) * 0.5;
+            const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(hidden) });
+            defer cb.free(input);
+            const residual = try cb.fromFloat32Shape(prior, &.{ @intCast(rows), @intCast(hidden) });
+            defer cb.free(residual);
+            const projected = try cb.linear(input, weight, bias, rows, hidden, hidden);
+            defer cb.free(projected);
+            const original = try cb.add(projected, residual);
+            defer cb.free(original);
+            const fused = (try CudaCompute.lightOnVisionOutputResidual(&cb, input, weight, bias, residual, rows, hidden)) orelse return error.TestUnexpectedResult;
+            defer cb.free(fused);
+            const expected = try cb.toFloat32(original, a);
+            defer a.free(expected);
+            const actual = try cb.toFloat32(fused, a);
+            defer a.free(actual);
+            for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-4);
+            const input_after = try cb.toFloat32(input, a);
+            defer a.free(input_after);
+            const residual_after = try cb.toFloat32(residual, a);
+            defer a.free(residual_after);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(input_after));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(prior), std.mem.sliceAsBytes(residual_after));
+            const launches = compute.ctx.stats.kernel_launches;
+            var truncated = tensorFromCt(bias).*;
+            truncated.buffer.len = hidden * 4 - 4;
+            try std.testing.expectError(error.InvalidShape, CudaCompute.lightOnVisionOutputResidual(&cb, input, weight, @ptrCast(&truncated), residual, rows, hidden));
+            compute.lighton_precision = .bf16_vision;
+            try std.testing.expect((try CudaCompute.lightOnVisionOutputResidual(&cb, input, weight, bias, residual, rows, hidden)) == null);
+            compute.lighton_precision = .f32;
+            compute.resident_training_cache = true;
+            try std.testing.expect((try CudaCompute.lightOnVisionOutputResidual(&cb, input, weight, bias, residual, rows, hidden)) == null);
+            compute.resident_training_cache = false;
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+        try std.testing.expectEqual(@as(usize, 5), compute.lighton_vision_output_residual_calls);
+        const bias_after = try cb.toFloat32(bias, a);
+        defer a.free(bias_after);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(bias_values), std.mem.sliceAsBytes(bias_after));
+        const weight_after = try a.alloc(u16, matrix.len);
+        defer a.free(weight_after);
+        try tensorFromCt(weight).buffer.copyToHost(&compute.ctx, std.mem.sliceAsBytes(weight_after));
+        try compute.ctx.synchronize();
+        try std.testing.expectEqualSlices(u16, matrix, weight_after);
+    }
+}
+
+test "LightOnOCR3 CUDA fused head matches dense projection with suppressed ties and odd token bank offsets" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+    compute.capability_profile = .lightonocr3;
+    const cb = compute.computeBackend();
+    const hidden = 1024;
+    const vocab = 248320;
+    const matrix = try a.alloc(u16, vocab * hidden);
+    defer a.free(matrix);
+    @memset(matrix, 0);
+    for ([_]usize{ 2, 17, 256, 248319 }) |token| matrix[token * hidden] = 0x3f80;
+    const shape = [_]i64{ vocab, hidden };
+    const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(matrix), .dtype = .bf16, .shape = &shape, .name = "fused-head.embedding", .allocator = a, .owns_data = false, .owns_shape = false };
+    try compute.insertBf16WeightFromTensor(try a.dupe(u8, tensor.name), &tensor);
+    try compute.ctx.synchronize();
+    const weight = try cb.getWeight(tensor.name);
+    defer cb.free(weight);
+    for ([_]usize{ 7, 65, 128 }) |rows| {
+        const values = try a.alloc(f32, rows * hidden);
+        defer a.free(values);
+        @memset(values, 0);
+        for (0..rows) |row| values[row * hidden] = 1;
+        const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), hidden });
+        defer cb.free(input);
+        for ([_]bool{ false, true }) |suppressed| {
+            const ids: []const i32 = if (suppressed) &.{ 2, 17, -1, 300000 } else &.{};
+            var burst = (try CudaCompute.beginLightOnTokenBurst(&cb, weight, rows, 2, hidden, vocab, ids)) orelse return error.UnsupportedOperation;
+            defer burst.deinit();
+            compute.lighton_fused_head_disabled = true;
+            const before = compute.lighton_head.calls;
+            try burst.projectArgmax(input, weight, 0);
+            try std.testing.expectEqual(before, compute.lighton_head.calls);
+            compute.lighton_fused_head_disabled = false;
+            // An odd row count puts the second bank column at 4B alignment.
+            try burst.projectArgmax(input, weight, 1);
+            try std.testing.expectEqual(before + 1, compute.lighton_head.calls);
+            var tokens: [256]u32 = undefined;
+            try burst.read(tokens[0 .. rows * 2]);
+            try std.testing.expectEqualSlices(u32, tokens[0..rows], tokens[rows .. rows * 2]);
+            for (tokens[0..rows]) |token| try std.testing.expectEqual(@as(u32, if (suppressed) 256 else 2), token);
+        }
+        const unchanged = try cb.toFloat32(input, a);
+        defer a.free(unchanged);
+        try std.testing.expectEqualSlices(f32, values, unchanged);
+    }
+    try std.testing.expectEqual(@as(usize, 6), compute.lighton_head.calls);
+}
+
+test "LightOn CUDA graph capability has no benchmark GPU allowlist and explains declines" {
+    // Only policy fields are initialized: no driver or device allocation is
+    // touched by eligibility. Actual graph execution is covered on CUDA.
+    var compute: CudaCompute = undefined;
+    compute.lighton_decode_graph_enabled = true;
+    compute.capability_profile = .lightonocr3;
+    compute.ctx.info.compute_major = 8;
+    compute.ctx.info.compute_minor = 0;
+    compute.ctx.info.driver_version = 13000;
+    compute.lighton_bf16_decode_outputs = false;
+    compute.lighton_bf16_projection_outputs = false;
+    compute.lighton_attention_enabled = true;
+    compute.lighton_batched_kv_write_enabled = true;
+    compute.lighton_recurrent_batch_enabled = true;
+    compute.lighton_ffn_block_enabled = true;
+    compute.lighton_ffn_bf16_inputs = true;
+    compute.lighton_state_pool_enabled = true;
+    compute.cublaslt = @as(cublaslt_mod.CublasLt, undefined);
+    compute.cublaslt.?.allocator = std.testing.allocator;
+    compute.cublaslt.?.plan_cache_capacity = 1024;
+    compute.lighton_gemm_bucket_rows = false;
+    compute.debug_cuda_graph_capture_active = false;
+    compute.ctx.debug_graph_capture_active = false;
+    compute.resident_training_cache = false;
+    compute.lazy_host_store = null;
+    const Decision = @import("lighton_device_policy.zig").GraphDecision;
+    for ([_][2]i32{ .{ 8, 0 }, .{ 8, 9 }, .{ 9, 0 }, .{ 12, 1 } }) |cc| {
+        compute.ctx.info.compute_major = cc[0];
+        compute.ctx.info.compute_minor = cc[1];
+        try std.testing.expectEqual(Decision.enabled, compute.lightOnGraphDecision());
+    }
+    compute.ctx.info.driver_version = 12090;
+    try std.testing.expectEqual(Decision.driver_unsupported, compute.lightOnGraphDecision());
+    compute.ctx.info.driver_version = 13000;
+    compute.lighton_state_pool_enabled = false;
+    try std.testing.expectEqual(Decision.state_pool_disabled, compute.lightOnGraphDecision());
+    compute.lighton_state_pool_enabled = true;
+    compute.lighton_bf16_projection_outputs = true;
+    try std.testing.expectEqual(Decision.arithmetic_not_capturable, compute.lightOnGraphDecision());
+    compute.lighton_bf16_projection_outputs = false;
+    compute.resident_training_cache = true;
+    try std.testing.expectEqual(Decision.execution_not_capturable, compute.lightOnGraphDecision());
+    compute.resident_training_cache = false;
+    compute.cublaslt.?.plan_cache_capacity = 8;
+    try std.testing.expectEqual(Decision.plan_cache_too_small, compute.lightOnGraphDecision());
+    compute.cublaslt = null;
+    try std.testing.expectEqual(Decision.cublaslt_unavailable, compute.lightOnGraphDecision());
+    compute.lighton_decode_graph_enabled = false;
+    try std.testing.expectEqual(Decision.operator_disabled, compute.lightOnGraphDecision());
+}
+
+test "CUDA Laya portable warp eligibility depends on loaded symbol and shape" {
+    var compute: CudaCompute = undefined;
+    compute.laya_optimizations = true;
+    compute.kernels.laya_attention_warp_f32 = @ptrFromInt(1);
+    try std.testing.expect(layaWarpEligible(&compute, 2, 512, 64));
+    try std.testing.expect(layaWarpEligible(&compute, 4, 128, 128));
+    try std.testing.expect(!layaWarpEligible(&compute, 1, 512, 64));
+    try std.testing.expect(!layaWarpEligible(&compute, 2, 513, 64));
+    try std.testing.expect(!layaWarpEligible(&compute, 2, 512, 256));
+    compute.kernels.laya_attention_warp_f32 = null;
+    try std.testing.expect(!layaWarpEligible(&compute, 2, 512, 64));
+    compute.kernels.laya_attention_warp_f32 = @ptrFromInt(1);
+    compute.laya_optimizations = false;
+    try std.testing.expect(!layaWarpEligible(&compute, 2, 512, 64));
+}
+
+test "CUDA vision automatic policy consumes resolved settings without a second environment gate" {
+    var compute: CudaCompute = undefined;
+    compute.capability_profile = .lightonocr3;
+    compute.lighton_fused_vision_qkv_enabled = true;
+    compute.lighton_fused_vision_mlp_enabled = true;
+    compute.ctx.info.compute_major = 8;
+    compute.ctx.info.compute_minor = 0;
+    compute.ctx.info.driver_version = 13000;
+    try std.testing.expect(compute.lightOnVisionQkvEnabled());
+    try std.testing.expect(compute.lightOnVisionMlpEnabled());
+    compute.lighton_fused_vision_qkv_enabled = false;
+    try std.testing.expect(!compute.lightOnVisionQkvEnabled());
+    try std.testing.expect(compute.lightOnVisionMlpEnabled());
+    compute.lighton_fused_vision_mlp_enabled = false;
+    try std.testing.expect(!compute.lightOnVisionMlpEnabled());
+    compute.lighton_fused_vision_qkv_enabled = true;
+    compute.lighton_fused_vision_mlp_enabled = true;
+    compute.ctx.info.driver_version = 12000;
+    try std.testing.expect(!compute.lightOnVisionQkvEnabled());
+    try std.testing.expect(!compute.lightOnVisionMlpEnabled());
+    compute.ctx.info.driver_version = 13000;
+    compute.capability_profile = null;
+    try std.testing.expect(!compute.lightOnVisionQkvEnabled());
+    try std.testing.expect(!compute.lightOnVisionMlpEnabled());
+}
+
+test "LightOn BF16 vision capability includes the portable artifact driver contract" {
+    var compute: CudaCompute = undefined;
+    compute.capability_profile = .lightonocr3;
+    compute.lighton_precision = .bf16_vision;
+    compute.resident_training_cache = false;
+    compute.lazy_host_store = null;
+    compute.debug_cuda_graph_capture_active = false;
+    compute.ctx.debug_graph_capture_active = false;
+    compute.ctx.info.compute_major = 8;
+    compute.ctx.info.compute_minor = 0;
+    compute.ctx.info.driver_version = 12090;
+    compute.cublaslt = @as(cublaslt_mod.CublasLt, undefined);
+    const Stub = struct {
+        fn kind(_: *anyopaque) ops.BackendKind {
+            return .cuda;
+        }
+    };
+    var table: ops.ComputeBackend.VTable = undefined;
+    table.backendKind = Stub.kind;
+    var cb = ops.ComputeBackend{ .ptr = &compute, .vtable = &table };
+    try std.testing.expect(!CudaCompute.lightOnBf16VisionEnabled(&cb));
+    compute.ctx.info.driver_version = 13000;
+    try std.testing.expect(CudaCompute.lightOnBf16VisionEnabled(&cb));
+    compute.ctx.info.compute_major = 7;
+    try std.testing.expect(!CudaCompute.lightOnBf16VisionEnabled(&cb));
+    compute.ctx.info.compute_major = 8;
+    compute.cublaslt = null;
+    try std.testing.expect(!CudaCompute.lightOnBf16VisionEnabled(&cb));
+}
+
+test "Whisper CUDA im2col preserves channel order padding and stride" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const channel = [_]f32{ 1, 2, 3, 4, 10, 20, 30, 40, 5, 6, 7, 8, 50, 60, 70, 80 };
+    const time_major = [_]f32{ 1, 10, 2, 20, 3, 30, 4, 40, 5, 50, 6, 60, 7, 70, 8, 80 };
+    const expected = [_]f32{ 0, 1, 2, 0, 10, 20, 2, 3, 4, 20, 30, 40, 0, 5, 6, 0, 50, 60, 6, 7, 8, 60, 70, 80 };
+    for ([_]bool{ false, true }) |major| {
+        const input = try cb.fromFloat32(if (major) &time_major else &channel);
+        defer cb.free(input);
+        const output = (try cb.conv1dIm2col(input, 2, 2, 4, 3, 2, 1, major)).?;
+        defer cb.free(output);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, &expected, actual);
+    }
+}
+
+test "Whisper CUDA logits statistics preserve suppression ties and timestamp mass" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const timestamps = @import("../../pipelines/whisper_timestamps.zig");
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_]usize{ 8, 51865 }) |count| {
+        const logits = try a.alloc(f32, count);
+        defer a.free(logits);
+        @memset(logits, -8);
+        @memcpy(logits[0..8], &[_]f32{ 0, 2, 2, 10, -1, 1.5, 1.5, 1.5 });
+        if (count > 8) {
+            logits[4000] = 12;
+            logits[50000] = 12;
+        }
+        const input = try cb.fromFloat32(logits);
+        defer cb.free(input);
+        const suppress = [_]i32{ -1, 3, 1000 };
+        for ([_]u32{ 0, 1 }) |text_allowed| {
+            const params = ops.WhisperLogitsParams{ .out_dim = @intCast(logits.len), .suppress_count = suppress.len, .ts_begin = 5, .text_allowed = text_allowed, .ts_min = 5, .ts_max = 8, .eot = 4, .probe_id = 3 };
+            const expected = timestamps.hostLogitsStats(logits, params, &suppress);
+            try std.testing.expect(try cb.whisperLogitsStatsEncode(input, &params, &suppress));
+            var actual: ops.WhisperLogitsStatsRaw = undefined;
+            try std.testing.expect(cb.whisperLogitsStatsRead(0, &actual));
+            for (0..16) |i| {
+                if (i == 1 or i == 3 or i == 5 or i == 7) {
+                    try std.testing.expectEqual(@as(u32, @bitCast(expected[i])), @as(u32, @bitCast(actual[i])));
+                } else if (std.math.isFinite(expected[i])) {
+                    try std.testing.expectApproxEqAbs(expected[i], actual[i], 0.00001 * @max(1, @abs(expected[i])));
+                } else try std.testing.expectEqual(expected[i], actual[i]);
+            }
+            try std.testing.expect(!cb.whisperLogitsStatsRead(0, &actual));
+        }
+    }
+}
+
+test "Whisper CUDA FP32 checkpoint upload retains FP16 matrices and FP32 bias" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .whisper;
+    compute.whisper_f16_weights_enabled = true;
+    const values = [_]f32{ 1, 2, 3, 4 };
+    const matrix = tensor_mod.Tensor{ .name = "matrix", .data = @constCast(std.mem.sliceAsBytes(&values)), .dtype = .f32, .shape = &.{ 2, 2 }, .allocator = a, .owns_data = false, .owns_shape = false };
+    try compute.insertWeightFromLoaded(try a.dupe(u8, "model.decoder.layers.0.fc1.weight"), &.{ .tensor = matrix });
+    try std.testing.expectEqual(@as(@TypeOf(compute.resident_weights.get("model.decoder.layers.0.fc1.weight").?.dtype), .f16), compute.resident_weights.get("model.decoder.layers.0.fc1.weight").?.dtype);
+    const vector = tensor_mod.Tensor{ .name = "bias", .data = @constCast(std.mem.sliceAsBytes(&values)), .dtype = .f32, .shape = &.{4}, .allocator = a, .owns_data = false, .owns_shape = false };
+    try compute.insertWeightFromLoaded(try a.dupe(u8, "model.decoder.layers.0.fc1.bias"), &.{ .tensor = vector });
+    try std.testing.expectEqual(@as(@TypeOf(compute.resident_weights.get("model.decoder.layers.0.fc1.bias").?.dtype), .f32), compute.resident_weights.get("model.decoder.layers.0.fc1.bias").?.dtype);
+}
+
+test "Whisper CUDA profile requires a device compatible with the portable kernel module" {
+    try std.testing.expect(!profileSupportsDevice(.whisper, 7, 0));
+    try std.testing.expect(profileSupportsDevice(.whisper, 7, 5));
+    try std.testing.expect(profileSupportsDevice(.whisper, 8, 0)); // A100
+    try std.testing.expect(profileSupportsDevice(.whisper, 8, 9)); // L4
+    try std.testing.expect(profileSupportsDevice(.whisper, 12, 1));
+}
+
+test "Whisper CUDA split key attention matches generic attention across masks and tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const batch = 2;
+    const heads = 2;
+    const dim = 64;
+    for ([_]usize{ 1, 3 }) |queries| {
+        for ([_]usize{ 1, 129, 1500 }) |keys| {
+            const q = try a.alloc(f32, batch * queries * heads * dim);
+            defer a.free(q);
+            const k = try a.alloc(f32, batch * keys * heads * dim);
+            defer a.free(k);
+            const v = try a.alloc(f32, k.len);
+            defer a.free(v);
+            const mask = try a.alloc(i64, batch * keys);
+            defer a.free(mask);
+            for (q, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.13) * 2;
+            for (k, v, 0..) |*x, *y, i| {
+                x.* = @cos(@as(f32, @floatFromInt(i)) * 0.07);
+                y.* = @sin(@as(f32, @floatFromInt(i)) * 0.17);
+            }
+            const qt = try cb.fromFloat32(q);
+            defer cb.free(qt);
+            const kt = try cb.fromFloat32(k);
+            defer cb.free(kt);
+            const vt = try cb.fromFloat32(v);
+            defer cb.free(vt);
+            for ([_]bool{ false, true }) |masked| {
+                for (mask, 0..) |*x, i| x.* = if (masked and i % 5 == 3) 0 else 1;
+                compute.capability_profile = null;
+                const reference = try cb.crossAttention(qt, kt, vt, mask, batch, queries, keys, heads, dim);
+                defer cb.free(reference);
+                compute.capability_profile = .whisper;
+                const actual = try cb.crossAttention(qt, kt, vt, mask, batch, queries, keys, heads, dim);
+                defer cb.free(actual);
+                const expected_values = try cb.toFloat32(reference, a);
+                defer a.free(expected_values);
+                const actual_values = try cb.toFloat32(actual, a);
+                defer a.free(actual_values);
+                for (expected_values, actual_values) |expected, value| try std.testing.expectApproxEqAbs(expected, value, 2e-5);
+                const prepared = (try cb.whisperPrepareCrossKv(kt, vt)).?;
+                defer cb.free(prepared.first);
+                defer cb.free(prepared.second);
+                for (k) |*value| value.* = @floatCast(@as(f16, @floatCast(value.*)));
+                for (v) |*value| value.* = @floatCast(@as(f16, @floatCast(value.*)));
+                const rounded_k = try cb.fromFloat32(k);
+                defer cb.free(rounded_k);
+                const rounded_v = try cb.fromFloat32(v);
+                defer cb.free(rounded_v);
+                compute.capability_profile = null;
+                const half_reference = try cb.crossAttention(qt, rounded_k, rounded_v, mask, batch, queries, keys, heads, dim);
+                defer cb.free(half_reference);
+                compute.capability_profile = .whisper;
+                const half_actual = try cb.crossAttention(qt, prepared.first, prepared.second, mask, batch, queries, keys, heads, dim);
+                defer cb.free(half_actual);
+                const half_expected = try cb.toFloat32(half_reference, a);
+                defer a.free(half_expected);
+                const half_values = try cb.toFloat32(half_actual, a);
+                defer a.free(half_values);
+                for (half_expected, half_values) |expected, value| try std.testing.expectApproxEqAbs(expected, value, 2e-5);
+            }
+        }
+    }
+}
+
+test "Whisper CUDA fused GEMV retains FP16 rounding bias and odd output tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_]usize{ 64, 67 }) |inputs| {
+        var compute = try CudaCompute.init(a);
+        defer compute.deinit();
+        compute.capability_profile = .whisper;
+        const cb = compute.computeBackend();
+        const outputs = 13;
+        const x = try a.alloc(f32, inputs);
+        defer a.free(x);
+        const w = try a.alloc(f32, inputs * outputs);
+        defer a.free(w);
+        var bias: [outputs]f32 = undefined;
+        for (x, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.31);
+        for (w, 0..) |*value, i| value.* = @cos(@as(f32, @floatFromInt(i)) * 0.13);
+        for (&bias, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i)) * 0.1;
+        const weight = tensor_mod.Tensor{ .name = "model.decoder.layers.0.fc1.weight", .data = std.mem.sliceAsBytes(w), .dtype = .f32, .shape = &.{ outputs, @intCast(inputs) }, .allocator = a, .owns_data = false, .owns_shape = false };
+        try compute.insertWeightFromLoaded(try a.dupe(u8, weight.name), &.{ .tensor = weight });
+        const wt = try cb.getWeight(weight.name);
+        const xt = try cb.fromFloat32(x);
+        defer cb.free(xt);
+        const bt = try cb.fromFloat32(&bias);
+        defer cb.free(bt);
+        for ([_]bool{ false, true }) |with_bias| {
+            const result = if (with_bias) try cb.linear(xt, wt, bt, 1, inputs, outputs) else try cb.linearNoBias(xt, wt, 1, inputs, outputs);
+            defer cb.free(result);
+            const actual = try cb.toFloat32(result, a);
+            defer a.free(actual);
+            if (with_bias) {
+                const reference_gelu = try cb.gelu(result);
+                defer cb.free(reference_gelu);
+                const fused_gelu = (try cb.linearGelu(xt, wt, bt, 1, inputs, outputs)).?;
+                defer cb.free(fused_gelu);
+                const expected_gelu = try cb.toFloat32(reference_gelu, a);
+                defer a.free(expected_gelu);
+                const actual_gelu = try cb.toFloat32(fused_gelu, a);
+                defer a.free(actual_gelu);
+                for (expected_gelu, actual_gelu) |expected, value| try std.testing.expectApproxEqAbs(expected, value, 1e-5);
+            }
+            for (actual, 0..) |value, row| {
+                var expected: f32 = 0;
+                for (x, 0..) |item, col| expected += @as(f32, @floatCast(@as(f16, @floatCast(item)))) * @as(f32, @floatCast(@as(f16, @floatCast(w[row * inputs + col]))));
+                if (with_bias) expected += bias[row];
+                try std.testing.expectApproxEqAbs(expected, value, 1e-5);
+            }
+        }
+    }
+}
+
+test "Whisper CUDA residual normalization returns the sum and matching normalization" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .whisper;
+    const cb = compute.computeBackend();
+    var x: [3 * 67]f32 = undefined;
+    var y: [x.len]f32 = undefined;
+    var gamma: [67]f32 = undefined;
+    var beta: [67]f32 = undefined;
+    for (&x, &y, 0..) |*lhs, *rhs, i| {
+        lhs.* = @sin(@as(f32, @floatFromInt(i)) * 0.17);
+        rhs.* = @cos(@as(f32, @floatFromInt(i)) * 0.31);
+    }
+    for (&gamma, &beta, 0..) |*g, *b, i| {
+        g.* = 0.5 + @as(f32, @floatFromInt(i)) * 0.01;
+        b.* = @as(f32, @floatFromInt(i)) * -0.001;
+    }
+    const xt = try cb.fromFloat32(&x);
+    defer cb.free(xt);
+    const yt = try cb.fromFloat32(&y);
+    defer cb.free(yt);
+    const gt = try cb.fromFloat32(&gamma);
+    defer cb.free(gt);
+    const bt = try cb.fromFloat32(&beta);
+    defer cb.free(bt);
+    const sum = try cb.add(xt, yt);
+    defer cb.free(sum);
+    const normalized = try cb.layerNorm(sum, gt, bt, 67, 1e-5);
+    defer cb.free(normalized);
+    const fused = (try cb.addLayerNormSum(xt, yt, gt, bt, 67, 1e-5)).?;
+    defer cb.free(fused.sum);
+    defer cb.free(fused.normed);
+    const expected_sum = try cb.toFloat32(sum, a);
+    defer a.free(expected_sum);
+    const actual_sum = try cb.toFloat32(fused.sum, a);
+    defer a.free(actual_sum);
+    try std.testing.expectEqualSlices(f32, expected_sum, actual_sum);
+    const expected_norm = try cb.toFloat32(normalized, a);
+    defer a.free(expected_norm);
+    const actual_norm = try cb.toFloat32(fused.normed, a);
+    defer a.free(actual_norm);
+    for (expected_norm, actual_norm) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+}
+
+test "cooperative decode batches preserve quantized routing without changing prefill mirrors" {
+    var compute: CudaCompute = undefined;
+    compute.cooperative_decode_rows = 0;
+    compute.cooperative_owner = .{};
+    compute.cooperative_owner.last_owner = 7;
+    compute.bf16_mirror_row_selector = .production;
+    var weight: CudaTensor = undefined;
+    weight.elem_count = 16;
+    weight.bf16_mirror = .{ .ptr = 128, .len = 32 };
+    try std.testing.expect(weightBf16MirrorForRows(&compute, &weight, 1) == null);
+    try std.testing.expect(weightBf16MirrorForRows(&compute, &weight, 2) != null);
+    CudaCompute.setCooperativeDecodeRows(&compute, 2);
+    try std.testing.expect(weightBf16MirrorForRows(&compute, &weight, 2) == null);
+    CudaCompute.setCooperativeDecodeRows(&compute, 0);
+    try std.testing.expectEqual(@as(u64, 0), compute.cooperative_owner.last_owner);
+    try std.testing.expectEqual(@as(u64, 1), compute.cooperative_owner.snapshot().cleanups);
+    try std.testing.expect(weightBf16MirrorForRows(&compute, &weight, 512) != null);
+}
+
+test "cooperative decode batches require the qualified quantized head and honor weight tying" {
+    const a = std.testing.allocator;
+    var shape = [_]i64{ 1, 32 };
+    var compute: CudaCompute = undefined;
+    compute.resident_weights = .{};
+    defer compute.resident_weights.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), compute.cooperativeDecodeBatchRows(true));
+    compute.tuned_route_gates = .{};
+    compute.tuned_route_gates.q6_k_lm_head_q8_1 = true;
+    compute.kernels.linear_q6_k_q8_1_f32_tile8_e4b = @ptrFromInt(1);
+    try compute.resident_weights.put(a, "model.embed_tokens.weight", .{ .buffer = .{}, .dtype = .u8, .shape = &shape, .elem_count = 32, .quant_type = .{ .known = .Q6_K } });
+    try compute.resident_weights.put(a, "gate.weight", .{ .buffer = .{}, .dtype = .u8, .shape = &shape, .elem_count = 32, .quant_type = .{ .known = .Q4_0 } });
+    try std.testing.expectEqual(@as(usize, 2), compute.cooperativeDecodeBatchRows(true));
+    try compute.resident_weights.put(a, "lm_head.weight", .{ .buffer = .{}, .dtype = .f32, .shape = &shape, .elem_count = 32 });
+    try std.testing.expectEqual(@as(usize, 1), compute.cooperativeDecodeBatchRows(false));
+    try std.testing.expectEqual(@as(usize, 2), compute.cooperativeDecodeBatchRows(true));
+    compute.tuned_route_gates.q6_k_lm_head_q8_1 = false;
+    try std.testing.expectEqual(@as(usize, 1), compute.cooperativeDecodeBatchRows(true));
+}
+
+test "cooperative decode batches keep sampled and greedy Q6 heads on the same quantized row contract" {
+    try std.testing.expect(cudaQuantizedDecodeRowsEligible(1, 0));
+    try std.testing.expect(!cudaQuantizedDecodeRowsEligible(2, 0));
+    try std.testing.expect(cudaQuantizedDecodeRowsEligible(2, 2));
+    try std.testing.expect(!cudaQuantizedDecodeRowsEligible(3, 2));
+    try std.testing.expect(!cudaQuantizedDecodeRowsEligible(0, 0));
+}
+
+test "GLiDE CUDA weight upload consumes keys on early allocation failure" {
+    const a = std.testing.allocator;
+    var tensor = try tensor_mod.Tensor.initFloat32(a, "norm.weight", &.{2}, &.{ 1, 1 });
+    defer tensor.deinit();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    var compute: CudaCompute = undefined;
+    compute.allocator = failing.allocator();
+    compute.glide_cuda = true;
+    // Key allocation succeeds; shape allocation fails before any CUDA access.
+    const key = try compute.allocator.dupe(u8, "norm.weight");
+    try std.testing.expectError(error.OutOfMemory, compute.insertGlideWeightFromTensor(key, &tensor));
+    compute.allocator = a;
+    compute.glide_cuda = false;
+    try std.testing.expectError(error.UnsupportedTensorType, compute.insertGlideWeightFromTensor(try a.dupe(u8, "norm.weight"), &tensor));
+}
+
+test "GLiDE CUDA geometry changes retire idle buffers and preserve live tensors" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    try compute.prepareGlideRequest(.{ 1, 17, 17 });
+    var active = try allocDeviceBufferOrdinary(&compute, 128);
+    defer releaseDeviceBuffer(&compute, &active);
+    try compute.kernels.launchFillF32(&compute.ctx, active, 32, 1.25);
+    var idle = try allocDeviceBufferOrdinary(&compute, 4096);
+    releaseDeviceBuffer(&compute, &idle);
+    const frees = compute.stats.device_free_calls;
+    try compute.prepareGlideRequest(.{ 1, 17, 17 });
+    try std.testing.expectEqual(frees, compute.stats.device_free_calls);
+    try std.testing.expectEqual(@as(usize, 1), compute.temp_buffers.buffers.items.len);
+    try compute.prepareGlideRequest(.{ 1, 33, 33 });
+    try std.testing.expectEqual(@as(usize, 0), compute.temp_buffers.buffers.items.len);
+    try std.testing.expectEqual(frees + 1, compute.stats.device_free_calls);
+    var values: [32]f32 = undefined;
+    try active.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+    for (values) |value| try std.testing.expectEqual(@as(f32, 1.25), value);
+    // Other model families never adopt GLiDE's geometry policy.
+    compute.glide_cuda = false;
+    try compute.prepareGlideRequest(.{ 2, 64, 128 });
+    try std.testing.expectEqual([3]usize{ 1, 33, 33 }, compute.glide_request_shape.?);
+}
+
+test "GLiDE CUDA shared projection staging matches independent projections" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    const cb = compute.computeBackend();
+    const rows = 257;
+    const widths = [_]usize{ 6144, 2048, 16, 16 };
+    for ([_]usize{ 1024, 2048 }) |hidden| {
+        const data = try a.alloc(f32, rows * hidden);
+        defer a.free(data);
+        for (data, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 997)) * 0.079);
+        const input = try cb.fromFloat32Shape(data, &.{ rows, @intCast(hidden) });
+        defer cb.free(input);
+        var weights: [4]CT = undefined;
+        var loaded: usize = 0;
+        defer for (weights[0..loaded]) |weight| cb.free(weight);
+        for (widths, 0..) |width, index| {
+            const values = try a.alloc(f16, hidden * width);
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = @floatCast(@sin(@as(f32, @floatFromInt((i * 7 + index) % 997)) * 0.71) * 0.025);
+            var name_buf: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "glide-projection-{d}-{d}", .{ hidden, index });
+            const shape = [_]i64{ @intCast(width), @intCast(hidden) };
+            const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(values), .dtype = .f16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+            try compute.insertGlideWeightFromTensor(try a.dupe(u8, name), &tensor);
+        }
+        // Resident tensor pointers are stable after model loading finishes;
+        // insertion can grow the map, so acquire them only after all inserts.
+        for (&weights, 0..) |*weight, index| {
+            var name_buf: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "glide-projection-{d}-{d}", .{ hidden, index });
+            weight.* = try cb.getWeight(name);
+            loaded += 1;
+        }
+        const actual = (try CudaCompute.glideDeltaProjections(&cb, input, weights, rows, hidden)).?;
+        defer for (actual) |value| cb.free(value);
+        for (weights, widths, actual) |weight, width, got| {
+            const expected = try cb.linearNoBias(input, weight, rows, hidden, width);
+            defer cb.free(expected);
+            const want_values = try cb.toFloat32(expected, a);
+            defer a.free(want_values);
+            const got_values = try cb.toFloat32(got, a);
+            defer a.free(got_values);
+            for (want_values, got_values) |want, value| try std.testing.expectApproxEqAbs(want, value, 1e-5);
+        }
+        const launches = compute.ctx.stats.kernel_launches;
+        var bad = tensorFromCt(input).*;
+        bad.buffer.len -= 4;
+        try std.testing.expectError(error.InvalidShape, CudaCompute.glideDeltaProjections(&cb, @ptrCast(&bad), weights, rows, hidden));
+        compute.strict_f32_weights = true;
+        try std.testing.expect((try CudaCompute.glideDeltaProjections(&cb, input, weights, rows, hidden)) == null);
+        compute.strict_f32_weights = false;
+        try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+    }
+}
+
+test "GLiDE CUDA tiled FFN matches separate operations across tile tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    const cb = compute.computeBackend();
+    for ([_]usize{ 1024, 2048 }, [_]usize{ 3584, 6144 }) |hidden, intermediate| {
+        var weights: [3]CT = undefined;
+        var loaded: usize = 0;
+        defer for (weights[0..loaded]) |weight| cb.free(weight);
+        for (&weights, 0..) |*weight, index| {
+            const values = try a.alloc(f16, hidden * intermediate);
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = @floatCast(@sin(@as(f32, @floatFromInt(i * 7 % 997 + index * 23)) * 0.71) * 0.025);
+            var name_buf: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "glide-test-{d}-{d}", .{ hidden, index });
+            const shape = [_]i64{ @intCast(if (index == 2) hidden else intermediate), @intCast(if (index == 2) intermediate else hidden) };
+            const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(values), .dtype = .f16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+            try compute.insertGlideWeightFromTensor(try a.dupe(u8, name), &tensor);
+            weight.* = try cb.getWeight(name);
+            loaded += 1;
+        }
+        for ([_]usize{ 1, 33, 1025, 2049, 4097 }) |rows| {
+            const values = try a.alloc(f32, rows * hidden);
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 1327)) * 0.079);
+            const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(hidden) });
+            defer cb.free(input);
+            const gate = try cb.linearNoBias(input, weights[0], rows, hidden, intermediate);
+            defer cb.free(gate);
+            const up = try cb.linearNoBias(input, weights[1], rows, hidden, intermediate);
+            defer cb.free(up);
+            const activated = (try cb.siluMultiply(gate, up)).?;
+            defer cb.free(activated);
+            const expected = try cb.linearNoBias(activated, weights[2], rows, intermediate, hidden);
+            defer cb.free(expected);
+            const request = ops.GatedFfnNoBiasRequest{ .input = input, .gate_weight = weights[0], .up_weight = weights[1], .down_weight = weights[2], .rows = rows, .hidden_size = hidden, .intermediate_size = intermediate, .activation = .silu };
+            const actual = (try cb.gatedFfnNoBias(&request)).?;
+            defer cb.free(actual);
+            const want = try cb.toFloat32(expected, a);
+            defer a.free(want);
+            const got = try cb.toFloat32(actual, a);
+            defer a.free(got);
+            for (want, got) |reference, value| try std.testing.expectApproxEqAbs(reference, value, 5e-4);
+            const launches = compute.ctx.stats.kernel_launches;
+            compute.strict_f32_weights = true;
+            try std.testing.expect((try cb.gatedFfnNoBias(&request)) == null);
+            compute.strict_f32_weights = false;
+            var bad = tensorFromCt(input).*;
+            bad.buffer.len = rows * hidden * 4 - 4;
+            var invalid = request;
+            invalid.input = @ptrCast(&bad);
+            try std.testing.expectError(error.InvalidShape, cb.gatedFfnNoBias(&invalid));
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+    }
+}
+
+test "GLiDE CUDA packed encoder preserves local global and pruned row attention" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    compute.gliner_encoder_attention = true;
+    const cb = compute.computeBackend();
+    const keys = 38;
+    const heads = 2;
+    const width = heads * 64;
+    var q: [keys * width]f32 = undefined;
+    var k: [keys * width]f32 = undefined;
+    var v: [keys * width]f32 = undefined;
+    for (&q, &k, &v, 0..) |*query, *key, *value, i| {
+        query.* = @sin(@as(f32, @floatFromInt(i)) * 0.037);
+        key.* = @cos(@as(f32, @floatFromInt(i)) * 0.019);
+        value.* = @sin(@as(f32, @floatFromInt(i)) * 0.021);
+    }
+    var ranges: [keys * 6]u32 = undefined;
+    var positions: [keys]i32 = undefined;
+    for (0..keys) |i| {
+        ranges[i * 6 ..][0..6].* = if (i < 5) .{ 0, 5, 0, 0, 0, 0 } else .{ 5, keys, 0, 0, 0, 0 };
+        positions[i] = @intCast(if (i < 5) i else i - 5);
+    }
+    const kc = try cb.fromFloat32Shape(&k, &.{ keys, width });
+    defer cb.free(kc);
+    const vc = try cb.fromFloat32Shape(&v, &.{ keys, width });
+    defer cb.free(vc);
+    for ([_]bool{ false, true }) |pruned| {
+        const queries: usize = if (pruned) 2 else keys;
+        var compact_q: [2 * width]f32 = undefined;
+        @memcpy(compact_q[0..width], q[2 * width ..][0..width]);
+        @memcpy(compact_q[width..], q[37 * width ..][0..width]);
+        const q_data: []const f32 = if (pruned) &compact_q else &q;
+        const compact_ranges = ranges[2 * 6 ..][0..6].* ++ ranges[37 * 6 ..][0..6].*;
+        const compact_positions = [_]i32{ 2, 32 };
+        const qc = try cb.fromFloat32Shape(q_data, &.{ @intCast(queries), width });
+        defer cb.free(qc);
+        for ([_]u32{ 2, std.math.maxInt(u32) }) |window| {
+            const request = ops.SegmentAttention{
+                .ranges = if (pruned) &compact_ranges else &ranges,
+                .query_positions = if (pruned) &compact_positions else &positions,
+                .key_positions = &positions,
+                .window = window,
+                .queries = queries,
+                .keys = keys,
+                .num_heads = heads,
+                .head_dim = 64,
+            };
+            const expected = try linalg.segmentAttentionHost(a, q_data, &k, &v, request.ranges, request.query_positions, &positions, window, queries, keys, heads, 64);
+            defer a.free(expected);
+            for ([_]bool{ false, true }) |mixed| {
+                compute.gliner_mixed_attention = mixed;
+                const output = (try glideEncoderSegmentAttention(&compute, qc, kc, vc, &request)).?;
+                defer cb.free(output);
+                const actual = try cb.toFloat32(output, a);
+                defer a.free(actual);
+                for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, if (mixed) @as(f32, 2e-3) else 3e-6);
+            }
+            const launches = compute.ctx.stats.kernel_launches;
+            positions[keys - 1] = -1;
+            try std.testing.expectError(error.InvalidShape, glideEncoderSegmentAttention(&compute, qc, kc, vc, &request));
+            positions[keys - 1] = 32;
+            var truncated = tensorFromCt(kc).*;
+            truncated.buffer.len -= 4;
+            try std.testing.expectError(error.InvalidShape, glideEncoderSegmentAttention(&compute, qc, @ptrCast(&truncated), vc, &request));
+            compute.glide_cuda = false;
+            try std.testing.expect((try glideEncoderSegmentAttention(&compute, qc, kc, vc, &request)) == null);
+            compute.glide_cuda = true;
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+    }
+}
+
+test "GLiDE CUDA dense attention workspace remains bounded" {
+    const limit = 256 * 1024 * 1024;
+    for ([_]usize{ 1, 17, 129, 5129, 16384, 40000 }) |n| {
+        const layout = (try glideDenseLayout(8, 2, n, n, limit)).?;
+        try std.testing.expectEqual(@as(usize, 0), layout.padded_keys % 16);
+        try std.testing.expect(layout.padded_keys >= n and layout.padded_keys - n < 16);
+        try std.testing.expect(layout.total <= limit and layout.tile > 0 and layout.tile <= (if (n <= 3072) @as(usize, 256) else 128));
+        try std.testing.expectEqual(2 * layout.padded_keys * 256 * @sizeOf(f16), layout.sizes[1]);
+        try std.testing.expectEqual(layout.sizes[1], layout.sizes[2]);
+        for (layout.offsets, layout.sizes, 0..) |offset, size, i| {
+            try std.testing.expectEqual(@as(usize, 0), offset % 256);
+            try std.testing.expect(offset + size <= layout.total);
+            if (i > 0) try std.testing.expect(offset >= layout.offsets[i - 1] + layout.sizes[i - 1]);
+        }
+    }
+    try std.testing.expect((try glideDenseLayout(8, 8, 40000, 40000, limit)) == null);
+    try std.testing.expect((try glideDenseLayout(8, 2, 33, 17, 1024)) == null);
+}
+
+test "GLiDE CUDA encoder reuses deferred storage without crossing model scope" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    if (!cudaDeferredFreeEnabled() or cudaDeferredFreeConfiguredBytes() == 0) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    compute.capability_profile = .gliner25_modern_bert;
+    compute.runtime_policy.max_temp_buffers = 1;
+    compute.runtime_policy.temp_cache_mb = 1;
+    var idle = try allocDeviceBufferOrdinary(&compute, 64);
+    releaseDeviceBuffer(&compute, &idle);
+    var original = try allocDeviceBufferOrdinary(&compute, 4096);
+    const pointer = original.ptr;
+    try compute.kernels.launchFillF32(&compute.ctx, original, 1024, 1.25);
+    releaseDeviceBuffer(&compute, &original);
+    try std.testing.expectEqual(@as(usize, 1), compute.deferred_device_frees.items.len);
+    try std.testing.expect(takeLightOnDeferredBufferUnlocked(&compute, 4096, true) == null);
+    compute.glide_cuda = true;
+    const allocations = compute.stats.device_alloc_calls;
+    var reused = try allocDeviceBufferOrdinary(&compute, 4096);
+    defer releaseDeviceBuffer(&compute, &reused);
+    try std.testing.expectEqual(pointer, reused.ptr);
+    try std.testing.expectEqual(allocations, compute.stats.device_alloc_calls);
+    var values: [1024]f32 = undefined;
+    try reused.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&values));
+    try compute.ctx.synchronize();
+    for (values) |value| try std.testing.expectEqual(@as(f32, 1.25), value);
+}
+
+test "GLiDE CUDA chunked linear core matches recurrence and resets row history" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    compute.lighton_cached_recurrent_gates = true;
+    const cb = compute.computeBackend();
+    const State = @import("lighton_recurrent.zig").State;
+    var weights: [4]CT = undefined;
+    var loaded: usize = 0;
+    defer for (weights[0..loaded]) |w| cb.free(w);
+    for (&weights, [_]usize{ 6144 * 4, 16, 16, 128 }, 0..) |*w, count, index| {
+        const values = try a.alloc(f32, count);
+        defer a.free(values);
+        for (values, 0..) |*value, i| value.* = switch (index) {
+            0 => @sin(@as(f32, @floatFromInt(i)) * 0.13) * 0.25,
+            1 => -1,
+            2 => -2,
+            else => 1,
+        };
+        w.* = try cb.fromFloat32Shape(values, &.{@intCast(count)});
+        loaded += 1;
+    }
+    var chunk_state: State = .{};
+    defer chunk_state.deinit();
+    // Reuse the same state across unequal rows, including the chunk boundary.
+    for ([_]usize{ 256, 257, 513 }) |n| {
+        var inputs: [4]CT = undefined;
+        var filled: usize = 0;
+        defer for (inputs[0..filled]) |input| cb.free(input);
+        for (&inputs, [_]usize{ 6144, 2048, 16, 16 }, 0..) |*input, width, index| {
+            const values = try a.alloc(f32, n * width);
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i + index * 17 + n)) * 0.031) * 0.3;
+            input.* = try cb.fromFloat32Shape(values, &.{ @intCast(n), @intCast(width) });
+            filled += 1;
+        }
+        var consume_mixed: bool = false;
+        _ = &consume_mixed;
+        var request = .{ .mixed = inputs[0], .z = inputs[1], .beta = inputs[2], .a = inputs[3], .conv_weight = weights[0], .a_log = weights[1], .dt_bias = weights[2], .norm_weight = weights[3], .seq_len = n, .key_heads = @as(usize, 16), .value_heads = @as(usize, 16), .dim = @as(usize, 128), .value_dim = @as(usize, 128), .conv_kernel = @as(usize, 4), .eps = @as(f32, 1e-6), .destination = @as(?CT, null), .device_state_admitted = false, .glide_consume_mixed = consume_mixed };
+        var exact_state: State = .{};
+        defer exact_state.deinit();
+        compute.strict_f32_weights = true;
+        const exact = (try CudaCompute.qwen35LinearCore(&cb, &exact_state, request)).?;
+        defer cb.free(exact);
+        compute.strict_f32_weights = false;
+        chunk_state.reset();
+        const output = (try CudaCompute.qwen35LinearCore(&cb, &chunk_state, request)).?;
+        defer cb.free(output);
+        try std.testing.expect(compute.glide_delta.module != null);
+        const want = try cb.toFloat32(exact, a);
+        defer a.free(want);
+        const got = try cb.toFloat32(output, a);
+        defer a.free(got);
+        for (want, got) |expected, actual| {
+            try std.testing.expect(std.math.isFinite(actual));
+            try std.testing.expectApproxEqAbs(expected, actual, 2e-3);
+        }
+        request.glide_consume_mixed = true;
+        chunk_state.reset();
+        const aliased_z = try cb.sliceRows2D(a, inputs[0], 0, n, 2048);
+        defer cb.free(aliased_z);
+        var invalid = request;
+        invalid.z = aliased_z;
+        const launches = compute.ctx.stats.kernel_launches;
+        try std.testing.expectError(error.InvalidTensorShape, CudaCompute.qwen35LinearCore(&cb, &chunk_state, invalid));
+        try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        const consumed = (try CudaCompute.qwen35LinearCore(&cb, &chunk_state, request)).?;
+        defer cb.free(consumed);
+        const reused_values = try cb.toFloat32(consumed, a);
+        defer a.free(reused_values);
+        for (got, reused_values) |original, reused| try std.testing.expectEqual(original, reused);
+    }
+}
+
+test "GLiDE CUDA compact attention preserves KV groups and query tile tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    const cb = compute.computeBackend();
+    const queries = 259;
+    const keys = 257;
+    const heads = 8;
+    const dim = 256;
+    const q = try a.alloc(f32, queries * heads * dim);
+    defer a.free(q);
+    for (q, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 1319)) * 0.037) * 0.2;
+    const qc = try cb.fromFloat32Shape(q, &.{ queries, heads * dim });
+    defer cb.free(qc);
+    var ranges: [queries * 6]u32 = @splat(0);
+    for (0..queries) |row| {
+        ranges[row * 6] = if (row < 257) 1 else 3;
+        ranges[row * 6 + 1] = if (row < 257) 256 else 36;
+    }
+    const qp: [queries]i32 = @splat(0);
+    const kp: [keys]i32 = @splat(0);
+    for ([_]usize{ 1, 2, 8 }) |kv_heads| {
+        const k = try a.alloc(f32, keys * kv_heads * dim);
+        defer a.free(k);
+        const v = try a.alloc(f32, k.len);
+        defer a.free(v);
+        for (k, v, 0..) |*key, *value, i| {
+            key.* = @cos(@as(f32, @floatFromInt(i % 1999)) * 0.019) * 0.3;
+            value.* = @sin(@as(f32, @floatFromInt(i % 1733)) * 0.021);
+        }
+        const kc = try cb.fromFloat32Shape(k, &.{ keys, @intCast(kv_heads * dim) });
+        defer cb.free(kc);
+        const vc = try cb.fromFloat32Shape(v, &.{ keys, @intCast(kv_heads * dim) });
+        defer cb.free(vc);
+        const request = ops.SegmentAttentionGrouped{ .visibility = .{
+            .ranges = &ranges,
+            .query_positions = &qp,
+            .key_positions = &kp,
+            .queries = queries,
+            .keys = keys,
+            .num_heads = heads,
+            .head_dim = dim,
+        }, .num_kv_heads = kv_heads, .score_scale = 0.0625 };
+        compute.strict_f32_weights = true;
+        const reference = (try glideSegmentAttentionGrouped(&compute, qc, kc, vc, &request)).?;
+        defer cb.free(reference);
+        compute.strict_f32_weights = false;
+        const output = (try glideSegmentAttentionGrouped(&compute, qc, kc, vc, &request)).?;
+        defer cb.free(output);
+        const expected = try cb.toFloat32(reference, a);
+        defer a.free(expected);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-3);
+    }
+}
+
+test "GLiDE CUDA grouped attention matches dense oracle and rejects invalid work before launch" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.glide_cuda = true;
+    const cb = compute.computeBackend();
+    const queries = 3;
+    const keys = 36;
+    const heads = 8;
+    const kv_heads = 2;
+    const dim = 256;
+    const q = try a.alloc(f32, queries * heads * dim);
+    defer a.free(q);
+    const k = try a.alloc(f32, keys * kv_heads * dim);
+    defer a.free(k);
+    const v = try a.alloc(f32, k.len);
+    defer a.free(v);
+    for (q, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.037);
+    for (k, v, 0..) |*key, *value, i| {
+        key.* = @cos(@as(f32, @floatFromInt(i)) * 0.019);
+        value.* = @sin(@as(f32, @floatFromInt(i)) * 0.021);
+    }
+    const expanded_k = try a.alloc(f32, keys * heads * dim);
+    defer a.free(expanded_k);
+    const expanded_v = try a.alloc(f32, expanded_k.len);
+    defer a.free(expanded_v);
+    for (0..keys) |row| for (0..heads) |h| {
+        const source = (row * kv_heads + h / 4) * dim;
+        const target = (row * heads + h) * dim;
+        @memcpy(expanded_k[target..][0..dim], k[source..][0..dim]);
+        @memcpy(expanded_v[target..][0..dim], v[source..][0..dim]);
+    };
+    var ranges = [_]u32{ 0, 1, 0, 0, 0, 0, 1, 34, 0, 0, 0, 0, 34, 36, 0, 0, 0, 0 };
+    const qp = [_]i32{ 0, 32, 1 };
+    const kp: [keys]i32 = @splat(0);
+    const expected = try linalg.segmentAttentionHost(a, q, expanded_k, expanded_v, &ranges, &qp, &kp, std.math.maxInt(u32), queries, keys, heads, dim);
+    defer a.free(expected);
+    const qc = try cb.fromFloat32Shape(q, &.{ queries, heads * dim });
+    defer cb.free(qc);
+    const kc = try cb.fromFloat32Shape(k, &.{ keys, kv_heads * dim });
+    defer cb.free(kc);
+    const vc = try cb.fromFloat32Shape(v, &.{ keys, kv_heads * dim });
+    defer cb.free(vc);
+    var request = ops.SegmentAttentionGrouped{ .visibility = .{
+        .ranges = &ranges,
+        .query_positions = &qp,
+        .key_positions = &kp,
+        .queries = queries,
+        .keys = keys,
+        .num_heads = heads,
+        .head_dim = dim,
+    }, .num_kv_heads = kv_heads, .score_scale = 0.0625 };
+    for ([_]bool{ true, false }) |exact| {
+        compute.strict_f32_weights = exact;
+        const output = (try glideSegmentAttentionGrouped(&compute, qc, kc, vc, &request)).?;
+        defer cb.free(output);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, if (exact) @as(f32, 3e-6) else 2e-3);
+    }
+    const launches = compute.ctx.stats.kernel_launches;
+    ranges[1] = keys + 1;
+    try std.testing.expectError(error.InvalidShape, glideSegmentAttentionGrouped(&compute, qc, kc, vc, &request));
+    ranges[1] = 1;
+    var truncated = tensorFromCt(kc).*;
+    truncated.buffer.len -= 4;
+    try std.testing.expectError(error.InvalidShape, glideSegmentAttentionGrouped(&compute, qc, @ptrCast(&truncated), vc, &request));
+    request.control = .{ .deadline_ns = 1 };
+    try std.testing.expectError(error.Timeout, glideSegmentAttentionGrouped(&compute, qc, kc, vc, &request));
+    try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+}
+
+test "Gemma4 CUDA raw Q4 upload avoids mirrors and preserves prefill and decode" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    if (compute.kernels.linear_gemma4_q4_0_bf16_raw == null) return error.SkipZigTest;
+    const cb = compute.computeBackend();
+    const dim = 256;
+    const shape = [_]i64{ dim, dim };
+    const raw = try a.alloc(u8, dim * dim / 32 * 18);
+    defer a.free(raw);
+    for (0..dim * dim / 32) |block| {
+        std.mem.writeInt(u16, raw[block * 18 ..][0..2], @bitCast(@as(f16, if (block % 2 == 0) 0.125 else -0.0625)), .little);
+        for (0..16) |i| raw[block * 18 + 2 + i] = @truncate(block * 11 + i * 17);
+    }
+    const loaded = weight_source_mod.LoadedWeight{
+        .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &shape, .name = "", .allocator = a, .owns_data = false, .owns_shape = false },
+        .quantized = true,
+        .quantized_storage = .{ .tensor_type = .{ .known = .Q4_0 }, .raw_bytes = raw, .shape = &shape, .allocator = a },
+    };
+    compute.tuned_route_gates.q4_0_tc_hmma_prefill = true;
+    compute.tuned_route_gates.q4_0_cublas_prefill = false;
+    compute.gemma4_raw_q4_prefill = false;
+    const before = compute.stats.resident_weight_bytes;
+    try compute.insertWeightFromLoaded(try a.dupe(u8, "packed_weight.weight"), &loaded);
+    try std.testing.expectEqual(raw.len * 2, compute.stats.resident_weight_bytes - before);
+    compute.gemma4_raw_q4_prefill = true;
+    const packed_bytes = compute.stats.resident_weight_bytes;
+    try compute.insertWeightFromLoaded(try a.dupe(u8, "raw.weight"), &loaded);
+    try std.testing.expectEqual(raw.len, compute.stats.resident_weight_bytes - packed_bytes);
+    const packed_weight = try cb.getWeight("packed_weight.weight");
+    defer cb.free(packed_weight);
+    const weight = try cb.getWeight("raw.weight");
+    defer cb.free(weight);
+    try std.testing.expect(tensorFromCt(weight).tc_quant == null);
+    try std.testing.expect(tensorFromCt(packed_weight).tc_quant != null);
+    for ([_]usize{ 1, 17, 65, 128 }) |rows| {
+        const values = try a.alloc(f32, rows * dim);
+        defer a.free(values);
+        for (values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18)) / 32;
+        const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), dim });
+        defer cb.free(input);
+        compute.gemma4_raw_q4_prefill = false;
+        const expected = try cb.linearNoBias(input, packed_weight, rows, dim, dim);
+        defer cb.free(expected);
+        compute.gemma4_raw_q4_prefill = true;
+        const actual = try cb.linearNoBias(input, weight, rows, dim, dim);
+        defer cb.free(actual);
+        const expected_host = try cb.toFloat32(expected, a);
+        defer a.free(expected_host);
+        const actual_host = try cb.toFloat32(actual, a);
+        defer a.free(actual_host);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected_host), std.mem.sliceAsBytes(actual_host));
+        if (rows > 1) {
+            const pair = try cb.linearNoBiasPair(input, weight, weight, rows, dim, dim);
+            defer cb.free(pair.first);
+            defer cb.free(pair.second);
+            const qkv = try cb.linearNoBiasQkv(input, weight, weight, weight, rows, dim, dim, dim);
+            defer cb.free(qkv.first);
+            defer cb.free(qkv.second);
+            defer cb.free(qkv.third);
+            for ([_]CT{ pair.first, pair.second, qkv.first, qkv.second, qkv.third }) |output| {
+                const host = try cb.toFloat32(output, a);
+                defer a.free(host);
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected_host), std.mem.sliceAsBytes(host));
+            }
+        }
+        if (rows > 1 and compute.cublaslt != null) {
+            compute.tuned_route_gates.q4_0_cublas_prefill_min_rows = 2;
+            compute.tuned_route_gates.q4_0_cublas_prefill = true;
+            defer compute.tuned_route_gates.q4_0_cublas_prefill = false;
+            const calls_before = compute.stats.bf16_cublaslt_linear_calls;
+            const dense = try cb.linearNoBias(input, weight, rows, dim, dim);
+            defer cb.free(dense);
+            const dense_host = try cb.toFloat32(dense, a);
+            defer a.free(dense_host);
+            try std.testing.expect(compute.stats.bf16_cublaslt_linear_calls > calls_before);
+            for (expected_host, dense_host) |expected_value, actual_value| {
+                try std.testing.expect(std.math.isFinite(actual_value));
+                try std.testing.expectApproxEqAbs(expected_value, actual_value, @as(f32, 0.0001) * @max(1, @abs(expected_value)));
+            }
+        }
+        try std.testing.expect(hasQ4_0TcPrefillWeight(&compute, tensorFromCt(weight)));
+        compute.gemma4_raw_q4_prefill = false;
+        try std.testing.expect(!hasQ4_0TcPrefillWeight(&compute, tensorFromCt(weight)));
+        try std.testing.expect(hasQ4_0TcPrefillWeight(&compute, tensorFromCt(packed_weight)));
+    }
+}
+
+test "Gemma4 CUDA short F32 prefill uses strict SGEMM with singleton and unqualified fallbacks" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    if (compute.cublaslt == null) return error.SkipZigTest;
+    const cb = compute.computeBackend();
+    for ([_][2]usize{ .{ 1024, 1024 }, .{ 2560, 10752 } }) |dims| {
+        const k = dims[0];
+        const n = dims[1];
+        const weights = try a.alloc(f32, k * n);
+        defer a.free(weights);
+        for (weights, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 1013)) * 0.037) * 0.03;
+        const weight = try cb.fromFloat32Shape(weights, &.{ @intCast(n), @intCast(k) });
+        defer cb.free(weight);
+        for ([_]usize{ 2, 17, 32, 63, 80, 127 }) |rows| {
+            const inputs = try a.alloc(f32, rows * k);
+            defer a.free(inputs);
+            for (inputs, 0..) |*value, i| value.* = @cos(@as(f32, @floatFromInt(i % 997)) * 0.019);
+            const input = try cb.fromFloat32Shape(inputs, &.{ @intCast(rows), @intCast(k) });
+            defer cb.free(input);
+            var dst = try allocDeviceBuffer(&compute, rows * n * @sizeOf(f32));
+            defer releaseDeviceBuffer(&compute, &dst);
+            compute.gemma4_e4b_sm89_qualified = false;
+            try std.testing.expect(!try tryCublasLtF32Linear(&compute, dst, tensorFromCt(input).buffer, tensorFromCt(weight).buffer, rows, k, n));
+            compute.gemma4_e4b_sm89_qualified = true;
+            try std.testing.expect(!try tryCublasLtF32Linear(&compute, dst, tensorFromCt(input).buffer, tensorFromCt(weight).buffer, 1, k, n));
+            try std.testing.expect(try tryCublasLtF32Linear(&compute, dst, tensorFromCt(input).buffer, tensorFromCt(weight).buffer, rows, k, n));
+            const output = try cb.linearNoBias(input, weight, rows, k, n);
+            defer cb.free(output);
+            const actual = try cb.toFloat32(output, a);
+            defer a.free(actual);
+            // Independent double-precision oracle samples every row and output
+            // range without repeating the billion-operation projection on CPU.
+            for (0..rows) |row| for (0..17) |sample| {
+                const col = sample * (n - 1) / 16;
+                var expected: f64 = 0;
+                for (0..k) |j| expected += @as(f64, inputs[row * k + j]) * @as(f64, weights[col * k + j]);
+                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), actual[row * n + col], 2e-5);
+            };
+            for (actual) |value| try std.testing.expect(std.math.isFinite(value));
+        }
+    }
+}
+
+test "Gemma4 CUDA compact projector linear preserves weights and F32 outputs" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const rows = 17;
+    const in_dim = 32;
+    const out_dim = 48;
+    var weights: [out_dim * in_dim]f32 = undefined;
+    var bits: [out_dim * in_dim]u16 = undefined;
+    var inputs: [rows * in_dim]f32 = undefined;
+    for (&weights, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) / 16;
+    for (&inputs, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) / 8;
+    const shape = [_]i64{ out_dim, in_dim };
+    inline for ([_]tensor_mod.DType{ .f16, .bf16, .f32 }) |dtype| {
+        for (&bits, weights) |*bit, value| bit.* = if (dtype == .f16) @bitCast(@as(f16, @floatCast(value))) else f32ToBf16BitsRoundNearestEven(value);
+        const source = tensor_mod.Tensor{ .data = if (dtype == .f32) std.mem.sliceAsBytes(&weights) else std.mem.sliceAsBytes(&bits), .dtype = dtype, .shape = &shape, .name = "v.blk.0.attn_q.weight", .allocator = a, .owns_data = false, .owns_shape = false };
+        const weight = try compute.uploadProjectorWeight(&source);
+        defer cb.free(weight);
+        try std.testing.expectEqual(dtype, tensorFromCt(weight).dtype);
+        try std.testing.expectEqual(weights.len * @as(usize, if (dtype == .f32) 4 else 2), tensorFromCt(weight).buffer.len);
+        const input = try cb.fromFloat32Shape(&inputs, &.{ rows, in_dim });
+        defer cb.free(input);
+        const before = compute.stats.f16_cublaslt_linear_calls + compute.stats.bf16_cublaslt_linear_calls;
+        const output = try cb.linearNoBias(input, weight, rows, in_dim, out_dim);
+        if (dtype != .f32) try std.testing.expect(compute.stats.f16_cublaslt_linear_calls + compute.stats.bf16_cublaslt_linear_calls > before);
+        defer cb.free(output);
+        try std.testing.expectEqual(tensor_mod.DType.f32, tensorFromCt(output).dtype);
+        const values = try cb.toFloat32(output, a);
+        defer a.free(values);
+        for (0..rows) |row| for (0..out_dim) |col| {
+            var expected: f32 = 0;
+            for (0..in_dim) |k| expected += inputs[row * in_dim + k] * @as(f32, weights[col * in_dim + k]);
+            try std.testing.expectEqual(expected, values[row * out_dim + col]);
+        };
+        var invalid = source;
+        invalid.data = source.data[0 .. source.data.len - 2];
+        try std.testing.expectError(error.InvalidShape, compute.uploadProjectorWeight(&invalid));
+        const unchanged = try cb.toFloat32(weight, a);
+        defer a.free(unchanged);
+        for (unchanged, weights) |got, expected| try std.testing.expectEqual(@as(f32, expected), got);
+    }
+}
+
+test "Gemma4 CUDA dense defaults preserve explicit rollbacks and unrelated models" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    compute.kernels.gqa_prefill_profile = .off;
+    compute.kernels.gqa_score_prework_mode = .disabled;
+    compute.runtime_policy.split_attention = false;
+    compute.runtime_policy.split_attention_chunk = 0;
+    compute.runtime_policy.max_temp_buffers = 0;
+    try compute.configureGemma4Dense(true, true);
+    try std.testing.expectEqual(@as(?bool, false), compute.runtime_policy.split_attention);
+    try std.testing.expectEqual(@as(?usize, 0), compute.runtime_policy.split_attention_chunk);
+    try std.testing.expectEqual(@as(?usize, 0), compute.runtime_policy.max_temp_buffers);
+    compute.runtime_policy.split_attention = null;
+    compute.runtime_policy.split_attention_chunk = null;
+    compute.runtime_policy.max_temp_buffers = null;
+    compute.runtime_policy.stable_temp_reuse = false;
+    try std.testing.expect(compute.gemma4_dense_qualified);
+    try std.testing.expectEqual(.off, compute.kernels.gqa_prefill_profile);
+    try std.testing.expectEqual(.disabled, compute.kernels.gqa_score_prework_mode);
+    compute.kernels.gqa_prefill_profile = .automatic;
+    compute.kernels.gqa_score_prework_mode = .automatic;
+    try compute.configureGemma4Dense(false, false);
+    try std.testing.expect(!compute.gemma4_dense_qualified);
+    try std.testing.expect(!compute.gemma4_raw_q4_prefill);
+    try std.testing.expectEqual(@as(?bool, null), compute.runtime_policy.split_attention);
+    try std.testing.expectEqual(@as(?usize, null), compute.runtime_policy.split_attention_chunk);
+    try std.testing.expectEqual(@as(?usize, null), compute.runtime_policy.max_temp_buffers);
+    try std.testing.expect(!compute.runtime_policy.stable_temp_reuse);
+    const cb = compute.computeBackend();
+    try std.testing.expect(!CudaCompute.gemma4SharedKvPrefillEnabled(&cb));
+    try std.testing.expectEqual(.automatic, compute.kernels.gqa_prefill_profile);
+    try std.testing.expectEqual(.automatic, compute.kernels.gqa_score_prework_mode);
+    try compute.configureGemma4Dense(true, true);
+    if (compute.ctx.info.compute_major == 8 and compute.ctx.info.compute_minor == 9) {
+        try std.testing.expectEqual(.flash_f16_sm89, compute.kernels.gqa_prefill_profile);
+        try std.testing.expectEqual(.disabled, compute.kernels.gqa_score_prework_mode);
+        try std.testing.expect(compute.kernels.e4b_f16_warp_split_enabled);
+        try std.testing.expectEqual(@as(?bool, true), compute.runtime_policy.split_attention);
+        try std.testing.expectEqual(@as(?usize, 64), compute.runtime_policy.split_attention_chunk);
+        try std.testing.expectEqual(@as(?usize, 2048), compute.runtime_policy.max_temp_buffers);
+        try std.testing.expect(compute.runtime_policy.stable_temp_reuse);
+    } else {
+        try std.testing.expectEqual(.automatic, compute.kernels.gqa_prefill_profile);
+        try std.testing.expectEqual(.automatic, compute.kernels.gqa_score_prework_mode);
+    }
+    var raw_env = try TestEnvGuard.captureAndClear(std.testing.allocator, "ANTFLY_INFERENCE_CUDA_GEMMA4_RAW_Q4_PREFILL");
+    defer raw_env.restore(std.testing.allocator);
+    const actual_device = compute.ctx.info;
+    defer compute.ctx.info = actual_device;
+    compute.ctx.info.compute_major = 12;
+    compute.ctx.info.compute_minor = 1;
+    try compute.configureGemma4Dense(true, true);
+    try std.testing.expect(!compute.gemma4_e4b_sm89_qualified);
+    try std.testing.expect(!compute.gemma4_raw_q4_prefill);
+    try std.testing.expect(!compute.gemma4_temp_lru);
+    try std.testing.expect(!compute.gemma4_projector_cache_enabled);
+    compute.ctx.info = actual_device;
+    try compute.configureGemma4Dense(true, false);
+    try std.testing.expect(!compute.gemma4_raw_q4_prefill);
+}
+
+test "Gemma4 CUDA varied prompt GEMM plans remain bounded and reusable" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var setting = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES");
+    defer setting.restore(a);
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    if (compute.ctx.info.compute_major != 8 or compute.ctx.info.compute_minor != 9 or compute.cublaslt == null) return error.SkipZigTest;
+    const blas = &compute.cublaslt.?;
+    try compute.configureGemma4Dense(false, false);
+    try std.testing.expectEqual(@as(usize, 256), blas.plan_cache_capacity);
+    try compute.configureGemma4Dense(true, false);
+    try std.testing.expectEqual(@as(usize, 256), blas.plan_cache_capacity);
+    try blas.setPlanCacheCapacity(4);
+
+    var weights: [64 * 64]f16 = @splat(0);
+    for (0..64) |i| weights[i * 64 + i] = 1;
+    const weight_source = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(&weights), .dtype = .f16, .shape = &.{ 64, 64 }, .name = "identity", .allocator = a, .owns_data = false, .owns_shape = false };
+    const weight = try compute.uploadProjectorWeight(&weight_source);
+    const cb = compute.computeBackend();
+    defer cb.free(weight);
+    for (0..3) |pass| {
+        if (pass == 1) {
+            try compute.configureGemma4Dense(true, true);
+            try std.testing.expectEqual(@as(usize, 1024), blas.plan_cache_capacity);
+            try std.testing.expectEqual(@as(usize, 4), blas.tensor_core_plans.count());
+        }
+        const uncached_before = blas.uncached_plans;
+        const hits_before = blas.plan_cache_hits;
+        for (2..14) |rows| {
+            const inputs = try a.alloc(f16, rows * 64);
+            defer a.free(inputs);
+            for (inputs, 0..) |*value, i| value.* = @as(f16, @floatFromInt(@as(i32, @intCast(i % 17)) - 8)) / 8;
+            const shape = [_]i64{ @intCast(rows), 64 };
+            const source = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(inputs), .dtype = .f16, .shape = &shape, .name = "input", .allocator = a, .owns_data = false, .owns_shape = false };
+            const input = try compute.uploadProjectorWeight(&source);
+            defer cb.free(input);
+            var output = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, inputs.len * @sizeOf(f32));
+            defer output.free(&compute.ctx);
+            try blas.matmulF16WeightF32Out(&compute.ctx, output, tensorFromCt(input).buffer, tensorFromCt(weight).buffer, .{}, rows, 64, 64);
+            try compute.ctx.synchronize();
+            const actual = try a.alloc(f32, inputs.len);
+            defer a.free(actual);
+            try output.copyToHost(&compute.ctx, std.mem.sliceAsBytes(actual));
+            for (actual, inputs) |got, want| try std.testing.expectEqual(@as(f32, want), got);
+        }
+        if (pass == 0) {
+            try std.testing.expectEqual(@as(usize, 4), blas.tensor_core_plans.count());
+            try std.testing.expect(blas.uncached_plans > uncached_before);
+        } else {
+            try std.testing.expectEqual(@as(usize, 12), blas.tensor_core_plans.count());
+            try std.testing.expectEqual(uncached_before, blas.uncached_plans);
+            if (pass == 2) try std.testing.expectEqual(hits_before + 12, blas.plan_cache_hits);
+        }
+    }
+    _ = setenv("ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES", "128", 1);
+    try compute.configureGemma4Dense(true, true);
+    try std.testing.expectEqual(@as(usize, 128), blas.plan_cache_capacity);
+    _ = setenv("ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES", "0", 1);
+    try std.testing.expectError(error.CublasLtUnsupported, compute.configureGemma4Dense(true, true));
+    _ = setenv("ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES", "4097", 1);
+    try std.testing.expectError(error.CublasLtUnsupported, compute.configureGemma4Dense(true, true));
+    try std.testing.expectEqual(@as(usize, 128), blas.plan_cache_capacity);
+}
+
+test "Gemma4 CUDA vision FP16 attention preserves scaled bidirectional rows and tile tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    if (compute.ctx.info.compute_major != 8 or compute.ctx.info.compute_minor != 9) return error.SkipZigTest;
+    const cb = compute.computeBackend();
+    var rng: u32 = 4937;
+    for ([_]usize{ 31, 33, 127, 2048, 2304, 3136 }) |seq| {
+        const batch: usize = if (seq < 128) 2 else 1;
+        const hidden = 12 * 64;
+        const count = batch * seq * hidden;
+        const q = try a.alloc(f32, count);
+        defer a.free(q);
+        const k = try a.alloc(f32, count);
+        defer a.free(k);
+        const v = try a.alloc(f32, count);
+        defer a.free(v);
+        for ([_][]f32{ q, k, v }, 0..) |values, operand| for (values) |*value| {
+            rng = rng *% 1664525 +% 1013904223;
+            value.* = (@as(f32, @floatFromInt(rng >> 8)) / 8388608.0 - 1) * (if (operand == 0) @as(f32, 8) else 1);
+        };
+        const shape = [_]i32{ @intCast(batch * seq), hidden };
+        const qt = try cb.fromFloat32Shape(q, &shape);
+        defer cb.free(qt);
+        const kt = try cb.fromFloat32Shape(k, &shape);
+        defer cb.free(kt);
+        const vt = try cb.fromFloat32Shape(v, &shape);
+        defer cb.free(vt);
+        compute.gemma4_e4b_sm89_qualified = false;
+        const reference = try sdpaGemma4Vision(&compute, qt, kt, vt, batch, seq, 12, 64);
+        defer cb.free(reference);
+        const before = compute.stats.gemma4_vision_f16_calls;
+        compute.gemma4_e4b_sm89_qualified = true;
+        const actual_ct = try sdpaGemma4Vision(&compute, qt, kt, vt, batch, seq, 12, 64);
+        defer cb.free(actual_ct);
+        try std.testing.expectEqual(before + 1, compute.stats.gemma4_vision_f16_calls);
+        const expected = try cb.toFloat32(reference, a);
+        defer a.free(expected);
+        const actual = try cb.toFloat32(actual_ct, a);
+        defer a.free(actual);
+        if (seq >= 2048) {
+            const kernel = compute.kernels.gemma4_vision_attention_registers;
+            try std.testing.expect(kernel != null);
+            compute.kernels.gemma4_vision_attention_registers = null;
+            defer compute.kernels.gemma4_vision_attention_registers = kernel;
+            const legacy_ct = try sdpaGemma4Vision(&compute, qt, kt, vt, batch, seq, 12, 64);
+            defer cb.free(legacy_ct);
+            const legacy = try cb.toFloat32(legacy_ct, a);
+            defer a.free(legacy);
+            for (legacy, actual) |old, new| try std.testing.expectApproxEqAbs(old, new, 1e-6);
+        }
+        var max_abs: f32 = 0;
+        var diff2: f64 = 0;
+        var norm2: f64 = 0;
+        for (expected, actual) |want, got| {
+            try std.testing.expect(std.math.isFinite(got));
+            max_abs = @max(max_abs, @abs(want - got));
+            diff2 += @as(f64, want - got) * (want - got);
+            norm2 += @as(f64, want) * want;
+        }
+        const relative_l2 = @sqrt(diff2 / @max(norm2, 1e-30));
+        std.debug.print("gemma4_vision_f16 seq={d} batch={d} max_abs={d} relative_l2={d}\n", .{ seq, batch, max_abs, relative_l2 });
+        try std.testing.expect(max_abs < 0.01);
+        try std.testing.expect(relative_l2 < 0.005);
+    }
+}
+
+test "Gemma4 CUDA temporary LRU bounds bytes and entries while preserving live tensors" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .gemma4;
+    compute.runtime_policy.stable_temp_reuse = true;
+    compute.runtime_policy.temp_cache_mb = 1;
+    compute.runtime_policy.max_temp_buffers = 2;
+    const cb = compute.computeBackend();
+    const values = [_]f32{ 1, -2, 3, 4 };
+    const live = try cb.fromFloat32Shape(&values, &.{4});
+    defer cb.free(live);
+    var first = try allocDeviceBuffer(&compute, 512 * 1024);
+    const first_ptr = first.ptr;
+    var second = try allocDeviceBuffer(&compute, 256 * 1024);
+    const second_ptr = second.ptr;
+    releaseDeviceBuffer(&compute, &first);
+    releaseDeviceBuffer(&compute, &second);
+    // Unqualified models keep their current admission/reuse policy.
+    var rejected = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 512 * 1024);
+    releaseDeviceBuffer(&compute, &rejected);
+    try std.testing.expectEqual(@as(usize, 768 * 1024), compute.temp_buffers.bytes);
+    try std.testing.expectEqual(first_ptr, compute.temp_buffers.buffers.items[0].ptr);
+    compute.gemma4_temp_lru = true;
+    // A merely available planner does not own addresses. Once observations
+    // start, preserve its ordinary allocation/reuse contract until reset.
+    compute.temp_arena_planner.observing = true;
+    var protected = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 512 * 1024);
+    releaseDeviceBuffer(&compute, &protected);
+    try std.testing.expectEqual(@as(usize, 768 * 1024), compute.temp_buffers.bytes);
+    try std.testing.expectEqual(first_ptr, compute.temp_buffers.buffers.items[0].ptr);
+    compute.temp_arena_planner.observing = false;
+    var touched = try allocDeviceBuffer(&compute, 512 * 1024);
+    try std.testing.expectEqual(first_ptr, touched.ptr);
+    releaseDeviceBuffer(&compute, &touched);
+    try std.testing.expectEqual(second_ptr, compute.temp_buffers.buffers.items[0].ptr);
+    var incoming = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 512 * 1024);
+    const incoming_ptr = incoming.ptr;
+    releaseDeviceBuffer(&compute, &incoming);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), compute.temp_buffers.bytes);
+    try std.testing.expectEqual(@as(usize, 2), compute.temp_buffers.buffers.items.len);
+    try std.testing.expectEqual(first_ptr, compute.temp_buffers.buffers.items[0].ptr);
+    try std.testing.expectEqual(incoming_ptr, compute.temp_buffers.buffers.items[1].ptr);
+    // A buffer larger than the ceiling cannot displace useful cached entries.
+    var oversized = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 2 * 1024 * 1024);
+    releaseDeviceBuffer(&compute, &oversized);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), compute.temp_buffers.bytes);
+    // The count ceiling also applies when the replacement is much smaller.
+    var small = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 64);
+    const small_ptr = small.ptr;
+    releaseDeviceBuffer(&compute, &small);
+    try std.testing.expectEqual(@as(usize, 512 * 1024 + 64), compute.temp_buffers.bytes);
+    try std.testing.expectEqual(@as(usize, 2), compute.temp_buffers.buffers.items.len);
+    try std.testing.expectEqual(incoming_ptr, compute.temp_buffers.buffers.items[0].ptr);
+    try std.testing.expectEqual(small_ptr, compute.temp_buffers.buffers.items[1].ptr);
+    const actual = try cb.toFloat32(live, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &values, actual);
+}
+test "Gemma4 CUDA projector cache preserves compact dtype and independent admission through borrowers" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var controller = @import("../../runtime/tier/memory.zig").AdmissionController{};
+    var replacement = @import("../../runtime/tier/memory.zig").AdmissionController{};
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .gemma4;
+    compute.gemma4_projector_cache_enabled = true;
+    const cb = compute.computeBackend();
+    const values = [_]f32{ 0.25, -0.5, 1, 2 };
+    inline for ([_]tensor_mod.DType{ .f32, .f16, .bf16 }) |dtype| {
+        try compute.configureEmbeddingGemma2Admission(.{ .controller = &controller, .limits = .{ .backend_limit_bytes = 64 }, .check_live_memory = false });
+        var bits: [4]u16 = undefined;
+        for (&bits, values) |*bit, value| bit.* = if (dtype == .f16) @bitCast(@as(f16, @floatCast(value))) else f32ToBf16BitsRoundNearestEven(value);
+        const source = tensor_mod.Tensor{ .data = if (dtype == .f32) @constCast(std.mem.sliceAsBytes(&values)) else std.mem.sliceAsBytes(&bits), .dtype = dtype, .shape = &.{4}, .name = "projector-fixture", .allocator = a, .owns_data = false, .owns_shape = false };
+        const weight = try compute.uploadProjectorWeight(&source);
+        defer cb.free(weight);
+        // Optional cache metadata failure neither fails the request nor leaks a lease.
+        compute.allocator = std.testing.failing_allocator;
+        compute.retainGemma4ProjectorWeight("failed-key", weight);
+        compute.allocator = a;
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
+        try std.testing.expectEqual(@as(usize, 0), compute.gemma4_projector_weight_count);
+        compute.retainGemma4ProjectorWeight("fixture", weight);
+        const bytes = 4 * dtype.byteSize();
+        try std.testing.expectEqual(bytes, controller.snapshot().backend_weight_bytes);
+        try std.testing.expectEqual(@as(usize, 1), compute.gemma4_projector_weight_count);
+        const borrowed = (try compute.borrowGemma4ProjectorWeight("fixture")).?;
+        var borrowed_owned = true;
+        defer if (borrowed_owned) cb.free(borrowed);
+        try std.testing.expectEqual(dtype, tensorFromCt(borrowed).dtype);
+        try std.testing.expectEqual(tensorFromCt(weight).buffer.ptr, tensorFromCt(borrowed).buffer.ptr);
+        try std.testing.expect(try compute.borrowGemma4ProjectorWeight("different-owner") == null);
+        // Replacing admission removes cache ownership but leaves live aliases
+        // and their old-controller reservation valid until their last release.
+        try compute.configureEmbeddingGemma2Admission(.{ .controller = &replacement, .limits = .{ .backend_limit_bytes = 64 }, .check_live_memory = false });
+        try std.testing.expect(try compute.borrowGemma4ProjectorWeight("fixture") == null);
+        try std.testing.expectEqual(bytes, controller.snapshot().backend_weight_bytes);
+        const actual = try cb.toFloat32(borrowed, a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, &values, actual);
+        cb.free(borrowed);
+        borrowed_owned = false;
+        // The original request still owns weight until this loop iteration ends.
+        try std.testing.expectEqual(bytes, controller.snapshot().backend_weight_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 0), compute.gemma4_projector_weight_bytes);
+    try compute.configureEmbeddingGemma2Admission(.{ .controller = &controller, .limits = .{ .backend_limit_bytes = 1 }, .check_live_memory = false });
+    const denied = try cb.fromFloat32Shape(&values, &.{4});
+    defer cb.free(denied);
+    compute.retainGemma4ProjectorWeight("denied", denied);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
+    try std.testing.expect(try compute.borrowGemma4ProjectorWeight("denied") == null);
+    const unchanged = try cb.toFloat32(denied, a);
+    defer a.free(unchanged);
+    try std.testing.expectEqualSlices(f32, &values, unchanged);
+}
+
+test "Gemma4 CUDA chunked mapped uploads preserve bytes and reject short destinations" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const length = gemma4_mapped_upload_chunk_bytes + 137;
+    const input = try a.alloc(u8, length + 57);
+    defer a.free(input);
+    for (input, 0..) |*byte, i| byte.* = @truncate(i *% 29 +% (i >> 8));
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "upload.bin", .data = input });
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/upload.bin", .{tmp.sub_path});
+    defer a.free(path);
+    var mapped = try c_file.MmapRegion.init(a, path);
+    defer mapped.deinit();
+    const bytes = mapped.data[17..][0..length];
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    compute.capability_profile = .gemma4;
+    compute.gemma4_chunked_upload = true;
+    var device = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, length);
+    defer device.free(&compute.ctx);
+    const uploaded_before = compute.stats.h2d_bytes;
+    try copyMappedWeightFromHostTracked(&compute, device, bytes, mapped.data);
+    try std.testing.expectEqual(@as(usize, 2), compute.stats.gemma4_mapped_upload_chunks);
+    try std.testing.expectEqual(length, compute.stats.h2d_bytes - uploaded_before);
+    const output = try a.alloc(u8, length);
+    defer a.free(output);
+    try device.copyToHost(&compute.ctx, output);
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(u8, input[17..][0..length], output);
+    // Unrelated host pointers cannot receive mmap advice; their ordinary upload
+    // remains valid. Neither the shape check nor fallback creates an owner.
+    const chunks_before = compute.stats.gemma4_mapped_upload_chunks;
+    try copyMappedWeightFromHostTracked(&compute, device, input[0..length], mapped.data);
+    try compute.ctx.synchronize();
+    try std.testing.expectEqual(chunks_before, compute.stats.gemma4_mapped_upload_chunks);
+    var short = device;
+    short.len = length - 1;
+    try std.testing.expectError(error.InvalidCudaState, copyMappedWeightFromHostTracked(&compute, short, bytes, mapped.data));
+}
+
+test "Gemma4 CUDA spatial norm rope matches independent F32 pairs and rejects other towers" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    if (compute.ctx.info.compute_major != 8 or compute.ctx.info.compute_minor != 9) return error.SkipZigTest;
+    try std.testing.expect(compute.kernels.gemma4_vision_norm_rope_f32 != null);
+    try compute.configureGemma4Dense(true, true);
+    const cb = compute.computeBackend();
+    const weights: [64]f32 = blk: {
+        var data: [64]f32 = undefined;
+        for (&data, 0..) |*value, i| value.* = 0.5 + @as(f32, @floatFromInt(i)) / 64;
+        break :blk data;
+    };
+    const weight = try cb.fromFloat32Shape(&weights, &.{64});
+    defer cb.free(weight);
+    for ([_][3]usize{ .{ 1, 1, 1 }, .{ 7, 5, 2 }, .{ 48, 48, 1 }, .{ 56, 56, 1 } }) |geometry| {
+        const rows = geometry[0] * geometry[1] * geometry[2];
+        const input = try a.alloc(f32, rows * 768);
+        defer a.free(input);
+        for (input, 0..) |*value, i| value.* = if (i / 64 % 17 == 0) 0 else @as(f32, @floatFromInt(@as(i32, @intCast(i % 131)) - 65)) / 23;
+        const tensor = try cb.fromFloat32Shape(input, &.{ @intCast(rows), 768 });
+        defer cb.free(tensor);
+        for ([_]f32{ 1, 8 }) |scale| {
+            const params = ops.VisionNormRopeParams{ .rows = @intCast(rows), .hidden = 768, .head_dim = 64, .grid_x = @intCast(geometry[0]), .grid_y = @intCast(geometry[1]), .eps = 1e-6, .theta = 10000, .scale = scale };
+            const output = (try cb.visionNormRope(tensor, weight, params)) orelse return error.MissingFusedVisionRope;
+            defer cb.free(output);
+            const actual = try cb.toFloat32(output, a);
+            defer a.free(actual);
+            var max_error: f32 = 0;
+            for (0..rows * 12) |head| {
+                const base = head * 64;
+                // Independent sequential F64 norm, spatial pairing and trig.
+                var squares: f64 = 0;
+                for (input[base..][0..64]) |value| squares += @as(f64, value) * value;
+                const inverse = 1 / @sqrt(squares / 64 + @as(f64, params.eps));
+                const row = head / 12;
+                for (0..2) |axis| for (0..16) |j| {
+                    const position = if (axis == 0) row % geometry[0] else row / geometry[0] % geometry[1];
+                    const angle = @as(f64, @floatFromInt(position)) / std.math.pow(f64, params.theta, @as(f64, @floatFromInt(j * 2)) / 32);
+                    const ai = axis * 32 + j;
+                    const bi = ai + 16;
+                    const x = @as(f64, input[base + ai]) * inverse * weights[ai];
+                    const y = @as(f64, input[base + bi]) * inverse * weights[bi];
+                    const expected_a: f32 = @floatCast((x * @cos(angle) - y * @sin(angle)) * scale);
+                    const expected_b: f32 = @floatCast((y * @cos(angle) + x * @sin(angle)) * scale);
+                    max_error = @max(max_error, @abs(actual[base + ai] - expected_a));
+                    max_error = @max(max_error, @abs(actual[base + bi] - expected_b));
+                };
+            }
+            try std.testing.expect(max_error < 0.0001);
+            std.debug.print("gemma4_spatial_norm_rope rows={d} scale={d} max_abs={d}\n", .{ rows, scale, max_error });
+            var other = params;
+            other.hidden = 1024;
+            try std.testing.expect((try cb.visionNormRope(tensor, weight, other)) == null);
+            other = params;
+            other.grid_x = 0;
+            try std.testing.expect((try cb.visionNormRope(tensor, weight, other)) == null);
+            other = params;
+            other.stride = 1;
+            try std.testing.expect((try cb.visionNormRope(tensor, weight, other)) == null);
+            const original_kernel = compute.kernels.gemma4_vision_norm_rope_f32;
+            compute.kernels.gemma4_vision_norm_rope_f32 = null;
+            try std.testing.expect((try cb.visionNormRope(tensor, weight, params)) == null);
+            compute.kernels.gemma4_vision_norm_rope_f32 = original_kernel;
+            compute.gemma4_e4b_sm89_qualified = false;
+            try std.testing.expect((try cb.visionNormRope(tensor, weight, params)) == null);
+            compute.gemma4_e4b_sm89_qualified = true;
+        }
+    }
+}
+
+test "Gemma4 CUDA adaptive replay binds reserved page tables and resets request ownership" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var graph = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY");
+    defer graph.restore(a);
+    var adaptive = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_GEMMA4_ADAPTIVE_REPLAY_CAPACITY");
+    defer adaptive.restore(a);
+    var forced = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY");
+    defer forced.restore(a);
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    try compute.configureGemma4Dense(true, true);
+    if (!compute.gemma4_e4b_sm89_qualified) return error.SkipZigTest;
+    var cb = compute.computeBackend();
+    const default_qualified = cuda_artifact.hasBf16WmmaCodeFor(compute.ctx.info.compute_major, compute.ctx.info.compute_minor) and
+        compute.capture_gates.persistent_replay and compute.capture_gates.device_scalars and
+        (compute.temp_slot_config.autoplan_enabled or compute.temp_slot_config.configured_period != 0);
+    try std.testing.expectEqual(if (default_qualified) @as(?usize, 144) else null, try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, true));
+    try std.testing.expectEqual(if (default_qualified) CudaDecodeGraphReplayMode.auto else .off, cudaRequestDecodeGraphReplayMode(&compute));
+    try std.testing.expectEqual(default_qualified, cb.debugCudaGraphReplayRequested());
+    try std.testing.expectEqual(default_qualified, gpt_arch.cudaDecodeGraphReplayPrefersGraph(&cb));
+    cb.execution_owner = 7;
+    try std.testing.expect(!cb.debugCudaGraphReplayRequested());
+    cb.execution_owner = 0;
+    try beginRequest(&compute);
+    try std.testing.expectEqual(CudaDecodeGraphReplayMode.off, cudaRequestDecodeGraphReplayMode(&compute));
+    try std.testing.expect(!cb.debugCudaGraphReplayRequested());
+    const gates = compute.capture_gates;
+    compute.capture_gates.persistent_replay = false;
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, true)) == null);
+    compute.capture_gates = gates;
+    compute.capture_gates.device_scalars = false;
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, true)) == null);
+    compute.capture_gates = gates;
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 4096, 1, true)) == null);
+    _ = setenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY", "off", 1);
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, true)) == null);
+    _ = unsetenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY");
+    _ = setenv("ANTFLY_INFERENCE_CUDA_GEMMA4_ADAPTIVE_REPLAY_CAPACITY", "0", 1);
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, true)) == null);
+    _ = unsetenv("ANTFLY_INFERENCE_CUDA_GEMMA4_ADAPTIVE_REPLAY_CAPACITY");
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, false)) == null);
+    _ = setenv("ANTFLY_INFERENCE_CUDA_GEMMA4_ADAPTIVE_REPLAY_CAPACITY", "1", 1);
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, false)) == null);
+    _ = setenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY", "required", 1);
+    try std.testing.expectEqual(@as(?usize, 144), (try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, false)));
+    try std.testing.expectEqual(@as(?usize, 144), cudaDebugGraphForcedKvReplayCapacityTokens(&compute));
+    var storage: CudaKvDeviceStorage = undefined;
+    storage.compute = &compute;
+    const blocks = [_]kv_block_mod.KvBlockId{ 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+    try std.testing.expectEqual(@as(usize, 9), try storage.blockTableUploadBlockCount(80, 16, &blocks));
+    try std.testing.expectEqual(@as(usize, 5), try storage.blockTableUploadBlockCount(80, 16, blocks[0..5]));
+    try std.testing.expectError(error.CudaGraphReplayRequired, CudaCompute.configureGemma4RequestReplayCapacity(&cb, 4096, 1, false));
+    try beginRequest(&compute);
+    try std.testing.expect(compute.gemma4_request_replay_capacity == null);
+    cb.execution_owner = 7;
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, false)) == null);
+    cb.execution_owner = 0;
+    compute.resident_training_cache = true;
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, false)) == null);
+    compute.resident_training_cache = false;
+    _ = setenv("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY", "512", 1);
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, false)) == null);
+    try std.testing.expectEqual(@as(?usize, 512), cudaDebugGraphForcedKvReplayCapacityTokens(&compute));
+    _ = setenv("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY", "0", 1);
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, false)) == null);
+    try std.testing.expect(cudaDebugGraphForcedKvReplayCapacityTokens(&compute) == null);
+    _ = unsetenv("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY");
+    compute.gemma4_e4b_sm89_qualified = false;
+    try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, false)) == null);
+}
+
+test "Gemma4 CUDA explicit auto replay falls back outside qualified capacity" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var graph = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY");
+    defer graph.restore(a);
+    var adaptive = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_GEMMA4_ADAPTIVE_REPLAY_CAPACITY");
+    defer adaptive.restore(a);
+    var forced = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY");
+    defer forced.restore(a);
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    try compute.configureGemma4Dense(true, true);
+    if (!compute.gemma4_e4b_sm89_qualified) return error.SkipZigTest;
+    const cb = compute.computeBackend();
+
+    for ([_][:0]const u8{ "auto", "required" }) |mode| {
+        _ = setenv("ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY", mode, 1);
+        // The exact output and total-token limits remain replay-eligible.
+        try std.testing.expectEqual(@as(?usize, 592), try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 512, false));
+        try beginRequest(&compute);
+        try std.testing.expectEqual(@as(?usize, 4096), try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 4095, 1, false));
+        try beginRequest(&compute);
+        for ([_][2]usize{
+            .{ 80, 513 },
+            .{ 4096, 1 },
+            .{ 0, 64 },
+            .{ 32, 0 },
+            .{ std.math.maxInt(usize), 64 },
+        }) |request| {
+            if (std.mem.eql(u8, mode, "required")) {
+                try std.testing.expectError(error.CudaGraphReplayRequired, CudaCompute.configureGemma4RequestReplayCapacity(&cb, request[0], request[1], false));
+            } else {
+                try std.testing.expect((try CudaCompute.configureGemma4RequestReplayCapacity(&cb, request[0], request[1], false)) == null);
+                try std.testing.expect(compute.gemma4_request_replay_disabled);
+                try std.testing.expectEqual(CudaDecodeGraphReplayMode.off, cudaRequestDecodeGraphReplayMode(&compute));
+                try std.testing.expect(!cudaDebugGraphPersistentReplayEnabled(&compute));
+                try std.testing.expect(!cudaDebugGraphCaptureDeviceScalarsEnabled(&compute));
+                try std.testing.expect(!try cb.debugCudaGraphCaptureBegin("outside-qualified-capacity"));
+            }
+            try std.testing.expect(compute.gemma4_request_replay_capacity == null);
+            try beginRequest(&compute);
+            try std.testing.expect(!compute.gemma4_request_replay_disabled);
+        }
+        // A following admitted request can replay after an eager fallback.
+        try std.testing.expectEqual(@as(?usize, 144), try CudaCompute.configureGemma4RequestReplayCapacity(&cb, 80, 64, false));
+        try std.testing.expect(!compute.gemma4_request_replay_disabled);
+        try std.testing.expect(cudaDebugGraphPersistentReplayEnabled(&compute));
+        try std.testing.expect(cudaDebugGraphCaptureDeviceScalarsEnabled(&compute));
+        try beginRequest(&compute);
+    }
+}
+
+test "Gemma4 CUDA native F16 PLE preserves checkpoint bytes and exact F32 singleton arithmetic" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var bf16 = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16");
+    defer bf16.restore(a);
+    var half_env = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_F16");
+    defer half_env.restore(a);
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    try compute.configureGemma4Dense(true, true);
+    if (!compute.gemma4_e4b_sm89_qualified or !canUseF16TensorCoreWeights(&compute)) return error.SkipZigTest;
+    const cb = compute.computeBackend();
+    const in_dim = 2560;
+    const out_dim = 10752;
+    const half = try a.alloc(f16, in_dim * out_dim);
+    defer a.free(half);
+    const full = try a.alloc(f32, half.len);
+    defer a.free(full);
+    for (half, full, 0..) |*h, *f, i| {
+        h.* = @floatCast(@as(f32, @floatFromInt(@as(i32, @intCast(i % 29)) - 14)) / 257);
+        f.* = h.*;
+    }
+    const shape = [_]i64{ out_dim, in_dim };
+    const name = "model.per_layer_input.per_layer_model_proj.weight";
+    const source = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(half), .dtype = .f16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+    try std.testing.expect(cudaShouldKeepGemma4PleF16(&compute, name, &source));
+    var full_precision = source;
+    full_precision.dtype = .f32;
+    try std.testing.expect(!cudaShouldKeepGemma4PleF16(&compute, name, &full_precision));
+    var transposed = source;
+    transposed.shape = &.{ in_dim, out_dim };
+    try std.testing.expect(!cudaShouldKeepGemma4PleF16(&compute, name, &transposed));
+    compute.gemma4_e4b_sm89_qualified = false;
+    try std.testing.expect(!cudaShouldKeepGemma4PleF16(&compute, name, &source));
+    compute.gemma4_e4b_sm89_qualified = true;
+    _ = setenv("ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_F16", "0", 1);
+    try std.testing.expect(!cudaShouldKeepGemma4PleF16(&compute, name, &source));
+    _ = setenv("ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_F16", "1", 1);
+    try std.testing.expect(cudaShouldKeepGemma4PleF16(&compute, name, &source));
+    try std.testing.expect(!cudaShouldKeepGemma4PleF16(&compute, "unrelated.weight", &source));
+    _ = setenv("ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16", "1", 1);
+    try std.testing.expect(!cudaShouldKeepGemma4PleF16(&compute, name, &source));
+    _ = unsetenv("ANTFLY_INFERENCE_CUDA_PLE_MODEL_PROJ_BF16");
+    const loaded = weight_source_mod.LoadedWeight{ .tensor = source };
+    try compute.insertWeightFromLoaded(try a.dupe(u8, name), &loaded);
+    const weight = try cb.getWeight(name);
+    defer cb.free(weight);
+    try std.testing.expectEqual(tensor_mod.DType.f16, tensorFromCt(weight).dtype);
+    try std.testing.expectEqual(half.len * 2, tensorFromCt(weight).buffer.len);
+    const check = try a.alloc(f16, half.len);
+    defer a.free(check);
+    try tensorFromCt(weight).buffer.copyToHost(&compute.ctx, std.mem.sliceAsBytes(check));
+    try compute.ctx.synchronize();
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(half), std.mem.sliceAsBytes(check));
+    const fp32_source = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(full), .dtype = .f32, .shape = &shape, .name = "f32-reference", .allocator = a, .owns_data = false, .owns_shape = false };
+    try compute.insertWeightFromTensor(try a.dupe(u8, fp32_source.name), &fp32_source);
+    const reference_weight = try cb.getWeight(fp32_source.name);
+    defer cb.free(reference_weight);
+    for ([_]usize{ 1, 17, 80 }) |rows| {
+        const values = try a.alloc(f32, rows * in_dim);
+        defer a.free(values);
+        for (values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) / 251;
+        const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), in_dim });
+        defer cb.free(input);
+        const before = compute.stats.f16_cublaslt_linear_calls;
+        const actual = try cb.linearNoBias(input, weight, rows, in_dim, out_dim);
+        defer cb.free(actual);
+        const reference = try cb.linearNoBias(input, reference_weight, rows, in_dim, out_dim);
+        defer cb.free(reference);
+        const got = try cb.toFloat32(actual, a);
+        defer a.free(got);
+        const expected = try cb.toFloat32(reference, a);
+        defer a.free(expected);
+        if (rows == 1) {
+            try std.testing.expectEqual(before, compute.stats.f16_cublaslt_linear_calls);
+            try std.testing.expectEqualSlices(f32, expected, got);
+        } else {
+            try std.testing.expect(compute.stats.f16_cublaslt_linear_calls > before);
+            for (got, expected) |x, y| try std.testing.expectApproxEqAbs(y, x, 0.0002);
+        }
+    }
+}
+
+test "Gemma4 CUDA prepared shared prefill consumes owned embeddings on pruned and fallback errors" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var slots = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_PREPARED_DECODER_SLOTS");
+    defer slots.restore(a);
+    var shared = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_E4B_SHARED_KV_PREFILL");
+    defer shared.restore(a);
+    var prepared = try TestEnvGuard.captureAndClear(a, "ANTFLY_INFERENCE_CUDA_E4B_PREPARED_SHARED_KV_PREFILL");
+    defer prepared.restore(a);
+    _ = setenv("ANTFLY_INFERENCE_CUDA_PREPARED_DECODER_SLOTS", "0", 1);
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    try compute.configureGemma4Dense(true, true);
+    const cb = compute.computeBackend();
+    const cfg: gpt_model.Config = .{
+        .family = .gemma,
+        .hidden_size = 2560,
+        .intermediate_size = 10240,
+        .num_hidden_layers = 42,
+        .num_kv_shared_layers = 18,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .global_head_dim = 512,
+        .position_encoding = .rope,
+        .sliding_window = 512,
+        .sliding_window_pattern = 6,
+    };
+    const context: gpt_arch.DecodeContext = .{
+        .attention_mode = .paged_prefill,
+        .total_sequence_len = 3,
+        .query_sequence_len = 3,
+        .kv_sequence_len = 3,
+        .kv_cache = .{ .sequence_id = 1, .pool_id = 0, .logical_block_count = 1, .tail_tokens = 3 },
+    };
+    const values: [3 * 2560]f32 = @splat(0.125);
+    for ([_][:0]const u8{ "1", "0" }) |enabled| {
+        _ = setenv("ANTFLY_INFERENCE_CUDA_E4B_PREPARED_SHARED_KV_PREFILL", enabled, 1);
+        const input = try cb.fromFloat32Shape(&values, &.{ 3, 2560 });
+        // The public API consumes input even when a missing model weight
+        // aborts before layer zero. Allocator leak checks own the CT header.
+        try std.testing.expectError(error.WeightNotFound, gpt_arch.forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
+            &cb,
+            a,
+            cfg,
+            input,
+            .{},
+            1,
+            3,
+            &context,
+            null,
+        ));
+    }
 }

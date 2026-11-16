@@ -60,6 +60,19 @@ npm trust github @antfly/embedded --file embedded-release-publish.yml \
 Repeat for the platform packages. PyPI pending publisher configuration is
 separate; see [licensing maintenance](licensing.md).
 
+## Rust SDK releases
+
+`antfly-sdk` uses `rs/antfly/sdk/vX.Y.Z` tags and the independent
+`rust-sdk-release.yml` workflow dispatched on `main`, with environment
+`crates-io`. Configure that exact workflow as the crate's trusted publisher;
+the embedded publisher does not publish this SDK. The existing `0.0.0` setup
+package has already established the crate name and ownership.
+
+The read-only preparation job verifies main ancestry, package version, bundled
+OpenAPI input, tests, and Cargo packaging. Publication verifies the sealed
+source commit and digest and uploads the `.crate` without executing source
+with credentials. Re-run failed jobs to retain the same packaged bytes.
+
 ## Embedded releases
 
 `embedded-release-publish.yml` runs after successful tagged release builds on main. It accepts stable and RC release requests; nightlies only build artifacts. The `workflow_run` entry point authenticates the producer and immutable release source, then dispatches the publisher on `main`. Registry OIDC jobs run only under `workflow_dispatch`, because crates.io rejects `workflow_run` tokens. Manual dispatch with an immutable tag and build run ID is the recovery path. All publishers verify the source commit and package digests before writing registry versions. npm publication is serialized and refuses to move `latest` or `next` backward; retry the newest release if an older build finishes late.
@@ -71,3 +84,46 @@ Configure crates.io trusted publishers for both crates with repository `antflydb
 For PyPI, configure the pending trusted publisher described in [licensing maintenance](licensing.md). The npm setup above must also be present before the first functional release. Registry setup cannot be inferred from a claimed name alone.
 
 The former `registry-claims/` placeholder crate sources were used only for the initial `0.0.0` uploads. Registry ownership persists without those files; functional releases always use `rs/crates`.
+
+## Better Auth integration
+
+`@antfly/better-auth` uses `ts-npm-publish.yml`, environment `npm`, in
+`antflydb/antfly`. It does not use the embedded-package publisher.
+An authorized npm owner must bootstrap the new package and configure its trusted
+publisher; GitHub access alone does not grant npm ownership. After the first
+qualified publication, configure:
+
+```sh
+npm trust github @antfly/better-auth --file ts-npm-publish.yml \
+  --repo antflydb/antfly --env npm --allow-publish --yes
+```
+
+Release order for the initial candidate:
+
+1. Publish SDK 0.2.2, which contains `getSQLTransactionOutcome` (0.2.1 does not).
+2. Complete embedded/server 0.3.0-rc.6 and its registry publication.
+3. Complete main Zig E2E qualification on the exact commit to be tagged. Its
+   supported Better Auth lane consumes the shared base/full server and library,
+   and includes the Linux container and installed-package smoke checks.
+4. Publish auth 0.1.0-rc.1 with npm tag `next`. Subsequent tag-driven publications
+   use `ts/antfly/better-auth/v<version>` and require the tag to match the manifest.
+
+The auth release gate verifies the existing same-commit Zig E2E result; it
+does not launch a native build. Daily Zig E2E runs also exercise latest/beta
+Better Auth candidates as advisory checks. Stable publication and promotion of native
+`next` packages to `latest` are separate release decisions.
+
+For the installed-package check, copy
+`ts/packages/better-auth/test/installed-smoke.mjs` into a new directory outside
+the repository, then run there:
+
+```sh
+npm init -y
+npm install @antfly/better-auth@0.1.0-rc.1 @antfly/embedded@0.3.0-rc.6 better-auth@1.7.14
+node installed-smoke.mjs
+```
+
+Before publication, substitute the sealed candidate auth/SDK tarballs for those
+packages. Keep the embedded package from the qualified native release. The
+smoke test checks installed exports, private search, reopen persistence and
+logout; it does not measure human onboarding time or validate live OAuth/mail.

@@ -18,9 +18,11 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import threading
@@ -35,6 +37,10 @@ import antfly_embedded
 from antfly_embedded._library import find_library
 
 pytestmark = pytest.mark.usefixtures("require_native")
+
+# Persisted resolver consumer bindings/work require this feature epoch. Keep
+# this independent of the latest supported reader: plain databases remain at 1.
+LITE_RESOLVER_CONSUMER_READER_VERSION = 29
 
 
 def _index(stats: dict, name: str) -> dict:
@@ -185,7 +191,9 @@ def _run_wait_workload(path: str, wait_mode: str) -> None:
             return [rng.uniform(0, 0.9) for _ in range(384)]
         return value
 
-    with antfly_embedded.create(path) as db:
+    # This is a replay/lock-order regression. Keep every original batch and
+    # vector dimension, but leave power-loss sync to durable checkpoint tests.
+    with antfly_embedded.create_with_options(path, antfly_embedded.OpenOptions(no_sync=True)) as db:
         db.add_index({"name": "graph", "kind": "graph", "config_json": "{}"})
         for field in ("name_embedding", "fact_embedding"):
             db.add_index(
@@ -202,9 +210,17 @@ def _run_wait_workload(path: str, wait_mode: str) -> None:
                     ),
                 }
             )
+        latest = {}
         for ordinal, batch in enumerate(batches):
             print(f"{wait_mode}: batch {ordinal} write", flush=True)
             inserts = {key: {field: expand(value) for field, value in doc.items()} for key, doc in batch.items()}
+            for doc in inserts.values():
+                # External indexes consume explicit payloads. Merely storing
+                # a vector field leaves the index empty and misses its replay.
+                vectors = {field: doc[field] for field in ("name_embedding", "fact_embedding") if field in doc}
+                if vectors:
+                    doc["_embeddings"] = vectors
+            latest.update(inserts)
             request: dict[str, object] = {"inserts": inserts}
             if wait_mode == "full_index":
                 request["sync_level"] = "full_index"
@@ -213,6 +229,16 @@ def _run_wait_workload(path: str, wait_mode: str) -> None:
                 print(f"{wait_mode}: batch {ordinal} drain", flush=True)
                 db.run_until_idle()
             print(f"{wait_mode}: batch {ordinal} complete", flush=True)
+        print(f"{wait_mode}: verify readiness", flush=True)
+        stats = db.stats()
+        for field in ("name_embedding", "fact_embedding"):
+            print(f"{wait_mode}: verify {field}", flush=True)
+            index = _index(stats, field)
+            assert index["replay_applied_sequence"] >= index["replay_target_sequence"] > 0, index
+            expected = {key for key, doc in latest.items() if field in doc}
+            vector = next(doc[field] for doc in latest.values() if field in doc)
+            result = db.search({"embeddings": {field: vector}, "indexes": [field], "limit": len(latest)})
+            assert {hit["_id"] for hit in result["responses"][0]["hits"]["hits"]} == expected, result
         print(f"{wait_mode}: closing", flush=True)
     print(f"{wait_mode}: closed", flush=True)
 
@@ -257,11 +283,12 @@ def test_public_traversal_retains_each_seed_path(aflite_path) -> None:
         assert {node["path"][0]["key"] for node in nodes} == {"concept:a", "concept:b"}
 
 
-@pytest.mark.parametrize("destination_storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
-@pytest.mark.parametrize("restore_method", ["memory", "file", "import"])
-def test_query_resolution_uses_durable_aliases_without_promotion(
-    aflite_path, tmp_path, destination_storage, restore_method
-) -> None:
+@pytest.fixture(scope="module")
+def durable_resolver_backup(tmp_path_factory, require_native):
+    # Exercise the complete source lifecycle once. Every restore case below
+    # gets an independent destination; only immutable backup bytes are shared.
+    tmp_path = tmp_path_factory.mktemp("durable-resolver")
+    aflite_path = tmp_path / "source.aflite"
     options = antfly_embedded.OpenOptions(profile=antfly_embedded.Profile.NATIVE, generated_enrichment_replay=True)
     with antfly_embedded.create_with_options(aflite_path, options) as db:
         config = {
@@ -356,6 +383,25 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         backup = db.backup()
         backup_file = tmp_path / "resolver.afb"
         db.backup_to_file(backup_file)
+    with antfly_embedded.open_with_options(aflite_path, options) as db:
+        db.add_index(config)
+        db.run_until_idle()
+        assert len(db.edges("knowledge_v2", "concept/qwen_embedding", "uses", 0)) == 1
+    with antfly_embedded.open_readonly(aflite_path) as db:
+        result = db.resolve_query("concepts", request)
+        assert result["resolution"]["config_generation"] == 4
+        assert result["resolution"]["entities"][0]["doc_ref"]["key"] == "concept/qwen_embedding"
+        assert json.loads(db.resolve_query("concepts", request, raw=True)) == result
+    return backup, backup_file, json.dumps(config), json.dumps(request), aflite_path
+
+
+@pytest.mark.parametrize("destination_storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+@pytest.mark.parametrize("restore_method", ["memory", "file", "import"])
+def test_query_resolution_uses_durable_aliases_without_promotion(
+    tmp_path, destination_storage, restore_method, durable_resolver_backup
+) -> None:
+    backup, backup_file, config_json, request_json, source_path = durable_resolver_backup
+    config, request = json.loads(config_json), json.loads(request_json)
     restored_path = tmp_path / (
         "restored.aflite" if destination_storage == antfly_embedded.Storage.LITE else "restored"
     )
@@ -479,15 +525,12 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         )
         restored.run_until_idle()
         assert restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"] == "fresh/qwen"
-    with antfly_embedded.open_with_options(aflite_path, options) as db:
-        db.add_index(config)
-        db.run_until_idle()
-        assert len(db.edges("knowledge_v2", "concept/qwen_embedding", "uses", 0)) == 1
-    with antfly_embedded.open_readonly(aflite_path) as db:
-        result = db.resolve_query("concepts", request)
+    # Destination migrations must never change the shared source or backup.
+    with antfly_embedded.open_readonly(source_path) as source:
+        result = source.resolve_query("concepts", request)
         assert result["resolution"]["config_generation"] == 4
         assert result["resolution"]["entities"][0]["doc_ref"]["key"] == "concept/qwen_embedding"
-        assert json.loads(db.resolve_query("concepts", request, raw=True)) == result
+        assert len(source.edges("knowledge_v2", "concept/qwen_embedding", "uses", 0)) == 1
 
 
 def test_resolver_revision_advances_for_unmerged_config_changes(tmp_path):
@@ -775,6 +818,7 @@ def test_index_upgrade_and_retired_identity_management(tmp_path, storage, order)
         db.add_index(config)
         db.merge_resolver_keys("concepts", "entity/ada", "entity/canonical")
         db.run_until_idle()
+        # Producer ownership and replay handoffs require reader epoch 3.
         reader_version = db.capabilities()["minimum_reader_version"]
         # Durable curation requires epoch 6. Newer persisted features may
         # raise that fence; the observed fence must never weaken on upgrade.
@@ -869,6 +913,7 @@ def test_same_name_and_template_across_source_tables(tmp_path, storage, shared):
 
 @pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
 def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, storage):
+    expected_reader = LITE_RESOLVER_CONSUMER_READER_VERSION if storage == antfly_embedded.Storage.LITE else 3
     options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
     path = tmp_path / ("replace.aflite" if storage == antfly_embedded.Storage.LITE else "replace")
     with _open_graph_test(path, options) as db:
@@ -878,9 +923,9 @@ def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, stora
         config["resolvers"][0]["promote"] = True
         config["replaces"] = "knowledge_v1"
         db.add_index(config)
-        # Lite persists resolver projection jobs; directory storage retains
+        # Lite persists resolver pin indexes; directory storage retains
         # the identity catalog's reader requirement without that file format.
-        assert db.capabilities()["minimum_reader_version"] == (15 if storage == antfly_embedded.Storage.LITE else 3)
+        assert db.capabilities()["minimum_reader_version"] == expected_reader
         before = db.list_resolver_identities()
         # Existing-target replacement must reject non-graph old indexes before
         # registering changed inline resolver config, for either storage mode.
@@ -893,7 +938,7 @@ def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, stora
         assert db.list_resolver_identities() == before
         db.add_index(config)
     with _open_graph_test(path, options) as db:
-        assert db.capabilities()["minimum_reader_version"] == (15 if storage == antfly_embedded.Storage.LITE else 3)
+        assert db.capabilities()["minimum_reader_version"] == expected_reader
         assert db.list_resolver_identities() == before
 
 
@@ -961,6 +1006,16 @@ def test_previous_reader_opens_plain_database_and_rejects_new_features(tmp_path)
     plain = tmp_path / "previous-plain.aflite"
     identity = tmp_path / "previous-identity.aflite"
     pending = tmp_path / "previous-pending.aflite"
+    # Current creation uses v7, while this pinned writer creates v4. Both
+    # support v3. Use a real empty v3 file so all cases reach catalog fencing,
+    # rather than failing at an intentionally incompatible physical header.
+    fixture = Path(__file__).resolve().parents[4] / "scripts/testdata/lite_previous_reader/empty-v3.aflite"
+    assert (
+        hashlib.sha256(fixture.read_bytes()).hexdigest()
+        == "d0a509a1ddf87feaf017032b1f9762bc89fd67c6568760a6f867bd23baf95d48"
+    )
+    for path in (plain, identity, pending):
+        shutil.copyfile(fixture, path)
     with _open_graph_test(plain, options) as db:
         db.create_table("plain_named", {})
         db.create_table("dropped_named", {})
@@ -974,11 +1029,13 @@ def test_previous_reader_opens_plain_database_and_rejects_new_features(tmp_path)
         config = _resolver_graph("knowledge", "concepts")
         config["resolvers"][0]["promote"] = True
         db.add_index(config)
-        # Durable Lite resolver projection work requires reader epoch 15.
-        assert db.capabilities()["minimum_reader_version"] == 15
+        # Durable resolver projection needs at least epoch 15; subsequent
+        # resolver features may raise that floor. The historical reader must
+        # still reject the database, checked below against its real library.
+        assert db.capabilities()["minimum_reader_version"] >= 15
     # Hosted maintenance leaves the shadow pending deterministically. The old
     # writer must fail open before it can truncate the retained journal.
-    with antfly_embedded.create_hosted(pending) as db:
+    with antfly_embedded.open_hosted(pending) as db:
         graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
         db.add_index(graph)
         db.batch_json({"inserts": {"source": {"links": ["before"]}}})
@@ -986,16 +1043,25 @@ def test_previous_reader_opens_plain_database_and_rejects_new_features(tmp_path)
         db.add_index(dict(graph, name="new", replaces="old"))
         assert db.pending_work_stats()["replacements"]
         assert db.capabilities()["minimum_reader_version"] == 2
+    for path in (plain, identity, pending):
+        with path.open("rb") as file:
+            assert file.read(8) == b"AFLITE\x03P", "catalog fencing requires a compatible physical format"
     script = r"""
 import ctypes, sys
 lib = ctypes.CDLL(sys.argv[1])
 lib.antfly_lite_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
 lib.antfly_lite_open.restype = ctypes.c_int
 lib.antfly_db_close.argtypes = [ctypes.c_void_p]
-for path, accepted in [(sys.argv[2], True), (sys.argv[3], False), (sys.argv[4], False)]:
+lib.antfly_last_error_detail.restype = ctypes.c_char_p
+for path, expected in [(sys.argv[2], None), (sys.argv[3], b"UnknownField"), (sys.argv[4], b"UnexpectedToken")]:
     handle = ctypes.c_void_p()
     code = lib.antfly_lite_open(path.encode(), ctypes.byref(handle))
-    assert (code == 0) == accepted, (path, code)
+    detail = lib.antfly_last_error_detail()
+    assert (code == 0) == (expected is None), (path, code, detail)
+    if expected is not None:
+        # Reject the new resolver fields / versioned catalog envelope before
+        # loading artifacts, rather than failing on physical file encoding.
+        assert detail == expected, (path, code, detail)
     if handle.value:
         lib.antfly_db_close(handle)
 """
@@ -1003,22 +1069,36 @@ for path, accepted in [(sys.argv[2], True), (sys.argv[3], False), (sys.argv[4], 
         [sys.executable, "-c", script, previous, str(plain), str(identity), str(pending)], check=True, timeout=60
     )
 
-    # A previously opened Lite writer must also reject mutation after the
-    # registration commit, when its connection refreshes the catalog.
-    live = tmp_path / "previous-live-writer.aflite"
+
+def test_previous_reader_live_directory_writer_blocks_generation_transition(tmp_path):
+    previous = os.environ.get("ANTFLY_LITE_PREVIOUS_LIBRARY")
+    if not previous:
+        if os.environ.get("ANTFLY_LITE_REQUIRE_PREVIOUS_READER") == "1":
+            pytest.fail("ANTFLY_LITE_PREVIOUS_LIBRARY is required")
+        pytest.skip("set ANTFLY_LITE_PREVIOUS_LIBRARY to the pinned pre-PR reader")
+    # A live historical directory writer owns its generation. Current code
+    # must reject the transition until that owner closes, before it can expose
+    # a new catalog feature to the old writer.
+    # That writer unconditionally upgrades writable Lite v3 files to v4,
+    # which current Lite cannot open. Directory storage avoids that separate
+    # physical-format boundary; the preceding test checks actual Lite opens.
+    live = tmp_path / "previous-live-writer"
     graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
     # Seed with the historical writer too: current full-text artifacts use a
     # newer section format. This case tests fencing a writer already open when
     # a new catalog feature is published, not opening newer index bytes.
     writer_script = r"""
-import ctypes, json, sys
+import ctypes, json, struct, sys
 class Slice(ctypes.Structure):
     _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
 class Buffer(ctypes.Structure):
     _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
 lib = ctypes.CDLL(sys.argv[1])
-lib.antfly_lite_create_hosted.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
-lib.antfly_lite_create_hosted.restype = ctypes.c_int
+lib.antfly_open_options_size.restype = ctypes.c_uint32
+lib.antfly_open_options_init.argtypes = [ctypes.c_void_p]
+lib.antfly_open_options_init.restype = ctypes.c_int
+lib.antfly_db_open_with_options.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+lib.antfly_db_open_with_options.restype = ctypes.c_int
 lib.antfly_db_batch_json.argtypes = [ctypes.c_void_p, Slice, ctypes.POINTER(Buffer)]
 lib.antfly_buffer_free.argtypes = [ctypes.POINTER(Buffer)]
 lib.antfly_db_batch_json.restype = ctypes.c_int
@@ -1028,7 +1108,12 @@ lib.antfly_db_run_until_idle.argtypes = [ctypes.c_void_p]
 lib.antfly_db_run_until_idle.restype = ctypes.c_int
 lib.antfly_db_close.argtypes = [ctypes.c_void_p]
 handle = ctypes.c_void_p()
-assert lib.antfly_lite_create_hosted(sys.argv[2].encode(), ctypes.byref(handle)) == 0
+options = ctypes.create_string_buffer(lib.antfly_open_options_size())
+assert lib.antfly_open_options_init(options) == 0
+# Stable ABI prefix: abi_size, storage_kind, open_mode, profile. Keep the
+# historical library's own ABI size and initialize every other field there.
+struct.pack_into("=I", options, 12, 1)  # hosted; default storage is directory
+assert lib.antfly_db_open_with_options(sys.argv[2].encode(), options, ctypes.byref(handle)) == 0
 def invoke(name, payload):
     data = json.dumps(payload).encode()
     buffer = ctypes.create_string_buffer(data)
@@ -1052,7 +1137,7 @@ try:
     code = lib.antfly_db_batch_json(handle, Slice(ctypes.cast(buffer, ctypes.c_void_p), len(request)), ctypes.byref(output))
 finally:
     if output.ptr: lib.antfly_buffer_free(ctypes.byref(output))
-assert code != 0, "old writer admitted mutation across the replacement fence"
+assert code == 0, "rejected transition must leave the old generation writable"
 lib.antfly_db_close(handle)
 """
     writer = subprocess.Popen(
@@ -1073,10 +1158,32 @@ lib.antfly_db_close(handle)
                 writer.kill()
             _, stderr = writer.communicate(timeout=30)
             pytest.fail(f"previous reader failed to initialize: exit={writer.returncode}, stdout={line!r}\n{stderr}")
-        with antfly_embedded.open_hosted(live) as db:
+        options = antfly_embedded.OpenOptions(
+            storage=antfly_embedded.Storage.DIRECTORY, profile=antfly_embedded.Profile.HOSTED
+        )
+        with pytest.raises(antfly_embedded.BusyError, match="GenerationTransitionActive"):
+            antfly_embedded.open_with_options(live, options)
+        _, stderr = writer.communicate("write\n", timeout=30)
+        assert writer.returncode == 0, stderr
+        with antfly_embedded.open_with_options(live, options) as db:
             db.add_index(dict(graph, name="new", replaces="old"))
-            _, stderr = writer.communicate("write\n", timeout=30)
-            assert writer.returncode == 0, stderr
+            assert db.capabilities()["minimum_reader_version"] == 2
+        # Once ownership transfers, the old catalog decoder must reject
+        # the pending feature even though physical directory storage is
+        # unchanged. Reuse the historical ABI, not the current reader.
+        reject_script = r"""
+import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+lib.antfly_db_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+lib.antfly_db_open.restype = ctypes.c_int
+lib.antfly_last_error_detail.restype = ctypes.c_char_p
+handle = ctypes.c_void_p()
+code = lib.antfly_db_open(sys.argv[2].encode(), ctypes.byref(handle))
+assert code != 0, "old reader admitted the pending replacement"
+assert lib.antfly_last_error_detail() == b"UnexpectedToken", lib.antfly_last_error_detail()
+"""
+        subprocess.run([sys.executable, "-c", reject_script, previous, str(live)], check=True, timeout=30)
+        with antfly_embedded.open_with_options(live, options) as db:
             db.batch_json({"inserts": {"source": {"links": ["latest"]}}})
             db.run_until_idle()
             edges = db.edges("new", "source", "R", antfly_embedded.GraphDirection.OUT)
@@ -1183,17 +1290,21 @@ def test_background_replacement_finishes_under_concurrent_writes(tmp_path, stora
     path = tmp_path / ("busy-shadow.aflite" if storage == antfly_embedded.Storage.LITE else "busy-shadow")
     with _open_graph_test(path, options) as db:
         db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
-        db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(500)}})
+        # Cross the detached builder's 256-document page boundary. More rows
+        # only add repeated page work; the native tests force cutover races.
+        db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(257)}})
         db.run_until_idle()
         stop = threading.Event()
         started = threading.Event()
+        revisions = 0
 
         def write():
-            revisions = 0
-            started.set()
+            nonlocal revisions
             while not stop.is_set():
                 db.batch_json({"inserts": {"source:0000": {"links": ["old"], "next_links": [f"v{revisions}"]}}})
                 revisions += 1
+                if revisions == 2:
+                    started.set()
                 time.sleep(0.002)
             return revisions
 
@@ -1201,6 +1312,7 @@ def test_background_replacement_finishes_under_concurrent_writes(tmp_path, stora
             future = executor.submit(write)
             try:
                 assert started.wait(timeout=5)
+                writes_before_replacement = revisions
                 request = {
                     "name": "new",
                     "type": "graph",
@@ -1215,10 +1327,12 @@ def test_background_replacement_finishes_under_concurrent_writes(tmp_path, stora
                     time.sleep(0.01)
             finally:
                 stop.set()
-            assert future.result(timeout=10) > 1
+            assert future.result(timeout=10) > writes_before_replacement
         db.batch_json({"inserts": {"source:0000": {"links": ["old"], "next_links": ["final"]}}})
         db.run_until_idle()
         assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "source:0000", "R", 0)] == ["final"]
+        for key in ("source:0001", "source:0256"):
+            assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", key, "R", 0)] == ["new"]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGKILL and pipe-polling fixture")
@@ -1318,7 +1432,19 @@ def test_pending_replacement_name_is_reserved_and_cancellable(tmp_path, storage)
         assert "old" in {i["name"] for i in db.list_indexes()}
         db.run_until_idle()
         assert not db.pending_work_stats()["replacements"]
-        db.add_index(dict(config, replaces="old"))
+        # Cancellation retires the shadow before its asynchronous artifact
+        # cleanup releases the name. Draining replay is not that cleanup fence.
+        # Retry only the documented retirement debt, without hiding other Busy
+        # errors or weakening the final replacement/edge assertions.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                db.add_index(dict(config, replaces="old"))
+                break
+            except antfly_embedded.BusyError as error:
+                assert "IndexArtifactCleanupPending" in str(error)
+                assert time.monotonic() < deadline, str(error)
+                time.sleep(0.01)
         db.run_until_idle()
         assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "s:0000", "R", 0)] == ["new"]
 
@@ -1388,7 +1514,10 @@ def test_replacement_wait_observes_cancellation(tmp_path, storage):
 @pytest.mark.parametrize("finish", ["cancel", "swap"])
 def test_named_replacement_does_not_permanently_upgrade_root(tmp_path, storage, finish):
     path = tmp_path / ("named-fence.aflite" if storage == antfly_embedded.Storage.LITE else "named-fence")
-    options = antfly_embedded.OpenOptions(storage=storage)
+    # This test controls the pending/cancelled/swapped lifecycle explicitly.
+    # Native background turns can finish between child and root capability
+    # reads; dedicated native tests below qualify that asynchronous progress.
+    options = antfly_embedded.OpenOptions(storage=storage, profile=antfly_embedded.Profile.HOSTED)
     graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
     with _open_graph_test(path, options) as db:
         db.create_table("source", {})
@@ -1416,6 +1545,7 @@ def test_named_replacement_does_not_permanently_upgrade_root(tmp_path, storage, 
 
 @pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
 def test_child_permanent_epoch_survives_root_temporary_fence(tmp_path, storage):
+    expected_reader = LITE_RESOLVER_CONSUMER_READER_VERSION if storage == antfly_embedded.Storage.LITE else 3
     path = tmp_path / ("aggregate-fence.aflite" if storage == antfly_embedded.Storage.LITE else "aggregate-fence")
     options = antfly_embedded.OpenOptions(storage=storage)
     graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
@@ -1429,10 +1559,10 @@ def test_child_permanent_epoch_survives_root_temporary_fence(tmp_path, storage):
         with db.open_table("source") as table:
             table.add_index(_resolver_graph("knowledge", "concepts", destination="source"))
         assert db.cancel_replacement("new")
-        assert db.capabilities()["minimum_reader_version"] == (15 if storage == antfly_embedded.Storage.LITE else 3)
+        assert db.capabilities()["minimum_reader_version"] == expected_reader
     with _open_graph_test(path, options) as db:
         # Permanent aggregation is durable, even before opening the child.
-        assert db.capabilities()["minimum_reader_version"] == (15 if storage == antfly_embedded.Storage.LITE else 3)
+        assert db.capabilities()["minimum_reader_version"] == expected_reader
 
 
 @pytest.mark.parametrize("promote", [False, True])
@@ -1504,13 +1634,23 @@ def test_inline_resolver_background_work_settles_after_writes(
                 time.sleep(0.1)
             assert docs.edges(graph_name, "d0", "about", antfly_embedded.GraphDirection.OUT)
             sequence = stats["derived_target_sequence"]
-            # Let the real worker run several further rounds without a write
-            # or a foreground drain that could hide detached publication bugs.
-            time.sleep(2)
-            after = docs.pending_work_stats()
-            assert after["derived_target_sequence"] == sequence, after
-            assert not after["resolution"]["catch_up_required"], after
-            assert not after["promotion"]["catch_up_required"], after
+            # Observe two actual rounds, rather than assuming a fixed sleep
+            # let the worker run. Never write or drain: either could hide a
+            # detached publication that keeps generating new work while idle.
+            publications = stats["background_publications"]
+            rounds = publications["maintenance_rounds"]
+            stable_deadline = background_progress_deadline()
+            while True:
+                after = docs.pending_work_stats()
+                observed = after["background_publications"]
+                assert after["derived_target_sequence"] == sequence, after
+                assert not after["resolution"]["catch_up_required"], after
+                assert not after["promotion"]["catch_up_required"], after
+                if observed["maintenance_rounds"] >= rounds + 2:
+                    break
+                if stable_deadline.expired(after, completed=observed["maintenance_rounds"]):
+                    pytest.fail(f"background worker stopped after settling: {json.dumps(after, sort_keys=True)}")
+                time.sleep(0.02)
 
 
 def test_native_child_replacement_replays_generated_artifacts_beside_idle_root(tmp_path):

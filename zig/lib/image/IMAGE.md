@@ -77,6 +77,10 @@ Current non-core format boundaries:
   dimensions, photo-like lossy input, and extended ALPH composition. Imported
   WebP fixture provenance and license text are recorded in
   `testdata/image/THIRD_PARTY_FIXTURES.md`.
+  VP8L normal-prefix code-length limits count encoded symbols before run-length
+  expansion; expanded entries remain bounded by the channel alphabet. Initial
+  repeat codes use the specified default length of 8. A Pillow-generated
+  lossless fixture and direct code-length regressions cover these cases.
 
 Current JPEG boundary:
 

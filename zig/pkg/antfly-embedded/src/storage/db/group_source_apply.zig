@@ -62,7 +62,7 @@ pub fn stage(a: A, overlay: *mutations.Overlay, command: contract.Command, next_
                 _ = try index.setDelivery(a, overlay, selected, raw, delivered);
             } else _ = try index.acknowledge(a, overlay, selected, raw);
         },
-        .backfill, .retire, .activate => return error.GroupedSourceBaselinePending,
+        .backfill, .retire, .activate, .activate_catalog => return error.GroupedSourceBaselinePending,
     }
     return empty;
 }

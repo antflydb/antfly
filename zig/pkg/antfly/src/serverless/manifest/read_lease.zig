@@ -98,6 +98,19 @@ pub const Cache = struct {
     }
 };
 
+/// Request-local protection from an already authenticated bounded cut. Never
+/// publish or renew a pin, and never populate the long-lived lease cache. The
+/// progress transport supplies either a durable pin or a GC-protected cut with
+/// its original deadline. A missing, expired or retired cut fails closed.
+pub fn acquireBoundedAt(progress: *ProgressStore, namespace: []const u8, version: u64, unix: u64, authority: u64) !Lease {
+    if (unix == 0 or authority == 0 or authority == std.math.maxInt(u64)) return error.ManifestReadLeaseExpired;
+    const deadline = (try progress.getManifestReadDeadline(namespace, version)) orelse return error.ManifestReadLeaseExpired;
+    if (deadline <= unix) return error.ManifestReadLeaseExpired;
+    if (try progress.getManifestGcFloor(namespace)) |floor| if (version < floor) return error.ManifestVersionRetired;
+    const remaining = @min(deadline - unix, 30 * std.time.ns_per_s);
+    return .{ .unix_deadline = std.math.add(u64, unix, remaining) catch return error.ManifestReadLeaseExpired, .authority_deadline = std.math.add(u64, authority, remaining) catch return error.ManifestReadLeaseExpired };
+}
+
 pub fn acquireAt(progress: *ProgressStore, namespace: []const u8, version: u64, unix: u64, authority: u64) !Lease {
     if (try progress.getManifestGcFloor(namespace)) |floor| if (version < floor) return error.ManifestVersionRetired;
     const desired = std.math.add(u64, unix, duration_ns) catch return error.ManifestReadLeaseExpired;
@@ -127,4 +140,29 @@ test "serverless manifest read lease grace is saturating and clock failure retai
     try std.testing.expect(protects(100, 100 + gc_grace_ns));
     try std.testing.expect(!protects(100, 101 + gc_grace_ns));
     try std.testing.expect(protects(std.math.maxInt(u64), std.math.maxInt(u64)));
+}
+
+test "serverless native read plan bounded manifest cuts never renew or retain expired protection" {
+    const objects = @import("objectstore");
+    const a = std.testing.allocator;
+    var memory = objects.MemoryClient.init(a);
+    defer memory.deinit();
+    var backing = try @import("../catalog/object_progress_store.zig").ObjectProgressStore.initWithClient(a, memory.client(), "db", "progress");
+    defer backing.deinit();
+    var progress = backing.progressStore();
+    const now = 100 * std.time.ns_per_s;
+    try std.testing.expectError(error.ManifestReadLeaseExpired, acquireBoundedAt(&progress, "ns", 3, now, 1));
+    const deadline = now + 20 * std.time.ns_per_s;
+    try std.testing.expect(try progress.compareAndSwapManifestReadDeadline("ns", 3, null, deadline));
+    const cut = try acquireBoundedAt(&progress, "ns", 3, now, 1);
+    try std.testing.expectEqual(deadline, cut.unix_deadline);
+    try std.testing.expectEqual(20 * std.time.ns_per_s + 1, cut.authority_deadline);
+    try std.testing.expectEqual(deadline, (try progress.getManifestReadDeadline("ns", 3)).?);
+    try std.testing.expectError(error.ManifestReadLeaseExpired, acquireBoundedAt(&progress, "ns", 3, deadline, 1));
+    try std.testing.expect(try progress.compareAndSwapManifestGcFloor("ns", null, 4));
+    try std.testing.expectError(error.ManifestVersionRetired, acquireBoundedAt(&progress, "ns", 3, now, 1));
+    try std.testing.expect(try progress.compareAndSwapManifestReadDeadline("ns", 4, null, now + duration_ns));
+    const long = try acquireBoundedAt(&progress, "ns", 4, now, 1);
+    try std.testing.expectEqual(now + 30 * std.time.ns_per_s, long.unix_deadline);
+    try std.testing.expectError(error.ManifestReadLeaseExpired, acquireBoundedAt(&progress, "ns", 4, 0, 1));
 }

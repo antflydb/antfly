@@ -82,6 +82,36 @@ pub const Connection = struct {
         return connection;
     }
 
+    /// Offline compaction must settle named indexes as well as the default
+    /// namespace. Copy the catalog before any maintenance changes its pages.
+    pub fn prepareCompact(self: *Connection) !void {
+        const catalog = @import("embedded_catalog.zig");
+        const a = self.db.alloc;
+        const bytes = try self.db.core.getStoreValue(a, catalog.key);
+        defer if (bytes) |value| a.free(value);
+        try prepareDatabaseCompact(&self.db);
+        if (bytes) |value| {
+            const parsed = try std.json.parseFromSlice(catalog.Catalog, a, value, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            try catalog.validate(parsed.value);
+            for (parsed.value.tables) |table| {
+                const namespace = try catalog.namespaceAlloc(a, table.id);
+                defer a.free(namespace);
+                var options: db_mod.OpenOptions = .{
+                    .open_mode = .writer,
+                    .external_derived_checkpoints = false,
+                    .identity_namespace = .{ .table_id = table.id, .shard_id = table.id, .range_id = table.id },
+                    .prefer_existing_identity_namespace = false,
+                    .online_source_authority = .native,
+                };
+                try self.backend.configureDbOpenOptionsForNamespace(&options, namespace);
+                var database = try db_mod.DB.open(a, self.db.core.path, options);
+                defer database.close();
+                try prepareDatabaseCompact(&database);
+            }
+        }
+    }
+
     pub fn close(self: *Connection) void {
         if (openModeCanWrite(self.open_mode)) {
             self.db.sync(true) catch {};
@@ -92,6 +122,16 @@ pub const Connection = struct {
         self.* = undefined;
     }
 };
+
+/// Explicit maintenance may repeat bounded replay turns until idle, then
+/// merge each text index before the physical vacuum measures live storage.
+pub fn prepareDatabaseCompact(database: *db_mod.DB) !void {
+    try database.runUntilIdle();
+    try database.forceCompactTextIndexes();
+    try database.drainScheduledTextMerges();
+    try database.sync(true);
+    try database.syncIndexes(true);
+}
 
 /// Embedded Lite's root is the future standalone `default` table. Assigning
 /// that deterministic identity at file creation avoids an O(live documents)

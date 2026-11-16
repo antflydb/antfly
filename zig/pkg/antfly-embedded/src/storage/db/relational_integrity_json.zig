@@ -18,6 +18,17 @@
 const std = @import("std");
 
 pub fn write(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
+    return writeMode(value, stream, false);
+}
+
+/// Compact process-local transport. Valid UTF-8 byte slices use JSON strings;
+/// arbitrary binary identities retain the existing byte-array representation.
+/// The canonical command writer above remains unchanged.
+pub fn writeCompact(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
+    return writeMode(value, stream, true);
+}
+
+fn writeMode(value: anytype, stream: anytype, comptime compact: bool) @TypeOf(stream.*).Error!void {
     const T = @TypeOf(value);
     // std.json.Value is a semantic JSON tree. Its object representation owns
     // hash-map pointers, which are not part of the wire format; delegate that
@@ -26,12 +37,12 @@ pub fn write(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     if (comptime T == std.json.Value) return stream.write(value);
     switch (@typeInfo(T)) {
         .@"struct" => |info| {
-            if (@hasDecl(T, "nativeJsonProjection")) return write(value.nativeJsonProjection(), stream);
+            if (@hasDecl(T, "nativeJsonProjection")) return writeMode(value.nativeJsonProjection(), stream, compact);
             try stream.beginObject();
             inline for (info.field_names) |reflected_name| {
                 if (!@hasDecl(T, "nativeJsonSkipField") or !value.nativeJsonSkipField(reflected_name)) {
                     try stream.objectField(reflected_name);
-                    try write(@field(value, reflected_name), stream);
+                    try writeMode(@field(value, reflected_name), stream, compact);
                 }
             }
             try stream.endObject();
@@ -42,23 +53,26 @@ pub fn write(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
             switch (value) {
                 inline else => |payload, tag| {
                     try stream.objectField(@tagName(tag));
-                    try write(payload, stream);
+                    try writeMode(payload, stream, compact);
                 },
             }
             try stream.endObject();
         },
         .pointer => |info| {
             if (info.size != .slice) @compileError("integrity commands cannot serialize pointer identities");
+            if (comptime compact and info.child == u8) {
+                if (std.unicode.utf8ValidateSlice(value)) return stream.write(value);
+            }
             try stream.beginArray();
-            for (value) |element| try write(element, stream);
+            for (value) |element| try writeMode(element, stream, compact);
             try stream.endArray();
         },
         .array => {
             try stream.beginArray();
-            for (value) |element| try write(element, stream);
+            for (value) |element| try writeMode(element, stream, compact);
             try stream.endArray();
         },
-        .optional => if (value) |payload| try write(payload, stream) else try stream.write(null),
+        .optional => if (value) |payload| try writeMode(payload, stream, compact) else try stream.write(null),
         .void => {
             // std.json's canonical tagged-union representation for void.
             try stream.beginObject();
@@ -67,4 +81,23 @@ pub fn write(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
         .@"enum" => try stream.write(@tagName(value)),
         else => try stream.write(value),
     }
+}
+
+test "privacy compact metadata transport preserves binary bytes without expanding text" {
+    const a = std.testing.allocator;
+    const Input = struct { text: []const u8, binary: []const u8 };
+    const input: Input = .{ .text = "scan cursor", .binary = &.{ 0xff, 0, 0xfe } };
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+    try writeCompact(input, &stream);
+    try std.testing.expectEqualStrings("{\"text\":\"scan cursor\",\"binary\":[255,0,254]}", output.written());
+    var restored = try std.json.parseFromSlice(Input, a, output.written(), .{});
+    defer restored.deinit();
+    try std.testing.expectEqualSlices(u8, input.text, restored.value.text);
+    try std.testing.expectEqualSlices(u8, input.binary, restored.value.binary);
+    output.clearRetainingCapacity();
+    var canonical: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+    try write(input, &canonical);
+    try std.testing.expect(std.mem.startsWith(u8, output.written(), "{\"text\":[115,99,97,110"));
 }

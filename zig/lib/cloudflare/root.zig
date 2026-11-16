@@ -27,6 +27,18 @@ pub const Config = struct {
     url: ?[]const u8 = null,
 };
 
+/// Resolve the exact endpoint used by native transport and physical model
+/// identity. Gateway headers and unused account fields on an explicit URL do
+/// not identify a different recognizer. Caller owns the result.
+pub fn nativeEndpointAlloc(a: A, config: Config) ![]u8 {
+    const canonical = try routing.nativeUrl(a, config.account_id, config.model);
+    if (config.url) |url| {
+        defer a.free(canonical);
+        return a.dupe(u8, url);
+    }
+    return canonical;
+}
+
 /// Reuses the caller's pooled HTTP client, secret resolution, deadline and
 /// cancellation. One task call is exactly one upstream attempt.
 pub fn invoke(client: anytype, a: A, config: Config, payload: V, options: anytype) !V {
@@ -56,18 +68,27 @@ pub fn decodeNative(a: A, body: []const u8) !V {
 /// Native JSON and binary adapters share one bounded upstream attempt. The
 /// response retains the HTTP client's buffer until the adapter releases it.
 pub fn postNative(client: anytype, a: A, config: Config, payload: V, options: anytype) anyerror!@typeInfo(@TypeOf(client.post("", .{}))).error_union.payload {
+    const encoded = try std.json.Stringify.valueAlloc(a, payload, .{});
+    defer a.free(encoded);
+    return postNativeEncoded(client, a, config, encoded, options);
+}
+
+/// Adapters with an admitted JSON encoder borrow their serialized request.
+pub fn postNativeEncoded(client: anytype, a: A, config: Config, encoded: []const u8, options: anytype) anyerror!@typeInfo(@TypeOf(client.post("", .{}))).error_union.payload {
     if (config.gateway_id) |id| {
         if (id.len == 0 or id.len > 256) return error.InvalidCloudflareConfig;
         for (id) |ch| if (ch < 0x21 or ch > 0x7e) return error.InvalidCloudflareConfig;
     }
-    const canonical = try routing.nativeUrl(a, config.account_id, config.model);
-    const url = config.url orelse canonical;
+    const url = try nativeEndpointAlloc(a, config);
+    defer a.free(url);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{config.api_key});
+    defer a.free(auth);
     var headers = std.ArrayList([2][]const u8).empty;
+    defer headers.deinit(a);
     try headers.append(a, .{ "Authorization", auth });
     if (config.gateway_id) |id| try headers.append(a, .{ "cf-aig-gateway-id", id });
     var response = try client.post(url, .{
-        .json = try std.json.Stringify.valueAlloc(a, payload, .{}),
+        .json = encoded,
         .headers = headers.items,
         .max_retries = 0,
         .cookies_enabled = false,

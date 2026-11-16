@@ -30,6 +30,7 @@ pub const DownloadedContent = struct {
 pub const HttpError = struct {
     status: u16,
     message: []const u8,
+    retry_after_ms: ?u64 = null,
 };
 
 pub const DownloadOutcome = union(enum) {
@@ -37,29 +38,11 @@ pub const DownloadOutcome = union(enum) {
     http_error: HttpError,
 };
 
-pub const ContentSecurityConfig = struct {
-    allowed_hosts: ?[]const []u8 = null,
-    block_private_ips: ?bool = null,
-    nat64_prefixes: ?[]const []u8 = null,
-    max_download_size_bytes: ?u64 = null,
-    download_timeout_seconds: ?u32 = null,
-    max_image_dimension: ?u32 = null,
-    allowed_paths: ?[]const []u8 = null,
-    user_agent: ?[]u8 = null,
-};
-
-pub const RemoteContentConfig = struct {
-    security: ?ContentSecurityConfig = null,
-    default_s3: ?[]u8 = null,
-    s3: EmptyCredentialMap = .{},
-    http: EmptyCredentialMap = .{},
-};
-
-pub const EmptyCredentialMap = struct {
-    pub fn count(_: EmptyCredentialMap) usize {
-        return 0;
-    }
-};
+// Configuration and lease lifetimes are portable contracts. Reuse their
+// canonical definitions so browser workers retain the same snapshot ownership
+// semantics without enabling the unsupported native fetch operation below.
+pub const ContentSecurityConfig = @import("antfly_scraping").ContentSecurityConfig;
+pub const RemoteContentConfig = @import("antfly_scraping").RemoteContentConfig;
 
 pub fn dataUriDecodedSize(uri: []const u8) !usize {
     return (try data_uri.parseRequired(uri)).decodedSize();
@@ -77,5 +60,9 @@ pub fn downloadContentOutcomeAllocWithHeaders(
     _ = security;
     _ = headers;
     _ = content_type_hint;
+    return error.UnsupportedPlatform;
+}
+
+pub fn authorizeLocalSource(_: std.mem.Allocator, _: std.Io, _: []const u8, _: ?*const RemoteContentConfig) !void {
     return error.UnsupportedPlatform;
 }

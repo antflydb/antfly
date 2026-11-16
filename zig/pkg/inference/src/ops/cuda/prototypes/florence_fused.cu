@@ -127,6 +127,9 @@ extern "C" __global__ void florence_cross_q1_f32(
         __syncthreads();
     }
     const float maximum = scratch[0];
+    // Every warp must snapshot the maximum before scratch[0] is reused
+    // for the denominator, even when warp scheduling is uneven.
+    __syncthreads();
     float local_denom = 0.f;
     for (unsigned token = tid; token < sequence; token += 256) {
         const float e = expf(scores[token] - maximum);

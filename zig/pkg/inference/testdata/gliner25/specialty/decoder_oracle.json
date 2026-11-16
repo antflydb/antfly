@@ -1,0 +1,477 @@
+{
+  "format_version": 1,
+  "upstream": {
+    "repository": "https://github.com/fastino-ai/GLiNER2.git",
+    "commit": "3c913c7369301133d3b7699252074c4303ada50e",
+    "package_version": "2.0.0",
+    "source_sha256": "042ea6064ddb439ccff6c6ac5eb7850dac6d9cc74bc33cbef40928e8f653b020"
+  },
+  "coordinate_unit": "unicode_codepoints",
+  "overlap_cases": [
+    {
+      "id": "greedy_differs_from_weighted",
+      "candidates": [
+        [
+          "long",
+          0.75,
+          0,
+          5
+        ],
+        [
+          "left",
+          0.5,
+          0,
+          2
+        ],
+        [
+          "right",
+          0.5,
+          3,
+          5
+        ]
+      ],
+      "omitted_overlap": [
+        [
+          "long",
+          0.75,
+          0,
+          5
+        ]
+      ],
+      "explicit_flat": [
+        [
+          "left",
+          0.5,
+          0,
+          2
+        ],
+        [
+          "right",
+          0.5,
+          3,
+          5
+        ]
+      ],
+      "explicit_allow": [
+        [
+          "long",
+          0.75,
+          0,
+          5
+        ],
+        [
+          "left",
+          0.5,
+          0,
+          2
+        ],
+        [
+          "right",
+          0.5,
+          3,
+          5
+        ]
+      ]
+    },
+    {
+      "id": "stable_equal_confidence",
+      "candidates": [
+        [
+          "first",
+          0.5,
+          2,
+          8
+        ],
+        [
+          "second",
+          0.5,
+          2,
+          15
+        ],
+        [
+          "third",
+          0.5,
+          9,
+          15
+        ]
+      ],
+      "omitted_overlap": [
+        [
+          "first",
+          0.5,
+          2,
+          8
+        ],
+        [
+          "third",
+          0.5,
+          9,
+          15
+        ]
+      ],
+      "explicit_flat": [
+        [
+          "first",
+          0.5,
+          2,
+          8
+        ],
+        [
+          "third",
+          0.5,
+          9,
+          15
+        ]
+      ],
+      "explicit_allow": [
+        [
+          "first",
+          0.5,
+          2,
+          8
+        ],
+        [
+          "second",
+          0.5,
+          2,
+          15
+        ],
+        [
+          "third",
+          0.5,
+          9,
+          15
+        ]
+      ]
+    }
+  ],
+  "count_threshold_unicode_cases": [
+    {
+      "id": "count_0",
+      "predicted_count": 0,
+      "text": "😀 Élodie Élodie",
+      "threshold": 0.5,
+      "span_logits": [
+        [
+          0.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0
+        ],
+        [
+          0.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0
+        ],
+        [
+          0.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0
+        ]
+      ],
+      "start_mapping": [
+        0,
+        2,
+        9
+      ],
+      "end_mapping": [
+        1,
+        8,
+        15
+      ],
+      "expected": {
+        "entities": {}
+      }
+    },
+    {
+      "id": "count_1",
+      "predicted_count": 1,
+      "text": "😀 Élodie Élodie",
+      "threshold": 0.5,
+      "span_logits": [
+        [
+          0.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0
+        ],
+        [
+          0.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0
+        ],
+        [
+          0.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0
+        ]
+      ],
+      "start_mapping": [
+        0,
+        2,
+        9
+      ],
+      "end_mapping": [
+        1,
+        8,
+        15
+      ],
+      "expected": {
+        "entities": {
+          "person": [
+            {
+              "text": "😀",
+              "confidence": 0.5,
+              "start": 0,
+              "end": 1
+            },
+            {
+              "text": "Élodie",
+              "confidence": 0.5,
+              "start": 2,
+              "end": 8
+            },
+            {
+              "text": "Élodie",
+              "confidence": 0.5,
+              "start": 9,
+              "end": 15
+            }
+          ],
+          "alias": [
+            {
+              "text": "😀",
+              "confidence": 0.5,
+              "start": 0,
+              "end": 1
+            },
+            {
+              "text": "Élodie",
+              "confidence": 0.5,
+              "start": 2,
+              "end": 8
+            },
+            {
+              "text": "Élodie",
+              "confidence": 0.5,
+              "start": 9,
+              "end": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "count_2",
+      "predicted_count": 2,
+      "text": "😀 Élodie Élodie",
+      "threshold": 0.5,
+      "span_logits": [
+        [
+          0.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0
+        ],
+        [
+          0.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0
+        ],
+        [
+          0.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0
+        ]
+      ],
+      "start_mapping": [
+        0,
+        2,
+        9
+      ],
+      "end_mapping": [
+        1,
+        8,
+        15
+      ],
+      "expected": {
+        "entities": {
+          "person": [
+            {
+              "text": "😀",
+              "confidence": 0.5,
+              "start": 0,
+              "end": 1
+            },
+            {
+              "text": "Élodie",
+              "confidence": 0.5,
+              "start": 2,
+              "end": 8
+            },
+            {
+              "text": "Élodie",
+              "confidence": 0.5,
+              "start": 9,
+              "end": 15
+            }
+          ],
+          "alias": [
+            {
+              "text": "😀",
+              "confidence": 0.5,
+              "start": 0,
+              "end": 1
+            },
+            {
+              "text": "Élodie",
+              "confidence": 0.5,
+              "start": 2,
+              "end": 8
+            },
+            {
+              "text": "Élodie",
+              "confidence": 0.5,
+              "start": 9,
+              "end": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "count_19",
+      "predicted_count": 19,
+      "text": "😀 Élodie Élodie",
+      "threshold": 0.5,
+      "span_logits": [
+        [
+          0.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0
+        ],
+        [
+          0.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0
+        ],
+        [
+          0.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0,
+          -100.0
+        ]
+      ],
+      "start_mapping": [
+        0,
+        2,
+        9
+      ],
+      "end_mapping": [
+        1,
+        8,
+        15
+      ],
+      "expected": {
+        "entities": {
+          "person": [
+            {
+              "text": "😀",
+              "confidence": 0.5,
+              "start": 0,
+              "end": 1
+            },
+            {
+              "text": "Élodie",
+              "confidence": 0.5,
+              "start": 2,
+              "end": 8
+            },
+            {
+              "text": "Élodie",
+              "confidence": 0.5,
+              "start": 9,
+              "end": 15
+            }
+          ],
+          "alias": [
+            {
+              "text": "😀",
+              "confidence": 0.5,
+              "start": 0,
+              "end": 1
+            },
+            {
+              "text": "Élodie",
+              "confidence": 0.5,
+              "start": 2,
+              "end": 8
+            },
+            {
+              "text": "Élodie",
+              "confidence": 0.5,
+              "start": 9,
+              "end": 15
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -67,7 +67,7 @@ import requests
 
 from .models import (
     DEFAULT_EXTRACTOR_MODEL,
-    bootstrap_models_for_listing,
+    prefetch_test_models,
     inference_server_command,
     maybe_pull_missing_model,
     ml_dir,
@@ -559,8 +559,26 @@ class InferenceServer:
             self.output.close()
 
 
+def _model_provision_plan(items):
+    selected, groups = [], []
+    for item in items:
+        required = tuple(
+            name
+            for marker in item.iter_markers("inference_models")
+            for name in marker.args
+        )
+        if required:
+            # A concrete declaration replaces broad file/family defaults. Keep
+            # module/function markers together as one complete test dependency.
+            groups.append(required)
+        else:
+            marker = item.get_closest_marker("inference_model")
+            selected.append((Path(item.path).name, marker.args[0] if marker else None))
+    return selected, tuple(groups)
+
+
 @pytest.fixture(scope="session")
-def base_url():
+def base_url(request):
     """Return the base URL of the inference server under test.
 
     If ANTFLY_INFERENCE_URL is set, use it directly (external server).
@@ -597,7 +615,10 @@ def base_url():
             "ANTFLY_INFERENCE_REQUIRE_SELECTED_BACKEND"
         )
 
+    forced_eviction = getattr(request, "param", None) == "eviction"
     url = env_first("ANTFLY_INFERENCE_URL")
+    if url and forced_eviction:
+        pytest.skip("forced-eviction coverage requires an E2E-managed one-model server")
     if url:
         if required_backend:
             raise pytest.UsageError(
@@ -615,6 +636,8 @@ def base_url():
     except RuntimeError:
         pytest.skip("Set ANTFLY_INFERENCE_URL or ANTFLY_BIN to run E2E tests")
 
+    selected, groups = _model_provision_plan(request.session.items)
+    prefetch_test_models(selected, required_model_groups=groups)
     models_path = str(models_dir())
     ml_path = str(ml_dir())
 
@@ -625,7 +648,9 @@ def base_url():
         ml_path,
         "127.0.0.1",
         port,
-        max_loaded_models=env_first("ANTFLY_INFERENCE_MAX_LOADED_MODELS"),
+        max_loaded_models="1"
+        if forced_eviction
+        else env_first("ANTFLY_INFERENCE_MAX_LOADED_MODELS"),
         extra_args=_server_budget_args(),
     )
     _LOCAL_SERVERS_BY_URL[server.url] = server
@@ -900,9 +925,26 @@ def api(base_url):
             _check(r)
             return r.json()
 
-        def transcribe(self, audio: str, model: str, **kwargs):
-            body = {"model": model, "audio": audio, **kwargs}
-            r = self.post("/transcribe", json=body)
+        def read_audio(
+            self,
+            audio: str,
+            model: str,
+            *,
+            language=None,
+            timestamps=None,
+            diarization=None,
+            **kwargs,
+        ):
+            options = dict(kwargs.pop("audio_options", {}))
+            for key, value in {
+                "language": language,
+                "timestamps": timestamps,
+                "diarization": diarization,
+            }.items():
+                if value is not None:
+                    options[key] = value
+            body = {"model": model, "audio": audio, "audio_options": options, **kwargs}
+            r = self.post("/read", json=body)
             _check(r)
             return r.json()
 
@@ -948,10 +990,6 @@ def api(base_url):
             r = self.get("/models", retry_on_missing_model=False)
             _check(r)
             payload = r.json()
-            if bootstrap_models_for_listing(payload):
-                r = self.get("/models", retry_on_missing_model=False)
-                _check(r)
-                payload = r.json()
             return payload
 
         def readyz(self):
@@ -971,6 +1009,13 @@ def openai_client(base_url):
 
 def pytest_configure(config):
     """Model downloads are handled lazily by the request helpers when enabled."""
+    config.addinivalue_line(
+        "markers", "inference_model(name): primary model affinity for CI scheduling"
+    )
+    config.addinivalue_line(
+        "markers",
+        "inference_models(*names): concrete curated models required before catalog discovery",
+    )
     if os.environ.get("ANTFLY_INFERENCE_DOWNLOAD") == "1":
         print(
             "ANTFLY_INFERENCE_DOWNLOAD=1: missing E2E models will be fetched with `antfly inference pull` on demand"

@@ -147,27 +147,13 @@ pub const Pipeline = struct {
         );
         defer encoded_query.deinit();
 
-        var prepared_images = std.ArrayListUnmanaged(qwen2vl.PreparedImage).empty;
-        defer {
-            for (prepared_images.items) |*image| image.deinit();
-            prepared_images.deinit(self.allocator);
+        const counts = try self.allocator.alloc(usize, images.len);
+        defer self.allocator.free(counts);
+        for (images, counts) |encoded, *count| {
+            if (self.execution_control) |control| try control.check();
+            count.* = (try qwen2vl.imageGeometryForEncoded(encoded, self.prep_cfg)).image_token_count;
         }
-        for (images) |image| {
-            try prepared_images.append(
-                self.allocator,
-                try qwen2vl.prepareImage(self.allocator, image, self.prep_cfg),
-            );
-        }
-        var prepared_document = try prepareDocumentPrompt(
-            self.allocator,
-            self.tok,
-            self.config.prompt,
-            self.gpt_cfg,
-            prepared_images.items,
-            document_text,
-            self.max_length,
-            self.add_bos_token,
-        );
+        var prepared_document = try prepareDocumentPromptForCounts(self.allocator, self.tok, self.config.prompt, self.gpt_cfg, counts, document_text, self.max_length, self.add_bos_token);
         defer prepared_document.deinit();
 
         return @max(
@@ -194,6 +180,14 @@ pub const Pipeline = struct {
         );
     }
 };
+
+/// Takes ownership on both success and failure. Keep this guard even when a
+/// caller preallocates list capacity, so future producers cannot lose a tensor
+/// between backend execution and publication into the cleanup inventory.
+fn appendOwnedImageEmbedding(cb: *const ComputeBackend, allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(NativeImageEmbedding), image: NativeImageEmbedding) !void {
+    errdefer cb.free(image.tensor);
+    try list.append(allocator, image);
+}
 
 fn activeTokenLength(mask: []const i32) usize {
     var last_active: usize = 0;
@@ -264,10 +258,11 @@ pub fn scoreDocument(
         for (prepared_images.items) |*img| img.deinit();
         prepared_images.deinit(allocator);
     }
+    try prepared_images.ensureTotalCapacity(allocator, images.len);
     for (images, 0..) |img, index| {
         if (execution_control) |control|
             try control.update(.tokenizing, @intCast(index), @intCast(images.len));
-        try prepared_images.append(allocator, try qwen2vl.prepareImage(allocator, img, prep_cfg));
+        prepared_images.appendAssumeCapacity(try qwen2vl.prepareImage(allocator, img, prep_cfg));
     }
 
     var prepared_doc = try prepareDocumentPrompt(allocator, tok, prompt_cfg, gpt_cfg, prepared_images.items, document_text, max_length, add_bos_token);
@@ -282,19 +277,21 @@ pub fn scoreDocument(
         native_image_embeddings.deinit(allocator);
     }
     if (vision_session == null) {
+        try native_image_embeddings.ensureTotalCapacity(allocator, prepared_images.items.len);
         for (prepared_images.items, 0..) |prepared, index| {
             if (execution_control) |control|
                 try control.update(.executing, @intCast(index), @intCast(prepared_images.items.len));
-            try native_image_embeddings.append(allocator, .{
+            try appendOwnedImageEmbedding(cb, allocator, &native_image_embeddings, .{
                 .tensor = try qwen2vl_vision.encodePreparedImageTokensTensor(cb, allocator, gpt_cfg, prep_cfg, prepared),
                 .token_count = prepared.image_token_count,
             });
         }
     } else {
+        try image_embeddings.ensureTotalCapacity(allocator, prepared_images.items.len);
         for (prepared_images.items, 0..) |prepared, index| {
             if (execution_control) |control|
                 try control.update(.executing, @intCast(index), @intCast(prepared_images.items.len));
-            try image_embeddings.append(allocator, try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared, execution_control));
+            image_embeddings.appendAssumeCapacity(try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared, execution_control));
         }
     }
 
@@ -326,12 +323,15 @@ pub fn prepareDocumentPrompt(
     max_length: usize,
     add_bos_token: bool,
 ) !qwen2vl.PreparedTextInput {
-    const prompt = try buildDocumentPromptString(allocator, prompt_cfg, prepared_images.len, document_text);
-    defer allocator.free(prompt);
-
     const counts = try allocator.alloc(usize, prepared_images.len);
     defer allocator.free(counts);
     for (prepared_images, 0..) |prepared, idx| counts[idx] = prepared.image_token_count;
+    return prepareDocumentPromptForCounts(allocator, tok, prompt_cfg, config, counts, document_text, max_length, add_bos_token);
+}
+
+fn prepareDocumentPromptForCounts(allocator: std.mem.Allocator, tok: Tokenizer, prompt_cfg: PromptConfig, config: gpt_mod.Config, counts: []const usize, document_text: []const u8, max_length: usize, add_bos_token: bool) !qwen2vl.PreparedTextInput {
+    const prompt = try buildDocumentPromptString(allocator, prompt_cfg, counts.len, document_text);
+    defer allocator.free(prompt);
     return encodeDocumentPromptWithImageExpansion(allocator, tok, prompt, config, counts, max_length, add_bos_token);
 }
 
@@ -866,5 +866,36 @@ test "encodeDocumentPromptWithImageExpansion truncates image placeholder run to 
     }
     for (prepared.attention_mask) |value| {
         try std.testing.expectEqual(@as(i32, 1), value);
+    }
+}
+
+test "image decode admission native image publication transfers or destroys its tensor exactly once" {
+    const Fake = struct {
+        frees: usize = 0,
+        fn free(raw: *anyopaque, _: CT) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.frees += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |deny| {
+        var fake = Fake{};
+        var table: ComputeBackend.VTable = undefined;
+        table.freeTensor = Fake.free;
+        const cb = ComputeBackend{ .ptr = &fake, .vtable = &table };
+        var marker: u8 = 0;
+        const image = NativeImageEmbedding{ .tensor = @ptrCast(&marker), .token_count = 1 };
+        var list = std.ArrayListUnmanaged(NativeImageEmbedding).empty;
+        const a = if (deny) std.testing.failing_allocator else std.testing.allocator;
+        defer list.deinit(a);
+        if (deny) {
+            try std.testing.expectError(error.OutOfMemory, appendOwnedImageEmbedding(&cb, a, &list, image));
+            try std.testing.expectEqual(@as(usize, 0), list.items.len);
+        } else {
+            try appendOwnedImageEmbedding(&cb, a, &list, image);
+            try std.testing.expectEqual(@as(usize, 0), fake.frees);
+            try std.testing.expectEqual(@as(usize, 1), list.items.len);
+            for (list.items) |owned| cb.free(owned.tensor);
+        }
+        try std.testing.expectEqual(@as(usize, 1), fake.frees);
     }
 }

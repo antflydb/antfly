@@ -1,0 +1,688 @@
+{
+  "format_version": 1,
+  "date": "2026-11-03",
+  "qualification_status": "partial",
+  "problem": "Native encoded-token capacity failed at the serving request heap despite larger aggregate budgets.",
+  "runtime_source_commit": "42d3eb1b7b60a2b8aacb8526580863a7b9ee8e9b",
+  "qualification_tools_commit": "2ca873bf37a1ff2d2faf6c586a5fcd1cdb6e1ec5",
+  "baseline_commit": "7cf3812a345c2f483cc0042bdb790ead6b43ce1c",
+  "source_sha256": {
+    "zig/pkg/inference/src/architectures/deberta.zig": "a73e5570db356422663e4eaee51fa93e37d607b1a395fdb174cdf5e6988348fa",
+    "zig/pkg/inference/src/extractors/gliner_boundary_executor.zig": "8a6cd11f494ec1770ac63d4754422fcf926853e21c28cb2f40a5a2a1f73da96e",
+    "zig/pkg/inference/scripts/gliner25/benchmark_linux_cpu_http.py": "448b869e43a513bae82f1e6ba31ad04b22869a77126126d373c09943a06ab807",
+    "zig/pkg/inference/scripts/gliner25/qualify_context_http.py": "99859ee2d11ca06bee68dba48db143f7095504472b7dbdcbe88fd366561b13c9"
+  },
+  "debug_validation": {
+    "selected": 6,
+    "passed": 6,
+    "skipped": 0,
+    "request_heap_limit_bytes": 536870912,
+    "learned_peaks_bytes": {
+      "word_4096": 186167928,
+      "four_word_4096_windows": 384021726,
+      "encoded_tokens_16381": 517336416
+    },
+    "coverage": [
+      "real native encoder/head/decoder",
+      "compact/eager relative projection parity",
+      "all allocator failure points through a complete synthetic encoder layer",
+      "padded host encoder cleanup",
+      "pinned base all-task pipeline parity"
+    ],
+    "before_failure": {
+      "requested_bytes": 50322432,
+      "live_bytes": 515489000,
+      "limit_bytes": 536870912,
+      "site": "native tiled attention output allocation"
+    },
+    "tested_runtime_patch_sha256": "9c4842523d08ecd8e1bbbf48eef9ac6c57b5266f198a0fa0ec5f82120ee1147a"
+  },
+  "exact_native_http_capacity": {
+    "status": "complete",
+    "prompt_tokens": 16384,
+    "total_tokens": 16384,
+    "window_count": 1,
+    "model_id": "fastino/gliner2.5-base-v1",
+    "model_revision": "72ac19b486cd4557424c8d61114e7530c243e9b0",
+    "native_cpu_threads": 2,
+    "aggregate_host_limit_bytes": 8589934592,
+    "aggregate_scratch_limit_bytes": 1073741824,
+    "request_heap_limit_bytes": 536870912,
+    "duration_ns": 204781922167,
+    "accuracy_qualified": false
+  },
+  "performance_assessment": "Partial. Corrected four-client run completed100 pairs each for short_entities and reference_windows, both meeting the predeclared upper95% median-ratio bound<=1.05. It failed during composed_windows after53 completed pairs with candidate live-host admission refusal. Earlier concurrent timings are superseded. Single-client uncertainty and the isolated slowdown remain recorded; no overall performance or production-tail qualification is claimed.",
+  "aggregate_ci": {
+    "status": "pending",
+    "run_url": "https://github.com/antflydb/antfly/actions/runs/41733141867",
+    "note": "Earlier merged-main runs were superseded/cancelled. No aggregate repository pass is claimed."
+  },
+  "sdk_changes_required": false,
+  "scope_exclusions": [
+    "long-context model accuracy",
+    "CUDA HTTP throughput",
+    "dedicated-host production tail latency",
+    "full Beads factory qualification"
+  ],
+  "performance_runs": {
+    "http-fixed-c1": {
+      "format_version": 1,
+      "status": "complete",
+      "scope": "warm_http",
+      "host": {
+        "system": "Darwin",
+        "machine": "arm64",
+        "kernel": "27.0.0",
+        "cpuinfo": null,
+        "affinity": null,
+        "cgroup": null,
+        "mountinfo": null,
+        "meminfo": null,
+        "commit": "2ca873bf37a1ff2d2faf6c586a5fcd1cdb6e1ec5",
+        "source_dirty": false,
+        "untracked_source_sha256": {},
+        "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "kernel_override": "auto",
+        "thread_override": null
+      },
+      "cases_sha256": "7731f939c9353345cb2bfc861ed81e2d23f42455453256829b10a6bc8f5a7359",
+      "artifacts": {
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-local-baseline/zig/zig-out/bin/antfly-inference-http-server": "ac7506cb30411829e21a1d80539d4339498a7517dd1071f2ba27c1ce7ba6548f",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/zig-out/bin/antfly-inference-http-server": "20f15770db057b64b3c2bf36e37758f5d6509f0a1b9b7287bc9a18b17ed8c06e",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/config.json": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/encoder_config/config.json": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/model.safetensors": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer.json": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer_config.json": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+      },
+      "arms": {
+        "baseline": "http://127.0.0.1:18775",
+        "candidate": "http://127.0.0.1:18776"
+      },
+      "warmup": 3,
+      "pairs": 100,
+      "concurrency": 1,
+      "round_scope": "single_request",
+      "timing": {
+        "client_latency": "HTTP send through response-body read; excludes JSON parsing and oracle comparison",
+        "burst": "barrier release through last response-body read; includes client dispatch and payload encoding"
+      },
+      "performance_release_qualified": false,
+      "comparisons": {
+        "short_entities": {
+          "candidate_ns": {
+            "min": 18720417.0,
+            "median": 83196896.0,
+            "mean": 118282605.82,
+            "p95": 323262056.84999996,
+            "max": 475159250.0,
+            "cv": 0.8733724779162412
+          },
+          "baseline_ns": {
+            "min": 16665459.0,
+            "median": 27294750.0,
+            "mean": 40704090.48,
+            "p95": 116432574.69999999,
+            "max": 243494584.0,
+            "cv": 0.9350805228133773
+          },
+          "candidate_over_baseline": {
+            "lower_95": 1.8339449798597642,
+            "median": 2.953007704951375,
+            "upper_95": 3.6096898271428657,
+            "samples": 2000,
+            "seed": 20260730,
+            "estimator": "median_paired_log_ratio"
+          }
+        },
+        "reference_windows": {
+          "candidate_ns": {
+            "min": 246038083.0,
+            "median": 325567416.5,
+            "mean": 676876432.06,
+            "p95": 2261393613.1499996,
+            "max": 2788677833.0,
+            "cv": 1.0056229196730733
+          },
+          "baseline_ns": {
+            "min": 258732958.0,
+            "median": 343485062.5,
+            "mean": 623231525.02,
+            "p95": 2221464323.25,
+            "max": 2803509333.0,
+            "cv": 0.9482747883385529
+          },
+          "candidate_over_baseline": {
+            "lower_95": 0.9574907894567598,
+            "median": 0.9786553033061097,
+            "upper_95": 1.0140948012133266,
+            "samples": 2000,
+            "seed": 20260730,
+            "estimator": "median_paired_log_ratio"
+          }
+        },
+        "composed_windows": {
+          "candidate_ns": {
+            "min": 252142083.0,
+            "median": 288070229.0,
+            "mean": 292907973.32,
+            "p95": 346515260.09999996,
+            "max": 376259625.0,
+            "cv": 0.08840354457275465
+          },
+          "baseline_ns": {
+            "min": 256994208.0,
+            "median": 295380625.0,
+            "mean": 299197242.0,
+            "p95": 344041102.09999996,
+            "max": 407357709.0,
+            "cv": 0.08818376248006901
+          },
+          "candidate_over_baseline": {
+            "lower_95": 0.966202037477878,
+            "median": 0.9745012292980809,
+            "upper_95": 0.9879907262935326,
+            "samples": 2000,
+            "seed": 20260730,
+            "estimator": "median_paired_log_ratio"
+          }
+        }
+      },
+      "raw_report_sha256": "6cd96b46966b3025cf3222a0f8eb088142b3d4de8ee0a2f4988384dd2207b243"
+    },
+    "http-fixed-c4": {
+      "format_version": 1,
+      "status": "complete",
+      "scope": "warm_http",
+      "host": {
+        "system": "Darwin",
+        "machine": "arm64",
+        "kernel": "27.0.0",
+        "cpuinfo": null,
+        "affinity": null,
+        "cgroup": null,
+        "mountinfo": null,
+        "meminfo": null,
+        "commit": "2ca873bf37a1ff2d2faf6c586a5fcd1cdb6e1ec5",
+        "source_dirty": false,
+        "untracked_source_sha256": {},
+        "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "kernel_override": "auto",
+        "thread_override": null
+      },
+      "cases_sha256": "7731f939c9353345cb2bfc861ed81e2d23f42455453256829b10a6bc8f5a7359",
+      "artifacts": {
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-local-baseline/zig/zig-out/bin/antfly-inference-http-server": "ac7506cb30411829e21a1d80539d4339498a7517dd1071f2ba27c1ce7ba6548f",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/zig-out/bin/antfly-inference-http-server": "20f15770db057b64b3c2bf36e37758f5d6509f0a1b9b7287bc9a18b17ed8c06e",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/config.json": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/encoder_config/config.json": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/model.safetensors": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer.json": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer_config.json": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+      },
+      "arms": {
+        "baseline": "http://127.0.0.1:18775",
+        "candidate": "http://127.0.0.1:18776"
+      },
+      "warmup": 3,
+      "pairs": 100,
+      "concurrency": 4,
+      "round_scope": "synchronized_burst",
+      "timing": {
+        "client_latency": "HTTP send through response-body read; excludes JSON parsing and oracle comparison",
+        "burst": "barrier release through last response-body read; includes client dispatch and payload encoding"
+      },
+      "performance_release_qualified": false,
+      "comparisons": {
+        "short_entities": {
+          "candidate_ns": {
+            "min": 32217792.0,
+            "median": 47267895.5,
+            "mean": 69752621.7,
+            "p95": 176165900.35,
+            "max": 377370041.0,
+            "cv": 0.7932564743455233
+          },
+          "baseline_ns": {
+            "min": 33190083.0,
+            "median": 46273604.5,
+            "mean": 73307219.59,
+            "p95": 201528260.39999992,
+            "max": 327576042.0,
+            "cv": 0.80516912765479
+          },
+          "candidate_over_baseline": {
+            "lower_95": 0.9853636190112617,
+            "median": 1.0237810984105644,
+            "upper_95": 1.0902694653982634,
+            "samples": 2000,
+            "seed": 20260730,
+            "estimator": "median_paired_log_ratio"
+          },
+          "client_latency_ns": {
+            "baseline": {
+              "min": 18323042.0,
+              "median": 34046375.0,
+              "mean": 42306769.8775,
+              "p95": 102397274.99999991,
+              "max": 327468000.0,
+              "cv": 0.8360358433934569
+            },
+            "candidate": {
+              "min": 17661167.0,
+              "median": 33675062.5,
+              "mean": 40768373.13,
+              "p95": 89944987.49999987,
+              "max": 377174958.0,
+              "cv": 0.8120946965307183
+            }
+          },
+          "requests_per_second": {
+            "baseline": 54.5648849099939,
+            "candidate": 57.34551479948173
+          }
+        },
+        "reference_windows": {
+          "candidate_ns": {
+            "min": 572304208.0,
+            "median": 872875541.5,
+            "mean": 952814158.35,
+            "p95": 1608755629.1499999,
+            "max": 2813069458.0,
+            "cv": 0.36673010974830456
+          },
+          "baseline_ns": {
+            "min": 621451417.0,
+            "median": 889202958.0,
+            "mean": 1005568995.85,
+            "p95": 2013794522.8999996,
+            "max": 2378107375.0,
+            "cv": 0.3804590489163871
+          },
+          "candidate_over_baseline": {
+            "lower_95": 0.9242697988430204,
+            "median": 0.9566678271737012,
+            "upper_95": 1.0059933271319788,
+            "samples": 2000,
+            "seed": 20260730,
+            "estimator": "median_paired_log_ratio"
+          },
+          "client_latency_ns": {
+            "baseline": {
+              "min": 523128875.0,
+              "median": 786644812.5,
+              "mean": 846019059.9975,
+              "p95": 1239088166.3499997,
+              "max": 2376431083.0,
+              "cv": 0.3160521033860077
+            },
+            "candidate": {
+              "min": 477266917.0,
+              "median": 761620771.0,
+              "mean": 826036083.965,
+              "p95": 1193600327.099999,
+              "max": 2812693791.0,
+              "cv": 0.3454737991469725
+            }
+          },
+          "requests_per_second": {
+            "baseline": 3.977847384424208,
+            "candidate": 4.198090430275353
+          }
+        },
+        "composed_windows": {
+          "candidate_ns": {
+            "min": 680554625.0,
+            "median": 848934333.5,
+            "mean": 886620186.23,
+            "p95": 1185109202.4,
+            "max": 1262816541.0,
+            "cv": 0.1634527115192553
+          },
+          "baseline_ns": {
+            "min": 656222750.0,
+            "median": 855330937.5,
+            "mean": 881149714.13,
+            "p95": 1131198054.1499999,
+            "max": 1571166083.0,
+            "cv": 0.1694687479775091
+          },
+          "candidate_over_baseline": {
+            "lower_95": 0.972851912928607,
+            "median": 1.0046686991012916,
+            "upper_95": 1.0323656899517883,
+            "samples": 2000,
+            "seed": 20260730,
+            "estimator": "median_paired_log_ratio"
+          },
+          "client_latency_ns": {
+            "baseline": {
+              "min": 520464667.0,
+              "median": 781331291.5,
+              "mean": 799682448.4575,
+              "p95": 1026712302.0499992,
+              "max": 1570879958.0,
+              "cv": 0.16648867821345809
+            },
+            "candidate": {
+              "min": 534325166.0,
+              "median": 768869333.0,
+              "mean": 800937649.5125,
+              "p95": 1053697252.4,
+              "max": 1262551166.0,
+              "cv": 0.1609141880368355
+            }
+          },
+          "requests_per_second": {
+            "baseline": 4.5395236880368115,
+            "candidate": 4.511514696059888
+          }
+        }
+      },
+      "raw_report_sha256": "9cba8e944febf59a8106d56cc4e103b2aacf847a66f83855e40e26f1bad8e61a",
+      "performance_timing_validated": false,
+      "superseded_reason": "Oracle validation could delay other concurrent response timestamps; rerun with transport-only workers."
+    },
+    "http-fixed-full-word-c1": {
+      "format_version": 1,
+      "status": "complete",
+      "scope": "warm_http",
+      "host": {
+        "system": "Darwin",
+        "machine": "arm64",
+        "kernel": "27.0.0",
+        "cpuinfo": null,
+        "affinity": null,
+        "cgroup": null,
+        "mountinfo": null,
+        "meminfo": null,
+        "commit": "2ca873bf37a1ff2d2faf6c586a5fcd1cdb6e1ec5",
+        "source_dirty": false,
+        "untracked_source_sha256": {},
+        "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "kernel_override": "auto",
+        "thread_override": null
+      },
+      "cases_sha256": "c70cef0a51560e2756926a925f60f9b5b381268cba59e7bca74430b1e17ec038",
+      "artifacts": {
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-local-baseline/zig/zig-out/bin/antfly-inference-http-server": "ac7506cb30411829e21a1d80539d4339498a7517dd1071f2ba27c1ce7ba6548f",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/zig-out/bin/antfly-inference-http-server": "20f15770db057b64b3c2bf36e37758f5d6509f0a1b9b7287bc9a18b17ed8c06e",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/config.json": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/encoder_config/config.json": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/model.safetensors": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer.json": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer_config.json": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+      },
+      "arms": {
+        "baseline": "http://127.0.0.1:18775",
+        "candidate": "http://127.0.0.1:18776"
+      },
+      "warmup": 3,
+      "pairs": 20,
+      "concurrency": 1,
+      "round_scope": "single_request",
+      "timing": {
+        "client_latency": "HTTP send through response-body read; excludes JSON parsing and oracle comparison",
+        "burst": "barrier release through last response-body read; includes client dispatch and payload encoding"
+      },
+      "performance_release_qualified": false,
+      "comparisons": {
+        "full_word_reference": {
+          "candidate_ns": {
+            "min": 10670672125.0,
+            "median": 11603989562.5,
+            "mean": 12374793108.2,
+            "p95": 17426408391.0,
+            "max": 19370271791.0,
+            "cv": 0.17769884710367248
+          },
+          "baseline_ns": {
+            "min": 10285370666.0,
+            "median": 11483311041.5,
+            "mean": 11850149666.55,
+            "p95": 15096728276.75,
+            "max": 16568469583.0,
+            "cv": 0.1404755838916053
+          },
+          "candidate_over_baseline": {
+            "lower_95": 0.9978362240955022,
+            "median": 1.0281460036571801,
+            "upper_95": 1.052492666606661,
+            "samples": 2000,
+            "seed": 20260730,
+            "estimator": "median_paired_log_ratio"
+          }
+        }
+      },
+      "raw_report_sha256": "e68499e11bcd048a3f8c23fec2e75bfe96b81a47e56d2d6342f60e9cedd83224"
+    },
+    "http-fixed-full-word-c4": {
+      "format_version": 1,
+      "status": "failed",
+      "scope": "warm_http",
+      "host": {
+        "system": "Darwin",
+        "machine": "arm64",
+        "kernel": "27.0.0",
+        "cpuinfo": null,
+        "affinity": null,
+        "cgroup": null,
+        "mountinfo": null,
+        "meminfo": null,
+        "commit": "2ca873bf37a1ff2d2faf6c586a5fcd1cdb6e1ec5",
+        "source_dirty": false,
+        "untracked_source_sha256": {},
+        "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "kernel_override": "auto",
+        "thread_override": null
+      },
+      "cases_sha256": "c70cef0a51560e2756926a925f60f9b5b381268cba59e7bca74430b1e17ec038",
+      "artifacts": {
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-local-baseline/zig/zig-out/bin/antfly-inference-http-server": "ac7506cb30411829e21a1d80539d4339498a7517dd1071f2ba27c1ce7ba6548f",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/zig-out/bin/antfly-inference-http-server": "20f15770db057b64b3c2bf36e37758f5d6509f0a1b9b7287bc9a18b17ed8c06e",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/config.json": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/encoder_config/config.json": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/model.safetensors": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer.json": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer_config.json": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+      },
+      "arms": {
+        "baseline": "http://127.0.0.1:18775",
+        "candidate": "http://127.0.0.1:18776"
+      },
+      "warmup": 3,
+      "pairs": 20,
+      "concurrency": 4,
+      "round_scope": "synchronized_burst",
+      "timing": {
+        "client_latency": "HTTP send through response-body read; excludes JSON parsing and oracle comparison",
+        "burst": "barrier release through last response-body read; includes client dispatch and payload encoding"
+      },
+      "performance_release_qualified": false,
+      "comparisons": {},
+      "error": "HTTPError: HTTP Error 503: Service Unavailable",
+      "completed_pairs": 7,
+      "performance_timing_validated": false,
+      "failure_attribution": "Candidate log at 2026-11-03T23:23:49Z: live_host admission refused a536870912-byte request; pending1073741824, capacity1546188226. No branch regression established."
+    },
+    "http-isolated-c4": {
+      "format_version": 1,
+      "status": "failed",
+      "scope": "warm_http",
+      "host": {
+        "system": "Darwin",
+        "machine": "arm64",
+        "kernel": "27.0.0",
+        "cpuinfo": null,
+        "affinity": null,
+        "cgroup": null,
+        "mountinfo": null,
+        "meminfo": null,
+        "commit": "29570dcf9924bce387c3d824af955f9f47956144",
+        "source_dirty": false,
+        "untracked_source_sha256": {},
+        "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "kernel_override": "auto",
+        "thread_override": null
+      },
+      "cases_sha256": "7731f939c9353345cb2bfc861ed81e2d23f42455453256829b10a6bc8f5a7359",
+      "artifacts": {
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-local-baseline/zig/zig-out/bin/antfly-inference-http-server": "ac7506cb30411829e21a1d80539d4339498a7517dd1071f2ba27c1ce7ba6548f",
+        "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/zig-out/bin/antfly-inference-http-server": "20f15770db057b64b3c2bf36e37758f5d6509f0a1b9b7287bc9a18b17ed8c06e",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/config.json": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/encoder_config/config.json": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/model.safetensors": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer.json": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer_config.json": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+      },
+      "arms": {
+        "baseline": "http://127.0.0.1:18775",
+        "candidate": "http://127.0.0.1:18776"
+      },
+      "warmup": 3,
+      "pairs": 100,
+      "concurrency": 4,
+      "round_scope": "synchronized_burst",
+      "timing": {
+        "client_latency": "HTTP send through response-body read; excludes JSON parsing and oracle comparison",
+        "burst": "barrier release through last response-body read; includes client dispatch and payload encoding",
+        "validation": "all response bodies and timestamps captured before any JSON parsing or oracle comparison"
+      },
+      "performance_release_qualified": false,
+      "comparisons": {
+        "short_entities": {
+          "candidate_ns": {
+            "min": 28742959.0,
+            "median": 35625458.5,
+            "mean": 36601897.07,
+            "p95": 44680981.55,
+            "max": 51801542.0,
+            "cv": 0.11726206479574303
+          },
+          "baseline_ns": {
+            "min": 27990916.0,
+            "median": 36206604.5,
+            "mean": 37578060.45,
+            "p95": 42694680.949999996,
+            "max": 125703458.0,
+            "cv": 0.25784450652488533
+          },
+          "candidate_over_baseline": {
+            "lower_95": 0.9580427838048223,
+            "median": 0.9867340862234573,
+            "upper_95": 0.995780655751602,
+            "samples": 2000,
+            "seed": 20260730,
+            "estimator": "median_paired_log_ratio"
+          },
+          "client_latency_ns": {
+            "baseline": {
+              "min": 18486458.0,
+              "median": 28643937.5,
+              "mean": 29604151.5425,
+              "p95": 40191558.349999994,
+              "max": 125516250.0,
+              "cv": 0.262954958763821
+            },
+            "candidate": {
+              "min": 18104083.0,
+              "median": 28971729.5,
+              "mean": 29384453.8475,
+              "p95": 40359741.95,
+              "max": 51333042.0,
+              "cv": 0.21528934788484333
+            }
+          },
+          "requests_per_second": {
+            "baseline": 106.4450892914565,
+            "candidate": 109.28395302435071
+          }
+        },
+        "reference_windows": {
+          "candidate_ns": {
+            "min": 406080333.0,
+            "median": 541234625.5,
+            "mean": 550665614.64,
+            "p95": 721929308.3499999,
+            "max": 859668167.0,
+            "cv": 0.16641472639091306
+          },
+          "baseline_ns": {
+            "min": 414582084.0,
+            "median": 538925374.5,
+            "mean": 552692405.83,
+            "p95": 722018749.35,
+            "max": 852451666.0,
+            "cv": 0.17168935882125508
+          },
+          "candidate_over_baseline": {
+            "lower_95": 0.9814468974627059,
+            "median": 1.0049622261784077,
+            "upper_95": 1.026379609472087,
+            "samples": 2000,
+            "seed": 20260730,
+            "estimator": "median_paired_log_ratio"
+          },
+          "client_latency_ns": {
+            "baseline": {
+              "min": 387546959.0,
+              "median": 508426979.0,
+              "mean": 524830127.0325,
+              "p95": 700205303.8499999,
+              "max": 852276208.0,
+              "cv": 0.1663222363391424
+            },
+            "candidate": {
+              "min": 360326042.0,
+              "median": 515361104.0,
+              "mean": 521837427.3125,
+              "p95": 654657124.9999999,
+              "max": 858847125.0,
+              "cv": 0.16016742330307526
+            }
+          },
+          "requests_per_second": {
+            "baseline": 7.237298645334274,
+            "candidate": 7.263936395620084
+          }
+        }
+      },
+      "error": "ValueError: http://127.0.0.1:18776/ai/v1/extract: HTTP 503: {\"error\":\"MODEL_RESOURCE_BUSY\",\"message\":\"insufficient inference capacity is currently available\",\"reason\":\"inference_capacity\",\"retryable\":true,\"retry_after_ms\":1000}",
+      "raw_report_sha256": "1fcef3e18416a8b1dd200017bee195ed2520cd31c7dec76308a144fdf159c11e",
+      "completed_pairs_by_case": {
+        "short_entities": 100,
+        "reference_windows": 100,
+        "composed_windows": 53
+      },
+      "transport_only_workers": true,
+      "artifacts_and_cases_verified_after_failure": true
+    }
+  },
+  "outstanding": [
+    "Complete corrected composed-window and full-word four-client profiles on a host with adequate memory headroom. The shared local host refused a fourth536870912-byte reservation with1610612736 pending and1932735283 live capacity.",
+    "Resolve single-client statistical uncertainty and the isolated short-request slowdown; later reversals do not prove a cause.",
+    "Aggregate CI requires maintainer approval for PR1490."
+  ],
+  "review_fixes": {
+    "python_checks_passed": 8,
+    "native_regression_standalone": {
+      "selected": 1,
+      "passed": 1,
+      "skipped": 0
+    },
+    "changes": [
+      "Capture every concurrent response before JSON parsing or oracle validation.",
+      "Explicitly import architectures.deberta in the test root.",
+      "Retain bounded HTTP failure details and endpoint in failed benchmark reports."
+    ],
+    "implementation_commit": "29570dcf9924bce387c3d824af955f9f47956144"
+  },
+  "subsequent_cleanup_validation": {
+    "receipt": "cleanup-review.json",
+    "debug_selected": 2,
+    "debug_passed": 2,
+    "debug_skipped": 0,
+    "attribution": "Pre-existing all-unique compact-layout double free and partial-encoder error-path leak.",
+    "optimized_http_requalified": false
+  }
+}

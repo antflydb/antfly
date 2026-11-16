@@ -180,13 +180,17 @@ class Server:
         config_path.write_text(
             json.dumps(
                 {
-                    "models_dir": str(self.args.models_dir),
-                    "admission": {"inference": {"max_concurrent_requests": 32}},
-                    "generation_batching": {
-                        "mode": self.mode,
-                        "max_step_items": self.args.max_step_items,
-                        "max_step_query_tokens": 512,
-                        "max_decode_wait_us": self.args.decode_wait_us,
+                    "resources": {
+                        "inference": {"admission": {"max_concurrent_requests": 32}}
+                    },
+                    "inference": {
+                        "models_dir": str(self.args.models_dir),
+                        "generation_batching": {
+                            "mode": self.mode,
+                            "max_step_items": self.args.max_step_items,
+                            "max_step_query_tokens": 512,
+                            "max_decode_wait_us": self.args.decode_wait_us,
+                        },
                     },
                 },
                 indent=2,

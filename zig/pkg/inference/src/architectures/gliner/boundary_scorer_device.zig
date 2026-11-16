@@ -151,8 +151,9 @@ pub const Context = struct {
     fn explicit(raw: *anyopaque, allocator: Allocator, request: scoring.ExplicitRequest, limits: cpu_head.Limits, control: ?scoring.Control) !scoring.ExplicitScores {
         const self = get(raw);
         try self.sample(request.sample_index, control);
-        if (request.query_ids.len > limits.max_queries or request.capacity > limits.max_explicit_candidates or try mul(request.indices.len, 4) > limits.max_intermediate_bytes) return error.ResourceLimitExceeded;
+        try request.validate(limits);
         const headed = self.head_result orelse return error.MissingBoundaryScores;
+        try request.validate(headed.context().limits);
         var result = try headed.scoreExplicitSubset(request.sample_index, request.query_ids, .{ .capacity = request.capacity, .indices = request.indices, .valid_mask = request.valid_mask });
         defer result.deinit();
         var storage = try scoring.Storage.init(allocator);
@@ -175,7 +176,7 @@ pub const Context = struct {
         try self.sample(request.sample_index, control);
         try self.validateMath(limits.math);
         if (!self.config.head.directional_relation_states) return error.UnsupportedGlinerBoundaryConfiguration;
-        if (request.query_pairs.len > limits.math.max_queries or request.pairs.len > limits.max_relation_pairs) return error.ResourceLimitExceeded;
+        if (request.query_pairs.len > limits.math.max_queries or request.pairs.len > self.taskLimits(limits).max_relation_pairs) return error.RelationProposalLimitExceeded;
         var storage = try scoring.Storage.init(allocator);
         errdefer storage.deinit();
         if (request.pairs.len == 0) return .{ .storage = storage, .logits = &.{}, .valid = &.{} };
@@ -184,7 +185,10 @@ pub const Context = struct {
         const h = self.config.encoder.hidden_size;
         const b = request.sample_index;
         const q = prepared.query_width;
-        const l = prepared.word_width;
+        const stride = prepared.word_width;
+        // Only real words enter relation distance normalization and span means.
+        // The source tensor still uses the padded batch stride for row lookup.
+        const l = prepared.samples[b].words.len;
         const headed = self.head_result orelse return error.MissingBoundaryScores;
         const math = headed.context();
         const query_ids = try storage.alloc().alloc(i32, try mul(request.query_pairs.len, 2));
@@ -195,8 +199,8 @@ pub const Context = struct {
         const queries = try gather(math, headed.query_states, try mul(prepared.samples.len, q), h, query_ids);
         defer math.drop(queries);
         const word_ids = try storage.alloc().alloc(i32, l);
-        for (word_ids, 0..) |*value, word| value.* = try id(try add(try mul(b, l), word));
-        const text = try gather(math, headed.text_states, try mul(prepared.samples.len, l), h, word_ids);
+        for (word_ids, 0..) |*value, word| value.* = try id(try add(try mul(b, stride), word));
+        const text = try gather(math, headed.text_states, try mul(prepared.samples.len, stride), h, word_ids);
         defer math.drop(text);
         var result = try tasks.scoreRelations(math, self.config, .{ .batch = 1, .text_length = l, .relations = request.query_pairs.len, .text_states = text, .relation_query_states = queries, .pairs = request.pairs, .control = control }, self.taskLimits(limits));
         defer result.deinit();
@@ -209,6 +213,7 @@ pub const Context = struct {
     fn record(raw: *anyopaque, allocator: Allocator, request: scoring.RecordRequest, limits: cpu_tasks.Limits, control: ?scoring.Control) !scoring.RecordScores {
         const self = get(raw);
         try self.sample(request.sample_index, control);
+        try request.validate(self.config.head.record_instance_queries, self.taskLimits(limits));
         try self.validateMath(limits.math);
         if (request.fields.len == 0 or request.fields.len > limits.max_record_fields) return error.InvalidBoundaryScorerRouting;
         const headed = self.head_result orelse return error.MissingBoundaryScores;

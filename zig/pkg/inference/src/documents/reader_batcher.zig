@@ -192,20 +192,13 @@ pub fn Batcher(comptime Node: type) type {
             for (tickets, images[0..tickets.len]) |ticket, *item| item.* = ticket.request.images[0];
             var request = first.request;
             request.images = images[0..tickets.len];
-            const Cancel = struct {
-                fn cancelled(raw: *const anyopaque) bool {
-                    const control: *const Control = @ptrCast(@alignCast(raw));
-                    control.check() catch return true;
-                    return false;
-                }
-            };
             if (tickets.len > 1) if (first.run.durable) |session| {
                 var keys: [max_items]@import("antfly_readers").document_runs.Digest = undefined;
                 for (tickets, 0..) |ticket, index| keys[index] = ticket.run.durable_stage orelse return error.InvalidDocumentCheckpoint;
                 try session.combineTokenReservations(work, keys[0..tickets.len]);
             };
             first.run.physicalCall();
-            const result = try self.node.readEncodedImagesReportedDirectWithContext(work, first.model, request, first.control.deadline_ns, .{ .ptr = &first.control, .is_cancelled_fn = Cancel.cancelled });
+            const result = try self.node.readEncodedImagesReportedDirectWithControl(work, first.model, request, first.control);
             try result.execution.validate(tickets.len);
             if (result.items.len != tickets.len) return error.InvalidDocumentModelResult;
             const physical = result.execution.native_batches + result.execution.serial_items;
@@ -234,7 +227,9 @@ pub fn Batcher(comptime Node: type) type {
 test "document ready reader batching groups compatible work and charges aggregate usage once" {
     const Fake = struct {
         calls: usize = 0,
-        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, _: []const u8, req: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        pub fn readEncodedImagesReportedDirectWithControl(self: *@This(), a: A, _: []const u8, req: readers.EncodedRequest, control: Control) !readers.BatchResult {
+            try std.testing.expect(control.request_slot_admitted);
+            try std.testing.expectEqual(@as(?usize, 7), control.audio_output_token_limit);
             self.calls += 1;
             const items = try a.alloc(readers.Result, req.images.len);
             for (items, req.images) |*item, input| item.* = .{ .text = input.item_id, .item_id = input.item_id, .page_number = input.page_number };
@@ -263,7 +258,7 @@ test "document ready reader batching groups compatible work and charges aggregat
         var tickets: [3]Batch.Ticket = undefined;
         for (&tickets, &runs, 0..) |*ticket, *run, i| {
             try run.call();
-            ticket.* = .{ .allocator = a, .model = if (i == 2) "other-model" else "same-model", .request = .{ .images = images[i..][0..1] }, .control = .{}, .run = run };
+            ticket.* = .{ .allocator = a, .model = if (i == 2) "other-model" else "same-model", .request = .{ .images = images[i..][0..1] }, .control = .{ .request_slot_admitted = true, .audio_output_token_limit = 7 }, .run = run };
             batch.pending[i] = ticket;
         }
         batch.count = tickets.len;
@@ -288,7 +283,7 @@ test "document incompatible ready batches preserve concurrent calls and independ
         io: std.Io,
         entered: std.atomic.Value(usize) = .init(0),
         both_entered: std.Io.Event = .unset,
-        pub fn readEncodedImagesReportedDirectWithContext(self: *@This(), a: A, model: []const u8, req: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        pub fn readEncodedImagesReportedDirectWithControl(self: *@This(), a: A, model: []const u8, req: readers.EncodedRequest, _: Control) !readers.BatchResult {
             if (self.entered.fetchAdd(1, .acq_rel) == 1) self.both_entered.set(self.io);
             // Neither invocation may return until the other has entered. A
             // serial dispatcher fails within five seconds instead of hanging.
@@ -351,7 +346,7 @@ test "document durable native batch attaches one measured receipt to every depen
     const readers_lib = @import("antfly_readers");
     const runs_lib = readers_lib.document_runs;
     const Fake = struct {
-        fn readEncodedImagesReportedDirectWithContext(_: *@This(), a: A, _: []const u8, req: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        fn readEncodedImagesReportedDirectWithControl(_: *@This(), a: A, _: []const u8, req: readers.EncodedRequest, _: Control) !readers.BatchResult {
             const items = try a.alloc(readers.Result, req.images.len);
             for (items) |*item| item.* = .{ .text = "Text" };
             return .{ .items = items, .execution = .{ .requested_items = items.len, .native_batches = 1, .native_items = items.len }, .usage = .{ .prompt_tokens = 10, .completion_tokens = 3, .total_tokens = 13 } };
@@ -416,7 +411,7 @@ test "document durable native batch attaches one measured receipt to every depen
 test "document durable native batch costs survive failed reporter retries in either replay order" {
     const runs = readers.document_runs;
     const Fake = struct {
-        fn readEncodedImagesReportedDirectWithContext(_: *@This(), a: A, _: []const u8, req: readers.EncodedRequest, _: ?u64, _: anytype) !readers.BatchResult {
+        fn readEncodedImagesReportedDirectWithControl(_: *@This(), a: A, _: []const u8, req: readers.EncodedRequest, _: Control) !readers.BatchResult {
             const items = try a.alloc(readers.Result, req.images.len);
             for (items) |*item| item.* = .{ .text = "Text" };
             return .{ .items = items, .execution = .{ .requested_items = items.len, .native_batches = 1, .native_items = items.len }, .usage = .{ .prompt_tokens = 10, .completion_tokens = 3, .total_tokens = 13 } };

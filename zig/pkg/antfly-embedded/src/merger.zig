@@ -180,7 +180,9 @@ pub const SegmentInfo = struct {
 
 pub const MergeOutputOptions = struct {
     source_map: ?*segment_mod.MergeSourceMap = null,
-    target_segment_bytes: usize = 256 * 1024 * 1024,
+    // A policy threshold, not an allocation length. Keep the policy's width:
+    // the default 5 GiB policy must also work with small inputs on wasm32.
+    target_segment_bytes: u64 = 256 * 1024 * 1024,
     index_sort: []const segment_mod.SegmentIndexSortField = &.{},
     /// Optional task-owned deletion view aligned with `segment_indices`.
     /// Background merges use this to remain independent of later mutations to
@@ -271,7 +273,7 @@ pub fn mergeSegmentsBounded(
     const live_docs = countLiveDocs(inputs);
     if (live_docs == 0) return try alloc.alloc([]u8, 0);
 
-    const target_bytes = @max(@as(usize, 1), options.target_segment_bytes);
+    const target_bytes = @max(@as(u64, 1), options.target_segment_bytes);
     if (live_docs <= 1) {
         const segments = try alloc.alloc([]u8, 1);
         errdefer alloc.free(segments);
@@ -284,11 +286,13 @@ pub fn mergeSegmentsBounded(
         return segments;
     }
 
-    const docs_per_segment_u64 = @max(
-        @as(u64, 1),
-        (@as(u64, live_docs) * @as(u64, @intCast(target_bytes))) / @max(@as(u64, 1), total_input_bytes),
+    // Widen only this once-per-merge estimate. Even an unbounded u64 policy
+    // must not overflow before the result is limited to the live document count.
+    const docs_per_segment_wide = @max(
+        @as(u128, 1),
+        (@as(u128, live_docs) * target_bytes) / @max(@as(u64, 1), total_input_bytes),
     );
-    const docs_per_segment: u32 = @intCast(@min(@as(u64, live_docs), docs_per_segment_u64));
+    const docs_per_segment: u32 = @intCast(@min(@as(u128, live_docs), docs_per_segment_wide));
 
     var outputs = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
@@ -603,6 +607,21 @@ test "bounded merge splits output and preserves live documents" {
         total_docs += reader.doc_count;
     }
     try std.testing.expectEqual(@as(u32, 3), total_docs);
+    // Policy sizes need not fit usize on a 32-bit host. They are thresholds,
+    // not requested allocations. Large policies must not overflow the initial
+    // document-window estimate either.
+    for ([_]u64{ 5 * 1024 * 1024 * 1024, std.math.maxInt(u64) }) |target| {
+        const combined = try mergeSegmentsBounded(alloc, writer.snapshot(), &.{ 0, 1, 2 }, .{ .target_segment_bytes = target });
+        defer freeMergedSegments(alloc, combined);
+        try std.testing.expectEqual(@as(usize, 1), combined.len);
+        var reader = try segment_mod.SegmentReader.init(alloc, combined[0]);
+        defer reader.deinit();
+        try std.testing.expectEqual(@as(u32, 3), reader.doc_count);
+        for (0..3) |doc| {
+            const original = (try writer.snapshot().segments[doc].reader.storedDoc(0)).?;
+            try std.testing.expectEqualStrings(original.id, (try reader.storedDoc(@intCast(doc))).?.id);
+        }
+    }
     for (0..3) |source_index| {
         const mapped = source_map.lookup(source_index, 0).?;
         var reader = try segment_mod.SegmentReader.init(alloc, merged[mapped.segment]);

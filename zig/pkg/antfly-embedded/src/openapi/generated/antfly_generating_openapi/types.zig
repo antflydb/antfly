@@ -766,10 +766,11 @@ pub const ConstrainedProbabilities = enum {
     }
 };
 
-/// A content part for multimodal input (text, image URL, or inline media).
+/// A content part for multimodal input (text, image URL, inline media, or a pinned source reference).
 pub const ContentPart = union(enum) {
     media_content_part: *MediaContentPart,
     image_url_content_part: *ImageURLContentPart,
+    source_content_part: *SourceContentPart,
     text_content_part: *TextContentPart,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
@@ -812,6 +813,7 @@ pub const ContentPart = union(enum) {
             .value => |disc_str| {
                 if (std.mem.eql(u8, disc_str, "media")) return .{ .media_content_part = try parseStructuralVariantFromSlice(MediaContentPart, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "image_url")) return .{ .image_url_content_part = try parseStructuralVariantFromSlice(ImageURLContentPart, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "source")) return .{ .source_content_part = try parseStructuralVariantFromSlice(SourceContentPart, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "text")) return .{ .text_content_part = try parseStructuralVariantFromSlice(TextContentPart, allocator, input, options) };
                 return error.UnexpectedToken;
             },
@@ -843,6 +845,10 @@ pub const ContentPart = union(enum) {
             const parsed = try parseStructuralVariant(ImageURLContentPart, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .image_url_content_part = parsed };
         }
+        if (std.mem.eql(u8, disc_str, "source")) {
+            const parsed = try parseStructuralVariant(SourceContentPart, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .source_content_part = parsed };
+        }
         if (std.mem.eql(u8, disc_str, "text")) {
             const parsed = try parseStructuralVariant(TextContentPart, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .text_content_part = parsed };
@@ -854,6 +860,7 @@ pub const ContentPart = union(enum) {
         switch (self) {
             .media_content_part => |v| try jw.write(v.*),
             .image_url_content_part => |v| try jw.write(v.*),
+            .source_content_part => |v| try jw.write(v.*),
             .text_content_part => |v| try jw.write(v.*),
         }
     }
@@ -886,11 +893,12 @@ pub const GeneratorConfig = struct {
     region: ?[]const u8 = null,
     /// Anthropic workspace for keys not scoped to a workspace. Defaults to ANTHROPIC_WORKSPACE_ID.
     workspace_id: ?[]const u8 = null,
+    /// Optional reasoning effort for Ollama's OpenAI-compatible endpoint. Use none to disable thinking on models that support it; supported values depend on the model.
+    reasoning_effort: ?OpenAIReasoningEffort = null,
     /// HTTP response timeout in seconds for Ollama API calls.
     timeout: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
-    reasoning_effort: ?OpenAIReasoningEffort = null,
     /// Opaque personal registration owned by the authenticated caller.
     connection_id: ?[]const u8 = null,
     /// OpenAI completion budget, including visible output and reasoning tokens. Use for reasoning models instead of max_tokens; the two are mutually exclusive.
@@ -918,9 +926,9 @@ pub const GeneratorConfig = struct {
         .{ "credentials_path", "credentials_path", true },
         .{ "region", "region", true },
         .{ "workspace_id", "workspace_id", true },
+        .{ "reasoning_effort", "reasoning_effort", true },
         .{ "timeout", "timeout", true },
         .{ "api_url", "api_url", true },
-        .{ "reasoning_effort", "reasoning_effort", true },
         .{ "connection_id", "connection_id", true },
         .{ "max_completion_tokens", "max_completion_tokens", true },
         .{ "max_image_input_tokens", "max_image_input_tokens", true },
@@ -1005,16 +1013,16 @@ pub const GeneratorConfig = struct {
             try jw.objectField("workspace_id");
             try jw.write(value);
         }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
         if (self.timeout) |value| {
             try jw.objectField("timeout");
             try jw.write(value);
         }
         if (self.api_url) |value| {
             try jw.objectField("api_url");
-            try jw.write(value);
-        }
-        if (self.reasoning_effort) |value| {
-            try jw.objectField("reasoning_effort");
             try jw.write(value);
         }
         if (self.connection_id) |value| {
@@ -1241,8 +1249,10 @@ pub const OllamaGeneratorConfig = struct {
     url: ?[]const u8 = null,
     /// Controls randomness in generation (0.0-2.0).
     temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
+    /// Maximum number of tokens to generate, including reasoning tokens for thinking models.
     max_tokens: ?i64 = null,
+    /// Optional reasoning effort for Ollama's OpenAI-compatible endpoint. Use none to disable thinking on models that support it; supported values depend on the model.
+    reasoning_effort: ?OpenAIReasoningEffort = null,
     /// Nucleus sampling parameter.
     top_p: ?f32 = null,
     /// Top-k sampling parameter.
@@ -1257,6 +1267,7 @@ pub const OllamaGeneratorConfig = struct {
         .{ "url", "url", true },
         .{ "temperature", "temperature", true },
         .{ "max_tokens", "max_tokens", true },
+        .{ "reasoning_effort", "reasoning_effort", true },
         .{ "top_p", "top_p", true },
         .{ "top_k", "top_k", true },
         .{ "timeout", "timeout", true },
@@ -1286,6 +1297,10 @@ pub const OllamaGeneratorConfig = struct {
         }
         if (self.max_tokens) |value| {
             try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
             try jw.write(value);
         }
         if (self.top_p) |value| {
@@ -1566,6 +1581,12 @@ pub const RetryConfig = struct {
         }
         try jw.endObject();
     }
+};
+
+/// Image, audio, or video named by a source record's `content.resource`. Accepted only on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security` and replace this part with inline media, so the source URL never reaches a model vendor. Fetching requires a nonempty `allowed_hosts`. Images are inlined within a 16 MiB expanded request. Audio and video travel as binary attachments, up to 256 MiB per request and `max_download_size_bytes`. Hosted providers receive them inline and may reject large requests. Models that do not support the media type reject the request.
+pub const SourceContentPart = struct {
+    type: []const u8,
+    source: std.json.Value,
 };
 
 /// Text content for multimodal input.

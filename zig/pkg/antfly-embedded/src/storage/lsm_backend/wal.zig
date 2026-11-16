@@ -70,6 +70,11 @@ pub const ReplayEntry = backend_types.ReplayEntry;
 
 pub const AppendOptions = struct {
     segment_bytes: u64 = default_wal_segment_bytes,
+    /// Set when a failed append may have left bytes that could not be cut
+    /// back; the caller must repair (`repairSegmentTail`) before appending.
+    unrepaired_tail: ?*?TornTail = null,
+    /// Set when a failed append is proven to have written nothing.
+    proven_unwritten: ?*bool = null,
 };
 
 pub const AppendResult = struct {
@@ -91,6 +96,16 @@ pub const ReplayStats = struct {
     bytes: u64 = 0,
     segments: u64 = 0,
     truncated_tail_bytes: u64 = 0,
+    /// The current segment ended in an incomplete or junk record: replay
+    /// stopped at this many bytes. A writer must cut the segment back to it
+    /// (`repairSegmentTail`) before appending, or later records would follow
+    /// bytes that the next recovery stops at, and be lost.
+    torn_tail: ?TornTail = null,
+};
+
+pub const TornTail = struct {
+    segment: u64,
+    valid_bytes: u64,
 };
 
 pub const ReplayHooks = struct {
@@ -267,6 +282,53 @@ pub fn appendStateWithOptionsResult(
         segment_path_owned = true;
     }
     const segment_became_nonempty = current_size == 0;
+    appendRecordOnce(storage, allocator, wal_dir, segment_path, record, sync, segment_became_nonempty) catch |err| {
+        if (comptime @import("builtin").is_test) if (err == error.TestCrashAfterPartialAppend) return err;
+        // The original error is always returned: callers act on its cause
+        // (for example cancellation). Only the tail is handled here.
+        const size: ?u64 = storage.fileSize(segment_path) catch |size_err| switch (size_err) {
+            error.FileNotFound => 0,
+            else => null,
+        };
+        // Proven: the append was refused before writing anything.
+        if (size == current_size) {
+            if (options.proven_unwritten) |out| out.* = true;
+            return err;
+        }
+        // Bytes may have landed. Cut the segment back before anything else
+        // is appended after them; if that fails, the caller repairs before
+        // its next append (and recovery repairs after a crash).
+        repairFileTail(storage, allocator, segment_path, current_size) catch |repair_err| {
+            std.log.warn("lsm wal append failed; tail repair deferred path={s} append_err={s} repair_err={s}", .{ segment_path, @errorName(err), @errorName(repair_err) });
+            if (options.unrepaired_tail) |out| out.* = .{ .segment = segment, .valid_bytes = current_size };
+        };
+        return err;
+    };
+    allocator.free(segment_path);
+    segment_path_owned = false;
+    return .{
+        .bytes = record.len,
+        .segment = segment,
+        .segment_became_nonempty = segment_became_nonempty,
+        .segment_syncs = @intFromBool(sync),
+        .index_syncs = index_syncs,
+    };
+}
+
+/// Test hook: append only the first `bytes` of the next record, then fail.
+/// With `crash`, the failure skips tail repair, as if the process died.
+pub const TestAppendFault = struct { bytes: usize, crash: bool = false, err: anyerror = error.InputOutput, fail_repairs: usize = 0 };
+pub var test_append_fault: if (@import("builtin").is_test) ?TestAppendFault else void = if (@import("builtin").is_test) null else {};
+/// Test hook: fail this many upcoming tail repairs.
+pub var test_fail_repairs: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {};
+
+fn appendRecordOnce(storage: storage_io.Storage, allocator: Allocator, wal_dir: []const u8, segment_path: []const u8, record: []const u8, sync: bool, segment_became_nonempty: bool) !void {
+    if (comptime @import("builtin").is_test) if (test_append_fault) |fault| {
+        test_append_fault = null;
+        test_fail_repairs = fault.fail_repairs;
+        if (fault.bytes != 0) try storage.appendFileAbsolute(allocator, segment_path, record[0..@min(fault.bytes, record.len)], true);
+        return if (fault.crash) error.TestCrashAfterPartialAppend else fault.err;
+    };
     storage.appendFileAbsolute(allocator, segment_path, record, sync) catch |err| switch (err) {
         error.FileNotFound => {
             try storage.createDirPath(wal_dir);
@@ -278,15 +340,6 @@ pub fn appendStateWithOptionsResult(
     // POSIX filesystems. Pay the parent-directory boundary only for the first
     // record in a segment; steady-state appends remain one file sync.
     if (sync and segment_became_nonempty) try storage.syncParentAbsolute(segment_path);
-    allocator.free(segment_path);
-    segment_path_owned = false;
-    return .{
-        .bytes = record.len,
-        .segment = segment,
-        .segment_became_nonempty = segment_became_nonempty,
-        .segment_syncs = @intFromBool(sync),
-        .index_syncs = index_syncs,
-    };
 }
 
 pub fn encodedStateRecordLen(state: anytype) usize {
@@ -1159,6 +1212,9 @@ fn replayFileStreaming(
                     pending.items.len,
                 });
                 stats.truncated_tail_bytes += @intCast(pending.items.len);
+                // Consumed records were removed from `pending`; only the junk
+                // remains, so the valid prefix ends just before it.
+                stats.torn_tail = .{ .segment = segment, .valid_bytes = offset - pending.items.len };
                 pending.clearRetainingCapacity();
                 releaseOversizedReplayPendingBuffer(allocator, &pending, retained_cap_bytes);
                 working_set.observePending(&pending);
@@ -1171,7 +1227,46 @@ fn replayFileStreaming(
     }
     if (pending.items.len > 0) {
         stats.truncated_tail_bytes += @intCast(pending.items.len);
+        if (options.allow_corrupt_tail) stats.torn_tail = .{ .segment = segment, .valid_bytes = file_size - pending.items.len };
     }
+}
+
+/// Durably cuts a segment back to its first `valid_bytes` (the end of its
+/// last complete record) by atomic replacement, so no later append can land
+/// after torn bytes. Bounded by the segment size, and only run after a failed
+/// append or a recovery that found a torn tail.
+pub fn repairSegmentTail(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8, segment: u64, valid_bytes: u64) !void {
+    const path = try segmentPathAlloc(allocator, root_dir, segment);
+    defer allocator.free(path);
+    try repairFileTail(storage, allocator, path, valid_bytes);
+}
+
+fn repairFileTail(storage: storage_io.Storage, allocator: Allocator, path: []const u8, valid_bytes: u64) !void {
+    if (comptime @import("builtin").is_test) if (test_fail_repairs > 0) {
+        test_fail_repairs -= 1;
+        return error.InputOutput;
+    };
+    const size = storage.fileSize(path) catch |err| switch (err) {
+        error.FileNotFound => if (valid_bytes == 0) return else return err,
+        else => return err,
+    };
+    if (size == valid_bytes) return;
+    if (size < valid_bytes) return error.CorruptLsmWal;
+    var sink = try storage.beginAtomicWrite(allocator, path);
+    var owned = true;
+    errdefer if (owned) sink.abort();
+    const chunk = try allocator.alloc(u8, @intCast(@min(valid_bytes, @as(u64, replay_chunk_bytes))));
+    defer allocator.free(chunk);
+    var offset: u64 = 0;
+    while (offset < valid_bytes) {
+        const len: usize = @intCast(@min(valid_bytes - offset, @as(u64, chunk.len)));
+        try storage.readFileRangeInto(allocator, path, offset, chunk[0..len]);
+        try sink.appendSlice(chunk[0..len]);
+        offset += len;
+    }
+    owned = false;
+    try sink.finish();
+    std.log.warn("lsm wal repaired torn tail path={s} from={} to={}", .{ path, size, valid_bytes });
 }
 
 fn logCorruptWalDetail(site: []const u8, segment: u64, pos: usize, pending_len: usize, detail: []const u8) void {
@@ -1257,6 +1352,9 @@ fn consumeCompleteRecords(
         if (pos == 0) return error.CorruptLsmWal;
         const remaining_len = pending.items.len - pos;
         if (remaining_len < @min(record_header_len, replay_record_header_len)) {
+            // Records before `pos` were applied: leave only the junk.
+            std.mem.copyForwards(u8, pending.items[0..remaining_len], pending.items[pos..]);
+            pending.items.len = remaining_len;
             return error.TruncatedLsmWalTailJunk;
         }
         return error.CorruptLsmWal;

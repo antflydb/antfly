@@ -1,0 +1,19 @@
+# Supply the checksum-verified RC's matching Linux library under qualification-linux/.
+ARG BASE_IMAGE=python:3.12-slim@sha256:12316debbfb86890f6b2d825820612741ba527ad5a44e3902759141d572bfe8f
+FROM ${BASE_IMAGE}
+ARG TARGETARCH
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 ANTFLY_LIBRARY=/app/lib/libantfly.so LD_LIBRARY_PATH=/app/lib
+WORKDIR /app
+COPY examples/hackernews/requirements-producer.txt /app/requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
+COPY py/packages/embedded/src/antfly_embedded /app/antfly_embedded
+COPY examples/hackernews/runtime.json /app/runtime.json
+COPY qualification-linux/${TARGETARCH}/hn-runtime.json /app/hn-runtime.json
+RUN python3 -c 'import json,sys; pin=json.load(open("runtime.json")); receipt=json.load(open("hn-runtime.json")); assert receipt["version"] == pin["version"] and receipt["source_commit"] == pin["source_commit"] and receipt["architecture"] == sys.argv[1] and receipt["asset"] == pin["libraries"][sys.argv[1]], "Producer library receipt does not match the pinned runtime"' "${TARGETARCH}"
+COPY qualification-linux/${TARGETARCH}/lib /app/lib
+COPY qualification-linux/${TARGETARCH}/LICENSE qualification-linux/${TARGETARCH}/LICENSING.md qualification-linux/${TARGETARCH}/THIRD_PARTY_NOTICES.md /app/
+COPY qualification-linux/${TARGETARCH}/LICENSES /app/LICENSES
+COPY examples/hackernews/*.py /app/
+RUN mkdir /state && chown 65532:65532 /state
+USER 65532:65532
+ENTRYPOINT ["python3", "/app/ingest.py"]

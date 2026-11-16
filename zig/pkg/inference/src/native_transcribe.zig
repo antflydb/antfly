@@ -36,6 +36,7 @@ const BackendChoice = enum {
     auto,
     native,
     metal,
+    cuda,
 };
 
 const Options = struct {
@@ -51,11 +52,15 @@ const Options = struct {
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
-    try ensureRequestedMetalHostedBackendAvailable(opts.backend);
+    try ensureRequestedBackendAvailable(opts.backend);
     const audio_data = try c_file.readFile(allocator, opts.audio_path);
     defer allocator.free(audio_data);
 
     var session_manager = backends.SessionManager.initWithIo(allocator, io);
+    // A one-shot CLI retains sessions and inputs until native calls finish,
+    // matching the direct embedding command's explicit lifetime policy.
+    session_manager.native_call_policy = .in_process;
+    session_manager.process_termination_available = false;
     configureBackendPreference(&session_manager, opts.backend);
 
     if (enc_dec_mod.findEncoderDecoderPaths(allocator, opts.model_dir)) |paths| {
@@ -97,6 +102,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             },
         );
 
+        pipeline.execution_control = .{ .io = io, .native_call_policy = .in_process };
         var result = try pipeline.transcribe(audio_data);
         defer result.deinit();
         try writeResultJson(allocator, opts.model_dir, result.text, result.language, result.timing);
@@ -109,16 +115,17 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const model = try model_manager.loadFromDir(opts.model_dir);
     const whisper_cfg = session_factory.getWhisperConfig(model.session) orelse return error.InvalidModelForTranscription;
     const decoder_session: backends.Session = blk: {
-        const want_native = switch (opts.decoder_backend) {
-            .native => true,
-            .metal, .auto => false,
+        if (opts.decoder_backend == .auto) break :blk model.session;
+        try ensureRequestedBackendAvailable(opts.decoder_backend);
+        const desired: backends.BackendType = switch (opts.decoder_backend) {
+            .native => .native,
+            .metal => .metal,
+            .cuda => .cuda,
+            .auto => unreachable,
         };
-        if (!want_native or model.session.backend() == .native) break :blk model.session;
-        const cpu_model = model_manager.loadFromDirWithPreferredBackends(opts.model_dir, &.{backends.BackendType.native}, false) catch |err| {
-            std.log.warn("decoder backend native unavailable, decoding on {s}: {s}", .{ @tagName(model.session.backend()), @errorName(err) });
-            break :blk model.session;
-        };
-        break :blk cpu_model.session;
+        if (model.session.backend() == desired) break :blk model.session;
+        const decoder_model = try model_manager.loadFromDirWithPreferredBackends(opts.model_dir, &.{desired}, false);
+        break :blk decoder_model.session;
     };
     const prompt_cache = if (model.whisper_prompt_cache) |*cache|
         cache
@@ -133,6 +140,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         decoder_session,
         model.getTokenizer(),
         .{
+            .vocab_size = whisper_cfg.vocab_size,
             .max_length = @intCast(whisper_cfg.max_target_positions),
             .decoder_start_token_id = whisper_cfg.decoder_start_token_id,
             .eos_token_id = whisper_cfg.eos_token_id,
@@ -145,6 +153,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         },
     );
 
+    pipeline.execution_control = .{ .io = io, .native_call_policy = .in_process };
     var result = try pipeline.transcribe(audio_data);
     defer result.deinit();
     try writeResultJson(allocator, opts.model_dir, result.text, result.language, result.timing);
@@ -243,6 +252,7 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
+    if (std.mem.eql(u8, value, "cuda")) return .cuda;
     return null;
 }
 
@@ -250,14 +260,18 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
     session_manager.preferred_backends = switch (choice) {
         .auto => if (build_options.enable_metal)
             &.{ backends.BackendType.metal, backends.BackendType.native }
+        else if (build_options.enable_cuda)
+            &.{ backends.BackendType.cuda, backends.BackendType.native }
         else
             &.{backends.BackendType.native},
+        .cuda => &.{backends.BackendType.cuda},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
     };
 }
 
-fn ensureRequestedMetalHostedBackendAvailable(choice: BackendChoice) !void {
+fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
+    if (choice == .cuda and !build_options.enable_cuda) return error.CudaNotEnabled;
     if (choice != .metal) return;
     if (native_backend_guard.checkMetal(build_options.enable_metal, metal_runtime.metalDeviceAvailable())) |failure| {
         native_backend_guard.printFailure(failure);
@@ -267,7 +281,7 @@ fn ensureRequestedMetalHostedBackendAvailable(choice: BackendChoice) !void {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference transcribe <model-dir> <audio.wav> [--backend auto|native|metal] [--decoder-backend auto|native|metal] [--language <lang>]
+        \\usage: antfly inference transcribe <model-dir> <audio.wav> [--backend auto|native|metal|cuda] [--decoder-backend auto|native|metal|cuda] [--language <lang>]
         \\  Runs local audio transcription and prints a JSON response to stdout.
         \\
     , .{});
@@ -287,4 +301,54 @@ test "parseArgs accepts backend and language" {
     try std.testing.expectEqualStrings("/tmp/audio.wav", opts.audio_path);
     try std.testing.expectEqual(BackendChoice.metal, opts.backend);
     try std.testing.expectEqualStrings("en", opts.language.?);
+}
+
+test "transcription CLI explicitly selects CUDA without CPU fallback" {
+    const opts = try parseArgs(&.{ "model", "audio.wav", "--backend", "cuda" });
+    try std.testing.expectEqual(BackendChoice.cuda, opts.backend);
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    configureBackendPreference(&manager, .cuda);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.cuda}, manager.preferred_backends);
+}
+
+test "Whisper CUDA checkpoint transcribes English with reusable model state" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const model_dir = std.c.getenv("ANTFLY_WHISPER_CUDA_MODEL_DIR") orelse return error.SkipZigTest;
+    const audio_path = std.c.getenv("ANTFLY_WHISPER_CUDA_AUDIO") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var sessions = backends.SessionManager.initWithIo(a, std.testing.io);
+    sessions.native_call_policy = .in_process;
+    sessions.process_termination_available = false;
+    configureBackendPreference(&sessions, .cuda);
+    var manager = model_manager_mod.ModelManager.init(a, sessions);
+    defer manager.deinit();
+    const model = try manager.loadFromDir(std.mem.span(model_dir));
+    try std.testing.expectEqual(backends.BackendType.cuda, model.session.backend());
+    const cfg = session_factory.getWhisperConfig(model.session).?;
+    const prompt = &model.whisper_prompt_cache.?;
+    var scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
+    const forced = try prompt.resolve(&scratch, "en");
+    var pipeline = transcription.TranscriptionPipeline.init(a, model.session, model.session, model.getTokenizer(), .{
+        .vocab_size = cfg.vocab_size,
+        .max_length = @intCast(cfg.max_target_positions),
+        .decoder_start_token_id = cfg.decoder_start_token_id,
+        .eos_token_id = cfg.eos_token_id,
+        .n_mels = cfg.num_mel_bins,
+        .language = "en",
+        .forced_decoder_ids = forced,
+        .language_tokens = prompt.language_tokens,
+        .decode = prompt.decode,
+        .no_timestamps_id = prompt.no_timestamps_id,
+        .temperature_fallback = false,
+    });
+    const audio_data = try c_file.readFile(a, std.mem.span(audio_path));
+    defer a.free(audio_data);
+    pipeline.execution_control = .{ .io = std.testing.io, .native_call_policy = .in_process };
+    for (0..5) |_| {
+        var result = try pipeline.transcribe(audio_data);
+        defer result.deinit();
+        for ([_][]const u8{ "quick", "brown", "fox", "lazy", "dog" }) |word|
+            try std.testing.expect(std.mem.indexOf(u8, result.text, word) != null);
+        try writeResultJson(a, std.mem.span(model_dir), result.text, result.language, result.timing);
+    }
 }

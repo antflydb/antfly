@@ -1,0 +1,469 @@
+{
+  "schema_version": 4,
+  "scope": "Selected CUDA head/vision kernels and correctness-qualified execution update 879. Latest isolated whole-model measurements remain build 767: 0.8B faster; 4B 1.24% behind. Timing confirmation of 879 is queued while the GPU is shared; earlier contended screens are excluded. Three synthetic pages; no representative OCR accuracy or complete BF16 decoder claim.",
+  "hardware": {
+    "gpu": "NVIDIA GB10, DGX Spark, SM12.1",
+    "driver": "580.178.04",
+    "physical_memory_bytes": 130660974592,
+    "architecture": "aarch64",
+    "nvcc": "13.0.88"
+  },
+  "reference_versions": {
+    "vllm": "0.32.0",
+    "vllm-bart-plugin": "0.6.2",
+    "transformers": "5.19.0",
+    "torch": "2.13.0"
+  },
+  "measurement": {
+    "warmup_requests": 256,
+    "requests_per_measured_round": 256,
+    "measured_rounds": 2,
+    "native_physical_slots": 128,
+    "vllm_max_sequences": 128,
+    "native_limits_gib": {
+      "memory": 80,
+      "shared": 90,
+      "backend": 60,
+      "kv": 8,
+      "scratch": 40
+    },
+    "prefix_and_processor_cache_reuse": false,
+    "isolation_audits": {
+      "native_08_foreign_processes": 0,
+      "native_4B_foreign_processes": 0,
+      "vllm_08_foreign_processes": 0,
+      "vllm_4B_foreign_processes": 0
+    },
+    "fixtures": [
+      {
+        "path": "invoice.png",
+        "sha256": "23050ef19787ebc8f5386ffd5a6c322e6001855a108c4c65639cce465262754e"
+      },
+      {
+        "path": "receipt.png",
+        "sha256": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03"
+      },
+      {
+        "path": "shipping.png",
+        "sha256": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007"
+      }
+    ],
+    "native_client_concurrency": 256,
+    "vllm_queue": "All256requests queued up front; max_num_seqs128",
+    "runtime_source_build": "767 (historical clean measurements; current source is 879)"
+  },
+  "selected_changes": [
+    "BF16 vision-block performance profile for both models; F32 conservative fallback remains available. Decoder projections/residuals and recurrent state stay F32; existing optional BF16 prefill stays unchanged.",
+    "Fused0.8B projection/top1 with exact suppression/tie semantics, caller-owned bounded scratch and dense fallback; optional ANTFLY_CUDA_DISABLE_LIGHTON_FUSED_HEAD rollback.",
+    "Vision up/GELU fusion and down/bias/residual fusion retain original F32/BF16 rounding. Existing fused-vision rollback remains; no new vision flags.",
+    "F32 attention input preparation/projection-residual fusion and ordinary vision output GEMM plus bias/residual, preserving original F32 math.",
+    "Ordinary cache reuse with O(1)byte ledger; selected0.8B cold-qualified projection descriptors.",
+    "Mixed prefix/decode choices reuse the cancellation-safe pinned token-bank readback and release the execution lane while waiting. Original multi-token counters remain separate; no inactive compute or state rows.",
+    "SM12.1 4B output-head heuristic queries M16, then validates actual layouts and launches only real rows, preserving the 1,024-plan bound and workspace policy.",
+    "Separately admitted 32 MiB host metadata arena uses copy-completion events rather than draining later GPU producers on reuse; existing upload-disable controls and admission-denied fallbacks remain.",
+    "Same-stream reuse of owned deferred allocations on SM12.1 LightOn ordinary-cache misses and exact recurrent-state misses. Existing physical/admission charges and cache/free controls remain; no kernel math, precision, capacity or environment controls change."
+  ],
+  "results": [
+    {
+      "model": "08",
+      "precision_profile": "bf16_vision",
+      "native_measured_pages_per_second": [
+        15.1768,
+        15.1975
+      ],
+      "vllm_measured_pages_per_second": [
+        14.485482591571502,
+        14.482254815719276
+      ],
+      "native_mean_pages_per_second": 15.187149999999999,
+      "vllm_mean_pages_per_second": 14.483868703645388,
+      "native_relative_to_vllm": 0.04855617727172601,
+      "parity_status": "faster",
+      "native_serial_byte_parity": true,
+      "vllm_raw_text_parity": true,
+      "actual_burst_width": 4,
+      "plan_cache_capacity": 1024,
+      "uncached_and_scalar_fallbacks": 0,
+      "native_report_sha256": "a3dcadce72aa80bc7bf7dbe84872776c0ff2f739205aba474ef9a2c3956758c8",
+      "vllm_report_sha256": "de1f2f24a2b7c87ee9ecc14201123f96a8a3d0d4e73a0fce3ad1a2ef5dfde736",
+      "runtime_source_build": "767"
+    },
+    {
+      "model": "4b",
+      "precision_profile": "bf16_vision",
+      "native_measured_pages_per_second": [
+        4.6341,
+        4.5643
+      ],
+      "vllm_measured_pages_per_second": [
+        4.656302775299886,
+        4.657437602544513
+      ],
+      "native_mean_pages_per_second": 4.5992,
+      "vllm_mean_pages_per_second": 4.656870188922199,
+      "native_relative_to_vllm": -0.01238389445756638,
+      "parity_status": "behind",
+      "native_serial_byte_parity": true,
+      "vllm_raw_text_parity": true,
+      "actual_burst_width": 4,
+      "plan_cache_capacity": 1024,
+      "uncached_and_scalar_fallbacks": 0,
+      "native_report_sha256": "57ef5a8068bd0e4c4844d780913215426de5398937412cda485e7f12ab8f526e",
+      "vllm_report_sha256": "7151bff06bc050241c34defd0667dc35a3db31664c0127a8288c06aa645117d3",
+      "runtime_source_build": "767"
+    }
+  ],
+  "qualification": {
+    "checkpoint_fingerprints": {
+      "0.8B": {
+        "config_sha256": "842fafd8f06807269960515fa6f0e4b5dd27f9e645b67a2b3e84f1699ee8d60c",
+        "safetensors_sha256": "ae46aa6fd7136d57297ac006ed9ec345b7a2083feb2e99501bedcb014ca3efdf"
+      },
+      "4B": {
+        "config_sha256": "99b4c363a998c2d8c5ed5b3f3a40ec5cb97a156034df5002d0d789c74324f5f0",
+        "safetensors_sha256": "6b0dab74a2dab02d5b10ca56322255024ed8dca35c02746b42e9f296aaeb4e67"
+      }
+    },
+    "matched_backend": "cuDNN versus independent Transformers/PyTorch cuDNN, same original BF16 checkpoint weights",
+    "reference_criteria": {
+      "maximum_element_error": "2 BF16 ULP at independent reference output + original F32 2e-4 + abs(reference)*2e-5",
+      "relative_L2_limit": 0.00390625,
+      "default_F32_oracles": "Unchanged and separately qualified; this is a distinct BF16 activation profile."
+    },
+    "vision_cases": 118,
+    "vision_bit_exact_cases": 118,
+    "maximum_vision_rows": 65536,
+    "maximum_vision_batch": 16,
+    "readonly_and_canaries": true,
+    "negative_controls": [
+      "wrong row order",
+      "crossed images",
+      "aliases",
+      "alignment",
+      "shape"
+    ],
+    "default_F32_regression": {
+      "selected": 285,
+      "passed": 271,
+      "skipped": 14
+    },
+    "wide_regression": {
+      "selected": 111,
+      "passed": 110,
+      "skipped": 1
+    },
+    "real_default_F32_models": [
+      "08",
+      "4b"
+    ],
+    "real_default_F32_vision_batch_sizes": [
+      1,
+      1,
+      2,
+      3,
+      8,
+      16
+    ],
+    "head": {
+      "oracle": "Independent IEEE F32 PyTorch GEMM using original BF16-rounded inputs and weights",
+      "cases": 12,
+      "exact_tokens": true,
+      "maximum_winning_score_abs_error": 1.7881393432617188e-06,
+      "fixed_abs_error_limit": 0.0002,
+      "unaligned_input_and_token_bank": true,
+      "readonly_and_canaries": true
+    },
+    "attention_inputs": {
+      "oracle": "Transformers Qwen3_5RMSNorm, Qwen3_5TextRotaryEmbedding and apply_rotary_pos_emb with real checkpoint norms",
+      "checker_sha256": "b812c538502e959db5bc4a5c62d60142370009d4319d421cb6b960e8a4dff7c4",
+      "reference_source_sha256": "aac2a1bcca88829afc6dbdf83f97155ebf64d800ee9d703af3802a9aebcfcd18",
+      "cases": 40,
+      "all_checkpoint_norm_pairs_covered": true,
+      "fixed_abs_tolerance": 0.0002,
+      "max_abs_error": 1.9073486328125e-06,
+      "readonly_and_canaries": true,
+      "rows": [
+        1,
+        2,
+        7,
+        21,
+        64,
+        85,
+        128,
+        256,
+        662,
+        2316
+      ],
+      "previous_checker_sha256": "f36a55025a9d5e18ddbd2ef079f6b84204ffb021294527f475159339434c430e"
+    },
+    "Metal": {
+      "source_inputs": 79,
+      "enabled_build": true,
+      "CPU_ownership_and_bounds_tests": 13,
+      "new_GPU_performance_claim": false,
+      "binary_sha256": "5cf017b780269b587dafc6166a946b87c66e3e194a6c874089e9748b47c8c4cb"
+    },
+    "maximum_shape_memory_preflight": {
+      "minimum_free_bytes": 64424509440,
+      "cleanup": "Release unused Torch cache and both immutable input checkpoint file-cache pages before same guard; cases, oracle and limits unchanged",
+      "proof_sha256": "f28407434943b586e23114ad337555477d3b6527ec1da03196c6681425769758"
+    },
+    "runtime_source_build": "879",
+    "unchanged_vision_kernel_independent_evidence": "767/780, retained in performance_evidence; vision PTX/generators unchanged.879also passes both real-model F32vision batch checks and BF16invoice transcription.",
+    "head_4B_descriptor": {
+      "cases": 256,
+      "suppression_variants": 2,
+      "oracle": "Independent IEEE F32 PyTorch full logits, exact tokens, readonly inputs and canaries",
+      "maximum_absolute_error": 5.602836608886719e-06,
+      "fixed_absolute_error_limit": 0.0002,
+      "checker_sha256": "a740f8295962dce81ba0c7c15fca97681fa43a58dcc06e0965352722ed4dd016",
+      "no_compute_padding": true,
+      "actual_rows_inclusive_range": [
+        1,
+        128
+      ]
+    },
+    "metadata_and_readback": {
+      "host_metadata_capacity_bytes": 33554432,
+      "independent_host_admission": true,
+      "denied_admission_fallback": true,
+      "upload_disable_combinations": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "pinned_download_disable_checked": true,
+      "dependent_token_bank_steps_checked": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "CPU_event_wrap_and_failed_retirement_checks": true
+    },
+    "deferred_buffer_reuse": {
+      "physical_quota": "Pinned before/after copies preserve original bytes; reuse succeeds with no new allocation headroom, allocation calls, drain or admission-charge change.",
+      "ownership": "Recurrent state reuses only exact tracked owners; poisoned retired storage matches independent fresh state for both head counts and weight formats.",
+      "controls": "Stable extents, zero cache-byte/slot limits, disabled deferred freeing and queue-at/over-drain-threshold fallbacks checked.",
+      "source_scope": "Host allocator only; every CUDA/PTX input is unchanged from build838."
+    }
+  },
+  "reproduction": {
+    "runtime_build_base_commit": "3ac0bed9e17630332af2682ff80cebf8de2334a1",
+    "runtime_binary_sha256": "996d273e287aaae909b12a9cbb0abd08977bda01acfbdff965713a1790079a0c",
+    "runtime_build_command": [
+      "/Users/ajroetker/bin/zig-0.17.0/zig",
+      "build",
+      "test-bin",
+      "-Dtarget=aarch64-linux.7.0...7.0-gnu.2.39",
+      "-Dcpu=cortex_a725+aes+sha2+sha3+sm4-perfmon-spe",
+      "-Dcuda=true",
+      "-Dcuda-artifacts=fatbin",
+      "-Dcuda-libs=auto",
+      "-Doptimize=ReleaseFast",
+      "-Dstrip=true",
+      "-Dtest-filter=LightOnOCR3"
+    ],
+    "runtime_source_sha256": {
+      "zig/pkg/inference/build/runtime.zig": "ab746106497ba472ca2fc4e0b4ebce97fd5451b1a4cb75d9eaf402832de0bb8a",
+      "zig/pkg/inference/build/tests.zig": "3ebd7564f8f0894c5196b3f6f34299dd1c6c63fcbfdd867d7ff20843aa7c739e",
+      "zig/pkg/inference/src/architectures/florence.zig": "9c1c49e74869a4533e7bb2b5e194c70cb87031dd5f311144da039219c9151b9c",
+      "zig/pkg/inference/src/architectures/gpt.zig": "4b776b40ef58ab3ff0461f7a8726fb3a6befde3385f4a8f2f2029d40a293e824",
+      "zig/pkg/inference/src/architectures/qwen3vl_projector.zig": "c0a9324c36588af3ac031e34909c4f3399b4f9eb0aee499ef9098932357a9e0b",
+      "zig/pkg/inference/src/architectures/session_factory.zig": "a343a52332aa523c52aeee6d41b83236e8bf310fa60d512a87be77f7fcbb56eb",
+      "zig/pkg/inference/src/models/gpt.zig": "648f016723da1b985f83ae134e555afd00009ad7c92fda1d7ccb118d5d3cecd4",
+      "zig/pkg/inference/src/ops/cuda/cublaslt.zig": "2312ef8b8057950155129f1be44318ee6a3a7e730d59066611546e1ac16569f3",
+      "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "d5bc7f6985438c8249702a41d3d8057b1d2f515147825fc2958fe0e6491f32a9",
+      "zig/pkg/inference/src/ops/cuda/cudnn_conv.zig": "98902ea34fd935aaffde6f52be43937f8997c03b9d14f3015705949b5294c765",
+      "zig/pkg/inference/src/ops/cuda/cudnn_sdpa.zig": "d732dd69e38f67325707e8f53862de0f50c5786a3053c89bc0d959cf7135e29f",
+      "zig/pkg/inference/src/ops/cuda/florence_fused.ptx": "d4f91e70390ffb1e571526c14370582584cc5c657d316245106ab576d0a0a5f8",
+      "zig/pkg/inference/src/ops/cuda/florence_fused.zig": "eb524921071cf947b33dc04da22afc5898b3982ea94219a8e4922004b07cbd03",
+      "zig/pkg/inference/src/ops/cuda/kernels.zig": "61dd2fdd23c8126ce3bc45efa2f5e5e424bdb47c41e85f71f56d164c0b3339e3",
+      "zig/pkg/inference/src/ops/cuda/lighton_attention.ptx": "f8bf0ecb66a9cd07545c143c06aecb2cab852ee0b7d24073cdf4237e99cbb482",
+      "zig/pkg/inference/src/ops/cuda/lighton_attention.zig": "11c07d461e7739ea181d5d6f77d303563e70786e742b6ee33c3f1660ac905fd5",
+      "zig/pkg/inference/src/ops/cuda/lighton_recurrent.ptx": "f0e2f9a87724fa2a78a45a246e4c6519c48ee213eb38474e21b94bb054c8f324",
+      "zig/pkg/inference/src/ops/cuda/lighton_recurrent.zig": "0a52e200087408a8e31ca57c6cdd6639feaef5dff32f7a29304a5d4f56411c6a",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision.ptx": "61717ac07d1da5ee8175b0721838b5e5eda8c8b8249d714b1abe58b1a263708c",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision.zig": "e80ddac3a42fcb195d988213285851e4caf7405b4e25cb7a49829b26d5f0affd",
+      "zig/pkg/inference/src/ops/cuda/prototypes/florence_fused.cu": "8c0a26fefa8180185cc48ca81ef3f1c09062187f7c2b4e0b46e528cc021fddc0",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_batched_attention.cu": "a253da43c5dce8d14ce0f02f843708cbd670dd74cfe781524384a7596a9dea44",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_qwen35_recurrent.cu": "55f269a128ad50eae0dfcaf8fe591bbded4aea5dbe05df67a8a6d034dff871aa",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision.cu": "41a1a9a0085731f97601182ea114050ac039d7f42699926f90e44e759003500a",
+      "zig/pkg/inference/src/pipelines/generation.zig": "4c5d43064e6f2300b783151fdcdcde5534cc1a7243e5864d1b3980eef8eef826",
+      "zig/pkg/inference/src/pipelines/reading.zig": "20ef5a3c5b96b2da54426faa4de9cca75a20afbe7c29c0b297ad2aed92c01bfd",
+      "zig/pkg/inference/src/runtime/scheduler/native_generate.zig": "3500ea6444834b27c3f6c2da0142dec098eef9a045362d5e7f51f716d8a821b6",
+      "zig/pkg/inference/src/server/server.zig": "b6abcda3b20745dc7d956e36d3f3698b1d2cb5a6e624486f79bcbbb6864b23c3",
+      "zig/pkg/inference/src/ops/cuda/driver.zig": "3561b9b1dcb50c2e857cf628fba06769ed371d8ad4b1e3f34f9849f6b5fc73c5",
+      "zig/pkg/inference/src/ops/cuda/lighton_activation.zig": "ecb56a4fccefc42a0b1f369d64c32492a9b0c9771a423e701ee75b03f5afec25",
+      "zig/pkg/inference/src/ops/cuda/lighton_activation.ptx": "ab9e6c67790cafa0f4f51ac9c2ffd5ed4acb89e60c731e46926d8310905f81e7",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_activation.cu": "8b5ba1721669b5b1a59352c974953840240a1678d509e6fb4e6fa52a714673a6",
+      "zig/pkg/inference/src/server/reader_execution_pool.zig": "3df029d8a5d8b66b73c6f110420b11a0713feecc30bf1453b83267b7209aab02",
+      "zig/pkg/inference/src/server/reader_epoch.zig": "e405cc24cdc8c73f9769ecf39c8ec0596e2d2f8e2e070819949d403a1e0d827a",
+      "zig/pkg/inference/src/server/reader_execution_config.zig": "ba292ef60f1f5e519195ae113816e89a01b5b3bd1bed5c1ef83d302b4790f0d0",
+      "zig/pkg/inference/src/server/reader_admission.zig": "1483ba2042ab77cc573db92c2ccbe64ede718ce7c97f2b5624ada96f1dc256fe",
+      "zig/pkg/inference/src/ops/cuda/lighton_prefill.zig": "ea5e5d978dcdce53d3a526c973c082843914b206e668feb3972847d49053a809",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_bf16_prefill.cu": "0fa3651f1374336081d4744590c56879a743691df4698905c4e68159512f9089",
+      "zig/pkg/inference/src/ops/cuda/lighton_decode_graph.zig": "22440b75a8cf9214978d3b1bc67f248927ce94c36f5135835e2bfe37b399582f",
+      "zig/pkg/inference/src/ops/cuda/execution_arena.zig": "a17673cdc478658c5e890ff47549ed86d63078b76b5be3c7e5ddaa610afea1e1",
+      "zig/pkg/inference/src/ops/cuda/audio_execution_plan.zig": "f1393c6f2418174f28f5a95de60fd6e12e4758a36eb976c69980c73eef2577cc",
+      "zig/pkg/inference/src/runtime/kv/storage_runtime.zig": "4889a0eaac378a0d0028cf7413a6b9d016650da13dbecc2973792352a51f9e18",
+      "zig/pkg/inference/src/ops/cuda/lighton_prefill_attention.zig": "b2da8e2ec686da0d8396649bfda75870ab7d1975d2272cd5d191129ea1317ca8",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_prefill_attention.cpp": "75c68f13762f9532524a66bbc294113cd5b4dec201e67a6688dbd9722b2d6a09",
+      "zig/pkg/inference/src/pipelines/packed_head_rows.zig": "68436c76d4f3e75843585e5829c41c1b83a6d67f72b369cbb7d3912cc15e667f",
+      "zig/pkg/inference/src/backends/metal_runtime.zig": "eff0608420bf035e3d0e9a233f2d8f202d548e010faeb384a4ee530ee0f6b10c",
+      "zig/pkg/inference/src/backends/metal_kernels.m": "c14ef7988614b38a4c047c1723d7b07f7cd4654230935a03f6301770d8aa5340",
+      "zig/pkg/inference/src/ops/metal_compute.zig": "ad7fb99ec9201915216aa33f29f15cf141d13fce436242ec75a5eccd3af36871",
+      "zig/pkg/inference/src/ops/cuda/runtime_policy.zig": "abacb9f82dc94b554aa6d339568dd98a176bc8c43a88b6b937cea1ab384a06b4",
+      "zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profiles.json": "8da2d2efaed926b1f302a97200e5233bae5ad8fe20b5b71ce9c74b2820af390b",
+      "zig/pkg/inference/src/architectures/qwen3vl_device_qualification.zig": "c61aaef3133d14e58ae7707a2ae044db7f40c126646254c3bc7643c02bcb25f0",
+      "zig/pkg/inference/src/ops/cuda/burst_readback.zig": "7839493da05812382d27fd89cccc193fea7fcbaad9ce11fbd35fb2e38241d11e",
+      "zig/pkg/inference/src/ops/cuda/pinned_input_arena.zig": "17c8cb1e5e8683fca96a0901811b2b9a580f09c43ac93c869e9f2896a9cd7aa7",
+      "zig/pkg/inference/src/ops/cuda/buffer.zig": "522126f2efd853d23793cf8da50aec5e3a5241fe7f6de60473f2393d4f8e3619",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.zig": "bdb694dbefb7529109de567b31db646b3e3fb6bfa65f604d5411c387cebac955",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_bf16.ptx": "b00eaff6ca8720442e85a81bc840f3a9c11aded2c89e9fa24dcac89aed397583",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision_bf16.cu": "d4bb2ae275a04bf8425d1d9bd9596a51c155af6a0d9340e232b92dc851727f09",
+      "zig/pkg/inference/scripts/lightonocr3/benchmark_concurrency.py": "e1b2adfb5e49e3e071e31f28cd09c37e3ab4655a89a994c9ee785c726fbcee83",
+      "zig/pkg/inference/scripts/lightonocr3/cuda_ocr_profile.py": "e1613b8f0a6274aa3ed90040c30c504bf044de9055b40aa7246e487022c01770",
+      "zig/pkg/inference/src/ops/cuda/lighton_attention_inputs.zig": "a140a134ff1dac27decfe78c583404027b753d6748a0f8e1b4f896cd92f7079b",
+      "zig/pkg/inference/src/ops/cuda/lighton_attention_inputs.ptx": "2c3ea7b5bd403ce186a17bce7a1e8703a34c4d627fd29db2cfe2ba71186e2f97",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_attention_inputs.cu": "77a6844922a7a1e5b91c0f0dd55b127f4d28c86654065b01fbff908f16d953fc",
+      "zig/pkg/inference/src/ops/cuda/buffer_cache.zig": "2155e95606e14c48a0cb07d7903f9a442d588862b215d2658ea16dbd5a76aa7b",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_gemm.zig": "9c73e5508e599accfe6e95765fcd8b22482dd0deecc2777f5ddee74226d734ae",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision_gemm.py": "64b24ca76d0b963eb7dd992509c80ad4865f9dcf44c831cd673ee48172692718",
+      "zig/pkg/inference/src/lighton_vision_bf16_qualification.zig": "32a97c96e510b89a6c2cef86ebdf1d8d885b4f2f3a8ea74dd28608f16ae70504",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_up_768_f32.ptx": "68480879138cb63be79523632c8a405a6deda5002579860606b2273b9eb5da58",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_up_768_bf16.ptx": "cc6361839c10e1e78fc246ed6e3461af08c0490e71432b68c31d632dab07e423",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_up_1024_f32.ptx": "694c4e0bc70785b061c3be0eb61323bbbdbf0d49e77f9ec36a190548e76d8b8b",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_up_1024_bf16.ptx": "9e8cc8c56b6379a4b8a4ce72f4bd750246b16ee91b059583ef169c3d66f7c3fd",
+      "zig/pkg/inference/src/ops/cuda/lighton_head.zig": "337a0427fe1bbab94db691221ac6aefb8e1d1defd35f1f5cbf1417eeec74aeb5",
+      "zig/pkg/inference/src/ops/cuda/lighton_head_top1_partial.ptx": "41210d0d65426e2aa30a990429637b3d0e55a10fd08623a13fb84c541e09b794",
+      "zig/pkg/inference/src/ops/cuda/lighton_head_top1_finish.ptx": "7491d46f381563ea2e100947b1085a14f36fe8b425a133d24e132f631723c2ad",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_head.py": "d4ca149300ed10c9e724f05e3952c1bca49a0c2d541cd150125a7f884e20e929",
+      "zig/pkg/inference/src/ops/cuda/prototypes/lighton_vision_down.py": "b278a37d1f89379f5f9e1b783ed4dbf7da6e6a4e848be9fc298c3b1944a0a836",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_down_768_f32.ptx": "a2bb8043444623fd0bcff5802887b3c38f745c7493dda99f7b457ab7a9d175f3",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_down_768_bf16.ptx": "1a5430c77927dbd50182f799b24bbf2a31a315b0ec4e30cceb6a285d0df26b17",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_down_1024_f32.ptx": "3a9053d17735bf5bac01fda744ba903f608bb1fc5e3661e2245912c5c94109f0",
+      "zig/pkg/inference/src/ops/cuda/lighton_vision_down_1024_bf16.ptx": "53b1860ce091b00757095b94a2e79f09a3efff77ba14931d0e0356131d658a46"
+    },
+    "source_archive_sha256": "6edd13850fe171137766524f8daea187ba4564e33af3c8eb3b9d4a9fe60e827a",
+    "source_identity": "All 79 current published source inputs match CUDA 879 and Metal 885. All 4,787 tracked Zig/C/C++/header/Metal/PTX files match the published working tree after porting only cuda_compute.zig. CUDA/PTX/math/precision remain unchanged from 838. Historical build 767 performance has separate evidence.",
+    "zig_version": "0.17.0",
+    "checker_sha256": {
+      "check_cuda_lighton_head.py": "4be3db2eb1de35301c8ab106a7344afefb571949ab72d5be8591ff93b520fb12",
+      "check_cuda_lighton_bf16_vision.py": "3f1b3650b9cf69a339ee8a927916a4048084a31b0636dd7ac143cf8c7dd3b28f"
+    },
+    "head_generation": {
+      "source_sha256": "d4ca149300ed10c9e724f05e3952c1bca49a0c2d541cd150125a7f884e20e929",
+      "kernels": [
+        {
+          "file": "lighton_head_top1_partial.ptx",
+          "sha256": "41210d0d65426e2aa30a990429637b3d0e55a10fd08623a13fb84c541e09b794",
+          "shared": 32768,
+          "threads": 256
+        },
+        {
+          "file": "lighton_head_top1_finish.ptx",
+          "sha256": "7491d46f381563ea2e100947b1085a14f36fe8b425a133d24e132f631723c2ad",
+          "shared": 16,
+          "threads": 128
+        }
+      ]
+    },
+    "vision_down_generation": {
+      "source_sha256": "b278a37d1f89379f5f9e1b783ed4dbf7da6e6a4e848be9fc298c3b1944a0a836",
+      "kernels": [
+        {
+          "file": "lighton_vision_down_768_f32.ptx",
+          "sha256": "a2bb8043444623fd0bcff5802887b3c38f745c7493dda99f7b457ab7a9d175f3",
+          "shared": 49152,
+          "threads": 128
+        },
+        {
+          "file": "lighton_vision_down_768_bf16.ptx",
+          "sha256": "1a5430c77927dbd50182f799b24bbf2a31a315b0ec4e30cceb6a285d0df26b17",
+          "shared": 49152,
+          "threads": 128
+        },
+        {
+          "file": "lighton_vision_down_1024_f32.ptx",
+          "sha256": "3a9053d17735bf5bac01fda744ba903f608bb1fc5e3661e2245912c5c94109f0",
+          "shared": 49152,
+          "threads": 128
+        },
+        {
+          "file": "lighton_vision_down_1024_bf16.ptx",
+          "sha256": "53b1860ce091b00757095b94a2e79f09a3efff77ba14931d0e0356131d658a46",
+          "shared": 49152,
+          "threads": 128
+        }
+      ]
+    },
+    "vision_up_generation": {
+      "triton": "3.7.1",
+      "libdevice_sha256": "91334d6e12748f6cb5bbf0a1cd965a56bcd93dc4f496d2e5c5f8c6e523094356",
+      "kernels": [
+        {
+          "file": "lighton_vision_up_768_f32.ptx",
+          "sha256": "68480879138cb63be79523632c8a405a6deda5002579860606b2273b9eb5da58",
+          "shared_bytes": 24576,
+          "threads": 128
+        },
+        {
+          "file": "lighton_vision_up_768_bf16.ptx",
+          "sha256": "cc6361839c10e1e78fc246ed6e3461af08c0490e71432b68c31d632dab07e423",
+          "shared_bytes": 24576,
+          "threads": 128
+        },
+        {
+          "file": "lighton_vision_up_1024_f32.ptx",
+          "sha256": "694c4e0bc70785b061c3be0eb61323bbbdbf0d49e77f9ec36a190548e76d8b8b",
+          "shared_bytes": 24576,
+          "threads": 128
+        },
+        {
+          "file": "lighton_vision_up_1024_bf16.ptx",
+          "sha256": "9e8cc8c56b6379a4b8a4ce72f4bd750246b16ee91b059583ef169c3d66f7c3fd",
+          "shared_bytes": 24576,
+          "threads": 128
+        }
+      ],
+      "ptx_version": "9.0",
+      "target": "sm121a",
+      "global_scratch_bytes": 0,
+      "profile_scratch_bytes": 0,
+      "source_sha256": "fb71916d4960fbb580f183dc282d6a6f19eda94ce81e2336b005745cd03f5e1e"
+    },
+    "evidence": {
+      "sha256": "281e76bd6221ac945a4837a0873dc0e6769bb9d365bdcf3f8e6932033c72002a",
+      "bytes": 26490798,
+      "remote_path": "/home/ajroetker/antfly/.worktrees/perf-lightonocr3-vllm-followup/.cache/evidence/ocr-879/281e76bd6221ac945a4837a0873dc0e6769bb9d365bdcf3f8e6932033c72002a.tar.gz",
+      "uri": "ssh://glowworm/home/ajroetker/antfly/.worktrees/perf-lightonocr3-vllm-followup/.cache/evidence/ocr-879/281e76bd6221ac945a4837a0873dc0e6769bb9d365bdcf3f8e6932033c72002a.tar.gz",
+      "inventory_files": 83
+    },
+    "published_source_base_commit": "d90b8a298c72cf44ed7e9d57c74571610d965ce3",
+    "published_source_proof_sha256": "77e45d1b1378ea5159a7f7caa4324d02029cd1ce5d7d8d1b97c858f0b73e5361",
+    "performance_evidence": {
+      "sha256": "eb0462cf69acb145ccc150776593fa5da38deccb918ee55eb8780de0d171f98b",
+      "bytes": 27708554,
+      "remote_path": "/home/ajroetker/antfly/.worktrees/perf-lightonocr3-vllm-followup/.cache/evidence/ocr-767/eb0462cf69acb145ccc150776593fa5da38deccb918ee55eb8780de0d171f98b.tar.gz",
+      "uri": "ssh://glowworm/home/ajroetker/antfly/.worktrees/perf-lightonocr3-vllm-followup/.cache/evidence/ocr-767/eb0462cf69acb145ccc150776593fa5da38deccb918ee55eb8780de0d171f98b.tar.gz",
+      "inventory_files": 37
+    },
+    "performance_runtime_binary_sha256": "806d4559349cbe3a1fd5f0cb836a7a6f27dc380b626a30c49609f79f8a4a49b1",
+    "performance_source_archive_sha256": "958fc5bd9dc07d372a6631cebd267bcced1e54c7b9190b9fddeb0302a4c3fb4a",
+    "performance_source_manifest_in_bundle": "qualification/source767.json"
+  }
+}

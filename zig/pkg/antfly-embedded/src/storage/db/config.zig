@@ -339,6 +339,10 @@ pub const IndexBackendOptions = struct {
     /// catalog has observed the migration floor. It may never be set on an
     /// ordinary active managed DB open.
     dense_native_candidate_build_authorized: bool = false,
+    /// Raft data shards: LEANN graphs change only through leader-planned
+    /// records committed to the log (see storage/leann_replicated.zig).
+    /// Standalone and embedded DBs keep LEANN replica-local.
+    leann_replication: bool = false,
     // Binding a caller-owned shared cache requires a manager whose lifetime
     // covers that cache. Per-DB fallback managers govern local work but must
     // not be installed into external caches.
@@ -538,6 +542,7 @@ pub fn indexBackendOptionsForPrimary(
         .retained_vector_cache_enabled = overrides.retained_vector_cache_enabled,
         .dense_native_migration_policy_source = overrides.dense_native_migration_policy_source,
         .dense_native_candidate_build_authorized = overrides.dense_native_candidate_build_authorized,
+        .leann_replication = overrides.leann_replication,
         .bind_cache_resource_manager = overrides.bind_cache_resource_manager and bind_cache_resource_manager,
         .text_main_lsm_options = mergedIndexLsmOptions(
             overrides.text_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,

@@ -24,10 +24,14 @@ pub const Action = @import("antfly_documents").types.Action;
 pub const Origin = @import("antfly_documents").types.Origin;
 pub const Operation = enum { read, decide, extract };
 pub const Provider = enum { antfly, cloudflare };
+pub const AudioReadOptions = @import("antfly_documents").types.AudioReadOptions;
 pub const Binding = struct {
+    audio_options: AudioReadOptions = .{},
     name: []const u8,
     model: []const u8,
     operation: Operation,
+    /// Source modality consumed by a read binding; other operations consume text.
+    input: enum { image, audio } = .image,
     output_origin: Origin = .transcription,
     provider: Provider = .antfly,
     /// Deployment-owned credential reference, never a credential value.
@@ -39,7 +43,17 @@ pub const Binding = struct {
     max_total_tokens: ?u64 = null,
 };
 /// Captured before inference. Paths never appear in public run metadata.
-pub const Snapshot = struct { binding: Binding, path: []const u8, identity: [32]u8, max_total_tokens: u64 = 131072 };
+pub const Snapshot = struct {
+    remote: bool = false,
+    binding: Binding,
+    path: []const u8,
+    identity: [32]u8,
+    max_total_tokens: u64 = 131072,
+    token_usage: enum { measured, unavailable } = .measured,
+    /// Native decoder can enforce an aggregate output ceiling across windows
+    /// and retries. Other backends retain their conservative fixed reservation.
+    adjustable_output_budget: bool = false,
+};
 pub const Limits = struct {
     max_sources: usize = 64,
     max_pages: usize = 1024,
@@ -178,6 +192,7 @@ pub const Definition = struct {
             return error.InvalidDocumentDefinition;
         try self.budget.validate();
         for (self.models, 0..) |b, i| {
+            if (b.input == .audio and (b.operation != .read or b.provider != .antfly)) return error.DocumentCapabilityMismatch;
             if (b.max_total_tokens != null and b.max_total_tokens.? == 0) return error.InvalidDocumentDefinition;
             if (b.name.len == 0 or b.model.len == 0) return error.InvalidDocumentDefinition;
             if ((b.output_origin != .transcription and b.output_origin != .interpretation) or (b.operation != .read and b.output_origin != .transcription)) return error.InvalidDocumentDefinition;
@@ -198,10 +213,11 @@ pub const Definition = struct {
             _ = try self.binding(r.reader, .read);
             if (!std.math.isFinite(r.min_confidence) or r.min_confidence < 0 or r.min_confidence > 1)
                 return error.InvalidDocumentDefinition;
+            if ((try self.binding(r.reader, .read)).input == .audio and r.table_reader != null) return error.DocumentCapabilityMismatch;
             if (r.router) |name| _ = try self.binding(name, .decide);
             for ([_]?[]const u8{ r.table_reader, r.accurate_reader, r.fallback_reader, r.verification_reader }) |name|
                 if (name) |n| {
-                    _ = try self.binding(n, .read);
+                    if ((try self.binding(n, .read)).input != (try self.binding(r.reader, .read)).input) return error.DocumentCapabilityMismatch;
                 };
         }
         if (self.extract) |e| {
@@ -238,6 +254,9 @@ pub const Page = @import("antfly_documents").types.Page;
 pub const Usage = struct {
     prompt_tokens: u64 = 0,
     completion_tokens: u64 = 0,
+    /// Conservative capacity spent on calls without provider token measurements.
+    /// Kept separate from prompt/completion counts; never bill as measured usage.
+    unmeasured_tokens: u64 = 0,
     total_tokens: u64 = 0,
     model_calls: usize = 0,
     physical_model_calls: usize = 0,
@@ -407,6 +426,16 @@ pub const Run = struct {
         }
         self.usage.model_calls += 1;
     }
+    pub fn remainingTokens(self: *const Run) u64 {
+        const local = self.limits.max_total_tokens -| self.usage.total_tokens;
+        if (self.shared) |shared| {
+            shared.lock();
+            defer shared.mutex.unlock();
+            const scoped = if (self.scope) |scope| scope.remaining("total_tokens", "max_total_tokens") else local;
+            return @min(local, scoped, shared.limits.max_total_tokens -| shared.usage.total_tokens);
+        }
+        return local;
+    }
     pub fn remainingCalls(self: *const Run) usize {
         // Semantic replay still traverses committed calls when the durable
         // dispatch budget is exhausted. Session.reserve independently fences
@@ -478,7 +507,9 @@ pub const Run = struct {
                 var usage = ctx.logical;
                 usage.prompt_tokens = delta.prompt_tokens;
                 usage.completion_tokens = delta.completion_tokens;
+                usage.unmeasured_tokens = delta.unmeasured_tokens;
                 usage.total_tokens = std.math.add(u64, delta.prompt_tokens, delta.completion_tokens) catch return error.InvalidDocumentCheckpoint;
+                usage.total_tokens = std.math.add(u64, usage.total_tokens, delta.unmeasured_tokens) catch return error.InvalidDocumentCheckpoint;
                 usage.rendered_pixels = delta.rendered_pixels;
                 try ctx.run.applyReplayUsage(usage);
             }
@@ -496,8 +527,18 @@ pub const Run = struct {
         self.usage.physical_model_calls += 1;
     }
     pub fn tokens(self: *Run, input: u64, output_tokens: u64) !void {
+        return self.chargeTokens(input, output_tokens, 0);
+    }
+    /// Spend the provider-declared allowance before dispatch. Unknown usage
+    /// cannot refund this capacity, including on synchronous sibling calls.
+    pub fn unmeasuredTokens(self: *Run, upper: u64) !void {
+        if (upper == 0) return error.UnsupportedMediaTokenBudget;
+        return self.chargeTokens(0, 0, upper);
+    }
+    fn chargeTokens(self: *Run, input: u64, output_tokens: u64, unmeasured: u64) !void {
         try self.control.check();
-        const count = std.math.add(u64, input, output_tokens) catch return error.DocumentTokenLimitExceeded;
+        const measured = std.math.add(u64, input, output_tokens) catch return error.DocumentTokenLimitExceeded;
+        const count = std.math.add(u64, measured, unmeasured) catch return error.DocumentTokenLimitExceeded;
         if (count > self.limits.max_total_tokens -| self.usage.total_tokens) return error.DocumentTokenLimitExceeded;
         if (self.shared) |shared| {
             shared.lock();
@@ -507,18 +548,21 @@ pub const Run = struct {
             if (self.scope) |scope| {
                 scope.add("prompt_tokens", input);
                 scope.add("completion_tokens", output_tokens);
+                scope.add("unmeasured_tokens", unmeasured);
                 scope.add("total_tokens", count);
             }
             shared.usage.prompt_tokens += input;
             shared.usage.completion_tokens += output_tokens;
+            shared.usage.unmeasured_tokens += unmeasured;
             shared.usage.total_tokens += count;
         }
         self.usage.prompt_tokens += input;
         self.usage.completion_tokens += output_tokens;
+        self.usage.unmeasured_tokens += unmeasured;
         self.usage.total_tokens += count;
         if (self.durable) |session| {
             const key = self.durable_stage orelse return error.InvalidDocumentCheckpoint;
-            try self.touchCost(try session.measureModelTokens(key, input, output_tokens));
+            try self.touchCost(try session.measure(session.modelCostKey(key), .{ .prompt_tokens = input, .completion_tokens = output_tokens, .unmeasured_tokens = unmeasured }));
         }
     }
     pub fn abandonPixels(self: *Run) void {
@@ -820,4 +864,33 @@ test "document durable cost replay is concurrent and retains logical and nested 
     scope.limits.max_model_calls = 3;
     denied.limits.max_model_calls = 3;
     try std.testing.expectError(error.DocumentOutputTooLarge, denied.restoreCosts(.{ .output_bytes = 1 }, &.{receipt}));
+}
+
+test "document audio bindings reject incompatible refinement and visual specialists" {
+    const audio = Binding{ .name = "speech", .model = "gemma4", .operation = .read, .input = .audio };
+    const image = Binding{ .name = "ocr", .model = "ocr", .operation = .read };
+    var definition = Definition{ .models = &.{ audio, image }, .read = .{ .reader = "speech", .accurate_reader = "ocr" } };
+    try std.testing.expectError(error.DocumentCapabilityMismatch, definition.validate());
+    definition.read = .{ .reader = "speech", .table_reader = "speech" };
+    try std.testing.expectError(error.DocumentCapabilityMismatch, definition.validate());
+    definition.read = .{ .reader = "speech" };
+    try definition.validate();
+}
+
+test "document shared unknown token allowances spend capacity before sibling dispatch" {
+    var shared = SharedAccounting{ .limits = .{ .max_total_tokens = 250 }, .usage = .{}, .event_count = 0 };
+    var scope = ScopeAccounting{ .limits = .{ .max_total_tokens = 200 }, .usage = .{} };
+    var left = Run{ .limits = shared.limits, .shared = &shared, .scope = &scope };
+    defer left.deinit();
+    var right = Run{ .limits = shared.limits, .shared = &shared, .scope = &scope };
+    defer right.deinit();
+    try left.unmeasuredTokens(100);
+    try right.unmeasuredTokens(100);
+    try std.testing.expectError(error.DocumentTokenLimitExceeded, right.unmeasuredTokens(100));
+    try std.testing.expectEqual(@as(u64, 200), shared.usage.total_tokens);
+    try std.testing.expectEqual(@as(u64, 200), shared.usage.unmeasured_tokens);
+    try std.testing.expectEqual(@as(u64, 0), shared.usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u64, 0), shared.usage.completion_tokens);
+    try std.testing.expectEqual(@as(u64, 200), scope.usage.unmeasured_tokens);
+    try std.testing.expectError(error.UnsupportedMediaTokenBudget, left.unmeasuredTokens(0));
 }

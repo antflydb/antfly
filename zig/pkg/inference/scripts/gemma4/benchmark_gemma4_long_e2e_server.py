@@ -1285,13 +1285,17 @@ def make_server_spec(
         write_json(
             config_path,
             {
-                "models_dir": str(args.models_dir.resolve()),
-                "admission": {"inference": {"max_concurrent_requests": 1}},
-                "generation_batching": {
-                    "mode": "off",
-                    "max_step_items": 1,
-                    "max_step_query_tokens": 512,
-                    "max_idle_prefill_chunk_size": SERVER_MAX_IDLE_PREFILL_CHUNK_SIZE,
+                "resources": {
+                    "inference": {"admission": {"max_concurrent_requests": 1}}
+                },
+                "inference": {
+                    "models_dir": str(args.models_dir.resolve()),
+                    "generation_batching": {
+                        "mode": "off",
+                        "max_step_items": 1,
+                        "max_step_query_tokens": 512,
+                        "max_idle_prefill_chunk_size": SERVER_MAX_IDLE_PREFILL_CHUNK_SIZE,
+                    },
                 },
             },
         )

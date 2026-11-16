@@ -796,3 +796,27 @@ Include and exclude patterns use [doublestar](https://github.com/bmatcuk/doubles
 ## License
 
 See repository root for license information.
+
+### Metadata-only S3 and Drive listing
+
+`S3Source` and `GoogleDriveSource` implement the optional `MetadataSource`
+interface. Call `List(ctx)` instead of `Traverse(ctx)` when Antfly or another
+consumer will fetch the bytes:
+
+```go
+items, errs := source.List(ctx)
+for item := range items {
+    // item.Content is nil. Paths, URLs, sizes and provider versions/checksums
+    // are available without object downloads or Workspace exports.
+}
+for err := range errs {
+    if err != nil { return err }
+}
+```
+
+Listing preserves traversal filters, pagination and cancellation, and propagates
+provider listing errors. S3 exposes `etag` and any listed `version_id`; an ETag is
+not necessarily an MD5 digest. Drive exposes its original MIME type, stable file
+ID, `version`, size and available `md5_checksum`, including metadata for Workspace
+objects. It does not invent SHA-256 or an export's unknown byte length.
+`Traverse` retains its content-download contract.

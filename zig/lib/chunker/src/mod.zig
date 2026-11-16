@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const ranking = @import("ranking.zig");
+pub const diarization = @import("diarization.zig");
 pub const outputs = @import("outputs.zig");
 pub const planning = @import("planning.zig");
 pub const types = @import("types.zig");

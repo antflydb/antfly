@@ -44,6 +44,8 @@ function result<Row>(wire: WireResult): SqlResult<Row> {
   return {
     columns: wire.columns,
     commandTag: wire.command_tag,
+    mutationOutcome: wire.mutation_outcome,
+    ddlReceipt: wire.ddl_receipt,
     rowsAffected: BigInt(wire.rows_affected),
     rows: wire.rows.map(
       (row, rowIndex) =>

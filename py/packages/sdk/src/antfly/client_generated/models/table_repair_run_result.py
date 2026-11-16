@@ -24,8 +24,8 @@ class TableRepairRunResult:
         failed (int): Number of supported repair attempts that failed.
         unsupported (int): Number of repair records skipped because no automated repair exists for the selected target.
         unresolved (int): Number of attempted repair records that remained queued after this pass.
-        in_progress (int): Number of selected repair records or indexes skipped because another repair pass already owns
-            them.
+        in_progress (int): Number of selected repair records or indexes still in progress after this pass, including
+            queued native producer work and work owned by another repair pass.
         indexes_rebuilt (int): Number of indexes rebuilt by this pass when target is index.
         indexes_degraded_before (int): Number of selected indexes that were degraded or quarantined when this repair
             pass began.

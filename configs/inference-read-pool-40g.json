@@ -1,0 +1,71 @@
+{
+  "resources": {
+    "memory": {
+      "max_bytes": 77309411328
+    },
+    "inference": {
+      "memory": {
+        "max_host_bytes": 34359738368,
+        "max_device_bytes": 40802189312,
+        "max_combined_bytes": 75161927680,
+        "max_kv_bytes": 21474836480,
+        "max_scratch_bytes": 12884901888
+      },
+      "admission": {
+        "max_concurrent_requests": 16,
+        "max_work_units": 1024
+      },
+      "request_limits": {
+        "max_items_per_request": 8,
+        "max_input_tokens_per_item": 32768,
+        "max_output_tokens_per_item": 4096,
+        "max_decoded_pixels_per_batch": 4000000
+      }
+    }
+  },
+  "inference": {
+    "models_dir": "/models",
+    "ml_dir": "/ml",
+    "max_loaded_models": 3,
+    "keep_alive": "0",
+    "preload": [
+      {
+        "kind": "generator",
+        "name": "google/gemma-4-E4B-it-qat-q4_0-gguf",
+        "backend": "cuda"
+      },
+      {
+        "kind": "extractor",
+        "name": "antflydb/GLiNER2.5-Decide",
+        "backend": "cuda"
+      },
+      {
+        "kind": "embedder",
+        "name": "google/embeddinggemma-2",
+        "backend": "cuda"
+      }
+    ],
+    "kernel_jit": {
+      "mode": "off"
+    },
+    "prompt_cache": {
+      "enabled": true,
+      "max_bytes_mb": 8192,
+      "min_tokens": 64,
+      "ttl_ms": 600000
+    },
+    "generation_batching": {
+      "mode": "on",
+      "max_step_items": 2,
+      "max_step_query_tokens": 512,
+      "max_decode_wait_us": 0,
+      "max_idle_prefill_chunk_size": 512
+    },
+    "cooperative_execution": {
+      "mode": "on",
+      "max_active_requests": 2,
+      "short_context_burst": 8,
+      "decode_handoff_wait_us": 5000
+    }
+  }
+}

@@ -67,9 +67,8 @@ function TableHead({ className, ...props }: React.ComponentProps<"th">) {
     <th
       data-slot="table-head"
       className={cn(
-        // mono uppercase "instrument readout" voice (same family as MonoLabel),
-        // dimmed so the heads recede behind the data
-        "font-mono uppercase tracking-[0.08em] text-[11px] font-medium text-muted-foreground/70",
+        // small muted sans, so the heads recede behind the data
+        "font-sans text-xs font-medium text-muted-foreground",
         "h-11 px-4 text-left align-middle whitespace-nowrap",
         // checkbox handling preserved
         "[&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",

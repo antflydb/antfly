@@ -49,6 +49,154 @@ Final rerank must use borrowed/external vector loading where possible. Search
 scratch belongs in `dense.search_working_set`; retained HBC nodes and quantized
 payloads remain in `hbc.node_metadata_cache`.
 
+Full effort (`search_effort: 1.0`) preserves complete published-snapshot
+coverage. It does not require loading every full-precision vector: fresh native
+postings with validated float16 projections can reject members whose
+deterministic lower distance bound is strictly worse than an already established
+exact top-k cutoff. When a posting has no local projection plane, the matching
+authoritative vector generation can supply deterministic intervals through its
+bounded-scoring interface. Overlapping intervals and ties still receive
+authoritative scores. Exact heaps use the public `(distance, vector_id)` ordering,
+including when already-exact source rows arrive before deferred completions.
+Filters run before screening; missing or stale bounded
+representations fall back to authoritative scoring. RaBitQ estimates never
+certify these rejections.
+
+This optimization still visits all postings and validates their membership. It
+reduces full-vector reads rather than guaranteeing sublinear search. Profiles
+separate `hbc_exact_projection_vectors_scored`,
+`hbc_exact_vectors_pruned_by_bound`, and `hbc_exact_vectors_scored`.
+
+Exact scoring streams waves of at most 128 members, including oversized and
+dirty postings. Source projections and locations are retained only through
+their wave's exact completion; the source-generation lease stays pinned across
+waves. Projection bytes, location maps, and borrowed-page descriptors reserve
+their resource budget before allocation. Failure to retain optional locations
+falls back to ordinary authoritative reads. Source-provided exact scores and
+resolved metadata are reused rather than fetched twice. Primary-store fallback
+also owns resolved payloads in admitted per-wave scratch: it retains one read
+snapshot and source-version lease, rather than retaining every payload in the
+transaction arena. Direct-document vector fields use the same wave-scoped
+read policy. Shared query-entry scopes and cache-residency transitions preserve
+captured primary snapshots. Exact entry retires a prior probe and its cached
+copies before acquiring a new visibility cut. HBC, profiled HBC, and filtered
+exact scoring use this same scope and restore retention policies on exit.
+A complete native source generation needs only its immutable generation lease;
+a primary read snapshot is acquired lazily if fallback requires it. Exact scans
+do not populate decoded-vector residency. Candidate-only exact scoring keeps
+its separate shared decoded-cache policy: an admitted residency lease can be
+filled without retaining duplicate vectors in the request-local cache.
+
+Both local and authoritative projection paths use the shared certified SIMD
+kernel. It includes reconstruction error and arithmetic error in both the
+projection and float32 scoring kernels, and declines pruning at unsafe
+magnitudes. Its norm guard shares the score traversal. The request's query norm
+is computed once, and the finite exact max-heap provides an O(1) cutoff per wave.
+
+The opt-in `benchmark exact search cache and certified scoring` test measures
+both policies through production scorers against brute-force top-k. Enable it
+with `ANTFLY_BENCH_EXACT_POLICY=1`, use a ReleaseFast storage test build, and
+optionally set `ANTFLY_BENCH_EXACT_VECTORS` (default 4096). It alternates control
+and treatment order, reports decoded-cache-cold and repeated-query timings,
+and separately compares certified full-effort search with screening disabled.
+It uses the C allocator so allocation-tracking test overhead is not timed.
+See [the benchmark results and reproduction notes](bench/vectors/exact_search_policy_bench.md).
+
+## Multi-bit RaBitQ codes
+
+`quantization_bits` (dense index config, 1 to 8, default 1) adds extended
+RaBitQ codes ([Gao et al., SIGMOD 2025](https://arxiv.org/abs/2409.09913),
+`antfly_vector.rabitq_ex`) next to the 1-bit codes in every quantized set.
+They describe the same residual against the same centroid with B bits per
+dimension, so their distance estimates and error bounds are much tighter.
+
+- **Why:** leaf scoring admits the best `k * rerank_factor` 1-bit estimates
+  into the candidate heap before any exact scoring. With 1-bit codes,
+  true neighbors often miss that cut (see the measurements below), and the
+  loose bounds make boundary rerank score most of the heap exactly.
+- **`quantization_refine: near_cutoff` (default):** score with the 1-bit
+  kernel, then rescore with extended codes only candidates whose 1-bit
+  estimate minus `quantization_refine_margin` (default 2) bounds could still
+  enter the heap. `all` rescores every scanned vector.
+- **Storage:** `ex_bits`/`ex_codes`/`ex_factors` fields on
+  `RaBitQuantizedVectorSet` (protobuf fields 9 to 11; older readers skip
+  them), an ex-codes flag on AFQD leaf entries and AFRC row-delta chunks
+  (older builds reject such entries instead of misreading them), and
+  `quantization_bits` in `IndexMetadata` (encoded only above 1). The stored
+  value wins on reopen.
+- **Rotation:** extended codes assume randomly rotated vectors, so bits above
+  1 turn on `use_random_ortho_trans`; opening such an index without rotation
+  fails.
+- **Cost:** about `dims * bits / 8 + 8` extra bytes per vector, longer
+  builds (about 2x at 4 bits), and the extended scorer's CPU for refined
+  candidates (byte-parallel SIMD for 2, 4 and 8 bits; 3, 5, 6, 7 use a
+  scalar path). Per-leaf query preparation uses a stack buffer.
+- **Not covered:** segment sections (`RBIQ`) and serverless vector segments
+  keep 1-bit codes; their quantizers have no config path yet.
+
+Measured on the real index with the opt-in `hbc_adapter.zig` test "hbc
+multi-bit quantization measurement on a dataset" (`ANTFLY_HBC_BENCH_DATA`).
+Setup: NYTimes-256 cosine, 100k vectors, 200 queries, leaf 168, branching
+168, epsilon 7, boundary rerank, rotation on. ReleaseFast on an Apple M4 Max,
+single-threaded queries, warm caches. Search width 1008 (the index manager
+default) scans all 100k vectors here:
+
+| Codes | Heap (k * rerank_factor) | Recall@10 | Rescored/q | Exact reranks/q | ms/query |
+|---|---:|---:|---:|---:|---:|
+| 1-bit (default) | 20 | 0.559 | 0 | 19 | 1.52 |
+| 1-bit | 80 | 0.719 | 0 | 76 | 2.29 |
+| 1-bit | 320 | 0.834 | 0 | 274 | 4.13 |
+| 2-bit, margin 2 | 80 | 0.937 | 37,533 | 64 | 3.58 |
+| 3-bit, margin 2 | 80 | 0.996 | 24,544 | 46 | 7.20 |
+| 4-bit, margin 1 | 80 | 0.975 | 3,883 | 21 | 1.57 |
+| 4-bit, margin 2 | 20 | 0.987 | 10,204 | 13 | 1.99 |
+| 4-bit, margin 2 | 80 | 0.999 | 19,137 | 22 | 2.21 |
+| 4-bit, all | 80 | 0.999 | 100,000 | 23 | 4.05 |
+| 8-bit, margin 2 | 80 | 0.996 | 8,393 | 1.5 | 2.06 |
+
+- 4 bits with the default margin reaches 0.999 recall in the same time 1-bit
+  needs for 0.719. Quadrupling the 1-bit heap only reaches 0.834 at almost
+  twice the time.
+- With 1-bit codes the loss is at admission: `rerank_policy: always` gives
+  the same recall as boundary rerank (measured at 20k: 0.620 both ways).
+- 3 bits uses the scalar scorer and is slower than 4. 8 bits makes rerank
+  nearly free but builds take 105 s against 9.5 s for 4 bits and 5.2 s for
+  1 bit, because code search sweeps 127 levels per dimension.
+- At search width 128 (21k vectors scanned) every multi-bit setting reaches
+  the 0.379 that routing allows, against 0.335 for 1-bit at heap 80.
+
+On real 768-d text embeddings the gap is much smaller.
+[Qdrant/arxiv-abstracts-instructorxl-embeddings](https://huggingface.co/datasets/Qdrant/arxiv-abstracts-instructorxl-embeddings),
+100k vectors, 200 held-out abstracts as queries, same settings, width 1008:
+
+| Codes | Heap | Recall@10 | Exact reranks/q | ms/query | Build |
+|---|---:|---:|---:|---:|---:|
+| 1-bit | 20 | 0.902 | 19 | 1.84 | 24.0 s |
+| 1-bit | 80 | 0.997 | 64 | 2.20 | |
+| 2-bit, margin 2 | 80 | 0.999 | 25 | 2.53 | 25.5 s |
+| 4-bit, margin 2 | 20 | 1.000 | 7 | 2.42 | 26.6 s |
+| 4-bit, margin 2 | 80 | 1.000 | 7 | 2.19 | |
+| 8-bit, margin 2 | 80 | 0.999 | 0.6 | 2.03 | 28.0 s |
+
+Here 1-bit codes already find nearly every neighbor at the default heap.
+Extended codes mainly cut exact reranks (64 to 7 per query), which matters
+when rerank reads vectors from cold or remote storage rather than the warm
+cache this test uses. NYTimes-256 is a deliberately hard set. These builds
+exceed one LSM commit and use bounded commits (below); the NYTimes ones fit
+in one.
+
+Build cost: extended codes use a golden-section search over the level scale
+(`rabitq_ex.Codec.bestLevels`), about 1.9 us per 256-d and 4.8 us per 768-d
+vector at 4 or 8 bits, against 51 us and 1 ms for the exact sweep it
+replaced. At 100k x 256 a 4-bit build takes 5.1 s against 4.7 s for 1-bit.
+Most bulk-build time at 256-d is Hilbert ordering
+(`vector.Hilbert.encodeVecBytesInto`, about 64% of samples), independent of
+the code width. Leaf scoring prepares the extended query only when a leaf
+first rescores a candidate.
+
+`bench/vectors/rabitq_hbc_sim.zig` reproduces the admission effect outside
+HBC.
+
 ## Dense Artifact Vectors
 
 Public writes and replay store dense vectors as primary-store artifacts. HBC
@@ -95,6 +243,33 @@ builds parent nodes upward from finished children, and quantizes each final
 node exactly once as it is written. There is no per-item online insert loop in
 the bulk-build path; search works correctly on the built index, and
 `active_count` and metadata are correct after reopen.
+
+### Bounded commits for large bulk builds
+
+A bulk build stages vectors, metadata and the finished tree in one LSM
+transaction, and the LSM admits at most `manifest_commit_backlog_bytes`
+(256 MiB by default) per commit. Builds past that failed with
+`ResourceBudgetExceeded` (for example 100k 768-d vectors, about 307 MB of raw
+vectors).
+
+When a build's conservative size estimate exceeds three quarters of that
+limit, `bulkBuildWithMetadata` and the split child rebuild
+(`preparedBulkBuildCommitBudget` / `bulkBuildPreparedInputsBounded`) run
+inside a bulk-publication session and commit whenever the batch reaches a
+quarter of the limit (`HBCIndex.bulkCommitBudgetBytes`):
+
+- Rotation points are between complete writes: after stored vectors or
+  metadata, and after each finished leaf.
+- The size check asks the batch what commit admission would count
+  (`NamespaceBatch.stagedBytes`, backed by the LSM transaction's logical
+  bytes), sampled at halving checkpoints toward the budget.
+- Searches keep the previous snapshot until the session finish publishes the
+  tree. A crash mid-build leaves the bulk-publish marker, so reopen fails
+  with `IncompleteBulkPublish` and the index manager rebuilds the index, as
+  for any interrupted bulk session.
+- Smaller builds keep the single transaction. Bounded commits cost a
+  read-back of committed nodes while linking parents, and an LSM flush at
+  session finish.
 
 ### Split Child Rebuild
 

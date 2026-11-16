@@ -226,23 +226,25 @@ fn average(raw: *anyopaque, field: []const u8) f32 {
 fn frequencies(raw: *anyopaque, _: A, field: []const u8, terms: []const []const u8, out: []u32) !void {
     const self: *Self = @ptrCast(@alignCast(raw));
     if (terms.len != out.len) return error.InvalidNativeLakeTextStatistics;
-    for (terms, out) |term, *frequency| {
+    var begin: usize = 0;
+    while (begin < terms.len) {
         try self.check();
         _ = self.scratch.reset(.retain_capacity);
         const a = self.scratch.allocator();
-        const key = try corpus.statistics.keyAlloc(a, field, term);
-        var cursor = try tree.Cursor.init(a, self.cache.store(), self.root.term_statistics, key, null);
-        defer cursor.deinit();
-        const entry = (try cursor.next()) orelse {
-            frequency.* = 0;
-            continue;
-        };
-        if (!std.mem.eql(u8, entry.key, key)) {
-            frequency.* = 0;
-            continue;
+        const end = @min(terms.len, begin + tree.max_lookup_batch);
+        const keys = try a.alloc([]const u8, end - begin);
+        for (terms[begin..end], keys) |term, *key| key.* = try corpus.statistics.keyAlloc(a, field, term);
+        const found = try tree.lookupMany(a, self.cache.store(), self.root.term_statistics, keys);
+        try self.check();
+        for (found, out[begin..end]) |entry, *frequency| {
+            const value = entry orelse {
+                frequency.* = 0;
+                continue;
+            };
+            if (value.value.len != 8) return error.InvalidNativeLakeTextStatistics;
+            frequency.* = @intCast(@min(std.math.maxInt(u32), std.mem.readInt(u64, value.value[0..8], .big)));
         }
-        if (entry.value.len != 8) return error.InvalidNativeLakeTextStatistics;
-        frequency.* = @intCast(@min(std.math.maxInt(u32), std.mem.readInt(u64, entry.value[0..8], .big)));
+        begin = end;
     }
     if (self.recent) |snapshot| {
         var temporary = std.heap.ArenaAllocator.init(self.a);
@@ -798,6 +800,26 @@ test "external lake global frontier reaches late competitive segments and comple
     std.mem.writeInt(u32, last[28..32], 8191, .big);
     const frontier = (try create(a, root, store, cached, .none, .{ .term = .{ .field = "body", .term = "common" } }, .{}, .{})).?;
     defer frontier.deinit();
+    // Multiple tiles preserve duplicate/input order and missing terms. Routing
+    // work depends on reached tree pages, not on the number of requested terms.
+    var terms: [tree.max_lookup_batch + 17][]const u8 = undefined;
+    var counts: [terms.len]u32 = undefined;
+    for (&terms, 0..) |*term, i| term.* = switch (i % 3) {
+        0 => "rare",
+        1 => "absent",
+        else => "common",
+    };
+    const statistics_decodes = frontier.cache.decodes;
+    const statistics_visits = frontier.cache.clock;
+    try frequencies(frontier, a, "body", &terms, &counts);
+    for (counts, 0..) |count, i| try std.testing.expectEqual(@as(u32, switch (i % 3) {
+        0 => 3,
+        1 => 0,
+        else => 8192,
+    }), count);
+    try std.testing.expect(frontier.cache.decodes - statistics_decodes <= 1);
+    try std.testing.expect(frontier.cache.clock - statistics_visits <= 2);
+    std.debug.print("TERM_STATISTICS terms={d} tree_visits={d} new_decodes={d}\n", .{ terms.len, frontier.cache.clock - statistics_visits, frontier.cache.decodes - statistics_decodes });
     const before = frontier.reads;
     try std.testing.expectEqual(last, (try frontier.next(null)).?);
     try std.testing.expect(before - frontier.reads < 2 * 1024 * 1024);

@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Alternate complete Parquet build variants; validate reopened recall and work.
+
+Build the ReleaseFast runtime probe first. Fixture preparation and query/reopen
+are outside its operation timer, but remain included in subprocess wall time.
+The child logs retain per-phase times, logical partition I/O, and recall sweeps.
+"""
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import platform
+import re
+import signal
+import sys
+import subprocess
+import struct
+import time
+from pathlib import Path
+from statistics import median
+
+
+class CancellationScope:
+    """Record signals; interrupt only at ownership-safe polling boundaries."""
+
+    current = None
+
+    def __init__(self):
+        self.signum = None
+        self.signals = [signal.SIGTERM, signal.SIGINT]
+        if hasattr(signal, "SIGHUP"):
+            self.signals.append(signal.SIGHUP)
+
+    def request(self, signum, _frame=None):
+        if self.signum is None:
+            self.signum = signum
+
+    def check(self):
+        if self.signum is not None:
+            raise SystemExit(128 + self.signum)
+
+    def __enter__(self):
+        self.previous = CancellationScope.current
+        self.handlers = {sig: signal.signal(sig, self.request) for sig in self.signals}
+        # A controller re-exec hands pending signals across exec while blocked.
+        # Install handlers before releasing those signals in the frozen image.
+        self.mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, self.signals)
+        CancellationScope.current = self
+        return self
+
+    def __exit__(self, *_):
+        CancellationScope.current = self.previous
+        signal.pthread_sigmask(signal.SIG_SETMASK, self.mask)
+        for sig, handler in self.handlers.items():
+            signal.signal(sig, handler)
+
+    def exec(self, argv):
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, self.signals)
+        try:
+            self.check()
+            os.execv(argv[0], argv)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def check_cancellation():
+    if CancellationScope.current is not None:
+        CancellationScope.current.check()
+
+
+def terminate_group(process):
+    if getattr(process, "_antfly_group_drained", False):
+        return
+    process.poll()
+
+    def send(value):
+        for attempt in range(2):
+            try:
+                os.killpg(process.pid, value)
+                return
+            except ProcessLookupError:
+                return
+            except PermissionError:
+                if attempt or process.poll() is None:
+                    raise
+
+    send(signal.SIGTERM)
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        send(signal.SIGKILL)
+        process.wait(timeout=10)
+        process._antfly_group_drained = True
+
+
+class OwnedProcess:
+    """Establish cleanup before spawning, including resource-aware native waits."""
+
+    def __init__(self, *, collect_usage=False):
+        self.process = None
+        self.usage = None
+        self.collect_usage = collect_usage
+        self.cleaning = False
+
+    def __enter__(self):
+        return self
+
+    def start(self, argv, **kwargs):
+        check_cancellation()
+        kwargs.setdefault("start_new_session", True)
+        kwargs.setdefault("stdin", subprocess.DEVNULL)
+        self.owns_group = kwargs["start_new_session"]
+        self.argv = argv
+        self.process = subprocess.Popen(argv, **kwargs)
+        # Signal handlers only record intent, so ownership is established even
+        # when a signal arrives inside Popen before it returns the child.
+        check_cancellation()
+        return self
+
+    @property
+    def pid(self):
+        return self.process.pid
+
+    @property
+    def returncode(self):
+        return self.process.returncode if self.process is not None else None
+
+    def poll(self):
+        if self.process is None or self.returncode is not None:
+            return self.returncode
+        if not self.collect_usage:
+            return self.process.poll()
+        pid, status, usage = os.wait4(self.pid, os.WNOHANG)
+        if pid:
+            self.usage = usage
+            self.process.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if not self.cleaning:
+                check_cancellation()
+            code = self.poll()
+            if code is not None:
+                return code
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+            time.sleep(0.02)
+
+    def communicate(self, timeout):
+        deadline = time.monotonic() + timeout
+        while True:
+            check_cancellation()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+            try:
+                return self.process.communicate(timeout=min(0.2, remaining))
+            except subprocess.TimeoutExpired:
+                pass
+
+    def __getattr__(self, name):
+        return getattr(self.process, name)
+
+    def __exit__(self, *_):
+        if self.process is None:
+            return
+        self.cleaning = True
+        try:
+            if self.owns_group:
+                terminate_group(self)
+            elif self.poll() is None:
+                # A native child stays in the worker's group. The controller's
+                # escalation therefore also reaches it if worker cleanup stalls.
+                self.process.terminate()
+                try:
+                    self.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.wait(timeout=10)
+        finally:
+            for stream in (
+                self.process.stdin,
+                self.process.stdout,
+                self.process.stderr,
+            ):
+                if stream is not None:
+                    stream.close()
+
+
+def sha256_stream(stream):
+    digest = hashlib.sha256()
+    buffer = bytearray(1024 * 1024)
+    view = memoryview(buffer)
+    while True:
+        check_cancellation()
+        count = stream.readinto(buffer)
+        check_cancellation()
+        if not count:
+            break
+        digest.update(view[:count])
+    return digest.hexdigest()
+
+
+def gcs_probe_environment(auth="adc"):
+    """Real GCS qualification has explicit endpoints and refreshable ADC."""
+    env = probe_environment()
+    forbidden = ["GCS_JSON_API_ENDPOINT", "GCS_JSON_API_UPLOAD_ENDPOINT"]
+    if auth == "adc":
+        forbidden += ["GCS_BEARER_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN"]
+    inherited = sorted(key for key in forbidden if env.get(key))
+    if inherited:
+        # Values can contain credentials; report names only.
+        raise ValueError(
+            "GCS qualification rejects inherited overrides: " + ", ".join(inherited)
+        )
+    return env
+
+
+def validate_truth(path, manifest, dims):
+    if (
+        manifest["k"] != 100
+        or manifest["metric"] != "squared_l2"
+        or manifest["normalization"] != "none"
+        or manifest["accumulation"] != "float64"
+        or not 1 <= manifest["queries"] <= 1000
+    ):
+        raise ValueError("unsupported ground-truth contract")
+    for name, size in (
+        ("queries.f32", manifest["queries"] * dims * 4),
+        ("truth.u64", manifest["queries"] * manifest["k"] * 8),
+    ):
+        payload = path / name
+        with payload.open("rb") as stream:
+            actual = sha256_stream(stream)
+        if payload.stat().st_size != size or actual != manifest["outputs"][name]:
+            raise ValueError(f"ground-truth payload mismatch: {payload}")
+
+
+def write_report(path, report):
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(report, indent=2) + "\n")
+    os.replace(temporary, path)
+
+
+def probe_environment():
+    # A case owns every probe control. Preserve ordinary credentials/proxies,
+    # but do not inherit stale local-source, compact, resume or headroom modes.
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("ANTFLY_LAKE_BULK_", "ANTFLY_LAKE_PROBE_"))
+    }
+
+
+BULK_PHASE_NAMES = (
+    "identity",
+    "fragments",
+    "spool",
+    "aggregate",
+    "ordered",
+    "text",
+    "sparse",
+    "dense",
+    "bulk_tee",
+    "bulk_receipt",
+    "dense_ingest",
+    "dense_cluster",
+    "dense_checkpoint",
+    "dense_upload",
+)
+
+
+def validate_phases(
+    records, required=("identity", "dense_cluster", "dense_checkpoint")
+):
+    if len(records) != 1:
+        raise ValueError("missing or duplicate phase records")
+    phase = records[0]
+    names, times, calls = (phase.get(key) for key in ("names", "ns", "calls"))
+    if (
+        not all(isinstance(value, list) for value in (names, times, calls))
+        or not all(isinstance(name, str) for name in names)
+        or not set(required).issubset(names)
+        or len(names) != len(set(names))
+        or len(names) != len(times)
+        or len(names) != len(calls)
+        or any(type(value) is not int or value < 0 for value in times + calls)
+    ):
+        raise ValueError("incomplete or invalid phase attribution")
+    return dict(zip(names, calls))
+
+
+def validate_recall(records, truth):
+    if not 5 <= len(records) <= 9 or [r["probes"] for r in records] != [
+        512 << i for i in range(len(records))
+    ]:
+        raise ValueError("missing, duplicate or out-of-order recall widths")
+    denominator = truth["queries"] * truth["k"]
+    for row in records:
+        if (
+            row["queries"] != truth["queries"]
+            or row["k"] != truth["k"]
+            or type(row["hits"]) is not int
+            or not 0 <= row["hits"] <= denominator
+            or type(row["scored"]) is not int
+            or row["scored"] < row["hits"]
+            or not math.isfinite(row["recall"])
+            or not math.isclose(
+                row["recall"], row["hits"] / denominator, rel_tol=0, abs_tol=1e-12
+            )
+        ):
+            raise ValueError("inconsistent recall evidence")
+    if records[-1]["recall"] < 0.95:
+        raise ValueError("recall target not reached")
+
+
+def validate_source(source, truth):
+    if source.is_file():
+        with source.open("rb") as stream:
+            digest = sha256_stream(stream)
+        if digest != truth["source_sha256"]:
+            raise ValueError("ground truth is not bound to this Parquet source")
+        return dict(bytes=source.stat().st_size, sha256=digest, fixture=None)
+    fixture = json.loads((source / "fixture.json").read_text())
+    objects = source / "buckets" / "antfly" / "objects"
+    files = fixture["files"]
+    expected = truth["sources"]
+    if (
+        fixture["format"] != "AFOBJ001"
+        or not files
+        or [f["name"] for f in files] != sorted(f["name"] for f in files)
+        or [f["name"] for f in files] != [f["name"] for f in expected]
+        or len({f["name"] for f in files}) != len(files)
+        or sum(f["rows"] for f in expected) != truth["vectors"]
+        or {p.name for p in objects.iterdir()} != {f["name"] for f in files}
+    ):
+        raise ValueError("framed Parquet inventory does not match ground truth")
+    for item, authored in zip(files, expected):
+        if (
+            Path(item["name"]).name != item["name"]
+            or item["sha256"] != authored["sha256"]
+        ):
+            raise ValueError("framed Parquet source identity mismatch")
+        payload = objects / item["name"]
+        with payload.open("rb") as stream:
+            expected_header = (
+                b"AFOBJ001"
+                + struct.pack("<QI", item["bytes"], 0)
+                + item["sha256"].encode("ascii")
+            )
+            if (
+                stream.read(84) != expected_header
+                or payload.stat().st_size != item["bytes"] + 84
+                or sha256_stream(stream) != item["sha256"]
+            ):
+                raise ValueError(f"framed Parquet payload mismatch: {payload}")
+    return dict(bytes=sum(f["bytes"] for f in files), sha256=None, fixture=fixture)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("executable", type=Path)
+    parser.add_argument(
+        "parquet", type=Path, help="Parquet file or verified framed fixture directory"
+    )
+    parser.add_argument("recall", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--logs", type=Path, required=True)
+    parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument(
+        "--variants",
+        nargs="+",
+        choices=["full_vectors", "fused_identity", "prebound_parents", "fused_compact"],
+        default=["full_vectors", "fused_identity", "prebound_parents"],
+    )
+    parser.add_argument("--dims", type=int, default=768)
+    parser.add_argument("--allowance", type=int, default=4 * 1024**3)
+    parser.add_argument("--identity-spill-allowance", type=int)
+    parser.add_argument("--algorithm", choices=["lloyd", "emeans"], default="lloyd")
+    args = parser.parse_args()
+    if args.trials < 1:
+        parser.error("trials must be positive")
+    if args.allowance <= 0 or (
+        args.identity_spill_allowance is not None and args.identity_spill_allowance <= 0
+    ):
+        parser.error("input and identity spill allowances must be positive")
+    args.logs.mkdir(parents=True, exist_ok=True)
+    executable = args.executable.resolve()
+    available = {
+        "full_vectors": ("full_vectors", "0", "0", "0"),
+        "fused_identity": ("fused_identity", "1", "0", "0"),
+        "prebound_parents": ("prebound_parents", "1", "0", "1"),
+        "fused_compact": ("fused_compact", "1", "1", "1"),
+    }
+    if len(set(args.variants)) != len(args.variants):
+        parser.error("variants must be unique")
+    configs = [available[name] for name in args.variants]
+    rows = []
+    source = args.parquet.resolve()
+    truth_manifest = json.loads((args.recall / "prepare.json").read_text())
+    if truth_manifest["dims"] != args.dims:
+        raise ValueError("ground truth is not bound to this dimension")
+    source_binding = validate_source(source, truth_manifest)
+    validate_truth(args.recall, truth_manifest, args.dims)
+    report = dict(
+        executable=str(executable),
+        executable_sha256=hashlib.file_digest(
+            executable.open("rb"), "sha256"
+        ).hexdigest(),
+        parquet=str(source),
+        parquet_bytes=source_binding["bytes"],
+        parquet_sha256=source_binding["sha256"],
+        source_fixture=source_binding["fixture"],
+        platform=platform.platform(),
+        logical_cpus=os.cpu_count(),
+        algorithm=args.algorithm,
+        dims=args.dims,
+        input_allowance=args.allowance,
+        identity_spill_allowance=args.identity_spill_allowance,
+        trials=args.trials,
+        variants=args.variants,
+        ground_truth=truth_manifest,
+        operation_scope="Complete native build call including identity, source/checkpoint work, clustering, and artifact candidate; excludes fixture framing, final metadata CAS, and reopened recall",
+        subprocess_scope="Entire probe including fixture framing, source opening, construction, reopen, raw recall, and teardown",
+        results=rows,
+    )
+    for trial in range(args.trials):
+        order = configs if trial % 2 == 0 else list(reversed(configs))
+        for name, fused, compact, prebind in order:
+            with executable.open("rb") as stream:
+                if sha256_stream(stream) != report["executable_sha256"]:
+                    raise ValueError("benchmark executable changed after preflight")
+            validate_truth(args.recall, truth_manifest, args.dims)
+            env = dict(
+                probe_environment(),
+                ANTFLY_LAKE_BULK_RECALL_DIR=str(args.recall.resolve()),
+                ANTFLY_LAKE_BULK_DIMS=str(args.dims),
+                ANTFLY_LAKE_BULK_INPUT_BYTES=str(args.allowance),
+                ANTFLY_LAKE_BULK_ALGORITHM=args.algorithm,
+                ANTFLY_LAKE_BULK_FUSED=fused,
+                ANTFLY_LAKE_BULK_COMPACT=compact,
+                ANTFLY_LAKE_BULK_PREBIND=prebind,
+                ANTFLY_LAKE_BULK_CHECKPOINT="1",
+            )
+            env.pop("ANTFLY_LAKE_BULK_PARQUET_FILE", None)
+            env.pop("ANTFLY_LAKE_BULK_PARQUET", None)
+            env.pop("ANTFLY_LAKE_BULK_IDENTITY_SPILL_BYTES", None)
+            env[
+                "ANTFLY_LAKE_BULK_PARQUET"
+                if source.is_dir()
+                else "ANTFLY_LAKE_BULK_PARQUET_FILE"
+            ] = source.as_uri() if source.is_dir() else str(source)
+            if args.identity_spill_allowance is not None:
+                env["ANTFLY_LAKE_BULK_IDENTITY_SPILL_BYTES"] = str(
+                    args.identity_spill_allowance
+                )
+            log = args.logs / f"{args.algorithm}-{trial}-{name}.log"
+            start = time.monotonic_ns()
+            load_before = os.getloadavg()
+            with log.open("w") as out:
+                with subprocess.Popen(
+                    [str(executable)], env=env, stdout=out, stderr=subprocess.STDOUT
+                ) as child:
+                    try:
+                        _, status, usage = os.wait4(child.pid, 0)
+                        child.returncode = os.waitstatus_to_exitcode(status)
+                    except BaseException:
+                        child.terminate()
+                        try:
+                            child.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            child.wait()
+                        raise
+            wall = time.monotonic_ns() - start
+            text = log.read_text()
+            # Save process measurements before interpreting or qualifying output.
+            # Cache retention is a soft target: pinned handles can exceed it;
+            # all cache ownership still belongs to the hard allocator quota.
+            row = dict(
+                trial=trial,
+                variant=name,
+                fused=fused == "1",
+                compact=compact == "1",
+                prebind_parents=prebind == "1",
+                process_exit_code=child.returncode,
+                qualified=False,
+                subprocess_wall_ns=wall,
+                subprocess_user_ns=round(usage.ru_utime * 1e9),
+                subprocess_system_ns=round(usage.ru_stime * 1e9),
+                subprocess_peak_rss_bytes=usage.ru_maxrss
+                * (1 if sys.platform == "darwin" else 1024),
+                load_before=load_before,
+                load_after=os.getloadavg(),
+                log=str(log),
+            )
+            rows.append(row)
+            write_report(args.output, report)
+            try:
+                with executable.open("rb") as stream:
+                    if sha256_stream(stream) != report["executable_sha256"]:
+                        raise ValueError(
+                            "benchmark executable changed during execution"
+                        )
+                if validate_source(source, truth_manifest) != source_binding:
+                    raise ValueError("benchmark source changed during execution")
+                validate_truth(args.recall, truth_manifest, args.dims)
+                if child.returncode:
+                    raise RuntimeError(f"{name} failed ({child.returncode}): {log}")
+                match = re.search(
+                    r"^PARQUET_BULK algorithm=(\w+) vectors=(\d+) dims=(\d+) total_ns=(\d+) reopened_hits=(\d+) checkpoints=(\d+) logical_identity=(true|false)$",
+                    text,
+                    re.M,
+                )
+                if (
+                    not match
+                    or match[1] != args.algorithm
+                    or int(match[2]) != truth_manifest["vectors"]
+                    or int(match[3]) != args.dims
+                    or int(match[5]) != 10
+                    or int(match[6]) < 2
+                    or match[7] != "true"
+                ):
+                    raise RuntimeError(f"incomplete build verification: {log}")
+                records = {
+                    prefix: [
+                        json.loads(line[len(prefix) + 1 :])
+                        for line in text.splitlines()
+                        if line.startswith(prefix + " ")
+                    ]
+                    for prefix in (
+                        "PARQUET_BULK_PHASES",
+                        "PARQUET_BULK_WORK",
+                        "PARQUET_BULK_RECALL",
+                        "PARQUET_BULK_SOURCE",
+                        "PARQUET_BULK_PROJECTION",
+                        "PARQUET_BULK_MEMORY",
+                        "PARQUET_BULK_BUILD_MODE",
+                    )
+                }
+                modes = records["PARQUET_BULK_BUILD_MODE"]
+                if (
+                    len(modes) != 1
+                    or modes[0]["caller"] != "fast"
+                    or modes[0]["provider"] != modes[0]["caller_value"]
+                    or modes[0]["provider_is_test"]
+                ):
+                    raise RuntimeError(
+                        f"mixed or non-release benchmark compilation: {log}"
+                    )
+                if (
+                    len(records["PARQUET_BULK_PROJECTION"]) != 1
+                    or len(records["PARQUET_BULK_MEMORY"]) != 1
+                ):
+                    raise RuntimeError(f"missing storage/memory evidence: {log}")
+                if len(records["PARQUET_BULK_WORK"]) != 1:
+                    raise RuntimeError(f"missing construction work evidence: {log}")
+                validate_recall(records["PARQUET_BULK_RECALL"], truth_manifest)
+                validate_phases(records["PARQUET_BULK_PHASES"])
+                if (
+                    len(records["PARQUET_BULK_SOURCE"]) != 1
+                    or records["PARQUET_BULK_SOURCE"][0]["new_bytes"] != 0
+                    or records["PARQUET_BULK_SOURCE"][0]["reused_runs"]
+                    != records["PARQUET_BULK_SOURCE"][0]["runs"]
+                    or records["PARQUET_BULK_SOURCE"][0]["runs"] <= 0
+                    or records["PARQUET_BULK_SOURCE"][0]["reused_bytes"] <= 0
+                ):
+                    raise RuntimeError(f"exact source was not fully reused: {log}")
+                memory = records["PARQUET_BULK_MEMORY"][0]
+                if (
+                    memory["dense_allocator_peak_bytes"] > 256 * 1024**2
+                    or memory["source_allocator_peak_bytes"] > 256 * 1024**2
+                ):
+                    raise RuntimeError(f"private allocation quota exceeded: {log}")
+                work = records["PARQUET_BULK_WORK"][0]
+                if (
+                    not work.get("identity_census_verified")
+                    or work["owned_index_count"] != 0
+                    or work["identity_merge_inputs"] > 32
+                    or work["projection_cache_peak_bytes"]
+                    > memory["dense_allocator_peak_bytes"]
+                ):
+                    raise RuntimeError(
+                        f"unbounded or unverified identity construction: {log}"
+                    )
+                if (
+                    prebind == "1"
+                    and records["PARQUET_BULK_WORK"][0]["update_parent_calls"] != 0
+                ):
+                    raise RuntimeError(f"prebound build rewrote parent headers: {log}")
+                row.update(
+                    trial=trial,
+                    fused=fused == "1",
+                    compact=compact == "1",
+                    prebind_parents=prebind == "1",
+                    variant=name,
+                    vectors=int(match[2]),
+                    dims=int(match[3]),
+                    algorithm=match[1],
+                    total_ns=int(match[4]),
+                    reopened_hits=int(match[5]),
+                    checkpoints=int(match[6]),
+                    logical_identity=match[7] == "true",
+                    subprocess_wall_ns=wall,
+                    subprocess_user_ns=round(usage.ru_utime * 1e9),
+                    subprocess_system_ns=round(usage.ru_stime * 1e9),
+                    subprocess_peak_rss_bytes=usage.ru_maxrss
+                    * (1 if sys.platform == "darwin" else 1024),
+                    load_before=load_before,
+                    load_after=os.getloadavg(),
+                    build_mode=modes[0],
+                    phases=records["PARQUET_BULK_PHASES"],
+                    work=records["PARQUET_BULK_WORK"],
+                    source_reuse=records["PARQUET_BULK_SOURCE"],
+                    projection=records["PARQUET_BULK_PROJECTION"],
+                    memory=records["PARQUET_BULK_MEMORY"],
+                    recall=records["PARQUET_BULK_RECALL"],
+                    log=str(log),
+                )
+                row["qualified"] = True
+                row["cache_retention_target_bytes"] = 16 * 1024**2
+                row["cache_target_exceeded"] = (
+                    work["projection_cache_peak_bytes"] > 16 * 1024**2
+                )
+                write_report(args.output, report)
+            except Exception as error:
+                row["qualified"] = False
+                row["qualification_error"] = f"{type(error).__name__}: {error}"
+                write_report(args.output, report)
+                raise
+            print(
+                json.dumps(
+                    {
+                        k: row[k]
+                        for k in (
+                            "trial",
+                            "variant",
+                            "vectors",
+                            "total_ns",
+                            "subprocess_wall_ns",
+                        )
+                    }
+                ),
+                flush=True,
+            )
+    report["median_total_ns"] = {
+        name: median(row["total_ns"] for row in rows if row["variant"] == name)
+        for name, *_ in configs
+    }
+    report["median_subprocess_cpu_ns"] = {
+        name: median(
+            row["subprocess_user_ns"] + row["subprocess_system_ns"]
+            for row in rows
+            if row["variant"] == name
+        )
+        for name, *_ in configs
+    }
+    write_report(args.output, report)
+    print(json.dumps(report["median_total_ns"]), flush=True)
+
+
+if __name__ == "__main__":
+    main()

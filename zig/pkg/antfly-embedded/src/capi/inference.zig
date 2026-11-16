@@ -290,13 +290,6 @@ pub fn antfly_inference_read_json(h: ?*anyopaque, request_json: capi.Slice, out:
     return invoke(h, .post, "read", request_json.bytes(), out);
 }
 
-pub fn antfly_inference_transcribe_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
-    if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @call(.auto, @extern(*const @TypeOf(antfly_inference_transcribe_json), .{ .name = "antfly_inference_transcribe_json" }), .{ h, request_json, out });
-    capi.clearLastError();
-    return invoke(h, .post, "transcribe", request_json.bytes(), out);
-}
-
 pub fn antfly_inference_list_models_json(h: ?*anyopaque, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_inference_list_models_json), .{ .name = "antfly_inference_list_models_json" }), .{ h, out });
@@ -1105,7 +1098,6 @@ comptime {
         "antfly_inference_decide_json",
         "antfly_inference_extract_json",
         "antfly_inference_read_json",
-        "antfly_inference_transcribe_json",
         "antfly_inference_list_models_json",
         "antfly_inference_pull_json",
         "antfly_inference_generate_stream_json",

@@ -132,7 +132,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                   </Tooltip>
                 </TooltipProvider>
               ) : (
-                <SidebarMenuButton size="lg" className="cursor-default">
+                <div className="flex h-12 w-full min-w-0 items-center gap-3 p-2 text-foreground">
                   <div className="flex h-8 min-w-8 items-center justify-center">
                     <Anty
                       size={24}
@@ -146,7 +146,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                   <div className="flex min-w-0 flex-1 items-center text-left text-sm leading-tight">
                     <span className="truncate font-semibold">Antfarm</span>
                   </div>
-                </SidebarMenuButton>
+                </div>
               )}
               {isMounted && (isMobile || sidebarState !== "collapsed") && (
                 <TooltipProvider delayDuration={0}>
@@ -184,7 +184,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
         {isProductEnabled("antfly") && (
           <>
             <SidebarGroup>
-              <SidebarGroupLabel className="mono-label">Data</SidebarGroupLabel>
+              <SidebarGroupLabel>Data</SidebarGroupLabel>
               <SidebarGroupContent>
                 <SidebarMenu>
                   <SidebarMenuItem>
@@ -214,6 +214,16 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                     >
                       <TableIcon className="size-4" />
                       <span>SQL workbench</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isPath("/graphs")}
+                      tooltip="Graphs"
+                      onClick={() => navigate("/graphs")}
+                    >
+                      <Network className="size-4" />
+                      <span>Graphs</span>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
                 </SidebarMenu>
@@ -255,7 +265,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
             </SidebarGroup>
 
             <SidebarGroup>
-              <SidebarGroupLabel className="mono-label">Retrieval</SidebarGroupLabel>
+              <SidebarGroupLabel>Retrieval</SidebarGroupLabel>
               <SidebarGroupContent>
                 <SidebarMenu>
                   <SidebarMenuItem>
@@ -296,6 +306,17 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                   </SidebarMenuItem>
                   <SidebarMenuItem>
                     <SidebarMenuButton
+                      isActive={isTableSection("time-series")}
+                      tooltip="Time series"
+                      disabled={!selectedTable}
+                      onClick={() => navigateTableSection("time-series")}
+                    >
+                      <Search className="size-4" />
+                      <span>Time series</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
                       isActive={isTableSection("graph")}
                       tooltip={graphIndexes.length > 0 ? "Graph" : "Create a graph index first"}
                       disabled={!selectedTable || (!isLoadingIndexes && graphIndexes.length === 0)}
@@ -311,7 +332,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
             </SidebarGroup>
 
             <SidebarGroup>
-              <SidebarGroupLabel className="mono-label">Ingest</SidebarGroupLabel>
+              <SidebarGroupLabel>Ingest</SidebarGroupLabel>
               <SidebarGroupContent>
                 <SidebarMenu>
                   <SidebarMenuItem>
@@ -336,6 +357,18 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                     >
                       <FileInput className="size-4" />
                       <span>Manual Entry</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      isActive={isTableSection("privacy")}
+                      tooltip="Privacy"
+                      disabled={!selectedTable}
+                      className="disabled:opacity-50"
+                      onClick={() => navigateTableSection("privacy")}
+                    >
+                      <Shield className="size-4" />
+                      <span>Privacy</span>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
                   <SidebarMenuItem>
@@ -370,7 +403,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
 
         {isProductEnabled("inference") && (
           <SidebarGroup>
-            <SidebarGroupLabel className="mono-label">AI workspace</SidebarGroupLabel>
+            <SidebarGroupLabel>AI workspace</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
                 <SidebarMenuItem>
@@ -410,7 +443,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                     </a>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
-                <div className="px-2 py-1.5 mono-label text-sidebar-foreground/50 group-data-[collapsible=icon]:hidden">
+                <div className="px-2 py-1.5 text-xs font-medium text-muted-foreground group-data-[collapsible=icon]:hidden">
                   Tools
                 </div>
 
@@ -547,7 +580,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
 
         {isProductEnabled("antfly") && (
           <SidebarGroup>
-            <SidebarGroupLabel className="mono-label">Operations</SidebarGroupLabel>
+            <SidebarGroupLabel>Operations</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
                 <SidebarMenuItem>

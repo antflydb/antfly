@@ -57,7 +57,20 @@ pub const Executor = struct {
     start_video: ?*const fn (*anyopaque, Payload, *media.admission.Pool) anyerror!?*@import("embedding_gemma2.zig").VideoAhead = null,
 };
 pub const Limits = @import("media_chunk_limits.zig").Limits;
+pub const SpeakerAnalysis = struct {
+    context: *anyopaque,
+    prepare: *const fn (*anyopaque, std.mem.Allocator, @import("media_chunking_audio.zig").Provider, usize, [32]u8, []const u8, bool) anyerror!void,
+    ensure: ?*const fn (*anyopaque, std.mem.Allocator, i64, i64, bool) anyerror!void = null,
+    samples: ?*const fn (*anyopaque) ?usize = null,
+    checkpoint: ?*const fn (*anyopaque, bool) void = null,
+    /// Idempotent: the provider scope closes first; run() also closes on failure.
+    close: ?*const fn (*anyopaque) void = null,
+    boundary: ?*const fn (*anyopaque, i64, i64) anyerror!chunker.diarization.Span = null,
+    /// Only a selected speaker boundary affects parent identities.
+    recipe_id: ?[]const u8 = null,
+};
 pub const Request = struct {
+    speaker_analysis: ?SpeakerAnalysis = null,
     audio_plan_store: ?@import("media_audio_plan.zig").Store.Context = null,
     index_cache: ?*@import("media_index_cache.zig").Cache = null,
     index_cache_admission: ?@import("media_index_cache.zig").Cache.Admission = null,
@@ -143,6 +156,7 @@ pub const Runner = struct {
         try request.policy.validate();
         try request.limits.validate();
         if (request.max_chunks > request.limits.max_chunks or request.max_working_bytes == 0) return error.InvalidChunkPolicy;
+        if (request.policy.audio_speaker_turns and !request.audio_boundary) return error.InvalidChunkPolicy;
         const bytes = switch (request.input) {
             .text => |text| text,
             .binary => |b| b.data,
@@ -153,7 +167,12 @@ pub const Runner = struct {
             .binary => |b| b.mime_type,
             .source => return error.UnresolvedChunkSource,
         };
-        const identity = if (request.native_source) |source| try planning.Identity.initPinned(source.identity, mime, request.source_version, executor.model, request.policy) else try planning.Identity.init(bytes, mime, request.source_version, executor.model, request.policy);
+        if (request.policy.audio_speaker_turns and (request.speaker_analysis == null or request.speaker_analysis.?.boundary == null)) return error.InvalidChunkPolicy;
+        var planning_model = executor.model;
+        const speaker_identity = if (request.speaker_analysis) |analysis| if (analysis.recipe_id) |recipe| try std.fmt.allocPrint(a, "{s}:speaker-turns:{s}", .{ executor.model.planning_identity, recipe }) else null else null;
+        defer if (speaker_identity) |value| a.free(value);
+        if (speaker_identity) |value| planning_model.planning_identity = value;
+        const identity = if (request.native_source) |source| try planning.Identity.initPinned(source.identity, mime, request.source_version, planning_model, request.policy) else try planning.Identity.init(bytes, mime, request.source_version, planning_model, request.policy);
         const start = if (request.continuation) |cursor| try identity.parseContinuation(cursor) else 0;
         var self = Runner{ .allocator = a, .executor = executor, .request = request, .control = control, .sink = sink, .summary = .{ .identity = identity, .start_ordinal = start, .next_ordinal = start }, .pool = .{ .limits = .{ .host_bytes = request.max_working_bytes } } };
         if (request.outputs) |config| {
@@ -262,6 +281,9 @@ pub const Runner = struct {
             }
         }
         if (self.request.execute_outputs) {
+            if (self.request.speaker_analysis) |analysis| if (analysis.ensure) |ensure| {
+                if (item.descriptor.coordinates.start_ns) |start| try ensure(analysis.context, output_arena.allocator(), start, item.descriptor.coordinates.end_ns.?, false);
+            };
             if (self.request.output_executor) |consumer| item.outputs = try consumer.execute(consumer.context, output_arena.allocator(), output_payload, descriptor, item.context, result, item.failure, self.request.allow_partial);
         }
         var required_failure = item.failure != null;
@@ -311,6 +333,7 @@ pub const Runner = struct {
             .video => {}, // Original source + interval is the replay recipe.
         };
         try self.sink.accept(self.sink.context, item);
+        if (self.request.speaker_analysis) |analysis| if (analysis.checkpoint) |save| save(analysis.context, false);
         self.summary.emitted += 1;
         self.summary.output_counts = coverage;
         self.summary.degraded = self.summary.degraded or optional_failure;
@@ -320,6 +343,7 @@ pub const Runner = struct {
         return true;
     }
     pub fn run(self: *Runner) !Summary {
+        defer self.finishSpeakers();
         const scope = image.work_control.Scope.enter(self.control.imageWorkControl());
         defer scope.deinit();
         try self.control.check();
@@ -430,6 +454,64 @@ pub const Runner = struct {
         try image.gif.visitFramesAllocBounded(self.allocator, bytes, self.request.max_working_bytes, .{ .context = &capture, .accept = Capture.accept, .result = &visited });
         if (!visited.complete) self.stopped = true;
     }
+    // Keep the cold first page streaming. The first continuation pays for an
+    // exact codec index; subsequent pages reuse bounded decoder seeks.
+    fn soundSeekable(self: *Runner, bytes: []const u8) !bool {
+        if (self.request.native_source != null) return false;
+        const cache = self.request.index_cache orelse return false;
+        const admission = self.request.index_cache_admission orelse return false;
+        const format = audio.detectFormat(bytes) orelse return false;
+        const aac = format == .mp4;
+        if (!aac and format != .mp3 and format != .flac and format != .ogg and format != .opus and format != .webm) return false;
+        const key = @import("media_index_cache.zig").Cache.inlineAudioKey(self.summary.identity.source, aac, self.request.limits.max_index_packets, self.request.max_working_bytes);
+        const adapter = self.control.imageWorkControl();
+        const scope = @import("inference_audio").work_control.Scope.enter(.{ .context = adapter.context, .check_fn = adapter.check_fn });
+        defer scope.deinit();
+        const identity = std.fmt.bytesToHex(self.summary.identity.source, .lower);
+        var source = media.source.Source{ .allocator = self.allocator, .storage = .{ .borrowed = bytes }, .identity = &identity, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .admission_pool = &self.pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
+        var building: ?@import("media_speaker_flights.zig").Registry.Lease = if (self.summary.start_ordinal > 0) try cache.acquireBuild(key, self.control) else null;
+        defer if (building) |lease| lease.deinit();
+        if (cache.get(key)) |entry| {
+            defer cache.release(entry);
+            if (building) |lease| lease.deinit();
+            building = null;
+            if (aac) {
+                var reader = entry.data.aac.reader(self.allocator, &source);
+                defer reader.deinit();
+                try self.soundWindows(reader.provider());
+            } else {
+                var reader = @import("media_audio_seek.zig").Reader{ .index = &entry.data.audio, .bytes = bytes, .control = self.control };
+                try self.soundWindows(reader.provider());
+            }
+            return true;
+        }
+        if (self.summary.start_ordinal == 0) return false;
+        if (aac) {
+            var owner = @import("media_chunking_audio_source.zig").Mp4.init(self.allocator, &source, @min(64 * 1024 * 1024, self.request.max_working_bytes), self.request.limits.max_index_packets) catch |err| switch (err) {
+                error.UnsupportedAudioFormat, error.UnsupportedStreamingAudioProfile => return false,
+                else => return err,
+            };
+            defer owner.deinit();
+            _ = cache.audio_builds.fetchAdd(1, .monotonic);
+            cache.remember(std.heap.smp_allocator, key, .{ .aac = owner }, admission);
+            if (building) |lease| lease.deinit();
+            building = null;
+            try self.soundWindows(owner.provider());
+        } else {
+            var index = @import("media_audio_seek.zig").Index.initAdmitted(self.allocator, bytes, self.request.limits.max_index_packets, .{ .context = admission.context, .acquire = admission.acquire }) catch |err| switch (err) {
+                error.UnsupportedAudioFormat, error.UnsupportedStreamingAudioProfile => return false,
+                else => return err,
+            };
+            defer index.deinit();
+            _ = cache.audio_builds.fetchAdd(1, .monotonic);
+            cache.remember(std.heap.smp_allocator, key, .{ .audio = index }, admission);
+            if (building) |lease| lease.deinit();
+            building = null;
+            var reader = @import("media_audio_seek.zig").Reader{ .index = &index, .bytes = bytes, .control = self.control };
+            try self.soundWindows(reader.provider());
+        }
+        return true;
+    }
     fn sound(self: *Runner, bytes: []const u8) !void {
         const providers = @import("media_chunking_audio.zig");
         if (audio.detectFormat(bytes)) |format| if (format == .wav) {
@@ -437,6 +519,7 @@ pub const Runner = struct {
             try self.soundWindows(wav.provider());
             return;
         };
+        if (try self.soundSeekable(bytes)) return;
         if (try providers.Stream.start(self.allocator, bytes, self.control)) |stream| {
             defer stream.deinit();
             try self.soundWindows(stream.provider());
@@ -451,12 +534,40 @@ pub const Runner = struct {
         var pcm = providers.Pcm{ .pcm = .{ .samples = decoded.samples, .sample_rate = decoded.sample_rate } };
         try self.soundWindows(pcm.provider());
     }
+    fn finishSpeakers(self: *Runner) void {
+        if (self.request.speaker_analysis) |analysis| if (analysis.close) |close| close(analysis.context);
+    }
+    fn prepareSpeakers(self: *Runner, provider: @import("media_chunking_audio.zig").Provider) !void {
+        if (self.request.speaker_analysis) |analysis| {
+            const cacheable = if (self.request.native_source) |source| switch (source.storage) {
+                .range => |range| range.immutable_binding != null,
+                .borrowed => false,
+            } else true;
+            try analysis.prepare(analysis.context, self.allocator, provider, self.request.max_working_bytes, self.summary.identity.source, self.request.source_version, cacheable);
+        }
+    }
     fn soundWindows(self: *Runner, provider: @import("media_chunking_audio.zig").Provider) !void {
+        defer self.finishSpeakers();
+        try self.prepareSpeakers(provider);
         if (provider.sample_rate == 0) return error.UnsupportedAudioFormat;
         const end: i64 = std.math.cast(i64, @divFloor(@as(u128, provider.samples) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate)) orelse return error.TimestampOverflow;
         var cursor = planning.Temporal{ .kind = .audio, .end_ns = end, .policy = self.request.policy, .model = self.executor.model, .picture_tokens = 0 };
         const plan = @import("media_audio_plan.zig");
-        const plan_key = if (self.request.policy.audio_pause_ns > 0 and provider.probe == null and provider.final_samples == null and self.request.index_cache != null and self.request.index_cache_admission != null)
+        const speaker_plan_key = blk: {
+            if (!self.request.policy.audio_speaker_turns) break :blk null;
+            if (self.request.native_source) |source| switch (source.storage) {
+                .range => |range| if (range.immutable_binding == null) break :blk null,
+                .borrowed => break :blk null,
+            };
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update("speaker-boundary-directory-v1");
+            hash.update(&self.summary.identity.plan);
+            hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u32, provider.sample_rate)));
+            var digest: [32]u8 = undefined;
+            hash.final(&digest);
+            break :blk @as(?[32]u8, digest);
+        };
+        const plan_key = if (speaker_plan_key != null and self.request.index_cache != null and self.request.index_cache_admission != null) speaker_plan_key else if (self.request.policy.audio_pause_ns > 0 and provider.probe == null and provider.final_samples == null and self.request.index_cache != null and self.request.index_cache_admission != null)
             if (self.request.native_source) |source| plan.key(source, self.summary.identity.plan, provider.sample_rate, provider.samples) else null
         else
             null;
@@ -479,18 +590,31 @@ pub const Runner = struct {
                 self.stopped = true;
                 break;
             }
-            if (provider.probe) |probe| {
+            if (!self.request.policy.audio_speaker_turns or self.executor.model.min_audio_ns > 0) if (provider.probe) |probe| {
                 // A bounded tail lookahead preserves the same minimum-duration
                 // final-window policy as a provider with a known total length.
                 const first: usize = @intCast(@divFloor(@as(u128, @intCast(cursor.offset_ns)) * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s));
                 const lookahead_ns = @as(u128, @intCast(cursor.offset_ns)) + @as(u128, @intCast(@min(self.request.policy.window_ns, self.executor.model.max_audio_ns))) + @as(u128, @intCast(self.executor.model.min_audio_ns));
                 const stop = std.math.cast(usize, @divFloor(lookahead_ns * provider.sample_rate, std.time.ns_per_s) + 1) orelse return error.TimestampOverflow;
                 if (try probe(provider.context, first, stop)) |samples| cursor.end_ns = @intCast(@divFloor(@as(u128, samples) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate));
-            }
+            };
             const planned = (try cursor.next()) orelse break;
             var descriptor = planned;
+            var speaker_cut = false;
+            if (self.request.policy.audio_speaker_turns) {
+                const analysis = self.request.speaker_analysis.?;
+                if (analysis.ensure) |ensure| try ensure(analysis.context, self.allocator, descriptor.coordinates.start_ns.?, descriptor.coordinates.end_ns.?, true);
+                if (analysis.samples) |length| {
+                    if (length(analysis.context)) |samples| cursor.end_ns = @intCast(@divFloor(@as(u128, samples) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate));
+                }
+                const turn = try analysis.boundary.?(analysis.context, descriptor.coordinates.start_ns.?, descriptor.coordinates.end_ns.?);
+                speaker_cut = turn.end_ns < descriptor.coordinates.end_ns.?;
+                descriptor.coordinates.end_ns = turn.end_ns;
+                descriptor.coordinates.speaker_index = turn.speaker_index;
+                cursor.offset_ns = turn.end_ns;
+            }
             const first: usize = @intCast(@divFloor(@as(u128, @intCast(descriptor.coordinates.start_ns.?)) * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s));
-            var last: usize = @intCast(@min(provider.samples, @divFloor(@as(u128, @intCast(descriptor.coordinates.end_ns.?)) * provider.sample_rate, std.time.ns_per_s)));
+            var last: usize = @intCast(@min(provider.samples, @divFloor(@as(u128, @intCast(descriptor.coordinates.end_ns.?)) * provider.sample_rate + (if (speaker_cut) @as(u128, std.time.ns_per_s / 2) else 0), std.time.ns_per_s)));
             if (last <= first) continue;
             if (self.request.max_chunks != 0 and self.summary.emitted >= self.request.max_chunks) {
                 self.stopped = true;
@@ -517,7 +641,7 @@ pub const Runner = struct {
                     cursor.offset_ns = stop - self.request.policy.overlap_ns;
                 }
             }
-            if (self.ordinal < self.summary.start_ordinal and self.request.policy.audio_pause_ns == 0 and (self.executor.audio_tokens != null or self.executor.preflight == null)) {
+            if (self.ordinal < self.summary.start_ordinal and self.request.policy.audio_pause_ns == 0 and !self.request.policy.audio_speaker_turns and (self.executor.audio_tokens != null or self.executor.preflight == null)) {
                 self.ordinal = try std.math.add(u64, self.ordinal, 1);
                 continue;
             }
@@ -572,7 +696,17 @@ pub const Runner = struct {
             descriptor.coordinates.sample_rate = provider.sample_rate;
             descriptor.coordinates.start_ns = @intCast(@divFloor(@as(u128, first) * std.time.ns_per_s, provider.sample_rate));
             descriptor.coordinates.end_ns = @intCast(@divFloor(@as(u128, last) * std.time.ns_per_s + provider.sample_rate - 1, provider.sample_rate));
-            const actual_samples = if (provider.final_samples) |length| length(provider.context) orelse provider.samples else provider.samples;
+            const analyzed_samples = if (self.request.speaker_analysis) |analysis| if (analysis.samples) |length| length(analysis.context) else null else null;
+            const actual_samples = analyzed_samples orelse (if (provider.final_samples) |length| length(provider.context) orelse provider.samples else provider.samples);
+            if (self.request.policy.audio_speaker_turns) {
+                // Source turns are sample-aligned, represented by floor(ns).
+                // Round their inverse above; keep internal clocks half-open so
+                // an odd rate such as 11025 Hz does not invent a tiny mixed turn.
+                if (last < actual_samples) descriptor.coordinates.end_ns = @intCast(@divFloor(@as(u128, last) * std.time.ns_per_s, provider.sample_rate));
+                const analysis = self.request.speaker_analysis.?;
+                const turn = try analysis.boundary.?(analysis.context, descriptor.coordinates.start_ns.?, descriptor.coordinates.end_ns.?);
+                descriptor.coordinates.speaker_index = if (turn.end_ns >= descriptor.coordinates.end_ns.?) turn.speaker_index else null;
+            }
             if (last < actual_samples) {
                 const stop: i64 = @intCast(@divFloor(@as(u128, last) * std.time.ns_per_s, provider.sample_rate));
                 if (stop <= descriptor.coordinates.start_ns.? + self.request.policy.overlap_ns) return error.ChunkUnitTooLarge;
@@ -580,7 +714,7 @@ pub const Runner = struct {
             }
             if (last <= first) continue;
             if (plan_key != null) {
-                checkpoints.append(.{ .ordinal = self.ordinal, .offset_ns = planned.coordinates.start_ns.? });
+                checkpoints.append(.{ .ordinal = self.ordinal, .offset_ns = if (self.request.policy.audio_speaker_turns) descriptor.coordinates.start_ns.? else planned.coordinates.start_ns.? });
                 checkpoints.append(.{ .ordinal = try std.math.add(u64, self.ordinal, 1), .offset_ns = if (last == actual_samples) cursor.end_ns else cursor.offset_ns });
             }
             if (!try self.emit(descriptor, .{ .pcm = .{ .samples = window.pcm.samples[0 .. last - first], .sample_rate = provider.sample_rate } }, "audio/wav")) break;
@@ -630,7 +764,11 @@ pub const Runner = struct {
                     break :blk null;
                 } else null;
                 defer if (audio_track) |*track_owner| track_owner.deinit();
-                if (audio_track) |*track_owner| self.audio_provider = track_owner.provider();
+                defer self.finishSpeakers();
+                if (audio_track) |*track_owner| {
+                    self.audio_provider = track_owner.provider();
+                    try self.prepareSpeakers(self.audio_provider.?);
+                }
                 defer self.audio_provider = null;
                 const identity = @import("media_index_cache.zig").Cache.key(&source, true, self.request.limits.max_index_packets, self.request.max_working_bytes);
                 const cached = if (identity) |key| if (self.request.index_cache) |cache| cache.get(key) else null else null;
@@ -651,7 +789,11 @@ pub const Runner = struct {
                     break :blk null;
                 } else null;
                 defer if (audio_track) |*track_owner| track_owner.deinit();
-                if (audio_track) |*track_owner| self.audio_provider = track_owner.provider();
+                defer self.finishSpeakers();
+                if (audio_track) |*track_owner| {
+                    self.audio_provider = track_owner.provider();
+                    try self.prepareSpeakers(self.audio_provider.?);
+                }
                 defer self.audio_provider = null;
                 const identity = @import("media_index_cache.zig").Cache.key(&source, false, self.request.limits.max_index_packets, self.request.max_working_bytes);
                 const cached = if (identity) |key| if (self.request.index_cache) |cache| cache.get(key) else null else null;
@@ -685,12 +827,37 @@ pub const Runner = struct {
         };
         const seek_audio = if (audio.detectFormatFromMime(mime)) |format| format == .mp3 or format == .flac or format == .ogg or format == .opus else false;
         const audio_key = if (seek_audio) @import("media_index_cache.zig").Cache.audioKey(&source, self.request.limits.max_index_packets, self.request.max_working_bytes) else null;
+        var audio_build: ?@import("media_speaker_flights.zig").Registry.Lease = if (audio_key) |key| if (self.request.index_cache) |cache| try cache.acquireBuild(key, self.control) else null else null;
+        defer if (audio_build) |lease| lease.deinit();
         if (audio_key) |key| if (self.request.index_cache) |cache| if (cache.get(key)) |entry| {
             defer cache.release(entry);
+            if (audio_build) |lease| lease.deinit();
+            audio_build = null;
             var reader = @import("media_audio_seek.zig").Reader{ .index = &entry.data.audio, .source = &source, .control = self.control };
             try self.soundWindows(reader.provider());
             return;
         };
+        if (audio.detectFormatFromMime(mime) == .flac) {
+            const Flac = @import("media_flac_seek.zig").Index;
+            const admission: ?@import("media_opus_seek.zig").Admission = if (self.request.index_cache_admission) |quota| .{ .context = quota.context, .acquire = quota.acquire } else null;
+            const flac: ?Flac = Flac.initSource(&source, self.request.limits.max_index_packets, admission, self.control) catch |err| switch (err) {
+                error.UnsupportedStreamingAudioProfile => null,
+                else => return err,
+            };
+            if (flac) |value| {
+                var index = @import("media_audio_seek.zig").Index{ .flac = value };
+                defer index.deinit();
+                if (audio_key) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |quota| {
+                    _ = cache.audio_builds.fetchAdd(1, .monotonic);
+                    cache.remember(std.heap.smp_allocator, key, .{ .audio = index }, quota);
+                };
+                if (audio_build) |lease| lease.deinit();
+                audio_build = null;
+                var reader = @import("media_audio_seek.zig").Reader{ .index = &index, .source = &source, .control = self.control };
+                try self.soundWindows(reader.provider());
+                return;
+            }
+        }
         // Still/document decoders own a bounded contiguous input. Keep this
         // explicit spool separate from the source-backed coded-video path.
         const length = std.math.cast(usize, source.length()) orelse return error.ResourceLimitExceeded;
@@ -707,7 +874,7 @@ pub const Runner = struct {
         if (audio_key != null and self.request.index_cache != null and self.request.index_cache_admission != null) {
             const audio_scope = @import("inference_audio").work_control.Scope.enter(.{ .context = adapter.context, .check_fn = adapter.check_fn });
             defer audio_scope.deinit();
-            var index = @import("media_audio_seek.zig").Index.init(self.allocator, bytes, self.request.limits.max_index_packets) catch |err| switch (err) {
+            var index = @import("media_audio_seek.zig").Index.initAdmitted(self.allocator, bytes, self.request.limits.max_index_packets, .{ .context = self.request.index_cache_admission.?.context, .acquire = self.request.index_cache_admission.?.acquire }) catch |err| switch (err) {
                 error.UnsupportedAudioFormat, error.UnsupportedStreamingAudioProfile => {
                     try self.sound(bytes);
                     return;
@@ -715,7 +882,10 @@ pub const Runner = struct {
                 else => return err,
             };
             defer index.deinit();
+            if (self.request.index_cache) |cache| _ = cache.audio_builds.fetchAdd(1, .monotonic);
             if (audio_key) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.remember(std.heap.smp_allocator, key, .{ .audio = index }, admission);
+            if (audio_build) |lease| lease.deinit();
+            audio_build = null;
             var reader = @import("media_audio_seek.zig").Reader{ .index = &index, .bytes = bytes, .control = self.control };
             try self.soundWindows(reader.provider());
             return;
@@ -735,7 +905,11 @@ pub const Runner = struct {
                 break :blk null;
             } else null;
             defer if (audio_track) |*track_owner| track_owner.deinit();
-            if (audio_track) |*track_owner| self.audio_provider = track_owner.provider();
+            defer self.finishSpeakers();
+            if (audio_track) |*track_owner| {
+                self.audio_provider = track_owner.provider();
+                try self.prepareSpeakers(self.audio_provider.?);
+            }
             defer self.audio_provider = null;
             var reader = try media.webm.Reader.init(self.allocator, &source, .{ .max_packets = self.request.limits.max_index_packets });
             defer reader.deinit();
@@ -747,7 +921,11 @@ pub const Runner = struct {
                 break :blk null;
             } else null;
             defer if (audio_track) |*track_owner| track_owner.deinit();
-            if (audio_track) |*track_owner| self.audio_provider = track_owner.provider();
+            defer self.finishSpeakers();
+            if (audio_track) |*track_owner| {
+                self.audio_provider = track_owner.provider();
+                try self.prepareSpeakers(self.audio_provider.?);
+            }
             defer self.audio_provider = null;
             var input = try @import("embedding_gemma2_video.zig").PacketInput.init(self.allocator, &source, bytes);
             defer input.deinit();
@@ -1764,19 +1942,38 @@ test "model aware media audio pages reuse admitted indexes and bind only the cur
     for ([_][]const u8{ "tone.mp3", "codec-corpus/tone-stereo.flac" }) |name| {
         const path = try std.fmt.allocPrint(a, "../../lib/audio/testdata/{s}", .{name});
         defer a.free(path);
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1024 * 1024));
+        const original = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1024 * 1024));
+        defer a.free(original);
+        const mp3 = std.mem.endsWith(u8, name, ".mp3");
+        // A large metadata block makes the recording exceed the working budget.
+        // Cold FLAC must skip it and read frames instead of spooling the source.
+        const padding = 1024 * 1024;
+        const bytes = if (mp3) try a.dupe(u8, original) else blk: {
+            const parsed = try @import("inference_audio").flac.parseStream(original);
+            const out = try a.alloc(u8, 46 + padding + original.len - parsed.data_offset);
+            @memcpy(out[0..42], original[0..42]);
+            out[4] = 0;
+            @memcpy(out[42..46], &[_]u8{ 0x81, 0x10, 0, 0 });
+            @memset(out[46..][0..padding], 0);
+            @memcpy(out[46 + padding ..], original[parsed.data_offset..]);
+            break :blk out;
+        };
         defer a.free(bytes);
         var cache: Cache = .{};
         defer cache.deinit();
         var provider = Provider{ .bytes = bytes };
         var next = Provider{ .bytes = bytes };
         var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = bytes.len, .immutable_binding = @splat(1) } } };
-        const mp3 = std.mem.endsWith(u8, name, ".mp3");
-        const request = Request{ .input = .{ .binary = .{ .mime_type = if (mp3) "audio/mpeg" else "audio/flac", .data = &.{} } }, .native_source = &source, .source_version = "v1", .index_cache = &cache, .index_cache_admission = .{ .context = &provider, .acquire = Provider.acquire }, .policy = .{ .window_ns = 100 * std.time.ns_per_ms, .step_ns = 100 * std.time.ns_per_ms }, .max_chunks = 1 };
+        const request = Request{ .input = .{ .binary = .{ .mime_type = if (mp3) "audio/mpeg" else "audio/flac", .data = &.{} } }, .native_source = &source, .source_version = "v1", .index_cache = &cache, .index_cache_admission = .{ .context = &provider, .acquire = Provider.acquire }, .policy = .{ .window_ns = 100 * std.time.ns_per_ms, .step_ns = 100 * std.time.ns_per_ms }, .max_chunks = 1, .max_working_bytes = 256 * 1024 };
         var first = Qualification{};
         var runner = try Runner.init(a, request, first.executor(), .{}, .{ .context = &first, .accept = Qualification.accept });
         const summary = try runner.run();
-        try std.testing.expectEqual(bytes.len, provider.read_bytes);
+        if (mp3) try std.testing.expectEqual(bytes.len, provider.read_bytes) else try std.testing.expect(provider.read_bytes < bytes.len);
+        const cold_read_bytes = provider.read_bytes;
+        if (!mp3) {
+            try std.testing.expect(cold_read_bytes < 16 * 1024);
+            std.debug.print("range FLAC source_bytes={d} cold_page_read_bytes={d} working_budget={d}\n", .{ bytes.len, cold_read_bytes, request.max_working_bytes });
+        }
         var cursor: [85]u8 = undefined;
         var resumed = request;
         resumed.continuation = summary.identity.cursor(summary.next_ordinal, &cursor);
@@ -1784,7 +1981,7 @@ test "model aware media audio pages reuse admitted indexes and bind only the cur
         var second = Qualification{};
         var replay = try Runner.init(a, resumed, second.executor(), .{}, .{ .context = &second, .accept = Qualification.accept });
         _ = try replay.run();
-        try std.testing.expectEqual(bytes.len, provider.read_bytes);
+        try std.testing.expectEqual(cold_read_bytes, provider.read_bytes);
         try std.testing.expectEqual(@as(usize, 1), second.seen);
         try std.testing.expectEqual(summary.next_ordinal, second.ordinals[0]);
         if (mp3) try std.testing.expectEqual(@as(usize, 0), next.read_bytes) else try std.testing.expect(next.read_bytes > 0 and next.read_bytes < bytes.len);
@@ -2248,4 +2445,276 @@ test "model aware media incremental spacing and legacy repair backfill bound lon
     try std.testing.expectEqual(@as(usize, 151560044), bytes[0]);
     try std.testing.expectEqual(@as(usize, 4044), bytes[1]);
     try std.testing.expectEqual(@as(usize, 8044), bytes[2]);
+}
+
+test "model aware media speaker turns preserve hard model caps source clocks and paged identities" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        timeline: chunker.diarization.Timeline = .{},
+        coordinates: [16]planning.Coordinates = undefined,
+        count: usize = 0,
+        prepared: usize = 0,
+        analysis_count: usize = 0,
+        first_analysis: i64 = 0,
+        controller: @import("../runtime/tier/memory.zig").AdmissionController = .{},
+        fn admission(raw: *anyopaque, bytes: usize) !@import("../runtime/tier/memory.zig").AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = @import("media_index_cache.zig").Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
+        }
+        fn ensure(raw: *anyopaque, _: std.mem.Allocator, start: i64, _: i64, turn: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!turn) return;
+            if (self.analysis_count == 0) self.first_analysis = start;
+            self.analysis_count += 1;
+        }
+        fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: @import("media_chunking_audio.zig").Provider, _: usize, _: [32]u8, _: []const u8, _: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.prepared += 1;
+        }
+        fn boundary(raw: *anyopaque, start: i64, end: i64) !chunker.diarization.Span {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const stop = self.timeline.turnEnd(start, end);
+            return .{ .start_ns = start, .end_ns = stop, .speaker_index = self.timeline.label(start, stop) };
+        }
+        fn accept(raw: *anyopaque, item: Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.coordinates[self.count] = item.descriptor.coordinates;
+            self.count += 1;
+        }
+    };
+    for ([_]u32{ 1000, 11025 }) |rate| {
+        var fixture = Fixture{};
+        var cache = @import("media_index_cache.zig").Cache{};
+        defer cache.deinit();
+        defer fixture.timeline.deinit(a);
+        try fixture.timeline.append(a, .{ .start_ns = 0, .end_ns = @as(i64, @intCast(@as(u64, rate * 3 / 2) * std.time.ns_per_s / rate)), .speaker_index = 0 });
+        try fixture.timeline.append(a, .{ .start_ns = @as(i64, @intCast(@as(u64, rate * 3 / 2) * std.time.ns_per_s / rate)), .end_ns = @as(i64, @intCast(@as(u64, rate * 9 / 2) * std.time.ns_per_s / rate)), .speaker_index = 1 });
+        try fixture.timeline.append(a, .{ .start_ns = @as(i64, @intCast(@as(u64, rate * 9 / 2) * std.time.ns_per_s / rate)), .end_ns = 5000 * std.time.ns_per_ms });
+        const samples = try a.alloc(f32, rate * 5);
+        defer a.free(samples);
+        @memset(samples, 0.2);
+        const wav = try audio.wav.encodeInterleaved(a, samples, 1, .{ .audio_format = 3, .sample_rate = rate, .bits_per_sample = 32 });
+        defer a.free(wav);
+        var fake = Qualification{};
+        var executor = fake.executor();
+        executor.model.max_audio_ns = 2 * std.time.ns_per_s;
+        var request = Request{ .input = .{ .binary = .{ .mime_type = "audio/wav", .data = wav } }, .execute = false, .audio_boundary = true, .policy = .{ .window_ns = 4 * std.time.ns_per_s, .audio_speaker_turns = true }, .speaker_analysis = .{ .context = &fixture, .prepare = Fixture.prepare, .ensure = Fixture.ensure, .boundary = Fixture.boundary, .recipe_id = "speaker-recipe1" } };
+        request.index_cache = &cache;
+        request.index_cache_admission = .{ .context = &fixture, .acquire = Fixture.admission };
+        var runner = try Runner.init(a, request, executor, .{}, .{ .context = &fixture, .accept = Fixture.accept });
+        const full = try runner.run();
+        try std.testing.expect(full.complete);
+        try std.testing.expectEqual(@as(usize, 4), fixture.count);
+        try std.testing.expectEqual(@as(u64, rate * 3 / 2), fixture.coordinates[0].end_sample.?);
+        const hard_end = @as(u64, rate * 3 / 2 + rate * 2);
+        try std.testing.expect(fixture.coordinates[1].end_sample.? <= hard_end and fixture.coordinates[1].end_sample.? >= hard_end - 1);
+        try std.testing.expectEqual(@as(?u32, 0), fixture.coordinates[0].speaker_index);
+        try std.testing.expectEqual(@as(?u32, 1), fixture.coordinates[2].speaker_index);
+        try std.testing.expectEqual(@as(?u32, null), fixture.coordinates[3].speaker_index);
+        for (fixture.coordinates[0..fixture.count], 0..) |coordinates, i| {
+            try std.testing.expect(coordinates.end_ns.? - coordinates.start_ns.? <= 2 * std.time.ns_per_s);
+            if (i != 0) try std.testing.expectEqual(fixture.coordinates[i - 1].end_sample, coordinates.start_sample);
+        }
+        const expected = fixture.coordinates;
+        fixture.count = 0;
+        request.max_chunks = 2;
+        runner = try Runner.init(a, request, executor, .{}, .{ .context = &fixture, .accept = Fixture.accept });
+        const page = try runner.run();
+        try std.testing.expect(!page.complete);
+        var cursor: [85]u8 = undefined;
+        request.continuation = page.identity.cursor(page.next_ordinal, &cursor);
+        fixture.analysis_count = 0;
+        fixture.count = 0;
+        runner = try Runner.init(a, request, executor, .{}, .{ .context = &fixture, .accept = Fixture.accept });
+        try std.testing.expect((try runner.run()).complete);
+        try std.testing.expectEqual(@as(usize, 2), fixture.analysis_count);
+        try std.testing.expectEqual(expected[2].start_ns.?, fixture.first_analysis);
+        try std.testing.expectEqualDeep(expected[2], fixture.coordinates[0]);
+        try std.testing.expectEqualDeep(expected[3], fixture.coordinates[1]);
+        request.speaker_analysis.?.recipe_id = "speaker-recipe2";
+        try std.testing.expectError(error.StaleChunkContinuation, Runner.init(a, request, executor, .{}, .{ .context = &fixture, .accept = Fixture.accept }));
+        request.continuation = null;
+        request.policy.audio_speaker_turns = false;
+        request.speaker_analysis.?.boundary = null;
+        request.speaker_analysis.?.recipe_id = null;
+        const annotated = try Runner.init(a, request, executor, .{}, .{ .context = &fixture, .accept = Fixture.accept });
+        request.speaker_analysis = null;
+        const plain = try Runner.init(a, request, executor, .{}, .{ .context = &fixture, .accept = Fixture.accept });
+        try std.testing.expectEqualSlices(u8, &annotated.summary.identity.plan, &plain.summary.identity.plan);
+    }
+}
+
+test "model aware media incremental speaker reader closes before provider owner retires" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        prepared: bool = false,
+        closed: bool = false,
+        emitted: usize = 0,
+        fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: @import("media_chunking_audio.zig").Provider, _: usize, _: [32]u8, _: []const u8, _: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.prepared = true;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed = true;
+        }
+        fn accept(raw: *anyopaque, _: Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.prepared and !self.closed);
+            self.emitted += 1;
+        }
+    };
+    var fixture = Fixture{};
+    var fake = Qualification{};
+    const samples: [8]f32 = @splat(0.2);
+    var pcm = @import("media_chunking_audio.zig").Pcm{ .pcm = .{ .samples = &samples, .sample_rate = 1000 } };
+    var runner = try Runner.init(a, .{ .input = .{ .binary = .{ .data = "source", .mime_type = "audio/wav" } }, .execute = false, .policy = .{ .window_ns = 3 * std.time.ns_per_ms }, .speaker_analysis = .{ .context = &fixture, .prepare = Fixture.prepare, .close = Fixture.close } }, fake.executor(), .{}, .{ .context = &fixture, .accept = Fixture.accept });
+    // Invoke the provider-owning scope directly: run()'s fallback defer must
+    // not be what protects a track whose buffers retire when soundWindows returns.
+    try runner.soundWindows(pcm.provider());
+    try std.testing.expect(fixture.closed);
+    try std.testing.expectEqual(@as(usize, 3), fixture.emitted);
+}
+
+test "model aware media inline audio continuations build exact seek indexes once and preserve PCM" {
+    const Cache = @import("media_index_cache.zig").Cache;
+    const memory = @import("../runtime/tier/memory.zig");
+    const Capture = struct {
+        pcm: std.ArrayList(f32) = .empty,
+        starts: [128]usize = undefined,
+        ends: [128]usize = undefined,
+        coordinates: [128]planning.Coordinates = undefined,
+        count: usize = 0,
+        fn embed(raw: *anyopaque, a: std.mem.Allocator, payload: Payload) !Output {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.starts[self.count] = self.pcm.items.len;
+            try self.pcm.appendSlice(a, payload.pcm.samples);
+            self.ends[self.count] = self.pcm.items.len;
+            return Qualification.embed(raw, a, payload);
+        }
+        fn accept(raw: *anyopaque, item: Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.coordinates[self.count] = item.descriptor.coordinates;
+            self.count += 1;
+        }
+        fn executor(self: *@This()) Executor {
+            return .{ .context = self, .count_text = Qualification.count, .embed = embed, .model = .{ .planning_identity = "inline-seek-test", .context_tokens = 8192 } };
+        }
+    };
+    const Admission = struct {
+        controller: memory.AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "tone.mp3", "codec-corpus/tone-stereo.flac", "codec-corpus/tone-stereo.opus", "codec-corpus/tone-stereo.ogg", "codec-corpus/tone-stereo.mp4", "codec-corpus/owned-he-aac-48000-mono.m4a" }) |name| {
+        const path = try std.fmt.allocPrint(a, "../../lib/audio/testdata/{s}", .{name});
+        defer a.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1024 * 1024));
+        defer a.free(bytes);
+        const aac = std.mem.endsWith(u8, name, ".mp4") or std.mem.endsWith(u8, name, ".m4a");
+        const seekable = std.mem.indexOf(u8, name, "he-aac") == null;
+        const mime = if (aac) "audio/mp4" else if (std.mem.endsWith(u8, name, ".mp3")) "audio/mpeg" else if (std.mem.endsWith(u8, name, ".opus")) "audio/opus" else if (std.mem.endsWith(u8, name, ".ogg")) "audio/ogg" else "audio/flac";
+        var baseline: Capture = .{};
+        defer baseline.pcm.deinit(a);
+        var request = Request{ .input = .{ .binary = .{ .mime_type = mime, .data = bytes } }, .policy = .{ .window_ns = 100 * std.time.ns_per_ms, .step_ns = 100 * std.time.ns_per_ms } };
+        var runner = try Runner.init(a, request, baseline.executor(), .{}, .{ .context = &baseline, .accept = Capture.accept });
+        const full = try runner.run();
+        try std.testing.expect(baseline.count >= 3);
+        var cache: Cache = .{};
+        defer cache.deinit();
+        var admission: Admission = .{};
+        request.index_cache = &cache;
+        request.index_cache_admission = .{ .context = &admission, .acquire = Admission.acquire };
+        request.max_chunks = 1;
+        const key = Cache.inlineAudioKey(full.identity.source, aac, request.limits.max_index_packets, request.max_working_bytes);
+        var first: Capture = .{};
+        defer first.pcm.deinit(a);
+        runner = try Runner.init(a, request, first.executor(), .{}, .{ .context = &first, .accept = Capture.accept });
+        _ = try runner.run();
+        try std.testing.expect(cache.get(key) == null);
+        var cursor: [85]u8 = undefined;
+        for ([_]u64{ 1, 2, 0 }) |ordinal| {
+            request.continuation = full.identity.cursor(ordinal, &cursor);
+            var resumed: Capture = .{};
+            defer resumed.pcm.deinit(a);
+            runner = try Runner.init(a, request, resumed.executor(), .{}, .{ .context = &resumed, .accept = Capture.accept });
+            _ = try runner.run();
+            try std.testing.expectEqual(@as(usize, 1), resumed.count);
+            try std.testing.expectEqualDeep(baseline.coordinates[ordinal], resumed.coordinates[0]);
+            const expected = baseline.pcm.items[baseline.starts[ordinal]..baseline.ends[ordinal]];
+            try std.testing.expectEqual(expected.len, resumed.pcm.items.len);
+            for (expected, resumed.pcm.items) |left, right| try std.testing.expectApproxEqAbs(left, right, 0.00001);
+            if (seekable) {
+                const hit = cache.get(key).?;
+                try std.testing.expect(if (aac) hit.data == .aac else hit.data == .audio);
+                cache.release(hit);
+            } else try std.testing.expect(cache.get(key) == null);
+        }
+        if (seekable) try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
+        try std.testing.expectEqual(@as(usize, 0), admission.controller.snapshot().hostTotalBytes());
+    }
+}
+
+test "model aware media concurrent inline continuations construct one admitted codec index" {
+    const Cache = @import("media_index_cache.zig").Cache;
+    const memory = @import("../runtime/tier/memory.zig");
+    const a = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/tone.mp3", a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    const Admission = struct {
+        controller: memory.AdmissionController = .{},
+        fn acquire(raw: *anyopaque, size: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = size }, false);
+        }
+    };
+    var admission: Admission = .{};
+    var cache: Cache = .{};
+    defer cache.deinit();
+    var request = Request{ .input = .{ .binary = .{ .mime_type = "audio/mpeg", .data = bytes } }, .policy = .{ .window_ns = 100 * std.time.ns_per_ms, .step_ns = 100 * std.time.ns_per_ms }, .max_chunks = 1, .index_cache = &cache, .index_cache_admission = .{ .context = &admission, .acquire = Admission.acquire } };
+    var first: Qualification = .{};
+    var runner = try Runner.init(a, request, first.executor(), .{}, .{ .context = &first, .accept = Qualification.accept });
+    const result = try runner.run();
+    var cursor: [85]u8 = undefined;
+    request.continuation = result.identity.cursor(result.next_ordinal, &cursor);
+    const Worker = struct {
+        request: Request,
+        ready: *std.atomic.Value(usize),
+        go: *std.atomic.Value(bool),
+        failure: ?anyerror = null,
+        output: Qualification = .{},
+        fn run(self: *@This()) void {
+            _ = self.ready.fetchAdd(1, .release);
+            while (!self.go.load(.acquire)) std.atomic.spinLoopHint();
+            self.runInner() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn runInner(self: *@This()) !void {
+            var run_ = try Runner.init(std.testing.allocator, self.request, self.output.executor(), .{}, .{ .context = &self.output, .accept = Qualification.accept });
+            _ = try run_.run();
+        }
+    };
+    var ready: std.atomic.Value(usize) = .init(0);
+    var go: std.atomic.Value(bool) = .init(false);
+    var workers: [4]Worker = undefined;
+    var threads: [4]std.Thread = undefined;
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{ .request = request, .ready = &ready, .go = &go };
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    }
+    while (ready.load(.acquire) < workers.len) std.atomic.spinLoopHint();
+    go.store(true, .release);
+    for (threads) |thread| thread.join();
+    for (&workers) |*worker| {
+        if (worker.failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 1), worker.output.seen);
+        try std.testing.expectEqual(result.next_ordinal, worker.output.ordinals[0]);
+    }
+    try std.testing.expectEqual(@as(u64, 1), cache.audio_builds.load(.monotonic));
+    try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
+    try std.testing.expectEqual(@as(usize, 0), admission.controller.snapshot().hostTotalBytes());
 }

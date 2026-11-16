@@ -207,11 +207,17 @@ fn admissionF32Bytes(rows: usize, columns: usize) !usize {
 
 /// Probe untrusted image headers and derive the exact geometry used by the
 /// projector before scheduler or process-wide memory admission occurs.
+pub const AdmissionBackend = enum { generic, cuda };
+
 pub fn estimateAdmission(
     images: []const []const u8,
     config: gpt_config.Config,
     limits: Limits,
 ) !AdmissionEstimate {
+    return estimateAdmissionForBackend(images, config, limits, .generic);
+}
+
+pub fn estimateAdmissionForBackend(images: []const []const u8, config: gpt_config.Config, limits: Limits, backend: AdmissionBackend) !AdmissionEstimate {
     try limits.validate();
     if (images.len == 0 or images.len > limits.max_images) return error.ImageLimitExceeded;
     var dimensions: [64]image.EncodedImageInfo = undefined;
@@ -219,7 +225,7 @@ pub fn estimateAdmission(
         if (bytes.len == 0 or bytes.len > limits.max_encoded_image_bytes) return error.VisionAdmissionExceeded;
         dimensions[index] = try image.inspectEncodedForInference(bytes, null);
     }
-    return estimateAdmissionForImageDimensions(dimensions[0..images.len], config, limits);
+    return estimateAdmissionForImageDimensionsWithBackend(dimensions[0..images.len], config, limits, backend);
 }
 
 /// A closed Metal graph with these two qualified vision geometries can use
@@ -238,6 +244,10 @@ fn estimateAdmissionForImageDimensions(
     config: gpt_config.Config,
     limits: Limits,
 ) !AdmissionEstimate {
+    return estimateAdmissionForImageDimensionsWithBackend(dimensions, config, limits, .generic);
+}
+
+fn estimateAdmissionForImageDimensionsWithBackend(dimensions: []const image.EncodedImageInfo, config: gpt_config.Config, limits: Limits, backend: AdmissionBackend) !AdmissionEstimate {
     try limits.validate();
     if (config.qwen35_metal_resident_vision and !supportsResidentVisionBudget(config)) return error.UnsupportedResidentVisionBudget;
     if (dimensions.len == 0 or dimensions.len > limits.max_images) return error.ImageLimitExceeded;
@@ -293,16 +303,12 @@ fn estimateAdmissionForImageDimensions(
     host_scratch = try admissionAdd(host_scratch, projected_outputs);
     host_scratch = try admissionAdd(host_scratch, deepstack_outputs);
 
-    // Backend peak: QKV/RoPE/output tensors plus the larger of an explicit
-    // attention score matrix and the two FFN intermediates. This deliberately
-    // remains conservative when a backend selects fused SDPA.
+    // Backend peak: QKV/RoPE/output tensors and the larger working phase.
+    // Generic estimation allows a materialized attention score matrix. CUDA
+    // uses the closed streaming/vendor contract shared with its dispatcher.
     const hidden_rows = try admissionF32Bytes(max_patch_tokens, vision_hidden);
     const qkv_rows = try admissionMul(hidden_rows, 3);
     const rope_and_outputs = try admissionMul(hidden_rows, 4);
-    const attention_scores = try admissionF32Bytes(
-        try admissionMul(try admissionMul(max_patch_tokens, max_patch_tokens), head_count),
-        1,
-    );
     const ffn_intermediates = try admissionMul(try admissionF32Bytes(max_patch_tokens, intermediate), 2);
     const merged_hidden = try admissionMul(vision_hidden, try admissionMul(config.vision_spatial_merge_size, config.vision_spatial_merge_size));
     const merge_intermediates = try admissionAdd(
@@ -317,10 +323,12 @@ fn estimateAdmissionForImageDimensions(
     // <=H. Existing 7H + this 20H + merge (>=3H) covers >=30H before the
     // separately charged two SDPA packing banks. Frame grouping still scales
     // the complete bound, including weights/output ownership as before.
-    const attention_working = if (config.qwen35_metal_resident_vision)
+    const attention_working = if (backend == .cuda and vision_hidden / head_count == 64 and vision_hidden % head_count == 0 and intermediate <= vision_hidden * 4)
+        try @import("../ops/cuda/vision_memory_contract.zig").workingBytes(max_patch_tokens, vision_hidden)
+    else if (config.qwen35_metal_resident_vision)
         try admissionMul(hidden_rows, 20)
     else
-        attention_scores;
+        try admissionF32Bytes(try admissionMul(try admissionMul(max_patch_tokens, max_patch_tokens), head_count), 1);
     backend_scratch = try admissionAdd(backend_scratch, @max(attention_working, ffn_intermediates));
     backend_scratch = try admissionAdd(backend_scratch, merge_intermediates);
     // Packed vision SDPA keeps two half Q/K/V workspaces for overlapping
@@ -346,6 +354,12 @@ fn estimateAdmissionForImageDimensions(
 pub const ProjectedImages = struct {
     allocator: std.mem.Allocator,
     embeddings: []f32,
+    // A device result never also owns a host feature copy. Its caller retains
+    // the model and holds its execution lane for prompt assembly and disposal.
+    device_embeddings: ?CT = null,
+    // Store only the model-owned release callback; no request-local execution
+    // control is retained when the encoder publishes its result.
+    device_backend: ?struct { ptr: *anyopaque, release_fn: *const fn (*anyopaque, CT) void } = null,
     deepstack_embeddings: []f32,
     tokens_per_image: []usize,
     grids: []qwen3vl_plan.VisionGrid,
@@ -355,6 +369,12 @@ pub const ProjectedImages = struct {
     deepstack_layer_count: usize,
 
     pub fn deinit(self: *ProjectedImages) void {
+        if (self.device_embeddings) |tensor| {
+            const owner = self.device_backend orelse unreachable;
+            self.device_embeddings = null;
+            self.device_backend = null;
+            owner.release_fn(owner.ptr, tensor);
+        }
         self.allocator.free(self.embeddings);
         self.allocator.free(self.deepstack_embeddings);
         self.allocator.free(self.tokens_per_image);
@@ -842,16 +862,36 @@ pub fn maxResidentVisionBatchItems(backend: ops.BackendKind) usize {
     return if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_CUDA_WIDE_MICROBATCHES")) resident_vision_batch_capacity else 8;
 }
 
-/// Exact resized geometry for a bounded, independent-image vision batch.
-pub fn residentBatchGeometryKey(config: gpt_config.Config, bytes: []const u8, limits: Limits) !u64 {
+/// Kernel geometry bounds are independent of the admission byte budget. CUDA
+/// supports full pages, but the total packed row count must still fit every
+/// vision-block kernel. Metal retains its qualified per-image envelope.
+pub fn residentVisionBatchItemLimit(backend: ops.BackendKind, patches: usize) usize {
+    if (patches == 0) return 0;
+    return switch (backend) {
+        .cuda => if (patches <= 16_384) @min(maxResidentVisionBatchItems(backend), 65_536 / patches) else 0,
+        .metal => if (patches <= 4096) maxResidentVisionBatchItems(backend) else 0,
+        else => 0,
+    };
+}
+
+pub const ResidentBatchGeometry = struct { key: u64, max_items: usize };
+
+pub fn residentBatchGeometryForShape(backend: ops.BackendKind, geometry: Geometry) !ResidentBatchGeometry {
+    const patches = std.math.mul(usize, geometry.grid_x, geometry.grid_y) catch return error.UnsupportedBatchedVision;
+    const max_items = residentVisionBatchItemLimit(backend, patches);
+    if (max_items == 0 or geometry.width == 0 or geometry.height == 0 or geometry.width > std.math.maxInt(u32) or geometry.height > std.math.maxInt(u32)) return error.UnsupportedBatchedVision;
+    return .{ .key = (@as(u64, @intCast(geometry.width)) << 32) | @as(u64, @intCast(geometry.height)), .max_items = max_items };
+}
+
+/// Exact resized geometry and backend capacity for independent-image batching.
+pub fn residentBatchGeometry(backend: ops.BackendKind, config: gpt_config.Config, bytes: []const u8, limits: Limits) !ResidentBatchGeometry {
     try limits.validate();
     if (bytes.len == 0 or bytes.len > limits.max_encoded_image_bytes) return error.VisionAdmissionExceeded;
     const cfg = try configFromResidentModel(config);
     const info = try image.inspectEncodedForInference(bytes, null);
     if (try admissionMul(info.width, info.height) > limits.max_decoded_pixels) return error.VisionAdmissionExceeded;
     const geometry = try targetGeometry(cfg, info.width, info.height, limits);
-    if (geometry.patchCount() > 4096) return error.UnsupportedBatchedVision;
-    return (@as(u64, @intCast(geometry.width)) << 32) | @as(u64, @intCast(geometry.height));
+    return residentBatchGeometryForShape(backend, geometry);
 }
 
 /// Caller admits the sum of the per-image working sets before invoking this
@@ -870,8 +910,9 @@ pub fn encodeProjectedImagesResidentBatched(
     if (images.len == 0 or images.len > maxResidentVisionBatchItems(cb.kind()) or images.len > limits.max_images) return error.ImageLimitExceeded;
     const cfg = try configFromResidentModel(config);
     if (!cfg.is_qwen35 or cfg.deepstack_len != 0 or (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedBatchedVision;
-    const key = try residentBatchGeometryKey(config, images[0], limits);
-    for (images[1..]) |bytes| if (try residentBatchGeometryKey(config, bytes, limits) != key) return error.VisionBatchGeometryMismatch;
+    const geometry = try residentBatchGeometry(cb.kind(), config, images[0], limits);
+    if (images.len > geometry.max_items) return error.UnsupportedBatchedVision;
+    for (images[1..]) |bytes| if ((try residentBatchGeometry(cb.kind(), config, bytes, limits)).key != geometry.key) return error.VisionBatchGeometryMismatch;
     const Check = struct {
         fn check(raw: ?*const anyopaque) !void {
             const backend: *const ComputeBackend = @ptrCast(@alignCast(raw.?));
@@ -898,6 +939,34 @@ pub fn encodePreparedProjectedImagesResidentBatched(
     prepared_images: []const *const PreparedImage,
     limits: Limits,
 ) ![]ProjectedImages {
+    return encodePreparedProjectedImagesResidentBatchedPolicy(false, cb, allocator, config, prepared_images, limits);
+}
+
+/// Keep projected features on the encoder stream. Each image receives its own
+/// owned allocation, so a delayed/cancelled page cannot pin a peer's features.
+/// The caller owns the model execution lane through publication and cleanup.
+pub fn encodePreparedProjectedImagesDeviceBatched(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: gpt_config.Config,
+    prepared_images: []const *const PreparedImage,
+    limits: Limits,
+) ![]ProjectedImages {
+    if (cb.kind() != .cuda or cb.vtable.copyRows2D == null or cb.vtable.concatRows2D == null or
+        cb.vtable.takeRows == null or cb.vtable.multiplyScalar == null) return error.UnsupportedBatchedVision;
+    return encodePreparedProjectedImagesResidentBatchedPolicy(true, cb, allocator, config, prepared_images, limits);
+}
+
+fn encodePreparedProjectedImagesResidentBatchedPolicy(
+    comptime device_features: bool,
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: gpt_config.Config,
+    prepared_images: []const *const PreparedImage,
+    limits: Limits,
+) ![]ProjectedImages {
+    const phase_timer = @import("antfly_platform").document_pipeline_metrics.start(.vision);
+    defer phase_timer.finish();
     try limits.validate();
     if (prepared_images.len == 0 or prepared_images.len > maxResidentVisionBatchItems(cb.kind()) or prepared_images.len > limits.max_images) return error.ImageLimitExceeded;
     const cfg = try configFromResidentModel(config);
@@ -906,13 +975,14 @@ pub fn encodePreparedProjectedImagesResidentBatched(
         try prepared.validateFor(cfg, limits);
         if (!std.meta.eql(prepared.geometry, prepared_images[0].geometry)) return error.VisionBatchGeometryMismatch;
     }
+    if (prepared_images.len > 1 and prepared_images.len > residentVisionBatchItemLimit(cb.kind(), prepared_images[0].geometry.patchCount())) return error.UnsupportedBatchedVision;
     const output = try allocator.alloc(ProjectedImages, prepared_images.len);
     var completed: usize = 0;
     errdefer {
         for (output[0..completed]) |*item| item.deinit();
         allocator.free(output);
     }
-    if (prepared_images.len == 1) {
+    if (!device_features and prepared_images.len == 1) {
         output[0] = try encodePreparedProjectedImageResident(cb, allocator, config, prepared_images[0], limits);
         return output;
     }
@@ -964,20 +1034,37 @@ pub fn encodePreparedProjectedImagesResidentBatched(
         std.debug.print("LIGHTONOCR3 vision_pipeline_enabled=1 vision_pipeline_submits={d} vision_pipeline_waits={d} vision_pipeline_overlaps={d}\n", .{ frame_group.submits, frame_group.waits, frame_group.overlaps });
     const normalized = try layerNormNamed(cb, allocator, &weights, hidden.?, "v.post_ln", cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normalized);
+    const visual_rows = geometry.tokenCount();
+    const grouped: ?CT = if (device_features)
+        try mergeProjectedRows(cb, allocator, &weights, cfg, normalized, rows, try admissionMul(visual_rows, prepared_images.len), "mm.0", "mm.2")
+    else
+        null;
+    defer if (grouped) |tensor| cb.free(tensor);
     for (output, 0..) |*value, index| {
-        const slice = try cb.sliceRows2D(allocator, normalized, index * per_image, per_image, cfg.vision_hidden);
-        defer cb.free(slice);
-        const projected = try mergeProjectedNamed(cb, allocator, &weights, cfg, slice, geometry, "mm.0", "mm.2");
-        defer cb.free(projected);
-        const embeddings = try cb.toFloat32(projected, allocator);
+        const projected = if (device_features) owned: {
+            const tensor = (try cb.allocUninitF32Shape(&.{ @intCast(visual_rows), @intCast(cfg.text_hidden) })) orelse return error.UnsupportedResidentQwenVision;
+            errdefer cb.free(tensor);
+            if (!try cb.copyRows2D(allocator, tensor, 0, grouped.?, index * visual_rows, visual_rows, cfg.text_hidden)) return error.UnsupportedResidentQwenVision;
+            break :owned tensor;
+        } else host: {
+            const slice = try cb.sliceRows2D(allocator, normalized, index * per_image, per_image, cfg.vision_hidden);
+            defer cb.free(slice);
+            break :host try mergeProjectedNamed(cb, allocator, &weights, cfg, slice, geometry, "mm.0", "mm.2");
+        };
+        var projected_owned = true;
+        defer if (projected_owned) cb.free(projected);
+        const embeddings: []f32 = if (device_features) &.{} else try cb.toFloat32(projected, allocator);
         errdefer allocator.free(embeddings);
         const counts = try allocator.dupe(usize, &.{geometry.tokenCount()});
         errdefer allocator.free(counts);
         const grids = try allocator.dupe(qwen3vl_plan.VisionGrid, &.{.{ .temporal = 1, .height = @intCast(geometry.grid_y), .width = @intCast(geometry.grid_x) }});
         errdefer allocator.free(grids);
-        value.* = .{ .allocator = allocator, .embeddings = embeddings, .tokens_per_image = counts, .grids = grids, .deepstack_embeddings = &.{}, .preprocess_evidence = &.{}, .preprocess_spatial_patches = &.{}, .hidden_size = cfg.text_hidden, .deepstack_layer_count = 0 };
+        value.* = .{ .allocator = allocator, .embeddings = embeddings, .device_embeddings = if (device_features) projected else null, .device_backend = if (device_features) .{ .ptr = cb.ptr, .release_fn = cb.vtable.freeTensor } else null, .tokens_per_image = counts, .grids = grids, .deepstack_embeddings = &.{}, .preprocess_evidence = &.{}, .preprocess_spatial_patches = &.{}, .hidden_size = cfg.text_hidden, .deepstack_layer_count = 0 };
+        if (device_features) projected_owned = false;
         completed += 1;
     }
+    if (device_features and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
+        std.debug.print("LIGHTONOCR3 device_vision_images={d} device_vision_feature_rows={d}\n", .{ prepared_images.len, try admissionMul(visual_rows, prepared_images.len) });
     return output;
 }
 
@@ -1121,6 +1208,11 @@ pub fn prepareExpandedPromptEmbeddings(
     {
         return error.InvalidMultimodalConfig;
     }
+    if (projected.device_embeddings != null) {
+        const owner = projected.device_backend orelse return error.InvalidTensorShape;
+        if (owner.ptr != cb.ptr or cb.kind() != .cuda or projected.embeddings.len != 0 or projected.deepstack_layer_count != 0)
+            return error.UnsupportedResidentQwenVision;
+    }
     var ids = std.ArrayListUnmanaged(i64).empty;
     errdefer ids.deinit(allocator);
     var modalities = std.ArrayListUnmanaged(u8).empty;
@@ -1162,8 +1254,10 @@ pub fn prepareExpandedPromptEmbeddings(
     const base = try cb.embeddingLookup(embedding_weight, ids.items, ids.items.len, config.hidden_size);
     defer cb.free(base);
     const hidden_size: usize = @intCast(config.hidden_size);
-    if (projected.embeddings.len != visual_tokens * hidden_size) return error.ImageTokenLengthMismatch;
-    const input_embeddings = if (cb.vtable.concatRows2D != null and cb.vtable.takeRows != null and cb.vtable.multiplyScalar != null)
+    if (projected.device_embeddings == null and projected.embeddings.len != visual_tokens * hidden_size) return error.ImageTokenLengthMismatch;
+    const input_embeddings = if (projected.device_embeddings) |images|
+        try assembleVisualPromptTensorDevice(cb, allocator, base, images, visual_tokens, plan.visual_token_mask, hidden_size, config.tokenEmbeddingScale())
+    else if (cb.vtable.concatRows2D != null and cb.vtable.takeRows != null and cb.vtable.multiplyScalar != null)
         try assembleVisualPromptTensor(cb, allocator, base, projected.embeddings, plan.visual_token_mask, hidden_size, config.tokenEmbeddingScale())
     else blk: {
         const host = try cb.toFloat32(base, allocator);
@@ -1253,6 +1347,8 @@ pub fn prepareProjectedImageResident(
     limits: Limits,
     control: image_work_control.Control,
 ) !PreparedImage {
+    const phase_timer = @import("antfly_platform").document_pipeline_metrics.start(.vision_prepare);
+    defer phase_timer.finish();
     const cfg = try configFromResidentModel(config);
     return prepareImageCpu(allocator, cfg, bytes, limits, control, true);
 }
@@ -1408,6 +1504,8 @@ fn encodePreparedSingleImage(
     limits: Limits,
     collect_preprocess_evidence: bool,
 ) !EncodedImage {
+    const phase_timer = @import("antfly_platform").document_pipeline_metrics.start(.vision);
+    defer phase_timer.finish();
     var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
     var stage_started_at = if (profile) monotonicNowNs() else 0;
@@ -1674,6 +1772,19 @@ const ResidentVisionScope = struct {
 
 // Hugging Face uses config.hidden_act in vision blocks. Patch mergers
 // deliberately retain their separate nn.GELU() (exact-erf) operation.
+fn tryLightOnVisionNormQkv(cb: *const ComputeBackend, weights: *WeightCache, cfg: Config, input: CT, rows: usize, layer: usize) !?CT {
+    if (comptime !build_options.enable_cuda) return null;
+    if (cb.kind() != .cuda or !cfg.is_qwen35) return null;
+    const compute: *const @import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    if (!compute.lightOnVisionQkvEnabled()) return null;
+    var name: [128]u8 = undefined;
+    const norm_w = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln1.weight", .{layer}));
+    const norm_b = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln1.bias", .{layer}));
+    const qkv_w = try weights.linear(try std.fmt.bufPrint(&name, "v.blk.{d}.attn_qkv.weight", .{layer}), cfg.vision_hidden, cfg.vision_hidden * 3);
+    const qkv_b = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.attn_qkv.bias", .{layer}));
+    return @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionNormQkv(cb, input, .{ norm_w, norm_b, qkv_w, qkv_b }, rows, cfg.vision_hidden, cfg.layer_norm_eps);
+}
+
 fn tryLightOnVisionMlp(
     cb: *const ComputeBackend,
     weights: *WeightCache,
@@ -1683,8 +1794,9 @@ fn tryLightOnVisionMlp(
     layer: usize,
 ) !?CT {
     if (comptime !@import("build_options").enable_cuda) return null;
-    if (cb.kind() != .cuda or !cfg.is_qwen35 or !cfg.block_gelu_tanh or
-        !platform.env.getenvBool("ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_VISION_MLP")) return null;
+    if (cb.kind() != .cuda or !cfg.is_qwen35 or !cfg.block_gelu_tanh) return null;
+    const compute: *const @import("../ops/cuda/cuda_compute.zig").CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    if (!compute.lightOnVisionMlpEnabled()) return null;
     var name: [128]u8 = undefined;
     const norm_w = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln2.weight", .{layer}));
     const norm_b = try weights.weight(try std.fmt.bufPrint(&name, "v.blk.{d}.ln2.bias", .{layer}));
@@ -1700,6 +1812,26 @@ fn visionBlockActivation(cb: *const ComputeBackend, cfg: Config, input: CT) !CT 
     return (try cb.geluExact(input)) orelse try cb.gelu(input);
 }
 
+fn tryLightOnBf16VisionBlock(cb: *const ComputeBackend, weights: *WeightCache, cfg: Config, input: CT, positions: []const u32, rows: usize, layer: usize, image_batch: usize) !?CT {
+    if (comptime !build_options.enable_cuda) return null;
+    const Cuda = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+    if (!cfg.is_qwen35 or cfg.deepstack_len != 0 or !cfg.block_gelu_tanh or !Cuda.lightOnBf16VisionEnabled(cb)) return null;
+    const keys = [_][]const u8{ "ln1.weight", "ln1.bias", "attn_qkv.weight", "attn_qkv.bias", "attn_out.weight", "attn_out.bias", "ln2.weight", "ln2.bias", "ffn_up.weight", "ffn_up.bias", "ffn_down.weight", "ffn_down.bias" };
+    var tensors: [12]CT = undefined;
+    var name: [128]u8 = undefined;
+    for (keys, 0..) |key, index| {
+        const full = try std.fmt.bufPrint(&name, "v.blk.{d}.{s}", .{ layer, key });
+        tensors[index] = switch (index) {
+            2 => try weights.linear(full, cfg.vision_hidden, 3 * cfg.vision_hidden),
+            4 => try weights.linear(full, cfg.vision_hidden, cfg.vision_hidden),
+            8 => try weights.linear(full, cfg.vision_hidden, cfg.intermediate),
+            10 => try weights.linear(full, cfg.intermediate, cfg.vision_hidden),
+            else => try weights.weight(full),
+        };
+    }
+    return Cuda.lightOnBf16VisionBlock(cb, input, tensors, positions, rows, cfg.vision_hidden, cfg.intermediate, image_batch, cfg.layer_norm_eps, cfg.rope_theta);
+}
+
 fn encoderBlock(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1711,7 +1843,16 @@ fn encoderBlock(
     layer: usize,
     image_batch: usize,
 ) !CT {
-    var resident_scope = try ResidentVisionScope.begin(cb, cfg, input_ct);
+    if (try tryLightOnBf16VisionBlock(cb, weights, cfg, input_ct, positions, token_count, layer, image_batch)) |compact| return compact;
+    // A rejected vendor plan must remain on the bounded portable path even
+    // when an earlier compact block returned BF16. Widen once for both norm
+    // and residual consumers rather than letting them see mixed dtypes.
+    const expanded_input: ?CT = if (comptime build_options.enable_cuda)
+        try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionBf16ToF32(cb, input_ct)
+    else
+        null;
+    defer if (expanded_input) |expanded| cb.free(expanded);
+    var resident_scope = try ResidentVisionScope.begin(cb, cfg, expanded_input orelse input_ct);
     defer resident_scope.deinit();
     const input = resident_scope.input;
     const owns_encoder_scope = if (cfg.is_qwen35)
@@ -1732,21 +1873,30 @@ fn encoderBlock(
         zig017_return_error = zig017_err;
         return zig017_err;
     });
-    const normed1 = (layerNormNamed(cb, allocator, weights, input, ln1_prefix, cfg.vision_hidden, cfg.layer_norm_eps) catch |zig017_err| {
+    var projected_qkv = try tryLightOnVisionNormQkv(cb, weights, cfg, input, token_count, layer);
+    defer if (projected_qkv) |projected| cb.free(projected);
+    const normed1: ?CT = if (projected_qkv == null) (layerNormNamed(cb, allocator, weights, input, ln1_prefix, cfg.vision_hidden, cfg.layer_norm_eps) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
-    });
-    defer cb.free(normed1);
+    }) else null;
+    defer if (normed1) |normalized| cb.free(normalized);
     const ln1_ns = profileLap(profile, &stage_started_at);
     failed_stage = "attention";
-    const attn = (visionAttention(cb, allocator, weights, cfg, normed1, positions, token_count, layer, image_batch) catch |zig017_err| {
+    var attention_has_residual = false;
+    const attn = (visionAttention(cb, allocator, weights, cfg, normed1 orelse input, positions, token_count, layer, image_batch, projected_qkv, input, &attention_has_residual) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
     });
-    defer cb.free(attn);
+    defer if (!attention_has_residual) cb.free(attn);
+    // Attention has submitted every QKV consumer. Release its borrowed input
+    // before the MLP starts so fusion does not extend the large QKV lifetime.
+    if (projected_qkv) |projected| {
+        cb.free(projected);
+        projected_qkv = null;
+    }
     const attention_ns = profileLap(profile, &stage_started_at);
     failed_stage = "attention_residual";
-    const residual1 = (cb.add(input, attn) catch |zig017_err| {
+    const residual1 = if (attention_has_residual) attn else (cb.add(input, attn) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
     });
@@ -1833,6 +1983,9 @@ fn visionAttention(
     token_count: usize,
     layer: usize,
     image_batch: usize,
+    projected_qkv: ?CT,
+    residual: CT,
+    residual_fused: *bool,
 ) !CT {
     var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
@@ -1847,16 +2000,24 @@ fn visionAttention(
         zig017_return_error = zig017_err;
         return zig017_err;
     });
-    const qkv = (linearNamed(cb, allocator, weights, input, qkv_prefix, token_count, cfg.vision_hidden, cfg.vision_hidden * 3) catch |zig017_err| {
+    const qkv = projected_qkv orelse (linearNamed(cb, allocator, weights, input, qkv_prefix, token_count, cfg.vision_hidden, cfg.vision_hidden * 3) catch |zig017_err| {
         zig017_return_error = zig017_err;
         return zig017_err;
     });
-    defer cb.free(qkv);
+    defer if (projected_qkv == null) cb.free(qkv);
     const qkv_ns = profileLap(profile, &stage_started_at);
     if (comptime build_options.enable_cuda) {
         if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionAttention(cb, qkv, positions, image_batch, token_count, cfg.head_count, cfg.headDim(), cfg.rope_theta)) |attended| {
             defer cb.free(attended);
             const attention_ns = profileLap(profile, &stage_started_at);
+            if (cfg.is_qwen35) {
+                const output_weight = try weights.linear(try std.fmt.bufPrint(&buf, "v.blk.{d}.attn_out.weight", .{layer}), cfg.vision_hidden, cfg.vision_hidden);
+                const output_bias = try weights.weight(try std.fmt.bufPrint(&buf, "v.blk.{d}.attn_out.bias", .{layer}));
+                if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionOutputResidual(cb, attended, output_weight, output_bias, residual, token_count, cfg.vision_hidden)) |output| {
+                    residual_fused.* = true;
+                    return output;
+                }
+            }
             const out_prefix = try std.fmt.bufPrint(&buf, "v.blk.{d}.attn_out", .{layer});
             const output = try linearNamed(cb, allocator, weights, attended, out_prefix, token_count, cfg.vision_hidden, cfg.vision_hidden);
             if (profile) std.debug.print("qwen3vl-vision-fused-attention-profile: layer={d} qkv_ms={d:.3} attention_ms={d:.3} out_ms={d:.3}\n", .{ layer, @as(f64, @floatFromInt(qkv_ns)) / std.time.ns_per_ms, @as(f64, @floatFromInt(attention_ns)) / std.time.ns_per_ms, @as(f64, @floatFromInt(profileLap(profile, &stage_started_at))) / std.time.ns_per_ms });
@@ -1981,23 +2142,37 @@ fn mergeProjectedNamed(
     fc1_prefix: []const u8,
     fc2_prefix: []const u8,
 ) !CT {
+    return mergeProjectedRows(cb, allocator, weights, cfg, hidden_ct, geometry.patchCount(), geometry.tokenCount(), fc1_prefix, fc2_prefix);
+}
+
+fn mergeProjectedRows(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    weights: *WeightCache,
+    cfg: Config,
+    hidden_ct: CT,
+    patch_rows: usize,
+    visual_rows: usize,
+    fc1_prefix: []const u8,
+    fc2_prefix: []const u8,
+) !CT {
     var resident_scope = try ResidentVisionScope.begin(cb, cfg, hidden_ct);
     defer resident_scope.deinit();
     const hidden = resident_scope.input;
     const merged = try cb.reshape2D(
         allocator,
         hidden,
-        geometry.patchCount(),
+        patch_rows,
         cfg.vision_hidden,
-        geometry.tokenCount(),
+        visual_rows,
         cfg.mergedHidden(),
     );
     defer cb.free(merged);
-    const fc1 = try linearNamed(cb, allocator, weights, merged, fc1_prefix, geometry.tokenCount(), cfg.mergedHidden(), cfg.mergedHidden());
+    const fc1 = try linearNamed(cb, allocator, weights, merged, fc1_prefix, visual_rows, cfg.mergedHidden(), cfg.mergedHidden());
     defer cb.free(fc1);
     const activated = try cb.geluExact(fc1) orelse try cb.gelu(fc1);
     defer cb.free(activated);
-    return linearNamed(cb, allocator, weights, activated, fc2_prefix, geometry.tokenCount(), cfg.mergedHidden(), cfg.text_hidden);
+    return linearNamed(cb, allocator, weights, activated, fc2_prefix, visual_rows, cfg.mergedHidden(), cfg.text_hidden);
 }
 
 fn layerNormNamed(
@@ -2015,6 +2190,10 @@ fn layerNormNamed(
     defer allocator.free(bias_name);
     const weight = try weights.weight(weight_name);
     const bias = try weights.weight(bias_name);
+    if (comptime build_options.enable_cuda) if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionBf16ToF32(cb, input)) |expanded| {
+        defer cb.free(expanded);
+        return cb.layerNorm(expanded, weight, bias, dim, eps);
+    };
     return cb.layerNorm(input, weight, bias, dim, eps);
 }
 
@@ -2161,7 +2340,18 @@ fn assembleVisualPromptTensor(cb: *const ComputeBackend, allocator: std.mem.Allo
     defer cb.free(scaled);
     const images = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(visual, &.{ @intCast(visual.len / dim), @intCast(dim) }));
     defer cb.free(images);
-    const source = try cb.concatRows2D(allocator, scaled, images, mask.len, visual.len / dim, dim);
+    return assembleVisualPromptTensorFromImages(cb, allocator, scaled, images, visual.len / dim, mask, dim);
+}
+
+fn assembleVisualPromptTensorDevice(cb: *const ComputeBackend, allocator: std.mem.Allocator, base: CT, images: CT, visual_rows: usize, mask: []const bool, dim: usize, scale: f32) !CT {
+    if (dim == 0 or visual_rows == 0) return error.InvalidTensorShape;
+    const scaled = try cb.multiplyScalar(base, scale) orelse return error.UnsupportedResidentQwenVision;
+    defer cb.free(scaled);
+    return assembleVisualPromptTensorFromImages(cb, allocator, scaled, images, visual_rows, mask, dim);
+}
+
+fn assembleVisualPromptTensorFromImages(cb: *const ComputeBackend, allocator: std.mem.Allocator, scaled: CT, images: CT, visual_rows: usize, mask: []const bool, dim: usize) !CT {
+    const source = try cb.concatRows2D(allocator, scaled, images, mask.len, visual_rows, dim);
     defer cb.free(source);
     const ids = try allocator.alloc(u32, mask.len);
     defer allocator.free(ids);
@@ -2170,11 +2360,17 @@ fn assembleVisualPromptTensor(cb: *const ComputeBackend, allocator: std.mem.Allo
         ids[row] = @intCast(if (is_visual) mask.len + visual_row else row);
         if (is_visual) visual_row += 1;
     }
-    if (visual_row != visual.len / dim) return error.ImageTokenLengthMismatch;
+    if (visual_row != visual_rows) return error.ImageTokenLengthMismatch;
     return try cb.takeRows(source, ids, mask.len, dim) orelse error.UnsupportedResidentQwenVision;
 }
 
 fn addInterpolatedPositionsTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, weights: *WeightCache, input: CT, cfg: Config, geometry: Geometry) !CT {
+    if (comptime build_options.enable_cuda) {
+        if (cb.kind() == .cuda and cfg.is_qwen35 and weights.source == .resident) {
+            const table = try weights.weight("v.position_embd.weight");
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.lightOnVisionPositions(cb, input, table, geometry.grid_x, geometry.grid_y, cfg.spatial_merge, cfg.image_size / cfg.patch_size, cfg.vision_hidden)) |positioned| return positioned;
+        }
+    }
     const positions = try allocator.alloc(f32, geometry.patchCount() * cfg.vision_hidden);
     defer allocator.free(positions);
     @memset(positions, 0);
@@ -3014,6 +3210,30 @@ test "LightOnOCR3 CUDA resident vision batch width preserves other backend ceili
     try std.testing.expectEqual(@as(usize, 4), maxResidentVisionBatchItems(.native));
 }
 
+test "LightOnOCR3 full page vision batching fits the CUDA kernel contract and preserves Metal bounds" {
+    const cuda_geometry = @import("../ops/cuda/lighton_vision_bf16.zig");
+    for ([_]usize{ 1, 4096, 7600, 8192, 16_384 }) |patches| {
+        const count = residentVisionBatchItemLimit(.cuda, patches);
+        try std.testing.expect(count >= 2);
+        try std.testing.expect(cuda_geometry.validRowGeometry(patches * count, count));
+    }
+    try std.testing.expectEqual(@as(usize, 4), residentVisionBatchItemLimit(.cuda, 16_384));
+    try std.testing.expectEqual(@as(usize, 0), residentVisionBatchItemLimit(.cuda, 16_385));
+    try std.testing.expectEqual(@as(usize, 0), residentVisionBatchItemLimit(.cuda, 0));
+    try std.testing.expectEqual(@as(usize, 4), residentVisionBatchItemLimit(.metal, 4096));
+    try std.testing.expectEqual(@as(usize, 0), residentVisionBatchItemLimit(.metal, 4097));
+    try std.testing.expectEqual(@as(usize, 0), residentVisionBatchItemLimit(.native, 1));
+    const geometry = Geometry{ .width = 2048, .height = 2048, .grid_x = 128, .grid_y = 128, .merged_x = 64, .merged_y = 64 };
+    const shape = try residentBatchGeometryForShape(.cuda, geometry);
+    try std.testing.expectEqual((@as(u64, 2048) << 32) | 2048, shape.key);
+    try std.testing.expectEqual(@as(usize, 4), shape.max_items);
+    // Callers must use their existing serial encoder for this Metal shape.
+    try std.testing.expectError(error.UnsupportedBatchedVision, residentBatchGeometryForShape(.metal, geometry));
+    var invalid = geometry;
+    invalid.grid_x = std.math.maxInt(usize);
+    try std.testing.expectError(error.UnsupportedBatchedVision, residentBatchGeometryForShape(.cuda, invalid));
+}
+
 test "LightOnOCR3 CUDA vision block activation follows checkpoint tanh GELU independently of exact merger GELU" {
     const a = std.testing.allocator;
     const model_config = try gpt_config.parseConfig(a, @embedFile("../models/testdata/lightonocr3/config.json"));
@@ -3070,4 +3290,130 @@ test "LightOnOCR3 CUDA vision block activation follows checkpoint tanh GELU inde
     const expected = try cb.toFloat32(exact, a);
     defer a.free(expected);
     try std.testing.expectEqualSlices(f32, expected, result);
+}
+
+test "LightOnOCR3 CUDA learned positions preserve host interpolation merge order and resident transfers" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const CudaCompute = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+    const tensor_mod = @import("../backends/tensor.zig");
+    const a = std.testing.allocator;
+    for ([_]usize{ 768, 1024 }) |dim| for ([_]bool{ false, true }) |bf16| {
+        var compute = try CudaCompute.init(a);
+        defer compute.deinit();
+        if (!@import("../ops/cuda/lighton_attention.zig").packetSupported(compute.ctx.info.compute_major, compute.ctx.info.driver_version)) return error.SkipZigTest;
+        compute.capability_profile = .lightonocr3;
+        const cb = compute.computeBackend();
+        const values = try a.alloc(f32, 48 * 48 * dim);
+        defer a.free(values);
+        for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 41)) - 20)) / 32;
+        const shape = [_]i64{ 48 * 48, @intCast(dim) };
+        const name = "model.visual.pos_embed.weight";
+        if (bf16) {
+            const bits = try a.alloc(u16, values.len);
+            defer a.free(bits);
+            for (values, bits) |value, *b| b.* = @intCast(@as(u32, @bitCast(value)) >> 16);
+            const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(bits), .dtype = .bf16, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+            try compute.insertBf16WeightFromTensor(try a.dupe(u8, name), &tensor);
+        } else {
+            const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(values), .dtype = .f32, .shape = &shape, .name = name, .allocator = a, .owns_data = false, .owns_shape = false };
+            try compute.insertWeightFromTensor(try a.dupe(u8, name), &tensor);
+        }
+        const cfg = Config{ .text_hidden = 1024, .vision_hidden = dim, .intermediate = dim * 4, .block_count = 1, .head_count = dim / 64, .image_size = 48, .patch_size = 1, .spatial_merge = 2, .layer_norm_eps = 1e-5, .image_mean = .{ 0, 0, 0 }, .image_std = .{ 1, 1, 1 }, .is_qwen35 = true };
+        var weights = WeightCache.initResident(a, &cb, cfg);
+        defer weights.deinit();
+        // Independent host reference uses exactly the existing projector.
+        weights.position_f32 = try a.dupe(f32, values);
+        for ([_][2]usize{ .{ 2, 2 }, .{ 34, 50 }, .{ 128, 128 } }) |grid| {
+            const geometry = Geometry{ .width = grid[0], .height = grid[1], .grid_x = grid[0], .grid_y = grid[1], .merged_x = grid[0] / 2, .merged_y = grid[1] / 2 };
+            const input_values = try a.alloc(f32, geometry.patchCount() * dim);
+            defer a.free(input_values);
+            for (input_values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 13) % 37)) - 18)) / 128;
+            const input = try cb.fromFloat32Shape(input_values, &.{ @intCast(geometry.patchCount()), @intCast(dim) });
+            defer cb.free(input);
+            const expected = try a.dupe(f32, input_values);
+            defer a.free(expected);
+            try addInterpolatedPositions(&weights, expected, cfg, geometry);
+            const before = compute.stats;
+            const positioned = try addInterpolatedPositionsTensor(&cb, a, &weights, input, cfg, geometry);
+            defer cb.free(positioned);
+            try std.testing.expectEqual(before.h2d_bytes, compute.stats.h2d_bytes);
+            try std.testing.expectEqual(before.d2h_bytes, compute.stats.d2h_bytes);
+            const actual = try cb.toFloat32(positioned, a);
+            defer a.free(actual);
+            for (expected, actual) |e, value| try std.testing.expectApproxEqAbs(e, value, 1e-6);
+            const unchanged = try cb.toFloat32(input, a);
+            defer a.free(unchanged);
+            try std.testing.expectEqualSlices(f32, input_values, unchanged);
+            const table = try weights.weight("v.position_embd.weight");
+            const table_values = try cb.toFloat32(table, a);
+            defer a.free(table_values);
+            try std.testing.expectEqualSlices(f32, values, table_values);
+            const launches = compute.ctx.stats.kernel_launches;
+            try std.testing.expect(try CudaCompute.lightOnVisionPositions(&cb, input, table, 1, 2, 2, 48, dim) == null);
+            compute.resident_training_cache = true;
+            try std.testing.expect(try CudaCompute.lightOnVisionPositions(&cb, input, table, grid[0], grid[1], 2, 48, dim) == null);
+            compute.resident_training_cache = false;
+            try std.testing.expectEqual(launches, compute.ctx.stats.kernel_launches);
+        }
+        try std.testing.expectEqual(@as(usize, 3), compute.lighton_vision_fused.position_calls);
+    };
+}
+
+test "LightOnOCR3 device feature prompt assembly preserves host bytes source tensors and backend preflight" {
+    const a = std.testing.allocator;
+    const native_compute = @import("../ops/native_compute.zig");
+    var store = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = native_compute.NativeCompute.init(a, &store, null);
+    defer native.deinit();
+    const cb = ComputeBackend{ .ptr = &native, .vtable = &native_compute.vtable_impl };
+    const text = [_]f32{ -0.0, 1.5, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    const visual = [_]f32{ 17, -0.0, -19, 23, 29, 31 };
+    const base = try cb.fromFloat32Shape(&text, &.{ 4, 3 });
+    defer cb.free(base);
+    const features = try cb.fromFloat32Shape(&visual, &.{ 2, 3 });
+    defer cb.free(features);
+    const mask = [_]bool{ false, true, true, false };
+    for ([_]f32{ 1, 2, -1 }) |scale| {
+        const expected = try assembleVisualPromptTensor(&cb, a, base, &visual, &mask, 3, scale);
+        defer cb.free(expected);
+        const actual = try assembleVisualPromptTensorDevice(&cb, a, base, features, 2, &mask, 3, scale);
+        defer cb.free(actual);
+        const left = try cb.toFloat32(expected, a);
+        defer a.free(left);
+        const right = try cb.toFloat32(actual, a);
+        defer a.free(right);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(left), std.mem.sliceAsBytes(right));
+    }
+    var counts = [_]usize{2};
+    var grids = [_]qwen3vl_plan.VisionGrid{.{ .temporal = 1, .height = 2, .width = 4 }};
+    // Borrowed test metadata is never consumed by the failing preflight.
+    const invalid_backend = ProjectedImages{
+        .allocator = a,
+        .embeddings = &.{},
+        .device_embeddings = features,
+        .device_backend = .{ .ptr = cb.ptr, .release_fn = cb.vtable.freeTensor },
+        .deepstack_embeddings = &.{},
+        .tokens_per_image = &counts,
+        .grids = &grids,
+        .preprocess_evidence = &.{},
+        .preprocess_spatial_patches = &.{},
+        .hidden_size = 3,
+        .deepstack_layer_count = 0,
+    };
+    try std.testing.expectError(error.UnsupportedResidentQwenVision, prepareExpandedPromptEmbeddings(&cb, a, .{ .family = .qwen3_5, .hidden_size = 3, .vocab_size = 8, .image_token_index = 5 }, &.{ 0, 5, 1 }, invalid_backend, 8));
+    const untouched = try cb.toFloat32(features, a);
+    defer a.free(untouched);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&visual), std.mem.sliceAsBytes(untouched));
+}
+
+test "CUDA Qwen vision admission preserves tokens and host bytes without quadratic score scratch" {
+    const cfg = gpt_config.Config{ .family = .qwen3_5, .hidden_size = 2560, .vision_hidden_size = 1024, .vision_intermediate_size = 4096, .vision_num_attention_heads = 16, .vision_patch_size = 16, .vision_spatial_merge_size = 2 };
+    const dims = [_]image.EncodedImageInfo{.{ .width = 2048, .height = 2048 }};
+    const limits = Limits{ .max_merged_tokens = 4096, .hard_max_merged_tokens = 4096 };
+    const generic = try estimateAdmissionForImageDimensionsWithBackend(&dims, cfg, limits, .generic);
+    const cuda = try estimateAdmissionForImageDimensionsWithBackend(&dims, cfg, limits, .cuda);
+    try std.testing.expectEqual(generic.visual_tokens, cuda.visual_tokens);
+    try std.testing.expectEqual(generic.host_scratch_bytes, cuda.host_scratch_bytes);
+    try std.testing.expect(cuda.backend_scratch_bytes < generic.backend_scratch_bytes);
+    try std.testing.expect(cuda.backend_scratch_bytes < 4 * @as(usize, 1024 * 1024 * 1024));
 }

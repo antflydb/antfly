@@ -17,11 +17,22 @@ package sources
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -66,6 +77,35 @@ func TestGCSSourcePinsGenerationAndNeverPromotesTruncatedInventory(t *testing.T)
 	require.NoError(t, err)
 	require.False(t, snapshot.Authoritative)
 }
+
+// TestGCSRelativeKeyStripsConfiguredPrefix pins that a GCS item's RelativeKey
+// is relative to the source's own root (its configured prefix), not the
+// bucket: Path keeps the full object name (unchanged, so canonical gs:// URIs
+// are unaffected) while RelativeKey strips config.Prefix, and setting
+// identity.namespace to today's provider-ID prefix must reconstruct the
+// provider ID byte for byte (the invariant IdentityKey relies on). Drive,
+// by contrast, has no path-like root of its own: its items get no explicit
+// RelativeKey and fall back to their native Drive file ID (see
+// relativeKeyFor in document.go), since moving a Drive item across
+// providers is never a meaningful operation to begin with.
+func TestGCSRelativeKeyStripsConfiguredPrefix(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"items":[{"name":"team-a/manual.txt","generation":"123","size":"5","contentType":"text/plain"}]}`)
+	}))
+	defer server.Close()
+	c := &GoogleConnector{ProviderName: ProviderGCS, APIBase: server.URL, HTTPClient: server.Client()}
+	req := Request{Mode: ImportModeSource, SourceNamespace: "job/" + testSourceID, Config: SourceConfig(`{"bucket":"docs","prefix":"team-a/"}`)}
+	inventory, err := c.Enumerate(context.Background(), req)
+	require.NoError(t, err)
+	require.Len(t, inventory.Objects, 1)
+	item := inventory.Objects[0]
+	require.Equal(t, "team-a/manual.txt", item.Path, "Path keeps the full bucket object name")
+	require.Equal(t, "manual.txt", item.RelativeKey, "RelativeKey strips the configured prefix")
+
+	namespace := strings.TrimSuffix(item.ID, "/"+item.RelativeKey)
+	require.Equal(t, item.ID, namespace+"/"+item.RelativeKey)
+}
+
 func TestDriveSourceExportsPinnedRevisionAndRejectsPermissionOrVersionFailure(t *testing.T) {
 	for _, mime := range []string{"application/vnd.google-apps.document", "application/vnd.google-apps.presentation"} {
 		t.Run(mime, func(t *testing.T) {
@@ -266,5 +306,360 @@ func TestGCSStagedAccessIsBoundToPinnedGeneration(t *testing.T) {
 			}
 			require.Equal(t, 1, calls)
 		})
+	}
+}
+
+func TestGCSProjectedPageProvenance(t *testing.T) {
+	text := []byte("one repaired page\n")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/b/projection/o":
+			if r.URL.Query().Get("maxResults") != "100" {
+				t.Error("provenance listing did not bound metadata page size")
+			}
+			if !strings.Contains(r.URL.Query().Get("fields"), "metadata") {
+				t.Error("listing did not request page provenance")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{map[string]any{
+				"name": "pages/page.txt", "generation": "1", "metageneration": "7", "size": fmt.Sprint(len(text)), "contentType": "text/plain",
+				"metadata": map[string]string{
+					"original_pdf_uri": "gs://original/source.pdf?generation=42",
+					"original_page":    "12", "extraction_revision": "3",
+					"content_sha256": fmt.Sprintf("%x", sha256.Sum256(text)),
+				},
+			}}})
+		case "/b/projection/o/pages/page.txt":
+			if r.URL.Query().Get("generation") != "1" || r.URL.Query().Get("ifGenerationMatch") != "1" || r.URL.Query().Get("ifMetagenerationMatch") != "7" {
+				t.Error("read did not pin the projection generation and metadata")
+			}
+			if r.URL.Query().Get("alt") != "media" {
+				_, _ = w.Write([]byte(`{"generation":"1"}`))
+				return
+			}
+			w.Header().Set("X-Goog-Generation", "1")
+			_, _ = w.Write(text)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	connector := GoogleConnector{ProviderName: ProviderGCS, HTTPClient: server.Client(), APIBase: server.URL}
+	request := Request{Mode: ImportModeSource, SourceNamespace: "test", Config: SourceConfig(`{"bucket":"projection","prefix":"pages/","page_provenance":true}`)}
+	inventory, err := connector.Enumerate(t.Context(), request)
+	if err != nil || len(inventory.Objects) != 1 {
+		t.Fatalf("page listing: %d objects, error = %v", len(inventory.Objects), err)
+	}
+	item := inventory.Objects[0]
+	if err := connector.CheckAccess(t.Context(), request, item); err != nil {
+		t.Fatal(err)
+	}
+	data, err := connector.Read(t.Context(), request, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	doc, err := Normalize("test-source", item, data, Permissions{}, time.Time{})
+	if err != nil || doc.URI != "gs://original/source.pdf?generation=42#page=12" || doc.Metadata["projection_uri"] != item.URL {
+		t.Fatalf("projected page citation = %q, error = %v", doc.URI, err)
+	}
+	if _, err := Normalize("test-source", item, []byte("different text"), Permissions{}, time.Time{}); err == nil {
+		t.Fatal("mismatched page text was accepted")
+	}
+	for _, uri := range []string{
+		"gs://original/source.pdf",
+		"gs://original/?generation=42",
+		"gs://original/source.pdf?generation=0",
+		"gs://original/source.pdf?generation=42&generation=43",
+		"https://original.example/source.pdf",
+	} {
+		item.Metadata["original_pdf_uri"] = uri
+		_, err := Normalize("test-source", item, text, Permissions{}, time.Time{})
+		require.Error(t, err, uri)
+	}
+}
+
+func TestGCSPreviewBoundsFilteredListing(t *testing.T) {
+	pages := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pages++
+		if r.URL.Query().Get("maxResults") != "100" {
+			t.Error("preview requested a full listing page")
+		}
+		fmt.Fprintf(w, `{"items":[{"name":"pages/skipped.pdf","size":"1","generation":"1"}],"nextPageToken":"%d"}`, pages)
+	}))
+	defer server.Close()
+	connector := GoogleConnector{ProviderName: ProviderGCS, HTTPClient: server.Client(), APIBase: server.URL}
+	request := Request{Mode: ImportModeSource, SourceNamespace: "test", Preview: true, Config: SourceConfig(`{"bucket":"docs","prefix":"pages/","suffixes":[".txt"]}`)}
+	_, err := connector.Enumerate(t.Context(), request)
+	if pages != 4 || err == nil || !strings.Contains(err.Error(), "preview sample exhausted") {
+		t.Fatalf("expected bounded preview, got %d pages and %v", pages, err)
+	}
+}
+
+func TestGCSPageProvenanceRequiresTextPublication(t *testing.T) {
+	connector := &GoogleConnector{ProviderName: ProviderGCS}
+	config := SourceConfig(`{"bucket":"projection","prefix":"pages/","page_provenance":true}`)
+	for _, publication := range []string{"", "native", "media", "text"} {
+		_, err := PublicationConnector(connector, Source{Config: config, Publication: publication})
+		if (err == nil) != (publication == "text") {
+			t.Errorf("publication %q returned %v", publication, err)
+		}
+	}
+}
+
+func TestGCSBatchTruncationIsDistinctFromMismatchedResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name, id, tail string
+		interrupted    bool
+	}{
+		{"truncated", "<response-0>", "", true},
+		{"mismatched identity", "<response-1>", "\r\n--fixture--\r\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "multipart/mixed; boundary=fixture")
+				fmt.Fprintf(w, "--fixture\r\nContent-Type: application/http\r\nContent-ID: %s\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n%s%s", tc.id, `{"generation":"1"}`, tc.tail)
+			}))
+			defer server.Close()
+			c := GoogleConnector{ProviderName: ProviderGCS, APIBase: server.URL, HTTPClient: server.Client()}
+			_, err := c.CheckGCSAccessBatch(t.Context(), Request{Config: SourceConfig(`{"bucket":"docs"}`)},
+				[]Item{{Path: "p.txt", Revision: "1", Metadata: map[string]any{"bucket": "docs"}}})
+			require.Error(t, err)
+			if tc.interrupted {
+				require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+			} else {
+				require.NotErrorIs(t, err, io.ErrUnexpectedEOF)
+			}
+		})
+	}
+}
+
+func TestGCSProjectedListingSkipsMarkersAndPreservesLiteralObjectKeys(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.EscapedPath() {
+		case "/b/docs/o":
+			fmt.Fprint(w, `{"items":[{"name":"pages/","size":"0","generation":"1"},{"name":"pages/a//b.txt","size":"1","generation":"2","metageneration":"1"}]}`)
+		case "/b/docs/o/pages%2Fa%2F%2Fb.txt":
+			if r.URL.Query().Get("alt") == "media" {
+				w.Header().Set("X-Goog-Generation", "2")
+				fmt.Fprint(w, "x")
+			} else {
+				fmt.Fprint(w, `{"generation":"2"}`)
+			}
+		default:
+			t.Errorf("unexpected escaped path %q", r.URL.EscapedPath())
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	c := GoogleConnector{ProviderName: ProviderGCS, APIBase: server.URL, HTTPClient: server.Client()}
+	for _, preview := range []bool{true, false} {
+		request := Request{Mode: ImportModeSource, Preview: preview, SourceNamespace: "test",
+			Config: SourceConfig(`{"bucket":"docs","prefix":"pages/","page_provenance":true}`)}
+		inventory, err := c.Enumerate(t.Context(), request)
+		require.NoError(t, err)
+		require.Len(t, inventory.Objects, 1)
+		item := inventory.Objects[0]
+		require.Equal(t, "pages/a//b.txt", item.Path)
+		payload, err := c.Read(t.Context(), request, item)
+		require.NoError(t, err)
+		require.Equal(t, "x", string(payload))
+		require.NoError(t, c.CheckAccess(t.Context(), request, item))
+	}
+	exact := Request{Mode: ImportModeSource, SourceNamespace: "test",
+		Config: SourceConfig(`{"bucket":"docs","key":"pages/","page_provenance":true}`)}
+	inventory, err := c.Enumerate(t.Context(), exact)
+	require.NoError(t, err)
+	require.True(t, inventory.Authoritative)
+	require.Len(t, inventory.Objects, 1)
+	require.Equal(t, "pages/", inventory.Objects[0].Path)
+	ordinary := exact
+	ordinary.Config = SourceConfig(`{"bucket":"docs","prefix":"pages/"}`)
+	inventory, err = c.Enumerate(t.Context(), ordinary)
+	require.NoError(t, err)
+	require.True(t, inventory.Authoritative)
+	require.Len(t, inventory.Objects, 1)
+	require.Equal(t, "pages/a//b.txt", inventory.Objects[0].Path)
+}
+
+func TestGCSBatchRejectsShortMemberBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "multipart/mixed; boundary=fixture")
+		fmt.Fprint(w, "--fixture\r\nContent-Type: application/http\r\nContent-ID: <response-0>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n")
+		fmt.Fprint(w, `{"generation":"1"}`+"\r\n--fixture--\r\n")
+	}))
+	defer server.Close()
+	c := GoogleConnector{ProviderName: ProviderGCS, APIBase: server.URL, HTTPClient: server.Client()}
+	results, err := c.CheckGCSAccessBatch(t.Context(), Request{Config: SourceConfig(`{"bucket":"docs"}`)},
+		[]Item{{Path: "p.txt", Revision: "1", Metadata: map[string]any{"bucket": "docs"}}})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.ErrorIs(t, results[0], io.ErrUnexpectedEOF)
+}
+
+func TestGCSProjectedPublicationResumesThroughServiceADC(t *testing.T) {
+	runner, _, backend := runnerFixture(t)
+	connection := Connection{Provider: ProviderGCS, GoogleADC: true}
+	runner.Profile.Connections["docs"] = connection
+	runner.Profile.Sources[0].Config = SourceConfig(`{"bucket":"docs","page_provenance":true}`)
+	runner.Profile.Sources[0].Publication = "text"
+	runner.Profile.DataPlaneTokenEnv = "SOURCE_SERVICE_TEST_DB_TOKEN"
+	t.Setenv("SOURCE_SERVICE_TEST_DB_TOKEN", "database-test-token")
+
+	const payload = "one projected page"
+	const pageCount = projectedPageBatchCount + 1
+	var reads, batches atomic.Int32
+	var metadataChanged, failLastRead atomic.Bool
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"access_token":"adc-fixture","token_type":"Bearer","expires_in":3600}`)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer adc-fixture" {
+			http.Error(w, "missing ADC token", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/b/docs/o":
+			if r.URL.Query().Get("maxResults") == "1" {
+				fmt.Fprint(w, `{"items":[{"name":"page.txt"}]}`)
+				return
+			}
+			items := make([]map[string]any, 0, pageCount)
+			for i := 1; i <= pageCount; i++ {
+				items = append(items, map[string]any{
+					"name": fmt.Sprintf("page-%02d.txt", i), "generation": "1", "metageneration": "7",
+					"size": fmt.Sprint(len(payload)), "contentType": "text/plain",
+					"metadata": map[string]string{
+						"original_pdf_uri": "gs://original/report.pdf?generation=42",
+						"original_page":    "12", "extraction_revision": "3",
+						"content_sha256": fmt.Sprintf("%x", sha256.Sum256([]byte(payload))),
+					},
+				})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
+		case "/batch/storage/v1":
+			batches.Add(1)
+			body, err := io.ReadAll(r.Body)
+			count := strings.Count(string(body), "generation=1&ifGenerationMatch=1&fields=generation&ifMetagenerationMatch=7")
+			if err != nil || count == 0 || count != strings.Count(string(body), "GET /storage/v1") {
+				t.Error("batch did not check pinned content and metadata")
+			}
+			w.Header().Set("Content-Type", "multipart/mixed; boundary=fixture")
+			status, proof := "200 OK", `{"generation":"1"}`
+			if metadataChanged.Load() {
+				status, proof = "412 Precondition Failed", `{"error":{"message":"metadata changed"}}`
+			}
+			for i := 0; i < count; i++ {
+				fmt.Fprintf(w, "--fixture\r\nContent-Type: application/http\r\nContent-ID: <response-%d>\r\n\r\nHTTP/1.1 %s\r\nContent-Length: %d\r\n\r\n%s\r\n", i, status, len(proof), proof)
+			}
+			fmt.Fprint(w, "--fixture--\r\n")
+		default:
+			if !strings.HasPrefix(r.URL.Path, "/b/docs/o/page-") {
+				http.NotFound(w, r)
+				return
+			}
+			reads.Add(1)
+			if failLastRead.Load() && r.URL.Path == fmt.Sprintf("/b/docs/o/page-%02d.txt", pageCount) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			if metadataChanged.Load() || r.URL.Query().Get("ifMetagenerationMatch") != "7" {
+				w.WriteHeader(http.StatusPreconditionFailed)
+				return
+			}
+			w.Header().Set("X-Goog-Generation", "1")
+			fmt.Fprint(w, payload)
+		}
+	}))
+	defer storage.Close()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	credentials, err := json.Marshal(map[string]string{
+		"type": "service_account", "client_email": "fixture@example.iam.gserviceaccount.com",
+		"private_key": string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})),
+		"token_uri":   storage.URL + "/token",
+	})
+	require.NoError(t, err)
+	file := filepath.Join(t.TempDir(), "adc.json")
+	require.NoError(t, os.WriteFile(file, credentials, 0600))
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", file)
+
+	service, err := NewService(ServiceOptions{Profile: runner.Profile, StateDir: t.TempDir(),
+		PublicURL: "https://source.example", AdminToken: serviceTestToken, MediaKey: serviceTestKey})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, service.Close()) })
+	runner.Factory = func(ctx context.Context, connection Connection) (Connector, error) {
+		connector, err := service.providerConnector(ctx, connection)
+		if err != nil {
+			return nil, err
+		}
+		google := *connector.(*GoogleConnector)
+		google.APIBase = storage.URL
+		return &google, nil
+	}
+
+	assertRestart := func(err error) {
+		t.Helper()
+		require.Error(t, err)
+		failure := describeSyncFailure(err)
+		require.Equal(t, "source_version_changed", failure.Code)
+		require.True(t, failure.RestartRequired)
+		require.False(t, failure.Retryable)
+	}
+	metadataChanged.Store(true)
+	assertRestart(runner.Sync(t.Context()))
+	require.EqualValues(t, 1, reads.Load())
+	require.Zero(t, batches.Load())
+	metadataChanged.Store(false)
+
+	failLastRead.Store(true)
+	require.Error(t, runner.Sync(t.Context()))
+	require.EqualValues(t, 1+pageCount, reads.Load())
+	require.Zero(t, batches.Load())
+	backend.mu.Lock()
+	require.Equal(t, 1, backend.contentMerges)
+	require.Len(t, backend.records, projectedPageBatchCount)
+	backend.mu.Unlock()
+	failLastRead.Store(false)
+
+	staleKey, err := RecordKey(testSourceID, "gcs://job/"+testSourceID+"/docs/removed.txt")
+	require.NoError(t, err)
+	backend.mu.Lock()
+	backend.records[staleKey] = map[string]any{"source_id": testSourceID}
+	backend.dropCleanupAck = true
+	backend.mu.Unlock()
+	require.Error(t, runner.Sync(t.Context()))
+	require.EqualValues(t, 2+pageCount, reads.Load())
+	require.EqualValues(t, 1, batches.Load())
+
+	metadataChanged.Store(true)
+	assertRestart(runner.Sync(t.Context()))
+	require.EqualValues(t, 2, batches.Load())
+	require.EqualValues(t, 2+pageCount, reads.Load())
+	metadataChanged.Store(false)
+
+	// A resumed acquisition may be older than its permission lease. Final
+	// metadata validation, rather than enumeration, starts the published lease.
+	statePath := filepath.Join(runner.StateDir, testSourceID+".json")
+	var pending runState
+	require.NoError(t, loadJSON(statePath, &pending, 256<<20))
+	pending.StartedAt = time.Now().Add(-24 * time.Hour).Unix()
+	require.NoError(t, writeJSON(statePath, pending, 256<<20))
+	before := time.Now().Unix()
+	require.NoError(t, runner.Sync(t.Context()))
+	var published Catalog
+	require.NoError(t, loadJSON(runner.CatalogPath, &published, 32<<20))
+	require.NotNil(t, published.Sources[0].ValidUntil)
+	require.Greater(t, *published.Sources[0].ValidUntil, before)
+	require.EqualValues(t, 4, batches.Load())
+	require.EqualValues(t, 2+pageCount, reads.Load())
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	require.Len(t, backend.records, pageCount)
+	require.Equal(t, 2, backend.contentMerges)
+	for _, row := range backend.records {
+		require.Equal(t, "gs://original/report.pdf?generation=42#page=12", row["source"].(map[string]any)["uri"])
 	}
 }

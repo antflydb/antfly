@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 import sys
 from pathlib import Path
@@ -17,7 +18,7 @@ FILES = {
 # Keep this post-generation check tied to the endpoint body contract rather
 # than the canonical model's historical name.
 REQUIRED_BODY = re.compile(
-    r"(body:\s+(?:GlobalStatefulQueryRequest|StatefulQueryRequest)\s+\|\s+File)"
+    r"(body:\s+(?:GlobalStatefulQueryRequest|StatefulQueryRequest|InferenceDictateRequest)\s+\|\s+File)"
     r"\s+\|\s+Unset\s*=\s*UNSET"
 )
 SCOPED_MERGE = Path("api/data_operations/linear_merge.py")
@@ -45,7 +46,25 @@ def _fix_embedding_input_union(source: str) -> str:
         raise RuntimeError(f"unexpected generated shape in {EMBED_REQUEST}: to_dict list union")
 
     input_start = generated_to_dict.index("        input_: dict[str, Any]")
-    encoding_start = generated_to_dict.index("        encoding_format:", input_start)
+    # Replace only the input union. Preserve every following field's generated
+    # serializer, including optional pins added ahead of encoding_format.
+    function = ast.parse("class Generated:\n" + generated_to_dict).body[0].body[0]
+    input_line = generated_to_dict[:input_start].count("\n") + 2
+    lines = generated_to_dict.splitlines(keepends=True)
+    fields_start = None
+    for statement in function.body:
+        if statement.lineno <= input_line:
+            continue
+        targets = (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else ([statement.target] if isinstance(statement, ast.AnnAssign) else [])
+        )
+        if any(isinstance(target, ast.Name) and target.id != "input_" for target in targets):
+            fields_start = sum(map(len, lines[: statement.lineno - 2]))
+            break
+    if fields_start is None:
+        raise RuntimeError(f"unexpected generated shape in {EMBED_REQUEST}: input union tail")
     fixed_input = """        input_: dict[str, Any] | list[dict[str, Any]] | list[str] | str
         if isinstance(self.input_, str):
             input_ = self.input_
@@ -63,10 +82,8 @@ def _fix_embedding_input_union(source: str) -> str:
         else:
             raise TypeError("input must be a string, list, or ordered content input")
 
-        model_identity = self.model_identity
-
 """
-    generated_to_dict = generated_to_dict[:input_start] + fixed_input + generated_to_dict[encoding_start:]
+    generated_to_dict = generated_to_dict[:input_start] + fixed_input + generated_to_dict[fields_start:]
     generated_to_dict = generated_to_dict.replace(
         "        from ..models.inference_embedding_content_input import InferenceEmbeddingContentInput\n",
         "        from ..models.inference_embedding_content_input import InferenceEmbeddingContentInput\n"
@@ -142,6 +159,15 @@ def fix_generated_client(root: Path) -> None:
                 f"required-body signatures={count}, NDJSON headers={source.count(NDJSON_HEADER)}"
             )
         updates[path] = REQUIRED_BODY.sub(r"\1", source)
+
+    path = root / "api/default/dictate.py"
+    source = path.read_text(encoding="utf-8")
+    if (
+        len(REQUIRED_BODY.findall(source)) != 5
+        or source.count('headers["Content-Type"] = "application/vnd.antfly.attachments.v1"') != 1
+    ):
+        raise RuntimeError("unexpected generated shape in dictate: required binary/JSON body")
+    updates[path] = REQUIRED_BODY.sub(r"\1", source)
 
     path = root / SCOPED_MERGE
     source = path.read_text(encoding="utf-8")

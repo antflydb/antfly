@@ -51,7 +51,7 @@ fn compile(alloc: Allocator, table: schema.TableSchema, layout: *const codec.Phy
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     if (definition.expression) |expression| {
-        if (definition.column != null or definition.op != null or definition.value != null or definition.collation != null) return error.InvalidSchemaUpdateRequest;
+        if (definition.column != null or definition.op != null or definition.value.isPresent() or definition.collation != null) return error.InvalidSchemaUpdateRequest;
         const json = try std.json.Stringify.valueAlloc(arena.allocator(), expression, .{});
         const value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{ .parse_numbers = false });
         return expressions.Plan.init(alloc, table, value, .boolean);
@@ -59,7 +59,7 @@ fn compile(alloc: Allocator, table: schema.TableSchema, layout: *const codec.Phy
     const column = definition.column orelse return error.InvalidSchemaUpdateRequest;
     const operation = definition.op orelse return error.InvalidSchemaUpdateRequest;
     const unary = operation == .is_null or operation == .is_not_null;
-    const literal = definition.value orelse .null;
+    const literal = definition.value.valueOrNull() orelse .null;
     if (unary and literal != .null) return error.InvalidRelationalPredicate;
     // CHECK operands live in the logical row domain, not the independently
     // versioned ordered-key domain. Resolve once against the pinned layout;

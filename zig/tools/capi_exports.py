@@ -139,6 +139,11 @@ def link_macho(args: argparse.Namespace) -> None:
         *link_args,
         "-lSystem",
     ]
+    # Archive stripping removes debug info, but this external final link can
+    # otherwise retain every private Zig symbol name in __LINKEDIT. Honor the
+    # product's strip policy without removing dynamic exports or unwind data.
+    if getattr(args, "strip", False):
+        command.append("-x")
     # Each declared API is a link root, including APIs owned by a provider
     # archive that otherwise has no undefined reference from the C API object.
     if getattr(args, "map", None) is not None:
@@ -239,6 +244,7 @@ def main() -> None:
     )
     link.add_argument("--output", type=Path, required=True)
     link.add_argument("--map", type=Path)
+    link.add_argument("--strip", action="store_true")
     link.add_argument("link_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     try:

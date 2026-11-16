@@ -1338,3 +1338,24 @@ def test_sql_vector_search_waits_for_normalized_text_filters(require_native, afl
                 ]
                 >= target
             )
+
+
+def test_compact_drains_named_table_indexes(require_native, aflite_path):
+    # Hosted mode leaves replay to explicit maintenance, making the pre-compact
+    # debt deterministic. A database-wide compact must include this namespace.
+    with af.create_hosted(aflite_path) as db:
+        db.sql("CREATE TABLE notes (body TEXT)")
+        with db.open_table("notes") as table:
+            table.batch_json({"inserts": {"fresh": {"body": "compactcanary"}}, "sync_level": "write"})
+            before = table.pending_work_stats()
+            target = before["derived_target_sequence"]
+            text = next(item for item in before["index_replay_debt"] if item["kind"] == "full_text")
+            assert text["applied_sequence"] < target
+        assert db.compact()["compacted"]
+        with db.open_table("notes") as table:
+            after = table.pending_work_stats()
+            text = next(item for item in after["index_replay_debt"] if item["kind"] == "full_text")
+            assert text["applied_sequence"] >= target
+            result = table.search({"full_text_search": {"match": "compactcanary", "field": "body"}, "limit": 10})
+            assert [hit["_id"] for hit in result["responses"][0]["hits"]["hits"]] == ["fresh"]
+        assert db.check()["valid"]

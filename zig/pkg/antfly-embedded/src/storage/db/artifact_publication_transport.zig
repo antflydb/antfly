@@ -41,7 +41,7 @@ const terminal_ring_prefix = "\x00\x00__artifact_publication_upload__:terminal_s
 /// publication still goes through the durable semantic receipt/guard path.
 pub const max_terminal_records: u64 = 1024;
 pub const max_active_uploads: usize = 8;
-pub const max_staged_bytes: usize = 256 * 1024 * 1024;
+pub const max_staged_bytes: usize = @max(256 * 1024 * 1024, codec.max_encoded_bytes + 2 * control_staged_bytes);
 pub const control_upload_slots: usize = 2;
 pub const control_staged_bytes: usize = 16 * 1024 * 1024;
 pub const max_producer_uploads = max_active_uploads - control_upload_slots;
@@ -129,6 +129,7 @@ pub fn validateBatchRequest(request: anytype) !void {
     try control.validate();
     const defaults: @TypeOf(request) = .{};
     inline for (@typeInfo(@TypeOf(request)).@"struct".field_names, @typeInfo(@TypeOf(request)).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime std.mem.eql(u8, reflected_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, reflected_name, "artifact_publication_transport") and
             !std.mem.eql(u8, reflected_name, "sync_level") and !std.mem.eql(u8, reflected_name, "timestamp"))
         {
@@ -137,6 +138,12 @@ pub fn validateBatchRequest(request: anytype) !void {
             } else if (!std.meta.eql(@field(request, reflected_name), @field(defaults, reflected_name))) return error.InvalidBatchRequest;
         }
     }
+}
+
+/// Small control messages retain their reserved slots and bytes. A control
+/// carrying a large admitted identity borrows ordinary staging capacity.
+pub fn usesReservedControl(mode: @FieldType(publication.Command, "mode"), encoded_len: usize) bool {
+    return mode != .publish and encoded_len <= std.math.maxInt(u32) and reservedBytes(@intCast(encoded_len)) <= control_staged_bytes / control_upload_slots;
 }
 
 pub const Manifest = struct {
@@ -545,35 +552,46 @@ fn progressKey(namespace: Namespace, digest: Digest) [progress_prefix.len + 56]u
 // This bounded bitmap is discovery metadata, never authority to publish.
 // Finalization still authenticates every chunk and rechecks the incarnation.
 const Progress = struct {
-    const len = 92;
-    received: u128 = 0,
-
-    fn encode(self: Progress, manifest: Manifest) [len]u8 {
-        var raw: [len]u8 = undefined;
-        @memcpy(raw[0..4], "APP1");
+    received: u512 = 0,
+    const Encoded = struct {
+        bytes: [140]u8,
+        len: usize,
+        fn slice(self: *const @This()) []const u8 {
+            return self.bytes[0..self.len];
+        }
+        fn checksum(self: *const @This()) Digest {
+            return self.bytes[self.len - 32 ..][0..32].*;
+        }
+    };
+    fn encode(self: Progress, manifest: Manifest) Encoded {
+        // Preserve the exact old representation for every legacy manifest.
+        const legacy = manifest.chunk_hashes.len <= 128;
+        var out: Encoded = .{ .bytes = undefined, .len = if (legacy) 92 else 140 };
+        const raw = out.bytes[0..out.len];
+        @memcpy(raw[0..4], if (legacy) "APP1" else "APP2");
         std.mem.writeInt(u64, raw[4..12], manifest.created_index, .little);
         @memcpy(raw[12..44], &manifest.root());
-        std.mem.writeInt(u128, raw[44..60], self.received, .little);
-        std.crypto.hash.Blake3.hash(raw[0..60], raw[60..92], .{});
-        return raw;
+        const end: usize = if (legacy) 60 else 108;
+        if (legacy) std.mem.writeInt(u128, raw[44..60], @intCast(self.received), .little) else std.mem.writeInt(u512, raw[44..108], self.received, .little);
+        std.crypto.hash.Blake3.hash(raw[0..end], raw[end..][0..32], .{});
+        return out;
     }
-
     fn load(txn: anytype, manifest: Manifest) !Progress {
         const raw = (try optionalGet(txn, &progressKey(manifest.namespace, manifest.publication_digest))) orelse return error.ArtifactCatalogCorrupt;
-        if (raw.len != len or !std.mem.eql(u8, raw[0..4], "APP1") or
-            std.mem.readInt(u64, raw[4..12], .little) != manifest.created_index or
-            !std.mem.eql(u8, raw[12..44], &manifest.root())) return error.ArtifactCatalogCorrupt;
+        const legacy = manifest.chunk_hashes.len <= 128;
+        const end: usize = if (legacy) 60 else 108;
+        if (raw.len != end + 32 or !std.mem.eql(u8, raw[0..4], if (legacy) "APP1" else "APP2") or
+            std.mem.readInt(u64, raw[4..12], .little) != manifest.created_index or !std.mem.eql(u8, raw[12..44], &manifest.root())) return error.ArtifactCatalogCorrupt;
         var checksum: Digest = undefined;
-        std.crypto.hash.Blake3.hash(raw[0..60], &checksum, .{});
-        if (!std.mem.eql(u8, &checksum, raw[60..92])) return error.ArtifactCatalogCorrupt;
-        const received = std.mem.readInt(u128, raw[44..60], .little);
+        std.crypto.hash.Blake3.hash(raw[0..end], &checksum, .{});
+        if (!std.mem.eql(u8, &checksum, raw[end..])) return error.ArtifactCatalogCorrupt;
+        const received: u512 = if (legacy) std.mem.readInt(u128, raw[44..60], .little) else std.mem.readInt(u512, raw[44..108], .little);
         if (received & ~mask(manifest) != 0) return error.ArtifactCatalogCorrupt;
         return .{ .received = received };
     }
-
-    fn mask(manifest: Manifest) u128 {
-        comptime std.debug.assert(codec.max_chunks < 128);
-        return (@as(u128, 1) << @as(u7, @intCast(manifest.chunk_hashes.len))) - 1;
+    fn mask(manifest: Manifest) u512 {
+        comptime std.debug.assert(codec.max_chunks < 512);
+        return (@as(u512, 1) << @as(u9, @intCast(manifest.chunk_hashes.len))) - 1;
     }
 };
 
@@ -654,7 +672,7 @@ pub fn recoveryInventory(txn: anytype, namespace: Namespace) !RecoveryInventory 
         const progress = try Progress.load(txn, manifest);
         const hint: RecoveryHint = .{ .namespace = namespace, .publication_digest = entry.publication_digest, .root = entry.root, .created_index = entry.created_index };
         const encoded = progress.encode(manifest);
-        result.entries[result.count] = .{ .hint = hint, .complete = progress.received == Progress.mask(manifest), .progress = encoded[60..92].* };
+        result.entries[result.count] = .{ .hint = hint, .complete = progress.received == Progress.mask(manifest), .progress = encoded.checksum() };
         result.count += 1;
     }
     return result;
@@ -672,7 +690,7 @@ pub fn stageAbandon(txn: anytype, request: Request) !bool {
     if (manifest.created_index != request.created_index or !std.mem.eql(u8, &manifest.root(), &request.manifest_root)) return false;
     const progress = try Progress.load(txn, manifest);
     const encoded = progress.encode(manifest);
-    if (progress.received == Progress.mask(manifest) or !std.mem.eql(u8, encoded[60..92], &request.observed_progress)) return false;
+    if (progress.received == Progress.mask(manifest) or !std.mem.eql(u8, &encoded.checksum(), &request.observed_progress)) return false;
     var quota = try decodeQuota(try optionalGet(txn, quota_key));
     try quota.remove(manifest);
     const chunk_count = manifest.chunk_hashes.len;
@@ -713,7 +731,7 @@ pub fn stageBegin(alloc: Allocator, txn: anytype, proposed: Manifest, applied_in
     const quota_raw = encodeQuota(quota);
     const progress = (Progress{}).encode(manifest);
     try txn.put(&key, raw);
-    try txn.put(&progressKey(manifest.namespace, manifest.publication_digest), &progress);
+    try txn.put(&progressKey(manifest.namespace, manifest.publication_digest), progress.slice());
     try txn.put(quota_key, &quota_raw);
 }
 
@@ -730,7 +748,7 @@ pub fn stageChunk(txn: anytype, namespace: Namespace, publication_digest: Digest
     if (!std.mem.eql(u8, &actual_root, &root)) return error.ArtifactPublicationUploadChanged;
     try manifest.verifyChunk(ordinal, bytes);
     var progress = try Progress.load(txn, manifest);
-    const bit = @as(u128, 1) << @as(u7, @intCast(ordinal));
+    const bit = @as(u512, 1) << @as(u9, @intCast(ordinal));
     const key = try chunkKey(namespace, publication_digest, ordinal);
     if (try optionalGet(txn, &key)) |previous| {
         if (!std.mem.eql(u8, previous, bytes)) return error.ArtifactPublicationUploadChanged;
@@ -741,7 +759,7 @@ pub fn stageChunk(txn: anytype, namespace: Namespace, publication_digest: Digest
     progress.received |= bit;
     const progress_raw = progress.encode(manifest);
     try txn.put(&key, bytes);
-    try txn.put(&progressKey(namespace, publication_digest), &progress_raw);
+    try txn.put(&progressKey(namespace, publication_digest), progress_raw.slice());
 }
 
 /// Assembles only after every point-addressed chunk was verified. This is an
@@ -771,7 +789,7 @@ pub fn assembleAlloc(alloc: Allocator, txn: anytype, namespace: Namespace, publi
     // The codec has already recomputed and verified this digest. Reuse it
     // rather than scanning the entire assembled command a second time.
     const decoded_digest = decoded.command.publication_digest;
-    if (manifest.control != (decoded.command.mode != .publish)) return error.ArtifactPublicationUploadChanged;
+    if (manifest.control != usesReservedControl(decoded.command.mode, manifest.encoded_len)) return error.ArtifactPublicationUploadChanged;
     if (!std.mem.eql(u8, &decoded.command.namespace, &namespace) or
         !std.mem.eql(u8, &decoded.command.publication_digest, &publication_digest) or
         !std.mem.eql(u8, &decoded_digest, &manifest.command_digest)) return error.ArtifactPublicationUploadChanged;
@@ -1029,7 +1047,7 @@ test "artifact publication upload stages exact retries and atomically retires qu
     try std.testing.expectEqual(@as(usize, 3), (try recoveryInventory(&txn, ready.namespace)).count);
     const manifest = try decodeManifest(try txn.get(&manifestKey(ready.namespace, ready.publication_digest)));
     const corrupt = (Progress{ .received = @as(u128, 1) << 100 }).encode(manifest);
-    try txn.put(&progressKey(ready.namespace, ready.publication_digest), &corrupt);
+    try txn.put(&progressKey(ready.namespace, ready.publication_digest), corrupt.slice());
     try std.testing.expectError(error.ArtifactCatalogCorrupt, nextRecovery(&txn, ready.namespace, 0));
 }
 
@@ -1108,4 +1126,31 @@ test "artifact publication upload prunes only by ordered age" {
     try std.testing.expectEqualDeep(command, decoded.command);
     try stageCompletion(&txn, control.namespace, control.publication_digest, control.root(), 30_001, 30_002);
     try std.testing.expectEqual(@as(usize, 0), (try decodeQuota(try optionalGet(&txn, quota_key))).bytes);
+}
+
+test "privacy publication progress retains legacy bytes and supports large identity uploads" {
+    var hashes: [codec.max_chunks]Digest = @splat(@splat(4));
+    const Fake = struct {
+        raw: []const u8,
+        fn get(self: *@This(), _: []const u8) ![]const u8 {
+            return self.raw;
+        }
+    };
+    for ([_]usize{ 1, 68, 128, 129, codec.max_chunks }) |count| {
+        const manifest = Manifest{ .namespace = @splat(1), .publication_digest = @splat(2), .command_digest = @splat(3), .encoded_len = @intCast(count * codec.chunk_bytes), .created_index = 1, .chunk_hashes = hashes[0..count] };
+        try manifest.validate();
+        const value = Progress{ .received = @as(u512, 1) << @as(u9, @intCast(count - 1)) };
+        const encoded = value.encode(manifest);
+        try std.testing.expectEqual(@as(usize, if (count <= 128) 92 else 140), encoded.len);
+        try std.testing.expectEqualStrings(if (count <= 128) "APP1" else "APP2", encoded.slice()[0..4]);
+        var fake = Fake{ .raw = encoded.slice() };
+        try std.testing.expectEqual(value.received, (try Progress.load(&fake, manifest)).received);
+        var bad = encoded;
+        if (count == 128) bad.bytes[bad.len - 1] ^= 1 else bad = (Progress{ .received = @as(u512, 1) << @as(u9, @intCast(count)) }).encode(manifest);
+        fake.raw = bad.slice();
+        try std.testing.expectError(error.ArtifactCatalogCorrupt, Progress.load(&fake, manifest));
+    }
+    try std.testing.expect(usesReservedControl(.baseline, 1024));
+    try std.testing.expect(!usesReservedControl(.baseline, 9 * 1024 * 1024));
+    try std.testing.expect(!usesReservedControl(.publish, 1024));
 }

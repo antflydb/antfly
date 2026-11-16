@@ -79,7 +79,7 @@ def verify_identity(
     document = verify_release_spec(request, tag, commit)
     if (
         document.get("schema_version") != 5
-        or document.get("build_contract_schema") not in {2, 3, 4, 5, 6}
+        or document.get("build_contract_schema") not in {2, 3, 4, 5, 6, 7}
         or document.get("build_controller_commit") != controller
         or document.get("release_line") != line.name
         or document.get("source_ref") != line.source_ref
@@ -106,8 +106,11 @@ def verify_identity(
         "commit": commit,
         "version": document["version"],
         "python_version": document["registry_versions"]["python"],
-        "npm_tag": channel["npm_tag"],
+        "npm_tag": channel["npm_tag"] or "",
         "tag": tag,
+        # Authenticate prerelease inputs too, but never admit them to registry
+        # preparation, dispatch, or credential-bearing publication jobs.
+        "publish": str(document["channel"] == "stable").lower(),
     }
 
 

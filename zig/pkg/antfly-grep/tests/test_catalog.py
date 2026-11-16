@@ -36,8 +36,10 @@ class CatalogTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.mode = "complete"
+        self.content_uri = "s3://docs/manual.txt"
         self.pages = []
         self.content_requests = []
+        self.content_source_ids = []
         self.file_catalog = None
         self.records = []
         for i in range(70):
@@ -91,9 +93,9 @@ class CatalogTests(unittest.TestCase):
                         return
                     after = body.get("search_after", [""])[0]
                     rows = test.records
-                    selected = body.get("query", {}).get("conjuncts")
+                    selected = body.get("query", {}).get("doc_id", {}).get("ids")
                     if selected:
-                        selected_id = selected[1]["equals"]
+                        selected_id = selected[0]
                         rows = [row for row in rows if row["_id"] == selected_id]
                     hits = [row for row in rows if row["_id"] > after][: body["limit"]]
                     snapshot = (
@@ -116,6 +118,7 @@ class CatalogTests(unittest.TestCase):
                     self.reply(404, {})
                     return
                 test.content_requests.append(body)
+                test.content_source_ids.append(self.headers.get("X-Antfly-Source-ID"))
                 if not body.get("remote_snapshot"):
                     if test.mode == "syncing_before_snapshot":
                         test.records[0]["_source"]["source"]["status"] = "syncing"
@@ -136,7 +139,7 @@ class CatalogTests(unittest.TestCase):
                             "_source": {
                                 "grep": {
                                     "version": 1,
-                                    "uri": "s3://docs/manual.txt",
+                                    "uri": test.content_uri,
                                     "path": "manual.txt",
                                     "content": "retry budget\n",
                                     "revision": "content-1",
@@ -172,7 +175,7 @@ class CatalogTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join()
 
-    def search(self):
+    def search(self, *flags):
         env = {
             key: value
             for key, value in os.environ.items()
@@ -194,6 +197,7 @@ class CatalogTests(unittest.TestCase):
                 ),
                 "--source",
                 "manuals",
+                *flags,
                 "retry budget",
             ],
             env=env,
@@ -206,11 +210,69 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(b"retry budget", result.stdout)
         self.assertEqual(len(self.pages), 3)
+        for page in self.pages[:2]:
+            policy = page["execution"]["value_verification"]
+            self.assertTrue(policy["allow_scan"])
+            self.assertEqual(policy["max_documents"], 10000)
+            self.assertEqual(policy["max_bytes"], 32 * 1024 * 1024)
+        selected = self.pages[2]
+        self.assertEqual(
+            selected["query"], {"doc_id": {"ids": [self.records[0]["_id"]]}}
+        )
+        self.assertFalse(selected["execution"]["value_verification"]["allow_scan"])
         self.assertEqual(self.pages[1]["remote_snapshot"], "catalog-1")
         self.assertEqual(self.pages[1]["search_after"], [self.records[63]["_id"]])
         self.assertIn(
             self.records[0]["_id"], json.dumps(self.content_requests[0]["filter_query"])
         )
+
+    def test_original_pdf_citation_keeps_generation_and_page(self):
+        self.content_uri = "gs://original/manual.pdf?generation=42#page=12"
+        result = self.search("--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(self.content_uri.encode(), result.stdout)
+
+    def test_physical_row_scope_in_file_and_table_catalogs(self):
+        source = self.records[0]["_source"]["source"]
+        logical_id = source["id"]
+        row_source_id = str(uuid.UUID(int=100))
+        source["row_source_id"] = row_source_id
+        source["filter"] = {
+            "conjuncts": [
+                {"field": "source_id", "equals": row_source_id},
+                {"field": "doc_type", "equals": "source_item"},
+            ]
+        }
+        self.file_catalog = Path(self.temp.name) / "catalog.json"
+        self.file_catalog.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "endpoint": self.endpoint,
+                    "sources": [dict(source, published_revision="inventory-1")],
+                }
+            )
+        )
+        for catalog in (self.file_catalog, None):
+            with self.subTest(catalog=catalog):
+                self.file_catalog = catalog
+                self.content_requests.clear()
+                self.content_source_ids.clear()
+                result = self.search()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(b"retry budget", result.stdout)
+                self.assertTrue(self.content_source_ids)
+                self.assertTrue(
+                    all(value == logical_id for value in self.content_source_ids)
+                )
+                self.assertIn(
+                    row_source_id,
+                    json.dumps(self.content_requests[0]["filter_query"]),
+                )
+        source["filter"]["conjuncts"][0]["equals"] = logical_id
+        result = self.search()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(b"InvalidSourceCatalog", result.stderr)
 
     def test_publication_changes_before_snapshot_fail_without_output(self):
         for mode, error in (

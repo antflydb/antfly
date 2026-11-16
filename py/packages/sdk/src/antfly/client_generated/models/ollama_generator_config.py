@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.ollama_generator_config_provider import OllamaGeneratorConfigProvider
+from ..models.open_ai_reasoning_effort import OpenAIReasoningEffort
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="OllamaGeneratorConfig")
@@ -21,7 +22,9 @@ class OllamaGeneratorConfig:
         model (str): The name of the Ollama model to use. Example: llama3.3:70b.
         url (str | Unset): The URL of the Ollama API endpoint.
         temperature (float | Unset): Controls randomness in generation (0.0-2.0).
-        max_tokens (int | Unset): Maximum number of tokens to generate.
+        max_tokens (int | Unset): Maximum number of tokens to generate, including reasoning tokens for thinking models.
+        reasoning_effort (OpenAIReasoningEffort | Unset): OpenAI reasoning effort; model support varies. Omit to use the
+            model default.
         top_p (float | Unset): Nucleus sampling parameter.
         top_k (int | Unset): Top-k sampling parameter.
         timeout (int | Unset): HTTP response timeout in seconds for Ollama API calls.
@@ -32,6 +35,7 @@ class OllamaGeneratorConfig:
     url: str | Unset = UNSET
     temperature: float | Unset = UNSET
     max_tokens: int | Unset = UNSET
+    reasoning_effort: OpenAIReasoningEffort | Unset = UNSET
     top_p: float | Unset = UNSET
     top_k: int | Unset = UNSET
     timeout: int | Unset = UNSET
@@ -47,6 +51,10 @@ class OllamaGeneratorConfig:
         temperature = self.temperature
 
         max_tokens = self.max_tokens
+
+        reasoning_effort: str | Unset = UNSET
+        if not isinstance(self.reasoning_effort, Unset):
+            reasoning_effort = self.reasoning_effort.value
 
         top_p = self.top_p
 
@@ -68,6 +76,8 @@ class OllamaGeneratorConfig:
             field_dict["temperature"] = temperature
         if max_tokens is not UNSET:
             field_dict["max_tokens"] = max_tokens
+        if reasoning_effort is not UNSET:
+            field_dict["reasoning_effort"] = reasoning_effort
         if top_p is not UNSET:
             field_dict["top_p"] = top_p
         if top_k is not UNSET:
@@ -90,6 +100,13 @@ class OllamaGeneratorConfig:
 
         max_tokens = d.pop("max_tokens", UNSET)
 
+        _reasoning_effort = d.pop("reasoning_effort", UNSET)
+        reasoning_effort: OpenAIReasoningEffort | Unset
+        if isinstance(_reasoning_effort, Unset):
+            reasoning_effort = UNSET
+        else:
+            reasoning_effort = OpenAIReasoningEffort(_reasoning_effort)
+
         top_p = d.pop("top_p", UNSET)
 
         top_k = d.pop("top_k", UNSET)
@@ -102,6 +119,7 @@ class OllamaGeneratorConfig:
             url=url,
             temperature=temperature,
             max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
             top_p=top_p,
             top_k=top_k,
             timeout=timeout,

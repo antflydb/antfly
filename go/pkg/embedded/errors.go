@@ -17,6 +17,7 @@ package embedded
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -31,15 +32,18 @@ const (
 	IntentConflict  ErrorCode = 4
 	TxnNotFound     ErrorCode = 5
 	Busy            ErrorCode = 6
-	// OutcomeUnknown means publication succeeded in the running process, but
-	// crash durability could not be confirmed. Inspect the destination and do
-	// not retry the operation automatically.
+	// OutcomeUnknown means the operation may have taken effect: either it
+	// was published but crash durability could not be confirmed, or a failure
+	// left it unknown whether it applied at all. Inspect the affected data
+	// and do not retry the operation automatically.
 	OutcomeUnknown ErrorCode = 7
 	// Unsupported means the operation requires a platform or filesystem
 	// capability that is unavailable. Retrying unchanged will not succeed.
 	Unsupported ErrorCode = 8
 	// Stalled reports stalled derived work or a failed derived worker. Inspect
-	// pending-work diagnostics and repair or reopen the database.
+	// pending-work diagnostics and repair or reopen the database. A batch may
+	// already have committed: inspect its error detail and do not replay it
+	// when reported as committed.
 	Stalled ErrorCode = 9
 	// Cancelled means the operation was cancelled, including cancellation
 	// of a pending replacement or a false progress/stream callback result
@@ -77,7 +81,7 @@ var errorCodeDescriptions = map[ErrorCode]string{
 	IntentConflict:                   "a transaction intent conflicts with the requested operation",
 	TxnNotFound:                      "the requested transaction was not found",
 	Busy:                             "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
-	OutcomeUnknown:                   "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
+	OutcomeUnknown:                   "the operation may have taken effect, but whether it applied or became durable could not be confirmed; inspect the affected data and do not retry automatically",
 	Unsupported:                      "the operation requires a capability that is not supported by this platform or filesystem",
 	Stalled:                          "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
 	Cancelled:                        "the caller cancelled the operation",
@@ -112,10 +116,76 @@ func (code ErrorCode) Description() string {
 type NativeError struct {
 	Code   ErrorCode
 	Detail string
+	// OutcomeReceipt is set when an autocommit SQL write or a batch failed
+	// with OutcomeUnknown and the database issued a receipt for it. Resolve
+	// it later with DB.OutcomeReceiptStatus.
+	OutcomeReceipt string
 }
 
-func (e *NativeError) Error() string { return e.Code.Error() + ": " + e.Detail }
+func (e *NativeError) Error() string {
+	message := e.Code.Error()
+	if e.Detail != "" {
+		message += ": " + e.Detail
+	}
+	if e.OutcomeReceipt != "" {
+		message += " (outcome receipt " + e.OutcomeReceipt + ")"
+	}
+	return message
+}
 func (e *NativeError) Unwrap() error { return e.Code }
+
+// OutcomeReceiptStatus is the resolved outcome of an OutcomeUnknown write.
+type OutcomeReceiptStatus uint8
+
+const (
+	// OutcomeReceiptApplied means the uncertain write applied.
+	OutcomeReceiptApplied OutcomeReceiptStatus = 1
+	// OutcomeReceiptNotApplied means the uncertain write did not apply.
+	OutcomeReceiptNotApplied OutcomeReceiptStatus = 2
+)
+
+func (status OutcomeReceiptStatus) String() string {
+	switch status {
+	case OutcomeReceiptApplied:
+		return "applied"
+	case OutcomeReceiptNotApplied:
+		return "not_applied"
+	default:
+		return fmt.Sprintf("OutcomeReceiptStatus(%d)", uint8(status))
+	}
+}
+
+// OutcomeReceiptOf returns the outcome receipt carried by err, if any. It
+// recognizes *NativeError and *SQLError anywhere in err's chain.
+func OutcomeReceiptOf(err error) (string, bool) {
+	var carrier outcomeReceiptCarrier
+	if errors.As(err, &carrier) {
+		if receipt := carrier.outcomeReceipt(); receipt != "" {
+			return receipt, true
+		}
+	}
+	return "", false
+}
+
+type outcomeReceiptCarrier interface {
+	error
+	outcomeReceipt() string
+}
+
+func (e *NativeError) outcomeReceipt() string { return e.OutcomeReceipt }
+
+// withOutcomeReceipt attaches receipt to err, a failure with code.
+func withOutcomeReceipt(err error, code ErrorCode, receipt string) error {
+	if err == nil || receipt == "" {
+		return err
+	}
+	var native *NativeError
+	if errors.As(err, &native) {
+		native.OutcomeReceipt = receipt
+		return err
+	}
+	return &NativeError{Code: code, OutcomeReceipt: receipt}
+}
 
 // InferenceAPIError is the JSON error body an Antfly inference call returns
 // on failure: {"error": "...", "message": "..."}. Code is a stable string

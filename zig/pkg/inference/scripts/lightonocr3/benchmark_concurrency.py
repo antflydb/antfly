@@ -48,6 +48,37 @@ def prefill_stream_observation(text):
     }
 
 
+def apply_token_burst_overrides(env, enabled, width):
+    """Omitted benchmark flags must preserve runtime automatic selection."""
+    if enabled is not None:
+        env["ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST"] = "1" if enabled else "0"
+    if width is not None:
+        env["ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"] = str(width)
+
+
+def recurrent_placement_observation(text, enabled):
+    """Require the loaded session's decision, not a CUDA backend banner."""
+    rows = [
+        dict(placement=placement, reason=reason, compute=f"{major}.{minor}")
+        for placement, reason, major, minor in re.findall(
+            r"inference recurrent placement backend=cuda placement=(\w+) "
+            r"reason=(\w+) compute=(\d+)\.(\d+)",
+            text,
+        )
+    ]
+    expected = (
+        ("host", "operator_disabled")
+        if enabled is False
+        else ("cuda", "supported_geometry")
+    )
+    return {
+        "sessions": rows,
+        "expected_placement": expected[0],
+        "matched": bool(rows)
+        and all((row["placement"], row["reason"]) == expected for row in rows),
+    }
+
+
 def run(args, model, label, mode, concurrency, output):
     env = os.environ.copy()
     for key in list(env):
@@ -213,8 +244,7 @@ def run(args, model, label, mode, concurrency, output):
     if args.pipeline_vision:
         env["ANTFLY_LIGHTONOCR3_CPU_PREPROCESS"] = "1"
         env["TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"] = "1"
-    env["ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST"] = "1" if args.gpu_token_burst else "0"
-    env["ANTFLY_LIGHTONOCR3_GPU_TOKEN_BURST_WIDTH"] = str(args.gpu_token_burst_width)
+    apply_token_burst_overrides(env, args.gpu_token_burst, args.gpu_token_burst_width)
     if args.gpu_token_burst:
         env["ANTFLY_LIGHTONOCR3_SINGLE_FRAME"] = "1" if args.backend == "metal" else "0"
         env["ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS"] = "0"
@@ -414,11 +444,17 @@ def run(args, model, label, mode, concurrency, output):
         ANTFLY_BENCH_LIGHTONOCR3="1",
         ANTFLY_INFERENCE_PREFERRED_BACKEND=args.backend,
         ANTFLY_INFERENCE_REQUIRED_BACKEND=args.backend,
-        TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE="1"
-        if args.cuda_recurrent_core
-        else "0",
         ANTFLY_LIGHTONOCR3_CUDA_BATCH="1" if args.cuda_batch else "0",
     )
+    # Omitted means exercise the serving default, not the old CPU baseline.
+    # Clear inherited benchmark controls so the report's null records a real
+    # default. The explicit negative switch retains reproducible CPU rollback.
+    if args.cuda_recurrent_core is None:
+        env.pop("TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE", None)
+    else:
+        env["TERMITE_CUDA_ENABLE_QWEN35_RECURRENT_CORE"] = (
+            "1" if args.cuda_recurrent_core else "0"
+        )
     if args.extended_epoch:
         env["ANTFLY_LIGHTONOCR3_EXTENDED_EPOCH"] = "1"
     if args.images:
@@ -470,6 +506,7 @@ def run(args, model, label, mode, concurrency, output):
                 "ANTFLY_CUDA_ENABLE_LIGHTON_GEMM_BUCKET_ROWS",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_DECODE_OUTPUTS",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PROJECTION_OUTPUTS",
+                "ANTFLY_CUDA_LIGHTON_PRECISION_PROFILE",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_BF16_PREFILL_FFN",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_FUSED_FFN",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_NORM_WEIGHT_CACHE",
@@ -523,6 +560,8 @@ def run(args, model, label, mode, concurrency, output):
                 "ANTFLY_INFERENCE_CUDA_CUBLASLT_PLAN_CACHE_ENTRIES",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_PARALLEL_PREFIX",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_BATCHED_PREFIX",
+                "ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY",
+                "ANTFLY_CUDA_ENABLE_LIGHTON_MODEL_GRAPH",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_PREFIX_SHARED_QK",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_STATE_POOL",
                 "ANTFLY_CUDA_ENABLE_LIGHTON_SHARED_RECURRENT_WEIGHTS",
@@ -627,6 +666,24 @@ def run(args, model, label, mode, concurrency, output):
                 prior_snapshots = re.findall(snapshot_pattern, pieces[0])
                 previous_snapshots = int(prior_snapshots[-1]) if prior_snapshots else 0
                 for sample, section in zip(result["policy_rounds"], sections):
+                    replay_rows = [
+                        int(v)
+                        for v in re.findall(
+                            r"LIGHTONOCR3 cuda_model_graph_first_replay_rows=(\d+)",
+                            section,
+                        )
+                    ]
+                    sample["model_graph_replay_cohort_rows"] = sorted(set(replay_rows))
+                    sample["model_graph_first_replay_events"] = len(replay_rows)
+                    sample["model_graph_max_replay_rows"] = max(replay_rows, default=0)
+                    if args.require_lighton_model_graph and not replay_rows:
+                        result["status"] = "missing_timed_model_graph_replay"
+                    if (
+                        args.require_lighton_model_graph
+                        and args.physical128
+                        and max(replay_rows, default=0) <= 64
+                    ):
+                        result["status"] = "missing_timed_wide_model_graph_replay"
                     sample["vision_batch_sizes"] = sorted(
                         {
                             int(v)
@@ -696,7 +753,11 @@ def run(args, model, label, mode, concurrency, output):
                         or sample["packed_max_query_rows"] > 4096
                     ):
                         result["status"] = "missing_timed_wide_packed_prefill"
-                    if args.require_physical128 and sample["packed_max_items"] <= 64:
+                    sample["physical_max_items"] = max(
+                        sample["packed_max_items"],
+                        sample["model_graph_max_replay_rows"],
+                    )
+                    if args.require_physical128 and sample["physical_max_items"] <= 64:
                         result["status"] = "missing_timed_physical128_steps"
                     sample["packed_input_frames"] = sum(
                         int(value)
@@ -707,6 +768,8 @@ def run(args, model, label, mode, concurrency, output):
                     for counter in [
                         "packed_gpu_decode_rows",
                         "packed_cpu_logit_rows",
+                        "packed_gpu_prefill_rows",
+                        "packed_skipped_prefix_heads",
                         "packed_standalone_wide_heads",
                     ]:
                         sample[counter] = sum(
@@ -764,6 +827,9 @@ def run(args, model, label, mode, concurrency, output):
                         sum(starts for starts, _, _ in chunk_progress)
                         if chunk_progress
                         else sample["packed_prefill_chunks"]
+                    )
+                    sample["prepared_prefill_chunk_rows_observed"] = sorted(
+                        {rows for _, _, rows in chunk_progress}
                     )
                     sample["prepared_prefill_chunk_rows"] = (
                         args.prepared_prefill_chunk_rows
@@ -957,6 +1023,32 @@ def run(args, model, label, mode, concurrency, output):
                         result["status"] = "missing_timed_phase_parking"
                     if args.executor_tail and not sample["executor_tail_steps"]:
                         result["status"] = "missing_timed_executor_tail"
+                    cuda_bursts = [
+                        (int(rows), int(steps))
+                        for rows, steps in re.findall(
+                            r"LIGHTONOCR3 cuda_token_burst_rows=(\d+) steps=(\d+)",
+                            section,
+                        )
+                    ]
+                    sample["cuda_token_burst_cohort_rows"] = sorted(
+                        {rows for rows, _ in cuda_bursts}
+                    )
+                    sample["cuda_token_burst_widths"] = sorted(
+                        {steps for _, steps in cuda_bursts}
+                    )
+                    if args.require_cuda_token_burst:
+                        if not cuda_bursts:
+                            result["status"] = "missing_timed_cuda_token_burst"
+                        elif args.physical128 and not any(
+                            rows > 64 for rows, _ in cuda_bursts
+                        ):
+                            result["status"] = "missing_timed_wide_cuda_token_burst"
+                        elif max(steps for _, steps in cuda_bursts) < (
+                            args.gpu_token_burst_width or 2
+                        ):
+                            result["status"] = (
+                                "missing_timed_requested_cuda_burst_width"
+                            )
                     sample["packed_core_rows_observed"] = sorted(
                         {
                             int(row)
@@ -1267,6 +1359,16 @@ def run(args, model, label, mode, concurrency, output):
                 args.require_cuda_token_burst,
             ),
             (
+                "cuda_model_graph_replays",
+                "lighton_model_graph",
+                args.require_lighton_model_graph,
+            ),
+            (
+                "cuda_bf16_recurrent_prefill_calls",
+                "lighton_bf16_recurrent_prefill",
+                args.require_lighton_bf16_recurrent_prefill,
+            ),
+            (
                 "cuda_bf16_prefill_ffn_calls",
                 "lighton_bf16_prefill_ffn",
                 args.require_lighton_bf16_prefill_ffn,
@@ -1295,6 +1397,11 @@ def run(args, model, label, mode, concurrency, output):
                 "cuda_fused_vision_qkv_calls",
                 "lighton_fused_vision_qkv",
                 args.require_lighton_fused_vision_qkv,
+            ),
+            (
+                "cuda_bf16_vision_blocks",
+                "lighton_bf16_vision",
+                args.require_lighton_bf16_vision,
             ),
             (
                 "cuda_prefix_shared_qk_calls",
@@ -1404,6 +1511,16 @@ def run(args, model, label, mode, concurrency, output):
                 int(groups) * ((int(prefill) + int(decode) + 63) // 64)
                 for (prefill, decode, _), (groups, _) in zip(claims, callbacks)
             )
+            # Graph replay skips host recording counters. Warm/learn/capture
+            # records carry their independently checked two-step packet count.
+            graph_recorded_packets = sum(
+                int(v)
+                for v in re.findall(
+                    r"LIGHTONOCR3 cuda_model_graph_recorded_ragged_packets=(\d+)", text
+                )
+            )
+            expected_packets += graph_recorded_packets
+            result["cuda_graph_recorded_ragged_packets"] = graph_recorded_packets
             actual_packets = result["lighton_ragged_recurrent_calls"]
             result["cuda_ragged_expected_packets"] = expected_packets
             result["cuda_ragged_observed_packets"] = actual_packets
@@ -1442,6 +1559,10 @@ def run(args, model, label, mode, concurrency, output):
         result["ocr_pinned_input_wraps"] = sum(int(w) for _, w in pinned_inputs)
         if args.require_ocr_pinned_inputs and not result["ocr_pinned_input_uploads"]:
             result["status"] = "missing_ocr_pinned_inputs"
+        result["cuda_vision_position_calls"] = sum(
+            int(n)
+            for n in re.findall(r"LIGHTONOCR3 cuda_vision_position_calls=(\d+)", text)
+        )
         metadata = re.findall(
             r"OCR_CUDA pinned_metadata_uploads=(\d+) mrope_cache_hits=(\d+) mrope_cache_uploads=(\d+)",
             text,
@@ -1670,6 +1791,15 @@ def run(args, model, label, mode, concurrency, output):
         )
     ):
         result["status"] = "missing_single_frame_packed_forwards"
+    if args.backend == "cuda":
+        placement = recurrent_placement_observation(text, args.cuda_recurrent_core)
+        result["recurrent_placement"] = placement
+        if (
+            args.require_recurrent_placement
+            and result["status"] == "ok"
+            and not placement["matched"]
+        ):
+            result["status"] = "recurrent_placement_mismatch"
     return result
 
 
@@ -1677,7 +1807,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--native-test", type=Path, required=True)
     parser.add_argument("--backend", choices=["metal", "cuda"], default="metal")
-    parser.add_argument("--cuda-recurrent-core", action="store_true")
+    parser.add_argument(
+        "--cuda-recurrent-core",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override recurrent execution; omitted exercises the runtime default",
+    )
+    parser.add_argument(
+        "--require-recurrent-placement",
+        action="store_true",
+        help="Require matching model-load placement diagnostics for every CUDA recurrent session",
+    )
     parser.add_argument("--cuda-batch", action="store_true")
     parser.add_argument(
         "--model", action="append", required=True, help="LABEL=CHECKPOINT_DIRECTORY"
@@ -1913,12 +2053,15 @@ def main():
     )
     parser.add_argument("--require-lighton-fused-vision-mlp", action="store_true")
     parser.add_argument("--require-lighton-bf16-prefill-ffn", action="store_true")
+    parser.add_argument("--require-lighton-bf16-recurrent-prefill", action="store_true")
+    parser.add_argument("--require-lighton-model-graph", action="store_true")
     parser.add_argument("--require-wide-packed-prefill", action="store_true")
     parser.add_argument("--require-lighton-norm-weight-cache", action="store_true")
     parser.add_argument("--require-florence-bart-ffn", action="store_true")
     parser.add_argument("--require-florence-incremental-admission", action="store_true")
     parser.add_argument("--require-cuda-temp-cache", action="store_true")
     parser.add_argument("--require-lighton-fused-vision-qkv", action="store_true")
+    parser.add_argument("--require-lighton-bf16-vision", action="store_true")
     parser.add_argument("--require-lighton-ragged-recurrent", action="store_true")
     parser.add_argument("--require-lighton-ffn-bf16-inputs", action="store_true")
     parser.add_argument("--require-lighton-ffn-block", action="store_true")
@@ -2034,16 +2177,17 @@ def main():
     )
     parser.add_argument(
         "--gpu-token-burst",
-        action="store_true",
-        help="Overlap greedy OCR decode steps using GPU token handoff",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override automatic greedy GPU token handoff selection",
     )
     parser.add_argument("--require-cuda-token-burst", action="store_true")
     parser.add_argument(
         "--gpu-token-burst-width",
         type=int,
         choices=tuple(range(2, 9)),
-        default=2,
-        help="Maximum GPU token burst width; two logits buffers are reused",
+        default=None,
+        help="Override the runtime GPU token burst width (2–8)",
     )
     parser.add_argument(
         "--pipeline-vision",
@@ -2058,9 +2202,13 @@ def main():
         help="Overlap admitted single-page prefill layer groups after one complete warm prompt",
     )
     args = parser.parse_args()
+    if args.require_recurrent_placement and args.backend != "cuda":
+        parser.error("--require-recurrent-placement requires --backend=cuda")
     if args.cuda_recurrent_core and args.backend != "cuda":
         parser.error("--cuda-recurrent-core requires --backend=cuda")
-    if args.cuda_batch and (args.backend != "cuda" or not args.cuda_recurrent_core):
+    if args.cuda_batch and (
+        args.backend != "cuda" or args.cuda_recurrent_core is False
+    ):
         parser.error("--cuda-batch requires the CUDA recurrent core")
     if args.bf16_projection_rounds and (
         not args.policy_rounds
@@ -2168,11 +2316,13 @@ def main():
             "--pipeline-vision requires continuous resident vision with single-image groups"
         )
     if args.require_cuda_token_burst and (
-        not args.gpu_token_burst or args.backend != "cuda"
+        args.gpu_token_burst is False or args.backend != "cuda"
     ):
-        parser.error("--require-cuda-token-burst requires CUDA and --gpu-token-burst")
-    if args.gpu_token_burst_width != 2 and not args.gpu_token_burst:
-        parser.error("--gpu-token-burst-width requires --gpu-token-burst")
+        parser.error(
+            "--require-cuda-token-burst requires CUDA without --no-gpu-token-burst"
+        )
+    if args.gpu_token_burst_width is not None and args.gpu_token_burst is False:
+        parser.error("--gpu-token-burst-width conflicts with --no-gpu-token-burst")
     if args.gpu_token_burst and (
         not args.continuous
         or not args.device_recurrent_state
@@ -2380,6 +2530,13 @@ def main():
         "scope": "One resident Node; timed native encoded-image API requests including preprocessing, queueing and inference; excludes loading, reference reads, HTTP, PDF rendering and indexing. Other machine workloads uncontrolled. Every timed output must match its same-model serial reference.",
         "results": [],
     }
+    prefill_library = os.environ.get("ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY")
+    if prefill_library:
+        report["bf16_recurrent_prefill_library"] = {
+            "path": str(Path(prefill_library).resolve()),
+            "sha256": digest(Path(prefill_library)),
+            "precision": "BF16 recurrent prefill operands/output; F32 state and decode",
+        }
     if build is not None:
         report["worktree_runtime_commit"] = report["runtime_commit"]
         report["worktree_runtime_source_diff_sha256"] = report[

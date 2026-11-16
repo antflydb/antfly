@@ -225,6 +225,32 @@ fn normalizeServerlessCreateIndexConfig(
     );
 }
 
+fn validateDirectBatchBounds(req: db_types.BatchRequest) !void {
+    if (req.writes.len +| req.deletes.len +| req.transforms.len > 1024) return error.CommitRequirementTooLarge;
+    var bytes: usize = 0;
+    var operations: usize = 0;
+    const Budget = struct {
+        fn add(total: *usize, size: usize) !void {
+            total.* = std.math.add(usize, total.*, size) catch return error.CommitRequirementTooLarge;
+            if (total.* > 8 * 1024 * 1024) return error.CommitRequirementTooLarge;
+        }
+    };
+    for (req.writes) |write| {
+        try Budget.add(&bytes, write.key.len);
+        try Budget.add(&bytes, write.value.len +| 32);
+    }
+    for (req.deletes) |key| try Budget.add(&bytes, key.len +| 32);
+    for (req.transforms) |transform| {
+        try Budget.add(&bytes, transform.key.len +| 32);
+        for (transform.operations) |operation| {
+            operations += 1;
+            if (operations > 16384) return error.CommitRequirementTooLarge;
+            try Budget.add(&bytes, operation.path.len);
+            if (operation.value_json) |value| try Budget.add(&bytes, value.len);
+        }
+    }
+}
+
 pub const HttpHandler = struct {
     alloc: Allocator,
     api: *api_service.Service,
@@ -233,6 +259,9 @@ pub const HttpHandler = struct {
     progress: *catalog_mod.ProgressStore,
     query: *query_mod.QueryRuntime,
     query_cache: ?*query_mod.QueryCache = null,
+    /// Native indexed hosts opt into bounded fresh transforms. The stack owns
+    /// only the derived cache; each batch owns its pinned base and WAL cut.
+    live_read_options: ?query_mod.LiveSession.Options = null,
     managed_query_embedder: ?*managed_embedder.ManagedEmbedder = null,
     embedding_provider_runtime: ?*managed_embedder.ProviderRuntime = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -1114,21 +1143,24 @@ pub const HttpHandler = struct {
     }
 
     fn handlePublicTableListIndexes(self: *HttpHandler, table_name: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableListIndexes(self.alloc, table_name, self.tableApi(.none));
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonSliceResponse(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
+        return self.handleIndexResource(table_name, null, .{});
     }
 
     fn handlePublicTableGetIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableGetIndex(self.alloc, table_name, index_name, self.tableApi(.none));
+        return self.handleIndexResource(table_name, index_name, .{});
+    }
+
+    /// Typed native hosting entry point: names are data, never URL fragments.
+    pub fn handleIndexResource(self: *HttpHandler, table_name: []const u8, index_name: ?[]const u8, context: api_operation.RequestContext) !HttpResponse {
+        const guard = http_types.RequestGuard{ .context = try context.platformDeadline() };
+        try guard.context.ensureActive();
+        var resp = if (index_name) |name|
+            try public_table_http.handleTableGetIndex(self.alloc, table_name, name, self.tableApi(guard.token()))
+        else
+            try public_table_http.handleTableListIndexes(self.alloc, table_name, self.tableApi(guard.token()));
         defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonSliceResponse(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
+        try guard.context.ensureActive();
+        return if (resp.json) try jsonSliceResponse(self.alloc, resp.status, resp.body) else try textResponse(self.alloc, resp.status, resp.body);
     }
 
     fn handlePublicTableCreateIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8, body: []const u8) !HttpResponse {
@@ -1875,6 +1907,7 @@ pub const HttpHandler = struct {
                 error.SparseSegmentNotFound,
                 => return error.FileNotFound,
                 else => {
+                    if (public_table_http.queryCancellationError(err)) |operation| return operation;
                     std.log.err("serverless public table search failed table={s} err={}", .{ table_name, err });
                     return error.InternalQueryFailure;
                 },
@@ -1890,7 +1923,12 @@ pub const HttpHandler = struct {
             .profile = execution.profile_requested,
             .aggregations_json = aggregations_json orelse "",
         };
-        var meta: query_api.QueryResponseMeta = .{};
+        // The native request adapter below intentionally omits execution
+        // operators. Attribute the result from this pinned, resolved plan.
+        var selected: [3][]const u8 = undefined;
+        const sources = execution.plan.sources.asSlice();
+        for (sources, 0..) |source, i| selected[i] = source.indexName();
+        var meta: query_api.QueryResponseMeta = .{ .resolved_indexes = selected[0..sources.len] };
         defer meta.deinit(self.alloc);
         var total_hits_u32: u32 = @intCast(@min(execution.hits.len, std.math.maxInt(u32)));
 
@@ -1906,7 +1944,7 @@ pub const HttpHandler = struct {
             computed_aggregations = computeServerlessAggregationResultsAlloc(self, &execution, json) catch |err| switch (normalizePublicAggregationError(err)) {
                 error.InvalidQueryRequest => return error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
-                else => return error.InternalQueryFailure,
+                else => return public_table_http.queryCancellationError(err) orelse error.InternalQueryFailure,
             };
             const computed = &computed_aggregations.?;
             total_hits_u32 = computed.total_hits;
@@ -1987,6 +2025,7 @@ pub const HttpHandler = struct {
             source_hits,
         );
         defer ctx_owned.deinit(self.alloc);
+        ctx_owned.ctx.control.cancellation = execution.session.?.readCancellation();
 
         const db_hits = try allocDbAggregationHitsAlloc(self.alloc, &execution.session.?, source_hits);
         defer freeDbSearchHits(self.alloc, db_hits);
@@ -2043,6 +2082,15 @@ pub const HttpHandler = struct {
             .context_json = .fromSlice(context_json),
             .hits = if (hits.len == 0) null else hits.ptr,
             .hit_count = @intCast(hits.len),
+            .execution_deadline_ns = ctx.control.deadline_ns orelse 0,
+            .has_execution_deadline = @intFromBool(ctx.control.deadline_ns != null),
+            .cancellation_ctx = if (ctx.control.cancellation != null) @ptrCast(@constCast(&ctx.control.cancellation.?)) else null,
+            .cancellation_fn = if (ctx.control.cancellation != null) struct {
+                fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
+                    const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                    return @intFromBool(token.isCancelled());
+                }
+            }.cancelled else null,
         });
         defer response.deinit();
         const results = std.json.parseFromSliceLeaky(
@@ -4051,6 +4099,8 @@ pub const HttpHandler = struct {
 
         var execution = self.executePublishedSearch(namespace, null, body, cancellation, null) catch |err| {
             switch (err) {
+                error.Timeout, error.DeadlineExceeded, error.Canceled, error.Cancelled => return (try queryOperationalFailureResponse(self.alloc, err)).?,
+
                 error.InvalidQueryRequest,
                 error.EmbeddingIndexNotFound,
                 error.InvalidEmbeddingDimensions,
@@ -4092,6 +4142,8 @@ pub const HttpHandler = struct {
         defer if (aggregations) |*value| deinitJsonValue(self.alloc, value);
         if (aggregations_json) |json| {
             aggregations = encodeServerlessAggregationsValueAlloc(self, execution.session.?.namespace(), &execution, json) catch |err| switch (normalizePublicAggregationError(err)) {
+                error.Timeout, error.DeadlineExceeded, error.Canceled, error.Cancelled => return (try queryOperationalFailureResponse(self.alloc, err)).?,
+
                 error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
                 error.UnsupportedQueryRequest => return try unsupportedQueryResponse(self.alloc),
                 else => {
@@ -4141,6 +4193,8 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
         var execution = self.executePublishedSearch(namespace, table_name, body, cancellation, null) catch |err| switch (err) {
+            error.Timeout, error.DeadlineExceeded, error.Canceled, error.Cancelled => return (try queryOperationalFailureResponse(self.alloc, err)).?,
+
             error.InvalidQueryRequest,
             error.EmbeddingIndexNotFound,
             error.InvalidEmbeddingDimensions,
@@ -4166,6 +4220,8 @@ pub const HttpHandler = struct {
         defer if (aggregations) |*value| deinitJsonValue(self.alloc, value);
         if (aggregations_json) |json| {
             aggregations = encodeServerlessAggregationsValueAlloc(self, table_name, &execution, json) catch |err| switch (normalizePublicAggregationError(err)) {
+                error.Timeout, error.DeadlineExceeded, error.Canceled, error.Cancelled => return (try queryOperationalFailureResponse(self.alloc, err)).?,
+
                 error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
                 error.UnsupportedQueryRequest => return try unsupportedQueryResponse(self.alloc),
                 error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
@@ -4542,7 +4598,7 @@ pub const HttpHandler = struct {
             const traversal_overflow = bounded and traversal_nodes.len > remaining;
 
             for (traversal_nodes) |node| {
-                if (named_query.query.params.deduplicate) {
+                if (named_query.query.params.deduplicate and !named_query.query.params.include_paths) {
                     if (!try seen.putIfAbsent(self.alloc, .{ .table = node.target_table, .key = node.key }, {})) continue;
                 }
 
@@ -5108,7 +5164,13 @@ pub const HttpHandler = struct {
         else
             null;
         defer freeFields(self.alloc, projected_fields);
+        var seen = graph_node_identity.BorrowedMap(void){};
+        defer seen.deinit(self.alloc);
         for (nodes) |node| {
+            const ref = graph_node_identity.Ref{ .table = node.table, .key = node.key };
+            if (seen.contains(ref)) continue;
+            try seen.ensureTotalCapacity(self.alloc, hits.items.len + 1);
+            seen.putAssumeCapacityNoClobber(ref, {});
             // This request cache owns one source-table snapshot. Same-table
             // qualifiers are safe; external qualified nodes cannot be
             // hydrated from this snapshot.
@@ -5799,40 +5861,99 @@ pub const HttpHandler = struct {
         return docs;
     }
 
-    fn resolveTableBatchMutationsAlloc(self: *HttpHandler, namespace: []const u8, req: db_types.BatchRequest) ![]api_types.DocumentMutation {
-        const latest_docs = try self.allocLatestDocumentsAlloc(namespace);
+    /// Check submitted work before source reads, then bound every allocation
+    /// in transform resolution independently of the provider scratch quota.
+    fn resolveDirectTableBatchMutationsAlloc(self: *HttpHandler, namespace: []const u8, req: db_types.BatchRequest, request: api_operation.RequestContext) ![]api_types.DocumentMutation {
+        try validateDirectBatchBounds(req);
+        try request.ensureActive();
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(self.alloc, 64 * 1024 * 1024);
+        defer quota.deinit();
+        var scoped = self.*;
+        scoped.alloc = quota.allocator();
+        const Control = struct {
+            fn canceled(ptr: *const anyopaque) bool {
+                const control: *const api_operation.RequestContext = @ptrCast(@alignCast(ptr));
+                control.ensureActive() catch return true;
+                return false;
+            }
+        };
+        const mutations = scoped.resolveTableBatchMutationsAlloc(namespace, req, .{ .ptr = &request, .is_cancelled_fn = Control.canceled }) catch |err| {
+            try request.ensureActive();
+            if (quota.limit_exceeded) return error.CommitRequirementTooLarge;
+            return err;
+        };
+        defer freeDocumentMutations(scoped.alloc, mutations);
+        try request.ensureActive();
+        var bytes: usize = 0;
+        for (mutations) |mutation| {
+            bytes = std.math.add(usize, bytes, mutation.doc_id.len + (if (mutation.body) |body| body.len else 0) + 32) catch return error.CommitRequirementTooLarge;
+            if (bytes > 8 * 1024 * 1024) return error.CommitRequirementTooLarge;
+        }
+        const output = try self.alloc.alloc(api_types.DocumentMutation, mutations.len);
+        errdefer self.alloc.free(output);
+        var initialized: usize = 0;
+        errdefer for (output[0..initialized]) |*mutation| mutation.deinit(self.alloc);
+        for (mutations, output) |mutation, *out| {
+            const id = try self.alloc.dupe(u8, mutation.doc_id);
+            errdefer self.alloc.free(id);
+            out.* = .{ .kind = mutation.kind, .doc_id = id, .body = if (mutation.body) |body| try self.alloc.dupe(u8, body) else null };
+            initialized += 1;
+        }
+        return output;
+    }
+
+    fn resolveTableBatchMutationsAlloc(self: *HttpHandler, namespace: []const u8, req: db_types.BatchRequest, cancellation: CancellationToken) ![]api_types.DocumentMutation {
+        try cancellation.check();
+        var live: ?*query_mod.LiveSession = null;
+        defer if (live) |session| session.deinit();
+        if (req.transforms.len > 0) if (self.live_read_options) |options| {
+            var configured = options;
+            configured.cancellation = cancellation;
+            configured.io = self.io;
+            live = query_mod.LiveSession.open(self.alloc, self.query, self.api.wal, namespace, configured) catch |err| switch (err) {
+                // Old published layouts retain their original materializer.
+                // Integrity, capacity and transport failures never fall back.
+                error.HostedDocumentFactsRequired => null,
+                else => return err,
+            };
+        };
+        // Gated transforms require bounded point reads. A legacy layout must
+        // migrate its facts instead of turning a small write into a table scan.
+        if (req.commit_requires == .direct_enrichments and req.transforms.len > 0 and live == null) return error.CommitRequirementUnavailable;
+        // Full replacements and deletes do not depend on any existing body.
+        const latest_docs = if (req.transforms.len > 0 and live == null)
+            try self.allocLatestDocumentsAlloc(namespace)
+        else
+            try self.alloc.alloc(query_materializer.Document, 0);
         defer query_materializer.freeDocuments(self.alloc, latest_docs);
 
         var deletes = std.ArrayListUnmanaged(api_types.DocumentMutation).empty;
         defer freeDocumentMutationList(self.alloc, &deletes);
         for (req.deletes) |doc_id| {
-            try deletes.append(self.alloc, .{
-                .kind = .delete,
-                .doc_id = try self.alloc.dupe(u8, doc_id),
-                .body = null,
-            });
+            try self.appendClonedBatchMutation(&deletes, .delete, doc_id, null);
         }
 
         var upserts = std.ArrayListUnmanaged(api_types.DocumentMutation).empty;
         defer freeDocumentMutationList(self.alloc, &upserts);
         for (req.writes) |write| {
-            try upserts.append(self.alloc, .{
-                .kind = .upsert,
-                .doc_id = try self.alloc.dupe(u8, write.key),
-                .body = try self.alloc.dupe(u8, write.value),
-            });
+            try self.appendClonedBatchMutation(&upserts, .upsert, write.key, write.value);
         }
 
         for (req.transforms) |transform| {
-            const existing_body = findMaterializedDocumentBody(latest_docs, transform.key);
-            const resolved = try db_transform.resolveDocumentTransform(self.alloc, existing_body, transform) orelse continue;
+            try cancellation.check();
+            const fetched = if (live) |session| try session.lookupAlloc(transform.key) else null;
+            defer if (fetched) |body| self.alloc.free(body);
+            const existing_body = if (live != null) fetched else findMaterializedDocumentBody(latest_docs, transform.key);
+            const resolved = try db_transform.resolveDocumentTransformWithCancellation(self.alloc, existing_body, transform, cancellation) orelse continue;
             errdefer self.alloc.free(resolved);
 
             removeDocumentMutationById(self.alloc, &deletes, transform.key);
             removeDocumentMutationById(self.alloc, &upserts, transform.key);
+            const owned_id = try self.alloc.dupe(u8, transform.key);
+            errdefer self.alloc.free(owned_id);
             try upserts.append(self.alloc, .{
                 .kind = .upsert,
-                .doc_id = try self.alloc.dupe(u8, transform.key),
+                .doc_id = owned_id,
                 .body = resolved,
             });
         }
@@ -5854,6 +5975,14 @@ pub const HttpHandler = struct {
         upserts.clearRetainingCapacity();
 
         return mutations;
+    }
+
+    fn appendClonedBatchMutation(self: *HttpHandler, list: *std.ArrayListUnmanaged(api_types.DocumentMutation), kind: api_types.MutationKind, id: []const u8, body: ?[]const u8) !void {
+        const owned_id = try self.alloc.dupe(u8, id);
+        errdefer self.alloc.free(owned_id);
+        const owned_body = if (body) |bytes| try self.alloc.dupe(u8, bytes) else null;
+        errdefer if (owned_body) |bytes| self.alloc.free(bytes);
+        try list.append(self.alloc, .{ .kind = kind, .doc_id = owned_id, .body = owned_body });
     }
 
     fn tableApi(self: *HttpHandler, cancellation: CancellationToken) public_table_http.TableApi {
@@ -5893,6 +6022,18 @@ pub const HttpHandler = struct {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.Unavailable;
 
+        const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch |err| switch (err) {
+            error.NamespaceNotFound => return error.NotFound,
+            else => {
+                std.log.err("serverless public table batch resolve failed table={s} err={}", .{ table_name, err });
+                return error.InternalFailure;
+            },
+        };
+        defer self.alloc.free(namespace);
+
+        const gated = req.commit_requires == .direct_enrichments;
+        if (gated and !self.api.wal.supportsCatalogFences()) return error.Unavailable;
+        const catalog_fence = if (gated) self.catalog.directCatalogFence(namespace) catch return error.Unavailable else @import("../wal/types.zig").CatalogFence{};
         self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
             error.NamespaceNotFound => return error.NotFound,
             error.RelationalStorageUnavailable => return error.MethodNotAllowed,
@@ -5915,17 +6056,24 @@ pub const HttpHandler = struct {
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
         try self.preflightPublicTableBatchSyncLevel(req.sync_level, status);
 
-        const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch |err| switch (err) {
-            error.NamespaceNotFound => return error.NotFound,
-            else => {
-                std.log.err("serverless public table batch resolve failed table={s} err={}", .{ table_name, err });
-                return error.InternalFailure;
-            },
-        };
-        defer self.alloc.free(namespace);
-
-        const mutations = self.resolveTableBatchMutationsAlloc(namespace, req) catch |err| switch (err) {
+        if (gated) validateDirectBatchBounds(req) catch return error.InvalidBatchRequest;
+        // Retain every transform read, including a transform that resolves to
+        // no mutation. Blind replacements/deletes have no source dependency.
+        const read_documents = self.alloc.alloc([]const u8, if (gated) req.transforms.len else 0) catch return error.InternalFailure;
+        defer self.alloc.free(read_documents);
+        if (gated) {
+            for (req.transforms, read_documents) |transform, *document| document.* = transform.key;
+        }
+        const mutations = (if (gated)
+            self.resolveDirectTableBatchMutationsAlloc(namespace, req, request)
+        else
+            self.resolveTableBatchMutationsAlloc(namespace, req, request.cancellation)) catch |err| switch (err) {
+            error.CommitRequirementTooLarge => return error.InvalidBatchRequest,
+            error.CommitRequirementUnavailable => return error.Unavailable,
             error.InvalidArgument => return error.InvalidBatchRequest,
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.WalReadBudgetExceeded, error.WalVisibilityUnavailable, error.WalSnapshotExpired => return error.Backpressured,
             else => {
                 std.log.err("serverless public table batch mutation resolution failed table={s} namespace={s} err={}", .{ table_name, namespace, err });
                 return error.InternalFailure;
@@ -5934,11 +6082,28 @@ pub const HttpHandler = struct {
         defer freeDocumentMutations(self.alloc, mutations);
 
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
-        var result = self.api.ingestBatch(.{
-            .namespace = namespace,
-            .timestamp_ns = currentTimeNs(),
-            .mutations = mutations,
-        }) catch |err| {
+        const timestamp = currentTimeNs();
+        const operation_id = if (gated) std.fmt.allocPrint(self.alloc, "direct/{s}/{s}/{d}", .{ namespace, request.request_id, timestamp }) catch return error.InternalFailure else null;
+        defer if (operation_id) |id| self.alloc.free(id);
+        const prepared = if (gated) blk: {
+            const runtime = self.runtime_metrics orelse return error.Unavailable;
+            break :blk runtime.prepareDirectMutationsWithContext(namespace, mutations, .{ .io = self.io orelse runtime.io, .deadline_ns = (request.platformDeadline() catch return error.InternalFailure).deadline_ns, .cancellation = request.cancellation }) catch |err| switch (err) {
+                error.UnsupportedCommitRequirement => return error.UnsupportedCommitRequirement,
+                error.CommitRequirementTooLarge, error.InvalidDocumentBody, error.InvalidDocumentMutation => return error.InvalidBatchRequest,
+                error.Canceled, error.Cancelled => return error.Canceled,
+                error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
+                else => return error.Unavailable,
+            };
+        } else null;
+        defer if (prepared) |values| freeDocumentMutations(self.alloc, values);
+        request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else error.Canceled;
+        var result = (if (prepared) |values|
+            self.api.ingestPreparedBatchWithReadSet(.{ .namespace = namespace, .timestamp_ns = timestamp, .operation_id = operation_id, .mutations = values }, catalog_fence, read_documents)
+        else
+            self.api.ingestBatch(.{ .namespace = namespace, .timestamp_ns = timestamp, .mutations = mutations })) catch |err| {
+            if (err == error.VersionConflict) return error.Conflict;
+            if (err == error.CommitRequirementUnavailable) return error.Unavailable;
+            if (err == error.CommitRequirementTooLarge or err == error.InvalidDocumentBody or err == error.InvalidDocumentMutation) return error.InvalidBatchRequest;
             std.log.err("serverless public table batch ingest failed table={s} namespace={s} err={}", .{ table_name, namespace, err });
             return error.InternalFailure;
         };
@@ -6153,12 +6318,13 @@ pub const HttpHandler = struct {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         const guard = http_types.RequestGuard{ .context = request };
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
-        return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (err) {
-            error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
+        return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (normalizePublicAggregationError(err)) {
+            error.ManifestReadLeaseContended, error.ManifestVersionRetired, error.StorageBusy => return error.StorageReadTemporarilyUnavailable,
             error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
+            error.UnsupportedNodeFilterQuery => return error.UnsupportedNodeFilterQuery,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
             error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
@@ -6167,6 +6333,8 @@ pub const HttpHandler = struct {
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
+            error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
+            error.ReembedSetupRetry => return error.ReembedSetupRetry,
             error.GraphMetricQueryBudgetExceeded => return error.GraphMetricQueryBudgetExceeded,
             error.GraphTraversalQueryBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
@@ -6182,6 +6350,7 @@ pub const HttpHandler = struct {
             error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
             error.Canceled => return error.Canceled,
             else => {
+                if (public_table_http.queryCancellationError(err)) |operation| return operation;
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
             },
@@ -6198,7 +6367,7 @@ pub const HttpHandler = struct {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         return self.executePublicTableQueryViewJsonAlloc(table_name, view, request.cancellation) catch |err| switch (err) {
-            error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
+            error.ManifestReadLeaseContended, error.ManifestVersionRetired, error.StorageBusy => return error.StorageReadTemporarilyUnavailable,
             error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
@@ -6331,6 +6500,8 @@ pub const HttpHandler = struct {
         ) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => return error.InternalFailure,
@@ -6342,6 +6513,8 @@ pub const HttpHandler = struct {
         }) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
             else => return error.InternalFailure,
@@ -6755,7 +6928,7 @@ const PublicGraphRequestCache = struct {
         defer cursor.deinit();
         while (try cursor.next()) |record| {
             if (initialized == count) return error.InvalidDocumentFactsRoot;
-            const fact = try document_facts_reader.Fact.decode(record.value);
+            const fact = try @import("../build/document_facts.zig").decodeRecord(record);
             try self.reserveRetained(record.key.len);
             out[initialized] = .{ .doc_id = try alloc.dupe(u8, record.key), .body = .{ .fact = fact }, .last_lsn = fact.last_lsn, .last_timestamp_ns = fact.last_timestamp_ns };
             initialized += 1;
@@ -6989,7 +7162,8 @@ const PublicGraphRequestCache = struct {
                     break :resolved .{ .owned = try @import("../build/document_facts.zig").resolveCheckpointBodyAlloc(self.handler.alloc, &pages, mutation.body orelse return error.InvalidDocumentBody) };
                 },
                 .upsert => .{ .owned = try self.handler.alloc.dupe(u8, mutation.body orelse "") },
-                .enriched => .{ .owned = try self.handler.alloc.dupe(u8, (try @import("../build/document_facts.zig").parseEnrichedBody(mutation.body orelse return error.InvalidDocumentBody)).body) },
+                .catalog => continue,
+                .enriched, .prepared => .{ .owned = try self.handler.alloc.dupe(u8, (try @import("../build/document_facts.zig").parseEnrichedBody(mutation.body orelse return error.InvalidDocumentBody)).body) },
                 .delete => .deleted,
             };
             switch (slot.body) {
@@ -8982,7 +9156,7 @@ fn lowerTableIngestMutationsAlloc(
     errdefer alloc.free(mutations);
     for (input_mutations, 0..) |mutation, idx| {
         mutations[idx] = switch (mutation.kind) {
-            .checkpoint, .enriched => return error.InvalidDocumentMutation,
+            .checkpoint, .enriched, .prepared, .catalog => return error.InvalidDocumentMutation,
             .upsert => switch (mutation.document) {
                 .object => |document| .{
                     .kind = .upsert,
@@ -9001,6 +9175,28 @@ fn lowerTableIngestMutationsAlloc(
         };
     }
     return mutations;
+}
+
+test "serverless multiprovider replacement batches need no read services and unwind every allocation" {
+    const Runner = struct {
+        fn run(a: Allocator) !void {
+            // No query/catalog/WAL service is installed: replacements must
+            // depend only on the admitted request's owned input bytes.
+            var handler: HttpHandler = undefined;
+            handler.alloc = a;
+            handler.live_read_options = null;
+            const mutations = try handler.resolveTableBatchMutationsAlloc("unused", .{
+                .writes = &.{ .{ .key = "a", .value = "{\"v\":1}" }, .{ .key = "b", .value = "{\"v\":2}" } },
+                .deletes = &.{ "c", "d" },
+            }, .none);
+            defer freeDocumentMutations(a, mutations);
+            try std.testing.expectEqual(@as(usize, 4), mutations.len);
+            try std.testing.expectEqual(api_types.MutationKind.delete, mutations[0].kind);
+            try std.testing.expectEqualStrings("c", mutations[0].doc_id);
+            try std.testing.expectEqualStrings("{\"v\":2}", mutations[3].body.?);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless public table mutation admission lowers embedded object documents without copying" {
@@ -10081,9 +10277,11 @@ fn updateJoinedResponseMetadata(
 }
 
 fn jsonResponse(alloc: Allocator, status: u16, value: anytype) !HttpResponse {
+    const content_type = try alloc.dupe(u8, "application/json");
+    errdefer alloc.free(content_type);
     return .{
         .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
+        .content_type = content_type,
         .body = try std.json.Stringify.valueAlloc(alloc, value, .{}),
     };
 }
@@ -10336,17 +10534,27 @@ fn unsupportedQueryResponse(alloc: Allocator) !HttpResponse {
     return jsonResponse(alloc, 422, public_table_http.UnsupportedQueryError{});
 }
 
+/// Match the existing public query contract at both serverless boundaries.
+fn queryOperationalFailureResponse(alloc: Allocator, err: anyerror) !?HttpResponse {
+    switch (public_table_http.queryCancellationError(err) orelse return null) {
+        error.Canceled => return try textResponse(alloc, 499, "client closed request"),
+        error.Timeout, error.DeadlineExceeded => {},
+    }
+    var response = try public_table_http.queryDependencyErrorOwnedResponse(alloc, 504, "query_timeout", "query timed out", true);
+    errdefer response.deinit(alloc);
+    return .{
+        .status = response.status,
+        .content_type = try alloc.dupe(u8, "application/json"),
+        .body = response.body,
+        .retry_after_seconds = response.retry_after_seconds,
+    };
+}
+
 /// Preserve the public distinction between malformed aggregation input and a
 /// well-formed capability this deployment cannot execute. Stateful and
 /// serverless query surfaces share this normalization so callers receive the
 /// same 400/422 contract independent of the serving architecture.
-fn normalizePublicAggregationError(err: anyerror) anyerror {
-    return switch (err) {
-        error.InvalidQueryRequest, error.InvalidAggregation => error.InvalidQueryRequest,
-        error.UnsupportedQueryRequest, error.UnsupportedAggregation => error.UnsupportedQueryRequest,
-        else => err,
-    };
-}
+const normalizePublicAggregationError = public_table_http.normalizePublicAggregationError;
 
 const UnsupportedArtifactIndexSourcesError = struct {
     @"error": []const u8 = "unsupported_index_capability",
@@ -12433,6 +12641,7 @@ test "serverless http handler create index expands schema-derived algebraic conf
 test "serverless create index normalization resolves and persists one probed embedding dimension" {
     const FakeProvider = struct {
         calls: usize = 0,
+        failure: ?anyerror = null,
 
         fn provider(self: *@This()) managed_embedder.AntflyProvider {
             return .{
@@ -12445,6 +12654,7 @@ test "serverless create index normalization resolves and persists one probed emb
         fn embedDense(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
+            if (self.failure) |failure| return failure;
             const vectors = try alloc.alloc([]f32, texts.len);
             errdefer alloc.free(vectors);
             var initialized: usize = 0;
@@ -12498,6 +12708,12 @@ test "serverless create index normalization resolves and persists one probed emb
         "{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"publication_policy\":\"progressive\",\"field\":\"body\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"dimension\":3}",
         response,
     );
+    for ([_]anyerror{ error.ResourceLimitExceeded, error.MemoryBudgetExceeded }) |failure| {
+        provider.failure = failure;
+        try std.testing.expectError(failure, normalizeServerlessCreateIndexConfig(alloc, "semantic_idx",
+            \\{"type":"embeddings","field":"body","embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+        , options));
+    }
 }
 
 test "serverless index catalog validation rejects malformed configs" {
@@ -12515,8 +12731,12 @@ test "serverless index catalog validation rejects malformed configs" {
         \\{"sales_rollup":{"type":"algebraic","version":1,"group_fields":[{"name":"customer","path":"customer","type":"keyword"}],"measure_fields":[{"name":"amount","path":"amount","type":"number"}],"materializations":[{"name":"bad","op":"sum","group_by":["missing"],"measure":"amount"}]}}
     ));
 
+    try validateServerlessIndexCatalog(alloc,
+        \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"weekly","op":"count","time":"created_at","bucket":"week"}]}}
+    );
+
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
-        \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"bad","op":"count","time":"created_at","bucket":"week"}]}}
+        \\{"sales_rollup":{"type":"algebraic","version":1,"time_fields":[{"name":"created_at","path":"created_at","type":"datetime"}],"materializations":[{"name":"bad","op":"count","time":"created_at","bucket":"fortnight"}]}}
     ));
 
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
@@ -13116,7 +13336,7 @@ test "serverless http handler serves the table public lifecycle and consistency 
     try std.testing.expectEqual(@as(?catalog_types.DocumentPublishMode, .append_mutation_tail), parsed_query_default.value.publication.head_document_publish_mode);
     try std.testing.expectEqual(@as(?catalog_types.DocumentPublishMode, .append_mutation_tail), parsed_query_default.value.publication.next_document_publish_mode);
     try std.testing.expectEqual(@as(bool, false), parsed_query_default.value.publication.pending_materialization_families.full_text);
-    try std.testing.expectEqualStrings("rebuild", @tagName(parsed_query_default.value.publication.artifact_actions.dense_vector));
+    try std.testing.expectEqualStrings("reuse", @tagName(parsed_query_default.value.publication.artifact_actions.dense_vector));
     try std.testing.expectEqual(@as(usize, 1), parsed_query_default.value.publication.full_text_index_actions.len);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed_query_default.value.publication.full_text_index_actions[0].name);
     try std.testing.expectEqual(@as(usize, 1), parsed_query_default.value.publication.vector_index_actions.len);
@@ -13141,7 +13361,7 @@ test "serverless http handler serves the table public lifecycle and consistency 
     try std.testing.expectEqual(@as(?catalog_types.DocumentPublishMode, .append_mutation_tail), parsed_query_latest.value.publication.head_document_publish_mode);
     try std.testing.expectEqual(@as(?catalog_types.DocumentPublishMode, .append_mutation_tail), parsed_query_latest.value.publication.next_document_publish_mode);
     try std.testing.expectEqual(@as(bool, false), parsed_query_latest.value.publication.pending_materialization_families.full_text);
-    try std.testing.expectEqualStrings("rebuild", @tagName(parsed_query_latest.value.publication.artifact_actions.dense_vector));
+    try std.testing.expectEqualStrings("reuse", @tagName(parsed_query_latest.value.publication.artifact_actions.dense_vector));
     try std.testing.expectEqual(@as(usize, 1), parsed_query_latest.value.publication.vector_index_actions.len);
     try std.testing.expectEqualStrings("semantic_idx", parsed_query_latest.value.publication.vector_index_actions[0].name);
     try std.testing.expectEqual(@as(usize, 2), parsed_query_latest.value.documents.len);
@@ -13738,6 +13958,23 @@ test "http handler honors public serverless sync levels on table batch writes" {
     try std.testing.expectEqual(@as(u16, 400), unsupported.status);
     try std.testing.expect(std.mem.indexOf(u8, unsupported.body, "unsupported sync_level") != null);
     try std.testing.expectEqual(@as(u64, 0), try wal_store.latestLsn("enriched"));
+    var gated = try handler.handle(.{
+        .method = .post,
+        .path = "/tables/enriched/batch",
+        .body = "{\"inserts\":{\"doc:gated\":{\"body\":\"must not commit\"}},\"commit_requires\":\"direct_enrichments\",\"sync_level\":\"write\"}",
+    });
+    defer gated.deinit(alloc);
+    // Legacy filesystem WAL cannot provide a conditional atomic batch.
+    try std.testing.expectEqual(@as(u16, 503), gated.status);
+    try std.testing.expectEqual(@as(u64, 0), try wal_store.latestLsn("enriched"));
+    var no_gate = try handler.handle(.{
+        .method = .post,
+        .path = "/tables/enriched/batch",
+        .body = "{\"inserts\":{\"doc:none\":{\"body\":\"portable wait-only write\"}},\"commit_requires\":\"none\",\"sync_level\":\"write\"}",
+    });
+    defer no_gate.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), no_gate.status);
+    try std.testing.expect((try wal_store.latestLsn("enriched")) > 0);
 }
 
 test "serverless full_index sync waits for enrichment and index publication" {
@@ -14270,6 +14507,20 @@ test "serverless http handler serves published graph query endpoints" {
     try std.testing.expectEqual(@as(usize, 2), neighbors_from_search.nodes.len);
     try std.testing.expectEqualStrings("doc-b", neighbors_from_search.nodes[0].key);
     try std.testing.expectEqualStrings("doc-c", neighbors_from_search.nodes[1].key);
+
+    // A seed is also a reachable endpoint. Keep both doc-a -> doc-b ->
+    // doc-c and doc-b -> doc-c when paths are requested with node dedup.
+    var overlapping = try handler.handle(.{ .method = .post, .path = "/tables/docs/query", .body =
+        \\{"graph_queries":{"walk":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a","doc-b"]},"edge_types":["cites"],"max_depth":2,"include_paths":true,"deduplicate_nodes":true}}}}
+    });
+    defer overlapping.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), overlapping.status);
+    var parsed_overlapping = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, overlapping.body);
+    defer parsed_overlapping.deinit();
+    const overlapping_nodes = parsed_overlapping.value.responses.?[0].graph_results.?.map.get("walk").?.graph_nodes_result.nodes;
+    try std.testing.expectEqual(@as(usize, 3), overlapping_nodes.len);
+    try std.testing.expectEqualStrings("doc-a", overlapping_nodes[1].path.?[0].key);
+    try std.testing.expectEqualStrings("doc-b", overlapping_nodes[2].path.?[0].key);
 
     // Exercise actual public admission and execution: rejected edges must not
     // enter traversal, path ranking, or MATCH, and literals remain lossless.
@@ -15298,4 +15549,35 @@ test "serverless graph metric compact admission charges actual final backing" {
     try std.testing.expectError(error.GraphMetricQueryBudgetExceeded, small.chargeRetained(partial));
     const zero = try graph_query_mod.GraphQueryEngine.compactMaterializationBytes(0, rows, n);
     try std.testing.expectEqual(@as(usize, 0), zero);
+}
+
+test "highlight query operational errors preserve public deadline and cancellation outcomes" {
+    const a = std.testing.allocator;
+    for ([_]anyerror{ error.Timeout, error.DeadlineExceeded, error.Canceled, error.Cancelled }) |err| {
+        var response = (try queryOperationalFailureResponse(a, err)).?;
+        defer response.deinit(a);
+        if (err == error.Timeout or err == error.DeadlineExceeded) {
+            try std.testing.expectEqual(@as(u16, 504), response.status);
+            try std.testing.expectEqual(@as(?u32, 1), response.retry_after_seconds);
+            const value = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
+            defer value.deinit();
+            try std.testing.expectEqualStrings("query_timeout", value.value.object.get("code").?.string);
+            try std.testing.expect(value.value.object.get("retryable").?.bool);
+        } else {
+            try std.testing.expectEqual(@as(u16, 499), response.status);
+            try std.testing.expectEqualStrings("client closed request", response.body);
+        }
+    }
+    try std.testing.expect((try queryOperationalFailureResponse(a, error.OutOfMemory)) == null);
+}
+
+test "commit requirements serverless raw bounds precede resolution allocation and reads" {
+    var failed = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var handler: HttpHandler = undefined;
+    handler.alloc = failed.allocator();
+    const writes: [1025]db_types.BatchWrite = @splat(.{ .key = "same", .value = "{}" });
+    try std.testing.expectError(error.CommitRequirementTooLarge, handler.resolveDirectTableBatchMutationsAlloc("docs", .{ .writes = &writes, .commit_requires = .direct_enrichments }, .{}));
+    const operations: [16385]db_types.TransformOp = @splat(.{ .op = .unset, .path = "x" });
+    try std.testing.expectError(error.CommitRequirementTooLarge, handler.resolveDirectTableBatchMutationsAlloc("docs", .{ .transforms = &.{.{ .key = "same", .operations = &operations }}, .commit_requires = .direct_enrichments }, .{}));
+    try std.testing.expect(!failed.has_induced_failure);
 }

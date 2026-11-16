@@ -127,12 +127,22 @@ Database failures retain an owned native diagnostic in `NativeError`. Use
 classify failures. The copied detail remains valid after later native calls;
 Go keeps each native call and diagnostic read on the same OS thread.
 
+When `Batch`, `BatchJSON`, or an autocommit SQL write fails with
+`OutcomeUnknown`, the error may carry an outcome receipt
+(`NativeError.OutcomeReceipt` or `SQLError.OutcomeReceipt`; read either with
+`lite.OutcomeReceiptOf(err)`). Resolve it later on any handle for the same
+database with `db.OutcomeReceiptStatus(receipt)`, which returns
+`OutcomeReceiptApplied` or `OutcomeReceiptNotApplied`, or `Stalled` while the
+uncertain commit is not reconciled yet (Lite: retry; directory database: close
+the issuing handle and reopen first). Call `db.ForgetOutcomeReceipt(receipt)`
+once resolved; afterwards the receipt can no longer be resolved.
+
 `OpenInference` opens a standalone `*Inference` handle that runs models with
 no `DB` attached -- models load on first use and stay cached until `Close`.
 Each method sends and receives the JSON of the matching `/ai/v1` route of the
 Antfly inference HTTP API (see `specs/openapi/inference/api.yaml`):
 `Embed`, `Rerank`, `Chunk`, `Generate`, `GenerateBatch`, `Rewrite`, `Extract`,
-`Read` (OCR), `Transcribe`, and `ListModels`. `Generate` always returns a
+`Read` (documents, images, or audio), and `ListModels`. `Generate` always returns a
 complete response; a request with `"stream": true` fails with
 `InvalidArgument`. Use `GenerateStream` to stream chunks instead.
 
@@ -216,8 +226,9 @@ publish new commits. Schema or index changes wait for in-flight calls. `Close` w
 
 Multiple writable Lite connections may remain open, including across processes.
 Native operations queue within a process and take a kernel writer lease across
-processes. `OpenOptions.BusyTimeout` waits for a competing operation rather than
-for another handle to close. Connection lifetimes are independent.
+processes. `OpenOptions.BusyTimeout` retries admission while another process
+holds the writer lease or advances the allocator checkpoint. This admission
+retry never replays a mutation body. Connection lifetimes are independent.
 
 Use `BeginTransaction`, `WriteTransaction`, `ResolveTransaction`,
 `TransactionStatus`, and `CommitVersion` when an embedded application needs the
@@ -278,6 +289,28 @@ backups.
 
 See [the native SQL contract](../../../zig/CAPI.md#database-sql) for
 transaction, savepoint, result-size, and commit-outcome behavior.
+
+## Cypher and SQL graph composition
+
+`GraphCatalogJSON`, `CypherJSON`, and `GraphWriteStatusJSON` expose durable named graphs, Cypher queries and mutations, and
+transaction receipts through libantfly. Catalog requests use `action` (`put`,
+`get`, `list`, `drop`), a graph `name`, and a `definition` for puts. Replacement
+and drop require the current decimal-string `expected_revision`.
+
+Queries use the same request contract as the server: `query`, `parameters` or
+lossless `typed_parameters`, optional limits, and `write_request_id`. Results
+contain tagged graph values; integer values are decimal strings. Native writes
+return a commit receipt. Retain the request ID and resolve an unknown outcome
+through the status method instead of replaying the query. `*GraphError` preserves
+the diagnostic code, span, outcome, and transaction ID when available.
+
+Local SQL supports `GRAPH_TABLE` over these catalogs, including ordinary-table
+joins and staged SQL rows in an explicit transaction. Graph definitions pin
+local table and graph-index identities across reopen. Raw embedded calls reject
+protected tables; authenticated principal queries use the server API.
+
+See [the Cypher contract](../../../zig/CYPHER.md) for grammar, mapping, value,
+mutation, and deployment semantics.
 
 
 The real local synonym/ANN regression is opt-in with

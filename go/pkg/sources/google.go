@@ -32,6 +32,7 @@ import (
 )
 
 type GoogleConfig struct {
+	PageProvenance  bool     `json:"page_provenance,omitempty"`
 	Bucket          string   `json:"bucket"`
 	Prefix          string   `json:"prefix,omitempty"`
 	Key             string   `json:"key,omitempty"`
@@ -74,6 +75,9 @@ func (c *GoogleConnector) Validate(_ context.Context, r Request) error {
 	}
 	if r.Mode != ImportModeSource {
 		return fmt.Errorf("%w: Google sources require source mode and a matching connection", ErrInvalidInput)
+	}
+	if config.PageProvenance && c.ProviderName != ProviderGCS {
+		return fmt.Errorf("%w: page provenance requires GCS", ErrInvalidInput)
 	}
 	if config.MaxObjects < 0 || config.MaxObjects > maxImportSourceObjects {
 		return fmt.Errorf("%w: invalid max_objects", ErrInvalidInput)
@@ -190,15 +194,29 @@ func (c *GoogleConnector) Enumerate(ctx context.Context, r Request) (Inventory, 
 }
 func (c *GoogleConnector) enumerateGCS(ctx context.Context, client *http.Client, r Request, config GoogleConfig, add func(Item) (bool, error)) error {
 	type object struct {
-		Name        string `json:"name"`
-		Generation  string `json:"generation"`
-		Size        string `json:"size"`
-		ContentType string `json:"contentType"`
+		Name           string            `json:"name"`
+		Generation     string            `json:"generation"`
+		Metageneration string            `json:"metageneration"`
+		Size           string            `json:"size"`
+		ContentType    string            `json:"contentType"`
+		Metadata       map[string]string `json:"metadata"`
 	}
 	token := ""
 	seen := map[string]bool{}
-	for pages := 0; pages < maxImportSourceObjects; pages++ {
+	pageLimit := maxImportSourceObjects
+	if r.Preview {
+		pageLimit = 4
+	}
+	for pages := 0; pages < pageLimit; pages++ {
 		q := url.Values{"prefix": {config.Prefix}, "maxResults": {"1000"}, "fields": {"nextPageToken,items(name,generation,size,contentType)"}}
+		if r.Preview {
+			q.Set("maxResults", "100")
+		}
+		if config.PageProvenance {
+			// Custom metadata can occupy 8 KiB per object before JSON escaping.
+			q.Set("maxResults", "100")
+			q.Set("fields", "nextPageToken,items(name,generation,metageneration,size,contentType,metadata)")
+		}
 		if config.Key != "" {
 			q.Set("prefix", config.Key)
 		}
@@ -223,8 +241,24 @@ func (c *GoogleConnector) enumerateGCS(ctx context.Context, client *http.Client,
 			if _, err := strconv.ParseInt(item.Generation, 10, 64); err != nil {
 				return fmt.Errorf("invalid GCS generation")
 			}
+			// Console-created directory markers are not source documents.
+			if config.Key == "" && size == 0 && strings.HasSuffix(item.Name, "/") {
+				continue
+			}
 			canonical := "gs://" + config.Bucket + "/" + escapeSourcePath(item.Name)
-			o := Item{ID: "gcs://" + r.SourceNamespace + "/" + config.Bucket + "/" + item.Name, Path: item.Name, Filename: filepath.Base(item.Name), URL: canonical, Revision: item.Generation, Size: size, ReadMode: sourceReadBytes, SourceKind: c.ProviderName, Metadata: map[string]any{"bucket": config.Bucket, "key": item.Name, "generation": item.Generation, "mime_type": item.ContentType, "canonical_url": canonical}}
+			// item.Name is the full bucket object name, including config.Prefix
+			// when the source is scoped to one; strip it so the relative key
+			// survives a later prefix or bucket change, same as S3.
+			// Preserve the exact suffix: a leading slash is part of the key.
+			relativeKey := strings.TrimPrefix(item.Name, config.Prefix)
+			o := Item{ID: "gcs://" + r.SourceNamespace + "/" + config.Bucket + "/" + item.Name, Path: item.Name, RelativeKey: relativeKey, RelativeKeySet: true, Filename: filepath.Base(item.Name), URL: canonical, Revision: item.Generation, Size: size, ReadMode: sourceReadBytes, SourceKind: c.ProviderName, Metadata: map[string]any{"bucket": config.Bucket, "key": item.Name, "generation": item.Generation, "mime_type": item.ContentType, "canonical_url": canonical}}
+			if config.PageProvenance {
+				for _, key := range []string{"original_pdf_uri", "original_page", "extraction_revision", "content_sha256"} {
+					o.Metadata[key] = item.Metadata[key]
+				}
+				o.Metadata["projection_uri"] = canonical
+				o.Metadata["metageneration"] = item.Metageneration
+			}
 			stop, err := add(o)
 			if err != nil || stop {
 				return err
@@ -238,6 +272,9 @@ func (c *GoogleConnector) enumerateGCS(ctx context.Context, client *http.Client,
 		}
 		seen[result.Next] = true
 		token = result.Next
+	}
+	if r.Preview {
+		return fmt.Errorf("%w: GCS preview sample exhausted; narrow the prefix", ErrInvalidInput)
 	}
 	return fmt.Errorf("Google source pagination budget exhausted")
 }
@@ -350,16 +387,23 @@ func (c *GoogleConnector) readWithin(ctx context.Context, client *http.Client, r
 	if limit < 0 || limit > maxImportSourceObjectBytes {
 		return nil, ErrInvalidInput
 	}
-	config, _ := decodeSourceConfig[GoogleConfig](r.Config)
 	if configString(o.Metadata, "mime_type") == "application/vnd.google-apps.spreadsheet" {
 		return nil, fmt.Errorf("%w: whole-workbook extraction is not supported; first-sheet CSV must not be presented as a complete workbook", ErrInvalidInput)
 	}
 	var path string
 	if c.ProviderName == ProviderGCS {
+		config, err := decodeSourceConfig[GoogleConfig](r.Config)
+		if err != nil {
+			return nil, err
+		}
 		if configString(o.Metadata, "bucket") != config.Bucket {
 			return nil, fmt.Errorf("GCS source is outside configured bucket")
 		}
 		path = "/b/" + url.PathEscape(config.Bucket) + "/o/" + url.PathEscape(o.Path) + "?alt=media&generation=" + url.QueryEscape(o.Revision) + "&ifGenerationMatch=" + url.QueryEscape(o.Revision)
+		path, err = gcsMetadataFence(path, config, o)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		id := configString(o.Metadata, "file_id")
 		if !googleFileID(id) {
@@ -383,7 +427,11 @@ func (c *GoogleConnector) readWithin(ctx context.Context, client *http.Client, r
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, googleResponseError(resp)
+		providerErr := googleResponseError(resp)
+		if c.ProviderName == ProviderGCS {
+			return nil, gcsPinnedAccessError(o, providerErr)
+		}
+		return nil, providerErr
 	}
 	if c.ProviderName == ProviderGCS && resp.Header.Get("X-Goog-Generation") != o.Revision {
 		return nil, &RevisionChangedError{Expected: o.Revision, Actual: resp.Header.Get("X-Goog-Generation")}
@@ -448,7 +496,11 @@ func (c *GoogleConnector) ValidateCachedSnapshot(ctx context.Context, r Request,
 	config, _ := decodeSourceConfig[GoogleConfig](r.Config)
 	var response json.RawMessage
 	if c.ProviderName == ProviderGCS {
-		return c.get(ctx, client, "/b/"+url.PathEscape(config.Bucket)+"/o?maxResults=1&prefix="+url.QueryEscape(config.Prefix), &response)
+		prefix := config.Prefix
+		if config.Key != "" {
+			prefix = config.Key
+		}
+		return c.get(ctx, client, "/b/"+url.PathEscape(config.Bucket)+"/o?maxResults=1&fields=items(name)&prefix="+url.QueryEscape(prefix), &response)
 	}
 	pinned, _, err := driveContentClient(client)
 	if err != nil {
@@ -457,6 +509,13 @@ func (c *GoogleConnector) ValidateCachedSnapshot(ctx context.Context, r Request,
 	return c.get(ctx, pinned, "/files/"+url.PathEscape(config.FolderID)+"?fields=id&supportsAllDrives=true", &response)
 }
 func (c *GoogleConnector) OpenSource(ctx context.Context, r Request, o Item) (io.ReadCloser, error) {
+	// Originals have exact lengths and can stream directly into a caller's
+	// durable staging store. Native Workspace exports retain the bounded reader
+	// because their enumerated size is only an upper bound.
+	upper, _ := o.Metadata["size_is_upper_bound"].(bool)
+	if o.Size > 0 && !upper && configString(o.Metadata, "export_mime_type") == "" && !strings.HasPrefix(configString(o.Metadata, "mime_type"), "application/vnd.google-apps.") {
+		return c.OpenMedia(ctx, r, o, MediaRange{Length: o.Size})
+	}
 	client, err := c.client(ctx, r)
 	if err != nil {
 		return nil, err
@@ -482,18 +541,15 @@ func (c *GoogleConnector) ValidateStagedSource(ctx context.Context, r Request, o
 	if err != nil {
 		return err
 	}
-	if o.Revision == "" || configString(o.Metadata, "bucket") != config.Bucket {
-		return fmt.Errorf("invalid pinned GCS source")
-	}
-	if _, err := strconv.ParseUint(o.Revision, 10, 64); err != nil {
-		return fmt.Errorf("invalid pinned GCS generation")
+	path, err := gcsObjectAccessPath(config, o)
+	if err != nil {
+		return err
 	}
 	var object struct {
 		Generation string `json:"generation"`
 	}
-	path := "/b/" + url.PathEscape(config.Bucket) + "/o/" + url.PathEscape(o.Path) + "?generation=" + url.QueryEscape(o.Revision) + "&ifGenerationMatch=" + url.QueryEscape(o.Revision)
 	if err := c.get(ctx, client, path, &object); err != nil {
-		return err
+		return gcsPinnedAccessError(o, err)
 	}
 	if object.Generation != o.Revision {
 		return &RevisionChangedError{Expected: o.Revision, Actual: object.Generation}
@@ -575,4 +631,48 @@ func (c *GoogleConnector) checkDriveContentAccess(ctx context.Context, client *h
 		return &RevisionChangedError{Expected: revision, Actual: file.Version}
 	}
 	return nil
+}
+
+// The content generation and its citation metadata have separate revisions.
+func gcsMetadataFence(path string, config GoogleConfig, item Item) (string, error) {
+	if !config.PageProvenance {
+		return path, nil
+	}
+	meta := configString(item.Metadata, "metageneration")
+	if n, err := strconv.ParseUint(meta, 10, 64); err != nil || n == 0 {
+		return "", fmt.Errorf("%w: missing GCS page metadata revision; start a new sync", ErrInvalidInput)
+	}
+	return path + "&ifMetagenerationMatch=" + url.QueryEscape(meta), nil
+}
+
+// ValidatePageProvenancePublication applies to both Cloud and self-hosted sources.
+func ValidatePageProvenancePublication(provider string, config GoogleConfig, publication string) error {
+	if config.PageProvenance && (provider != ProviderGCS || publication != "text") {
+		return fmt.Errorf("%w: page_provenance requires a GCS source with text publication", ErrInvalidInput)
+	}
+	return nil
+}
+
+// A failed precondition cannot succeed on the same pinned inventory.
+func gcsPinnedAccessError(item Item, err error) error {
+	var provider *GoogleHTTPError
+	if errors.As(err, &provider) && provider.Status == http.StatusPreconditionFailed {
+		return &restartRequiredError{cause: &RevisionChangedError{
+			Expected: item.Revision, Actual: "GCS generation or metageneration precondition failed",
+		}}
+	}
+	return err
+}
+
+func gcsObjectAccessPath(config GoogleConfig, item Item) (string, error) {
+	if configString(item.Metadata, "bucket") != config.Bucket {
+		return "", fmt.Errorf("%w: invalid pinned GCS source", ErrInvalidInput)
+	}
+	if generation, err := strconv.ParseUint(item.Revision, 10, 64); err != nil || generation == 0 {
+		return "", fmt.Errorf("%w: invalid pinned GCS generation", ErrInvalidInput)
+	}
+	generation := url.QueryEscape(item.Revision)
+	path := "/b/" + url.PathEscape(config.Bucket) + "/o/" + url.PathEscape(item.Path) +
+		"?generation=" + generation + "&ifGenerationMatch=" + generation + "&fields=generation"
+	return gcsMetadataFence(path, config, item)
 }

@@ -1,0 +1,857 @@
+{
+  "date": "2026-11-10",
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "dataset": "VectorDBBench Cohere Medium 1M",
+  "configuration": {
+    "vectors": 1000000,
+    "dimensions": 768,
+    "queries": 100,
+    "metric": "l2_squared",
+    "unit_normalized": true,
+    "leaf_capacity": 100,
+    "branching_factor": 16,
+    "maximum_external_router_centers": 16,
+    "training_rows_per_center": 32,
+    "sample_vector_bytes_limit": 8388608,
+    "terminal_region_bytes_limit": 8388608,
+    "staged_commit_bytes": 8388608,
+    "spooled_allocator_limit_bytes": 268435456,
+    "spooled_finish_compaction": false,
+    "backend": "cpu",
+    "quantization_bits": 1,
+    "seeds": [
+      42,
+      71
+    ],
+    "optimize": "ReleaseFast"
+  },
+  "benchmark_executable_sha256": "c879d787da6444ebc1f605830c4845cdbd23f08b6ff84ed1b4b621c6b3578ec4",
+  "source_base_commit": "99c11f2bd3",
+  "parquet_preparation": {
+    "vectors": 1000000,
+    "dims": 768,
+    "queries": 100,
+    "parquet_scan_normalize_write_ns": 16267472000
+  },
+  "notes": [
+    "The baseline is full-corpus Hilbert bulk construction at production leaf capacity. The production lake incremental ingestion path is a separate baseline.",
+    "Spooled arms stream the corpus from the normalized file through checksummed partitions. The Hilbert full-build baseline holds its prepared float32 plane in memory.",
+    "Both sampled algorithms use the same root reservoir selection, fixed seed, router fanout limits and terminal construction machinery.",
+    "Training row counts accumulate across hierarchy nodes and can include repeated corpus members.",
+    "The spooled HBC allocator is shared by construction and native publication and enforces a 256 MiB live-allocation limit. Process RSS includes mmap residency, file pages and allocator overhead.",
+    "Each successful build publishes native authority, reopens it, and verifies tree links and active member count.",
+    "The stored query sweeps were repeated against the completed generations using the same disk-backed vector loader and bounded retained caches for all three algorithms.",
+    "The 95.5 percent target uses the first measured probe count at or above the target, with unequal recall at those selected points.",
+    "Trials ran serially on a shared workstation. Query timings and build timings are observations without controlled statistical speedup claims.",
+    "Local build times start from prepared normalized inputs. Remote I/O, Parquet normalization, exact-vector LSM construction and lake artifact upload are measured separately.",
+    "Construction trials precede the final origin/main merge. The complete recall sweeps, generation reopen, tree-link checks and member-count checks were repeated after merging origin/main; every recall point matched."
+  ],
+  "results": [
+    {
+      "algorithm": "spool_lloyd",
+      "seed": 42,
+      "count": 1000000,
+      "leaf_size": 100,
+      "fixture_load_ns": 2063708,
+      "construction_ns": 37829474042,
+      "leaf_cluster_ns": 23747101000,
+      "posting_publish_ns": 3897647792,
+      "segments": 1,
+      "sample_limit": 0,
+      "training_rows": 449344,
+      "training_ns": 7259951000,
+      "corpus_route_ns": 14537133000,
+      "leaf_count": 11770,
+      "min_leaf_members": 1,
+      "max_leaf_members": 100,
+      "build_and_reopen_ns": 41732572209,
+      "normalized_fixture_to_published_phase_sum_ns": 41729185542,
+      "peak_process_rss_bytes": 702857216,
+      "user_cpu_seconds": 40.318849,
+      "system_cpu_seconds": 8.686209,
+      "first_tested_point_at_95_5_percent_recall": {
+        "probes": 2048,
+        "recall_at_100": 0.9605,
+        "mean_query_ms": 10.40002333,
+        "vectors_scored": 19058314
+      },
+      "query_sweep": [
+        {
+          "probes": 16,
+          "recall_at_100": 0.2038,
+          "mean_query_ms": 24.87315042,
+          "vectors_scored": 151296
+        },
+        {
+          "probes": 32,
+          "recall_at_100": 0.293,
+          "mean_query_ms": 11.62348709,
+          "vectors_scored": 302823
+        },
+        {
+          "probes": 48,
+          "recall_at_100": 0.3592,
+          "mean_query_ms": 7.64734542,
+          "vectors_scored": 454007
+        },
+        {
+          "probes": 56,
+          "recall_at_100": 0.3885,
+          "mean_query_ms": 3.85415333,
+          "vectors_scored": 529502
+        },
+        {
+          "probes": 64,
+          "recall_at_100": 0.4125,
+          "mean_query_ms": 3.35140208,
+          "vectors_scored": 605097
+        },
+        {
+          "probes": 72,
+          "recall_at_100": 0.4352,
+          "mean_query_ms": 3.02961958,
+          "vectors_scored": 680617
+        },
+        {
+          "probes": 80,
+          "recall_at_100": 0.4552,
+          "mean_query_ms": 2.91615167,
+          "vectors_scored": 756239
+        },
+        {
+          "probes": 96,
+          "recall_at_100": 0.4867,
+          "mean_query_ms": 3.78561125,
+          "vectors_scored": 907123
+        },
+        {
+          "probes": 128,
+          "recall_at_100": 0.5427,
+          "mean_query_ms": 5.66040875,
+          "vectors_scored": 1209187
+        },
+        {
+          "probes": 256,
+          "recall_at_100": 0.6779,
+          "mean_query_ms": 10.32518375,
+          "vectors_scored": 2414732
+        },
+        {
+          "probes": 512,
+          "recall_at_100": 0.8037,
+          "mean_query_ms": 9.36404459,
+          "vectors_scored": 4817147
+        },
+        {
+          "probes": 1024,
+          "recall_at_100": 0.8961,
+          "mean_query_ms": 8.95116708,
+          "vectors_scored": 9594625
+        },
+        {
+          "probes": 2048,
+          "recall_at_100": 0.9605,
+          "mean_query_ms": 10.40002333,
+          "vectors_scored": 19058314
+        },
+        {
+          "probes": 4096,
+          "recall_at_100": 0.9833,
+          "mean_query_ms": 14.19449584,
+          "vectors_scored": 37745642
+        },
+        {
+          "probes": 8192,
+          "recall_at_100": 0.9886,
+          "mean_query_ms": 23.93495834,
+          "vectors_scored": 74164251
+        },
+        {
+          "probes": 16384,
+          "recall_at_100": 0.9889,
+          "mean_query_ms": 31.31634875,
+          "vectors_scored": 99999463
+        }
+      ],
+      "construction_allocations": {
+        "limit_bytes": 268435456,
+        "peak_bytes": 185546299
+      },
+      "publication_allocations": {
+        "limit_bytes": 268435456,
+        "peak_bytes": 185546299,
+        "live_bytes": 47337657
+      }
+    },
+    {
+      "algorithm": "spool_lloyd",
+      "seed": 71,
+      "count": 1000000,
+      "leaf_size": 100,
+      "fixture_load_ns": 1307916,
+      "construction_ns": 36208390417,
+      "leaf_cluster_ns": 23778837000,
+      "posting_publish_ns": 3803913875,
+      "segments": 1,
+      "sample_limit": 0,
+      "training_rows": 447840,
+      "training_ns": 7192235000,
+      "corpus_route_ns": 14694244000,
+      "leaf_count": 11665,
+      "min_leaf_members": 1,
+      "max_leaf_members": 100,
+      "build_and_reopen_ns": 40017609584,
+      "normalized_fixture_to_published_phase_sum_ns": 40013612208,
+      "peak_process_rss_bytes": 718995456,
+      "user_cpu_seconds": 38.774219,
+      "system_cpu_seconds": 8.107868,
+      "first_tested_point_at_95_5_percent_recall": {
+        "probes": 2048,
+        "recall_at_100": 0.962,
+        "mean_query_ms": 7.78900042,
+        "vectors_scored": 19184511
+      },
+      "query_sweep": [
+        {
+          "probes": 16,
+          "recall_at_100": 0.2372,
+          "mean_query_ms": 12.00129583,
+          "vectors_scored": 152554
+        },
+        {
+          "probes": 32,
+          "recall_at_100": 0.3351,
+          "mean_query_ms": 7.68457667,
+          "vectors_scored": 305326
+        },
+        {
+          "probes": 48,
+          "recall_at_100": 0.3899,
+          "mean_query_ms": 4.1855733399999995,
+          "vectors_scored": 457936
+        },
+        {
+          "probes": 56,
+          "recall_at_100": 0.4125,
+          "mean_query_ms": 2.30772625,
+          "vectors_scored": 534637
+        },
+        {
+          "probes": 64,
+          "recall_at_100": 0.4363,
+          "mean_query_ms": 2.2203933300000003,
+          "vectors_scored": 610940
+        },
+        {
+          "probes": 72,
+          "recall_at_100": 0.4552,
+          "mean_query_ms": 2.23605625,
+          "vectors_scored": 687367
+        },
+        {
+          "probes": 80,
+          "recall_at_100": 0.4735,
+          "mean_query_ms": 1.89161625,
+          "vectors_scored": 763595
+        },
+        {
+          "probes": 96,
+          "recall_at_100": 0.5037,
+          "mean_query_ms": 2.94156125,
+          "vectors_scored": 916112
+        },
+        {
+          "probes": 128,
+          "recall_at_100": 0.5514,
+          "mean_query_ms": 3.19687208,
+          "vectors_scored": 1221325
+        },
+        {
+          "probes": 256,
+          "recall_at_100": 0.6862,
+          "mean_query_ms": 6.1641533399999995,
+          "vectors_scored": 2437767
+        },
+        {
+          "probes": 512,
+          "recall_at_100": 0.807,
+          "mean_query_ms": 5.6387275,
+          "vectors_scored": 4856551
+        },
+        {
+          "probes": 1024,
+          "recall_at_100": 0.9036,
+          "mean_query_ms": 5.65876125,
+          "vectors_scored": 9664164
+        },
+        {
+          "probes": 2048,
+          "recall_at_100": 0.962,
+          "mean_query_ms": 7.78900042,
+          "vectors_scored": 19184511
+        },
+        {
+          "probes": 4096,
+          "recall_at_100": 0.9837,
+          "mean_query_ms": 13.16844417,
+          "vectors_scored": 37982701
+        },
+        {
+          "probes": 8192,
+          "recall_at_100": 0.9881,
+          "mean_query_ms": 24.05010584,
+          "vectors_scored": 74556761
+        },
+        {
+          "probes": 16384,
+          "recall_at_100": 0.9883,
+          "mean_query_ms": 31.94709833,
+          "vectors_scored": 99994609
+        }
+      ],
+      "construction_allocations": {
+        "limit_bytes": 268435456,
+        "peak_bytes": 185813822
+      },
+      "publication_allocations": {
+        "limit_bytes": 268435456,
+        "peak_bytes": 185813822,
+        "live_bytes": 47653260
+      }
+    },
+    {
+      "algorithm": "spool_emeans",
+      "seed": 42,
+      "count": 1000000,
+      "leaf_size": 100,
+      "fixture_load_ns": 1077791,
+      "construction_ns": 28153606209,
+      "leaf_cluster_ns": 16214978000,
+      "posting_publish_ns": 3684696500,
+      "segments": 1,
+      "sample_limit": 0,
+      "training_rows": 432160,
+      "training_ns": 3455350000,
+      "corpus_route_ns": 11246204000,
+      "leaf_count": 11165,
+      "min_leaf_members": 5,
+      "max_leaf_members": 100,
+      "build_and_reopen_ns": 31843374334,
+      "normalized_fixture_to_published_phase_sum_ns": 31839380500,
+      "peak_process_rss_bytes": 702267392,
+      "user_cpu_seconds": 32.419211,
+      "system_cpu_seconds": 7.297059,
+      "first_tested_point_at_95_5_percent_recall": {
+        "probes": 2048,
+        "recall_at_100": 0.9607,
+        "mean_query_ms": 7.46448292,
+        "vectors_scored": 19019762
+      },
+      "query_sweep": [
+        {
+          "probes": 16,
+          "recall_at_100": 0.2572,
+          "mean_query_ms": 8.69716334,
+          "vectors_scored": 150876
+        },
+        {
+          "probes": 32,
+          "recall_at_100": 0.3515,
+          "mean_query_ms": 4.35712583,
+          "vectors_scored": 301631
+        },
+        {
+          "probes": 48,
+          "recall_at_100": 0.4192,
+          "mean_query_ms": 3.33657458,
+          "vectors_scored": 452270
+        },
+        {
+          "probes": 56,
+          "recall_at_100": 0.4444,
+          "mean_query_ms": 1.88457167,
+          "vectors_scored": 527809
+        },
+        {
+          "probes": 64,
+          "recall_at_100": 0.4678,
+          "mean_query_ms": 2.05941917,
+          "vectors_scored": 603120
+        },
+        {
+          "probes": 72,
+          "recall_at_100": 0.4843,
+          "mean_query_ms": 1.50332583,
+          "vectors_scored": 678687
+        },
+        {
+          "probes": 80,
+          "recall_at_100": 0.5001,
+          "mean_query_ms": 1.50249583,
+          "vectors_scored": 753789
+        },
+        {
+          "probes": 96,
+          "recall_at_100": 0.5321,
+          "mean_query_ms": 2.68177084,
+          "vectors_scored": 903888
+        },
+        {
+          "probes": 128,
+          "recall_at_100": 0.5838,
+          "mean_query_ms": 2.81064917,
+          "vectors_scored": 1204761
+        },
+        {
+          "probes": 256,
+          "recall_at_100": 0.7088,
+          "mean_query_ms": 4.6752475,
+          "vectors_scored": 2404077
+        },
+        {
+          "probes": 512,
+          "recall_at_100": 0.8204,
+          "mean_query_ms": 5.13816083,
+          "vectors_scored": 4797833
+        },
+        {
+          "probes": 1024,
+          "recall_at_100": 0.9087,
+          "mean_query_ms": 5.3511804199999995,
+          "vectors_scored": 9561683
+        },
+        {
+          "probes": 2048,
+          "recall_at_100": 0.9607,
+          "mean_query_ms": 7.46448292,
+          "vectors_scored": 19019762
+        },
+        {
+          "probes": 4096,
+          "recall_at_100": 0.9828,
+          "mean_query_ms": 12.631045,
+          "vectors_scored": 37774173
+        },
+        {
+          "probes": 8192,
+          "recall_at_100": 0.9886,
+          "mean_query_ms": 22.87383,
+          "vectors_scored": 74616367
+        },
+        {
+          "probes": 16384,
+          "recall_at_100": 0.9891,
+          "mean_query_ms": 30.080615,
+          "vectors_scored": 100000000
+        }
+      ],
+      "construction_allocations": {
+        "limit_bytes": 268435456,
+        "peak_bytes": 180428757
+      },
+      "publication_allocations": {
+        "limit_bytes": 268435456,
+        "peak_bytes": 180428757,
+        "live_bytes": 46024761
+      }
+    },
+    {
+      "algorithm": "spool_emeans",
+      "seed": 71,
+      "count": 1000000,
+      "leaf_size": 100,
+      "fixture_load_ns": 1129958,
+      "construction_ns": 27962564250,
+      "leaf_cluster_ns": 16079640000,
+      "posting_publish_ns": 3721518625,
+      "segments": 1,
+      "sample_limit": 0,
+      "training_rows": 433632,
+      "training_ns": 3429974000,
+      "corpus_route_ns": 11143446000,
+      "leaf_count": 11194,
+      "min_leaf_members": 3,
+      "max_leaf_members": 100,
+      "build_and_reopen_ns": 31689814042,
+      "normalized_fixture_to_published_phase_sum_ns": 31685212833,
+      "peak_process_rss_bytes": 648101888,
+      "user_cpu_seconds": 32.085711,
+      "system_cpu_seconds": 7.293632,
+      "first_tested_point_at_95_5_percent_recall": {
+        "probes": 2048,
+        "recall_at_100": 0.9603,
+        "mean_query_ms": 7.38412417,
+        "vectors_scored": 18912618
+      },
+      "query_sweep": [
+        {
+          "probes": 16,
+          "recall_at_100": 0.2887,
+          "mean_query_ms": 6.72299083,
+          "vectors_scored": 149283
+        },
+        {
+          "probes": 32,
+          "recall_at_100": 0.3837,
+          "mean_query_ms": 3.4037420800000002,
+          "vectors_scored": 298926
+        },
+        {
+          "probes": 48,
+          "recall_at_100": 0.4513,
+          "mean_query_ms": 2.7133475,
+          "vectors_scored": 448044
+        },
+        {
+          "probes": 56,
+          "recall_at_100": 0.4709,
+          "mean_query_ms": 1.55932625,
+          "vectors_scored": 522510
+        },
+        {
+          "probes": 64,
+          "recall_at_100": 0.491,
+          "mean_query_ms": 1.51370083,
+          "vectors_scored": 597282
+        },
+        {
+          "probes": 72,
+          "recall_at_100": 0.5116,
+          "mean_query_ms": 1.47544333,
+          "vectors_scored": 671713
+        },
+        {
+          "probes": 80,
+          "recall_at_100": 0.528,
+          "mean_query_ms": 1.40268458,
+          "vectors_scored": 746243
+        },
+        {
+          "probes": 96,
+          "recall_at_100": 0.5604,
+          "mean_query_ms": 1.87680625,
+          "vectors_scored": 895621
+        },
+        {
+          "probes": 128,
+          "recall_at_100": 0.6159,
+          "mean_query_ms": 2.5427425,
+          "vectors_scored": 1193990
+        },
+        {
+          "probes": 256,
+          "recall_at_100": 0.728,
+          "mean_query_ms": 4.30845125,
+          "vectors_scored": 2385603
+        },
+        {
+          "probes": 512,
+          "recall_at_100": 0.8353,
+          "mean_query_ms": 4.18723875,
+          "vectors_scored": 4761776
+        },
+        {
+          "probes": 1024,
+          "recall_at_100": 0.9133,
+          "mean_query_ms": 4.88774625,
+          "vectors_scored": 9496680
+        },
+        {
+          "probes": 2048,
+          "recall_at_100": 0.9603,
+          "mean_query_ms": 7.38412417,
+          "vectors_scored": 18912618
+        },
+        {
+          "probes": 4096,
+          "recall_at_100": 0.9819,
+          "mean_query_ms": 12.53761583,
+          "vectors_scored": 37601289
+        },
+        {
+          "probes": 8192,
+          "recall_at_100": 0.9886,
+          "mean_query_ms": 23.61589583,
+          "vectors_scored": 74398093
+        },
+        {
+          "probes": 16384,
+          "recall_at_100": 0.9889,
+          "mean_query_ms": 31.24798125,
+          "vectors_scored": 100000000
+        }
+      ],
+      "construction_allocations": {
+        "limit_bytes": 268435456,
+        "peak_bytes": 182048782
+      },
+      "publication_allocations": {
+        "limit_bytes": 268435456,
+        "peak_bytes": 182048782,
+        "live_bytes": 47213571
+      }
+    },
+    {
+      "algorithm": "hilbert_seeded",
+      "seed": 42,
+      "count": 1000000,
+      "leaf_size": 100,
+      "fixture_load_ns": 260752500,
+      "construction_ns": 194953708417,
+      "leaf_cluster_ns": 0,
+      "posting_publish_ns": 1692276708,
+      "segments": 1,
+      "sample_limit": 0,
+      "training_rows": 0,
+      "training_ns": 0,
+      "corpus_route_ns": 0,
+      "leaf_count": 0,
+      "min_leaf_members": 0,
+      "max_leaf_members": 0,
+      "build_and_reopen_ns": 196651430625,
+      "normalized_fixture_to_published_phase_sum_ns": 196906737625,
+      "peak_process_rss_bytes": 6878527488,
+      "user_cpu_seconds": 168.931958,
+      "system_cpu_seconds": 14.637091,
+      "first_tested_point_at_95_5_percent_recall": {
+        "probes": 8192,
+        "recall_at_100": 0.9625,
+        "mean_query_ms": 25.12280709,
+        "vectors_scored": 81920000
+      },
+      "query_sweep": [
+        {
+          "probes": 16,
+          "recall_at_100": 0.0272,
+          "mean_query_ms": 11.68310667,
+          "vectors_scored": 160000
+        },
+        {
+          "probes": 32,
+          "recall_at_100": 0.0464,
+          "mean_query_ms": 6.85574833,
+          "vectors_scored": 320000
+        },
+        {
+          "probes": 48,
+          "recall_at_100": 0.0627,
+          "mean_query_ms": 4.84893292,
+          "vectors_scored": 480000
+        },
+        {
+          "probes": 56,
+          "recall_at_100": 0.0713,
+          "mean_query_ms": 2.53206333,
+          "vectors_scored": 560000
+        },
+        {
+          "probes": 64,
+          "recall_at_100": 0.0783,
+          "mean_query_ms": 2.33206083,
+          "vectors_scored": 640000
+        },
+        {
+          "probes": 72,
+          "recall_at_100": 0.0854,
+          "mean_query_ms": 2.2297570899999997,
+          "vectors_scored": 720000
+        },
+        {
+          "probes": 80,
+          "recall_at_100": 0.0944,
+          "mean_query_ms": 2.2284966600000002,
+          "vectors_scored": 800000
+        },
+        {
+          "probes": 96,
+          "recall_at_100": 0.1085,
+          "mean_query_ms": 2.80461666,
+          "vectors_scored": 960000
+        },
+        {
+          "probes": 128,
+          "recall_at_100": 0.134,
+          "mean_query_ms": 3.78075,
+          "vectors_scored": 1280000
+        },
+        {
+          "probes": 256,
+          "recall_at_100": 0.2142,
+          "mean_query_ms": 6.5168491699999995,
+          "vectors_scored": 2560000
+        },
+        {
+          "probes": 512,
+          "recall_at_100": 0.3214,
+          "mean_query_ms": 6.81894792,
+          "vectors_scored": 5120000
+        },
+        {
+          "probes": 1024,
+          "recall_at_100": 0.4641,
+          "mean_query_ms": 5.78450416,
+          "vectors_scored": 10240000
+        },
+        {
+          "probes": 2048,
+          "recall_at_100": 0.6407,
+          "mean_query_ms": 7.64158666,
+          "vectors_scored": 20480000
+        },
+        {
+          "probes": 4096,
+          "recall_at_100": 0.8277,
+          "mean_query_ms": 13.26473666,
+          "vectors_scored": 40960000
+        },
+        {
+          "probes": 8192,
+          "recall_at_100": 0.9625,
+          "mean_query_ms": 25.12280709,
+          "vectors_scored": 81920000
+        },
+        {
+          "probes": 16384,
+          "recall_at_100": 0.9806,
+          "mean_query_ms": 29.37184916,
+          "vectors_scored": 100000000
+        }
+      ]
+    },
+    {
+      "algorithm": "hilbert_seeded",
+      "seed": 71,
+      "count": 1000000,
+      "leaf_size": 100,
+      "fixture_load_ns": 481165833,
+      "construction_ns": 198473508584,
+      "leaf_cluster_ns": 0,
+      "posting_publish_ns": 1765859166,
+      "segments": 1,
+      "sample_limit": 0,
+      "training_rows": 0,
+      "training_ns": 0,
+      "corpus_route_ns": 0,
+      "leaf_count": 0,
+      "min_leaf_members": 0,
+      "max_leaf_members": 0,
+      "build_and_reopen_ns": 200245689167,
+      "normalized_fixture_to_published_phase_sum_ns": 200720533583,
+      "peak_process_rss_bytes": 5389811712,
+      "user_cpu_seconds": 168.64046,
+      "system_cpu_seconds": 17.073402,
+      "first_tested_point_at_95_5_percent_recall": {
+        "probes": 8192,
+        "recall_at_100": 0.9631,
+        "mean_query_ms": 24.63009875,
+        "vectors_scored": 81920000
+      },
+      "query_sweep": [
+        {
+          "probes": 16,
+          "recall_at_100": 0.028,
+          "mean_query_ms": 7.46954958,
+          "vectors_scored": 160000
+        },
+        {
+          "probes": 32,
+          "recall_at_100": 0.0521,
+          "mean_query_ms": 4.26059875,
+          "vectors_scored": 320000
+        },
+        {
+          "probes": 48,
+          "recall_at_100": 0.0703,
+          "mean_query_ms": 3.3464341600000003,
+          "vectors_scored": 480000
+        },
+        {
+          "probes": 56,
+          "recall_at_100": 0.0774,
+          "mean_query_ms": 2.06984125,
+          "vectors_scored": 560000
+        },
+        {
+          "probes": 64,
+          "recall_at_100": 0.0842,
+          "mean_query_ms": 1.94178208,
+          "vectors_scored": 640000
+        },
+        {
+          "probes": 72,
+          "recall_at_100": 0.0919,
+          "mean_query_ms": 1.7444245900000002,
+          "vectors_scored": 720000
+        },
+        {
+          "probes": 80,
+          "recall_at_100": 0.0992,
+          "mean_query_ms": 1.7712341699999998,
+          "vectors_scored": 800000
+        },
+        {
+          "probes": 96,
+          "recall_at_100": 0.1118,
+          "mean_query_ms": 2.43478709,
+          "vectors_scored": 960000
+        },
+        {
+          "probes": 128,
+          "recall_at_100": 0.139,
+          "mean_query_ms": 2.92654333,
+          "vectors_scored": 1280000
+        },
+        {
+          "probes": 256,
+          "recall_at_100": 0.2141,
+          "mean_query_ms": 4.37670209,
+          "vectors_scored": 2560000
+        },
+        {
+          "probes": 512,
+          "recall_at_100": 0.3238,
+          "mean_query_ms": 4.26780041,
+          "vectors_scored": 5120000
+        },
+        {
+          "probes": 1024,
+          "recall_at_100": 0.47,
+          "mean_query_ms": 4.77052292,
+          "vectors_scored": 10240000
+        },
+        {
+          "probes": 2048,
+          "recall_at_100": 0.6454,
+          "mean_query_ms": 7.29502583,
+          "vectors_scored": 20480000
+        },
+        {
+          "probes": 4096,
+          "recall_at_100": 0.8268,
+          "mean_query_ms": 12.96782416,
+          "vectors_scored": 40960000
+        },
+        {
+          "probes": 8192,
+          "recall_at_100": 0.9631,
+          "mean_query_ms": 24.63009875,
+          "vectors_scored": 81920000
+        },
+        {
+          "probes": 16384,
+          "recall_at_100": 0.9801,
+          "mean_query_ms": 29.438335,
+          "vectors_scored": 100000000
+        }
+      ]
+    }
+  ],
+  "post_merge_query_validation": {
+    "source_base_commit": "ba50a7bdcf",
+    "origin_main_commit": "2feba57298",
+    "benchmark_executable_sha256": "38de4de8046a398026671dbb101d223bb39fecceefbd6d8ac3e732445ca356c0",
+    "all_generations_reopened": true,
+    "tree_links_and_member_counts_verified": true,
+    "recall_matches_pre_merge_trials": true
+  }
+}

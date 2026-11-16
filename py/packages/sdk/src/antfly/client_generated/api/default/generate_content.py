@@ -122,8 +122,14 @@ def sync_detailed(
     token deltas. Each event contains a `ChatCompletionChunk` object.
     A successful stream ends with `data: [DONE]`. If generation or stream
     writing fails after the HTTP response starts, the server instead emits
-    an `event: error` frame whose data is a plain-text error message, then
-    closes the stream without a `[DONE]` frame.
+    an `event: error` frame and closes without a `[DONE]` frame. Permanent
+    inference-budget failures carry a JSON `Error` object with
+    `error: MODEL_RESOURCE_LIMIT` (admission policy) or
+    `error: MEMORY_BUDGET_EXCEEDED` (request working set), `retryable: false`,
+    and, when known, `budget`, `required_bytes`, and `limit_bytes`.
+    The HTTP status remains
+    unchanged once streaming starts. Clients must also accept plain-text
+    error frames from older servers and other failure paths.
 
     ## Input Format
 
@@ -132,13 +138,13 @@ def sync_detailed(
 
     Downloaded and inline encoded media is limited cumulatively across the request
     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-    `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero
-    configured
+    `resources.inference.admission.max_work_units` is positive—16 MiB times that effective work capacity
+    (derived from request concurrency when omitted). A zero configured
     download limit disables nonempty media. Remote URL byte potential is reserved before
     fetch; inline sources reserve their actual encoded size without adding it to the
     existing request-body reservation. Accepted image headers are then validated and
     decoded source pixels are admitted at a conservative 16 bytes per pixel against
-    the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a
+    the lower of 512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a
     zero
     concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
     limits each source edge. Malformed images return 400, while dimension or aggregate
@@ -188,8 +194,14 @@ def sync(
     token deltas. Each event contains a `ChatCompletionChunk` object.
     A successful stream ends with `data: [DONE]`. If generation or stream
     writing fails after the HTTP response starts, the server instead emits
-    an `event: error` frame whose data is a plain-text error message, then
-    closes the stream without a `[DONE]` frame.
+    an `event: error` frame and closes without a `[DONE]` frame. Permanent
+    inference-budget failures carry a JSON `Error` object with
+    `error: MODEL_RESOURCE_LIMIT` (admission policy) or
+    `error: MEMORY_BUDGET_EXCEEDED` (request working set), `retryable: false`,
+    and, when known, `budget`, `required_bytes`, and `limit_bytes`.
+    The HTTP status remains
+    unchanged once streaming starts. Clients must also accept plain-text
+    error frames from older servers and other failure paths.
 
     ## Input Format
 
@@ -198,13 +210,13 @@ def sync(
 
     Downloaded and inline encoded media is limited cumulatively across the request
     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-    `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero
-    configured
+    `resources.inference.admission.max_work_units` is positive—16 MiB times that effective work capacity
+    (derived from request concurrency when omitted). A zero configured
     download limit disables nonempty media. Remote URL byte potential is reserved before
     fetch; inline sources reserve their actual encoded size without adding it to the
     existing request-body reservation. Accepted image headers are then validated and
     decoded source pixels are admitted at a conservative 16 bytes per pixel against
-    the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a
+    the lower of 512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a
     zero
     concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
     limits each source edge. Malformed images return 400, while dimension or aggregate
@@ -249,8 +261,14 @@ async def asyncio_detailed(
     token deltas. Each event contains a `ChatCompletionChunk` object.
     A successful stream ends with `data: [DONE]`. If generation or stream
     writing fails after the HTTP response starts, the server instead emits
-    an `event: error` frame whose data is a plain-text error message, then
-    closes the stream without a `[DONE]` frame.
+    an `event: error` frame and closes without a `[DONE]` frame. Permanent
+    inference-budget failures carry a JSON `Error` object with
+    `error: MODEL_RESOURCE_LIMIT` (admission policy) or
+    `error: MEMORY_BUDGET_EXCEEDED` (request working set), `retryable: false`,
+    and, when known, `budget`, `required_bytes`, and `limit_bytes`.
+    The HTTP status remains
+    unchanged once streaming starts. Clients must also accept plain-text
+    error frames from older servers and other failure paths.
 
     ## Input Format
 
@@ -259,13 +277,13 @@ async def asyncio_detailed(
 
     Downloaded and inline encoded media is limited cumulatively across the request
     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-    `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero
-    configured
+    `resources.inference.admission.max_work_units` is positive—16 MiB times that effective work capacity
+    (derived from request concurrency when omitted). A zero configured
     download limit disables nonempty media. Remote URL byte potential is reserved before
     fetch; inline sources reserve their actual encoded size without adding it to the
     existing request-body reservation. Accepted image headers are then validated and
     decoded source pixels are admitted at a conservative 16 bytes per pixel against
-    the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a
+    the lower of 512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a
     zero
     concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
     limits each source edge. Malformed images return 400, while dimension or aggregate
@@ -313,8 +331,14 @@ async def asyncio(
     token deltas. Each event contains a `ChatCompletionChunk` object.
     A successful stream ends with `data: [DONE]`. If generation or stream
     writing fails after the HTTP response starts, the server instead emits
-    an `event: error` frame whose data is a plain-text error message, then
-    closes the stream without a `[DONE]` frame.
+    an `event: error` frame and closes without a `[DONE]` frame. Permanent
+    inference-budget failures carry a JSON `Error` object with
+    `error: MODEL_RESOURCE_LIMIT` (admission policy) or
+    `error: MEMORY_BUDGET_EXCEEDED` (request working set), `retryable: false`,
+    and, when known, `budget`, `required_bytes`, and `limit_bytes`.
+    The HTTP status remains
+    unchanged once streaming starts. Clients must also accept plain-text
+    error frames from older servers and other failure paths.
 
     ## Input Format
 
@@ -323,13 +347,13 @@ async def asyncio(
 
     Downloaded and inline encoded media is limited cumulatively across the request
     to the lower of 100 MiB, configured `max_download_size_bytes`, and—when
-    `admission.inference.max_concurrent_requests` is positive—16 MiB times that capacity. A zero
-    configured
+    `resources.inference.admission.max_work_units` is positive—16 MiB times that effective work capacity
+    (derived from request concurrency when omitted). A zero configured
     download limit disables nonempty media. Remote URL byte potential is reserved before
     fetch; inline sources reserve their actual encoded size without adding it to the
     existing request-body reservation. Accepted image headers are then validated and
     decoded source pixels are admitted at a conservative 16 bytes per pixel against
-    the lower of 512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a
+    the lower of 512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a
     zero
     concurrency setting still uses the finite 512 MiB ceiling. `max_image_dimension`
     limits each source edge. Malformed images return 400, while dimension or aggregate

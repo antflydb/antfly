@@ -29,11 +29,14 @@ pub const Column = struct {
 pub const TransactionStatus = enum(u8) { idle = 'I', in_transaction = 'T', failed = 'E' };
 
 pub const Identity = struct {
+    renewable: bool = false,
     context: *anyopaque,
     release: *const fn (*anyopaque, std.mem.Allocator) void,
 };
 
 pub const Request = struct {
+    completion: ?*@import("completion.zig").Completion = null,
+    completion_allocator: ?std.mem.Allocator = null,
     statement: []const u8,
     /// Reclaiming allocator sharing the connection cap. Result envelopes use
     /// the describe/execute arena; backend-owned execution scratch/results can
@@ -199,6 +202,9 @@ pub const Backend = struct {
         // alone decides whether credentials authorize a principal; a startup
         // username/database never itself grants access.
         authenticate: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!Identity,
+        /// Private gateway renewal; never available to native password sessions.
+        /// Called serially between protocol operations, after backend work joins.
+        refresh: ?*const fn (*anyopaque, std.mem.Allocator, Identity, []const u8) anyerror!void = null,
         describe: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Description,
         execute: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Result,
         /// Authenticated catalog snapshot for typed dotted-name SET/SHOW/RESET.
@@ -218,6 +224,12 @@ pub const Backend = struct {
         // Disconnect/termination must abandon any transaction session owned by
         // the connection. This callback must not commit it or perform retries.
         disconnect: *const fn (*anyopaque, Identity, ?[]const u8) void,
+        // Called after disconnect, while the credential is still owned. False
+        // retains external fencing for a durable decision handed to recovery.
+        completion_ready: ?*const fn (*anyopaque) bool = null,
+        reserve_completion: ?*const fn (*anyopaque, *@import("completion.zig").Completion, usize) anyerror!void = null,
+        pin_completion: ?*const fn (*anyopaque, std.mem.Allocator, *@import("completion.zig").Completion) void = null,
+        completion_safe: ?*const fn (*anyopaque, Identity) bool = null,
     };
 };
 

@@ -24,6 +24,8 @@ pub fn build(b: *std.Build) void {
         .@"embedded-only" = true,
         .target = target,
         .optimize = optimize,
+        .@"apple-providers" = b.option(bool, "apple-providers", "Enable Apple OCR, transcription and generation (default on macOS)"),
+        .@"apple-bridge-path" = b.option([]const u8, "apple-bridge-path", "Path to a custom Apple provider bridge"),
         .metal = b.option(bool, "metal", "Enable Metal") orelse false,
         .@"blas-root" = b.option([]const u8, "blas-root", "Path to the consumer's system BLAS installation"),
         .blas = b.option([]const u8, "blas", "CPU BLAS policy: auto, linked, or off") orelse "auto",

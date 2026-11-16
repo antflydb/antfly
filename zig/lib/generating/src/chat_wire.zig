@@ -43,6 +43,16 @@ pub const ChatRequestOptions = struct {
     enable_thinking: ?bool = null,
 };
 
+/// Null means no tools. Reject invalid shapes before adapting vendor types;
+/// tools remain opaque objects so provider-specific tool kinds are preserved.
+pub fn chatToolsFromValue(value: ?std.json.Value) error{InvalidGeneratorToolConfig}!?[]const std.json.Value {
+    const tools = value orelse return null;
+    if (tools == .null) return null;
+    if (tools != .array) return error.InvalidGeneratorToolConfig;
+    for (tools.array.items) |tool| if (tool != .object) return error.InvalidGeneratorToolConfig;
+    return tools.array.items;
+}
+
 pub fn chatRequestJsonAlloc(
     alloc: std.mem.Allocator,
     model: []const u8,
@@ -70,8 +80,12 @@ pub fn chatRequestJsonWithOptionsAlloc(
     }
     try out.append(alloc, ']');
     if (options.tools_json) |tools_json| {
-        try out.appendSlice(alloc, ",\"tools\":");
-        try out.appendSlice(alloc, tools_json);
+        const parsed = try @import("antfly-json").parseValueLossless(alloc, tools_json);
+        defer parsed.deinit();
+        if (try chatToolsFromValue(parsed.value)) |_| {
+            try out.appendSlice(alloc, ",\"tools\":");
+            try out.appendSlice(alloc, tools_json);
+        }
     }
     if (options.tool_choice_json) |tool_choice_json| {
         try out.appendSlice(alloc, ",\"tool_choice\":");
@@ -123,6 +137,8 @@ fn appendChatMessageJson(
     if (message.content) |content| {
         try out.appendSlice(alloc, ",\"content\":");
         try appendChatMessageContentJson(alloc, out, content, flavor);
+    } else if (message.role == .assistant and (message.tool_calls == null or message.tool_calls.?.len == 0)) {
+        try out.appendSlice(alloc, ",\"content\":\"\"");
     }
     if (message.tool_calls) |tool_calls| {
         try out.appendSlice(alloc, ",\"tool_calls\":[");
@@ -251,6 +267,38 @@ fn appendJsonString(
     const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(encoded);
     try out.appendSlice(alloc, encoded);
+}
+
+test "shared chat wire normalizes nullable tools and rejects invalid tool shapes" {
+    const a = std.testing.allocator;
+    for ([_]ChatWireFlavor{ .openai_compatible, .termite_native }) |flavor| {
+        const body = try chatRequestJsonWithOptionsAlloc(a, "m", &.{}, flavor, .{ .tools_json = "null" });
+        defer a.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(!parsed.value.object.contains("tools"));
+        for ([_][]const u8{ "{}", "true", "42", "\"tools\"", "[null]", "[1]", "[[]]" }) |invalid| {
+            try std.testing.expectError(error.InvalidGeneratorToolConfig, chatRequestJsonWithOptionsAlloc(a, "m", &.{}, flavor, .{ .tools_json = invalid }));
+        }
+    }
+}
+
+test "shared chat wire gives empty assistant turns content and preserves tool-only turns" {
+    const a = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant },
+        .{ .role = .assistant, .tool_calls = &.{} },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "call-1", .name = "search", .arguments = "{}" }} },
+    };
+    const body = try chatRequestJsonAlloc(a, "m", &messages, .openai_compatible);
+    defer a.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    const turns = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqualStrings("", turns[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("", turns[1].object.get("content").?.string);
+    try std.testing.expect(turns[2].object.get("content") == null);
+    try std.testing.expectEqualStrings("call-1", turns[2].object.get("tool_calls").?.array.items[0].object.get("id").?.string);
 }
 
 test "shared chat wire preserves image detail and native media content" {

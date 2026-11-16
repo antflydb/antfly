@@ -18,6 +18,7 @@ package main
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"container/heap"
 	"crypto/hmac"
 	"crypto/rand"
@@ -53,6 +54,8 @@ type corpusSource struct {
 	Zip     bool   `json:"zip,omitempty"`
 }
 type corpusConfig struct {
+	Profile        string         `json:"profile,omitempty"`
+	IndexedAt      int64          `json:"indexed_at"`
 	Sources        []corpusSource `json:"sources"`
 	Key            string         `json:"key"`
 	BaseURL        string         `json:"base_url"`
@@ -82,8 +85,20 @@ type corpusRecord struct {
 
 func corpusMIME(name string) string {
 	switch strings.ToLower(path.Ext(name)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
 	case ".pdf":
 		return "application/pdf"
+	case ".ogg", ".opus":
+		return "audio/ogg"
+	case ".aac":
+		return "audio/aac"
+	case ".amr":
+		return "audio/amr"
 	case ".wav":
 		return "audio/wav"
 	case ".mp3":
@@ -127,6 +142,10 @@ func includedSource(name string) bool {
 // A bounded external merge sort deduplicates source IDs without keeping the corpus
 // in a map. Only duplicate candidates require a full content comparison.
 func discoverCorpus(cfg corpusConfig, output string) error {
+	profile, err := processingProfile(cfg.Profile)
+	if err != nil {
+		return err
+	}
 	scratch, err := os.MkdirTemp(filepath.Dir(output), "inventory-sort-")
 	if err != nil {
 		return err
@@ -161,7 +180,7 @@ func discoverCorpus(cfg corpusConfig, output string) error {
 		return err
 	}
 	add := func(i int, name string, size, modified int64, crc uint32) error {
-		if !includedSource(name) {
+		if !includedSource(name) || !profile.accepts(corpusMIME(name)) {
 			return nil
 		}
 		entries = append(entries, corpusEntry{ID: corpusID(cfg.Sources[i].Dataset, name), Dataset: cfg.Sources[i].Dataset, MIME: corpusMIME(name), Locator: sourceLocator{Source: i, Name: name, Size: size, Modified: modified, CRC: crc}})
@@ -274,9 +293,16 @@ func readCorpusLine[T any](r *bufio.Reader, v *T) (int64, error) {
 		}
 		break
 	}
-	err := error(nil)
-	if err = json.Unmarshal(line, v); err != nil {
+	// Locators contain nanosecond timestamps, which exceed float64's exact
+	// integer range. Keep numbers lossless even inside document metadata maps.
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	decoder.UseNumber()
+	if err := decoder.Decode(v); err != nil {
 		return 0, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return 0, fmt.Errorf("manifest line contains trailing JSON")
 	}
 	return int64(len(line)), nil
 }

@@ -1,0 +1,651 @@
+# Grepstein inference release qualification
+
+Qualify the release candidate and the deployed serving profile separately.
+A CUDA backend, a ready pod, a downloaded model, or a passing synthetic
+throughput test does not establish complete document extraction. Keep shared
+inference as the execution plane; Grepstein does not need an instance-local pool.
+
+## Record the exact candidate
+
+Keep the source revision (and dirty patch digest if applicable), binary and
+container digests, GPU model/compute capability, driver, model revisions,
+effective resource/request ceilings, environment overrides, and fixture hashes
+with every receipt. Historical DGX Spark measurements are not A100 results.
+Run correctness before measuring throughput, and exclude competing GPU jobs
+from timed runs. Report missing hardware and skipped tests as unqualified.
+
+The Grepstein model selections are:
+
+| Role | Pinned artifact | Required checks |
+| --- | --- | --- |
+| Reader | `lightonai/LightOnOCR-3-4B:safetensors@b71010f095dc3735de7ee6b9969bff8f8f50b39a` | Full-page completion, GPU recurrent dispatch, numerical parity, bounded memory |
+| Alternate reader | `lightonai/LightOnOCR-3-0.8B:safetensors@36d8636925327c671bd8e479c517a004f7566bd9` | The same checks independently; changing model is a new extraction recipe |
+| Embedder | `google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b` | Document/query task preparation, dimension, normalization, identity fencing, retrieval ranking |
+| Extractor | `fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d` | Exact artifact/backend qualification, entity spans, relation endpoints and long-document coverage |
+
+An installed GLiNER2 checkpoint does not substitute for GLiNER2.5. Request the
+pinned model explicitly and verify discovery and the selected route agree.
+Gemma 4 generation is a separate capability; enabling it is not a prerequisite
+for the initial full-text, embedding, and GLiNER graph pipeline.
+
+For focused Zig checks, use compile-time substrings (for example
+`zig build test-bin -Dcuda=true -Dcuda-artifacts=fatbin -Dtest-filter=LightOn`),
+then run the installed binary with `--test-filter LightOn`. On the current
+Zig 0.17 toolchain, both compile-time filters and the runtime runner combine
+multiple filters as a union. `-Druntime-test-filter=true` deliberately compiles the full suite and is
+expensive. Require named cases and nonzero runtime matches; declaration-wrapper
+checks alone do not establish numerical or policy coverage.
+
+## Reader execution and completeness
+
+1. Run the placement, recurrent numerical oracle, ownership, and admission
+   tests on the candidate. Test both checkpoint geometries. Default CUDA
+   recurrence must remain device-resident; explicitly disabling the core must
+   resolve to `host/operator_disabled` at model load. A resident device history
+   must fail closed if device execution fails, rather than migrate to an empty
+   host history. Full-prefix forwards without a decode cache must acquire
+   temporary device state, release its admission on completion or failure,
+   and match a fresh cached forward. Check placement logs and recurrent
+   model metrics.
+2. Compare the default serving profile with the explicit CPU recurrence
+   baseline on identical inputs. Use `benchmark_concurrency.py --backend cuda
+   --require-recurrent-placement`; omit `--cuda-recurrent-core` for the default
+   and use `--no-cuda-recurrent-core` for the baseline. Keep resource ceilings
+   and fixture hashes in the reports. The benchmark rejects missing or mixed
+   placement diagnostics when this assertion is requested.
+3. Include representative scanned DOJ pages: dense text, rotated scans,
+   tables, low contrast, blank pages, and mixed native/scanned PDFs. Preserve
+   page order and source/version identity. Compare full text including the
+   last visible lines; a short nonempty response is not a completeness proof.
+4. Force an output cap too small for a known fixture. Plain `/read` must reject
+   incomplete output with `OUTPUT_TRUNCATED`; structured document output must
+   preserve `truncated`/`unresolved` status. Materialization must not upgrade
+   either to a complete searchable transcript. Exercise the configured accurate
+   reader/refinement policy and verify exhausted budgets remain unresolved.
+
+A 512-token diagnostic, matching the deployed allowance, rejected a cached dense
+DOJ page on Glowworm. The Grepstein reader example now requests 2048 tokens; both checkpoint diagnostics
+completed that page and retained the checked tail text. This is a bounded
+sample, not proof that every corpus page fits. Do not retry an unchanged capped request forever.
+Measure the failing pages, then qualify a larger admitted output allowance or
+a bounded document refinement policy. A higher serving ceiling and the reader
+request must agree; increasing only one does not recover the missing tail.
+Also qualify the work-unit capacity: a single image with a 2048-token output
+allowance currently needs at least 12 generation admission units, exceeding
+the existing eight-unit serving profile. Raising only the token ceiling would
+still reject it. Keep request concurrency bounded while qualifying that change.
+The proposed reader-policy adjustment is below; retain the current memory,
+pixel, and input-token limits and qualify it on the intended hardware before
+applying it. Sixteen work units leave headroom above that twelve-unit minimum;
+the independent concurrency ceiling still admits one request.
+
+```json
+{
+  "resources": {
+    "inference": {
+      "admission": {"max_concurrent_requests": 1, "max_work_units": 16},
+      "request_limits": {"max_output_tokens_per_item": 2048}
+    }
+  }
+}
+```
+
+This is a partial configuration to merge into the existing policy, not a
+replacement for its other limits. Use the native pool probe's
+`--reader-max-output-tokens 2048` switch to check the intended ceiling and its
+exact rejection boundary after deployment to a qualification environment.
+Retry affected source versions after the policy change and require complete
+artifact coverage before semantic or graph enrichment. Avoid automatic image
+tiling without a tested ordering/deduplication policy.
+
+## Diagnose repeated output before raising token limits
+
+Use the native PDF raster in the reader comparison, alongside a reference
+renderer. A photo page can induce invented or repeated tables when small
+lettering is aliased; an `OUTPUT_TRUNCATED` response does not by itself mean
+the legitimate transcription needs more tokens. Keep incomplete OCR unresolved.
+
+Configure PDF sampling independently of model preprocessing:
+
+```json
+{"ocr":{"render":{"sampling":"auto","dpi":150,"resolution":"requested_dpi"},"reader":{"provider":"antfly","model":"lightonai/LightOnOCR-3-4B","max_tokens":2048}}}
+```
+
+- `auto` (default) smooths continuous-tone images and preserves one-bit ink
+  coverage during minification.
+- `pdf` honors source PDF interpolation declarations for reproducibility.
+- `smooth` explicitly uses bilinear sampling even for one-bit image color;
+  stencil masks keep their source rules. It can blur thin strokes.
+
+DPI, resolution, pixel/dimension caps and memory admission remain independent.
+Sampling does not raise those limits. Shared windows, embedding source identities
+and extraction fingerprints include the policy and its algorithm version.
+Units and chunks carry `ocr_render_policy` alongside requested/effective DPI and
+actual geometry. `resolved_profile` is null when a platform compatibility
+renderer supplies the pixels instead of the native sampler.
+
+The default OCR rendering profile smooths continuous-tone images independently of the
+PDF's `/Interpolate` setting. Exact rendering retains PDF sampling semantics,
+and one-bit scans retain coverage-preserving minification. Smoothing operates
+on the existing decoded image; it adds no full-page buffer or output pixels.
+It increases sampling work and can increase PNG size, so include rendering and
+transport in throughput measurements.
+
+For a bounded A100 reproduction on rc.13, the native 150-DPI raster of
+`EFTA00001227.pdf` (PDF SHA-256
+`d00cd4de31cea68991ae53508df4b78f5f0fd7c424c571388a747aa3746b41fa`)
+exhausted 2048 tokens with both pinned reader sizes while continuing invented
+table rows. With OCR-profile smoothing, 4B stopped at 528 tokens and 0.8B at
+10 tokens under the same ceiling and image-only greedy generation request.
+These are renderer-to-reader diagnostics using the deployed CUDA runtime,
+not proof of full-corpus accuracy or of a deployed server containing the
+rendering change. Inspect actual visible text, not only completion status.
+The corpus artifact definition and pool limits need not change for this fix;
+retry native extraction only after deploying a runtime with the rendering fix.
+
+## Model preprocessing and provider guidance
+
+PDF painting and model resizing are different operations. Resize filters,
+normalization, patch geometry and pixel/token limits belong to the pinned
+model's processor contract. `ocr.render.sampling` does not override them.
+Qwen2-VL honors supported nearest, bilinear or bicubic declarations. The native
+Qwen3.5/LightOn path implements Pillow-compatible antialiased bicubic and
+rejects conflicting declarations. Unknown/malformed filters fail closed.
+The shared image library owns an execution recipe. Model resolution revisions
+include it for declared image/video inputs and for undeclared modalities (whose
+embedding pipelines may accept images until loading resolves their executor).
+Explicit text-only and audio-only models retain their artifact-only revision.
+Qwen2/ColQwen additionally version their model-specific processor contract. This
+fences SigLIP/default-profile vectors as well as Qwen vectors without requiring
+model-name exceptions for every future image encoder.
+
+Current derived-unit writers emit `duf6`, and completed-state reuse still requires
+version 6. Readers can authenticate persisted `duf5` units using the original
+hashed field set, so child work does not have to wait for a parent re-extraction.
+Version-5 payloads cannot claim rendering-policy metadata, even as a null mirror;
+unknown versions and modified content are rejected. Their rendering policy stays
+unknown. When the parent later publishes version 6, the existing generation and
+acceptance fences invalidate the old children and replace them with children
+bound to the new fingerprint. No source-table recreation is required. Plan parent
+regeneration with the same bounded job/admission limits.
+
+LightOn's [4B model card](https://huggingface.co/lightonai/LightOnOCR-3-4B#rendering-and-preprocessing-tips)
+recommends rendering at 400 DPI, then resizing to a 2048-pixel longest edge with
+aspect ratio preserved. Its [processor](https://huggingface.co/lightonai/LightOnOCR-3-4B/blob/main/processor_config.json)
+declares bicubic sampling. Pin the revision when reproducing this pipeline.
+Direct low-resolution painting is not equivalent to high-resolution rendering
+followed by antialiased reduction. This change retains the explicit 150-DPI
+default and existing caps; it does not silently allocate 400-DPI pages or claim
+exact reproduction of LightOn's reference pipeline.
+
+Hosted providers publish different input quality guidance:
+[Document AI](https://docs.cloud.google.com/document-ai/docs/file-types)
+recommends at least 200 DPI, generally 300 or higher;
+[Textract](https://docs.aws.amazon.com/textract/latest/dg/textract-best-practices.html)
+recommends at least 150 DPI and avoiding conversion/downsampling of supported
+originals. Neither recommendation establishes their internal sampling filter.
+[Tesseract](https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html) performs
+its own preprocessing and generally prefers at least 300 DPI.
+
+## Sampling regression and CPU measurements
+
+The processor contract is checked against checked-in Pillow 12.1.0 RGB fixtures
+for all supported filters (nearest, antialiased bilinear and antialiased bicubic),
+including magnification, reduction, single-pixel axes and non-default channel
+normalization. Regenerate with
+`uv run --with pillow==12.1.0 zig/lib/image/testdata/generate_resampling_references.py`,
+then format the generated Zig file. These pixel checks do not invoke a model.
+
+The separable resizer retains an 8-bit horizontal row window, rather than a
+full-height intermediate. This preserves the reference quantization boundary.
+Coefficient storage is allocated exactly; Pillow only retains one row of f64
+coefficients, while Torchvision retains the axis needed for its global precision
+selection. Geometry-based admission initially forecasts source decoding, normalized images
+retained earlier in the batch, filter tables and the row window. Both the native
+ColQwen reranker and the Qwen3.5 fallback generation route borrow that process
+credit through an admitted allocator. Actual codec scratch, allocation metadata
+and retained tensors acquire additional capacity before allocating. A
+bytes-per-pixel forecast is not a decoder ceiling: PNG scanlines, bit depth,
+compressed-buffer growth and other codec storage can exceed it. Growth is
+chunked and reused across serial preparation, with no extra image copies or
+resampling passes. Generation returns unused growth after prompt preparation
+while keeping output ownership; serial reranking reuses its capacity. Outputs
+release before their allocation owner; additional
+leases release before the original borrowed permit. Generation reserves known
+media work in its invocation budget before choosing a prefill chunk, including
+offline callers. Execution borrows the process and local credits independently
+without charging either twice. CLI resource-pressure retries and alternate-route
+replanning preserve this fixed credit while reducing model workspace. Unknown
+codec growth acquires only the remaining deficit in each ledger; a failed
+reservation-metadata allocation refunds both ledgers before a same-scope retry. Admission failures preserve permanent-limit versus transient-contention
+errors, while actual backing-allocator failures remain distinct.
+Reranker token preflight inspects image headers and uses the execution geometry;
+it no longer decodes/resizes the same image before execution.
+
+A local safe-build CPU comparison with the previous implementation preserved
+all output floats for three nonuniform RGB workloads. Each result is a mean of
+three timed iterations after warm-up; shared-machine timing is diagnostic,
+not a performance threshold or hosted-GPU measurement.
+
+| Source → model dimensions | Previous bicubic | Row-window bicubic |
+| --- | ---: | ---: |
+| 1801×1278 → 1024×728 | 22.5 ms | 19.8 ms |
+| 2400×3200 → 840×1120 | 70.0 ms | 68.9 ms |
+| 1×100000 → 28×3584 | 28.4 ms | 18.8 ms |
+
+The million-row regression (1×1000000 → 28×35840) fits a preprocessing
+allocation budget below 32 MiB. Previously the horizontal buffer alone required
+84 MB, excluding tensors and coefficients. Source decoding is admitted as part of actual preparation ownership.
+
+To compare actual native PDF painting and PNG transport sizes, build
+`zig build lib-pdf-bench -Doptimize=safe -j2` from `zig/`, then run from the
+repository root:
+
+```sh
+zig/zig-out/bin/lib-pdf-bench sampling-report path/to/sample.pdf 150 3 output-prefix
+```
+
+The command emits one JSON record per sampling policy, including PDF/PNG SHA-256,
+actual geometry, renderer quality, PNG byte count and mean render-plus-encode
+time. It rejects nondeterministic output and optionally writes each PNG for
+comparison through the same pinned `/read` model. Parsing/cold-start, HTTP
+transport, reader latency and accuracy are separate measurements.
+
+Local 150-DPI measurements on the native-text fixture and the two-line scan
+produced identical PNG hashes across policies (the scan explicitly requests
+interpolation); rendering plus encoding took about 20–23 ms and 35–39 ms,
+respectively. The text fixture reports `degraded` native glyph rendering, not
+fully native fidelity. For the Grepstein photo canary, `auto` took 180 ms and
+produced 2,463,230 bytes; `pdf` took 99 ms and produced 612,874 bytes.
+The `auto` PNG hash remains
+`622c903d2c249c0924403cae961a7f2ca53f6f975887060f7c3db370b263aa72`.
+That material CPU/transport tradeoff must remain visible in rollout measurements.
+
+The state-gate test separately verifies that old markers cannot satisfy current
+completed-state reuse. The ordered apply integration test uses a complete unit
+captured from the previous version-5 encoder: it computes/publishes child chunks,
+then replaces them after a version-6 parent publication and retires them after
+parent removal. Run `zig build document-unit-upgrade-test -Doptimize=safe -j2`
+from `zig/` for that production callback/receiver path. Codec tests verify the
+captured fingerprint, tamper rejection, missing-policy semantics and allocation
+failure cleanup. Both metadata-based and downloaded-byte source fingerprints
+bind the resolved render recipe. Full scan/photo/text reader accuracy and deployed end-to-end throughput
+remain required before broad backfill; these local tests do not claim them.
+
+## Large-page vLLM comparison
+
+The reader throughput target is parity with vLLM, preferably faster, while
+preserving complete extraction. A faster short response does not qualify.
+Compare both LightOn checkpoints independently, using the original checkpoint,
+identical image hashes, image-only prompts, greedy decoding, and the same output
+allowance. Include dense full pages and mixed page lengths at concurrency one
+and the proposed serving concurrency. Compare pages per second and latency
+distributions; token accounting can differ by whether the terminator is counted.
+
+Use `benchmark_vllm_offline.py` to produce a private reference report and
+`scripts/qualify_reader_page_latency.py --reference-report REPORT` to compare
+native HTTP responses without copying document text into public receipts. The
+report records exact, whitespace-insensitive, and alphanumeric comparisons
+separately. Only exact comparison is an automatic parity gate
+(`--require-reference-parity`); an alphanumeric match alone cannot qualify
+punctuation, layout, or correctness. Review every differing full output against
+the source image. Record formatting-only differences explicitly rather than
+stripping separators or punctuation from production responses to match an oracle.
+
+Verify the GPU has no competing compute processes before each run and that the
+server owns the measured GPU process. Drain and unload each model before stopping
+its server. Keep uninstrumented timing runs separate from profiler runs and
+report the HTTP versus in-process boundary. Disable reference prefix and processor
+caches and use fresh media identifiers. Measure cached-weight startup, new-node
+artifact download, and first-request compilation separately; a warm local model
+load does not establish Cloud cold-start latency.
+
+Qualify the final runtime defaults, not only a diagnostic environment profile.
+Recheck mixed-page batching, model eviction/reload, complete tails, memory limits,
+and overload behavior with those defaults. DGX Spark results establish a useful
+kernel comparison but do not qualify the A100 serving deployment or its container
+libraries. Require the paired released runtime/operator and an A100 canary before
+changing the live shared reader pool.
+
+### Current large-page investigation
+
+The concurrent throughput target is not met yet. The isolated DGX Spark tests
+use original BF16 checkpoints, identical hashes for a deposition page and a
+longer dense page, image-only greedy decoding, and a 2,048-token output allowance.
+Each four-request cohort contains two copies of each image. The same HTTP client
+can now compare `/ai/v1/read` with an OpenAI-compatible reference using
+`--api-shape openai-chat --url http://127.0.0.1:PORT/v1/chat/completions`.
+Payload construction is outside timing in both modes; unknown or truncated chat
+finish reasons cannot qualify, even if expected tail words appear.
+
+| Four-page policy | LightOn 4B seconds | LightOn 0.8B seconds |
+| --- | ---: | ---: |
+| vLLM in-process, two fresh rounds | 33.01–33.05 | 7.08–7.12 |
+| vLLM HTTP, same client and prompts | 32.93–33.02 | Not measured |
+| Earlier native defaults, main-merged runtime | 44.70–44.84 | 12.24–12.31 |
+| Current automatic capability policy | 40.68–40.71 | 9.77–9.87 |
+| Best measured diagnostic profile | 35.24–35.44 | 8.18–8.21 |
+| Two-image vision diagnostic, after geometry fix | Not measured | 11.58–11.75 |
+
+The best 4B diagnostic uses recurrent-input packing, BF16 vision, an owned greedy
+continuation, and optional decoder graphs. It captures four graphs and replays
+766 times without graph admission denials over two rounds. Bounded 1,024-row
+prefill chunks reduce its four-page time from 35.46–35.52 to 35.24–35.44 seconds.
+The 0.8B diagnostic uses its independently selected eager profile and a four-token
+executor burst; the burst improves 8.28–8.36 to 8.18–8.21 seconds. These complete
+precision/chunk/burst configurations remain distinct from automatic policy.
+Portable packing, graph prerequisites and owned continuation now select
+automatically; BF16 vision and the diagnostic chunk/burst settings remain explicit.
+Paired feed-forward weight copies add little improvement over recurrent-input
+packing; projection-output BF16, bounded matrix tuning, and a simple batched
+matrix-vector prototype did not improve on the selected path. They were not
+promoted. Wider vision batching is correct on the tested pages but slower;
+keep the single-image vision default.
+
+The native 4B outputs are byte-identical to vLLM's batched outputs. The dense
+page's vLLM serial output differs from its own batched output in line breaks and
+a trailing Markdown separator. Its strict in-process serial-reference assertion
+therefore still fails. The HTTP comparison passes functional completion checks,
+with that exact-reference difference recorded separately; it is not an automatic
+serial-reference correctness pass. Do not strip production output to hide the
+difference. Native 0.8B outputs match both serial and batched references exactly,
+including the new two-image vision path and the optional token burst. Every
+successful run listed above retains complete tails; failed experiments are
+excluded from those timing ranges. This is bounded same-page coverage, not a corpus-wide accuracy
+qualification.
+
+With the earlier defaults, the two 4B pages took 52.96–52.97 seconds serially,
+compared with the earlier clean 57.22–57.23-second vLLM serial control. Four-page
+native decoding improved from approximately 51 seconds before the packet changes
+to 44.7 seconds in that earlier default-policy measurement. Diagnostic profiles must
+remain distinct from these default-policy measurements.
+
+Clean software-timestamp profiles attribute 34.52 seconds of GPU busy time to
+the native graph/input-packing profile versus 32.86 seconds to vLLM. Matrix
+kernels consume approximately 29.7 seconds in each. Native paged-attention
+chunk kernels take 1.33 seconds versus 0.70 seconds for the reference decode
+attention, and native also spends more time in prefill and vocabulary reduction.
+The profile is diagnostic evidence, not a replacement for uninstrumented timing.
+Attention variants measured at actual page contexts pass independent numerical,
+canary and input-immutability checks. Kernel microbenchmarks establish kernel
+behavior; uninstrumented full-page runs measure serving throughput. Throughput
+parity remains open.
+
+The long-context packet passes 64 independent GPU numerical and graph-replay
+oracle cases, including sparse/permuted tables and contexts through 8,192 tokens.
+It requires a CUDA 13 driver API; older drivers retain ordinary CUDA attention.
+The projector now applies backend-specific per-image and aggregate vision bounds:
+CUDA accepts up to 16,384 patches per image and 65,536 packed rows, while Metal
+retains its 4,096-patch batching envelope. Brokers cap their work to that geometry.
+A prepared page outside the batching envelope retains its serial encoder instead
+of failing only because batching was enabled.
+
+Canonical reader profiles authorize the executor-owned continuation independently
+of multi-token bursts. Pure-greedy, callback, progress, cancellation and scheduler
+ownership checks remain mandatory. A live functional check timed out one request
+with `504 INFERENCE_TIMEOUT` while a peer completed with the expected full output
+hash; all 38 readiness probes succeeded. The same check passed four-page 0.8B
+batching and 4B eviction/reload. Compilation ran during this functional check,
+so its timings are excluded from performance qualification. The final main-merged
+binary separately passes serial and mixed-page requests, exact 0.8B reference
+checks, model switching, readiness after each phase, and explicit unloading.
+
+Decoder graphs now select automatically from compiled/runtime capabilities,
+with explicit operator disables preserved. Projection-rounding modes whose
+arithmetic is not capture-compatible retain eager CUDA execution. Immutable fusion copies consume
+the device weight budget independently of scratch; device/combined admission and
+release on model retirement remain mandatory. All measured native runs retain
+the 20 GiB host, 34 GiB device, 4 GiB KV and 8 GiB scratch limits. The DGX uses
+its reference environment's CUDA 13 libraries, not the deployment image's pinned
+CUDA 12 libraries. No result here qualifies the A100 pool, full container image,
+new-node artifact download, or production rollout.
+
+## Capability-based defaults
+
+Hardware selection and benchmark evidence are separate. LightOn graph capture,
+FFN fusion, input projection packing, recurrent state pooling and device token
+bursts must not depend on the GPU used for testing. Portable PTX 9.0 operations
+require SM80+ and CUDA driver API 13.0; ordinary tensor-core and device-ID
+operations use their own compiled kernel/library checks. Older drivers retain
+ordinary CUDA instead of attempting unsupported PTX.
+
+The runtime selects graph prerequisites automatically for resident LightOn CUDA
+sessions and preserves each explicit environment disable. Startup logs include
+`lighton_cuda_policy`, compute capability, driver, and a named graph decision:
+unsupported compute/driver, disabled dependency, unavailable cuBLASLt, insufficient
+plan cache, noncapturable arithmetic/execution, or enabled. Epoch ownership,
+immutable weights, greedy eligibility, admission and cancellation still gate
+individual claims. A bounded request can use eager CUDA even when the session
+supports graphs. Projectors query the resolved backend vision policy instead of
+rereading old opt-in environment flags; explicit disables apply at both caller
+and execution paths. End-to-end checks require the selected path counters,
+not just successful text responses.
+
+Encoder BF16 mirrors, bounded DeBERTa attention, portable quantized routes and
+generic graph replay support select from compiled tensor-core capability rather
+than an L4 allowlist. Laya warp attention uses its loaded symbol and shape
+contract instead of a GPU-model check. Per-operation symbols, shapes, numerical recipe and memory
+checks remain authoritative. Explicit overrides continue to work.
+
+Retained architecture restrictions correspond to actual compiled artifacts:
+`sm_121a` fused vision/head kernels, the external SM12.1 recurrent-prefill
+library, and layout-dependent attention kernels. Generated portable matmul
+execution uses its multi-target build contract and common resource envelope;
+the catalog retains the original SM89 evidence fingerprint. No benchmark record
+is relabeled as an A100 measurement. SM121-specific cuBLASLt
+heuristic tables also remain local to that architecture; other GPUs use native
+cuBLASLt heuristics. Generated Flash-prefill kernels that still index opaque
+WMMA fragments retain their implementation-specific layout restriction. Typed,
+exhaustive renderer contracts declare portable SIMT versus layout-dependent
+execution; command strings and benchmark labels are not execution contracts.
+Arithmetic-changing precision profiles and experimental
+algorithms retain their independent explicit settings. Resource capacities stay
+bounded; no DGX benchmark memory or 128-row preset becomes a serving default.
+
+The current automatic-policy run uses the same 20/34/4/8 GiB host/device/KV/
+scratch envelope, four decoder rows, one image per request, and original pinned
+checkpoints. Four mixed pages take 40.68–40.71 seconds for 4B and 9.77–9.87
+seconds for 0.8B; two serial 4B pages take 51.68–52.06 seconds. Portable vision
+QKV/MLP counters confirm execution without opt-in flags. Diagnostic precision,
+chunk and burst configurations remain separate; throughput parity is still open.
+The final binary SHA-256 is
+`3cf76237db376d4dbf10038e2b5357b50ce576ed8709c594079b3abd5ee316b1`.
+The isolated run passes all seven phases, including model switch/reload,
+complete reference hashes, cancellation/recovery and unloading. An 8-second
+request receives `504 INFERENCE_TIMEOUT` while its peer completes correctly;
+all 37 readiness probes succeed. Automatic QKV and MLP counters each reach
+576 calls; normalization-cache hits and pinned metadata uploads are positive.
+Graph capture/replay is observed for both readers. No diagnostic optimization
+flags are set. Startup is 10.1 seconds with locally cached artifacts, not a
+new-node download measurement.
+Use `scripts/check_cuda_generated_matmul.py --output REPORT` from the inference
+package to check bundled portable Q4 kernels against a CPU FP64 reference,
+including output guards and readonly inputs. A100 test coverage is an evidence
+gap, not an additional software allowlist or a requirement for manually enabling compatible
+paths.
+
+Final focused CUDA validation selected 165 tests: 164 passed and one optional
+BF16-prefill scratch case skipped. This includes the automatic policy and
+explicit-disable checks, immutable evidence/portable execution contracts,
+generated selectors, graph and cancellation ownership, and the A4B baseline
+primitive smoke test. Additional focused resolved-vision policy and CUDA
+recipe-pin regressions pass. A4B admission now checks its loaded resident primitives;
+its exact geometry and memory envelope remain enforced. The GB10 smoke uses
+small synthetic expert matrices, not a full 26B model qualification. Six
+independent bundled Q4 matmul checks passed (maximum absolute error 2.33e-7),
+as did 16 profile/benchmark Python tests and five artifact-policy tests.
+
+## Portable EmbeddingGemma attention
+
+EmbeddingGemma 2's online BF16 attention now uses the documented PTX
+`mma.sync.m16n8k16` register layout for P×V accumulation and rescaling. It does
+not index implementation-defined WMMA fragments. Q×K continues through public
+WMMA load/store APIs, which preserve the logical matrix layout. Accumulators
+stay in registers, and output normalization stores directly from those
+registers. Two value tiles share one `ldmatrix.x4.trans` load. Launch bounds
+prevent a small register increase from halving 512-thread block occupancy.
+The default local/global routing follows bundled BF16 kernel support and the
+existing geometry bounds, including the scalar route for partial query tiles.
+
+A DGX GB10 comparison of standalone old/new kernels passed six cases bitwise,
+covering local/global attention, batches, masks, fully masked input, and
+64–2,048 tokens. Independent CPU FP64 SDPA checks passed (maximum absolute
+error 0.00185, including the kernel's existing BF16 probability boundary).
+The final bundled image additionally passed eight cases bitwise, including
+65/129-token scalar query tails; output guards and readonly inputs passed.
+Compiled SM80 through SM120 images each use 64 registers per thread.
+Seven alternating-order rounds of
+100 CUDA-event-timed launches per kernel measured:
+
+| Batch / tokens / head dimension | Old ms | Portable ms |
+| --- | ---: | ---: |
+| 1 / 512 / 256 | 0.319 | 0.320 |
+| 4 / 512 / 256 | 0.952 | 0.950 |
+| 1 / 2,048 / 256 | 1.313 | 1.332 |
+| 1 / 512 / 512 | 0.557 | 0.572 |
+| 4 / 512 / 512 | 3.072 | 3.045 |
+
+This preserves kernel performance within approximately 3% on this GPU. It
+is not an A100 timing result or an end-to-end embedding/retrieval result. Run
+`scripts/check_cuda_embeddinggemma_attention.py --artifact FATBIN --output REPORT`
+on each target GPU; add `--baseline OLD_FATBIN --benchmark` for bitwise and
+latency comparison. Use the existing encoder/retrieval qualification below
+before changing an index's serving recipe.
+
+## Embeddings and extraction
+
+EmbeddingGemma 2's CUDA/BF16 execution recipe has a different `model_identity`
+from CPU/F32, and optimized arithmetic profiles also have distinct identities.
+Discover the serving identity, pin it in the index configuration, and use the
+same compatible recipe for document and query vectors. Portable default
+attention advances the CUDA recipe to `embeddinggemma2-cuda-bf16-mean-v3-portable-mma`:
+compatible GPUs can replace a previous scalar route with BF16 tiled attention.
+CPU/Metal artifact identities remain unchanged. Existing CUDA pins must use a
+new index/identity after reindexing, including conservatively invalidating old
+SM89 pins even though the tested kernel outputs match bitwise. A request with an old
+identity must fail with a conflict, not silently produce vectors from a changed
+recipe. Verify index recovery and query caches preserve the pin. Rebuild into a
+new index when the recipe changes; do not mix the two vector spaces. Run the
+existing `scripts/embeddinggemma2/qualify.py` against the matching pinned oracle,
+and check a small labeled retrieval set using the real task prefixes.
+
+For GLiNER2.5, retain the artifact/backend/feature/length checks in
+`models/gliner_boundary_qualification.zig`. Check entity text and offsets,
+typed relation endpoints, chunk boundaries, and repeated entities across chunks
+against the independent fixtures. Reject requests outside supported contracts;
+do not remove an artifact or numerical qualification gate to improve routing.
+Graph publication must wait for complete current-version extraction, and a
+retry must not duplicate graph edges or leave stale-version edges searchable.
+
+## Cold starts, pressure, and recovery
+
+Through the actual authenticated hosted proxy, exercise each model from a
+naturally idle pool: execution discovery, advertised activation, model download,
+loading, successful work, and a second warm request. Verify the returned
+capability lease and model identity. Record activation and download time apart
+from execution. Do not scale down a busy shared production pool for this test.
+
+Test model-loading responses, stale capability leases, overload, deadline
+expiry, client cancellation, and a retry after recovery. Check exact error
+codes/retry guidance. A temporary loading failure must not become a permanent
+document failure, and retries must retain source/version identity. Existing
+single-flight activation tests cover the protocol; a release receipt must also
+include the actual deployed proxy/operator path.
+
+Under the intended per-role memory and concurrency ceilings, exercise long
+prompts and outputs, mixed-size requests, model switching, and cancellation
+while work is queued or GPU buffers are retained. Include host, device,
+combined/unified, KV, scratch, persistent recurrent state, download staging,
+and ephemeral storage. Verify refusal before unsafe allocation, release after
+success and failure, sustained readiness, no eviction/restarts, and completion
+of a later valid request. Keep request cardinality separate from native
+microbatch width. DGX Spark's 128-slot preset and large unified-memory budgets
+must not become the shared A100/L4 serving defaults.
+
+## Publication gate
+
+Keep original preparation, full-text extraction, embedding enrichment, and
+graph publication as separate resumable stages. Run Grepstein's `qualify`
+command against the sealed publication: index readiness alone does not prove
+that every source page was extracted. Keep semantic/graph publication disabled
+until the required source versions have complete artifacts and the corresponding
+model checks above pass. Public hosting additionally needs the source
+suppression and exposed-API bounds described in the Grepstein design.
+
+## CUDA reader memory admission
+
+CUDA Qwen vision admission now follows the streaming implementation rather than
+reserving a device attention-score matrix. The closed linear contract applies to
+64-dimensional heads with an FFN no wider than four hidden dimensions; other
+geometries retain the generic conservative estimate. Read, generate and multimodal
+rerank admission all select this policy from the actual session backend.
+
+The shared contract bounds retained cuDNN Q/K/V/output storage, vendor workspace,
+and overlapping FFN intermediates. `DeviceScratch.acquire` synchronizes and frees
+an older arena before growth. Both vendor entry points check the same workspace
+cap before allocation or launch and otherwise use the existing tiled CUDA path.
+The portable encoder widens a BF16 input once before F32 normalization and residual
+operations if a compact vendor block declines execution. This changes no model
+weights, image geometry, token limits, or precision default.
+
+Reader epochs reserve solo vision and decoder work initially. New admitted pages
+can grow the shared reservation to the actual available group, bounded by the
+configured microbatch maximum. The decoder still owns two queued working sets;
+CUDA no longer rounds that lease to a second power-of-two envelope. A pending
+request is not counted as an admitted page. Admission growth is transactional
+with the page lease, and failed growth rolls back before any consumer can enqueue
+GPU work. Existing peaks remain charged until backend teardown so queued work and
+cached buffers cannot outlive their reservation. Geometry planning uses current
+admitted pages; a completed large page cannot permanently multiply the estimate
+for later small-page groups.
+
+Lease bookkeeping does not invalidate a captured decoder graph. Actual compute
+and cleanup phases continue to do so. The graph's two-row requirement remains:
+serial page delivery still cannot demonstrate graph replay or maximum throughput.
+
+The explicit `bf16_vision` profile and the cuDNN route still need a complete-page
+A100 comparison of output, warm throughput, cold load, batch cardinality and peak
+memory. Spark-only fused GEMM results are not A100 results. The admission contract
+and host-side CUDA-enabled tests do not establish those performance measurements.
+
+### Extraction completion and publication ownership
+
+A partial OCR publication withholds request-completion credit. A failed
+publication also carries an explicit pipeline-failure marker through scanner
+and asynchronous lane boundaries; a matching provider error tag cannot reuse
+a document retry identity. Exhausting storage retries must not exhaust OCR
+attempts or acknowledge an incomplete generation.
+
+The raw extraction manifest persists `ocr_retryable_failed_count` across all
+pages, independently of the 32-entry failure diagnostic sample. Artifact PUT
+repairs inline declarations and stores the canonical table-wide declaration,
+which survives removal of its declaring index. An embedding declaration also
+retains the owning index's admitted, credential-free producer identity when its
+inline form inherited that producer. Artifact DELETE removes both
+forms and leaves consumers for normal dependency validation to reject.
+
+These storage and catalog regressions are distinct from the outstanding
+complete-page A100 output and memory qualification above.
+
+## Decoder allocation regressions
+
+Run the focused allocation and model-processor contracts from
+`zig/pkg/inference`:
+
+```sh
+zig build test-bin -Dtest-filter="image decode admission" -Dtest-filter="model processor resampling" -Doptimize=safe -j2
+./zig-out/bin/antfly-inference-tests --test-filter "image decode admission" --test-filter "model processor resampling"
+```
+
+The fixtures include short, wide 8-bit and 16-bit RGBA PNGs, retained multi-image
+outputs, permanent and contended denials, offline-budget quantum tails, backing
+allocation failure, cancellation and allocation-failure cleanup. Planning tests
+verify that a fitting smaller prefill chunk is selected with media already
+reserved. Transactional tests cover independent process/local credits, immediate
+metadata-failure refunds, same-scope retries and owned backend-tensor publication. A generated
+4,000,000×1 PNG exercises the original default-Qwen-geometry reproduction:
+its initial forecast is about 60 MB, while decoding alone needs over 64 MB.
+Extraction must grow its admission rather than allocate that difference outside
+the resource ledger. Prompt preparation also exercises failure after image
+preparation so retained images are destroyed exactly once. These are local
+CPU ownership checks; they do not qualify GPU reader accuracy or throughput.

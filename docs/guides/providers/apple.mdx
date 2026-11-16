@@ -1,0 +1,270 @@
+---
+title: Apple
+description: macOS Vision OCR, SpeechAnalyzer transcription, and Foundation Models generation on device
+order: 10
+---
+
+The `apple` provider uses Apple's on-device frameworks on macOS: Vision for OCR,
+SpeechAnalyzer for file transcription, and Foundation Models for text
+generation. Each component is available independently; working OCR does not
+mean the Apple Intelligence generation model is ready.
+
+## What It Provides
+
+| Component | Inputs | Framework | Minimum macOS |
+|---|---|---|---|
+| Reader | PNG and JPEG images, rendered PDF pages | Vision text recognition | Any supported |
+| Transcriber | Audio files up to one hour | SpeechAnalyzer | 26 |
+| Generator | Text | Foundation Models (Apple Intelligence) | 26 |
+
+Apple components take no `model`: macOS provides it.
+
+## Credentials
+
+None. Everything runs on the device.
+
+## Enable It
+
+Native macOS CLI and embedded-library builds enable **Vision OCR, speech
+transcription, and Foundation Models generation together by default**. One
+`apple-providers` switch controls all three; there is no separate OCR toggle.
+From the repository's `zig` directory with Zig 0.17:
+
+```bash
+zig build antfly capi                     # All Apple providers, default on macOS
+zig build antfly -Dapple-providers=false  # Disable all three, for example with an older SDK
+```
+
+Release build contract 7 includes the committed ARM64 bridge in both macOS server
+and embedded archives. Existing older releases are unchanged. Linux release jobs
+verify its Swift source hash, binary hash, architecture and ABI before packaging.
+CLI and SDK packages retain the adjacent bridge; users need neither Xcode nor Swift.
+Native and cross-compiled ARM64 builds use and verify the committed bridge by default.
+
+`make generate` rebuilds the bridge automatically on Apple Silicon Macs.
+Use `make apple-bridge-generate` to rebuild only the bridge. Other platforms
+keep the committed binary. When changing `zig/lib/apple_native/src/bridge.swift`, rebuild on a Mac with
+Swift 6 and the macOS 27 SDK, then commit both the dylib and its metadata:
+
+```bash
+python3 scripts/packaging/apple_bridge.py build \
+  --directory zig/lib/apple_native/prebuilt/arm64 --architecture arm64
+python3 scripts/packaging/apple_bridge.py verify \
+  --directory zig/lib/apple_native/prebuilt/arm64 --architecture arm64
+```
+
+The metadata records the build's provenance commit and the actual Swift source
+hash. Verification checks source contents rather than requiring the build's commit
+to equal each subsequent release commit. Source edits require a rebuilt bridge;
+unrelated Antfly changes reuse the existing binary. `-Dapple-bridge-path` can
+explicitly select a custom bridge.
+
+Transcription and generation live in `lib/libantfly-apple.dylib`, which the
+`antfly`, `capi`, and independent `libantfly` steps install. Keep it in the `lib/` directory beside
+`libantfly`, or beside the CLI's installation. For a custom Lite layout, set
+`ANTFLY_APPLE_BRIDGE_PATH` to the library's absolute path. The CLI and `libantfly`
+can target older macOS releases:
+
+```bash
+zig build antfly capi -Dapple-providers=true -Dtarget=aarch64-macos.15.0
+```
+
+On macOS below 26, transcription and generation return
+`AppleIntelligenceProviderUnavailable`, while OCR keeps working. If the library
+is missing or from a different build, calls return `AppleNativeBridgeUnavailable`
+or `AppleNativeBridgeIncompatible`; install the right library and restart
+Antfly.
+
+## Read Images
+
+Use a `reader` producer on an asset enrichment whose field holds a PNG or JPEG
+URL:
+
+```json
+{
+  "type": "reader",
+  "config": {
+    "provider": "apple",
+    "recognition_languages": ["en-US"],
+    "recognition_level": "accurate",
+    "uses_language_correction": false
+  }
+}
+```
+
+`recognition_level` is `accurate` (the default) or `fast`. Language tags must be
+supported by the installed Vision runtime. The defaults are accurate
+recognition, English, and no language correction. Inputs can be HTTP(S) URLs or
+inline `data:image/...;base64,...` URIs; local file URLs are blocked.
+
+Plain-text output contains the recognized lines. With `content_type:
+"application/json"`, the reader returns its result array with `regions_json`:
+text, confidence, and bounding boxes in image pixels from the top left.
+
+Vision recognizes text; it does not rebuild tables or multi-column layouts, and
+it does not describe scenes. Use [LightOnOCR-3](/docs/guides/models/lightonocr3) for
+documents with tables and formulas, or a vision-capable generator to describe
+images.
+
+To try it interactively, open **Inference → Reader Playground** in Antfarm on a
+server built with Apple providers, pick the **Local inference** connection and
+**Apple Vision OCR**, then upload an image or choose **Load Sample**. The first
+request can take noticeably longer while macOS initializes Vision.
+
+## Index Scanned PDFs
+
+A document extraction producer renders PDF pages and passes their pixels to
+Vision. OCR boxes are mapped to page coordinates and kept as text spans for
+grounding. This table indexes OCR chunks:
+
+```json
+{
+  "num_shards": 1,
+  "indexes": {
+    "document_text": {
+      "type": "full_text",
+      "field": "text",
+      "artifact_name": "document_chunks",
+      "enrichments": [
+        {
+          "name": "document_units",
+          "kind": "asset",
+          "field": "document_url",
+          "content_type": "application/json",
+          "producer": {
+            "type": "document_extraction",
+            "config": {
+              "ocr": {
+                "mode": "always",
+                "render": {"dpi": 150},
+                "reader": {
+                  "provider": "apple",
+                  "recognition_languages": ["en-US"]
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "document_chunks",
+          "kind": "chunk",
+          "field": "text",
+          "source_artifact_name": "document_units",
+          "chunk_size": 256,
+          "full_text_index": true
+        }
+      ]
+    }
+  }
+}
+```
+
+Send that body to `POST /db/v1/tables/documents`, then write documents whose
+`document_url` points to a PDF, either a URL or an inline
+`data:application/pdf;base64,...` value. `mode: "always"` OCRs every page; `auto`
+OCRs only pages whose native text is missing or fails the quality checks.
+
+## Transcribe Recordings
+
+Use this configuration in a transcriber enrichment:
+
+```json
+{
+  "provider": "apple",
+  "language_code": "en-US",
+  "timestamps": true,
+  "download_assets": false
+}
+```
+
+The locale defaults to `en-US` and must be supported by the installed
+SpeechTranscriber runtime. Installed assets are used as-is; set
+`download_assets: true` to let macOS install a missing locale. Responses contain
+the final text, phrase segments, and word time ranges when `timestamps` is set.
+Diarization and live transcription are not supported; for speaker turns, see
+[Index Recorded Calls and Podcasts](/docs/guides/transcription).
+
+Audio can come from HTTP(S), S3 with request credentials, or an inline data URI,
+up to 128 MiB, in any format AVAudioFile reads.
+
+## Generate Text
+
+Use this generator configuration with the generation endpoints or a generator
+enrichment:
+
+```json
+{"provider": "apple", "max_tokens": 256, "temperature": 0.2}
+```
+
+System instructions and alternating user and assistant turns keep their roles.
+Tools, image or audio attachments, and other sampling options are rejected.
+
+Non-streaming Apple generation verifies natural completion for every caller,
+including `/generate`. Foundation Models does not distinguish a token-cap stop
+from a natural stop, so Antfly lets the response complete and checks its budget.
+An over-budget or incomplete response returns `InferenceOutputIncomplete` rather
+than partial text labeled `stop`. macOS 27 checks reported output tokens; macOS 26
+uses a conservative bounded byte limit because token usage is unavailable.
+
+Apple token budgets must be integers from 1 through 2,147,483,647, matching the
+generation API's integer range. This range is a numeric safety bound, not a
+promise that the model can generate that many tokens: model context, response
+bytes, and request deadlines still apply. Configuration and request overrides
+are validated before bridge invocation; the bridge independently validates
+direct ABI calls and computes its byte cap without overflowing.
+
+macOS must have Apple Intelligence enabled and its model downloaded; on macOS 27
+the setting is under **Siri**. Antfly never downloads the model or falls back to
+the cloud. `AppleModelNotReady` means the model isn't available yet, and
+`AppleIntelligenceDisabled` means Apple Intelligence is off. Context overflow and
+refusals return errors rather than truncated output.
+
+## Limits
+
+- One native OCR call, and one transcription or generation call, runs per
+  process at a time. Others get the retryable `AppleOcrBusy` or `AppleNativeBusy`
+  error, and batches run serially.
+- OCR accepts at most eight images per request: 16 Mi pixels per image, 64 Mi
+  pixels and 64 MiB of encoded media per batch. Responses are capped at 8 MiB
+  and fail rather than truncate.
+- OCR takes no instruction prompt or `max_tokens`.
+- Each OCR call reserves 384 MiB of working memory in Antfly's scheduler, and
+  each transcription or generation call reserves 512 MiB. Small process memory
+  budgets can reject large documents with `DocumentExtractionWorkingSetTooLarge`.
+
+## Push-to-talk dictation
+
+Named Apple transcribers work with `POST /ai/v1/dictate` on database nodes. Set
+`model` to `transcribers/<name>` and optionally `cleanup_model` to a named generator
+(`cleanup` or `generators/cleanup`). Dictionary spellings, style, context, and
+instructions use the same cleanup prompts as Whisper. Without a cleanup generator,
+or with `style: verbatim`, the raw transcript is returned. Apple rejects
+Whisper-specific recognition hints, VAD tuning, and audio-context options.
+
+With `stream: true`, the raw transcript arrives before cleanup. Provider cleanup
+can emit the entire result as one delta; this does not enable live Apple
+transcription. Model discovery exposes named transcriber dictation capabilities,
+native availability, and installed speech locales without installing assets.
+
+The [`examples/dictation`](https://github.com/antflydb/antfly/tree/main/examples/dictation)
+macOS app demonstrates both engines, global hold/toggle shortcuts, per-app presets,
+a dictionary, local settings caching, Antfly snapshots, and searchable history.
+Apple runs on the Antfly server, so using a user's Mac requires a local Apple-enabled
+Antfly instance.
+
+## Related
+
+- [Inference providers](/docs/guides/inference-providers): every provider and component
+- [Index PDFs and Scanned Documents](/docs/guides/index-documents): document extraction and OCR options
+- [Apple native provider design](https://github.com/antflydb/antfly/blob/main/docs/design/apple-intelligence-provider.md): bridge loading, validation, and test commands
+
+
+Dictation cleanup requires Apple bridge ABI 2 so completion checks cannot be
+silently skipped by an older sidecar. Apple’s token limit can return partial text
+without an error ([maximumResponseTokens](https://developer.apple.com/documentation/foundationmodels/generationoptions/maximumresponsetokens)).
+For dictation cleanup, the bridge therefore allows natural completion under the
+request deadline and a streaming byte bound of eight times the token budget.
+macOS 27 additionally checks measured output tokens against the budget. Failed
+or incomplete cleanup never replaces the raw transcript. All Apple generation
+calls use these completion checks; exceeding a configured budget fails instead
+of returning partial text labeled as complete.

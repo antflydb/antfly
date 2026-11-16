@@ -14,6 +14,11 @@
 // limitations under the License.
 
 const std = @import("std");
+
+// Keep default execution disjoint from the focused ownership roots.
+const execution_batch_filters = [_][]const u8{ "ops.execution_scope.test.", "ops.execution_batch.test.execution batch", "pipelines.generation.test.cooperative decode publication", "pipelines.generation.test.execution batch", "ops.cuda.cuda_compute.test.cooperative decode batches", "runtime.scheduler.native_generate.test." };
+const cuda_lifecycle_filters = [_][]const u8{ "ops.cuda.buffer.test.CUDA physical OOM", "ops.cuda.buffer.test.CUDA quarantine", "ops.cuda.allocation_ledger.test.CUDA ", "ops.cuda.allocation_budget.test.CUDA boundary physical allocation budget", "test_cuda_allocation_lifecycle.test.CUDA quarantine" };
+const executor_microbatch_filters = [_][]const u8{ "gliner microbatch", "executor microbatch", "executor_microbatch.test.", "embedding text batch", "gliner span v2 batch admission", "tensor microbatch" };
 const Context = @import("context.zig").Context;
 const runtime_build = @import("runtime.zig");
 const build_test_filters = @import("test_filters.zig");
@@ -37,11 +42,22 @@ pub fn create(ctx: Context) Suite {
     // Native CPU Debug peaked at 12,070,764,544 bytes with cold compiler
     // caches. 12,672 MiB retains 10% headroom rounded up to 128 MiB.
     // Accelerator and other-host reservations retain their existing profiles.
-    const native_cpu_debug = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
-        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and
+    const native_cpu = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and
         !ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
     const tests = b.addTest(.{
-        .max_rss = if (native_cpu_debug) 12_672 * 1024 * 1024 else @as(usize, if ((ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) or ctx.backend.enable_cuda) 14 else 9) * 1024 * 1024 * 1024,
+        // Zig 0.17's focused CUDA serving suite reached 19.57 GB on aarch64
+        // Linux. Reserve 24 GiB so the scheduler admits its measured compiler
+        // footprint and leaves room for the socket/reference coverage.
+        // Native aarch64 Linux CPU document orchestration (Zig 0.17,
+        // ReleaseFast) peaked at 14.26 GB. Reserve 16 GiB for this closure.
+        // The ReleaseSafe boundary admission regression peaked at
+        // 20,025,544,704 bytes with cold caches; reserve 24 GiB in that mode.
+        // The focused native CPU ReleaseFast suite peaked at 10,032,644,096
+        // bytes. Its old 9 GiB declaration rejected a successful compilation.
+        // Native macOS Metal GLiNER Decide serving (Zig 0.17, ReleaseFast)
+        // peaked at 15,153,954,816 bytes; 16 GiB keeps measured headroom.
+        .max_rss = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) @as(usize, if (ctx.optimize == .safe) 24 else 16) * 1024 * 1024 * 1024 else if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 16 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
@@ -50,6 +66,24 @@ pub fn create(ctx: Context) Suite {
         .filters = main_test_filters,
         .test_runner = runtime_filter_test_runner,
     });
+    if (ctx.backend.enable_pjrt) {
+        const fixture = b.addLibrary(.{
+            .name = "pjrt-admission-fixture",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/pjrt/src/test_plugin.zig" })),
+                .target = ctx.target,
+                .optimize = ctx.optimize,
+                .link_libc = true,
+            }),
+        });
+        // Embed the provider so tests remain runnable from any working
+        // directory (including zig build --build-file from the repo root).
+        const fixture_files = b.addWriteFiles();
+        _ = fixture_files.addCopyFile(fixture.getEmittedBin(), "plugin");
+        const fixture_module = fixture_files.add("fixture.zig", "pub const bytes = @embedFile(\"plugin\");\n");
+        tests.root_module.addAnonymousImport("pjrt_admission_fixture", .{ .root_source_file = fixture_module });
+    }
     tests.root_module.strip = ctx.strip;
     tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
     tests.root_module.addImport("antfly_cloudflare", ctx.graph.inference_mod.import_table.get("antfly_cloudflare").?);
@@ -61,6 +95,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("httpx", ctx.graph.httpx_mod);
     tests.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
     tests.root_module.addImport("inference_api", ctx.graph.inference_api_mod);
+    tests.root_module.addImport("antfly_generating", ctx.graph.inference_mod.import_table.get("antfly_generating").?);
     tests.root_module.addImport("antfly_generating_openapi", ctx.graph.generating_openapi_mod);
     tests.root_module.addImport("antfly_extraction_openapi", ctx.graph.extraction_openapi_mod);
     tests.root_module.addImport("antfly_extracting", ctx.graph.extracting_mod);
@@ -87,12 +122,12 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);
     tests.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     tests.root_module.addImport("antfly_media", ctx.graph.inference_mod.import_table.get("antfly_media").?);
-    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
-    tests.root_module.addImport("antfly_documents", ctx.graph.inference_mod.import_table.get("antfly_documents").?);
+    tests.root_module.addImport("antfly_pdf", ctx.graph.pdf_source_mod);
+    tests.root_module.addImport("antfly_documents", runtime_build.sourceDocumentsModule(b, ctx.graph.inference_mod.import_table.get("antfly_documents").?, ctx.graph.pdf_source_mod));
     tests.root_module.addImport("antfly_video", ctx.graph.inference_mod.import_table.get("antfly_video").?);
-    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
+    tests.root_module.addImport("antfly_pdf", ctx.graph.pdf_source_mod);
     tests.root_module.addImport("inference_chunker", ctx.graph.inference_chunker_mod);
-    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
+    tests.root_module.addImport("antfly_pdf", ctx.graph.pdf_source_mod);
     tests.root_module.addImport("jinja", ctx.graph.jinja_mod);
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
     tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
@@ -118,6 +153,9 @@ pub fn create(ctx: Context) Suite {
     if (ctx.backend.enable_system_blas) {
         runtime_build.configureSystemBlas(b, tests.root_module, ctx.target, ctx.backend.blas_root);
     }
+    // No-copy host buffer wrapping can succeed even for misaligned pointers
+    // on some devices. Exercise the copied-output fallback deterministically.
+    if (ctx.backend.enable_metal) tests.root_module.addCMacro("ANTFLY_METAL_TEST_FORCE_HOST_OUTPUT_COPY", "1");
     runtime_build.configureMetal(b, tests.root_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
     runtime_build.configureCudaVideo(b, tests.root_module, ctx.target, ctx.backend.enable_cuda, ctx.paths);
     tests.root_module.link_libc = ctx.backend.link_libc;
@@ -153,6 +191,28 @@ pub fn create(ctx: Context) Suite {
         run_cli_tests.addArgs(&.{ "--test-filter", filter });
     }
     build_test_filters.addRuntimeControls(run_cli_tests, ctx.args orelse &.{});
+    // Keep the Gemma CUDA upload/dispatch regression loop independent of
+    // unrelated library suites, while retaining the normal runtime imports.
+    const gemma_cuda_tests = b.addTest(.{
+        .root_module = tests.root_module,
+        .filters = &.{ "Gemma4 CUDA", "embeddinggemma2 CUDA model constants", "embeddinggemma2 CUDA constant snapshots", "generated CUDA tiled64", "generated CUDA score prework", "generated CUDA paged score prework", "E4B shared KV prefill", "detect clip gemma4", "warm generator admission metadata", "explicit load policy placement", "model selection resident sessions and load flights", "compatibility signature", "compatibility backend candidates", "CUDA greedy graph output", "CUDA suppressed argmax", "CUDA graph", "clearing CUDA graph capture", "CUDA persistent buffer reallocation", "split-K replay rejection", "uncompressed CUDA KV capacity", "CUDA capture defaults", "CUDA temp arena" },
+        .test_runner = runtime_filter_test_runner,
+        .max_rss = 7 * 1024 * 1024 * 1024,
+    });
+    ctx.step("test-gemma4-cuda", "Verify Gemma CUDA raw weights, compact projector and attention dispatch")
+        .dependOn(&ctx.addRunArtifact(gemma_cuda_tests).step);
+
+    const gemma_ple_host_tests = b.addTest(.{
+        .root_module = tests.root_module,
+        .filters = &.{ "Gemma4 CUDA host PLE", "admission lease releases transient", "admission resource budget mirrors", "embeddinggemma2 stage supplements", "embeddinggemma2 stage admission reduces", "reader admitted owner caches domain" },
+        .test_runner = runtime_filter_test_runner,
+        .max_rss = @as(usize, if (ctx.backend.enable_cuda and ctx.target.result.cpu.arch == .aarch64) 16 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_gemma_ple_host_tests = ctx.addRunArtifact(gemma_ple_host_tests);
+    build_test_filters.addRuntimeControls(run_gemma_ple_host_tests, ctx.args orelse &.{});
+    ctx.step("test-gemma4-ple-host", "Verify mapped PLE ownership, admission, gathers and CUDA graph replay")
+        .dependOn(&run_gemma_ple_host_tests.step);
+
     const run_tests = ctx.addRunArtifact(tests);
     const evidence_module = b.createModule(.{
         .root_source_file = ctx.path("src/pipelines/grammar.zig"),
@@ -182,6 +242,13 @@ pub fn create(ctx: Context) Suite {
     }
     // Keep backend packaging covered even when CUDA implementation tests are
     // excluded. A CPU/Metal test product must not retain a device image.
+    const context_tests = b.addTest(.{
+        .root_module = tests.root_module,
+        .filters = &.{"server.context_management."},
+        .test_runner = runtime_filter_test_runner,
+        .max_rss = 6 * 1024 * 1024 * 1024,
+    });
+    ctx.step("test-context-management", "Verify native context adapter and checkpoint contracts").dependOn(&ctx.addRunArtifact(context_tests).step);
     const artifact_module = b.createModule(.{
         .root_source_file = ctx.path("src/ops/cuda/artifact.zig"),
         .target = ctx.target,
@@ -200,6 +267,8 @@ pub fn create(ctx: Context) Suite {
     // the default gates assign these tests to the shared finetuning owner.
     if (selected_test_filters.len == 0) {
         for (@import("finetune/tests.zig").inference_overlap_filters) |filter|
+            run_tests.addArgs(&.{ "--skip-test-filter", filter });
+        for (execution_batch_filters ++ cuda_lifecycle_filters ++ executor_microbatch_filters) |filter|
             run_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
     return .{
@@ -229,7 +298,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const run_bge_m3_e2e_bench_tests = checks.bge_benchmark;
     const test_step = ctx.step("test", "Run unit tests");
     const media_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/media/src/inference.zig" })),
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/media/inference_test_root.zig" })),
         .target = ctx.target,
         .optimize = ctx.optimize,
     }) });
@@ -242,10 +311,59 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
             .link_libc = true,
         }) });
         callbacks.root_module.addCSourceFile(.{ .file = ctx.path("tests/video_decode_test.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-UNDEBUG" } });
-        media_step.dependOn(&ctx.addRunArtifact(callbacks).step);
+        const run_callbacks = ctx.addRunArtifact(callbacks);
+        media_step.dependOn(&run_callbacks.step);
+        test_step.dependOn(&run_callbacks.step);
     }
-    test_step.dependOn(media_step);
-    ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites").dependOn(&run_tests.step);
+    // Shared container/source tests run once through lib-test's test-media.
+    // test-video-media retains the complete focused suite, including callbacks.
+    const cooperative_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cooperative_admission.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var cooperative_imports = suite.tests.root_module.import_table.iterator();
+    while (cooperative_imports.next()) |entry| cooperative_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    cooperative_root.link_libc = true;
+    const cooperative_tests = b.addTest(.{ .root_module = cooperative_root, .filters = &.{"cooperative sustained"} });
+    const run_cooperative_tests = ctx.addRunArtifact(cooperative_tests);
+    test_step.dependOn(&run_cooperative_tests.step);
+    ctx.step("test-cooperative-admission", "Verify sustained cooperative/exclusive turnover and queued deadlines").dependOn(&run_cooperative_tests.step);
+    const batch_root = b.createModule(.{ .root_source_file = ctx.path("src/test_execution_batch.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var batch_imports = suite.tests.root_module.import_table.iterator();
+    while (batch_imports.next()) |entry| batch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    batch_root.link_libc = true;
+    // Native Apple Silicon Metal Debug peaked at 3,872,571,392 bytes with a
+    // cold local cache; 4,352 MiB adds 18% measured headroom. Keep the
+    // CUDA and other platform profiles independent. Native CPU Debug now
+    // peaks at 2,852,749,312 bytes; 3,072 MiB retains 13% measured headroom.
+    const native_debug_metal_batch = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and
+        ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
+    const native_debug_cpu_batch = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and !ctx.hasAccelerator();
+    const batch_tests = b.addTest(.{ .max_rss = @as(usize, if (native_debug_metal_batch) 4_352 else if (native_debug_cpu_batch) 3_072 else 2_048) * 1024 * 1024, .root_module = batch_root, .filters = &(execution_batch_filters ++ [_][]const u8{"test_0"}) });
+    const run_batch_tests = ctx.addRunArtifact(batch_tests);
+    test_step.dependOn(&run_batch_tests.step);
+    ctx.step("test-execution-batch", "Verify cohort budgets, scope retirement and decode arithmetic without a GPU").dependOn(&run_batch_tests.step);
+    const lifecycle_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_allocation_lifecycle.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var lifecycle_imports = suite.tests.root_module.import_table.iterator();
+    while (lifecycle_imports.next()) |entry| lifecycle_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    lifecycle_root.link_libc = true;
+    const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_root, .filters = &(cuda_lifecycle_filters ++ [_][]const u8{"test_0"}) });
+    const run_lifecycle_tests = ctx.addRunArtifact(lifecycle_tests);
+    test_step.dependOn(&run_lifecycle_tests.step);
+    ctx.step("test-cuda-allocation-lifecycle", "Verify failed-free quarantine across primary-context lifetimes without a GPU").dependOn(&run_lifecycle_tests.step);
+    const microbatch_root = b.createModule(.{ .root_source_file = ctx.path("src/test_executor_microbatch.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var microbatch_imports = suite.tests.root_module.import_table.iterator();
+    while (microbatch_imports.next()) |entry| microbatch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    microbatch_root.link_libc = true;
+    const microbatch_tests = b.addTest(.{ .max_rss = 4 * 1024 * 1024 * 1024, .root_module = microbatch_root, .filters = &(executor_microbatch_filters ++ [_][]const u8{"test_0"}) });
+    const run_microbatch_tests = ctx.addRunArtifact(microbatch_tests);
+    test_step.dependOn(&run_microbatch_tests.step);
+    ctx.step("test-executor-microbatch", "Verify executor batching, GLiNER adapters, row ownership, capacity and cancellation").dependOn(&run_microbatch_tests.step);
+    const inference_unit = ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites");
+    inference_unit.dependOn(&run_tests.step);
+    inference_unit.dependOn(&run_microbatch_tests.step);
+    inference_unit.dependOn(&run_lifecycle_tests.step);
+    inference_unit.dependOn(&run_batch_tests.step);
+    inference_unit.dependOn(&run_cooperative_tests.step);
     const cancellation_e2e_step = ctx.step("test-cancellation-e2e", "Run HTTP inference cancellation and worker recovery E2E tests");
     if (ctx.target.result.os.tag == .linux or ctx.target.result.os.tag == .macos) {
         const fixture = b.addExecutable(.{
@@ -300,6 +418,67 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     cuda_step.dependOn(&run_gliner25_cuda_tests.step);
     cuda_step.dependOn(&quant_kernel_codegen_test_check.step);
     cuda_step.dependOn(&cuda_artifact_source_policy_check.step);
+    // Serving qualification is separate from the optimizer/kernel gate above.
+    // A passing run requires real pinned artifacts and the production policy;
+    // opt-in fixtures must not silently turn a release gate into skips.
+    const production_cuda_filters = [_][]const u8{
+        "production CUDA required artifacts",
+        "CUDA pinned base full inference",
+        "CUDA pinned multi full inference",
+        "GLiNER bounded window composition pinned CUDA",
+        "frozen CUDA family profiles",
+        "CUDA boundary multi profiles",
+        "CUDA boundary batch rows",
+        "GLiNER production CUDA distinct input batches",
+        "Decide published checkpoint",
+        "Decide Q8 published bundle",
+        "Decide Q8 CUDA classification oracle",
+        "GLiNER2.5-Decide native parity",
+        "Decide Q8 CUDA qualification binds",
+        "Decide CUDA legacy geometry",
+        "exact DeBERTa CUDA qualification",
+        "GLiNER2.5-Decide CUDA classification oracle parity",
+        "GLiNER production CUDA typed decisions",
+        "GLiNER production CUDA extraction through concurrent HTTP",
+        "pinned CUDA extraction direct and HTTP",
+    };
+    // Keep the original Decide batch/cancellation gate runnable on smaller
+    // hosts without admitting the complete 24 GiB family compiler closure.
+    const decide_serving_tests = b.addTest(.{
+        .name = "gliner25-decide-cuda-serving-tests",
+        .max_rss = 11 * 1024 * 1024 * 1024,
+        .root_module = suite.tests.root_module,
+        .filters = &.{ "Decide CUDA serving required artifact", "Decide CUDA execution batches", "model listing reports an unreadable model", "executor contract failures preserve", "gliner span configuration diagnostics", "span GLiNER native config", "always-download files pull the GLiNER2.5 boundary encoder", "GLiNER production CUDA distinct input batches Decide", "qualified FP32 attention policy", "Decide Q8 CUDA qualification binds", "Decide CUDA legacy geometry", "Decide Q8 projection mirrors", "Decide Q8 mirror admission", "GLiNER Decide CUDA Q8 half staging", "GLiNER Decide CUDA Q8 execution mirror" },
+        .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    ctx.step("gliner25-decide-cuda-serving-test-build", "Build focused original Decide CUDA batch and cancellation tests").dependOn(&b.addInstallArtifact(decide_serving_tests, .{}).step);
+    const run_decide_serving_tests = ctx.addRunArtifact(decide_serving_tests);
+    run_decide_serving_tests.setEnvironmentVariable("ANTFLY_GLINER_DECIDE_REQUIRE_SERVING_TESTS", "1");
+    const decide_serving_step = ctx.step("test-gliner25-decide-cuda-serving", "Require original Decide CUDA batch-32 ordering, admission and queued cancellation");
+    if (ctx.backend.enable_cuda) {
+        decide_serving_step.dependOn(&run_decide_serving_tests.step);
+    } else {
+        decide_serving_step.dependOn(&b.addFail("Decide CUDA serving tests require -Dcuda=true").step);
+    }
+    const gliner25_production_cuda_tests = b.addTest(.{
+        .name = "gliner25-production-cuda-tests",
+        .max_rss = 24 * 1024 * 1024 * 1024,
+        .root_module = suite.tests.root_module,
+        .filters = &production_cuda_filters,
+        .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    ctx.step("gliner25-production-cuda-test-build", "Build pinned GLiNER2.5 production CUDA serving qualification").dependOn(&b.addInstallArtifact(gliner25_production_cuda_tests, .{}).step);
+    const run_gliner25_production_cuda_tests = ctx.addRunArtifact(gliner25_production_cuda_tests);
+    for (production_cuda_filters) |filter| run_gliner25_production_cuda_tests.addArgs(&.{ "--test-filter", filter });
+    run_gliner25_production_cuda_tests.setEnvironmentVariable("TERMITE_REQUIRE_CUDA_TESTS", "1");
+    run_gliner25_production_cuda_tests.setEnvironmentVariable("ANTFLY_GLINER25_REQUIRE_PRODUCTION_MODELS", "1");
+    run_gliner25_production_cuda_tests.setEnvironmentVariable("ANTFLY_GLINER_DECIDE_BACKEND", "cuda");
+    const production_cuda_step = ctx.step("test-gliner25-production-cuda", "Require pinned GLiNER2.5 CUDA parity and production serving checks");
+    if (ctx.backend.enable_cuda) {
+        production_cuda_step.dependOn(&run_gliner25_production_cuda_tests.step);
+    } else {
+        production_cuda_step.dependOn(&b.addFail("GLiNER2.5 production CUDA qualification requires -Dcuda=true; skipped GPU tests cannot qualify serving").step);
+    }
     // A focused server/library filter need not match an executable-root test.
     // The default aggregate still owns the complete executable-root suites.
     if (selected_test_filters.len == 0) {

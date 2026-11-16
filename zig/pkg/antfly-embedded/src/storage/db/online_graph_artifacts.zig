@@ -376,6 +376,11 @@ test "online graph transfer requires explicit source effect protocol for values 
     try pages.validateArtifactEffect(source, edge, raw);
     try pages.validateArtifactEffect(source, edge, null);
     try std.testing.expectError(error.InvalidMergePage, pages.validateArtifactEffect(source, catalogs.ordered_key, "foreign authority"));
-    source.artifact_catalog.?.effect_protocol = 17;
+    for ([_]u16{ 16, 17, 18 }) |protocol| {
+        source.artifact_catalog.?.effect_protocol = protocol;
+        try pages.validateArtifactEffect(source, edge, raw);
+        try pages.validateArtifactEffect(source, edge, null);
+    }
+    source.artifact_catalog.?.effect_protocol = std.math.maxInt(u16);
     try std.testing.expectError(error.InvalidMergePage, pages.validateArtifactEffect(source, edge, raw));
 }

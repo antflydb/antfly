@@ -69,12 +69,12 @@ fn validateTree(value: V, depth: usize, remaining: *usize) !void {
 /// Document callers select server-owned models, never provider configuration.
 /// Validate the request envelope while leaving schema names and source data
 /// opaque; credential-shaped names in those values are ordinary document data.
-fn validateSubmission(operation: Operation, request: V) !void {
+fn validateSubmission(a: A, operation: Operation, request: V) !void {
     if (request != .object) return error.InvalidInferenceRequest;
     const fields: []const []const u8 = if (operation == .read)
-        &.{ "model", "documents", "images", "prompt", "max_tokens", "retain_artifact" }
+        &.{ "model", "documents", "images", "audio", "audio_options", "prompt", "max_tokens", "retain_artifact" }
     else
-        &.{ "model", "schema_version", "schema", "options", "inputs", "documents", "read_artifact" };
+        &.{ "model", "schema_version", "schema", "options", "inputs", "documents", "read_artifact", "audio_options" };
     for (request.object.keys()) |key| {
         var known = false;
         for (fields) |allowed| if (std.mem.eql(u8, key, allowed)) {
@@ -83,6 +83,10 @@ fn validateSubmission(operation: Operation, request: V) !void {
         };
         if (!known) return error.InvalidInferenceRequest;
     }
+    if (request.object.get("audio_options")) |options| if (options != .null) {
+        const parsed = std.json.parseFromValue(@import("inference_api").AudioReadOptions, a, options, .{}) catch return error.InvalidInferenceRequest;
+        defer parsed.deinit();
+    };
 }
 
 pub const LeasePolicy = struct {
@@ -165,29 +169,29 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
         if (request != .object) return error.InvalidInferenceRequest;
         var nodes: usize = 1_000_000;
         try validateTree(request, 0, &nodes);
-        try validateSubmission(operation, request);
-        // Persist the effective backend selector, never a mutable gateway alias.
+        try validateSubmission(a, operation, request);
+        // Persist the effective selector and defaults. Hosted ASR retains its
+        // deployment-owned runtime identity, never inline provider settings.
         const selector = request.object.get("model") orelse return error.ModelRequired;
         if (selector != .string) return error.InvalidInferenceRequest;
         const named = try gateway.view(server);
-        const task = if (operation == .read) sources.common_provider_registry.gateway.Task.read else .extract;
+        const task = if (operation == .read) sources.common_inference_gateway.Task.read else .extract;
         const local = if (std.mem.indexOfScalar(u8, selector.string, '/') == null or named.contains(task, selector.string)) try gateway.localModels(a, server, task) else &.{};
         const resolved = try named.resolve(task, selector.string, local);
         var connection: []const u8 = if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id;
-        const model = switch (resolved) {
+        const model = if (operation == .read) blk: {
+            const plan = (try sources.common_inference_tasks.planReading(a, named, resolved, request)) orelse return error.DocumentStorageNotConfigured;
+            if (plan.local_only and server.cfg.local_inference_connection_target == null) return error.ModelNotFound;
+            connection = plan.connection orelse connection;
+            request = plan.request;
+            break :blk request.object.get("model").?.string;
+        } else switch (resolved) {
             .local => |value| value.model,
             .connection => |value| blk: {
                 connection = value.connection;
                 break :blk value.model;
             },
             .configured => |value| blk: {
-                if (operation == .read) {
-                    const cfg = try named.readers.?.getConfig(value.name);
-                    if (cfg.provider != .antfly) return error.DocumentStorageNotConfigured;
-                    if (cfg.resolvedUrl() != null) connection = try std.fmt.allocPrint(a, "readers/{s}", .{value.name});
-                    request = try std.json.parseFromSliceLeaky(V, a, try sources.common_provider_registry.tasks.readingBody(a, cfg, request), .{ .parse_numbers = false });
-                    break :blk cfg.model orelse return error.ModelRequired;
-                }
                 const binding = named.providers.extractor_configs.get(value.name) orelse return error.ModelNotFound;
                 connection = binding.connection;
                 break :blk binding.model;
@@ -197,17 +201,6 @@ fn handleBounded(server: anytype, ctx: *httpx.Context, principal: []const u8, op
         _ = try connections.inferenceConnectionAdmissionOwner(server.cfg.node_config, server.cfg.local_inference_connection_target, connection, @tagName(operation));
         try request.object.put(a, "model", .{ .string = model });
         if (operation == .read) {
-            if (!request.object.contains("documents") and !request.object.contains("images")) return error.InvalidInferenceRequest;
-            // Normalize ordinary reader image forms into the document source
-            // path so every durable read uses the shared checkpoint executor.
-            if (request.object.getPtr("images")) |images| {
-                if (images.* != .array or images.array.items.len == 0) return error.InvalidInferenceRequest;
-                for (images.array.items) |*value| if (value.* == .string) {
-                    var image: V = .{ .object = .empty };
-                    try image.object.put(a, "url", value.*);
-                    value.* = image;
-                };
-            }
             _ = request.object.swapRemove("retain_artifact");
         }
         const bytes = try std.json.Stringify.valueAlloc(a, request, .{});
@@ -462,15 +455,38 @@ test "httpx inference gateway document job validation treats schemas and source 
     defer arena.deinit();
     const work = arena.allocator();
     const valid = try std.json.parseFromSliceLeaky(V, work, "{\"model\":\"extractor\",\"schema_version\":2,\"schema\":{\"structures\":{\"record\":{\"fields\":{\"api_key\":\"str\",\"session_token\":\"str\"}}}},\"inputs\":[{\"content\":{\"credentials_json\":\"document data\"}}]}", .{});
-    try validateSubmission(.extract, valid);
+    try validateSubmission(work, .extract, valid);
     // Provider settings are server-owned, not part of either public envelope.
     for ([_][]const u8{ "{\"model\":\"m\",\"api_key\":\"inline\"}", "{\"model\":\"m\",\"generator\":{\"api_key\":\"inline\"}}", "{\"model\":\"m\",\"provider\":\"openai\"}" }) |body| {
         const request = try std.json.parseFromSliceLeaky(V, work, body, .{});
-        try std.testing.expectError(error.InvalidInferenceRequest, validateSubmission(.extract, request));
-        try std.testing.expectError(error.InvalidInferenceRequest, validateSubmission(.read, request));
+        try std.testing.expectError(error.InvalidInferenceRequest, validateSubmission(work, .extract, request));
+        try std.testing.expectError(error.InvalidInferenceRequest, validateSubmission(work, .read, request));
     }
     const read = try std.json.parseFromSliceLeaky(V, work, "{\"model\":\"reader\",\"documents\":[{\"id\":\"receipt\",\"url\":\"https://example.test/file.pdf\"}],\"prompt\":\"Find api_key\"}", .{});
-    try validateSubmission(.read, read);
+    try validateSubmission(work, .read, read);
+}
+
+test "httpx inference gateway document job accepts typed audio options for reading and extraction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]Operation{ .read, .extract }) |operation| {
+        const request = try std.json.parseFromSliceLeaky(V, a,
+            \\{"model":"transcribers/speech","documents":[{"id":"recording","url":"fixture","media_type":"audio/wav"}],"audio_options":{"language":"fr","timestamps":true,"diarization":false}}
+        , .{});
+        try validateSubmission(a, operation, request);
+        for ([_][]const u8{
+            \\{"model":"m","audio_options":{"timestamps":"true"}}
+            ,
+            \\{"model":"m","audio_options":{"provider":"openai"}}
+            ,
+            \\{"model":"m","audio_options":[]}
+            ,
+        }) |body| {
+            const invalid = try std.json.parseFromSliceLeaky(V, a, body, .{});
+            try std.testing.expectError(error.InvalidInferenceRequest, validateSubmission(a, operation, invalid));
+        }
+    }
 }
 
 test "httpx inference gateway document worker renews throughout slow request hydration" {

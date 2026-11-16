@@ -134,7 +134,7 @@ pub fn ImplementationFor(comptime D: type) type {
                 alloc: Allocator,
                 db: anytype,
                 doc_key: []const u8,
-                artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+                artifact_delete_keys: anytype,
             ) !void {
                 for (self.groups.items) |group| {
                     const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", group.artifact_name);
@@ -253,6 +253,11 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const flushDurableReplicationOutboxesLocked = commit.flushDurableReplicationOutboxesLocked;
         pub const flushTransactionReplicationOutbox = commit.flushTransactionReplicationOutbox;
         pub const generatedPrecomputeModeForSyncLevel = preparation.generatedPrecomputeModeForSyncLevel;
+        pub const capturePreparedEnrichments = preparation.capturePreparedEnrichments;
+        pub const validatePreparedEnrichments = preparation.validatePreparedEnrichments;
+        pub const restorePreparedEnrichments = preparation.restorePreparedEnrichments;
+        pub const restorePreparedEnrichmentsForRows = preparation.restorePreparedEnrichmentsForRows;
+        pub const generatedPrecomputeMode = preparation.generatedPrecomputeMode;
         pub const graphMutationIdentityEql = materialization.graphMutationIdentityEql;
         pub const hasConfiguredResolvers = materialization.hasConfiguredResolvers;
         pub const hasCoordinatedConstraints = commit.hasCoordinatedConstraints;
@@ -262,6 +267,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const loadDenseArtifactCounterBootstrap = materialization.loadDenseArtifactCounterBootstrap;
         pub const loadDenseArtifactTargetCounter = materialization.loadDenseArtifactTargetCounter;
         pub const lockApplyForPortableRuntime = commit.lockApplyForPortableRuntime;
+        pub const tryLockApplyForPortableRuntime = commit.tryLockApplyForPortableRuntime;
         pub const maintenanceRequiresOrderedApply = commit.maintenanceRequiresOrderedApply;
         pub const markPrecomputedEnrichmentAppliedForSync = commit.markPrecomputedEnrichmentAppliedForSync;
         pub const maybeFinalizePendingRowPolicyPublication = commit.maybeFinalizePendingRowPolicyPublication;
@@ -278,12 +284,9 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const projectedBatchLsmAdmissionBytes = preparation.projectedBatchLsmAdmissionBytes;
         pub const rememberBulkIngestAllNewIdentityUpserts = commit.rememberBulkIngestAllNewIdentityUpserts;
         pub const replicationMutationBarrier = commit.replicationMutationBarrier;
-        pub const resetCoalescedEntryToDelete = preparation.resetCoalescedEntryToDelete;
         pub const resolveTransactionIntentsInternal = commit.resolveTransactionIntentsInternal;
         pub const resolveTransactionIntentsPrepared = commit.resolveTransactionIntentsPrepared;
         pub const restoreStagingStatus = commit.restoreStagingStatus;
-        pub const setCoalescedEntryToBorrowedWrite = preparation.setCoalescedEntryToBorrowedWrite;
-        pub const setCoalescedEntryToOwnedWrite = preparation.setCoalescedEntryToOwnedWrite;
         pub const shouldApplySplitReplicationLocked = commit.shouldApplySplitReplicationLocked;
         pub const splitMarkerMatches = commit.splitMarkerMatches;
         pub const storedDocumentValuesEqual = preparation.storedDocumentValuesEqual;
@@ -431,6 +434,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const clearGeneratedSparseMemoJobs = preparation.clearGeneratedSparseMemoJobs;
         pub const clearGraphArtifactStatePaged = materialization.clearGraphArtifactStatePaged;
         pub const clearPrecomputeAssetProducerBatchItems = materialization.clearPrecomputeAssetProducerBatchItems;
+        pub const applyAssetPublicationMetadataContext = materialization.applyAssetPublicationMetadataContext;
         pub const clearPublishedAssetArtifactRepairIssuesContext = materialization.clearPublishedAssetArtifactRepairIssuesContext;
         pub const clearPublishedEmbeddingArtifactRepairIssueContext = materialization.clearPublishedEmbeddingArtifactRepairIssueContext;
         pub const clearPublishedEmbeddingArtifactRepairIssuesContext = materialization.clearPublishedEmbeddingArtifactRepairIssuesContext;
@@ -487,7 +491,6 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const derivedCoverageOutcomeCounterValueForStore = materialization.derivedCoverageOutcomeCounterValueForStore;
         pub const directGraphNeighborContextHintsAlloc = materialization.directGraphNeighborContextHintsAlloc;
         pub const documentExtractionFailureManifestPayloadAlloc = materialization.documentExtractionFailureManifestPayloadAlloc;
-        pub const documentExtractionFingerprintAlloc = materialization.documentExtractionFingerprintAlloc;
         pub const documentExtractionKeyIndex = materialization.documentExtractionKeyIndex;
         pub const documentExtractionManifestGeneration = materialization.documentExtractionManifestGeneration;
         pub const documentExtractionManifestHasLastError = materialization.documentExtractionManifestHasLastError;
@@ -528,6 +531,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const encodeStoreLookupKeyWithPinnedSchemaAlloc = commit.encodeStoreLookupKeyWithPinnedSchemaAlloc;
         pub const encodeThinReplayRecordPayload = commit.encodeThinReplayRecordPayload;
         pub const encodeTimestampValue = preparation.encodeTimestampValue;
+        pub const encodeDocumentTimestampValue = preparation.encodeDocumentTimestampValue;
         pub const enforcePortableRuntimeGateOptional = commit.enforcePortableRuntimeGateOptional;
         pub const envBoolEnabled = commit.envBoolEnabled;
         pub const extractAssetSourceValue = materialization.extractAssetSourceValue;
@@ -756,6 +760,7 @@ pub fn ImplementationFor(comptime D: type) type {
         // actual owner. The synchronous worker never copies owned descriptors.
         pub const PreparedBatchOwner = struct {
             const NativeBoundary = @import("../named_callback.zig").Boundary(struct { get_fn: @FieldType(PreparedBatchOwner, "get_fn"), wait_fn: @FieldType(PreparedBatchOwner, "wait_fn"), resolved_wait_fn: @FieldType(PreparedBatchOwner, "resolved_wait_fn") });
+            preparation_context: ?@import("antfly_inference_execution_context").RequestContext = null,
             callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
             recovery: bool,
             context: *anyopaque,
@@ -880,6 +885,7 @@ pub fn ImplementationFor(comptime D: type) type {
                 };
                 var view: PreparedBatchOwner = undefined;
                 inline for (@typeInfo(Execution).@"struct".field_names) |field| @field(view, field) = &@field(receiver, field);
+                view.preparation_context = null;
                 view.callback_dispatch = NativeBoundary.local_dispatch;
                 view.recovery = Receiver == *Execution;
                 view.context = @ptrCast(receiver);

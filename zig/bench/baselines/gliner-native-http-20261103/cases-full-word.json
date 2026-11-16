@@ -1,0 +1,222 @@
+{
+  "cases": [
+    {
+      "id": "full_word_reference",
+      "path": "/ai/v1/extract",
+      "request": {
+        "schema_version": 2,
+        "model": "fastino/gliner2.5-base-v1",
+        "options": {
+          "include_confidence": true,
+          "include_spans": true,
+          "long_document": {
+            "mode": "window",
+            "window_words": 4096,
+            "overlap_words": 128
+          }
+        },
+        "schema": {
+          "entities": [
+            "concept"
+          ]
+        },
+        "inputs": [
+          {
+            "content": "The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. The library indexes records and answers search queries. "
+          }
+        ]
+      },
+      "expected": {
+        "object": "extraction",
+        "model": "fastino/gliner2.5-base-v1",
+        "schema_version": 2,
+        "data": [
+          {
+            "offset_unit": "utf8_bytes",
+            "entities": [
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9849634766578674,
+                "start": 1216,
+                "end": 1230
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9846357107162476,
+                "start": 1160,
+                "end": 1174
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9843752980232239,
+                "start": 1104,
+                "end": 1118
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9837195873260498,
+                "start": 1048,
+                "end": 1062
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9832635521888733,
+                "start": 992,
+                "end": 1006
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9820375442504883,
+                "start": 936,
+                "end": 950
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9817119836807251,
+                "start": 880,
+                "end": 894
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9809082746505737,
+                "start": 824,
+                "end": 838
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9798761606216431,
+                "start": 712,
+                "end": 726
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9796745181083679,
+                "start": 768,
+                "end": 782
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9791415333747864,
+                "start": 656,
+                "end": 670
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9763534069061279,
+                "start": 600,
+                "end": 614
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9756321310997009,
+                "start": 544,
+                "end": 558
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9739342927932739,
+                "start": 488,
+                "end": 502
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9713005423545837,
+                "start": 432,
+                "end": 446
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9694907665252686,
+                "start": 376,
+                "end": 390
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.967592179775238,
+                "start": 320,
+                "end": 334
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9634624123573303,
+                "start": 264,
+                "end": 278
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9588097333908081,
+                "start": 208,
+                "end": 222
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9535868167877197,
+                "start": 152,
+                "end": 166
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.9390444755554199,
+                "start": 96,
+                "end": 110
+              },
+              {
+                "label": "concept",
+                "text": "search queries",
+                "score": 0.8440619707107544,
+                "start": 40,
+                "end": 54
+              }
+            ],
+            "long_document": {
+              "version": 1,
+              "window_count": 1,
+              "window_policy": "source_words_midpoint_ownership",
+              "classification_aggregation": "owned_word_weighted_mean_raw_logits",
+              "duplicate_score": "maximum_calibrated_score",
+              "natural_record_identity": "exact_source_anchor",
+              "other_record_identity": "occurrence",
+              "solver_optimality_scope": "retained_candidate_graph"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 4105,
+          "completion_tokens": 0,
+          "total_tokens": 4105
+        }
+      },
+      "confidence_tolerance": 0.002
+    }
+  ],
+  "artifacts": [
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-local-baseline/zig/zig-out/bin/antfly-inference-http-server",
+    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/zig-out/bin/antfly-inference-http-server",
+    "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/config.json",
+    "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/encoder_config/config.json",
+    "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/model.safetensors",
+    "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer.json",
+    "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer_config.json"
+  ]
+}

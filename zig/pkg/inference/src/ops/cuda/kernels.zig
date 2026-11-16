@@ -45,6 +45,21 @@ fn bundledQ4_0TcHmmaBf16Supported(compute_major: i32, compute_minor: i32) bool {
     return cuda_artifact.hasBf16WmmaCodeFor(compute_major, compute_minor);
 }
 
+// The portable compute_75 PTX exports this symbol with an empty SM80-only
+// body. A non-null symbol is insufficient: require a matching SASS image.
+fn gemma4VisionRegisterArtifactEligible(has_mma_body: bool, compute_major: i32, compute_minor: i32) bool {
+    return has_mma_body and compute_major == 8 and compute_minor == 9;
+}
+
+test "Gemma4 CUDA vision register attention declines portable PTX stubs and other devices" {
+    try std.testing.expect(gemma4VisionRegisterArtifactEligible(true, 8, 9));
+    try std.testing.expect(!gemma4VisionRegisterArtifactEligible(false, 8, 9));
+    for ([_][2]i32{ .{ 7, 5 }, .{ 8, 0 }, .{ 9, 0 }, .{ 12, 1 }, .{ 13, 0 } }) |cc| {
+        try std.testing.expect(!gemma4VisionRegisterArtifactEligible(true, cc[0], cc[1]));
+        try std.testing.expect(!gemma4VisionRegisterArtifactEligible(false, cc[0], cc[1]));
+    }
+}
+
 pub const Q8ActivationEncoding = enum {
     /// Historical Antfly layout: half d, zero half, 32 signed values.
     q8_zp_legacy,
@@ -407,8 +422,9 @@ fn generatedGqaScorePreworkTiled64Eligible(
     compute_major: i32,
     compute_minor: i32,
 ) bool {
-    if (compute_major != 8 or compute_minor != 9 or
-        request.num_heads != 8 or request.num_kv_heads != 1 or
+    const portable_e2b = @import("../../graph/quant_kernel_catalog.zig").portableCudaDeviceSupported(compute_major, compute_minor) and request.num_kv_heads == 1;
+    const gb10_e4b = compute_major == 12 and compute_minor == 1 and request.num_kv_heads == 2;
+    if ((!portable_e2b and !gb10_e4b) or request.num_heads != 8 or
         request.format != 2 or request.value_format != 2)
     {
         return false;
@@ -479,11 +495,10 @@ fn generatedGqaScorePreworkSelectionFor(
             null;
         if (selection) |selected| {
             if (mode == .explicit) return selected;
-            // The default is intentionally architecture- and evidence-bound:
-            // the exact route was qualified on sm_89 and only wins once the
-            // long-context crossover is reached. Explicit mode remains the
-            // controlled path for qualifying other supported architectures.
-            if (compute_major == 8 and compute_minor == 9 and request.kv_seq_len >= 512) return selected;
+            // The same portable kernel already serves explicit mode on these
+            // devices. Keep the bounded long-context crossover, independently
+            // of the machine used to collect benchmark evidence.
+            if (request.kv_seq_len >= 512) return selected;
         }
         return null;
     }
@@ -956,13 +971,39 @@ fn qwen3VlAutomaticM32GqaPrefillEligible(
     mask_len: usize,
     bias_mode: u32,
 ) bool {
-    return compute_major == 8 and
-        compute_minor == 9 and
+    _ = compute_minor;
+    // M32 uses the SM80+ dynamic shared-memory envelope; opaque WMMA
+    // fragment elements are not indexed (rescaling uses shared matrices).
+    return compute_major >= 8 and
         batch == 1 and
         num_heads == 16 and
         num_kv_heads == 8 and
         head_dim == 128 and
         gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode);
+}
+
+/// LightOn's two original checkpoint geometries use the same admitted,
+/// page-16 F16 storage as the explicit MMA profile. Keep this automatic
+/// selection local to OCR; other models and explicit profiles are independent.
+fn lightOnAutomaticM32GqaPrefillEligible(compute_major: i32, batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
+    return compute_major >= 8 and batch == 1 and head_dim == 256 and
+        ((num_heads == 8 and num_kv_heads == 2) or (num_heads == 16 and num_kv_heads == 4)) and
+        gqaPrefillShapeEligible(batch, q_seq_len, num_heads, num_kv_heads, head_dim, mask_len, bias_mode);
+}
+
+test "LightOnOCR3 automatic tensor core prefill covers both full page geometries" {
+    for ([_]i32{ 8, 9, 12 }) |major| {
+        try std.testing.expect(lightOnAutomaticM32GqaPrefillEligible(major, 1, 1914, 8, 2, 256, 0, 0));
+        try std.testing.expect(lightOnAutomaticM32GqaPrefillEligible(major, 1, 4096, 16, 4, 256, 0, 0));
+    }
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(7, 1, 1914, 8, 2, 256, 0, 0));
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(12, 2, 1914, 8, 2, 256, 0, 0));
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(12, 1, 1, 8, 2, 256, 0, 0));
+    try std.testing.expect(lightOnAutomaticM32GqaPrefillEligible(12, 1, 8192, 8, 2, 256, 0, 0));
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(12, 1, 1914, 16, 8, 256, 0, 0));
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(12, 1, 1914, 8, 2, 128, 0, 0));
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(12, 1, 1914, 8, 2, 256, 1, 0));
+    try std.testing.expect(!lightOnAutomaticM32GqaPrefillEligible(12, 1, 1914, 8, 2, 256, 0, 1));
 }
 
 fn fastGqaPrefillEligible(profile: GqaPrefillProfile, batch: usize, q_seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, mask_len: usize, bias_mode: u32) bool {
@@ -1077,7 +1118,7 @@ pub fn gqaSplitkOnlineDecodeReplayScalarsEligible(
 fn gqaSplitkOnlineDecodeEligibility(
     request: GqaSplitkOnlineDecodeRequest,
 ) GqaSplitkOnlineDecodeEligibility {
-    if (request.compute_major != 8 or request.compute_minor != 9) {
+    if (!@import("../../graph/quant_kernel_catalog.zig").portableCudaDeviceSupported(request.compute_major, request.compute_minor)) {
         return .compute_capability_ineligible;
     }
     if (request.batch != 1 or request.q_seq_len != 1 or
@@ -1354,8 +1395,14 @@ const GqaFlashPrefillRequest = struct {
     total_sequence_len: usize,
 };
 
+fn gqaFlashPrefillTargetSupported(major: i32, minor: i32, kv_heads: usize) bool {
+    // E4B's page-16 F16 kernel is also qualified on GB10. The automatic
+    // selector still excludes E4B, so this requires an explicit Flash profile.
+    return (major == 8 and minor == 9) or (major == 12 and minor == 1 and kv_heads == 2);
+}
+
 fn gqaFlashPrefillEligibility(request: GqaFlashPrefillRequest) GqaFlashPrefillEligibility {
-    if (request.compute_major != 8 or request.compute_minor != 9) {
+    if (!gqaFlashPrefillTargetSupported(request.compute_major, request.compute_minor, request.base.num_kv_heads)) {
         return .compute_capability_ineligible;
     }
     const kv_heads: usize = if (request.base.num_kv_heads == 2) 2 else 1;
@@ -2206,6 +2253,39 @@ pub fn attentionMatchSplitScratchBytes(queries: usize) !usize {
     return bytes;
 }
 
+fn rmsQ8RangesOverlap(a: buffer_mod.DeviceBuffer, b: buffer_mod.DeviceBuffer) bool {
+    if (a.ptr == 0 or b.ptr == 0 or a.len == 0 or b.len == 0) return false;
+    return a.ptr < b.ptr +| b.len and b.ptr < a.ptr +| a.len;
+}
+
+test "CUDA RMS Q8 tiled launch rejects overlapping outputs before GPU work" {
+    var module = KernelModule{ .rms_q8_1_2560 = @ptrFromInt(1) };
+    var context: context_mod.CudaContext = undefined;
+    const input = buffer_mod.DeviceBuffer{ .ptr = 0x10000, .len = 2560 * @sizeOf(f32) };
+    const weight = buffer_mod.DeviceBuffer{ .ptr = 0x30000, .len = 2560 * @sizeOf(f32) };
+    const q8 = buffer_mod.DeviceBuffer{ .ptr = 0x50000, .len = 80 * 36 };
+    try std.testing.expectError(error.InvalidCudaState, module.launchRmsQ8Mirror2560(&context, .norm, .{ .ptr = input.ptr + 4, .len = input.len }, q8, input, weight, .{}, .{}, 1e-6));
+    try std.testing.expectError(error.InvalidCudaState, module.launchRmsQ8Mirror2560(&context, .norm, .{ .ptr = 0x70000, .len = input.len }, .{ .ptr = q8.ptr, .len = 1 }, input, weight, .{}, .{}, 1e-6));
+}
+
+test "CUDA E4B prefetch keeps A100 on generic kernels and requires GB10 opt in" {
+    var module = KernelModule{
+        .e4b_head_prefetch_l2 = @ptrFromInt(1),
+        .e4b_pair_prefetch_l2 = @ptrFromInt(2),
+        .e4b_down_prefetch_l2 = @ptrFromInt(3),
+    };
+    const routes = [_]KernelModule.E4bPrefetchRoute{ .head, .pair, .down };
+    for (routes, 0..) |route, index| {
+        // Even an inherited GB10 flag cannot select its kernels on SM80.
+        try std.testing.expect(module.e4bPrefetchFunctionForDevice(true, 8, 0, route) == null);
+        try std.testing.expect(module.e4bPrefetchFunctionForDevice(true, 12, 0, route) == null);
+        try std.testing.expect(module.e4bPrefetchFunctionForDevice(false, 12, 1, route) == null);
+        try std.testing.expectEqual(@as(driver_mod.CUfunction, @ptrFromInt(index + 1)), module.e4bPrefetchFunctionForDevice(true, 12, 1, route));
+    }
+    var missing = KernelModule{};
+    try std.testing.expect(missing.e4bPrefetchFunctionForDevice(true, 12, 1, .head) == null);
+}
+
 pub const KernelModule = struct {
     module: driver_mod.CUmodule = null,
     runtime_jit_modules: [quant_kernel_compiler.first_generated_artifacts.len]driver_mod.CUmodule =
@@ -2275,6 +2355,14 @@ pub const KernelModule = struct {
     linear_pair_bias_f32_tile4_r2: driver_mod.CUfunction = null,
     linear_triple_bias_f32_tile4_r2: driver_mod.CUfunction = null,
     rms_norm_f32: driver_mod.CUfunction = null,
+    e4b_head_prefetch_l2: driver_mod.CUfunction = null,
+    e4b_pair_prefetch_l2: driver_mod.CUfunction = null,
+    e4b_down_prefetch_l2: driver_mod.CUfunction = null,
+    e4b_prefetch_reported: [3]bool = @splat(false),
+    e4b_prefetch_missing_reported: [3]bool = @splat(false),
+    rms_q8_1_2560: driver_mod.CUfunction = null,
+    rms_add_q8_1_2560: driver_mod.CUfunction = null,
+    rms_add_scale_q8_1_2560: driver_mod.CUfunction = null,
     rms_norm_f32_bf16: driver_mod.CUfunction = null,
     rms_norm_add_f32_bf16: driver_mod.CUfunction = null,
     rms_norm_add_f32: driver_mod.CUfunction = null,
@@ -2390,6 +2478,7 @@ pub const KernelModule = struct {
     /// Model-scoped opt-in for Qwen3-VL automatic prefill routes. Explicit
     /// operator-selected profiles remain available to every architecture.
     qwen3vl_automatic_prefill: bool = false,
+    lighton_automatic_prefill: bool = false,
     gqa_splitk_online_decode_telemetry_word: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     kv_write_suffix_decode_scalars_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_turboquant_fast_f32: driver_mod.CUfunction = null,
@@ -2442,6 +2531,7 @@ pub const KernelModule = struct {
     kv_write_suffix_turboquant_f32: driver_mod.CUfunction = null,
     deberta_attention_f32: driver_mod.CUfunction = null,
     deberta_attention_fused_f32: driver_mod.CUfunction = null,
+    deberta_attention_stream_f32: driver_mod.CUfunction = null,
     deberta_attention_stream_f16: driver_mod.CUfunction = null,
     /// Generated tensor-core DeBERTa prefill schedule. It consumes graph
     /// layout F32 directly and owns a 16-query x 32-key tile per CTA.
@@ -2500,6 +2590,9 @@ pub const KernelModule = struct {
     linear_q4_0_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q4_0_f32_tc_hmma_bf16: driver_mod.CUfunction = null,
     linear_q4_0_bf16_staged: driver_mod.CUfunction = null,
+    gemma4_vision_norm_rope_f32: driver_mod.CUfunction = null,
+    gemma4_vision_attention_registers: driver_mod.CUfunction = null,
+    linear_gemma4_q4_0_bf16_raw: driver_mod.CUfunction = null,
     linear_q4_0_bias_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q4_0_bias_gelu_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q4_0_bias_add_f32_tc_hmma: driver_mod.CUfunction = null,
@@ -3415,6 +3508,12 @@ pub const KernelModule = struct {
         var rms_norm_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_f32, module, "termite_rms_norm_f32"));
         const rms_norm_f32_bf16 = loadOptionalFunction(ctx, module, "termite_rms_norm_f32_bf16");
+        const e4b_head_prefetch_l2 = loadOptionalFunction(ctx, module, "antfly_gemma4_e4b_head_prefetch_l2");
+        const e4b_pair_prefetch_l2 = loadOptionalFunction(ctx, module, "antfly_gemma4_e4b_pair_prefetch_l2");
+        const e4b_down_prefetch_l2 = loadOptionalFunction(ctx, module, "antfly_gemma4_e4b_down_prefetch_l2");
+        const rms_q8_1_2560 = loadOptionalFunction(ctx, module, "antfly_rms_q8_1_2560_tile256");
+        const rms_add_q8_1_2560 = loadOptionalFunction(ctx, module, "antfly_rms_add_q8_1_2560_tile256");
+        const rms_add_scale_q8_1_2560 = loadOptionalFunction(ctx, module, "antfly_rms_add_scale_q8_1_2560_tile256");
         const rms_norm_add_f32_bf16 = loadOptionalFunction(ctx, module, "termite_rms_norm_add_f32_bf16");
         var rms_norm_add_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&rms_norm_add_f32, module, "termite_rms_norm_add_f32"));
@@ -3646,6 +3745,7 @@ pub const KernelModule = struct {
         var deberta_attention_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&deberta_attention_f32, module, "termite_deberta_attention_f32"));
         const deberta_attention_fused_f32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_fused_f32");
+        const deberta_attention_stream_f32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_stream_f32");
         const deberta_attention_stream_f16 = loadOptionalFunction(ctx, module, "termite_deberta_attention_stream_f16");
         const deberta_attention_tc_f16_m16n32 = loadOptionalFunction(ctx, module, "termite_deberta_attention_tc_f16_m16n32");
         const deberta_attention_tc_f16_m32n16 = loadOptionalFunction(ctx, module, "termite_deberta_attention_tc_f16_m32n16");
@@ -3969,6 +4069,12 @@ pub const KernelModule = struct {
             .linear_pair_bias_f32_tile4_r2 = linear_pair_bias_f32_tile4_r2,
             .linear_triple_bias_f32_tile4_r2 = linear_triple_bias_f32_tile4_r2,
             .rms_norm_f32 = rms_norm_f32,
+            .e4b_head_prefetch_l2 = e4b_head_prefetch_l2,
+            .e4b_pair_prefetch_l2 = e4b_pair_prefetch_l2,
+            .e4b_down_prefetch_l2 = e4b_down_prefetch_l2,
+            .rms_q8_1_2560 = rms_q8_1_2560,
+            .rms_add_q8_1_2560 = rms_add_q8_1_2560,
+            .rms_add_scale_q8_1_2560 = rms_add_scale_q8_1_2560,
             .rms_norm_f32_bf16 = rms_norm_f32_bf16,
             .rms_norm_add_f32_bf16 = rms_norm_add_f32_bf16,
             .rms_norm_add_f32 = rms_norm_add_f32,
@@ -4094,13 +4200,14 @@ pub const KernelModule = struct {
             .gqa_score_prework_consumer_mode = gqa_score_prework_consumer_mode,
             .gqa_attention_decode_turboquant_split_stage1_f32 = gqa_attention_decode_turboquant_split_stage1_f32,
             .gqa_attention_decode_f16_warp_stage1_f32 = gqa_attention_decode_f16_warp_stage1_f32,
-            .e4b_f16_warp_split_enabled = ctx.info.compute_major == 8 and ctx.info.compute_minor == 9 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT", false),
+            .e4b_f16_warp_split_enabled = gqa_attention_decode_f16_warp_stage1_f32 != null and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_E4B_F16_WARP_SPLIT", false),
             .gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32 = gqa_attention_decode_turboquant_split_stage1_polar4_int8_identity_f32,
             .gqa_attention_decode_turboquant_split_stage2_f32 = gqa_attention_decode_turboquant_split_stage2_f32,
             .gqa_attention_decode_turboquant_f32 = gqa_attention_decode_turboquant_f32,
             .kv_write_suffix_turboquant_f32 = kv_write_suffix_turboquant_f32,
             .deberta_attention_f32 = deberta_attention_f32,
             .deberta_attention_fused_f32 = deberta_attention_fused_f32,
+            .deberta_attention_stream_f32 = deberta_attention_stream_f32,
             .deberta_attention_stream_f16 = deberta_attention_stream_f16,
             .deberta_attention_tc_f16_m16n32 = deberta_attention_tc_f16_m16n32,
             .deberta_attention_tc_f16_m32n16 = deberta_attention_tc_f16_m32n16,
@@ -4155,8 +4262,10 @@ pub const KernelModule = struct {
             .linear_q8_0_bias_add_f32_tc_hmma = linear_q8_0_bias_add_f32_tc_hmma,
             .linear_q4_0_f32_tc_hmma = linear_q4_0_f32_tc_hmma,
             .linear_q4_0_f32_tc_hmma_bf16 = linear_q4_0_f32_tc_hmma_bf16,
-            .linear_q4_0_bf16_staged = if (ctx.info.compute_major == 8 and ctx.info.compute_minor == 9 and
-                bundledQ4_0TcHmmaBf16Supported(ctx.info.compute_major, ctx.info.compute_minor))
+            .gemma4_vision_norm_rope_f32 = loadOptionalFunction(ctx, module, "antfly_gemma4_vision_norm_rope_f32"),
+            .gemma4_vision_attention_registers = if (gemma4VisionRegisterArtifactEligible(cuda_artifact.hasBf16WmmaCodeFor(ctx.info.compute_major, ctx.info.compute_minor), ctx.info.compute_major, ctx.info.compute_minor)) loadOptionalFunction(ctx, module, "antfly_gemma4_vision_attention_registers") else null,
+            .linear_gemma4_q4_0_bf16_raw = if (bundledQ4_0TcHmmaBf16Supported(ctx.info.compute_major, ctx.info.compute_minor)) loadOptionalFunction(ctx, module, "antfly_linear_gemma4_q4_0_bf16_raw") else null,
+            .linear_q4_0_bf16_staged = if (bundledQ4_0TcHmmaBf16Supported(ctx.info.compute_major, ctx.info.compute_minor))
                 loadOptionalFunction(ctx, module, "antfly_linear_q4_0_bf16_staged")
             else
                 null,
@@ -4425,6 +4534,12 @@ pub const KernelModule = struct {
             self.linear_pair_bias_f32_tile4_r2 = null;
             self.linear_triple_bias_f32_tile4_r2 = null;
             self.rms_norm_f32 = null;
+            self.e4b_head_prefetch_l2 = null;
+            self.e4b_pair_prefetch_l2 = null;
+            self.e4b_down_prefetch_l2 = null;
+            self.rms_q8_1_2560 = null;
+            self.rms_add_q8_1_2560 = null;
+            self.rms_add_scale_q8_1_2560 = null;
             self.rms_norm_f32_bf16 = null;
             self.rms_norm_add_f32_bf16 = null;
             self.rms_norm_add_mul_scalar_f32 = null;
@@ -4545,6 +4660,7 @@ pub const KernelModule = struct {
             self.attention_match_repeat_launches = 0;
             self.gqa_prefill_profile = .automatic;
             self.qwen3vl_automatic_prefill = false;
+            self.lighton_automatic_prefill = false;
             self.gqa_score_prework_mode = .automatic;
             self.gqa_score_prework_consumer_mode = .serial;
             for (&self.gqa_prefill_route_log_words) |*word| word.store(0, .monotonic);
@@ -4562,6 +4678,7 @@ pub const KernelModule = struct {
             self.kv_write_suffix_turboquant_f32 = null;
             self.deberta_attention_f32 = null;
             self.deberta_attention_fused_f32 = null;
+            self.deberta_attention_stream_f32 = null;
             self.deberta_attention_stream_f16 = null;
             self.deberta_attention_tc_f16_m16n32 = null;
             self.deberta_attention_tc_f16_m32n16 = null;
@@ -4616,6 +4733,7 @@ pub const KernelModule = struct {
             self.linear_q8_0_bias_add_f32_tc_hmma = null;
             self.linear_q4_0_f32_tc_hmma = null;
             self.linear_q4_0_f32_tc_hmma_bf16 = null;
+            self.linear_gemma4_q4_0_bf16_raw = null;
             self.linear_q4_0_bf16_staged = null;
             self.linear_q4_0_bias_f32_tc_hmma = null;
             self.linear_q4_0_bias_gelu_f32_tc_hmma = null;
@@ -6553,12 +6671,6 @@ pub const KernelModule = struct {
         const use_e4b_stage1 =
             !use_a4b_stage1 and rows == 1 and in_dim == 2560 and out_dim == 262144 and suppress_count == 0 and
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b != null;
-        const stage1 = if (use_a4b_stage1)
-            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b orelse return error.CudaKernelUnavailable
-        else if (use_e4b_stage1)
-            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b orelse return error.CudaKernelUnavailable
-        else
-            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 orelse return error.CudaKernelUnavailable;
         const reduce = self.argmax_reduce_rows_pairs_f32_w16 orelse (self.argmax_reduce_rows_pairs_f32 orelse return error.CudaKernelUnavailable);
         if (rows == 0 or in_dim == 0 or out_dim == 0 or in_dim % q6_k_values_per_block != 0) return error.InvalidCudaState;
         const row_blocks = in_dim / q6_k_values_per_block;
@@ -6571,6 +6683,14 @@ pub const KernelModule = struct {
         try checkRawBytes(input_q8_1, try checkedTensorElements(try checkedTensorElements(rows, q8_row_blocks), q8_1_block_bytes));
         try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q6_k_block_bytes));
         try checkRawBytes(suppress_token_ids, try checkedTensorElements(suppress_count, @sizeOf(i32)));
+
+        const prefetch = if (use_e4b_stage1) self.e4bPrefetchFunction(ctx, .head) else null;
+        const stage1 = if (prefetch) |function| function else if (use_a4b_stage1)
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b orelse return error.CudaKernelUnavailable
+        else if (use_e4b_stage1)
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b orelse return error.CudaKernelUnavailable
+        else
+            self.linear_q6_k_q8_1_argmax_rows_stage1_tile8 orelse return error.CudaKernelUnavailable;
 
         var partial_values_ptr = partial_values.ptr;
         var partial_indices_ptr = partial_indices.ptr;
@@ -6594,6 +6714,7 @@ pub const KernelModule = struct {
         };
         const stage1_threads: usize = if (use_a4b_stage1) 192 else if (use_e4b_stage1) 160 else q6KQ8_1Tile8Stage1Threads(row_blocks);
         try launchBlocks(stage1, ctx, partial_count, stage1_threads, &stage1_params);
+        if (prefetch != null) self.noteE4bPrefetchLaunch(.head);
 
         var dst_ptr = dst.ptr;
         var col_tiles_u32 = try toU32(col_tiles);
@@ -7330,6 +7451,112 @@ pub const KernelModule = struct {
         };
         const bindings = [_]F32RowBinding{ .{ .pointer = &dst_ptr, .base = dst_ptr, .row_bytes = out_dim * @sizeOf(f32) }, .{ .pointer = &input_ptr, .base = input_ptr, .row_bytes = in_dim * @sizeOf(f32) } };
         try launchF32RowTiles(function, ctx, rows, in_dim, out_dim, &rows_u32, &bindings, &params);
+    }
+
+    const E4bPrefetchRoute = enum { head, pair, down };
+
+    fn e4bPrefetchFunction(self: *KernelModule, ctx: *const context_mod.CudaContext, route: E4bPrefetchRoute) driver_mod.CUfunction {
+        const enabled = platform.env.getenvBoolDefault(switch (route) {
+            .head => "ANTFLY_INFERENCE_CUDA_E4B_HEAD_PREFETCH_L2",
+            .pair => "ANTFLY_INFERENCE_CUDA_E4B_PAIR_PREFETCH_L2",
+            .down => "ANTFLY_INFERENCE_CUDA_E4B_DOWN_PREFETCH_L2",
+        }, false);
+        return self.e4bPrefetchFunctionForDevice(enabled, ctx.info.compute_major, ctx.info.compute_minor, route);
+    }
+
+    fn e4bPrefetchFunctionForDevice(self: *KernelModule, enabled: bool, compute_major: i32, compute_minor: i32, route: E4bPrefetchRoute) driver_mod.CUfunction {
+        if (!enabled) return null;
+        const index = @backingInt(route);
+        const device_supported = compute_major == 12 and compute_minor == 1;
+        const function = if (device_supported) switch (route) {
+            .head => self.e4b_head_prefetch_l2,
+            .pair => self.e4b_pair_prefetch_l2,
+            .down => self.e4b_down_prefetch_l2,
+        } else null;
+        if (function == null) {
+            if (!self.e4b_prefetch_missing_reported[index]) {
+                self.e4b_prefetch_missing_reported[index] = true;
+                std.log.warn("cuda_e4b_prefetch: route={s} requested=1 active=0 reason={s}", .{
+                    @tagName(route), if (device_supported) @as([]const u8, "kernel_unavailable") else "unsupported_device",
+                });
+            }
+            return null;
+        }
+        return function;
+    }
+
+    fn noteE4bPrefetchLaunch(self: *KernelModule, route: E4bPrefetchRoute) void {
+        const index = @backingInt(route);
+        if (!self.e4b_prefetch_reported[index]) {
+            self.e4b_prefetch_reported[index] = true;
+            const symbol = switch (route) {
+                .head => "antfly_gemma4_e4b_head_prefetch_l2",
+                .pair => "antfly_gemma4_e4b_pair_prefetch_l2",
+                .down => "antfly_gemma4_e4b_down_prefetch_l2",
+            };
+            std.log.info("cuda_e4b_prefetch: route={s} requested=1 active=1 cache=L2 next_column=1 arithmetic=unchanged kernel={s}", .{ @tagName(route), symbol });
+        }
+    }
+
+    pub const RmsQ8Operation = enum { norm, add, add_scale };
+
+    pub fn hasRmsQ8Mirror2560(self: *const KernelModule, operation: RmsQ8Operation) bool {
+        return switch (operation) {
+            .norm => self.rms_q8_1_2560 != null,
+            .add => self.rms_add_q8_1_2560 != null,
+            .add_scale => self.rms_add_scale_q8_1_2560 != null,
+        };
+    }
+
+    /// Qualified exact single-row E4B shape. The tiled reduction reads the
+    /// whole row in every CTA; all outputs must therefore be disjoint inputs.
+    pub fn launchRmsQ8Mirror2560(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        operation: RmsQ8Operation,
+        dst: buffer_mod.DeviceBuffer,
+        q8: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        residual: buffer_mod.DeviceBuffer,
+        scalar: buffer_mod.DeviceBuffer,
+        eps: f32,
+    ) driver_mod.Error!void {
+        const function = switch (operation) {
+            .norm => self.rms_q8_1_2560,
+            .add => self.rms_add_q8_1_2560,
+            .add_scale => self.rms_add_scale_q8_1_2560,
+        } orelse return error.CudaKernelUnavailable;
+        try checkBytes(dst, 2560);
+        try checkBytes(input, 2560);
+        try checkBytes(weight, 2560);
+        if (q8.ptr == 0 or q8.len < 80 * 36) return error.InvalidCudaState;
+        if (operation != .norm) try checkBytes(residual, 2560);
+        if (operation == .add_scale) try checkBytes(scalar, 1);
+        const output_range = buffer_mod.DeviceBuffer{ .ptr = dst.ptr, .len = 2560 * @sizeOf(f32) };
+        const q8_range = buffer_mod.DeviceBuffer{ .ptr = q8.ptr, .len = 80 * 36 };
+        if (rmsQ8RangesOverlap(output_range, q8_range)) return error.InvalidCudaState;
+        for ([_]buffer_mod.DeviceBuffer{
+            input,                                     weight,
+            if (operation != .norm) residual else .{}, if (operation == .add_scale) scalar else .{},
+        }) |source| {
+            if (rmsQ8RangesOverlap(output_range, source) or rmsQ8RangesOverlap(q8_range, source)) return error.InvalidCudaState;
+        }
+        var dst_ptr = dst.ptr;
+        var q8_ptr = q8.ptr;
+        var mirror_ptr: driver_mod.CUdeviceptr = 0;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var residual_ptr = residual.ptr;
+        var scalar_ptr = scalar.ptr;
+        var rows_u32: u32 = 1;
+        var eps_value = eps;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),    @ptrCast(&q8_ptr),     @ptrCast(&mirror_ptr),
+            @ptrCast(&input_ptr),  @ptrCast(&weight_ptr), @ptrCast(&residual_ptr),
+            @ptrCast(&scalar_ptr), @ptrCast(&rows_u32),   @ptrCast(&eps_value),
+        };
+        try launchBlocks(function, ctx, 10, 256, &params);
     }
 
     pub fn launchRmsNormF32(
@@ -8472,6 +8699,7 @@ pub const KernelModule = struct {
         gh: buffer_mod.DeviceBuffer,
         rows: usize,
         dim: usize,
+        add_residual: bool,
     ) driver_mod.Error!void {
         const count = try checkedTensorElements(rows, dim);
         const gate_dim = try checkedTensorElements(dim, 3);
@@ -8487,6 +8715,7 @@ pub const KernelModule = struct {
         var gh_ptr = gh.ptr;
         var rows_u32 = try toU32(rows);
         var dim_u32 = try toU32(dim);
+        var add_residual_u32: u32 = @intFromBool(add_residual);
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&label_ptr),
@@ -8494,6 +8723,7 @@ pub const KernelModule = struct {
             @ptrCast(&gh_ptr),
             @ptrCast(&rows_u32),
             @ptrCast(&dim_u32),
+            @ptrCast(&add_residual_u32),
         };
         try launch1d(self.gliner_gru_combine_f32, ctx, count, &params);
     }
@@ -9110,6 +9340,48 @@ pub const KernelModule = struct {
         const window = @min(seq, radius *| 2 +| 1);
         try launchBlocksShared(self.gliner_encoder_attention_f32 orelse return error.CudaKernelUnavailable, ctx, try checkedTensorElements(try checkedTensorElements(batch, seq), heads), 128, window * @sizeOf(f32), &params);
     }
+    pub fn launchGemma4VisionNormRope(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, rows: usize, grid_x: usize, grid_y: usize, eps: f32, theta: f32, scale: f32) driver_mod.Error!void {
+        if (rows == 0 or grid_x == 0 or grid_y == 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(rows, 768);
+        try checkBytes(dst, count);
+        try checkBytes(input, count);
+        try checkBytes(weight, 64);
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight.ptr;
+        var rows_u32 = try toU32(rows);
+        var x = try toU32(grid_x);
+        var y = try toU32(grid_y);
+        var epsilon = eps;
+        var base = theta;
+        var multiplier = scale;
+        var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&input_ptr), @ptrCast(&weight_ptr), @ptrCast(&rows_u32), @ptrCast(&x), @ptrCast(&y), @ptrCast(&epsilon), @ptrCast(&base), @ptrCast(&multiplier) };
+        try launchBlocks(self.gemma4_vision_norm_rope_f32 orelse return error.CudaKernelUnavailable, ctx, try checkedTensorElements(rows, 12), 64, &params);
+    }
+
+    pub fn launchGemma4VisionRegisterAttention(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, q: buffer_mod.DeviceBuffer, k: buffer_mod.DeviceBuffer, v: buffer_mod.DeviceBuffer, mask: buffer_mod.DeviceBuffer, batch: usize, seq: usize) driver_mod.Error!void {
+        if (!gemma4VisionRegisterArtifactEligible(cuda_artifact.hasBf16WmmaCodeFor(ctx.info.compute_major, ctx.info.compute_minor), ctx.info.compute_major, ctx.info.compute_minor)) return error.CudaKernelUnavailable;
+        if (ctx.info.compute_major != 8 or ctx.info.compute_minor != 9 or batch == 0 or batch > 4 or seq < 2048 or seq > 3136) return error.InvalidCudaState;
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq), 768);
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkRawBytes(mask, try checkedTensorElements(try checkedTensorElements(batch, seq), @sizeOf(i64)));
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_u32 = try toU32(seq);
+        var heads_u32: u32 = 12;
+        var dim_u32: u32 = 64;
+        var radius_u32 = seq_u32;
+        var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&q_ptr), @ptrCast(&k_ptr), @ptrCast(&v_ptr), @ptrCast(&mask_ptr), @ptrCast(&batch_u32), @ptrCast(&seq_u32), @ptrCast(&heads_u32), @ptrCast(&dim_u32), @ptrCast(&radius_u32) };
+        try launchBlocks(self.gemma4_vision_attention_registers orelse return error.CudaKernelUnavailable, ctx, try checkedTensorElements(batch * 12, (seq + 63) / 64), 256, &params);
+    }
+
     pub fn launchGlinerEncoderAttentionTcF16(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, q: buffer_mod.DeviceBuffer, k: buffer_mod.DeviceBuffer, v: buffer_mod.DeviceBuffer, mask: buffer_mod.DeviceBuffer, batch: usize, seq: usize, heads: usize, dim: usize, radius: usize) driver_mod.Error!void {
         if (ctx.info.compute_major < 7 or batch == 0 or seq == 0 or seq > 8192 or dim != 64 or heads == 0) return error.InvalidCudaState;
         const count = try checkedTensorElements(try checkedTensorElements(batch, seq), try checkedTensorElements(heads, dim));
@@ -11684,10 +11956,9 @@ pub const KernelModule = struct {
                     }
                 },
                 .automatic => {
-                    if (self.qwen3vl_automatic_prefill and
-                        ctx.driver.fns.cuFuncSetAttribute != null and
+                    if (ctx.driver.fns.cuFuncSetAttribute != null and
                         mmaM32GqaPrefillEnabled() and
-                        qwen3VlAutomaticM32GqaPrefillEligible(
+                        ((self.qwen3vl_automatic_prefill and qwen3VlAutomaticM32GqaPrefillEligible(
                             ctx.info.compute_major,
                             ctx.info.compute_minor,
                             batch,
@@ -11697,7 +11968,16 @@ pub const KernelModule = struct {
                             head_dim,
                             mask_len,
                             bias_mode,
-                        ))
+                        )) or (self.lighton_automatic_prefill and lightOnAutomaticM32GqaPrefillEligible(
+                            ctx.info.compute_major,
+                            batch,
+                            q_seq_len,
+                            num_heads,
+                            num_kv_heads,
+                            head_dim,
+                            mask_len,
+                            bias_mode,
+                        ))))
                     {
                         if (self.gqa_attention_prefill_turboquant_mma_m32_f32) |mma_m32_function| {
                             function = mma_m32_function;
@@ -13453,6 +13733,64 @@ pub const KernelModule = struct {
         return true;
     }
 
+    /// Eight FP32 query warps per block, with no additional scratch allocation.
+    pub fn launchDebertaAttentionStreamF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        q_r: buffer_mod.DeviceBuffer,
+        k_r: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!bool {
+        const function = self.deberta_attention_stream_f32 orelse return false;
+        if (seq_len == 0 or seq_len > 512 or batch == 0 or num_heads == 0 or head_dim != 64) return false;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
+        const rel_count = try checkedTensorElements(2 * seq_len - 1, hidden);
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkBytes(q_r, rel_count);
+        try checkBytes(k_r, rel_count);
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq_len) * @sizeOf(i64));
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var q_r_ptr = q_r.ptr;
+        var k_r_ptr = k_r.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&q_r_ptr),
+            @ptrCast(&k_r_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+        };
+        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), (seq_len + 7) / 8);
+        try launchBlocks(function, ctx, blocks, 256, &params);
+        return true;
+    }
+
     /// Generated-style Flash/streaming DeBERTa encoder attention. The
     /// specialized FP16-storage route is intentionally narrow: DeBERTa-base's
     /// 64-wide heads and encoder prefill up to 256 tokens. Callers retain F32
@@ -14474,6 +14812,43 @@ pub const KernelModule = struct {
         try launch2d(function, ctx, (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols, (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows, q_tc_hmma_threads, &params);
     }
 
+    // Same BF16 rounding and accumulation, directly from GGUF blocks.
+    pub fn launchLinearGemma4Q4RawBf16F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_raw: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_gemma4_q4_0_bf16_raw orelse return error.CudaSymbolMissing;
+        if (in_dim == 0 or in_dim % q4_0_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_0_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        try checkBytes(dst, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_raw, try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_0_block_bytes));
+        if (out_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var weight_ptr = weight_raw.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch2d(function, ctx, (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols, (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows, q_tc_hmma_threads, &params);
+    }
+
     pub fn launchLinearQ4_0F32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -14927,13 +15302,16 @@ pub const KernelModule = struct {
         }
         if (in_dim == 10240 and out_dim == 2560) {
             if (rows == 1 and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_Q4_0_LINEAR_Q8_1_TILE4_W10_E4B_DOWN", false)) {
-                if (self.linear_q4_0_q8_1_f32_tile4_w10_e4b_down) |function| {
+                const prefetch = self.e4bPrefetchFunction(ctx, .down);
+                const selected = if (prefetch != null) prefetch else self.linear_q4_0_q8_1_f32_tile4_w10_e4b_down;
+                if (selected) |function| {
                     var params = [_]?*anyopaque{
                         @ptrCast(&dst_ptr),
                         @ptrCast(&input_ptr),
                         @ptrCast(&weight_ptr),
                     };
                     try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads_w10, &params);
+                    if (prefetch != null) self.noteE4bPrefetchLaunch(.down);
                     return;
                 }
             }
@@ -16882,7 +17260,9 @@ pub const KernelModule = struct {
                     return;
                 }
             }
-            if (self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn) |function| {
+            const prefetch = self.e4bPrefetchFunction(ctx, .pair);
+            const selected = if (prefetch != null) prefetch else self.linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn;
+            if (selected) |function| {
                 var params = [_]?*anyopaque{
                     @ptrCast(&dst_ptr),
                     @ptrCast(&input_ptr),
@@ -16891,6 +17271,7 @@ pub const KernelModule = struct {
                     @ptrCast(&activation_u32),
                 };
                 try launchBlocks(function, ctx, out_dim / q4_0_col_tile, q4_0_tiled_threads, &params);
+                if (prefetch != null) self.noteE4bPrefetchLaunch(.pair);
                 return;
             }
         }
@@ -21070,6 +21451,7 @@ pub fn smokeDenseF32(allocator: std.mem.Allocator) !void {
 
     try smokeLinearF32(allocator, &ctx, &module);
     try smokeRmsNormF32(allocator, &ctx, &module);
+    try smokeRmsNormE4BShape(allocator, &ctx, &module);
     try smokeRmsNormBareF32(allocator, &ctx, &module);
     try smokeElementwiseF32(allocator, &ctx, &module);
     try smokeLayerNormF32(allocator, &ctx, &module);
@@ -22474,6 +22856,69 @@ fn smokeRmsNormF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, 
     try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected, 0.003);
+}
+
+// Cover the E4B register-retained fast path, including multiple rows and
+// output aliasing. The oracle accumulates in f64 independently of the GPU tree.
+fn smokeRmsNormE4BShape(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const dim = 2560;
+    const rows = 3;
+    const count = rows * dim;
+    const eps: f32 = 1e-5;
+    const x = try allocator.alloc(f32, count);
+    defer allocator.free(x);
+    const w = try allocator.alloc(f32, dim);
+    defer allocator.free(w);
+    const r = try allocator.alloc(f32, count);
+    defer allocator.free(r);
+    const expected = try allocator.alloc(f32, count);
+    defer allocator.free(expected);
+    const actual = try allocator.alloc(f32, count);
+    defer allocator.free(actual);
+    for (x, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 211)) - 105)) / 31.0;
+    for (w, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18)) / 13.0;
+    for (r, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 53)) - 26)) / 17.0;
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer input.free(ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(ctx, dim * @sizeOf(f32));
+    defer weight.free(ctx);
+    var residual = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer residual.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, count * @sizeOf(f32));
+    defer output.free(ctx);
+    var scalar = try buffer_mod.DeviceBuffer.alloc(ctx, @sizeOf(f32));
+    defer scalar.free(ctx);
+    const scale = [_]f32{-0.375};
+    try weight.copyFromHost(ctx, std.mem.sliceAsBytes(w));
+    try residual.copyFromHost(ctx, std.mem.sliceAsBytes(r));
+    try scalar.copyFromHost(ctx, std.mem.sliceAsBytes(&scale));
+    for (0..3) |op| {
+        for (0..rows) |row| {
+            var sum: f64 = 0;
+            for (x[row * dim ..][0..dim]) |value| sum += @as(f64, value) * value;
+            const inv = 1.0 / @sqrt(sum / dim + eps);
+            for (0..dim) |col| {
+                const i = row * dim + col;
+                var value = @as(f64, x[i]) * inv * w[col];
+                if (op != 0) value += r[i];
+                if (op == 2) value *= scale[0];
+                expected[i] = @floatCast(value);
+            }
+        }
+        for ([_]bool{ false, true }) |in_place| {
+            try input.copyFromHost(ctx, std.mem.sliceAsBytes(x));
+            const dst = if (in_place) input else output;
+            switch (op) {
+                0 => try module.launchRmsNormF32(ctx, dst, input, weight, rows, dim, eps),
+                1 => try module.launchRmsNormAddF32(ctx, dst, input, weight, residual, rows, dim, eps),
+                2 => try module.launchRmsNormAddOutputScaleF32(ctx, dst, input, weight, residual, scalar, rows, dim, eps),
+                else => unreachable,
+            }
+            try dst.copyToHost(ctx, std.mem.sliceAsBytes(actual));
+            try ctx.synchronize();
+            try expectApproxSlice(actual, expected, 5e-6);
+        }
+    }
 }
 
 fn smokeRmsNormBareF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
@@ -24256,7 +24701,7 @@ test "CUDA SM89 split-K online decode selector enforces locked replay capacity" 
 
     request.compute_minor = 0;
     try std.testing.expectEqual(
-        GqaSplitkOnlineDecodeEligibility.compute_capability_ineligible,
+        GqaSplitkOnlineDecodeEligibility.eligible,
         gqaSplitkOnlineDecodeEligibility(request),
     );
     request.compute_minor = 9;
@@ -24347,8 +24792,8 @@ test "CUDA GQA prefill profile is canonical and legacy resolution is unambiguous
     try std.testing.expectEqual(GqaPrefillProfile.automatic, defaults.profile);
     try std.testing.expectEqual(GqaPrefillProfileSource.default, defaults.source);
     // The promoted automatic default attempts paged-F16 Flash first, uses
-    // cooperative dense prefill for F32 attention, and selects the qualified
-    // SM89 Qwen3-VL-2B M32 tensor-core route. It never fails closed; explicit
+    // cooperative dense prefill for F32 attention, and selects the supported
+    // SM80+ Qwen3-VL-2B M32 tensor-core route. It never fails closed; explicit
     // `off` remains the rollback with neither selection.
     try std.testing.expect(defaults.profile.selectsFlashF16Sm89());
     try std.testing.expect(!defaults.profile.failClosed());
@@ -24359,7 +24804,7 @@ test "CUDA GQA prefill profile is canonical and legacy resolution is unambiguous
     try std.testing.expect(!fastGqaPrefillEligible(.automatic, 0, 511, 16, 8, 128, 0, 0));
     try std.testing.expect(!fastGqaPrefillEligible(.automatic, 4, 511, 16, 8, 128, 1, 0));
     try std.testing.expect(qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 159, 16, 8, 128, 0, 0));
-    try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 0, 1, 159, 16, 8, 128, 0, 0));
+    try std.testing.expect(qwen3VlAutomaticM32GqaPrefillEligible(8, 0, 1, 159, 16, 8, 128, 0, 0));
     try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 2, 159, 16, 8, 128, 0, 0));
     try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 159, 8, 1, 256, 0, 0));
     try std.testing.expect(!qwen3VlAutomaticM32GqaPrefillEligible(8, 9, 1, 1, 16, 8, 128, 0, 0));
@@ -24787,7 +25232,7 @@ test "generated CUDA paged score prework selects exact Gemma 4 F16 boundaries" {
     try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 9) == null);
 
     request.block_count = 16;
-    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 0) == null);
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 0) != null);
     try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .disabled, 8, 9) == null);
 
     request.head_dim = 512;
@@ -24838,7 +25283,7 @@ test "generated CUDA paged score prework selects exact Gemma 4 one-KV-head bound
     try std.testing.expectEqual(GeneratedGqaScorePreworkRoute.gemma4_f16_local, local.route);
     try std.testing.expectEqual(@as(u16, 512), local.score_capacity);
     try std.testing.expectEqual(@as(?usize, 16 * 1024), local.workspaceBytes(8));
-    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 0) == null);
+    try std.testing.expect(generatedGqaScorePreworkSelectionFor(request, .automatic, 8, 0) != null);
 
     // The benchmark's 2,051 prompt tokens plus 299 subsequent decode
     // positions remain eligible with logical page coverage independent of a
@@ -24918,12 +25363,10 @@ test "generated CUDA score prework tiled64 consumer is typed and fail closed" {
     try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.tiled64, required.consumer);
     try std.testing.expect(required.tiled64_required);
 
-    // Explicit score prework can run on other architectures, but the tiled
-    // candidate remains SM89-only. Required mode carries the unsatisfied
-    // requirement to launch-time so it errors instead of silently falling
-    // back to serial.
+    // Portable tiled score consumers select on A100 too. Required mode still
+    // rejects unsupported shapes instead of silently falling back to serial.
     try std.testing.expectEqual(
-        std.meta.Tag(GeneratedGqaScorePreworkDecision).required_tiled64_rejected,
+        std.meta.Tag(GeneratedGqaScorePreworkDecision).selected,
         std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .explicit, .required_tiled64, 8, 0)),
     );
 
@@ -24986,6 +25429,49 @@ test "generated CUDA score prework tiled64 consumer is typed and fail closed" {
         return error.MissingScorePreworkSelection;
     try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.tiled64, global.consumer);
     try std.testing.expectEqual(@as(u16, 4096), global.score_capacity);
+}
+
+test "generated CUDA tiled64 GB10 E4B opt-in preserves topology format and paging bounds" {
+    var request = GeneratedGqaScorePreworkRequest{
+        .batch = 1,
+        .q_seq_len = 1,
+        .kv_seq_len = 256,
+        .num_heads = 8,
+        .num_kv_heads = 2,
+        .head_dim = 256,
+        .sliding_window = 512,
+        .mask_len = 0,
+        .bias_mode = 0,
+        .key_row_bytes = 1024,
+        .base_key_row_bytes = 1024,
+        .value_row_bytes = 1024,
+        .block_count = 16,
+        .page_size_tokens = 16,
+        .format = 2,
+        .value_format = 2,
+        .physical_token_capacity = 256,
+    };
+    const selected = generatedGqaScorePreworkSelectionWithConsumerFor(request, .explicit, .required_tiled64, 12, 1) orelse return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.tiled64, selected.consumer);
+    try std.testing.expect(selected.tiled64_required);
+    // The eligibility extension does not promote automatic score prework.
+    try std.testing.expect(generatedGqaScorePreworkSelectionWithConsumerFor(request, .automatic, .serial, 12, 1) == null);
+    for ([_][2]i32{ .{ 12, 0 }, .{ 8, 0 }, .{ 8, 9 } }) |cc| {
+        const other = generatedGqaScorePreworkSelectionWithConsumerFor(request, .explicit, .tiled64, cc[0], cc[1]) orelse return error.MissingScorePreworkSelection;
+        try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.serial, other.consumer);
+    }
+    request.block_count = 15;
+    try std.testing.expectEqual(std.meta.Tag(GeneratedGqaScorePreworkDecision).required_tiled64_rejected, std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .explicit, .required_tiled64, 12, 1)));
+    request.block_count = 16;
+    request.head_dim = 512;
+    request.sliding_window = 0;
+    request.key_row_bytes = 2048;
+    request.base_key_row_bytes = 2048;
+    request.value_row_bytes = 2048;
+    const global = generatedGqaScorePreworkSelectionWithConsumerFor(request, .explicit, .required_tiled64, 12, 1) orelse return error.MissingScorePreworkSelection;
+    try std.testing.expectEqual(GeneratedGqaScorePreworkConsumer.tiled64, global.consumer);
+    request.value_format = 0;
+    try std.testing.expectEqual(std.meta.Tag(GeneratedGqaScorePreworkDecision).required_tiled64_rejected, std.meta.activeTag(generatedGqaScorePreworkDecisionFor(request, .explicit, .required_tiled64, 12, 1)));
 }
 
 test "generated CUDA score prework consumer telemetry is bounded by event consumer and head dim" {
@@ -25494,6 +25980,12 @@ test "E4B Flash selector checks two-head strides and long-context bounds" {
         .base = .{ .batch = 1, .q_seq_len = 2048, .kv_seq_len = 32768, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .mask_len = 0, .bias_mode = 0, .key_row_bytes = 2048, .base_key_row_bytes = 2048, .value_row_bytes = 2048, .block_count = 2048, .page_size_tokens = 16, .format = 2, .value_format = 2, .physical_token_capacity = 32768, .block_table_present = true, .decode_scalars_present = false },
     };
     try std.testing.expect(gqaFlashPrefillEligibility(request) == .eligible);
+    request.compute_major = 12;
+    request.compute_minor = 1;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .eligible);
+    request.compute_minor = 0;
+    try std.testing.expect(gqaFlashPrefillEligibility(request) == .compute_capability_ineligible);
+    request.compute_minor = 1;
     // The old one-KV-head exact/warp entry points must still reject E4B.
     try std.testing.expect(gqaF16PrefillEligibility(request.base) == .shape_ineligible);
     request.base.value_row_bytes = 1024;
@@ -25511,6 +26003,16 @@ test "E4B Flash selector checks two-head strides and long-context bounds" {
     request.query_position_offset = 24575;
     request.base.q_seq_len = 8193;
     try std.testing.expect(gqaFlashPrefillEligibility(request) == .query_length_policy_ineligible);
+}
+
+test "E4B Flash prefill target gate keeps GB10 qualification narrow" {
+    try std.testing.expect(gqaFlashPrefillTargetSupported(8, 9, 1));
+    try std.testing.expect(gqaFlashPrefillTargetSupported(8, 9, 2));
+    try std.testing.expect(gqaFlashPrefillTargetSupported(12, 1, 2));
+    try std.testing.expect(!gqaFlashPrefillTargetSupported(12, 1, 1));
+    try std.testing.expect(!gqaFlashPrefillTargetSupported(12, 0, 2));
+    try std.testing.expect(!gqaFlashPrefillTargetSupported(8, 0, 2));
+    try std.testing.expect(!gqaFlashPrefillTargetSupported(9, 0, 2));
 }
 
 test "E4B Flash warp decode selection preserves compressed and E2B routes" {
@@ -25532,4 +26034,13 @@ test "E4B Flash warp decode selection preserves compressed and E2B routes" {
     module.gqa_attention_decode_turboquant_split_stage2_f32 = @ptrFromInt(1);
     module.gqa_attention_decode_f16_warp_stage1_f32 = null;
     try std.testing.expect(!module.e4bF16WarpSplitSelected(8, 2, 256, 2, 2));
+}
+
+test "CUDA A4B baseline primitives execute on the loaded device without a GPU allowlist" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = try context_mod.CudaContext.initDefault();
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    try smokeGemma4A4BResidentQ4_0(std.testing.allocator, &ctx, &module);
 }

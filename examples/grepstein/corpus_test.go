@@ -90,7 +90,7 @@ func TestCorpusPilotStopsBeforeOpeningLaterPDF(t *testing.T) {
 		t.Fatalf("records=%d", len(records))
 	}
 	loc := records[0].Document["metadata"].(map[string]any)["source_locator"].(map[string]any)
-	if loc["first"] != float64(1) || loc["last"] != float64(2) {
+	if loc["first"] != json.Number("1") || loc["last"] != json.Number("2") {
 		t.Fatalf("range=%v", loc)
 	}
 	cfg := testCorpusConfig(t, state)
@@ -140,6 +140,14 @@ func TestCorpusResumeTruncatesUncommittedTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Model a preparation resumed much later without a timing-dependent sleep.
+	// Both committed and replayed rows must retain the saved generation time.
+	cfg := testCorpusConfig(t, state)
+	expected = bytes.ReplaceAll(expected, []byte(fmt.Sprintf("\"indexed_at\":%d", cfg.IndexedAt)), []byte("\"indexed_at\":1700000000"))
+	cfg.IndexedAt = 1700000000
+	if err := atomicCorpusJSON(filepath.Join(state, "sources.json"), cfg); err != nil {
+		t.Fatal(err)
+	}
 	inventory, _ := os.ReadFile(filepath.Join(state, "inventory.ndjson"))
 	lines := bytes.SplitAfter(expected, []byte("\n"))
 	firstOffset := len(lines[0]) + len(lines[1])
@@ -162,7 +170,7 @@ func TestCorpusResumeTruncatesUncommittedTail(t *testing.T) {
 func TestCorpusAudioZIPRangeAndSourceSecurity(t *testing.T) {
 	dir := t.TempDir()
 	archive := createTestZip(t, map[string][]byte{"nested/EFTA00000001.wav": []byte("RIFFaudio"), "EFTA00000002.mp4": []byte("video"), "__MACOSX/._noise.pdf": []byte("noise")})
-	cfg := corpusConfig{Key: "test-key", Sources: []corpusSource{{Dataset: "ds11", Path: archive, Zip: true}}}
+	cfg := corpusConfig{Profile: "transcription", Key: "test-key", Sources: []corpusSource{{Dataset: "ds11", Path: archive, Zip: true}}}
 	inventory := filepath.Join(dir, "inventory")
 	if err := discoverCorpus(cfg, inventory); err != nil {
 		t.Fatal(err)
@@ -225,7 +233,7 @@ func TestCorpusExternalSort(t *testing.T) {
 		writeCorpusFixture(t, filepath.Join(source, fmt.Sprintf("EFTA%08d.wav", i)), []byte("audio"))
 	}
 	output := filepath.Join(dir, "out")
-	if err := discoverCorpus(corpusConfig{Sources: []corpusSource{{Dataset: "ds9", Path: source}}}, output); err != nil {
+	if err := discoverCorpus(corpusConfig{Profile: "transcription", Sources: []corpusSource{{Dataset: "ds9", Path: source}}}, output); err != nil {
 		t.Fatal(err)
 	}
 	file, _ := os.Open(output)
@@ -259,7 +267,7 @@ func TestCorpusLoadResumeAfterFailedBatch(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		writeCorpusFixture(t, filepath.Join(source, fmt.Sprintf("EFTA%08d.wav", i)), []byte("audio"))
 	}
-	if err := corpusPrepareCmd([]string{"--state", state, "--source", "ds9=" + source}); err != nil {
+	if err := corpusPrepareCmd([]string{"--profile", "transcription", "--state", state, "--source", "ds9=" + source}); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(state, "records.ndjson"))
@@ -272,7 +280,7 @@ func TestCorpusLoadResumeAfterFailedBatch(t *testing.T) {
 	if err = atomicCorpusJSON(filepath.Join(state, "publication.json"), map[string]any{"sha256": fmt.Sprintf("%x", sha256.Sum256(data)), "records": 2}); err != nil {
 		t.Fatal(err)
 	}
-	indexConfig, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, DefaultInferenceURL, "", false, false)
+	indexConfig, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, DefaultInferenceURL, "", false, false, corpusIndexOptions{Profile: "transcription"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +340,7 @@ func TestCorpusLoadResumeAfterFailedBatch(t *testing.T) {
 		io.WriteString(w, `{}`)
 	}))
 	defer server.Close()
-	args := []string{"--state", state, "--url", server.URL, "--batch-size", "1", "--semantic=false"}
+	args := []string{"--state", state, "--url", server.URL, "--inference-url", DefaultInferenceURL, "--batch-size", "1", "--semantic=false"}
 	if err := corpusLoadCmd(append(append([]string{}, args...), "--create-table", "--create-only")); err != nil || !created {
 		t.Fatalf("public table creation contract failed: %v", err)
 	}
@@ -362,6 +370,62 @@ func TestCorpusTruncatedManifestIsNotEOF(t *testing.T) {
 	var record corpusRecord
 	if _, err := readCorpusLine(bufio.NewReader(strings.NewReader(`{"id":"partial"}`)), &record); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestCorpusManifestPreservesArchiveNanosecondsAndPageOffsets(t *testing.T) {
+	archive := createTestZip(t, map[string][]byte{"document.pdf": createMultiPagePDF(4)})
+	stamp := time.Unix(0, 1792906979419410749)
+	if err := os.Chtimes(archive, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(t.TempDir(), "state")
+	if err := corpusPrepareCmd([]string{"--state", state, "--source", "doj-06=" + archive, "--pages-per-record", "2"}); err != nil {
+		t.Fatal(err)
+	}
+	records := testCorpusRecords(t, state)
+	if len(records) != 2 {
+		t.Fatalf("prepared %d records", len(records))
+	}
+	metadata := records[1].Document["metadata"].(map[string]any)
+	raw, err := json.Marshal(metadata["source_locator"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loc sourceLocator
+	if err := json.Unmarshal(raw, &loc); err != nil {
+		t.Fatal(err)
+	}
+	if loc.Modified != mustStat(t, archive).ModTime().UnixNano() {
+		t.Fatalf("archive timestamp changed during manifest decoding: %d", loc.Modified)
+	}
+	if citation, page := corpusPageCitation("s3://bucket/document.pdf", metadata, 2); page != 4 || citation != "s3://bucket/document.pdf#page=4" {
+		t.Fatalf("lost original page offset: %s (%d)", citation, page)
+	}
+	store := newCorpusStore(testCorpusConfig(t, state))
+	defer store.Close()
+	if err := warmCorpusPageWindows(store, filepath.Join(state, "records.ndjson")); err != nil {
+		t.Fatalf("unchanged prepared archive rejected: %v", err)
+	}
+	reader, err := store.open(loc)
+	if err != nil {
+		t.Fatalf("unchanged archive could not be opened for publication: %v", err)
+	}
+	reader.Close()
+	changed := stamp.Add(time.Second)
+	if err := os.Chtimes(archive, changed, changed); err != nil {
+		t.Fatal(err)
+	}
+	if reader, err := store.open(loc); err == nil {
+		reader.Close()
+		t.Fatal("changed archive passed the revision guard")
+	}
+}
+
+func TestCorpusManifestRejectsTrailingJSON(t *testing.T) {
+	var record corpusRecord
+	if _, err := readCorpusLine(bufio.NewReader(strings.NewReader("{\"id\":\"first\"} {\"id\":\"second\"}\n")), &record); err == nil {
+		t.Fatal("multiple JSON values were accepted as one manifest record")
 	}
 }
 func TestCorpusExtractorModelUsesRegisteredIdentifier(t *testing.T) {

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Raw FFI declarations for libantfly, the embedded Antfly C ABI (hand-written, no bindgen)"
+repository = "https://github.com/antflydb/antfly"
 links = "antfly"
 build = "build.rs"
 

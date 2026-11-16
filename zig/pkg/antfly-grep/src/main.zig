@@ -63,6 +63,8 @@ const help =
     \\      --dictionary PATH     Brotli/LZ4/Zstandard external dictionary
     \\      --source-endpoint URL Discover sources from an ordinary Antfly catalog table
     \\      --source-table TABLE  Catalog table (default: antfly_sources)
+    \\      --artifact NAME       Select a source text/artifact stream (repeatable)
+    \\      --all-artifacts       Search every configured text/artifact stream
     \\      --source-principal ID Additional local reader identity (repeatable)
     \\      --source-catalog FILE Portable source profile (no Cloud dependency)
     \\      --cloud              Search authorized sources from antfly-cloud login
@@ -104,6 +106,7 @@ const help =
     \\      --max-requests N      Request budget: N or unlimited (default 1000)
     \\      --model MODEL         Decision model (or ANTFLY_GREP_MODEL)
     \\      --media text|images   Text regions or whole image/page/slide evidence
+    \\      --indexed-media-transport inline|source  Antfly gateway media references (indexed images)
     \\      --max-image-bytes N   Encoded image bytes (512K; maximum 768K)
     \\      --max-image-pixels N  Image pixel admission (16777216)
     \\      --provider NAME       antfly, openai, custom, local

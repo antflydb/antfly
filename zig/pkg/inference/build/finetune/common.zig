@@ -18,6 +18,7 @@ const std = @import("std");
 pub const Import = enum {
     antfly_extracting,
     antfly_image,
+    antfly_video,
     antfly_platform,
     build_options,
     build_info,
@@ -83,6 +84,7 @@ pub const Context = struct {
         return switch (import) {
             .antfly_extracting => ctx.inference_internal_mod.import_table.get("antfly_extracting").?,
             .antfly_image => ctx.antfly_image_mod,
+            .antfly_video => ctx.inference_internal_mod.import_table.get("antfly_video").?,
             .antfly_platform => ctx.antfly_platform_mod,
             .build_options => ctx.build_options_mod,
             .build_info => ctx.build_info_mod,

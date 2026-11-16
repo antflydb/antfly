@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const allocator = @import("allocator.zig");
+pub const document_pipeline_metrics = @import("document_pipeline_metrics.zig");
 pub const atomic = @import("atomic.zig");
 pub const clock = @import("clock.zig");
 pub const env = @import("env.zig");
@@ -22,6 +23,8 @@ pub const filesystem = @import("filesystem.zig");
 pub const inference_process_supervisor = @import("inference_process_supervisor.zig");
 pub const one_shot_process = @import("one_shot_process.zig");
 pub const process = @import("process.zig");
+pub const inference_settings = @import("inference_settings.zig");
+pub const resource_policy = @import("resource_policy.zig");
 pub const process_memory = @import("process_memory.zig");
 pub const sync = @import("sync.zig");
 pub const time = @import("time.zig");

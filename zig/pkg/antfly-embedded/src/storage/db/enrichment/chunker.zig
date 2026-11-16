@@ -76,6 +76,15 @@ pub fn chunkTextWithConfigJson(
     return try chunkTextWithConfigJsonAndProvider(alloc, text, config_json, null);
 }
 
+pub fn chunkTextWithConfigJsonControlled(alloc: Allocator, text: []const u8, config_json: []const u8, context: ?@import("antfly_inference_execution_context").RequestContext) ![]Chunk {
+    if (context) |control| {
+        try control.check();
+        const provider = chunk_provider.Provider{ .execution = .{ .io = control.io, .deadline_ns = control.deadline_ns, .cancellation = control.cancellation orelse .none } };
+        return chunkTextWithConfigJsonAndProvider(alloc, text, config_json, provider);
+    }
+    return chunkTextWithConfigJson(alloc, text, config_json);
+}
+
 pub fn chunkTextWithConfigJsonAndProvider(
     alloc: Allocator,
     text: []const u8,
@@ -209,4 +218,19 @@ test "enrichment configured chunker replaces invalid utf8 before dispatch" {
     try std.testing.expectEqual(@as(?u32, 0), chunks[0].start_offset);
     try std.testing.expectEqual(@as(?u32, 9), chunks[0].end_offset);
     try std.testing.expect(utf8_text.invalidUtf8RepairCount() > repairs_before);
+}
+
+test "enrichment chunker omits short text with either fixed provider" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "mock", "antfly" }) |provider| {
+        const config = try std.fmt.allocPrint(a, "{{\"provider\":\"{s}\",\"text\":{{\"min_chars\":16}}}}", .{provider});
+        defer a.free(config);
+        const empty = try chunkTextWithConfigJson(a, "C-8\n)\n", config);
+        defer freeChunks(a, empty);
+        try std.testing.expectEqual(@as(usize, 0), empty.len);
+        const chunks = try chunkTextWithConfigJson(a, "replace all six gyroscopes", config);
+        defer freeChunks(a, chunks);
+        try std.testing.expectEqual(@as(usize, 1), chunks.len);
+        try std.testing.expectEqualStrings("replace all six gyroscopes", chunks[0].text.?);
+    }
 }

@@ -15,9 +15,10 @@
 
 //! Transport-neutral operations for internal group coordination.
 
+const storage_descriptor_errors = @import("storage_descriptor_errors.zig");
 const std = @import("std");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const batch_api = @import("antfly_local_sources").api_batch;
+const batch_api = @import("antfly_local_sources").api_internal_batch;
 const distributed_txn = @import("distributed_txn.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
@@ -49,14 +50,18 @@ fn logUnknownTransitionFailure(group_id: u64, action: metadata_mod.TransitionAct
 }
 
 pub const Error = operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
+    ResourceBudgetExceeded,
     RetainedEffectsFull,
     AuthoritativeLookupMissing,
     TopologyChanged,
     IdentityReadGenerationChanged,
     IndexGenerationMismatch,
+    IndexRebuilding,
+    IncompletePublishedSnapshot,
     GenerationTransitionActive,
     HierarchyCursorStale,
     DocumentArtifactPublicationFailed,
+    ArtifactPublicationPending,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
     ReadIndexTimeout,
@@ -77,6 +82,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     EnrichmentWorkerFailed,
     RepairCanceled,
     InvalidRepairCancelToken,
+    UnsupportedQueryRequest,
 };
 
 /// A rejected primary mutation can be retried after retention catches up.
@@ -292,6 +298,7 @@ pub const Operations = struct {
     }
 
     fn mapCommonReadError(err: anyerror) ?Error {
+        if (storage_descriptor_errors.isPressure(err)) return error.StorageReadTemporarilyUnavailable;
         if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
         if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
         return switch (err) {
@@ -303,6 +310,8 @@ pub const Operations = struct {
             error.TopologyChanged => error.TopologyChanged,
             error.IdentityReadGenerationChanged => error.IdentityReadGenerationChanged,
             error.IndexGenerationMismatch => error.IndexGenerationMismatch,
+            error.IndexRebuilding => error.IndexRebuilding,
+            error.IncompletePublishedSnapshot => error.IncompletePublishedSnapshot,
             error.GenerationTransitionActive => error.GenerationTransitionActive,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
             error.DocumentArtifactPublicationFailed => error.DocumentArtifactPublicationFailed,
@@ -478,7 +487,7 @@ pub const Operations = struct {
             error.EnrichmentWaitTimeout => return error.EnrichmentWaitTimeout,
             error.EnrichmentRetryInProgress => return error.EnrichmentRetryInProgress,
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
-            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
+            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable, error.Unavailable => return error.GroupLeaderUnavailable,
             else => {
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
@@ -667,7 +676,7 @@ pub const Operations = struct {
             error.EnrichmentWaitTimeout => return error.EnrichmentWaitTimeout,
             error.EnrichmentRetryInProgress => return error.EnrichmentRetryInProgress,
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
-            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
+            error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable, error.Unavailable => return error.GroupLeaderUnavailable,
             else => {
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
@@ -968,6 +977,7 @@ pub const Operations = struct {
             input,
         ) catch |err| switch (err) {
             error.InvalidBatchRequest, error.InvalidArgument => return error.InvalidArgument,
+            error.ArtifactPublicationPending => return error.ArtifactPublicationPending,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,
@@ -1086,8 +1096,7 @@ pub const Operations = struct {
                     context: operation.RequestContext,
                     fn canceled(ptr: *const anyopaque) bool {
                         const deadline_context: *const @This() = @ptrCast(@alignCast(ptr));
-                        deadline_context.context.ensureActive() catch return true;
-                        return false;
+                        return deadline_context.context.isCancellationRequested();
                     }
                 };
                 const deadline: Deadline = .{ .context = request };
@@ -1137,11 +1146,12 @@ pub const Operations = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
     ) Error!db_mod.types.DocumentArtifactManifest {
-        try request.ensureActive();
+        const control = try request.platformDeadline();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .read_index) catch |err| {
+        return (reads.documentArtifactManifestGroupLocalControlled(alloc, group_id, table_name, doc_key, artifact_name, .read_index, .{ .execution_deadline_ns = control.deadline_ns, .cancellation = control.cancellation }) catch |err| {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
+                error.ResourceBudgetExceeded => error.ResourceBudgetExceeded,
                 error.UnknownGroup, error.TableNotFound, error.NotFound => error.NotFound,
                 else => error.Internal,
             };
@@ -1222,7 +1232,8 @@ pub const Operations = struct {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
                 error.HierarchyCursorStale => error.HierarchyCursorStale,
-                error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => error.InvalidArgument,
+                error.UnsupportedQueryRequest => error.UnsupportedQueryRequest,
+                error.InvalidQueryRequest, error.InvalidArgument, error.IndexNotFound => error.InvalidArgument,
                 error.UnknownGroup, error.TableNotFound => error.NotFound,
                 else => error.Internal,
             };
@@ -1385,6 +1396,7 @@ pub const Operations = struct {
 };
 
 fn mapLookupError(err: anyerror) Error {
+    if (storage_descriptor_errors.isPressure(err)) return error.StorageReadTemporarilyUnavailable;
     return switch (err) {
         error.Timeout => error.DeadlineExceeded,
         error.Cancelled, error.Canceled => error.Canceled,
@@ -1397,7 +1409,6 @@ fn mapLookupError(err: anyerror) Error {
         error.UnknownGroup,
         error.ReadUnavailable,
         => error.GroupLeaderUnavailable,
-        error.PersistentDescriptorAdmissionExhausted,
         error.ResourceBudgetExceeded,
         error.WriterLocked,
         error.LsmRootWriterAlreadyOpen,
@@ -1528,8 +1539,9 @@ fn consumerTests() type {
                 source.failure = @field(errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
-            inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
-                source.failure = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
+            const execution_errors = @import("antfly_local_sources").schema_relational_expression_errors.Error || @import("relational_row_errors.zig").PolicyError;
+            inline for (@typeInfo(execution_errors).error_set.error_names.?) |field| {
+                source.failure = @field(execution_errors, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
         }
@@ -2124,6 +2136,10 @@ fn consumerTests() type {
                 .{},
                 forwarding,
             ));
+            for ([_]anyerror{ error.Unavailable, error.MetadataSnapshotUnavailable }) |failure| {
+                state.visibility_error = failure;
+                try std.testing.expectError(error.GroupLeaderUnavailable, operations.routedBatch(std.testing.allocator, request, 17, "documents", .{}, forwarding));
+            }
         }
 
         test "typed internal query workers preserve identity generation validation" {
@@ -2176,7 +2192,7 @@ fn consumerTests() type {
                 .shard_db_adapter = null,
             };
 
-            try std.testing.expectError(error.InvalidArgument, operations.query(
+            try std.testing.expectError(error.UnsupportedQueryRequest, operations.query(
                 std.testing.allocator,
                 .{},
                 17,
@@ -2237,11 +2253,13 @@ fn consumerTests() type {
                 Operations.mapCommonReadError(error.CatalogRoutingUnavailable).?,
             );
             const FakeReads = struct {
+                artifact_error: anyerror = error.StorageReadTemporarilyUnavailable,
                 scan_error: anyerror = error.StorageReadTemporarilyUnavailable,
 
                 fn source(self: *@This()) table_reads.TableReadSource {
                     return .{ .ptr = self, .vtable = &.{
                         .lookup = lookup,
+                        .lookup_group_local = groupLookup,
                         .scan = scan,
                         .query = publicQuery,
                         .query_group_local = groupQuery,
@@ -2250,12 +2268,18 @@ fn consumerTests() type {
                         .text_stats_group_local = auxiliary,
                         .algebraic_partials_group_local = auxiliary,
                         .document_artifact_manifest_group_local = artifact,
+                        .document_artifact_manifest_group_local_controlled = artifactControlled,
                         .document_artifact_manifests_group_local = artifacts,
                     } };
                 }
 
-                fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
-                    return null;
+                fn lookup(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.scan_error;
+                }
+
+                fn groupLookup(raw: *anyopaque, allocator: std.mem.Allocator, _: u64, table: []const u8, key: []const u8, options: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+                    return lookup(raw, allocator, table, key, options, consistency);
                 }
 
                 fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
@@ -2266,12 +2290,14 @@ fn consumerTests() type {
                     return null;
                 }
 
-                fn groupQuery(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
-                    return error.StorageReadTemporarilyUnavailable;
+                fn groupQuery(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.scan_error;
                 }
 
-                fn groupPreflight(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency, _: u32) !?runtime_preflight.RuntimePreflightSummary {
-                    return error.StorageReadTemporarilyUnavailable;
+                fn groupPreflight(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency, _: u32) !?runtime_preflight.RuntimePreflightSummary {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.scan_error;
                 }
 
                 fn groupScan(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
@@ -2291,8 +2317,13 @@ fn consumerTests() type {
                     return error.StorageReadTemporarilyUnavailable;
                 }
 
-                fn artifact(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
-                    return error.StorageReadTemporarilyUnavailable;
+                fn artifactControlled(raw: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, key: []const u8, name: []const u8, consistency: raft_mod.ReadConsistency, _: db_mod.types.LookupOptions) !?db_mod.types.DocumentArtifactManifest {
+                    return artifact(raw, allocator, group, table, key, name, consistency);
+                }
+
+                fn artifact(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.artifact_error;
                 }
 
                 fn artifacts(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifestList {
@@ -2309,6 +2340,8 @@ fn consumerTests() type {
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.algebraicPartials(alloc, .{}, 7, "docs", "{}"));
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifest(alloc, .{}, 7, "docs", "doc:a", "chunks"));
             try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifests(alloc, .{}, 7, "docs", "doc:a"));
+            fake.artifact_error = error.ResourceBudgetExceeded;
+            try std.testing.expectError(error.ResourceBudgetExceeded, operations.documentArtifactManifest(alloc, .{}, 7, "docs", "doc:a", "dense"));
             try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.NotLeader));
             try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.UnknownGroup));
             try std.testing.expectEqual(
@@ -2316,6 +2349,21 @@ fn consumerTests() type {
                 mapLookupError(error.ResourceBudgetExceeded),
             );
             try std.testing.expectEqual(error.Internal, mapLookupError(error.CorruptInput));
+            for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot }) |failure| {
+                fake.scan_error = failure;
+                try std.testing.expectError(failure, operations.query(alloc, .{}, 7, "docs", .{}));
+                try std.testing.expectError(failure, operations.queryPreflight(alloc, .{}, 7, "docs", .{}, 0));
+            }
+            for (storage_descriptor_errors.failures) |failure| {
+                fake.scan_error = failure;
+                try std.testing.expectEqual(error.StorageReadTemporarilyUnavailable, Operations.mapCommonReadError(failure).?);
+                try std.testing.expectEqual(error.StorageReadTemporarilyUnavailable, mapLookupError(failure));
+                try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.lookup(alloc, .{}, .{ .group_id = 7, .table_name = "docs", .key = "key" }));
+                try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.scan(alloc, .{}, 7, "docs", "", "", .{}));
+            }
+            fake.scan_error = error.InputOutput;
+            try std.testing.expectError(error.Internal, operations.lookup(alloc, .{}, .{ .group_id = 7, .table_name = "docs", .key = "key" }));
+            try std.testing.expect(Operations.mapCommonReadError(error.InputOutput) == null);
             const sink = table_reads.ScanStreamSink{ .context = null, .start_fn = FakeReads.unexpectedStart, .write_fn = FakeReads.unexpectedWrite };
             for ([_]anyerror{ error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.UnknownGroup, error.ReadUnavailable }) |failure| {
                 fake.scan_error = failure;

@@ -27,6 +27,7 @@ import CreateTablePage from "./pages/CreateTablePage";
 import EmbeddingPlaygroundPage from "./pages/EmbeddingPlaygroundPage";
 import EvalsPlaygroundPage from "./pages/EvalsPlaygroundPage";
 import ExtractionPlaygroundPage from "./pages/ExtractionPlaygroundPage";
+import GraphCatalogPage from "./pages/GraphCatalogPage";
 import InferenceGatewayPage from "./pages/InferenceGatewayPage";
 import KnowledgeGraphPlaygroundPage from "./pages/KnowledgeGraphPlaygroundPage";
 import { LoginPage } from "./pages/LoginPage";
@@ -49,11 +50,22 @@ const tableSections = new Set([
   "semantic",
   "graph",
   "faceted",
+  "time-series",
   "bulk",
   "document-builder",
   "artifacts",
+  "privacy",
   "reprocess",
 ]);
+
+function SQLWorkbenchRoute() {
+  const location = useLocation();
+  return (
+    <SQLWorkbenchPage
+      initialStatement={new URLSearchParams(location.search).get("statement") ?? undefined}
+    />
+  );
+}
 
 function TableSectionRedirect({ section, fallback = "/" }: { section: string; fallback?: string }) {
   const { selectedTable, tables, isLoadingTables } = useTable();
@@ -127,7 +139,8 @@ function AppContent() {
                       <>
                         <Route path="/" element={<TablesListPage />} />
                         <Route path="/create" element={<CreateTablePage />} />
-                        <Route path="/sql" element={<SQLWorkbenchPage />} />
+                        <Route path="/sql" element={<SQLWorkbenchRoute />} />
+                        <Route path="/graphs" element={<GraphCatalogPage />} />
                         <Route
                           path="/tables/:tableName"
                           element={<TableDetailsPage currentSection={currentSection} />}

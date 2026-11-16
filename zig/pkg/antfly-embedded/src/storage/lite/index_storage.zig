@@ -54,6 +54,7 @@ pub const Store = struct {
     const vtable: StorageIo.VTable = .{
         .private_scratch_directory = privateScratchDirectory,
         .create_dir_path = createDirPath,
+        .virtual_directories = true,
         .read_file_alloc = readFileAlloc,
         .read_file_range_alloc = readFileRangeAlloc,
         .open_immutable_source = openImmutableSource,
@@ -243,6 +244,8 @@ fn mapImmutableArtifact(ptr: *anyopaque, allocator: Allocator, path: []const u8)
     defer value.deinit(allocator);
     const lease = try self.docs.reserveArtifactBytes(value.length);
     errdefer docstore.ArtifactLease.release(lease);
+    var fd_permit = try storage_io.ProcessNativeFdPermit.acquire(self.docs.file.runtime());
+    defer fd_permit.release();
     const file = privateArtifactFile(allocator, self.docs) catch |err| switch (err) {
         error.AccessDenied, error.ReadOnlyFileSystem => if (self.docs.read_only) return error.MappedArtifactUnavailable else return err,
         else => return err,
@@ -288,7 +291,7 @@ fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !v
 }
 
 const CatalogWrite = struct {
-    kind: enum { put, append, rename, delete, sync },
+    kind: enum { put, append, rename, delete },
     path: []const u8,
     value: []const u8 = "",
     fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
@@ -298,7 +301,6 @@ const CatalogWrite = struct {
             .append => try file.appendIndexCatalogRecord(self.path, self.value),
             .rename => try file.renameIndexCatalogRecord(self.path, self.value),
             .delete => try file.deleteIndexCatalogRecord(self.path),
-            .sync => try file.sync(),
         }
     }
 };
@@ -491,8 +493,7 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
 fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    var mutation = CatalogWrite{ .kind = .sync, .path = path };
-    try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
+    try self.docs.syncIndexContents();
 }
 
 fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -550,6 +551,7 @@ const NativeAtomicWriteSink = struct {
     storage: *Store,
     path: []u8,
     file: ?std.Io.File = null,
+    fd_permit: ?storage_io.ProcessNativeFdPermit = null,
     tmp_path: ?[]u8 = null,
     persisted: usize = 0,
     buffered: usize = 0,
@@ -581,6 +583,7 @@ const NativeAtomicWriteSink = struct {
     pub fn deinit(self: *NativeAtomicWriteSink) void {
         const io = self.storage.docs.file.runtime();
         if (self.file) |file| file.close(io);
+        if (self.fd_permit) |*permit| permit.release();
         if (self.tmp_path) |path| {
             // A staging path can remain if its initial unlink failed.
             // Abort and failed publication must remove it even if canceled.
@@ -616,8 +619,11 @@ const NativeAtomicWriteSink = struct {
         const parent = std.fs.path.dirname(self.storage.docs.file.path) orelse ".";
         const path = try std.fs.path.join(self.allocator, &.{ parent, basename });
         errdefer self.allocator.free(path);
+        var fd_permit = try storage_io.ProcessNativeFdPermit.acquire(io);
+        errdefer fd_permit.release();
         const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
         self.file = file;
+        self.fd_permit = fd_permit;
         self.tmp_path = path;
         // On POSIX the descriptor owns the staging file after unlink. Abort,
         // cancellation, and process death then reclaim it without a scavenger.
@@ -957,7 +963,12 @@ test "lite native index reads remain pinned while newer checkpoints publish" {
     defer docs.close();
     var indexes = Store.init(allocator, &docs);
     try writeFileAbsolute(&indexes, "segments/current", "generation-one");
-    const pinned = docs.file.activeCheckpoint();
+    // A checkpoint value identifies a generation; a live read owns its page
+    // retention. Exercise the real reader lease while the allocator reuses
+    // pages for the next publication.
+    var snapshot = try docs.beginRead();
+    defer snapshot.abort();
+    const pinned = snapshot.checkpoint;
     try writeFileAbsolute(&indexes, "segments/current", "generation-two");
 
     const old = (try docs.file.getIndexCatalogRecordAtCheckpointAlloc(allocator, "segments/current", pinned)) orelse return error.TestUnexpectedResult;
@@ -2157,6 +2168,56 @@ test "lite mapped read only views report unavailable when directory cannot write
     try std.testing.expectEqualStrings("immutable", bytes);
 }
 
+test "lite artifact leases expire detached caches and retain active readers through close" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Markers = struct {
+        fn count(path: []const u8) !usize {
+            var dir = try std.Io.Dir.cwd().openDir(std.testing.io, std.fs.path.dirname(path).?, .{ .iterate = true });
+            defer dir.close(std.testing.io);
+            var iterator = dir.iterate();
+            var total: usize = 0;
+            while (try iterator.next(std.testing.io)) |entry| {
+                if (entry.name.len == ".aflite-lease-".len + 32 and std.mem.startsWith(u8, entry.name, ".aflite-lease-")) total += 1;
+            }
+            return total;
+        }
+    };
+    inline for (.{ false, true }) |active| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "detached-cache.aflite");
+        defer a.free(path);
+        var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = io, .reclamation = .{ .enabled = false } });
+        var docs_open = true;
+        defer if (docs_open) docs.close();
+        docs.maintenance_start_suppressed = true;
+        var indexes = Store.init(a, &docs);
+        try indexes.storage().writeFileAbsolute("/cached", "immutable payload");
+        var source = try docs.openArtifactSource("/cached");
+        defer source.close();
+        source.enableIdleExpiry();
+        if (active) {
+            try std.testing.expect(source.acquireUse());
+            _ = try docs.vacuum();
+        }
+        try std.testing.expectEqual(@as(usize, 1), try Markers.count(path));
+        docs.close();
+        docs_open = false;
+        if (active) {
+            // The retired inode and its accounting survive owner teardown
+            // until the final active reader returns its use token.
+            try std.testing.expectEqual(@as(usize, 1), try Markers.count(path));
+            var bytes: [9]u8 = undefined;
+            try source.readInto(0, &bytes);
+            try std.testing.expectEqualStrings("immutable", &bytes);
+            source.releaseUse();
+        }
+        try std.testing.expect(!source.acquireUse());
+        try std.testing.expectEqual(@as(usize, 0), try Markers.count(path));
+    }
+}
+
 test "lite artifact leases survive owner close and do not pin document retirement" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2203,6 +2264,81 @@ test "lite artifact leases survive owner close and do not pin document retiremen
     defer cursor.deinit();
     try std.testing.expect((try cursor.next()) == null);
     try std.testing.expect((try reopened.checkWithCancel(null)).valid);
+}
+
+test "lite artifact leases close without reentering writer admission" {
+    const Admission = struct {
+        calls: usize = 0,
+        fn enter(ptr: *anyopaque, _: docstore.PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.FileBusy;
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "source-close-no-admission.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    try adapter.storage().writeFileAbsolute("/segment", "immutable");
+    var source = try docs.openArtifactSource("/segment");
+    defer source.close();
+    var admission: Admission = .{};
+    docs.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    source.close();
+    docs.writer_admission = null;
+    try std.testing.expectEqual(@as(usize, 0), admission.calls);
+    try docs.maintainOnce(false);
+    var cursor = try docs.file.metadataCatalogCursor(docs.file.activeCheckpoint(), native.NativeFile.artifact_lease_key_prefix);
+    defer cursor.deinit();
+    try std.testing.expect((try cursor.next()) == null);
+}
+
+test "lite artifact leases share immutable inputs across serving owners without publication" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "shared-source.aflite");
+    defer a.free(path);
+    var first = try docstore.Store.createWithOptions(a, path, .{ .externally_locked = true, .no_sync = true, .io = std.testing.io });
+    var first_open = true;
+    defer if (first_open) first.close();
+    first.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &first);
+    const payload: [32768]u8 = @splat('a');
+    try adapter.storage().writeFileAbsolute("/segment", &payload);
+    var one = try first.openArtifactSource("/segment");
+    defer one.close();
+    var second = try docstore.Store.openWithOptions(a, path, .{ .externally_locked = true, .no_sync = true, .io = std.testing.io });
+    defer second.close();
+    second.maintenance_start_suppressed = true;
+    const before = second.file.header;
+    var two = try second.openArtifactSource("/segment");
+    defer two.close();
+    try std.testing.expectEqual(one.ranges.ptr, two.ranges.ptr);
+    try std.testing.expectEqualDeep(before, second.file.header);
+    one.enableIdleExpiry();
+    first.close();
+    first_open = false;
+    var out: [64]u8 = undefined;
+    try two.readInto(123, &out);
+    try std.testing.expectEqualSlices(u8, payload[123..][0..out.len], &out);
+    // Reusing the pathname with different content must create a new source.
+    var second_adapter = Store.init(a, &second);
+    const changed: [32768]u8 = @splat('b');
+    try second_adapter.storage().writeFileAbsolute("/segment", &changed);
+    var three = try second.openArtifactSource("/segment");
+    defer three.close();
+    try std.testing.expect(one.ranges.ptr != three.ranges.ptr);
+    try three.readInto(123, &out);
+    try std.testing.expectEqualSlices(u8, changed[123..][0..out.len], &out);
+    try two.readInto(123, &out);
+    try std.testing.expectEqualSlices(u8, payload[123..][0..out.len], &out);
 }
 
 test "lite artifact leases transfer retired inode accounting between readers" {
@@ -2580,4 +2716,36 @@ test "lite atomic publication returns owned immutable source without requiring m
     var bytes: [8]u8 = undefined;
     try source.readInto(0, &bytes);
     try std.testing.expectEqualStrings("original", &bytes);
+}
+
+test "lite mapped artifacts and spilled writers obey process descriptor pressure" {
+    if (!supports_mapped_artifacts) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "descriptor-pressure.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    var store = Store.init(a, &docs);
+    const storage = store.storage();
+    try storage.writeFileAbsolute("/mapped", "pinned bytes");
+    var native_storage = try storage_io.NativeStorage.init(a, .threaded);
+    defer native_storage.deinit();
+    var pool = storage_io.NativeStoragePool.init(a);
+    defer pool.deinit();
+    const stats = pool.snapshotStats();
+    var occupying = try native_storage.acquireFdPermits(stats.fd_admission_capacity - stats.fd_persistent_reserve);
+    defer occupying.release();
+    try std.testing.expectError(error.StorageDescriptorPressure, storage.mapImmutableArtifact(a, "/mapped"));
+    var writer = try storage.beginAtomicWrite(a, "/spilled");
+    const bytes: [65 * 1024]u8 = @splat('x');
+    try std.testing.expectError(error.StorageDescriptorPressure, writer.appendSlice(&bytes));
+    writer.abort();
+    occupying.release();
+    var mapped = try storage.mapImmutableArtifact(a, "/mapped");
+    defer mapped.deinit();
+    try std.testing.expectEqualStrings("pinned bytes", mapped.bytes);
+    // Only the mapping's byte lease survives materialization, not its FD permit.
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
 }

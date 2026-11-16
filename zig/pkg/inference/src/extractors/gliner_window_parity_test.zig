@@ -38,7 +38,10 @@ const Capture = struct {
 
 fn parity(comptime backend: enum { native, metal, cuda }) !void {
     const accelerated = backend != .native;
-    const directory = platform.env.getenv("ANTFLY_GLINER_WINDOW_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_GLINER_WINDOW_MODEL_DIR") orelse if (backend == .cuda and platform.env.getenvBool("ANTFLY_GLINER25_REQUIRE_PRODUCTION_MODELS"))
+        platform.env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.MissingProductionQualificationModel
+    else
+        return error.SkipZigTest;
     const capture_path = platform.env.getenv("ANTFLY_GLINER_WINDOW_CAPTURE");
     const variant = platform.env.getenv("ANTFLY_GLINER_WINDOW_VARIANT") orelse "base";
     const fixtures = @import("gliner_graph_qualification_fixtures.zig");
@@ -104,7 +107,7 @@ fn parity(comptime backend: enum { native, metal, cuda }) !void {
             const group_sizes: []const usize = if (backend == .cuda) &.{ 1, 2, 4 } else &.{1};
             for (group_sizes) |group_size| {
                 const options = long.Options{ .identity = try factory.getGlinerBoundaryIdentity(session), .control = control, .pipeline = item.options.native(.{ .control = control }), .limits = .{ .window_batch_size = group_size } };
-                var gate = try @import("gliner_boundary_qualification.zig").Gate.init(options.identity, switch (backend) {
+                var gate = try @import("gliner_boundary_qualification.zig").Admission.init(options.identity, switch (backend) {
                     .native => .native,
                     .metal => .metal,
                     .cuda => .cuda,
@@ -118,8 +121,8 @@ fn parity(comptime backend: enum { native, metal, cuda }) !void {
     }
     if (backend == .cuda) {
         // Grepstein uses plain entity/relation labels, without descriptions or
-        // classifications. It must still fit complete prompts to the qualified
-        // token context rather than treating source words as model tokens.
+        // classifications. It must still fit complete prompts to the actual
+        // model context rather than treating source words as model tokens.
         const base_case = capture.value.cases[capture.value.cases.len - 1];
         const text = try std.fmt.allocPrint(a, "{s} {s} {s} {s} {s} {s}", .{ base_case.text, base_case.text, base_case.text, base_case.text, base_case.text, base_case.text });
         defer a.free(text);
@@ -135,22 +138,28 @@ fn parity(comptime backend: enum { native, metal, cuda }) !void {
         defer request.deinit();
         const item = &request.items[0];
         const options = long.Options{ .identity = try factory.getGlinerBoundaryIdentity(session), .control = control, .pipeline = item.options.native(.{ .control = control }), .limits = .{ .window_batch_size = 1 } };
-        var gate = try @import("gliner_boundary_qualification.zig").Gate.init(options.identity, .cuda, &request, control);
+        var gate = try @import("gliner_boundary_qualification.zig").Admission.init(options.identity, .cuda, &request, control);
         const config = try factory.getGlinerBoundaryConfig(session);
         var serial = try long.executeQualified(&managed.backend, a, &config, tokenizer.tokenizer(), item, options, &gate);
         defer serial.deinit();
         try std.testing.expect(serial.window_count > 4);
-        try std.testing.expect(serial.prompt_tokens <= 1024 * serial.window_count);
+        try std.testing.expect(serial.prompt_tokens <= (@import("../architectures/gliner/boundary_engine.zig").Limits{}).max_sequence_tokens * serial.window_count);
         const expected_json = try std.json.Stringify.valueAlloc(a, serial.sample, .{});
         defer a.free(expected_json);
         const expected = try std.json.parseFromSlice(pipeline.ExpectedSample, a, expected_json, .{ .ignore_unknown_fields = true });
         defer expected.deinit();
+        var normal_group_tokens: usize = 0;
+        var normal_group_attention: u64 = 0;
         for ([_]usize{ 2, 4 }) |group_size| {
             var grouped_options = options;
             grouped_options.limits.window_batch_size = group_size;
-            var grouped_gate = try @import("gliner_boundary_qualification.zig").Gate.init(options.identity, .cuda, &request, control);
+            var grouped_gate = try @import("gliner_boundary_qualification.zig").Admission.init(options.identity, .cuda, &request, control);
             var grouped = try long.executeQualified(&managed.backend, a, &config, tokenizer.tokenizer(), item, grouped_options, &grouped_gate);
             defer grouped.deinit();
+            if (group_size == 4) {
+                normal_group_tokens = grouped.encoded_tokens;
+                normal_group_attention = grouped.attention_work_items;
+            }
             try std.testing.expectEqual(serial.window_count, grouped.window_count);
             try pipeline.expectSample(expected.value, grouped.sample, pipeline.fp32_confidence_tolerance);
         }
@@ -161,13 +170,26 @@ fn parity(comptime backend: enum { native, metal, cuda }) !void {
         var retry_options = options;
         retry_options.limits.window_batch_size = 4;
         retry_options.observer = .{ .context = &failure, .emit_fn = EncodeAllocationFailure.observe };
-        var retry_gate = try @import("gliner_boundary_qualification.zig").Gate.init(options.identity, .cuda, &request, control);
+        var retry_gate = try @import("gliner_boundary_qualification.zig").Admission.init(options.identity, .cuda, &request, control);
         var recovered = try long.executeQualified(&managed.backend, failure.allocator.allocator(), &config, tokenizer.tokenizer(), item, retry_options, &retry_gate);
         defer recovered.deinit();
         try std.testing.expect(failure.allocator.has_induced_failure);
         try std.testing.expect(failure.attempts > (serial.window_count + 3) / 4);
         try std.testing.expectEqual(serial.window_count, recovered.window_count);
         try pipeline.expectSample(expected.value, recovered.sample, pipeline.fp32_confidence_tolerance);
+        try std.testing.expectEqual(serial.prompt_tokens, recovered.prompt_tokens);
+        try std.testing.expect(recovered.encoded_tokens > normal_group_tokens);
+        try std.testing.expect(recovered.attention_work_items > normal_group_attention);
+        // The original physical quota admits the no-failure request, but
+        // cannot silently absorb extra attempts after a backing OOM.
+        var capped_failure = EncodeAllocationFailure{ .allocator = std.testing.FailingAllocator.init(a, .{}) };
+        var capped_options = options;
+        capped_options.limits.window_batch_size = 4;
+        capped_options.limits.max_total_encoded_tokens = normal_group_tokens;
+        capped_options.observer = .{ .context = &capped_failure, .emit_fn = EncodeAllocationFailure.observe };
+        var capped_gate = try @import("gliner_boundary_qualification.zig").Admission.init(options.identity, .cuda, &request, control);
+        try std.testing.expectError(error.LongDocumentWorkLimitExceeded, long.executeQualified(&managed.backend, capped_failure.allocator.allocator(), &config, tokenizer.tokenizer(), item, capped_options, &capped_gate));
+        try std.testing.expect(capped_failure.allocator.has_induced_failure);
     }
 }
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "antfly-sdk"
-version = "0.2.1"
+version = "0.3.0"
 description = "Python SDK for Antfly distributed key-value store and search engine"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,10 +30,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/antflydb/antfly-py"
-Documentation = "https://antfly-sdk-python.readthedocs.io"
-Repository = "https://github.com/antflydb/antfly-py"
-Issues = "https://github.com/antflydb/antfly-py/issues"
+Homepage = "https://github.com/antflydb/antfly"
+Documentation = "https://docs.antfly.io"
+Repository = "https://github.com/antflydb/antfly"
+Issues = "https://github.com/antflydb/antfly/issues"
 
 [dependency-groups]
 dev = [

@@ -28,6 +28,22 @@ from check_embedded_isolated_build import stage_sources
 
 
 class EmbeddedBoundaryTest(unittest.TestCase):
+    def test_direct_storage_dispatch_omits_native_abi_only_on_browser_targets(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "pkg/antfly-embedded/src/storage/engine_dispatch.zig"
+        ).read_text()
+        for target in ("freestanding", "wasi"):
+            self.assertNotIn(
+                "engine.zig",
+                production_imports(source, include_named=True, target_os=target),
+            )
+        for target in ("linux", "macos", "windows", None):
+            self.assertIn(
+                "engine.zig",
+                production_imports(source, include_named=True, target_os=target),
+            )
+
     def test_isolated_stage_keeps_working_sources_and_omits_server_owners(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory) / "repo"

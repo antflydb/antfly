@@ -1,0 +1,53 @@
+name: AI SDK integration
+on:
+  push:
+    branches: [main]
+    paths: ['ts/packages/ai-sdk/**', 'ts/packages/sdk/**', 'ts/pnpm-lock.yaml', 'ts/pnpm-workspace.yaml', '.github/workflows/ai-sdk-js.yml']
+  workflow_dispatch:
+  schedule:
+    - cron: '41 8 * * 1'
+permissions:
+  contents: read
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dependencies: [locked, latest-compatible]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ts/package.json
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: ts/package.json
+      - run: pnpm install --frozen-lockfile
+        working-directory: ts
+      - name: Update compatible dependencies
+        if: matrix.dependencies == 'latest-compatible'
+        working-directory: ts
+        run: pnpm --filter @antfly/ai-sdk add --save-dev 'ai@^7.0.162' 'zod@^4.1.8' --ignore-scripts
+      - name: Build, typecheck, lint and test
+        working-directory: ts
+        run: |
+          pnpm --filter @antfly/ai-sdk... build
+          pnpm --filter @antfly/ai-sdk... typecheck
+          pnpm --filter @antfly/ai-sdk lint
+          pnpm --filter @antfly/ai-sdk... test
+      - name: Verify independent npm consumer
+        working-directory: ts
+        run: |
+          if [ '${{ matrix.dependencies }}' = latest-compatible ]; then
+            pnpm --filter @antfly/ai-sdk test:package --latest-peers
+          else
+            pnpm --filter @antfly/ai-sdk test:package
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          retention-days: 14
+          name: ai-sdk-package-${{ matrix.dependencies }}
+          path: .state/ai-sdk/consumer-*/receipt.json
+          include-hidden-files: true

@@ -125,7 +125,34 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     if (!source.canEnumerate() or request.physical_selection != null or request.after != null or request.before != null) try source.ensureInventory(read_context);
     return openPinnedMaterialized(alloc, table, request, context, source);
 }
+/// Open one deterministic, disjoint split of an immutable pinned source.
+/// Unlike split_scan's local work queue this assignment can be reconstructed
+/// on another process after a task retry without sharing mutable iterators.
+pub fn openPinnedPartition(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource, index: usize, count: usize) !catalog.Cursor {
+    if (count == 0 or count > 65536 or index >= count) return error.InvalidSqlBackendResponse;
+    const cursor = try openPinnedMaterializedMode(alloc, table, request, context, source, .{ .index = index, .count = count });
+
+    return cursor;
+}
+
+/// Bucket groups retain the complete file iterator; manifest partition pruning
+/// chooses files, independently of the number or order of physical files.
+pub fn openPinnedBucket(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource, group: @import("../serverless/query/lake_stream.zig").Stream.BucketGroup) !catalog.Cursor {
+    if (group.groups == 0 or group.index >= group.groups or group.count == 0 or group.count % group.groups != 0) return error.InvalidSqlBackendResponse;
+    const cursor = try openPinned(alloc, table, request, context, source);
+    const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+    owner.stream.bucket_group = group;
+    return cursor;
+}
+
 fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource) !catalog.Cursor {
+    return openPinnedMaterializedMode(alloc, table, request, context, source, null);
+}
+fn openPinnedMaterializedMode(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource, partition: ?struct { index: usize, count: usize }) !catalog.Cursor {
+    if (partition != null) {
+        const deadline = try context.platformDeadline();
+        try source.ensureInventory(.{ .io = if (source.context_store) |store| store.context.io else null, .deadline_ns = deadline.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(deadline.cancellation.ptr, deadline.cancellation.is_cancelled_fn) });
+    }
     if (request.include_primary_digest or request.include_document or request.index_equality != null) return error.UnsupportedSqlExecution;
     try context.ensureActive();
     const binding = table.external_base_source orelse return error.InvalidSqlBackend;
@@ -187,8 +214,10 @@ fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catal
         try pruning.append(owned, .{ .column = column.path, .op = std.meta.stringToEnum(Predicate.Op, @tagName(condition.op)).?, .value = value });
     }
     const normalized = try context.platformDeadline();
-    var stream = try @import("../serverless/query/lake_stream.zig").Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
+    const Stream = @import("../serverless/query/lake_stream.zig").Stream;
+    var stream = if (partition != null) try Stream.initMaterialized(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{}) else try Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
     errdefer stream.deinit();
+    if (partition) |part| try stream.partitionRows(part.index, part.count);
     stream.identity_only = identity_only;
     if (request.physical_selection) |selection| {
         if (request.row_refs != null) return error.InvalidLakeCandidateReference;
@@ -394,7 +423,7 @@ pub fn projectedRow(alloc: Allocator, table: catalog.Table, row: rows.ProjectedR
             .i64 => |v| .{ .integer = v },
             .f64 => |v| .{ .float = v },
             .bool => |v| .{ .bool = v },
-            .vector_f32 => return error.UnsupportedSqlExecution,
+            .vector_f32 => |v| try (@import("../storage/rowsource/types.zig").ColumnValues{ .vector_f32 = &.{v} }).jsonAt(alloc, 0),
         } else .null;
         try object.put(alloc, column.name, value);
         try nulls.append(alloc, cell.value == null);
@@ -713,7 +742,11 @@ const Owner = struct {
             // its row groups; unordered scans may freeze a few files below.
             if (self.stream.iterator_parent.?.fileCount() != 1 or !try self.stream.freezeSmallEnumeration(maximum)) return self.splitEnumerated(a, maximum);
         }
-        if (self.stream.selection != null) return null;
+        if (self.stream.selection != null) {
+            if (self.stream.files.len == 1) return self.splitSelectedGroups(a, maximum);
+            if (self.stream.files.len == 0) return null;
+            return try self.splitChildren(a, @min(maximum, self.stream.files.len), true);
+        }
         if (self.started or self.dynamic != null or self.stream.partition_count != 1 or maximum < 2 or self.stream.source.scanner.shared_reader == null) return null;
         // Multiple files form lazy contiguous ranges. Opening a later footer
         // must not move its error ahead of an earlier successfully read prefix.
@@ -1030,7 +1063,38 @@ const Owner = struct {
         self.started = true;
         return cursors;
     }
+    fn splitSelectedGroups(self: *Owner, a: Allocator, maximum: usize) !?[]catalog.Cursor {
+        const selection = self.stream.selection orelse return null;
+        const file = self.stream.files[0];
+        var groups = selection.groups(file);
+        var group_count: usize = 0;
+        while (groups.next() != null) {
+            if (group_count % 1024 == 0) try self.stream.context.ensureActive();
+            group_count += 1;
+        }
+        const count = @min(maximum, group_count);
+        if (count < 2) return null;
+        // Two linear passes over already sorted selections, O(lanes) memory.
+        // Archive-scale bitmap selections never become an ordinal array.
+        const windows = try a.alloc(@import("../serverless/query/lake_row_selection.zig").Selection, count);
+        defer a.free(windows);
+        groups = selection.groups(file);
+        var consumed: usize = 0;
+        for (windows, 0..) |*window, i| {
+            const first = groups.next().?;
+            consumed += 1;
+            var last = first;
+            // Quotient/remainder avoids multiplying archive-sized counts.
+            const end = (group_count / count) * (i + 1) + @min(i + 1, group_count % count);
+            while (consumed < end) : (consumed += 1) last = groups.next().?;
+            window.* = selection.groupWindow(file, first, last);
+        }
+        return try self.splitChildrenMode(a, count, true, windows);
+    }
     fn splitChildren(self: *Owner, a: Allocator, count: usize, ordered_files: bool) ![]catalog.Cursor {
+        return self.splitChildrenMode(a, count, ordered_files, null);
+    }
+    fn splitChildrenMode(self: *Owner, a: Allocator, count: usize, ordered_files: bool, windows: ?[]const @import("../serverless/query/lake_row_selection.zig").Selection) ![]catalog.Cursor {
         // Publish one query-owned qualifier before independent lanes borrow
         // source state, including manually supplied embedded source owners.
         _ = try self.stream.source.qualifiedDeletes(self.stream.context);
@@ -1050,7 +1114,7 @@ const Owner = struct {
             errdefer a.destroy(reader);
             reader.* = .{ .cache = parent_reader.cache, .base = parent_reader.base, .scope = parent_reader.scope, .context = parent_reader.context };
             source.scanner.shared_reader = reader;
-            cursor.* = try openPinned(a, self.table, .{ .fields = self.stream.columns, .conditions = self.conditions, .after = self.after, .before = self.before, .primary_key = self.primary_key, .limit = 1024 }, self.context, source);
+            cursor.* = try openPinned(a, self.table, .{ .fields = self.stream.columns, .conditions = self.conditions, .after = self.after, .before = self.before, .primary_key = self.primary_key, .physical_selection = if (windows) |selected| selected[index] else self.stream.selection, .limit = 1024 }, self.context, source);
             const child: *Owner = @ptrCast(@alignCast(cursor.ptr));
             child.stream.examined = self.stream.examined;
             child.stream.limits = self.stream.limits;
@@ -1058,8 +1122,8 @@ const Owner = struct {
             child.partition_versions_owned = ordered_files;
             child.borrowed_prepared = source.prepared_deletes;
             if (!ordered_files) child.stream.work = self.stream.work;
-            child.stream.partition_index = index;
-            child.stream.partition_count = count;
+            child.stream.partition_index = if (windows != null) 0 else index;
+            child.stream.partition_count = if (windows != null) 1 else count;
             opened += 1;
             if (self.dynamic) |filter| if (!try cursor.set_dynamic_filter.?(cursor.ptr, filter)) return error.InvalidSqlBackendResponse;
         }
@@ -2963,4 +3027,141 @@ test "lake SQL compact encodings accept all-null delta headers in full and selec
         try std.testing.expectEqual(@as(usize, if (selective) 1 else 4), result.rows.len);
         for (result.rows) |row| for ([_][]const u8{ "v", "lengths", "prefixes" }) |field| try std.testing.expect(row.value.object.get(field).? == .null);
     };
+}
+
+test "lake SQL bounded window profiles selected file lanes preserve exact rows and canonical order" {
+    const a = std.testing.allocator;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populateData(a, 3, @embedFile("../serverless/query/testdata/pyarrow_plain_nullable_snappy.parquet"));
+    defer lake.deinit(a);
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{});
+    var refs: [3]@import("../storage/rowsource/types.zig").RowRef = undefined;
+    for (&refs, [_]usize{ 2, 0, 2 }) |*ref, index| ref.* = .{ .external = .{ .source_id = lake.inventory.source_id, .snapshot_id = lake.inventory.snapshot_id, .file_id = lake.inventory.files[index].file_id, .row_group_ordinal = 0, .row_ordinal = 0 } };
+    const request: catalog.Scan = .{ .fields = &.{"amount"}, .row_refs = &refs, .limit = 1024 };
+    var expected: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (expected.items) |id| a.free(id);
+        expected.deinit(a);
+    }
+    {
+        const serial = try openPinned(a, lake.table, request, .{}, &lake.source);
+        defer serial.close(serial.ptr);
+        while (true) {
+            const page = try serial.next(serial.ptr, a, 128);
+            defer page.deinit();
+            for (page.rows) |row| try expected.append(a, try a.dupe(u8, row.id));
+            if (page.after == null) break;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), expected.items.len);
+    const parallel = try openPinned(a, lake.table, request, .{}, &lake.source);
+    defer parallel.close(parallel.ptr);
+    const lanes = (try parallel.split_ordered.?(parallel.ptr, a, 4)).?;
+    defer {
+        for (lanes) |lane| lane.close(lane.ptr);
+        a.free(lanes);
+    }
+    try std.testing.expectEqual(@as(usize, 2), lanes.len);
+    var seen: usize = 0;
+    for (lanes) |lane| while (true) {
+        const page = try lane.next(lane.ptr, a, 128);
+        defer page.deinit();
+        for (page.rows) |row| {
+            try std.testing.expect(seen < expected.items.len);
+            try std.testing.expectEqualStrings(expected.items[seen], row.id);
+            seen += 1;
+        }
+        if (page.after == null) break;
+    };
+    try std.testing.expectEqual(expected.items.len, seen);
+}
+
+test "lake SQL bounded window profiles single file selected group lanes preserve mixed candidates" {
+    const a = std.testing.allocator;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populateData(a, 1, @embedFile("../serverless/query/testdata/pyarrow_plain_nullable_snappy.parquet"));
+    defer lake.deinit(a);
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{});
+    const Selection = @import("../serverless/query/lake_row_selection.zig").Selection;
+    const Coordinate = @import("../serverless/query/lake_row_selection.zig").Coordinate;
+    var bitmap = @import("../encoding/roaring.zig").RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    try bitmap.add(0);
+    const points = [_]Coordinate{ .{ .file = 0, .group = 0, .row = 0 }, .{ .file = 0, .group = 2, .row = 0 }, .{ .file = 0, .group = 4, .row = 0 } };
+    const blocks = [_]Selection.Block{ .{ .file = 0, .group = 1, .high = 0, .rows = &bitmap }, .{ .file = 0, .group = 2, .high = 0, .rows = &bitmap } };
+    const request: catalog.Scan = .{ .fields = &.{"amount"}, .physical_selection = .{ .coordinates = &points, .blocks = &blocks }, .limit = 1024 };
+    var expected: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (expected.items) |id| a.free(id);
+        expected.deinit(a);
+    }
+    {
+        const serial = try openPinned(a, lake.table, request, .{}, &lake.source);
+        defer serial.close(serial.ptr);
+        while (true) {
+            const page = try serial.next(serial.ptr, a, 1);
+            defer page.deinit();
+            for (page.rows) |row| try expected.append(a, try a.dupe(u8, row.id));
+            if (page.after == null) break;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), expected.items.len);
+    for ([_]usize{ 2, 3, 8 }) |maximum| {
+        const parallel = try openPinned(a, lake.table, request, .{}, &lake.source);
+        defer parallel.close(parallel.ptr);
+        const lanes = (try parallel.split_ordered.?(parallel.ptr, a, maximum)).?;
+        defer {
+            for (lanes) |lane| lane.close(lane.ptr);
+            a.free(lanes);
+        }
+        try std.testing.expectEqual(@min(maximum, @as(usize, 4)), lanes.len);
+        var seen: usize = 0;
+        for (lanes) |lane| while (true) {
+            const page = try lane.next(lane.ptr, a, 1);
+            defer page.deinit();
+            for (page.rows) |row| {
+                try std.testing.expect(seen < expected.items.len);
+                try std.testing.expectEqualStrings(expected.items[seen], row.id);
+                seen += 1;
+            }
+            if (page.after == null) break;
+        };
+        try std.testing.expectEqual(expected.items.len, seen);
+        try std.testing.expect(try parallel.split_ordered.?(parallel.ptr, a, maximum) == null);
+    }
+}
+
+test "lake SQL bounded window profiles selected small chunks avoid separate header and payload reads" {
+    const a = std.testing.allocator;
+    const values = try a.alloc(i64, 20000);
+    defer a.free(values);
+    for (values, 0..) |*value, i| value.* = @intCast(i);
+    var calls: [2]usize = undefined;
+    for ([_]bool{ false, true }, 0..) |selected, i| {
+        var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+        try lake.populate(a, 1, values);
+        defer lake.deinit(a);
+        var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+        defer cache.deinit();
+        var trace: @import("../serverless/query/lake_read_context.zig").IoTrace = .{};
+        // Native ranking may already have spent the shared read-ahead budget.
+        // This must still eliminate the extra header RTT without widening the
+        // object or relying on a previously warmed 1 MiB window.
+        trace.read_ahead_budget.used.store(8 * 1024 * 1024, .release);
+        try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .trace = &trace });
+        const points = [_]@import("../serverless/query/lake_row_selection.zig").Coordinate{.{ .file = 0, .group = 0, .row = 0 }};
+        const cursor = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .physical_selection = if (selected) .{ .coordinates = &points } else null, .limit = 1 }, .{}, &lake.source);
+        defer cursor.close(cursor.ptr);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const page = try cursor.next_columns.?(cursor.ptr, arena.allocator(), 1);
+        try std.testing.expectEqual(@as(usize, 1), page.selection.len);
+        try std.testing.expectEqual(@as(i64, 0), (try page.cell(arena.allocator(), 0, "amount")).value.integer);
+        calls[i] = lake.meter.reads;
+    }
+    try std.testing.expectEqual(calls[1] + 1, calls[0]);
 }

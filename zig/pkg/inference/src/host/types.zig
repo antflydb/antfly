@@ -30,6 +30,7 @@ pub const ChatMessage = generating.ChatMessage;
 pub const TextContentCursor = generating.TextContentCursor;
 pub const jsonValuesEqual = generating.jsonValuesEqual;
 pub const emptyToolParameters = generating.emptyToolParameters;
+pub const chatToolsFromValue = generating.chatToolsFromValue;
 pub const ChatStream = generating.ChatStream;
 pub const writeChatStreamChunk = generating.writeChatStreamChunk;
 

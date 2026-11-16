@@ -59,6 +59,13 @@ FILES = {
     "onnx/tokenizer.json": b"{}",
 }
 MODE = sys.argv[2]
+if MODE == "lighton-template":
+    FILES = {
+        "config.json": b'{"model_type":"qwen3_5"}',
+        "tokenizer_config.json": b"{}",
+        "model.safetensors": b"LightOn snapshot weights",
+        "chat_template.jinja": b"{% for message in messages %}{{ message.content }}{% endfor %}",
+    }
 if MODE == "gliner-split":
     FILES = {
         "config.json": b"{}",

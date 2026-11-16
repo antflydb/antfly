@@ -91,6 +91,10 @@ class S3Publisher(Publisher):
         self.client_error = ClientError
 
     def existing_sha256(self, key: str) -> str | None:
+        existing = self.existing_fingerprint(key)
+        return existing[0] if existing is not None else None
+
+    def existing_fingerprint(self, key: str) -> tuple[str, int | None] | None:
         assert self.client is not None
         try:
             head = self.client.head_object(Bucket=self.bucket, Key=key)
@@ -104,12 +108,16 @@ class S3Publisher(Publisher):
             raise
         metadata_digest = head.get("Metadata", {}).get("sha256")
         if metadata_digest:
-            return str(metadata_digest)
+            return str(metadata_digest), head.get("ContentLength")
         response = self.client.get_object(Bucket=self.bucket, Key=key)
         digest = hashlib.sha256()
-        for chunk in iter(lambda: response["Body"].read(1024 * 1024), b""):
-            digest.update(chunk)
-        return digest.hexdigest()
+        stream = response["Body"]
+        try:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        finally:
+            stream.close()
+        return digest.hexdigest(), head.get("ContentLength")
 
     def upload(
         self, path: Path, key: str, dry_run: bool, immutable: bool = False
@@ -241,6 +249,10 @@ class LocalPublisher(Publisher):
     def __init__(self, root: Path, bucket: str) -> None:
         self.root = root
         self.bucket = bucket
+
+    def existing_fingerprint(self, key: str) -> tuple[str, int] | None:
+        path = self.root / self.bucket / key
+        return (sha256(path), path.stat().st_size) if path.exists() else None
 
     def upload(
         self, path: Path, key: str, dry_run: bool, immutable: bool = False

@@ -551,7 +551,7 @@ pub const ServerlessHttpClient = struct {
 
         for (req.mutations, 0..) |mutation, idx| {
             json_mutations[idx] = .{
-                .kind = mutationKindString(mutation.kind),
+                .kind = try mutationKindString(mutation.kind),
                 .doc_id = mutation.doc_id,
                 .body = mutation.body,
             };
@@ -912,13 +912,21 @@ fn tablePath(alloc: std.mem.Allocator, table_name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "/tables/{s}", .{table_name});
 }
 
-fn mutationKindString(kind: serverless.MutationKind) []const u8 {
+fn mutationKindString(kind: serverless.MutationKind) error{InvalidMutationKind}![]const u8 {
     return switch (kind) {
         .upsert => "upsert",
         .delete => "delete",
-        .checkpoint => "checkpoint",
-        .enriched => "enriched",
+        // Output-only frames and catalog transitions belong to the private
+        // publication protocols, never the public ingestion codec.
+        .checkpoint, .enriched, .prepared, .catalog => error.InvalidMutationKind,
     };
+}
+
+test "serverless http client ingestion rejects private publication kinds" {
+    try std.testing.expectEqualStrings("upsert", try mutationKindString(.upsert));
+    try std.testing.expectEqualStrings("delete", try mutationKindString(.delete));
+    for ([_]serverless.MutationKind{ .checkpoint, .enriched, .prepared, .catalog }) |kind|
+        try std.testing.expectError(error.InvalidMutationKind, mutationKindString(kind));
 }
 
 test "serverless http client round-trips serverless http server" {

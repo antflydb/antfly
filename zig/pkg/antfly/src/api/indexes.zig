@@ -81,17 +81,58 @@ pub fn addIndexToTableIndexesJsonWithIo(
     index_name: []const u8,
     index_json: []const u8,
 ) ![]u8 {
-    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.InvalidCreateIndexRequest;
+    // Compose new physical consumers with the current privacy graph in the
+    // same table CAS. Existing protected consumers are immutable through this
+    // endpoint; migration creates B, waits for completeness, then swaps A's alias.
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    try privacy.validateUserConfiguration(alloc, index_json);
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
+    if (current.value != .object) return error.InvalidTableIndexMetadata;
     var config = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
     defer config.deinit();
+    if (config.value != .object) return error.InvalidCreateIndexRequest;
+    if (try privacy.current(alloc, current.value)) |owned| {
+        var resource = owned;
+        defer resource.deinit();
+        if (resource.value.policy.mode == .redact_for_search_and_ai) {
+            if (std.mem.startsWith(u8, index_name, "_privacy_") or
+                @import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.PrivacyManagedGraph;
+            if (current.value.object.contains(index_name)) {
+                var logical_root = try std.json.parseFromSlice(std.json.Value, alloc, resource.value.unprotected_indexes_json, .{});
+                defer logical_root.deinit();
+                const existing = logical_root.value.object.get(index_name) orelse return error.PrivacyManagedGraph;
+                if (!try equivalentIndexConfigValues(alloc, index_name, existing, config.value)) return error.PrivacyManagedGraph;
+                return alloc.dupe(u8, current_indexes_json);
+            }
+            if (current.value.object.get(@import("antfly_local_sources").api_index_metadata.aliases.key)) |bindings| {
+                if (bindings != .object) return error.InvalidTableIndexMetadata;
+                if (bindings.object.contains(index_name)) return error.IndexAliasNameConflict;
+            }
+            const logical = try addIndexToTableIndexesJsonWithIo(alloc, io, resource.value.unprotected_indexes_json, index_name, index_json);
+            defer alloc.free(logical);
+            var replacement = resource.value;
+            replacement.unprotected_indexes_json = logical;
+            return try privacy.install(alloc, current_indexes_json, replacement);
+        }
+    }
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
+    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.InvalidCreateIndexRequest;
 
     const root = switch (current.value) {
         .object => |object| object,
         else => return error.InvalidTableIndexMetadata,
     };
     if (config.value != .object) return error.InvalidCreateIndexRequest;
+    if (root.get(index_name)) |existing| {
+        if (!try equivalentIndexConfigValues(alloc, index_name, existing, config.value))
+            try @import("antfly_local_sources").api_index_metadata.aliases.ensureUnreferenced(alloc, current_indexes_json, index_name);
+    }
+    if (root.get(@import("antfly_local_sources").api_index_metadata.aliases.key)) |aliases| {
+        if (aliases != .object) return error.InvalidTableIndexMetadata;
+        if (aliases.object.contains(index_name)) return error.IndexAliasNameConflict;
+    }
+
     const stored_config = storedIndexConfigForMutationAlloc(
         alloc,
         io,
@@ -195,6 +236,36 @@ pub fn removeIndexFromTableIndexesJson(
     current_indexes_json: []const u8,
     index_name: []const u8,
 ) !?[]u8 {
+    try @import("antfly_local_sources").api_index_metadata.aliases.ensureUnreferenced(alloc, current_indexes_json, index_name);
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    var live = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
+    defer live.deinit();
+    if (try privacy.current(alloc, live.value)) |owned| {
+        var resource = owned;
+        defer resource.deinit();
+        if (resource.value.policy.mode == .redact_for_search_and_ai) {
+            if (std.mem.startsWith(u8, index_name, "_privacy_") or
+                @import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.PrivacyManagedGraph;
+            if (!live.value.object.contains(index_name)) return null;
+            var declarations = try std.json.parseFromSlice(std.json.Value, alloc, resource.value.unprotected_indexes_json, .{});
+            defer declarations.deinit();
+            // Synthesized serving guards are owned by privacy, not by index DDL.
+            if (!declarations.value.object.contains(index_name)) return error.PrivacyManagedGraph;
+            const logical = (try removeIndexFromTableIndexesJson(alloc, resource.value.unprotected_indexes_json, index_name)) orelse return null;
+            defer alloc.free(logical);
+            var replacement = resource.value;
+            replacement.unprotected_indexes_json = logical;
+            const updated = try privacy.install(alloc, current_indexes_json, replacement);
+            errdefer alloc.free(updated);
+            var result = try std.json.parseFromSlice(std.json.Value, alloc, updated, .{});
+            defer result.deinit();
+            if (result.value.object.contains(index_name)) return error.PrivacyManagedGraph;
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, updated);
+            try @import("antfly_local_sources").api_index_metadata.aliases.validateDependencyMutation(alloc, current_indexes_json, updated);
+            return updated;
+        }
+    }
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
     if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.ExtensionOwnedObject;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
@@ -226,12 +297,46 @@ pub fn removeIndexFromTableIndexesJson(
     return try @import("antfly_local_sources").storage_db_resolver_curation.retainRetiredMetadata(alloc, current_indexes_json, out.items);
 }
 
+/// Resolve the same admitted, credential-free producer that inline collection
+/// inherits from an owning index. A table-wide declaration must retain that
+/// provenance instead of becoming a producer-less copy of an executable artifact.
+fn inheritedInlineEmbeddingProducerAlloc(alloc: std.mem.Allocator, root: std.json.ObjectMap, name: []const u8, replacement: std.json.Value) !?[]u8 {
+    const kind = replacement.object.get("kind") orelse return null;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "embedding")) return null;
+    if (replacement.object.get("producer") != null) return null;
+    if (replacement.object.get("producer_json")) |producer| {
+        if (producer != .string or producer.string.len != 0) return null;
+    }
+    var inherited: ?[]u8 = null;
+    errdefer if (inherited) |value| alloc.free(value);
+    var entries = root.iterator();
+    while (entries.next()) |entry| {
+        const index = entry.value_ptr.*;
+        if (index != .object or index.object.get("embedder") == null) continue;
+        const index_type = index.object.get("type") orelse continue;
+        if (index_type != .string or !std.mem.eql(u8, index_type.string, "embeddings")) continue;
+        const definitions = index.object.get("enrichments") orelse continue;
+        if (definitions != .array) continue;
+        for (definitions.array.items) |definition| {
+            if (!enrichmentValueNameEquals(definition, name)) continue;
+            const candidate = try managed_embedder.embeddingCatalogSemanticProducerJsonAllocWithOptions(alloc, index, .{});
+            defer alloc.free(candidate);
+            if (inherited) |prior| {
+                if (!try enrichment_config_validation.producerJsonValuesEqual(alloc, prior, candidate)) return error.ConflictingEnrichmentConfig;
+            } else inherited = try alloc.dupe(u8, candidate);
+        }
+    }
+    return inherited;
+}
+
 pub fn addEnrichmentToTableIndexesJson(
     alloc: std.mem.Allocator,
     current_indexes_json: []const u8,
     enrichment_name: []const u8,
     enrichment_json: []const u8,
 ) ![]u8 {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, enrichment_name);
+    try @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(alloc, enrichment_json);
     try validateEnrichmentConfigName(alloc, enrichment_name, enrichment_json);
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
@@ -243,6 +348,10 @@ pub fn addEnrichmentToTableIndexesJson(
         else => return error.InvalidTableIndexMetadata,
     };
     if (config.value != .object) return error.InvalidExtensionEnrichment;
+    const inherited_producer = try inheritedInlineEmbeddingProducerAlloc(alloc, root, enrichment_name, config.value);
+    defer if (inherited_producer) |value| alloc.free(value);
+    if (inherited_producer) |value| try config.value.object.put(config.arena.allocator(), "producer_json", .{ .string = value });
+    _ = @import("enrichment_catalog_update.zig").replaceInline(root, enrichment_name, config.value);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -285,6 +394,7 @@ pub fn removeEnrichmentFromTableIndexesJson(
     current_indexes_json: []const u8,
     enrichment_name: []const u8,
 ) !?[]u8 {
+    try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, enrichment_name);
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
 
@@ -292,12 +402,12 @@ pub fn removeEnrichmentFromTableIndexesJson(
         .object => |object| object,
         else => return error.InvalidTableIndexMetadata,
     };
-    const current_enrichments = root.get("enrichments") orelse return null;
-    if (current_enrichments != .array) return error.InvalidTableIndexMetadata;
+    const current_enrichments = root.get("enrichments");
+    if (current_enrichments != null and current_enrichments.? != .array) return error.InvalidTableIndexMetadata;
 
-    var removed = false;
+    var removed = @import("enrichment_catalog_update.zig").removeInline(root, enrichment_name) != 0;
     var remaining: usize = 0;
-    for (current_enrichments.array.items) |item| {
+    for (if (current_enrichments) |value| value.array.items else &.{}) |item| {
         if (enrichmentValueNameEquals(item, enrichment_name)) {
             removed = true;
         } else {
@@ -344,13 +454,16 @@ pub fn encodeArtifactEnrichmentList(
     indexes_json: []const u8,
 ) ![]u8 {
     var enrichments = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
-    var unique_len: usize = 0;
+    // Retain ownership of every collected config through fallible sorting.
+    // Compaction below has no fallible operations and then narrows this span.
+    var unique_len: usize = enrichments.len;
     defer {
         for (enrichments[0..unique_len]) |*cfg| cfg.deinit(alloc);
         alloc.free(enrichments);
     }
 
-    sortArtifactEnrichmentsByDependency(enrichments);
+    try sortArtifactEnrichmentsByDependency(alloc, enrichments);
+    unique_len = 0;
     for (enrichments, 0..) |*cfg, i| {
         var duplicate = false;
         for (enrichments[0..unique_len]) |prior| {
@@ -415,6 +528,7 @@ pub fn validateArtifactEnrichmentsForTableIndexesJson(
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(indexes_json), .{});
     defer parsed.deinit();
     try validateArtifactIndexReferences(alloc, parsed.value, enrichments);
+    try @import("antfly_local_sources").api_index_metadata.aliases.validateReferences(parsed.value);
 }
 
 /// Validate only properties that can be decided from one create-index request.
@@ -460,6 +574,11 @@ fn validateArtifactIndexReferences(
 
         if (std.mem.eql(u8, index_type, "embeddings")) {
             const external = if (object.get("external")) |value| value == .bool and value.bool else false;
+            if (object.get("external_vector_space")) |space| {
+                if (!external or space != .string or space.string.len == 0 or space.string.len > 4096)
+                    return error.InvalidEnrichmentConfig;
+                if (object.get("sparse")) |sparse| if (sparse == .bool and sparse.bool) return error.InvalidEnrichmentConfig;
+            }
             if (!external) {
                 try validateEmbeddingArtifactReferences(alloc, object, configs);
             }
@@ -620,7 +739,7 @@ fn validateEmbeddingArtifactShape(
     dims: u32,
 ) !void {
     if (sparse) {
-        if (cfg.expected_dims != 0) return error.InvalidEnrichmentConfig;
+        if (cfg.expected_dims != 0 or cfg.embedding_input != .text) return error.InvalidEnrichmentConfig;
     } else if (dims > 0 and cfg.expected_dims > 0 and cfg.expected_dims != dims) {
         return error.InvalidEnrichmentConfig;
     }
@@ -707,13 +826,24 @@ pub fn encodeIndexList(
     return try out.toOwnedSlice(alloc);
 }
 
+fn isRetryableLakeBuildFailure(reason: []const u8) bool {
+    // This controls coordinator readiness, not HTTP replay. The coordinator
+    // reacquires its fence and resumes verified checkpoints after backoff.
+    // In particular, an ambiguous TLS write must not be blindly replayed.
+    if (@import("httpx").isRetryableTransportErrorName(reason)) return true;
+    inline for (.{ "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "TlsTransportReadFailed", "RateLimited", "RemoteUnavailable", "StorageReadTemporarilyUnavailable", "ConcurrencyUnavailable", "ResourceTemporarilyUnavailable", "SystemResources", "ProcessFdQuotaExceeded", "SystemFdQuotaExceeded" }) |name| {
+        if (std.mem.eql(u8, reason, name)) return true;
+    }
+    return false;
+}
+
 /// Remote readiness is catalog owned. Empty native shard indexes cannot prove
 /// external coverage. Queryability is supplied only by a serving proof.
 pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, index_name: []const u8, config: std.json.Value, queryable: bool) ![]u8 {
     const lake = @import("antfly_local_sources").metadata_lake_index_catalog;
     var state = try lake.parse(alloc, table.lake_index_catalog_json);
     defer state.deinit();
-    const desired = lake.desiredFingerprint(table);
+    const desired = try lake.desiredFingerprint(alloc, table);
     const failure = if (state.value.failure) |value| if (std.mem.eql(u8, &value.desired, &desired)) value else null else null;
     const published: ?u64 = if (state.value.published) |value| published: {
         if (!std.mem.eql(u8, &value.signature.desired, &desired)) break :published null;
@@ -729,7 +859,7 @@ pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_m
                     const name = mat.object.get("name") orelse break :published null;
                     if (name != .string) break :published null;
                     const found = for (value.declarations) |declaration| {
-                        if (declaration.artifact.kind == .algebraic_segment and try @import("lake_index_names.zig").matches(alloc, declaration.name, index_name, name.string, declaration.artifact.metadata_version)) break true;
+                        if (declaration.artifact.kind == .algebraic_segment and try @import("lake_index_names.zig").matches(alloc, declaration.name, index_name, name.string)) break true;
                     } else false;
                     if (!found) break :published null;
                 }
@@ -739,13 +869,16 @@ pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_m
         break :published null;
     } else null;
     const serving_ready = queryable and published != null;
+    // Reconciliation retries interruptions and transient transport failures
+    // after durable backoff. Queryability still requires the independent proof.
+    const terminal_failure = if (failure) |value| !isRetryableLakeBuildFailure(value.reason) else false;
     const readiness: indexes_openapi.IndexReadinessStatus = .{
-        .state = if (serving_ready) .ready else if (failure != null) .failed else .pending,
+        .state = if (serving_ready) .ready else if (terminal_failure) .failed else .pending,
         .queryable = serving_ready,
         .complete = serving_ready,
         .target_revision = if (state.value.generation > 0) state.value.generation else null,
         .published_revision = published,
-        .pending_reasons = if (serving_ready) &.{} else if (failure != null) &.{.load_failure} else &.{.publication},
+        .pending_reasons = if (serving_ready) &.{} else if (terminal_failure) &.{.load_failure} else &.{.publication},
     };
     const status = try std.json.Stringify.valueAlloc(alloc, .{
         .index_type = indexTypeName(inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata),
@@ -1160,7 +1293,7 @@ fn appendIndexStatusWithIdentity(
     const coverage_generation = if (runtime_identity) |identity| identity.incarnation else 0;
     const coverage_config_hash = if (runtime_identity) |identity| identity.config_hash else 0;
     var source_name_buffer: [64][]const u8 = undefined;
-    const configured_sources = configuredArtifactSourceNames(config, index_type, &source_name_buffer);
+    const configured_sources = configuredArtifactSourceNames(index_name, config, index_type, &source_name_buffer);
     try out.appendSlice(alloc, "{\"config\":");
     try appendIndexConfig(alloc, out, index_name, config);
     try out.appendSlice(alloc, ",\"status\":");
@@ -1170,7 +1303,7 @@ fn appendIndexStatusWithIdentity(
     try out.append(alloc, '}');
 }
 
-fn configuredArtifactSourceNames(config: std.json.Value, index_type: ApiIndexType, buffer: *[64][]const u8) []const []const u8 {
+fn configuredArtifactSourceNames(index_name: []const u8, config: std.json.Value, index_type: ApiIndexType, buffer: *[64][]const u8) []const []const u8 {
     if (config != .object) return &.{};
     var count: usize = 0;
     if (config.object.get("sources")) |sources| if (sources == .array) {
@@ -1199,6 +1332,15 @@ fn configuredArtifactSourceNames(config: std.json.Value, index_type: ApiIndexTyp
             buffer[0] = artifact.string;
             return buffer[0..1];
         }
+    }
+    // Inline embedders produce an implicit same-name artifact. Its replay and
+    // producer closure are real completion fences, including on empty tables.
+    // External/direct-field indexes have no such producer dependency.
+    if (index_type == .embeddings and embeddingsCoveragePolicy(config) != .external) {
+        if (config.object.get("embedder")) |embedder| if (embedder == .object) {
+            buffer[0] = index_name;
+            return buffer[0..1];
+        };
     }
     return &.{};
 }
@@ -1233,9 +1375,17 @@ pub fn indexesConfigUsesArtifactSources(alloc: std.mem.Allocator, indexes_json: 
     if (parsed.value != .object) return error.InvalidCreateTableRequest;
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
+            @import("antfly_local_sources").api_index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
         if (try indexConfigValueUsesArtifactSources(entry.value_ptr.*)) return true;
     }
     return false;
+}
+
+test "privacy restore artifact admission skips opaque state and declarations in any order" {
+    const a = std.testing.allocator;
+    try std.testing.expect(!try indexesConfigUsesArtifactSources(a, "{\"enrichments\":[],\"_privacy\":{\"coverage\":{}},\"resolvers\":[],\"full_text_index_v0\":{\"type\":\"full_text\"}}"));
+    try std.testing.expect(try indexesConfigUsesArtifactSources(a, "{\"_privacy\":{},\"enrichments\":[],\"full_text_index_v0\":{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"safe\"}]}}"));
 }
 
 fn appendIndexConfig(
@@ -1915,31 +2065,12 @@ fn publicShardIndexRuntimeView(
     // this after aggregation can erase unrelated live catch-up on a sibling.
     if (publicIndexRepairState(item) != null and repairActiveGenerationServiceable(item)) return view;
 
+    // Worker progress has no index identity. It may annotate an already
+    // active consumer's phase, but cannot create debt or rewrite watermarks.
     const dense_catch_up = async_indexing.dense_catch_up;
-    if (!dense_catch_up.active) return view;
-    view.catch_up_active = true;
-    view.catch_up_phase = dense_catch_up.phase;
-    view.catch_up_applied_sequence = @max(view.catch_up_applied_sequence, dense_catch_up.current_sequence);
-    view.catch_up_target_sequence = @max(view.catch_up_target_sequence, dense_catch_up.current_target_sequence);
+    if (view.catch_up_active and view.catch_up_phase == .idle and dense_catch_up.active)
+        view.catch_up_phase = dense_catch_up.phase;
 
-    // The DB-wide snapshot can lead the per-index overlay briefly. Only use it
-    // as a replay-watermark fallback when the index has published no replay
-    // facts of its own; explicit per-index watermarks remain authoritative.
-    const index_replay_present = view.replay_applied_sequence != 0 or
-        view.replay_target_sequence != 0 or view.replay_catch_up_required;
-    if (!index_replay_present) {
-        view.replay_catch_up_required = true;
-        view.backfill_active = true;
-        view.replay_target_sequence = dense_catch_up.current_target_sequence;
-        view.replay_applied_sequence = dense_catch_up.current_sequence;
-        if (view.replay_target_sequence > 0) {
-            view.backfill_progress = @min(
-                0.999,
-                @as(f64, @floatFromInt(view.replay_applied_sequence)) /
-                    @as(f64, @floatFromInt(view.replay_target_sequence)),
-            );
-        }
-    }
     return view;
 }
 
@@ -2084,6 +2215,9 @@ const AggregatedIndexStatus = struct {
     source_replay: [64]db_mod.types.IndexSourceReplayStatus = @as([64]db_mod.types.IndexSourceReplayStatus, @splat(.{ .artifact_name = "" })),
     source_replay_count: usize = 0,
     replay_catch_up_required: bool = false,
+    // All observed physical consumers retain their own checkpoint fence;
+    // shard-wide producer telemetry cannot establish this proof.
+    scoped_checkpoint_complete: bool = true,
     catch_up_active: bool = false,
     catch_up_phase: db_mod.types.DenseCatchUpStats.Phase = .idle,
     catch_up_applied_sequence: u64 = 0,
@@ -2685,6 +2819,8 @@ fn aggregateIndexStatusIndexed(
                 aggregate.embedding_activity.merge(runtime.group_id, item.embedding_activity);
             }
         }
+        aggregate.scoped_checkpoint_complete = aggregate.scoped_checkpoint_complete and
+            std.mem.eql(u8, public_item.projection_checkpoint_status, "clean");
         aggregate.replay_applied_sequence += public_item.replay_applied_sequence;
         aggregate.replay_target_sequence += public_item.replay_target_sequence;
         for (public_item.source_replay) |source| accumulateSourceReplayStatus(&aggregate, source);
@@ -2811,6 +2947,15 @@ fn coverageIdentityMatches(item: anytype, expected_generation: u64, expected_con
     return true;
 }
 
+/// Physical checkpoint completion is independent of materialization counts
+/// and producer telemetry. Aggregates carry the conjunction of their shards.
+fn consumerCheckpointComplete(item: anytype) bool {
+    const Item = @TypeOf(item);
+    if (@hasField(Item, "projection_checkpoint_status") and !std.mem.eql(u8, item.projection_checkpoint_status, "clean")) return false;
+    if (@hasField(Item, "scoped_checkpoint_complete") and !item.scoped_checkpoint_complete) return false;
+    return true;
+}
+
 fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
     const kind = aggregate.kind orelse return;
     if (kind != .dense_vector and kind != .sparse_vector) return;
@@ -2821,6 +2966,11 @@ fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
         aggregate.remote_unknown_group_count > 0 or
         aggregate.expected_group_count != aggregate.fresh_group_count) return;
     if (aggregate.load_error != null or aggregate.repair_degraded or aggregate.enrichment_failed) return;
+    if (!consumerCheckpointComplete(aggregate.*)) {
+        aggregate.backfill_active = true;
+        aggregate.backfill_progress = @min(aggregate.backfill_progress, 0.999);
+        return;
+    }
     if (aggregate.dense_vector_projection_pending) return;
     const enrichment_blocked = aggregate.enrichment.enabled and (aggregate.enrichment.retrying or aggregate.enrichment.worker_failed);
     if (enrichment_blocked) return;
@@ -3424,7 +3574,19 @@ fn appendCoverageFingerprint(alloc: std.mem.Allocator, out: *std.ArrayListUnmana
 
 fn embeddingsArtifactVisible(item: anytype, sparse: bool) bool {
     if (sparse) return item.doc_count > 0;
+    // Current owners explicitly certify their serving snapshot. LEANN can
+    // serve an exact pending buffer before it has graph nodes; HBC root/node
+    // counts are only a compatibility fallback for older observations.
+    if (@hasField(@TypeOf(item), "serving_snapshot_ready"))
+        return item.doc_count > 0 and item.serving_snapshot_ready;
     return item.doc_count > 0 and (item.node_count > 0 or item.root_node > 0);
+}
+
+test "certified dense exact buffers are visible without HBC roots" {
+    const Observation = struct { doc_count: u64 = 3, node_count: u64 = 0, root_node: u64 = 0, serving_snapshot_ready: bool };
+    try std.testing.expect(embeddingsArtifactVisible(Observation{ .serving_snapshot_ready = true }, false));
+    try std.testing.expect(!embeddingsArtifactVisible(Observation{ .serving_snapshot_ready = false, .node_count = 1, .root_node = 1 }, false));
+    try std.testing.expect(embeddingsArtifactVisible(.{ .doc_count = @as(u64, 3), .node_count = @as(u64, 1), .root_node = @as(u64, 1) }, false));
 }
 
 fn embeddingsArtifactPublishComplete(item: anytype, sparse: bool, expected_doc_count: u64) bool {
@@ -3561,6 +3723,23 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try out.append(alloc, '}');
 }
 
+/// A fresh, complete physical consumer proof supersedes shard-wide producer
+/// telemetry for readiness. Missing/stale topology, source debt and publication
+/// debt keep the conservative producer fence; diagnostics remain unmodified.
+fn independentConsumerComplete(item: anytype, observation: IndexReadinessObservation, table_doc_count: u64, coverage_policy: EmbeddingsCoveragePolicy, sparse: bool, generation: u64, config_hash: u64) bool {
+    const Item = @TypeOf(item);
+    if (!@hasField(Item, "coverage_produced_count") or !@hasField(Item, "coverage_skipped_count") or !@hasField(Item, "coverage_terminal_failed_count")) return false;
+    if (!observation.completionFencesClear()) return false;
+    if (!consumerCheckpointComplete(item)) return false;
+    if (@hasField(Item, "dense_vector_projection_pending") and item.dense_vector_projection_pending) return false;
+    if (aggregateRuntimeCoverageIncomplete(item, generation, config_hash)) return false;
+    if (!coverageReplayCurrent(item.replay_applied_sequence, item.replay_target_sequence, item.replay_catch_up_required)) return false;
+    if (item.coverage_terminal_failed_count != 0) return false;
+    if (!coverageCountersValid(table_doc_count, item.coverage_produced_count, item.coverage_skipped_count, item.coverage_terminal_failed_count)) return false;
+    if (coverage_policy != .external and !coverageAllSourcesTerminal(table_doc_count, item.coverage_produced_count, item.coverage_skipped_count, item.coverage_terminal_failed_count)) return false;
+    return embeddingsArtifactPublishComplete(item, sparse, item.coverage_produced_count);
+}
+
 fn appendSingleIndexRuntimeStatus(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -3641,13 +3820,19 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     const visible_edge_count = if (embeddings_materialization_current) item.edge_count else 0;
     const visible_node_count = if (embeddings_materialization_current) item.node_count else 0;
     const visible_root_node = if (embeddings_materialization_current) item.root_node else 0;
+    const readiness_observation = indexReadinessObservation(item, authority, coverage_generation);
+    const visible_enrichment = if (embeddings_materialization_current) enrichment else null;
+    const readiness_enrichment = if (index_type == .embeddings and independentConsumerComplete(public_item, readiness_observation, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash)) null else visible_enrichment;
     const embeddings_view = if (index_type == .embeddings)
-        embeddingsRuntimeView(public_item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, enrichment, coverage_runtime_present)
+        embeddingsRuntimeView(public_item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, readiness_enrichment, coverage_runtime_present)
     else
         null;
-    const visible_enrichment = if (embeddings_materialization_current) enrichment else null;
     var backfill_active = if (embeddings_view) |view| view.backfill_active else item.backfill_active;
     var backfill_progress = if (embeddings_view) |view| view.backfill_progress else item.backfill_progress;
+    if (!consumerCheckpointComplete(public_item)) {
+        backfill_active = true;
+        backfill_progress = @min(backfill_progress, 0.999);
+    }
     // Coverage can be authoritative before the serving incarnation is. Keep
     // that useful coverage visible, but never project the lifecycle as ready
     // while the exact incarnation still lacks a readiness proof.
@@ -3684,25 +3869,16 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     var catch_up_active = if (embeddings_materialization_current) public_item.catch_up_active else false;
     var catch_up_phase = if (embeddings_materialization_current) public_item.catch_up_phase else .idle;
     var catch_up_applied_sequence = if (embeddings_materialization_current) public_item.catch_up_applied_sequence else 0;
-    var catch_up_target_sequence = if (embeddings_materialization_current) public_item.catch_up_target_sequence else 0;
-    if (index_type == .embeddings) {
-        if (embeddings_materialization_current and dense_catch_up.active and
-            !active_generation_serviceable and
-            (dense_catch_up.current_target_sequence > dense_catch_up.current_sequence or
-                embeddings_view == null or embeddings_view.?.backfill_active))
-        {
-            catch_up_active = true;
-            catch_up_phase = dense_catch_up.phase;
-            catch_up_applied_sequence = @max(catch_up_applied_sequence, dense_catch_up.current_sequence);
-            catch_up_target_sequence = @max(catch_up_target_sequence, dense_catch_up.current_target_sequence);
-        } else if (embeddings_view) |view| {
-            if (!view.backfill_active) {
-                catch_up_active = false;
-                catch_up_phase = .idle;
-                catch_up_applied_sequence = @max(catch_up_applied_sequence, catch_up_target_sequence);
-            }
+    const catch_up_target_sequence = if (embeddings_materialization_current) public_item.catch_up_target_sequence else 0;
+    if (index_type == .embeddings and catch_up_active and catch_up_phase == .idle and dense_catch_up.active)
+        catch_up_phase = dense_catch_up.phase;
+    if (index_type == .embeddings) if (embeddings_view) |view| {
+        if (!view.backfill_active) {
+            catch_up_active = false;
+            catch_up_phase = .idle;
+            catch_up_applied_sequence = @max(catch_up_applied_sequence, catch_up_target_sequence);
         }
-    }
+    };
     const catch_up_pending = catch_up_active or catch_up_target_sequence > catch_up_applied_sequence;
     if (catch_up_pending) {
         replay_catch_up_required = true;
@@ -3790,7 +3966,7 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     const index_activity_pending = index_type == .embeddings and
         item.embedding_activity.epoch != 0 and
         item.embedding_activity.effectivePhase() != .idle;
-    const supervised_coverage_pending = if (visible_enrichment) |stats|
+    const supervised_coverage_pending = if (readiness_enrichment) |stats|
         stats.enabled and !stats.worker_failed and
             (if (embeddings_view) |view| view.coverage_pending else false)
     else
@@ -3809,9 +3985,8 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     const enrichment_degraded = index_type == .embeddings and
         ((embeddings_materialization_current and item.enrichment_failed and !enrichment_work_pending) or coverage_degraded);
     const terminal_enrichment_failure = enrichment_degraded or
-        (if (visible_enrichment) |stats| stats.worker_failed else false);
+        (if (readiness_enrichment) |stats| stats.worker_failed else false);
     const terminal_load_failure = load_error != null and raw_load_error_matches_desired_incarnation;
-    const readiness_observation = indexReadinessObservation(item, authority, coverage_generation);
     // Progress is a completion fraction, not merely a pulse from an active
     // worker. Full-text runtime snapshots can legitimately retain their last
     // cursor value after the worker settles; once the exact incarnation is
@@ -3875,7 +4050,7 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     } else if (repair_blocks_readiness and repair_state != null and std.mem.eql(u8, repair_state.?, "waiting")) {
         try appendJsonString(alloc, out, "retrying");
     } else {
-        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, enrichment_degraded, replay_applied_sequence, replay_target_sequence, visible_enrichment));
+        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, enrichment_degraded, replay_applied_sequence, replay_target_sequence, readiness_enrichment));
     }
     if (load_error) |err_name| {
         const msg = try std.fmt.allocPrint(alloc, "load failed: {s}", .{err_name});
@@ -4221,7 +4396,7 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
         backfill_active,
         terminal_load_failure,
         terminal_enrichment_failure,
-        (if (visible_enrichment) |stats| stats.worker_failed else false),
+        (if (readiness_enrichment) |stats| stats.worker_failed else false),
         repair_state,
         repair_action_required,
         repair_lifecycle.blocks_queryable,
@@ -4296,9 +4471,9 @@ fn appendIndexReadinessStatus(
         ((terminal_load_failure or repair_failed) and
             (!active_generation_serviceable or repair_blocks_queryable)) or
         (terminal_enrichment_failure and !serving_snapshot_ready);
-    const publication_pending = index_type == .embeddings and incarnation_current and
-        (replay_target_sequence > replay_applied_sequence or artifact_publish_pending or
-            !serving_snapshot_ready);
+    const publication_pending = incarnation_current and
+        (!consumerCheckpointComplete(item) or (index_type == .embeddings and
+            (replay_target_sequence > replay_applied_sequence or artifact_publish_pending or !serving_snapshot_ready)));
     const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and
         !source_coverage_complete;
     const sources_complete = observation.sources_complete;
@@ -4584,6 +4759,8 @@ fn appendResolverReplayDiagnosticsStatus(alloc: std.mem.Allocator, out: *std.Arr
         try appendJsonString(alloc, out, "resolution_artifact");
         try out.appendSlice(alloc, ":");
         try appendJsonString(alloc, out, resolver.resolution_artifact);
+        try out.appendSlice(alloc, ",\"candidate_key_prefix\":");
+        try appendJsonString(alloc, out, resolver.candidate_key_prefix);
         try out.appendSlice(alloc, "}");
     }
     try out.appendSlice(alloc, "]}");
@@ -5046,7 +5223,10 @@ fn expectCreatedObjectAllowlistCovers(
     shape: public_index_contract.CreatedObjectShape,
 ) !void {
     inline for (comptime std.meta.fieldNames(T)) |reflected_name| {
-        try std.testing.expect(public_index_contract.isAllowedCreatedObjectField(shape, reflected_name));
+        if (!public_index_contract.isAllowedCreatedObjectField(shape, reflected_name)) {
+            std.debug.print("CreatedIndex response shape {s} omits generated field {s}\n", .{ @tagName(shape), reflected_name });
+            return error.TestUnexpectedResult;
+        }
     }
 }
 
@@ -5056,6 +5236,56 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "public media pass admits named outputs from model chunks (#1210)" {
+            const a = std.testing.allocator;
+            const recipe =
+                \\{"enrichments":[{"name":"windows","kind":"chunk","field":"recording","chunker":{"provider":"antfly","embedding":{"model":"model","dimensions":2},"outputs":{"boundary_model":"embedding","targets":[{"name":"embedding","kind":"embedding","model":"model","dimensions":2},{"name":"speech","kind":"transcribe","model":"whisper"}]}}},{"name":"transcript","kind":"asset","source_artifact_name":"windows","producer":{"type":"media_output","config":{"output_name":"speech"}}},{"name":"transcript_chunks","kind":"chunk","field":"text","source_artifact_name":"transcript","chunk_size":512},{"name":"media_vectors","kind":"embedding","source_artifact_name":"windows","expected_dims":2}]}
+            ;
+            const body = try std.fmt.allocPrint(a, "{{\"type\":\"full_text\",\"field\":\"body\",{s}", .{recipe[1..]});
+            defer a.free(body);
+            const normalized = try parseCreateIndexRequest(a, body);
+            defer a.free(normalized);
+            try validateArtifactEnrichmentsForIndexRequestJson(a, normalized);
+            try validateArtifactEnrichmentsForTableIndexesJson(a, normalized);
+            try validateArtifactEnrichmentsForTableIndexesJson(a, recipe);
+            const configs = try collectArtifactEnrichmentsFromTableIndexesJson(a, recipe);
+            defer db_mod.types.freeEnrichmentConfigs(a, configs);
+            try sortArtifactEnrichmentsByDependency(a, configs);
+            try std.testing.expectEqualStrings("windows", configs[0].name);
+            try std.testing.expectEqualStrings("transcript", configs[1].name);
+            try std.testing.expectEqualStrings("transcript_chunks", configs[2].name);
+            try std.testing.expectEqualStrings("media_vectors", configs[3].name);
+            // A model output is also a valid root for ordinary asset chains.
+            var chained = [_]db_mod.types.EnrichmentConfig{ configs[0], configs[1], .{ .name = "transcript_copy", .kind = .asset, .source_artifact_name = "transcript", .producer_json = "{\"type\":\"copy\"}" } };
+            try validateArtifactEnrichmentConfigs(a, &chained);
+            try sortArtifactEnrichmentsByDependency(a, &chained);
+            try std.testing.expectEqualStrings("transcript_copy", chained[2].name);
+
+            const Sort = struct {
+                fn qualify(allocator: std.mem.Allocator) !void {
+                    var entries = [_]db_mod.types.EnrichmentConfig{
+                        .{ .name = "result", .kind = .asset, .source_artifact_name = "chunks" },
+                        .{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 10 },
+                    };
+                    try sortArtifactEnrichmentsByDependency(allocator, &entries);
+                    try std.testing.expectEqualStrings("chunks", entries[0].name);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(a, Sort.qualify, .{});
+            var cyclic = [_]db_mod.types.EnrichmentConfig{
+                .{ .name = "a", .kind = .asset, .source_artifact_name = "b" },
+                .{ .name = "b", .kind = .chunk, .source_artifact_name = "a", .chunk_size = 10 },
+            };
+            try std.testing.expectError(error.InvalidEnrichmentConfig, sortArtifactEnrichmentsByDependency(a, &cyclic));
+
+            for (configs) |*config| if (config.kind == .asset) {
+                const original = config.producer_json;
+                config.producer_json = @constCast("{\"type\":\"media_output\",\"config\":{\"output_name\":\"missing\"}}");
+                defer config.producer_json = original;
+                try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentConfigs(a, configs));
+            };
+        }
+
         test "artifact source admission recognizes canonical and v0.2 request forms" {
             const alloc = std.testing.allocator;
             try std.testing.expect(try indexConfigUsesArtifactSources(alloc, "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks\"}]}"));
@@ -6096,7 +6326,7 @@ fn consumerTests() type {
             );
             try ant_json.testing.expectSubsetJsonText(
                 alloc,
-                "{\"incarnation\":\"g-000000000000002a\",\"searchable_vectors\":266,\"activity\":null,\"source_coverage\":{\"covered\":64,\"observation_complete\":false,\"observation_incomplete_reasons\":[\"target_observation\"]},\"milestones\":{\"queryable\":{\"reached\":true},\"complete\":{\"reached\":false,\"blockers\":[\"target_observation\",\"source_coverage\",\"publication\"]}},\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"target_observation\",\"backfill\",\"coverage\",\"publication\"]}}",
+                "{\"incarnation\":\"g-000000000000002a\",\"searchable_vectors\":266,\"activity\":null,\"source_coverage\":{\"covered\":64,\"observation_complete\":false,\"observation_incomplete_reasons\":[\"target_observation\"]},\"milestones\":{\"queryable\":{\"reached\":true},\"complete\":{\"reached\":false,\"blockers\":[\"target_observation\",\"source_coverage\",\"publication\"]}},\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"target_observation\",\"backfill\",\"coverage\"]}}",
                 encoded.items,
             );
         }
@@ -6700,6 +6930,12 @@ fn consumerTests() type {
                 .coverage_config_hash = 99,
                 .coverage_identity_ready = true,
                 .coverage_summary_ready = true,
+                .replay_applied_sequence = 7,
+                .replay_target_sequence = 11,
+                .replay_catch_up_required = true,
+                .catch_up_active = true,
+                .catch_up_applied_sequence = 7,
+                .catch_up_target_sequence = 11,
                 .projection_checkpoint_status = "clean",
                 .projection_checkpoint_applied_sequence = 7,
                 .projection_checkpoint_generation = 42,
@@ -6713,9 +6949,8 @@ fn consumerTests() type {
                     .doc_count = 1,
                     .index_count = 1,
                     .indexes = indexes[0..],
-                    // The table-level worker snapshot can lead the per-index replay
-                    // overlay briefly. The already-published physical generation
-                    // remains queryable while the later revision catches up.
+                    // This index owns replay debt; the published prefix remains
+                    // queryable while its later revision catches up.
                     .async_indexing = .{ .dense_catch_up = .{
                         .active = true,
                         .phase = .replay,
@@ -6762,7 +6997,7 @@ fn consumerTests() type {
             );
         }
 
-        test "serviceable repair preserves sibling shard dense catch-up fallback" {
+        test "serviceable repair preserves sibling shard dense catch-up" {
             var repair_indexes = [_]db_mod.types.DBIndexStats{.{
                 .name = "thumbnail",
                 .kind = .dense_vector,
@@ -6796,6 +7031,12 @@ fn consumerTests() type {
                 .coverage_config_hash = 99,
                 .coverage_identity_ready = true,
                 .coverage_summary_ready = true,
+                .replay_applied_sequence = 7,
+                .replay_target_sequence = 11,
+                .replay_catch_up_required = true,
+                .catch_up_active = true,
+                .catch_up_applied_sequence = 7,
+                .catch_up_target_sequence = 11,
             }};
             const runtimes = [_]runtime_status.LocalTableRuntimeStatus{
                 .{
@@ -6824,8 +7065,7 @@ fn consumerTests() type {
                         .doc_count = 1,
                         .index_count = 1,
                         .indexes = live_indexes[0..],
-                        // This shard's table-level snapshot leads its per-index
-                        // overlay and remains authoritative public readiness debt.
+                        // This shard owns explicit per-index replay debt.
                         .async_indexing = .{ .dense_catch_up = .{
                             .active = true,
                             .phase = .replay,
@@ -6846,7 +7086,7 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("rebuilding", aggregate.repair_state.?);
             try std.testing.expect(aggregate.repair_active_generation_serviceable);
             // The repair shard contributes its active-generation 2 -> 2 boundary;
-            // the sibling contributes the live 7 -> 11 fallback.
+            // the sibling contributes the live 7 -> 11 index ledger.
             try std.testing.expectEqual(@as(u64, 9), aggregate.replay_applied_sequence);
             try std.testing.expectEqual(@as(u64, 13), aggregate.replay_target_sequence);
             try std.testing.expect(aggregate.replay_catch_up_required);
@@ -7227,6 +7467,9 @@ fn consumerTests() type {
             try std.testing.expect(pending.backfill_active);
             item.doc_count = 50;
             item.node_count = 1;
+            const uncertified = embeddingsRuntimeView(item, 200, .external, false, 7, 41, null, true);
+            try std.testing.expect(uncertified.backfill_active);
+            item.serving_snapshot_ready = true;
             const ready = embeddingsRuntimeView(item, 200, .external, false, 7, 41, null, true);
             try std.testing.expect(!ready.backfill_active);
             try std.testing.expectEqual(@as(f64, 1.0), ready.backfill_progress);
@@ -7237,6 +7480,7 @@ fn consumerTests() type {
                 .name = "vec",
                 .kind = .dense_vector,
                 .doc_count = 1,
+                .serving_snapshot_ready = true,
                 .node_count = 1,
                 .coverage_produced_count = 1,
                 .publication_target_count = 1,
@@ -7278,6 +7522,99 @@ fn consumerTests() type {
             normalizeReadyEmbeddingsAggregate(&aggregate);
             try std.testing.expect(aggregate.backfill_active);
             try std.testing.expect(aggregate.dense_vector_projection_pending);
+        }
+
+        test "protected consumer public status ignores unrelated worker debt and preserves source fences" {
+            const a = std.testing.allocator;
+            var sources = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "A", .published_sequence = 9, .target_sequence = 9, .producer_complete = true, .repair_summary_ready = true, .observation_count = 1 }};
+            var item: db_mod.types.DBIndexStats = .{
+                .name = "A",
+                .kind = .dense_vector,
+                .doc_count = 1,
+                .node_count = 1,
+                .root_node = 1,
+                .serving_snapshot_ready = true,
+                .publication_target_ready = true,
+                .publication_target_count = 1,
+                .coverage_produced_count = 1,
+                .coverage_generation = 7,
+                .coverage_config_hash = 41,
+                .coverage_identity_ready = true,
+                .coverage_summary_ready = true,
+                .backfill_progress = 1,
+                .replay_applied_sequence = 9,
+                .replay_target_sequence = 9,
+                .catch_up_applied_sequence = 9,
+                .catch_up_target_sequence = 9,
+                .projection_checkpoint_status = "clean",
+                .projection_checkpoint_applied_sequence = 9,
+                .projection_checkpoint_generation = 7,
+                .projection_checkpoint_config_hash = 41,
+                .source_replay = &sources,
+            };
+            const worker: db_mod.types.AsyncIndexingStats = .{ .dense_catch_up = .{ .active = true, .phase = .replay, .current_sequence = 2, .current_target_sequence = 100 } };
+            const metadata: runtime_status.RuntimeStatusMetadata = .{ .source = .live_writer_publish, .freshness = .fresh };
+            const view = publicShardIndexRuntimeView(item, worker);
+            try std.testing.expect(!view.catch_up_active);
+            try std.testing.expectEqual(@as(u64, 9), view.catch_up_target_sequence);
+            var encoded: std.ArrayListUnmanaged(u8) = .empty;
+            defer encoded.deinit(a);
+            for ([_]bool{ false, true }) |failed| {
+                encoded.clearRetainingCapacity();
+                try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, view, 1, .strict, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = !failed, .worker_failed = failed }, null, null, .{}, metadata, true);
+                try ant_json.testing.expectSubsetJsonText(a, "{\"rebuilding\":false,\"backfill_active\":false,\"dense_replay_applied_sequence\":9,\"dense_replay_target_sequence\":9,\"readiness\":{\"state\":\"ready\",\"queryable\":true,\"complete\":true}}", encoded.items);
+            }
+            // External coverage may intentionally omit vectors, while its
+            // own physical publication and zero-producer identity are complete.
+            var external = item;
+            external.source_replay = &.{};
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, external, 10, .external, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true }, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"rebuilding\":false,\"readiness\":{\"complete\":true}}", encoded.items);
+            // The same worker diagnostics cannot discharge A's own source debt.
+            sources[0].producer_complete = false;
+            item.source_replay = &sources;
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, item, 1, .strict, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true }, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"complete\":false}}", encoded.items);
+            sources[0].producer_complete = true;
+            item.runtime_observation_stale = true;
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, item, 1, .strict, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true }, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"complete\":false}}", encoded.items);
+            item.runtime_observation_stale = false;
+            item.runtime_target_observation_complete = false;
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, item, 1, .strict, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true }, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"complete\":false}}", encoded.items);
+            item.runtime_target_observation_complete = true;
+            item.projection_checkpoint_status = "rebuilding";
+            const producer_states = [_]?db_mod.types.EnrichmentStats{
+                .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true },
+                .{ .enabled = true, .applied_sequence = 100, .target_sequence = 100 },
+                null,
+            };
+            for (producer_states) |producer| {
+                for ([_]ApiIndexType{ .full_text, .graph }) |kind| {
+                    var projection = item;
+                    projection.kind = if (kind == .full_text) .full_text else .graph;
+                    encoded.clearRetainingCapacity();
+                    try appendSingleIndexRuntimeStatus(a, &encoded, kind, projection, 1, .strict, false, 7, 41, worker, producer, null, null, .{}, metadata, true);
+                    try ant_json.testing.expectSubsetJsonText(a, "{\"rebuilding\":true,\"backfill_active\":true,\"readiness\":{\"complete\":false}}", encoded.items);
+                }
+                for ([_]EmbeddingsCoveragePolicy{ .strict, .external }) |coverage_policy| {
+                    encoded.clearRetainingCapacity();
+                    try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, item, 1, coverage_policy, false, 7, 41, worker, producer, null, null, .{}, metadata, true);
+                    try ant_json.testing.expectSubsetJsonText(a, "{\"rebuilding\":true,\"backfill_active\":true,\"readiness\":{\"queryable\":true,\"complete\":false}}", encoded.items);
+                    var dirty_indexes = [_]db_mod.types.DBIndexStats{item};
+                    const dirty_runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{ .group_id = 7, .metadata = metadata, .stats = .{ .source_doc_count = 1, .doc_count = 1, .index_count = 1, .indexes = &dirty_indexes, .async_indexing = worker, .enrichment = producer orelse .{} } }};
+                    const dirty_aggregate = aggregateIndexStatusIndexed(&dirty_runtimes, "A", &.{7}, 7, 41, null).?;
+                    try std.testing.expect(!dirty_aggregate.scoped_checkpoint_complete);
+                    encoded.clearRetainingCapacity();
+                    try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, dirty_aggregate, 1, coverage_policy, false, 7, 41, worker, producer, null, null, .{}, null, true);
+                    try ant_json.testing.expectSubsetJsonText(a, "{\"rebuilding\":true,\"backfill_active\":true,\"readiness\":{\"queryable\":true,\"complete\":false}}", encoded.items);
+                }
+            }
         }
 
         test "table-wide native vector work does not block an independently ready index" {
@@ -7608,13 +7945,59 @@ fn consumerTests() type {
             );
             defer parsed.deinit();
             var names_buffer: [64][]const u8 = undefined;
-            const names = configuredArtifactSourceNames(parsed.value, .embeddings, &names_buffer);
+            const names = configuredArtifactSourceNames("vectors", parsed.value, .embeddings, &names_buffer);
             var out = std.ArrayListUnmanaged(u8).empty;
             defer out.deinit(std.testing.allocator);
             try appendMinimalIndexRuntimeStatus(std.testing.allocator, &out, .embeddings, names);
             try std.testing.expect(std.mem.indexOf(u8, out.items, "\"artifact\":\"document_vectors\",\"state\":\"pending\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, out.items, "\"artifact\":\"chunk_vectors\",\"state\":\"pending\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, out.items, "\"source_observation_incomplete\"") != null);
+        }
+
+        test "api index status preserves inline embedding source publication debt" {
+            const a = std.testing.allocator;
+            var config = try std.json.parseFromSlice(std.json.Value, a,
+                \\{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"test"}}
+            , .{});
+            defer config.deinit();
+            var sources = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "semantic_idx", .target_sequence = 1 }};
+            var indexes = [_]db_mod.types.DBIndexStats{.{
+                .name = "semantic_idx",
+                .kind = .dense_vector,
+                .serving_snapshot_ready = true,
+                .publication_target_ready = true,
+                .coverage_generation = 42,
+                .coverage_config_hash = 99,
+                .coverage_identity_ready = true,
+                .coverage_summary_ready = true,
+                .source_replay = &sources,
+            }};
+            var items = [_]runtime_status.LocalTableRuntimeStatus{
+                .{ .group_id = 1, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .index_count = 1, .indexes = &indexes } },
+                .{ .group_id = 2, .metadata = .{ .source = .live_writer_publish, .freshness = .fresh }, .stats = .{ .index_count = 1, .indexes = &indexes } },
+            };
+            var statuses: runtime_status.LocalTableRuntimeStatuses = .{ .items = &items };
+            var lookup = try RuntimeStatusLookup.init(a, &.{ 1, 2 }, &statuses);
+            defer lookup.deinit();
+            // Empty cardinality must not erase either replay or producer debt.
+            for (0..3) |phase| {
+                sources[0].published_sequence = if (phase == 0) 0 else 1;
+                sources[0].producer_complete = phase != 1;
+                var out: std.ArrayListUnmanaged(u8) = .empty;
+                defer out.deinit(a);
+                try appendIndexStatusWithIdentity(a, &out, "semantic_idx", config.value, .{ .incarnation = 42, .config_hash = 99 }, &.{ 1, 2 }, &statuses, &lookup);
+                var parsed = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+                defer parsed.deinit();
+                const aggregate = parsed.value.object.get("status").?.object;
+                const readiness = aggregate.get("readiness").?.object;
+                try std.testing.expectEqual(phase == 2, readiness.get("complete").?.bool);
+                try std.testing.expectEqual(@as(usize, 1), readiness.get("sources").?.array.items.len);
+                try std.testing.expectEqual(phase == 2, aggregate.get("milestones").?.object.get("complete").?.object.get("reached").?.bool);
+                for ([_][]const u8{ "1", "2" }) |group| {
+                    const shard = parsed.value.object.get("shard_status").?.object.get(group).?.object;
+                    try std.testing.expectEqual(phase == 2, shard.get("readiness").?.object.get("complete").?.bool);
+                }
+            }
         }
 
         test "index encoders expose metadata-backed configs" {
@@ -7724,6 +8107,7 @@ fn consumerTests() type {
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.MediaChunkPolicy, .chunker_policy);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkOutputs, .chunker_outputs);
             try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkOutputTarget, .chunker_output_target);
+            try expectCreatedObjectAllowlistCovers(chunking_api_openapi.ChunkDiarizationConfig, .chunker_diarization);
             // Inline skip-window items are generated as std.json.Value. Their
             // closed projection is exercised through the response encoder below.
             try expectCreatedObjectAllowlistCovers(indexes_openapi.IndexExecutionConfig, .index_execution);
@@ -7757,6 +8141,7 @@ fn consumerTests() type {
                 .chunker_outputs,
                 .chunker_output_targets,
                 .chunker_output_target,
+                .chunker_diarization,
                 .chunker_output_windows,
                 .chunker_output_window,
                 .index_execution,
@@ -7766,7 +8151,7 @@ fn consumerTests() type {
                 try std.testing.expect(!public_index_contract.isAllowedCreatedObjectField(shape, "settings"));
             }
             const config =
-                \\{"type":"embeddings","dimension":2,"chunker":{"provider":"antfly","model":"model-aware","embedding":{"model":"encoder","dimensions":2,"execute":false,"allow_partial":true,"client_value":"private"},"policy":{"max_frames":8,"target_tokens":"invalid","settings":"private"}}}
+                \\{"type":"embeddings","dimension":2,"chunker":{"provider":"antfly","model":"model-aware","embedding":{"model":"encoder","dimensions":2,"execute":false,"allow_partial":true,"client_value":"private"},"text":{"target_tokens":64,"min_chars":32,"client_value":"private"},"policy":{"max_frames":8,"target_tokens":"invalid","settings":"private"}}}
             ;
             const created = try encodeCreatedIndexConfig(std.testing.allocator, "media", config);
             defer std.testing.allocator.free(created);
@@ -7779,6 +8164,11 @@ fn consumerTests() type {
             try std.testing.expect(!embedding.get("execute").?.bool);
             try std.testing.expect(embedding.get("allow_partial").?.bool);
             try std.testing.expect(!embedding.contains("client_value"));
+            const text = chunker.get("text").?.object;
+            try std.testing.expectEqual(@as(i64, 32), text.get("min_chars").?.integer);
+            try std.testing.expectEqual(@as(i64, 64), text.get("target_tokens").?.integer);
+            try std.testing.expect(!text.contains("client_value"));
+            try std.testing.expect(!public_index_contract.createdFieldValueMatches(.chunker_text, "min_chars", .{ .string = "32" }));
             const policy = chunker.get("policy").?.object;
             try std.testing.expectEqual(@as(i64, 8), policy.get("max_frames").?.integer);
             try std.testing.expect(!policy.contains("target_tokens"));
@@ -7788,7 +8178,7 @@ fn consumerTests() type {
         test "public index config encoders preserve named media outputs with closed nested schemas" {
             const a = std.testing.allocator;
             const config =
-                \\{"type":"embeddings","dimension":2,"chunker":{"provider":"antfly","model":"model-aware","outputs":{"boundary_model":"embedding","api_key":"private-root","targets":[{"name":"embedding","kind":"embedding","model":"encoder","dimensions":2,"execute":false,"required":true,"task_type":"RETRIEVAL_DOCUMENT","settings":{"token":"private-settings"}},{"name":"transcript","kind":"transcribe","model":"asr","language":"en","diarize":true,"api_key":"private-target"},{"name":"labels","kind":"classify","model":"classifier","top_k":3,"skip_windows":[{"ordinal":18446744073709551615,"sub_index":4294967295,"client_value":"private-window"}]}]}}}
+                \\{"type":"embeddings","dimension":2,"chunker":{"provider":"antfly","model":"model-aware","outputs":{"boundary_model":"embedding","api_key":"private-root","targets":[{"name":"embedding","kind":"embedding","model":"encoder","dimensions":2,"execute":false,"required":true,"task_type":"RETRIEVAL_DOCUMENT","settings":{"token":"private-settings"}},{"name":"transcript","kind":"transcribe","model":"asr","language":"en","diarize":true,"api_key":"private-target"},{"name":"labels","kind":"classify","model":"classifier","top_k":3,"skip_windows":[{"ordinal":18446744073709551615,"sub_index":4294967295,"client_value":"private-window"}]},{"name":"speakers","kind":"diarize","model":"speaker","diarization":{"model":"speaker","model_identity":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","similarity_threshold":0.45,"ambiguity_margin":0.03,"min_rms":0.01,"max_speakers":4,"api_key":"private-key","settings":{"secret":"private-setting"}}}]}}}
             ;
             const encoded = try encodeCreatedIndexConfig(a, "media", config);
             defer a.free(encoded);
@@ -7798,9 +8188,13 @@ fn consumerTests() type {
             const actual = try std.json.Stringify.valueAlloc(a, outputs, .{});
             defer a.free(actual);
             try ant_json.testing.expectEqualJsonText(a,
-                \\{"boundary_model":"embedding","targets":[{"name":"embedding","kind":"embedding","model":"encoder","dimensions":2,"execute":false,"required":true,"task_type":"RETRIEVAL_DOCUMENT"},{"name":"transcript","kind":"transcribe","model":"asr","language":"en","diarize":true},{"name":"labels","kind":"classify","model":"classifier","top_k":3,"skip_windows":[{"ordinal":18446744073709551615,"sub_index":4294967295}]}]}
+                \\{"boundary_model":"embedding","targets":[{"name":"embedding","kind":"embedding","model":"encoder","dimensions":2,"execute":false,"required":true,"task_type":"RETRIEVAL_DOCUMENT"},{"name":"transcript","kind":"transcribe","model":"asr","language":"en","diarize":true},{"name":"labels","kind":"classify","model":"classifier","top_k":3,"skip_windows":[{"ordinal":18446744073709551615,"sub_index":4294967295}]},{"name":"speakers","kind":"diarize","model":"speaker","diarization":{"model":"speaker","model_identity":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","similarity_threshold":0.45,"ambiguity_margin":0.03,"min_rms":0.01,"max_speakers":4}}]}
             , actual);
             try std.testing.expect(std.mem.indexOf(u8, encoded, "private-") == null);
+            // The optional nested model has no minLength in the public schema.
+            try std.testing.expect(public_index_contract.createdFieldValueMatches(.chunker_diarization, "model", .{ .string = "" }));
+            try std.testing.expect(!public_index_contract.createdFieldValueMatches(.chunker_diarization, "max_speakers", .{ .integer = 0 }));
+            try std.testing.expect(!public_index_contract.createdFieldValueMatches(.chunker_diarization, "similarity_threshold", .{ .float = 1.1 }));
 
             // A persisted malformed required target cannot become a partial
             // public output recipe. Keep the surrounding valid chunker config.
@@ -8114,6 +8508,65 @@ fn consumerTests() type {
             try std.testing.expect(std.mem.indexOf(u8, removed, "\"default\"") != null);
         }
 
+        test "artifact replacement repairs obsolete inline extraction without dropping its index" {
+            const alloc = std.testing.allocator;
+            const original =
+                \\{"document_text":{"type":"full_text","sources":[{"artifact":"chunks"}],"enrichments":[{"name":"units","kind":"asset","field":"url","producer_json":"{\"type\":\"document_extraction\",\"config\":{\"ocr_fallback\":true}}"},{"name":"chunks","kind":"chunk","field":"text","source_artifact_name":"units","chunk_size":512}]}}
+            ;
+            const repaired = try addEnrichmentToTableIndexesJson(alloc, original, "units",
+                \\{"name":"units","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"}
+            );
+            defer alloc.free(repaired);
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, repaired);
+            try std.testing.expect(std.mem.indexOf(u8, repaired, "ocr_fallback") == null);
+            try std.testing.expect(std.mem.indexOf(u8, repaired, "chunks") != null);
+            try std.testing.expect(std.mem.indexOf(u8, repaired, "document_text") != null);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, repaired, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("enrichments").?.array.items.len);
+            const dropped = (try removeIndexFromTableIndexesJson(alloc, repaired, "document_text")).?;
+            defer alloc.free(dropped);
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, dropped);
+            try std.testing.expect(std.mem.indexOf(u8, dropped, "units") != null);
+            const deleted = (try removeEnrichmentFromTableIndexesJson(alloc, dropped, "units")).?;
+            defer alloc.free(deleted);
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, deleted);
+            try std.testing.expect(std.mem.indexOf(u8, deleted, "units") == null);
+            // Inline copies must not silently resurrect a deleted producer.
+            const dependent = (try removeEnrichmentFromTableIndexesJson(alloc, repaired, "units")).?;
+            defer alloc.free(dependent);
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(alloc, dependent));
+        }
+
+        test "artifact replacement preserves inherited inline embedding producers" {
+            const alloc = std.testing.allocator;
+            const original =
+                \\{"vectors":{"type":"embeddings","dimension":1536,"embedder":{"provider":"openai","model":"text-embedding-3-small","api_url":"https://embedding.example/v1","api_key":"${secret:embedding_key}"},"sources":[{"artifact":"vectors"}],"enrichments":[{"name":"vectors","kind":"embedding","field":"body","expected_dims":1536}]}}
+            ;
+            try validateArtifactEnrichmentsForTableIndexesJson(alloc, original);
+            for ([_][]const u8{
+                \\{"name":"vectors","kind":"embedding","field":"updated_body","expected_dims":1536}
+                ,
+                \\{"name":"vectors","kind":"embedding","field":"updated_body","expected_dims":1536,"producer_json":""}
+            }) |replacement| {
+                const updated = try addEnrichmentToTableIndexesJson(alloc, original, "vectors", replacement);
+                defer alloc.free(updated);
+                try validateArtifactEnrichmentsForTableIndexesJson(alloc, updated);
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc, updated, .{});
+                defer parsed.deinit();
+                const producer = parsed.value.object.get("enrichments").?.array.items[0].object.get("producer_json").?;
+                try std.testing.expect(producer == .string and producer.string.len > 0);
+                try std.testing.expect(std.mem.indexOf(u8, producer.string, "embedding_key") == null);
+                const configs = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, updated);
+                defer db_mod.types.freeEnrichmentConfigs(alloc, configs);
+                try validateArtifactEnrichmentConfigDefinitions(alloc, configs);
+                for (configs) |cfg| {
+                    try std.testing.expectEqualStrings("updated_body", cfg.field);
+                    try std.testing.expectEqualStrings(producer.string, cfg.producer_json);
+                }
+            }
+        }
+
         test "index metadata validates artifact enrichment graph" {
             try std.testing.expectError(
                 error.InvalidEnrichmentConfig,
@@ -8308,7 +8761,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 2), configs.len);
             try std.testing.expectEqualStrings("application/json", configs[0].content_type);
             try std.testing.expectEqualStrings(
-                "{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-base\",\"language_code\":\"en\",\"timestamps\":true}}}}",
+                "{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"transcriber\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-base\",\"language_code\":\"en\",\"timestamps\":true}}}}",
                 configs[0].producer_json,
             );
             try validateArtifactEnrichmentConfigs(std.testing.allocator, configs);
@@ -8343,10 +8796,16 @@ fn consumerTests() type {
             try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
                 \\{"enrichments":[{"name":"echo","kind":"asset","source_artifact_name":"missing"}]}
             ));
-            // Consuming assets read produced bytes; a field cannot also be set.
-            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+            // A field selects structured produced bytes; retain both parts of
+            // that lineage rather than mistaking it for a primary-row field.
+            const selected =
                 \\{"enrichments":[{"name":"summary_text","kind":"asset","field":"summary"},{"name":"echo","kind":"asset","field":"summary","source_artifact_name":"summary_text"}]}
-            ));
+            ;
+            try validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, selected);
+            const configs = try collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator, selected);
+            defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, configs);
+            try std.testing.expectEqualStrings("summary", configs[1].field);
+            try std.testing.expectEqualStrings("summary_text", configs[1].source_artifact_name);
             // Media-locator producers dereference the source as a URL and
             // stay closed to artifact consumption.
             try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
@@ -8955,7 +9414,7 @@ fn consumerTests() type {
             const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "search_idx", &local_status)).?;
             defer alloc.free(encoded);
             try ant_json.testing.expectSubsetJsonText(alloc,
-                \\{"status":{"incarnation":"g-000000000000002a","total_indexed":0,"milestones":{"queryable":{"reached":false}},"readiness":{"state":"pending","queryable":false,"incarnation":"g-000000000000002a"}},"shard_status":{"7":{"incarnation":"g-000000000000002a","milestones":{"queryable":{"reached":false,"blockers":["incarnation"]}},"readiness":{"state":"pending","queryable":false,"incarnation":"g-000000000000002a","pending_reasons":["incarnation_pending"]}}}}
+                \\{"status":{"incarnation":"g-000000000000002a","total_indexed":0,"milestones":{"queryable":{"reached":false}},"readiness":{"state":"pending","queryable":false,"incarnation":"g-000000000000002a"}},"shard_status":{"7":{"incarnation":"g-000000000000002a","milestones":{"queryable":{"reached":false,"blockers":["runtime_observation","incarnation"]}},"readiness":{"state":"pending","queryable":false,"incarnation":"g-000000000000002a","pending_reasons":["runtime_unavailable","incarnation_pending"]}}}}
             , encoded);
         }
 
@@ -9965,6 +10424,7 @@ fn consumerTests() type {
                 .name = try std.testing.allocator.dupe(u8, "vec"),
                 .kind = .dense_vector,
                 .doc_count = 50_000,
+                .serving_snapshot_ready = true,
                 .publication_target_ready = true,
                 .publication_target_count = 50_000,
                 .node_count = 24,
@@ -11098,4 +11558,128 @@ test "resolver curation HTTP hides destination namespace metadata from index res
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
     try std.testing.expect(parsed.value.object.contains("default"));
+}
+
+test "external lake native interrupted publication is pending while integrity and admission failures remain terminal" {
+    const a = std.testing.allocator;
+    const lake = @import("antfly_local_sources").metadata_lake_index_catalog;
+    var config = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"full_text\"}", .{});
+    defer config.deinit();
+    var table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "events", .indexes_json = "{\"body_text\":{\"type\":\"full_text\"}}" };
+    const desired = try lake.desiredFingerprint(a, table);
+    const pending_errors = [_][]const u8{ "ConcurrencyUnavailable", "ResourceTemporarilyUnavailable", "SystemResources", "ProcessFdQuotaExceeded", "SystemFdQuotaExceeded", "Canceled", "Cancelled", "DeadlineExceeded", "Timeout", "TlsTransportReadFailed", "NameServerFailure", "ConnectionReset", "ConnectionResetByPeer", "ConnectionAborted", "ConnectionTimedOut", "ConnectionTimeout", "BrokenPipe", "ConnectionClosed", "ConnectionRefused", "Closed", "NotConnected", "EndOfStream", "UnexpectedEof", "ReadFailed", "WriteFailed", "RecvFailed", "SendFailed", "RateLimited", "RemoteUnavailable", "StorageReadTemporarilyUnavailable" };
+    const terminal_errors = [_][]const u8{ "ArtifactIntegrityMismatch", "SqlProgramLimitExceeded", "TlsBadRecordMac", "TlsAlert", "AccessDenied", "Unauthorized", "PreconditionFailed" };
+    for (pending_errors ++ terminal_errors, 0..) |reason, i| {
+        const catalog_json = try lake.encode(a, .{ .generation = 1, .failure = .{ .generation = 1, .desired = desired, .reason = reason, .retry_at_ms = 1000 } });
+        defer a.free(catalog_json);
+        table.lake_index_catalog_json = catalog_json;
+        const bytes = try encodeLakeIndexResource(a, table, "body_text", config.value, false);
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+        defer parsed.deinit();
+        const status = parsed.value.object.get("status").?;
+        const readiness = status.object.get("readiness").?;
+        try std.testing.expectEqualStrings(if (i < pending_errors.len) "pending" else "failed", readiness.object.get("state").?.string);
+        try std.testing.expect(!readiness.object.get("queryable").?.bool);
+        try std.testing.expectEqualStrings(if (i < pending_errors.len) "publication" else "load_failure", readiness.object.get("pending_reasons").?.array.items[0].string);
+        try std.testing.expectEqualStrings(reason, status.object.get("error").?.string);
+    }
+}
+
+test "ordered artifact inventory enrichment list owns configs through allocation failures" {
+    const Harness = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const recipe =
+                \\{"enrichments":[{"name":"first","kind":"chunk","field":"body","chunk_size":10},{"name":"second","kind":"chunk","field":"body","chunk_size":10}]}
+            ;
+            const listed = try encodeArtifactEnrichmentList(a, "docs", recipe);
+            defer a.free(listed);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "privacy new index migration preserves protected serving generations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    const index = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"embedder\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}";
+    const logical = try addIndexToTableIndexesJson(a, "{}", "a", index);
+    const resource = try privacy.next(a, null, .{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} }, null);
+    const initial = try privacy.install(a, logical, resource);
+    var pinned = (try std.json.parseFromSlice(std.json.Value, a, initial, .{})).value;
+    try pinned.object.put(a, aliases.key, (try std.json.parseFromSlice(std.json.Value, a, "{\"search\":{\"index\":\"a\"}}", .{})).value);
+    const before = try std.json.Stringify.valueAlloc(a, pinned, .{});
+    const updated = try addIndexToTableIndexesJson(a, before, "b", index);
+    try aliases.validateDependencyMutation(a, before, updated);
+    try validateArtifactEnrichmentsForTableIndexesJson(a, updated);
+    const after = (try std.json.parseFromSlice(std.json.Value, a, updated, .{})).value;
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, pinned.object.get("a").?, .{}), try std.json.Stringify.valueAlloc(a, after.object.get("a").?, .{}));
+    const b = after.object.get("b").?;
+    try std.testing.expect(b.object.get("embedder") == null);
+    try std.testing.expect(std.mem.startsWith(u8, b.object.get("sources").?.array.items[0].object.get("artifact").?.string, "_privacy_"));
+    try std.testing.expectEqualStrings(updated, try addIndexToTableIndexesJson(a, updated, "b", index));
+    try std.testing.expectError(error.PrivacyManagedGraph, addIndexToTableIndexesJson(a, updated, "a", "{\"type\":\"full_text\"}"));
+    try std.testing.expectError(error.IndexAliasNameConflict, addIndexToTableIndexesJson(a, updated, "search", index));
+    try std.testing.expectError(error.PrivacyExternalEmbeddingsUnsupported, addIndexToTableIndexesJson(a, updated, "external", "{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}"));
+    try std.testing.expectError(error.PrivacyUnsupportedIndexType, addIndexToTableIndexesJson(a, updated, "graph", "{\"type\":\"graph\"}"));
+    const stored = (try privacy.current(a, after)).?.value;
+    const disabled = try privacy.next(a, stored, .{ .mode = .monitor, .fields = &.{"body"} }, try privacy.etag(a, stored));
+    const restored = (try std.json.parseFromSlice(std.json.Value, a, try privacy.install(a, updated, disabled), .{})).value;
+    try std.testing.expect(restored.object.get("b").?.object.contains("embedder"));
+}
+
+test "privacy model migration retires only unreferenced consumers and their private producers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    const index = "{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":2,\"embedder\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}";
+    const raw = try privacy.install(a, try addIndexToTableIndexesJson(a, "{}", "a", index), try privacy.next(a, null, .{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} }, null));
+    var root = (try std.json.parseFromSlice(std.json.Value, a, try addIndexToTableIndexesJson(a, raw, "b", index), .{})).value;
+    try root.object.put(a, aliases.key, (try std.json.parseFromSlice(std.json.Value, a, "{\"search\":{\"index\":\"a\"}}", .{})).value);
+    try std.testing.expectError(error.IndexReferencedByAlias, removeIndexFromTableIndexesJson(a, try std.json.Stringify.valueAlloc(a, root, .{}), "a"));
+    try root.object.getPtr(aliases.key).?.object.getPtr("search").?.object.put(a, "index", .{ .string = "b" });
+    const before = try std.json.Stringify.valueAlloc(a, root, .{});
+    const updated = (try removeIndexFromTableIndexesJson(a, before, "a")).?;
+    const result = (try std.json.parseFromSlice(std.json.Value, a, updated, .{})).value;
+    try std.testing.expect(!result.object.contains("a"));
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, root.object.get("b").?, .{}), try std.json.Stringify.valueAlloc(a, result.object.get("b").?, .{}));
+    try std.testing.expectEqual(root.object.get("enrichments").?.array.items.len - 2, result.object.get("enrichments").?.array.items.len);
+    try std.testing.expectError(error.PrivacyManagedGraph, removeIndexFromTableIndexesJson(a, updated, "full_text_index_v0"));
+    try std.testing.expectError(error.IndexReferencedByAlias, removeIndexFromTableIndexesJson(a, updated, "b"));
+    try aliases.validateDependencyMutation(a, before, updated);
+    try validateArtifactEnrichmentsForTableIndexesJson(a, updated);
+}
+
+test "privacy new index targeted activation installs only its root producer closure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/target-closure", .{tmp.sub_path});
+    defer a.free(path);
+    var db = try db_mod.DB.open(a, path, .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    const reconcile = @import("antfly_local_sources").metadata_local_index_reconcile;
+    _ = try reconcile.reconcileDbIndexesWithOptions(a, &db, "{\"serving\":{\"type\":\"full_text\"}}", .{});
+    const desired =
+        \\{"serving":{"type":"full_text"},"target":{"type":"full_text","artifact_name":"chunks"},"sibling":{"type":"full_text","artifact_name":"unrelated"},"enrichments":[{"name":"units","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},{"name":"chunks","kind":"chunk","source_artifact_name":"units","field":"text","chunk_size":128},{"name":"unrelated","kind":"chunk","field":"body","chunk_size":128}]}
+    ;
+    const added = try reconcile.reconcileDbIndexTargetWithOptions(a, &db, desired, "target", .{});
+    try std.testing.expectEqual(@as(usize, 2), added.enrichments_added);
+    const configs = try db.listEnrichments(a);
+    defer {
+        for (configs) |*cfg| cfg.deinit(a);
+        a.free(configs);
+    }
+    try std.testing.expectEqual(@as(usize, 2), configs.len);
+    for (configs) |cfg| try std.testing.expect(!std.mem.eql(u8, cfg.name, "unrelated"));
+    const again = try reconcile.reconcileDbIndexTargetWithOptions(a, &db, desired, "target", .{});
+    try std.testing.expectEqual(@as(usize, 0), again.enrichments_added);
+    const indexes = try db.listIndexes(a);
+    defer db_mod.types.freeIndexConfigs(a, indexes);
+    try std.testing.expectEqual(@as(usize, 2), indexes.len);
 }

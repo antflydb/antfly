@@ -146,8 +146,8 @@ function toPullProgress(decoded: DecodedPullProgress): PullProgress {
 
 /**
  * An embedded Antfly inference runtime handle: no database, just model
- * inference (embed, rerank, chunk, generate, rewrite, decide, extract, read/OCR,
- * transcribe) via the libantfly antfly_inference_* C ABI. Models load on
+ * inference (embed, rerank, chunk, generate, rewrite, decide, extract, and read
+ * for documents/images/audio) via the libantfly antfly_inference_* C ABI. Models load on
  * first use and stay cached until close().
  *
  * Every JSON call except pull() and generateStream() is async (runs on
@@ -396,19 +396,12 @@ export class Inference implements AsyncDisposable {
     return parseJson(await this.extractRaw(request));
   }
 
-  /** OCR. */
+  /** Read images, documents, or audio. */
   readRaw(request: JsonInput): Promise<Buffer> {
     return this.#invokeJson(this.#native.inferenceReadJson, request);
   }
   async read(request: JsonInput): Promise<unknown> {
     return parseJson(await this.readRaw(request));
-  }
-
-  transcribeRaw(request: JsonInput): Promise<Buffer> {
-    return this.#invokeJson(this.#native.inferenceTranscribeJson, request);
-  }
-  async transcribe(request: JsonInput): Promise<unknown> {
-    return parseJson(await this.transcribeRaw(request));
   }
 
   /** The installed models, as returned by GET /ai/v1/models. */

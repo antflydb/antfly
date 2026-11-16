@@ -21,20 +21,50 @@ const envelope = @import("httpx").attachment_envelope;
 pub const Options = struct {
     model: []const u8 = "",
     model_identity: ?[]const u8 = null,
+    model_revision: ?[32]u8 = null,
     dimensions: ?u32 = null,
     task_type: ?[]const u8 = null,
     instruction: ?[]const u8 = null,
+    grouped: bool = false,
+
+    pub fn fromEmbeddingContext(model: []const u8, context: anytype, grouped: bool) Options {
+        return .{
+            .model = model,
+            .model_identity = context.model_identity,
+            .model_revision = context.model_revision,
+            .dimensions = context.dimensions,
+            .task_type = context.task_type.canonical(),
+            .instruction = context.instruction,
+            .grouped = grouped,
+        };
+    }
 };
 
 pub fn Request(comptime Part: type) type {
     return struct {
         model: []const u8,
         parts: []const Part,
-        attachment_count: usize,
-        task_type: ?[]const u8,
-        instruction: ?[]const u8,
+        attachment_count: usize = 0,
+        task_type: ?[]const u8 = null,
+        instruction: ?[]const u8 = null,
         model_identity: ?[]const u8 = null,
+        model_revision: ?[32]u8 = null,
         dimensions: ?u32 = null,
+        grouped: bool = false,
+
+        pub fn init(options: Options, parts: []const Part, attachment_count: usize) @This() {
+            return .{
+                .model = options.model,
+                .model_identity = options.model_identity,
+                .model_revision = options.model_revision,
+                .dimensions = options.dimensions,
+                .task_type = options.task_type,
+                .instruction = options.instruction,
+                .grouped = options.grouped,
+                .parts = parts,
+                .attachment_count = attachment_count,
+            };
+        }
     };
 }
 
@@ -61,15 +91,7 @@ pub const Sizer = struct {
     envelope_size: envelope.SizeAccumulator = .{},
 
     pub fn init(comptime Part: type, options: Options) !Sizer {
-        return .{ .base_bytes = try jsonSize(Request(Part){
-            .model = options.model,
-            .model_identity = options.model_identity,
-            .dimensions = options.dimensions,
-            .parts = &.{},
-            .attachment_count = 0,
-            .task_type = options.task_type,
-            .instruction = options.instruction,
-        }) };
+        return .{ .base_bytes = try jsonSize(Request(Part).init(options, &.{}, 0)) };
     }
 
     pub fn append(self: *Sizer, part: anytype) !usize {

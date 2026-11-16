@@ -664,6 +664,7 @@ pub const SchemaColumn = struct {
     column_id: []u8,
     physical_type: ?i32 = null,
     nested: bool = false,
+    physical_column_id: ?[]u8 = null,
     nullable: bool,
     type_length: i32 = 0,
     logical_type: []u8 = &.{},
@@ -673,6 +674,7 @@ pub const SchemaColumn = struct {
 
     pub fn deinit(self: *SchemaColumn, alloc: Allocator) void {
         if (self.column_id.len > 0) alloc.free(self.column_id);
+        if (self.physical_column_id) |id| alloc.free(id);
         if (self.logical_type.len > 0) alloc.free(self.logical_type);
         self.* = undefined;
     }
@@ -796,6 +798,27 @@ fn collectSchemaColumnsAlloc(
         cursor.* += 1;
 
         const element_nullable = inherited_nullable or isNullableRepetition(element.repetition_type);
+        // Preserve one logical vector column for standard three-level LISTs.
+        // The physical leaf path remains available while binding column chunks.
+        if (depth == 0 and element.child_count == 1 and std.mem.eql(u8, element.logical_type, "list") and cursor.* + 1 < elements.len) {
+            const repeated = elements[cursor.*];
+            const leaf = elements[cursor.* + 1];
+            if (repeated.repetition_type == 2 and repeated.child_count == 1 and leaf.child_count == 0 and
+                (leaf.physical_type == 4 or leaf.physical_type == 5) and leaf.repetition_type != 2)
+            {
+                const optional: u8 = @intFromBool(element_nullable);
+                const definition: u8 = optional + 1 + @as(u8, @intFromBool(isNullableRepetition(leaf.repetition_type)));
+                const name = try alloc.dupe(u8, element.name);
+                errdefer alloc.free(name);
+                const physical = try std.fmt.allocPrint(alloc, "{s}.{s}.{s}", .{ element.name, repeated.name, leaf.name });
+                errdefer alloc.free(physical);
+                const logical = try std.fmt.allocPrint(alloc, "{s}:{d}:{d}", .{ if (leaf.physical_type == 5) "vector_f64_json" else "vector_f32", definition, optional });
+                errdefer alloc.free(logical);
+                try columns.append(alloc, .{ .column_id = name, .physical_column_id = physical, .physical_type = leaf.physical_type, .nullable = element_nullable, .logical_type = logical, .field_id = element.field_id });
+                cursor.* += 2;
+                continue;
+            }
+        }
         try path.append(alloc, element.name);
         defer _ = path.pop();
 
@@ -856,6 +879,11 @@ fn applySchemaNullability(alloc: Allocator, row_groups: []external_source.RowGro
     for (row_groups) |*row_group| {
         for (row_group.column_chunks) |*chunk| {
             const schema_column = schemaColumnForId(columns, chunk.column_id) orelse return error.InvalidParquetMetadata;
+            if (schema_column.physical_column_id != null) {
+                const name = try alloc.dupe(u8, schema_column.column_id);
+                alloc.free(chunk.column_id);
+                chunk.column_id = name;
+            }
             chunk.nullable = schema_column.nullable;
             chunk.type_length = schema_column.type_length;
             if (schema_column.logical_type.len != 0) {
@@ -872,7 +900,7 @@ fn applySchemaNullability(alloc: Allocator, row_groups: []external_source.RowGro
 
 fn schemaColumnForId(columns: []const SchemaColumn, column_id: []const u8) ?SchemaColumn {
     for (columns) |column| {
-        if (std.mem.eql(u8, column.column_id, column_id)) return column;
+        if (std.mem.eql(u8, column.physical_column_id orelse column.column_id, column_id)) return column;
     }
     return null;
 }
@@ -927,7 +955,12 @@ fn parseRowGroup(
             2 => _ = try reader.readRequiredU64(field.type),
             3 => row_count = try reader.readRequiredU64(field.type),
             5 => file_offset = try reader.readRequiredU64(field.type),
-            7 => ordinal = @intCast(try reader.readRequiredU64(field.type)),
+            7 => {
+                if (field.type != .i16) return error.InvalidParquetMetadata;
+                const value = try reader.readI16();
+                if (value < 0) return error.InvalidParquetMetadata;
+                ordinal = @intCast(value);
+            },
             else => try reader.skip(field.type),
         }
     }
@@ -1333,6 +1366,7 @@ fn physicalTypeNameAlloc(alloc: Allocator, physical_type: i32) ![]u8 {
 fn logicalTypeNameForConvertedTypeAlloc(alloc: Allocator, converted_type: i32) ![]u8 {
     return switch (converted_type) {
         0 => try alloc.dupe(u8, "string"),
+        3 => try alloc.dupe(u8, "list"),
         6 => try alloc.dupe(u8, "date"),
         19 => try alloc.dupe(u8, "json"),
         5 => try alloc.dupe(u8, "decimal"),
@@ -1368,10 +1402,11 @@ fn parseLogicalTypeAnnotationAlloc(alloc: Allocator, reader: *Reader, field_type
     errdefer annotation.deinit(alloc);
     while (try reader.readFieldHeader(&previous_field_id)) |field| {
         switch (field.id) {
-            1, 6, 12 => {
+            1, 3, 6, 12 => {
                 annotation.deinit(alloc);
                 annotation = .{ .name = try alloc.dupe(u8, switch (field.id) {
                     1 => "string",
+                    3 => "list",
                     6 => "date",
                     12 => "json",
                     else => unreachable,
@@ -1573,11 +1608,11 @@ const Reader = struct {
     }
 
     fn readI16(self: *Reader) !i16 {
-        return @intCast(zigzagDecode(try self.readVarintU64()));
+        return std.math.cast(i16, zigzagDecode(try self.readVarintU64())) orelse error.InvalidParquetMetadata;
     }
 
     fn readI32(self: *Reader) !i32 {
-        return @intCast(zigzagDecode(try self.readVarintU64()));
+        return std.math.cast(i32, zigzagDecode(try self.readVarintU64())) orelse error.InvalidParquetMetadata;
     }
 
     fn readI64(self: *Reader) !i64 {
@@ -2040,7 +2075,7 @@ fn buildSingleColumnMetadataFixture(alloc: Allocator) !std.ArrayListUnmanaged(u8
     try appendI64(&out, alloc, 2);
     try appendField(&out, alloc, &rg_prev, 5, .i64);
     try appendI64(&out, alloc, 100);
-    try appendField(&out, alloc, &rg_prev, 7, .i64);
+    try appendField(&out, alloc, &rg_prev, 7, .i16);
     try appendI64(&out, alloc, 0);
     try appendStop(&out, alloc);
 
@@ -2121,7 +2156,7 @@ fn buildSingleColumnMetadataFixtureWithSchema(alloc: Allocator, nullable: bool) 
     try appendI64(&out, alloc, 2);
     try appendField(&out, alloc, &rg_prev, 5, .i64);
     try appendI64(&out, alloc, 100);
-    try appendField(&out, alloc, &rg_prev, 7, .i64);
+    try appendField(&out, alloc, &rg_prev, 7, .i16);
     try appendI64(&out, alloc, 0);
     try appendStop(&out, alloc);
 
@@ -2240,7 +2275,7 @@ fn buildSingleColumnTimestampMetadataFixture(alloc: Allocator, converted_type: ?
     try appendI64(&out, alloc, 2);
     try appendField(&out, alloc, &rg_prev, 5, .i64);
     try appendI64(&out, alloc, 100);
-    try appendField(&out, alloc, &rg_prev, 7, .i64);
+    try appendField(&out, alloc, &rg_prev, 7, .i16);
     try appendI64(&out, alloc, 0);
     try appendStop(&out, alloc);
 
@@ -2285,4 +2320,10 @@ test "lake SQL Parquet statistics retain null and distinct counts for metadata-o
     defer statistics.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u64, 10), statistics.null_count);
     try std.testing.expectEqual(@as(?u64, 7), statistics.distinct_count);
+}
+
+test "Parquet vector metadata accepts the large Cohere row group" {
+    var footer = try parseFooterMetadataAlloc(std.testing.allocator, @embedFile("testdata/cohere_1m_footer.bin"), 3131995162);
+    defer footer.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 1000000), footer.row_count);
 }

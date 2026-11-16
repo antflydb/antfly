@@ -24,6 +24,36 @@ pub const resolver_key = "\x00\x00__metadata__:resolvers";
 pub const ordered_key = "\x00\x00__metadata__:ordered_artifact_catalog";
 pub const local_key = "\x00\x00__metadata__:artifact_inventory";
 
+pub fn isCatalogKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, index_key) or std.mem.eql(u8, key, enrichment_key) or std.mem.eql(u8, key, resolver_key);
+}
+
+/// The common DocStore writer refreshes this identity atomically with every
+/// catalog put/delete. Readiness and restore audits still use `local`, which
+/// independently checks all bytes. Publication reads only this bounded record.
+pub fn publicationIdentity(txn: anytype) !?LocalBinding {
+    const raw = try get(txn, local_key);
+    if (raw.len == 0) return null;
+    if (raw.len != 40) return error.ArtifactCatalogCorrupt;
+    const epoch = std.mem.readInt(u64, raw[0..8], .little);
+    if (epoch == 0) return error.ArtifactCatalogCorrupt;
+    return .{ .epoch = epoch, .digest = raw[8..40].* };
+}
+
+pub fn requirePublicationDigest(txn: anytype, expected: [32]u8) !void {
+    if (try publicationIdentity(txn)) |identity| {
+        if (!std.mem.eql(u8, &identity.digest, &expected)) return error.EnrichmentSourceChanged;
+    } else {
+        // Older stores install the witness only after checking current bytes
+        // under the writer. No format migration or repeated catalog scan.
+        if (!std.mem.eql(u8, &(try catalogs(txn)).digest(), &expected)) return error.EnrichmentSourceChanged;
+        try refresh(txn);
+    }
+}
+
+pub const dense_artifact_flags_protocol: u16 = 19;
+pub const max_effect_protocol: u16 = dense_artifact_flags_protocol;
+
 pub const Binding = struct {
     epoch: u64,
     digest: [32]u8,
@@ -33,7 +63,7 @@ pub const Binding = struct {
     effect_protocol: u16 = 14,
 
     pub fn valid(self: Binding) bool {
-        return self.epoch != 0 and (self.effect_protocol >= 14 and self.effect_protocol <= 16);
+        return self.epoch != 0 and (self.effect_protocol >= 14 and self.effect_protocol <= max_effect_protocol);
     }
 
     /// Protocol 16 extends protocol 15's receipt-backed stream witnesses.
@@ -53,26 +83,52 @@ pub const Catalogs = struct {
     /// Select capabilities from this immutable definition cut, independently
     /// of the database's monotonic reader floor. Resolver/producer receipts
     /// need protocol 15; grouped producer ownership needs protocol 16.
+    /// Base dense and sparse vectors need protocol 17; scoped chunk vectors need protocol 18.
     pub fn requiredEffectProtocol(self: Catalogs, alloc: std.mem.Allocator) !u16 {
-        var required: u16 = 14;
+        const enrichments = @import("catalog/enrichment_catalog.zig");
+        const producers = if (self.enrichments.len != 0)
+            try enrichments.deserializeCatalog(alloc, self.enrichments)
+        else
+            try alloc.alloc(enrichments.EnrichmentConfig, 0);
+        defer {
+            for (producers) |*cfg| cfg.deinit(alloc);
+            alloc.free(producers);
+        }
+        var required: u16 = if (producers.len != 0) 15 else 14;
+        for (producers) |cfg| if (cfg.group_source_json.len != 0 or cfg.prior_context_json.len != 0) {
+            required = 16;
+        };
+        if (self.indexes.len != 0) {
+            const indexes = @import("catalog/index_manager.zig");
+            const configs = try indexes.deserializeCatalog(alloc, self.indexes);
+            defer @import("types.zig").freeIndexConfigs(alloc, configs);
+            for (configs) |cfg| {
+                if (try indexes.denseArtifactFlagsRequired(alloc, cfg)) return dense_artifact_flags_protocol;
+                if (try indexes.onlineGeneratedChunkVectorConfig(alloc, cfg, producers)) required = @max(required, 18);
+                if (try indexes.onlineBaseGeneratedVectorConfig(alloc, cfg, producers)) required = @max(required, 17);
+            }
+        }
         if (self.resolvers.len != 0) {
             const configs = try @import("catalog/resolver_catalog.zig").deserializeCatalog(alloc, self.resolvers);
             defer {
                 for (configs) |*cfg| cfg.deinit(alloc);
                 alloc.free(configs);
             }
-            if (configs.len != 0) required = 15;
-        }
-        if (self.enrichments.len != 0) {
-            const configs = try @import("catalog/enrichment_catalog.zig").deserializeCatalog(alloc, self.enrichments);
-            defer {
-                for (configs) |*cfg| cfg.deinit(alloc);
-                alloc.free(configs);
-            }
-            if (configs.len != 0) required = 15;
-            for (configs) |cfg| if (cfg.group_source_json.len != 0 or cfg.prior_context_json.len != 0) return 16;
+            if (configs.len != 0) required = @max(required, 15);
         }
         return required;
+    }
+
+    /// Protocol requirements and the installed reader floor are independent.
+    /// An activation may raise either, but must never lower an installed floor.
+    pub fn effectProtocolFor(self: Catalogs, alloc: std.mem.Allocator, previous: ?Binding, minimum: u16) !u16 {
+        const floor = @max(minimum, if (previous) |binding| binding.effect_protocol else 14);
+        // The highest supported floor already covers every catalog feature.
+        // Ordinary readiness polling must not deserialize all index/producer
+        // definitions once that floor is installed. Catalog validation remains
+        // owned by admission, semantic binding and materialization.
+        if (floor == max_effect_protocol) return floor;
+        return @max(try self.requiredEffectProtocol(alloc), floor);
     }
 
     pub fn jsonStringify(self: Catalogs, stream: anytype) @TypeOf(stream.*).Error!void {
@@ -129,6 +185,25 @@ pub const Ordered = struct { command: Command, applied_index: u64 };
 pub const LocalBinding = struct { epoch: u64, digest: [32]u8 };
 pub const Status = struct { ordered: ?Binding, applied_index: u64, local: LocalBinding, ready: bool };
 
+/// Plan against one immutable catalog observation. Catalog bytes are borrowed
+/// from the caller; this function never changes their ownership.
+pub fn desiredCommand(alloc: std.mem.Allocator, txn: anytype, namespace: [24]u8, catalogs_value: Catalogs, observed: Status, minimum: u16) !Command {
+    const effect_protocol = try catalogs_value.effectProtocolFor(alloc, observed.ordered, minimum);
+    if (observed.ready and observed.ordered.?.effect_protocol == effect_protocol) {
+        var installed = (try load(alloc, txn)).?;
+        defer installed.deinit();
+        var command = installed.value.command;
+        command.catalogs = catalogs_value;
+        return command;
+    }
+    return .{ .namespace = namespace, .previous = observed.ordered, .binding = .{
+        .epoch = try std.math.add(u64, if (observed.ordered) |binding| binding.epoch else 0, 1),
+        .digest = catalogs_value.digest(),
+        .semantic_digest = try catalogs_value.semanticDigest(alloc),
+        .effect_protocol = effect_protocol,
+    }, .catalogs = catalogs_value };
+}
+
 test "grouped sources production ordered artifact inventory compatibility binds the complete effect protocol" {
     const direct: Binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3) };
     var extended = direct;
@@ -142,6 +217,12 @@ test "grouped sources production ordered artifact inventory compatibility binds 
     try std.testing.expect(extended.supportsProducerWitnesses());
     try std.testing.expect(!direct.compatible(extended));
     extended.effect_protocol = 17;
+    try std.testing.expect(extended.supportsProducerWitnesses());
+    extended.effect_protocol = 18;
+    try std.testing.expect(extended.supportsProducerWitnesses());
+    extended.effect_protocol = 19;
+    try std.testing.expect(extended.supportsProducerWitnesses());
+    extended.effect_protocol = 20;
     try std.testing.expect(!extended.supportsProducerWitnesses());
     try std.testing.expect(!extended.valid() and !extended.compatible(extended));
 }
@@ -161,6 +242,7 @@ pub fn validateRequest(req: anytype) !void {
     try command.validate();
     const empty: @TypeOf(req) = .{};
     inline for (@typeInfo(@TypeOf(req)).@"struct".field_names, @typeInfo(@TypeOf(req)).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime std.mem.eql(u8, reflected_name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, reflected_name, "artifact_catalog") and !std.mem.eql(u8, reflected_name, "sync_level") and !std.mem.eql(u8, reflected_name, "online_source") and !std.mem.eql(u8, reflected_name, "merge_checkpoint") and !std.mem.eql(u8, reflected_name, "merge_replication")) {
             if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                 if (@field(req, reflected_name).len != 0) return error.InvalidArtifactCatalogCommand;
@@ -181,9 +263,9 @@ pub fn validateRequest(req: anytype) !void {
 }
 
 fn get(txn: anytype, key: []const u8) ![]const u8 {
-    return txn.get(key) catch |err| switch (err) {
-        error.NotFound => "",
-        else => return err,
+    return txn.get(key) catch |err| {
+        if (err == error.NotFound) return "";
+        return err;
     };
 }
 /// Content identity fences this scalar cache across publication, rollback and
@@ -191,6 +273,29 @@ fn get(txn: anytype, key: []const u8) ![]const u8 {
 pub const SemanticDigestCache = struct {
     mutex: std.atomic.Mutex = .unlocked,
     entry: ?struct { catalog: [32]u8, semantic: [32]u8 } = null,
+    protocol_entry: ?struct { catalog: [32]u8, required: u16 } = null,
+
+    /// Reader floors below the latest capability still need feature discovery.
+    /// Cache that discovery by immutable catalog content so an upgrade does not
+    /// add catalog parsing to every ordinary readiness poll.
+    pub fn effectProtocolFor(self: *SemanticDigestCache, alloc: std.mem.Allocator, value: Catalogs, previous: ?Binding, minimum: u16) !u16 {
+        const floor = @max(minimum, if (previous) |binding| binding.effect_protocol else 14);
+        if (floor == max_effect_protocol) return floor;
+        const identity = value.digest();
+        {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.mutex.unlock();
+            if (self.protocol_entry) |cached| if (std.mem.eql(u8, &cached.catalog, &identity)) return @max(floor, cached.required);
+        }
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const required = try value.requiredEffectProtocol(arena.allocator());
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        self.protocol_entry = .{ .catalog = identity, .required = required };
+        return @max(floor, required);
+    }
+
     pub fn get(self: *SemanticDigestCache, alloc: std.mem.Allocator, value: Catalogs) ![32]u8 {
         const identity = value.digest();
         {
@@ -207,6 +312,19 @@ pub const SemanticDigestCache = struct {
         return semantic;
     }
 };
+
+test "leann protocol readiness caches catalog discovery across floor upgrades" {
+    var cache = SemanticDigestCache{};
+    const catalogs_value = Catalogs{};
+    try std.testing.expectEqual(@as(u16, 18), try cache.effectProtocolFor(std.testing.allocator, catalogs_value, null, 18));
+    // A cache hit needs no allocator, including after a semantic-cache lookup.
+    _ = try cache.get(std.testing.allocator, catalogs_value);
+    try std.testing.expectEqual(@as(u16, 18), try cache.effectProtocolFor(std.testing.failing_allocator, catalogs_value, null, 18));
+    // Another immutable catalog cannot inherit that cached requirement.
+    if (cache.effectProtocolFor(std.testing.allocator, .{ .enrichments = "[" }, null, 18)) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
 
 pub fn catalogs(txn: anytype) !Catalogs {
     return .{ .indexes = try get(txn, index_key), .enrichments = try get(txn, enrichment_key), .resolvers = try get(txn, resolver_key) };

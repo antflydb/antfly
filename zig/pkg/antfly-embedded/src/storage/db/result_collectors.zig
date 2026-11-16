@@ -96,12 +96,17 @@ pub fn externalizeArtifactWritesAlloc(alloc: Allocator, writes: []types.BatchWri
 }
 
 /// Reserve first, then transfer only a fully initialized owned value.
-pub fn appendArtifact(alloc: Allocator, out: *std.ArrayListUnmanaged(types.BatchWrite), key: []const u8, value: []const u8) !void {
-    try out.ensureUnusedCapacity(alloc, 1);
+pub fn appendArtifact(alloc: Allocator, out: anytype, key: []const u8, value: []const u8) !void {
+    if (comptime @hasField(@TypeOf(out.*), "budget")) if (out.budget) |budget| {
+        var projected = budget.*;
+        try projected.reserve(key.len, 1);
+        try projected.reserve(value.len, 0);
+    };
     const owned_key = try alloc.dupe(u8, key);
     errdefer alloc.free(owned_key);
     const owned_value = try alloc.dupe(u8, value);
-    out.appendAssumeCapacity(.{ .key = owned_key, .value = owned_value });
+    errdefer alloc.free(owned_value);
+    try out.append(alloc, .{ .key = owned_key, .value = owned_value });
 }
 
 pub fn appendDocument(alloc: Allocator, out: *std.ArrayListUnmanaged(types.EnrichmentDocumentWrite), key: []const u8, value: []const u8, names: []const []const u8) !void {
@@ -199,7 +204,12 @@ test "result collectors release scan rows across every allocation failure" {
             try std.testing.expectEqual(@as(usize, 3), result.documents.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
+    // Allocation-failure enumeration requires the same allocation sequence on
+    // every run. Backing-allocator remaps may succeed depending on neighboring
+    // allocations; force the allocate/copy fallback so every ownership transfer
+    // and growth allocation is tested independently of heap placement.
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), F.run, .{});
 }
 
 test "result collectors adopt enrichment arrays atomically across every allocation failure" {
@@ -227,7 +237,12 @@ test "result collectors adopt enrichment arrays atomically across every allocati
             try std.testing.expectEqual(@as(usize, 1), result.failed_keys.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
+    // Allocation-failure enumeration requires the same allocation sequence on
+    // every run. Backing-allocator remaps may succeed depending on neighboring
+    // allocations; force the allocate/copy fallback so every ownership transfer
+    // and growth allocation is tested independently of heap placement.
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), F.run, .{});
 }
 
 /// Owns every partially constructed extraction and every transferred array.
@@ -319,5 +334,10 @@ test "result collectors release complete graph identity and extraction transfers
             try std.testing.expectEqualStrings("embedding", result.dense_embeddings[0].artifact_ref.?.name);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
+    // Allocation-failure enumeration requires the same allocation sequence on
+    // every run. Backing-allocator remaps may succeed depending on neighboring
+    // allocations; force the allocate/copy fallback so every ownership transfer
+    // and growth allocation is tested independently of heap placement.
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), F.run, .{});
 }

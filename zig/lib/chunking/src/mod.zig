@@ -41,12 +41,14 @@ pub const Provider = enum {
 pub const TextChunkOptions = struct {
     target_tokens: u32 = 0,
     overlap_tokens: u32 = 0,
+    min_chars: u32 = 0,
     separator: []const u8 = "",
 
     pub fn clone(self: TextChunkOptions, alloc: Allocator) !TextChunkOptions {
         return .{
             .target_tokens = self.target_tokens,
             .overlap_tokens = self.overlap_tokens,
+            .min_chars = self.min_chars,
             .separator = if (self.separator.len > 0) try alloc.dupe(u8, self.separator) else "",
         };
     }
@@ -224,6 +226,7 @@ fn configFromOpenApi(
         cfg.full_text_index_json = try json.Stringify.valueAlloc(alloc, full_text_index, .{});
     }
 
+    if (cfg.text.min_chars > 1_000_000) return error.InvalidChunkerConfig;
     if (cfg.provider == .antfly and cfg.api_url.len > 0 and cfg.model.len == 0 and !cfg.isModelAware()) return error.InvalidChunkerConfig;
     return cfg;
 }
@@ -246,6 +249,10 @@ fn textChunkOptionsFromOpenApi(alloc: Allocator, generated: ?api_openapi.TextChu
             0,
         .overlap_tokens = if (value.overlap_tokens) |overlap|
             std.math.cast(u32, overlap) orelse return error.InvalidChunkerConfig
+        else
+            0,
+        .min_chars = if (value.min_chars) |minimum|
+            std.math.cast(u32, minimum) orelse return error.InvalidChunkerConfig
         else
             0,
         .separator = if (value.separator) |separator| try alloc.dupe(u8, separator) else "",
@@ -289,9 +296,10 @@ fn openApiFromConfig(cfg: Config) CombinedChunkerConfig {
     return .{
         .max_chunks = if (cfg.max_chunks > 0) cfg.max_chunks else null,
         .threshold = cfg.threshold,
-        .text = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0 or cfg.text.separator.len > 0) .{
+        .text = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0 or cfg.text.min_chars > 0 or cfg.text.separator.len > 0) .{
             .target_tokens = if (cfg.text.target_tokens > 0) cfg.text.target_tokens else null,
             .overlap_tokens = if (cfg.text.overlap_tokens > 0) cfg.text.overlap_tokens else null,
+            .min_chars = if (cfg.text.min_chars > 0) cfg.text.min_chars else null,
             .separator = if (cfg.text.separator.len > 0) cfg.text.separator else null,
         } else null,
         .audio = if (cfg.audio.window_duration_ms > 0 or cfg.audio.overlap_duration_ms > 0) .{
@@ -356,4 +364,18 @@ test "chunker config detects full text indexing" {
         "{\"provider\":\"antfly\",\"text\":{\"target_tokens\":64}}",
     )));
     try std.testing.expect(!(try parseStoreChunksFromSlice(alloc, "")));
+}
+
+test "chunker minimum content survives normalization clone and serialization" {
+    const a = std.testing.allocator;
+    var cfg = try parseConfigFromSlice(a, "{\"provider\":\"antfly\",\"text\":{\"min_chars\":16}}");
+    defer cfg.deinit(a);
+    var copy = try cfg.clone(a);
+    defer copy.deinit(a);
+    const encoded = try stringifyAlloc(a, copy);
+    defer a.free(encoded);
+    var decoded = try parseConfigFromSlice(a, encoded);
+    defer decoded.deinit(a);
+    try std.testing.expectEqual(@as(u32, 16), decoded.text.min_chars);
+    try std.testing.expectError(error.InvalidChunkerConfig, parseConfigFromSlice(a, "{\"provider\":\"antfly\",\"text\":{\"min_chars\":1000001}}"));
 }

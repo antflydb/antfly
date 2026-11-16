@@ -3246,20 +3246,20 @@ pub fn findExactEntryInBlock(
 fn compareEntryTo(entry: Entry, namespace_name: ?[]const u8, key: []const u8) std.math.Order {
     const namespace_order = compareNamespace(entry.namespace_name, namespace_name);
     if (namespace_order != .eq) return namespace_order;
-    return std.mem.order(u8, entry.key, key);
+    return byte_copy.orderBytes(entry.key, key);
 }
 
 fn compareKeyBound(lhs_namespace_name: ?[]const u8, lhs_key: []const u8, rhs_namespace_name: ?[]const u8, rhs_key: []const u8) std.math.Order {
     const namespace_order = compareNamespace(lhs_namespace_name, rhs_namespace_name);
     if (namespace_order != .eq) return namespace_order;
-    return std.mem.order(u8, lhs_key, rhs_key);
+    return byte_copy.orderBytes(lhs_key, rhs_key);
 }
 
 fn compareNamespace(lhs: ?[]const u8, rhs: ?[]const u8) std.math.Order {
     if (lhs == null and rhs == null) return .eq;
     if (lhs == null) return .lt;
     if (rhs == null) return .gt;
-    return std.mem.order(u8, lhs.?, rhs.?);
+    return byte_copy.orderBytes(lhs.?, rhs.?);
 }
 
 fn entryHashes(namespace_name: ?[]const u8, key: []const u8) [2]u64 {

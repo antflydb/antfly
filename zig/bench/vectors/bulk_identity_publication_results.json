@@ -1,0 +1,88 @@
+{
+  "scope": "One million authored identity keys per case, actual FsStore publication and paged readback, full-corpus BLAKE3 equality; counts are artifact API calls, not measured GCS HTTP requests",
+  "optimize": "fast",
+  "variants": "Existing 192 KiB target versus largest target compatible with the 256 KiB reader cap; one observation per target/key width",
+  "private_allocator_limit_bytes": 8388608,
+  "qualification": "Every case stored and reread one million keys with exact order/digest equality; oversized 1 MiB target rejected before appending",
+  "results": [
+    {
+      "target_bytes": 196608,
+      "key_width": 96,
+      "rows": 1000000,
+      "chunks": 489,
+      "puts": 524,
+      "elapsed_ns": 598174000,
+      "allocator_peak": 519243
+    },
+    {
+      "target_bytes": 262037,
+      "key_width": 96,
+      "rows": 1000000,
+      "chunks": 367,
+      "puts": 395,
+      "elapsed_ns": 561118000,
+      "allocator_peak": 519243
+    },
+    {
+      "target_bytes": 196608,
+      "key_width": 108,
+      "rows": 1000000,
+      "chunks": 550,
+      "puts": 590,
+      "elapsed_ns": 2061811000,
+      "allocator_peak": 454327
+    },
+    {
+      "target_bytes": 262037,
+      "key_width": 108,
+      "rows": 1000000,
+      "chunks": 413,
+      "puts": 441,
+      "elapsed_ns": 650949000,
+      "allocator_peak": 552489
+    }
+  ],
+  "limitations": [
+    "Filesystem timings on a shared workstation; not a WAN or full-build speedup",
+    "Ongoing 1M GCS qualification remains on earlier frozen executable/harness inputs"
+  ],
+  "prior_results_before_reference_upload_quota_fix": [
+    {
+      "target_bytes": 196608,
+      "key_width": 96,
+      "rows": 1000000,
+      "chunks": 489,
+      "puts": 524,
+      "allocator_peak": 519004,
+      "elapsed_ns": 439743000
+    },
+    {
+      "target_bytes": 262037,
+      "key_width": 96,
+      "rows": 1000000,
+      "chunks": 367,
+      "puts": 395,
+      "allocator_peak": 519004,
+      "elapsed_ns": 408669000
+    },
+    {
+      "target_bytes": 196608,
+      "key_width": 108,
+      "rows": 1000000,
+      "chunks": 550,
+      "puts": 590,
+      "allocator_peak": 454088,
+      "elapsed_ns": 520510000
+    },
+    {
+      "target_bytes": 262037,
+      "key_width": 108,
+      "rows": 1000000,
+      "chunks": 413,
+      "puts": 441,
+      "allocator_peak": 552250,
+      "elapsed_ns": 453108000
+    }
+  ],
+  "allocator_scope": "Tracker buffers, page-tree scratch, page packing and backend publication allocations; upload callback verifies allocator identity for every publication; shared capability unchanged"
+}

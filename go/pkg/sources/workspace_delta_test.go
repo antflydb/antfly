@@ -220,3 +220,28 @@ func TestAcquisitionResumePinsPagesWithoutCachingBodiesOrDownloadURLs(t *testing
 	require.NotContains(t, string(sanitized), "private body")
 	require.NotContains(t, string(sanitized), "secret=")
 }
+
+func TestNativeWorkspaceBaselineRequiresMatchingAcquisitionLayout(t *testing.T) {
+	full := 0
+	c := &CollaborationConnector{ProviderName: ProviderGoogleWorkspace, NativeAttachments: true, Services: []string{"gmail"}, GmailBase: "https://test/gmail", HTTPClient: fixtureClient(t, func(r *http.Request) (int, any) {
+		switch r.URL.Path {
+		case "/gmail/profile":
+			return 200, map[string]any{"emailAddress": "alice@example.com", "historyId": "20"}
+		case "/gmail/messages":
+			full++
+			return 200, map[string]any{"messages": []any{}}
+		default:
+			t.Fatalf("old layout must not resume a history cursor: %s", r.URL)
+			return 500, nil
+		}
+	})}
+	r := Request{Mode: ImportModeSource, SourceNamespace: "job/" + testSourceID, Config: SourceConfig(`{"resource":"gmail"}`)}
+	for _, layout := range []string{"old-text-layout", acquisitionKey(c.ProviderName + "\x00" + workspaceSelectionKey(r) + "\x00native-attachments-v3")} {
+		before := full
+		c.Baseline = &Inventory{Authoritative: true, ProviderState: map[string]string{"config": workspaceSelectionKey(r), "hydration": layout, "account": "alice@example.com", "gmail": "10"}}
+		inventory, err := c.Enumerate(t.Context(), r)
+		require.NoError(t, err)
+		require.True(t, inventory.Authoritative)
+		require.Equal(t, before+1, full, "a prior acquisition layout must rediscover canonical parent revisions")
+	}
+}

@@ -46,6 +46,7 @@ pub const weighted_subgroup_selection = @import("weighted_subgroup_selection.zig
 comptime {
     if (@import("builtin").is_test) {
         _ = @import("quantized_directory.zig");
+        _ = @import("centroid_directory.zig");
         _ = @import("vector_block.zig");
         _ = @import("antfly_hash");
         _ = @import("posting_wal.zig");
@@ -55,6 +56,7 @@ comptime {
         _ = @import("vector_block_manifest.zig");
         _ = @import("hbc_vector_directory.zig");
         _ = @import("hbc_index.zig");
+        _ = @import("bulk_identity.zig");
         _ = @import("posting.zig");
         _ = @import("spfresh_index.zig");
         _ = @import("posting_subgroups.zig");
@@ -63,6 +65,7 @@ comptime {
         _ = @import("compact_subgroups.zig");
         _ = @import("search_results.zig");
         _ = @import("search_runtime.zig");
+        _ = @import("leann.zig");
     }
 }
 pub const posting_wal = @import("posting_wal.zig");
@@ -76,6 +79,9 @@ pub const hbc_index = @import("hbc_index.zig");
 pub const spfresh_index = @import("spfresh_index.zig");
 pub const hbc_transfer = @import("hbc_transfer.zig");
 pub const hbc_debug = @import("hbc_debug.zig");
+/// LEANN low-storage graph index (arXiv:2506.08276). Standalone; not yet
+/// selectable as a table index. See zig/LEANN.md.
+pub const leann = @import("leann.zig");
 
 pub const HBCConfig = types.HBCConfig;
 pub const CentroidDirectoryMode = types.HBCConfig.CentroidDirectoryMode;

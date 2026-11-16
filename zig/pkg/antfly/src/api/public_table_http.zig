@@ -18,7 +18,7 @@ const ant_json = @import("antfly-json");
 const builtin = @import("builtin");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const backups_api = @import("backups.zig");
-const batch_api = @import("antfly_local_sources").api_batch;
+const batch_api = @import("antfly_local_sources").api_internal_batch;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const graph_pattern_mod = @import("antfly_local_sources").graph_pattern;
 const graph_query_mod = @import("antfly_local_sources").graph_query;
@@ -26,6 +26,7 @@ const graph_distinct_budget_diagnostic = @import("antfly_local_sources").graph_d
 const graph_work_budget_diagnostic = @import("antfly_local_sources").graph_work_budget_diagnostic;
 const graph_path_weight_diagnostic = @import("antfly_local_sources").graph_path_weight_diagnostic;
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
+const inference_validation_errors = @import("inference_validation_errors.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
 const common_secrets = @import("antfly_local_sources").common_secrets;
 const common_config = @import("antfly_local_sources").common_config;
@@ -109,6 +110,7 @@ pub const TableApi = struct {
         InvalidBatchRequest,
         Forbidden,
         UnsupportedSyncLevel,
+        UnsupportedCommitRequirement,
         GraphMetricFeatureNotEnabled,
         GraphMetricMaterializationRejected,
         NotFound,
@@ -120,6 +122,7 @@ pub const TableApi = struct {
         ForeignKeyReferenced,
         MethodNotAllowed,
         Backpressured,
+        StorageDescriptorPressure,
         DenseRepairBackpressure,
         Unavailable,
         WriteUnavailable,
@@ -151,6 +154,7 @@ pub const TableApi = struct {
         InvalidFilterQueryRequest,
         InvalidExclusionQueryRequest,
         UnsupportedFilterQueryRequest,
+        UnsupportedNodeFilterQuery,
         UnsupportedExclusionQueryRequest,
         UnsupportedQueryRequest,
         UnsupportedHierarchyGrouping,
@@ -209,6 +213,8 @@ pub const TableApi = struct {
         UnsupportedVersion,
         Corrupted,
         IncompletePublishedSnapshot,
+        ReembedBudgetExceeded,
+        ReembedSetupRetry,
         InternalFailure,
     };
 
@@ -326,6 +332,8 @@ pub const TableApi = struct {
         UnsupportedArtifactIndexSources,
         ArtifactIndexSourcesTemporarilyUnavailable,
         ProbeUnavailable,
+        ResourceLimitExceeded,
+        MemoryBudgetExceeded,
         InferenceEndpointAccessDenied,
         ModelNotFound,
         Backpressured,
@@ -371,6 +379,12 @@ pub const TableApi = struct {
         InvalidEmbeddingArtifactProducer,
         EmbeddingArtifactDimensionRequired,
         ConflictingEmbeddingArtifactDimensions,
+        ProbeUnavailable,
+        ResourceLimitExceeded,
+        MemoryBudgetExceeded,
+        InferenceEndpointAccessDenied,
+        ModelNotFound,
+        AmbiguousModelIdentifier,
         InternalFailure,
     };
 
@@ -403,6 +417,7 @@ pub const TableApi = struct {
         ReadUnavailable,
         StorageReadTemporarilyUnavailable,
         InternalFailure,
+        ResourceBudgetExceeded,
     };
 
     pub const ExecuteDocumentArtifactManifestsError = error{
@@ -424,6 +439,7 @@ pub const TableApi = struct {
         MethodNotAllowed,
         DocIdentityUnavailable,
         InternalFailure,
+        InferenceUnavailable,
     };
 
     pub const ExecuteReprocessDocumentArtifactRangeError = error{
@@ -863,6 +879,46 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
         .json = true,
         .retry_after_seconds = storage_read_temporarily_unavailable_retry_after_seconds,
     };
+}
+
+/// Preserve malformed versus unsupported aggregation failures at every public
+/// query boundary, including errors discovered while reading source values.
+pub fn normalizePublicAggregationError(err: anyerror) anyerror {
+    return switch (err) {
+        error.InvalidQueryRequest, error.InvalidAggregation => error.InvalidQueryRequest,
+        error.UnsupportedQueryRequest, error.UnsupportedAggregation => error.UnsupportedQueryRequest,
+        else => err,
+    };
+}
+
+test "time series public aggregation failures retain client and operational classes" {
+    try std.testing.expectEqual(error.InvalidQueryRequest, normalizePublicAggregationError(error.InvalidAggregation));
+    try std.testing.expectEqual(error.InvalidQueryRequest, normalizePublicAggregationError(error.InvalidQueryRequest));
+    try std.testing.expectEqual(error.UnsupportedQueryRequest, normalizePublicAggregationError(error.UnsupportedAggregation));
+    try std.testing.expectEqual(error.UnsupportedQueryRequest, normalizePublicAggregationError(error.UnsupportedQueryRequest));
+    for ([_]anyerror{ error.OutOfMemory, error.Timeout, error.Canceled, error.QueryCandidateBudgetExceeded }) |failure| {
+        try std.testing.expectEqual(failure, normalizePublicAggregationError(failure));
+    }
+}
+
+/// Preserve operation outcomes across query adapters before dependency-error
+/// classification can mistake cancellation for an upstream provider failure.
+pub fn queryCancellationError(err: anyerror) ?error{ Timeout, DeadlineExceeded, Canceled } {
+    return switch (err) {
+        error.Timeout => error.Timeout,
+        error.DeadlineExceeded => error.DeadlineExceeded,
+        error.Canceled, error.Cancelled => error.Canceled,
+        else => null,
+    };
+}
+
+test "highlight query cancellation classification preserves deadline identity before dependency normalization" {
+    try std.testing.expectEqual(error.Timeout, queryCancellationError(error.Timeout).?);
+    try std.testing.expectEqual(error.DeadlineExceeded, queryCancellationError(error.DeadlineExceeded).?);
+    try std.testing.expectEqual(error.Canceled, queryCancellationError(error.Canceled).?);
+    try std.testing.expectEqual(error.Canceled, queryCancellationError(error.Cancelled).?);
+    try std.testing.expect(queryCancellationError(error.ConnectionResetByPeer) == null);
+    try std.testing.expect(queryCancellationError(error.OutOfMemory) == null);
 }
 
 pub fn queryDependencyErrorOwnedResponse(
@@ -1627,13 +1683,14 @@ pub fn handleTableBatch(
 ) !OwnedResponse {
     resetLastBatchFailureName();
     last_ambiguous_batch_txn_id = null;
-    var batch_req = batch_api.parseBatchRequest(alloc, body) catch |err| {
+    var public_request = @import("antfly_local_sources").api_batch.parseBatchRequest(alloc, body) catch |err| {
         switch (err) {
             error.ValueTooLong => return .{ .status = 413, .body = try alloc.dupe(u8, "value too large") },
             error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
             else => return err,
         }
     };
+    var batch_req = batch_api.takePublic(&public_request);
     defer batch_req.deinit(alloc);
 
     return executeOwnedTableBatch(alloc, table_name, batch_req, api);
@@ -1724,6 +1781,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         error.RelationalIndexKeyTooLarge => return .{ .status = 413, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"RelationalIndexKeyTooLarge\",\"message\":\"encoded relational index keys, including the document ID, must not exceed 1048576 bytes\"}") },
         error.Forbidden => return .{ .status = 403, .body = try alloc.dupe(u8, "write permission required for every table affected by this mutation") },
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
+        error.UnsupportedCommitRequirement => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported commit_requires on this mutation surface") },
         error.UnsupportedSyncLevel => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported sync_level") },
         error.GraphMetricFeatureNotEnabled => return .{
             .status = 422,
@@ -1749,6 +1807,12 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
             .body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = @errorName(err) }, .{}),
         },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.StorageDescriptorPressure => return .{
+            .status = 503,
+            .json = true,
+            .body = try alloc.dupe(u8, "{\"error\":\"storage_descriptor_pressure\",\"message\":\"Storage file descriptors are exhausted. Reduce concurrent storage work and check RLIMIT_NOFILE and system file limits; see the production open-file limit guidance.\"}"),
+            .retry_after_seconds = 1,
+        },
         error.Backpressured => return .{
             .status = 429,
             .body = try alloc.dupe(u8, "{\"code\":\"table_backpressured\",\"message\":\"write capacity is temporarily exhausted\",\"retryable\":true,\"retry_after_ms\":1000}"),
@@ -1891,6 +1955,11 @@ pub fn handleTableQueryRequest(
                     return .{ .status = 422, .body = try unsupportedExactSortBody(alloc), .json = true };
                 }
                 std.log.err("public table query invalid table={s} err={}", .{ table_name, err });
+                if (try query_request_diagnostics.validationErrorBodyForRequest(alloc, table_name, body)) |error_body| return .{
+                    .status = 400,
+                    .body = error_body,
+                    .json = true,
+                };
                 return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
             },
             error.InvalidFilterQueryRequest => return publicFilterQueryErrorResponse(
@@ -1905,6 +1974,10 @@ pub fn handleTableQueryRequest(
                 "exclusion_query",
                 .invalid,
             ),
+            error.UnsupportedNodeFilterQuery => return .{
+                .status = 400,
+                .body = try alloc.dupe(u8, "unsupported graph node_filter.filter_query"),
+            },
             error.UnsupportedFilterQueryRequest => return publicFilterQueryErrorResponse(
                 alloc,
                 body,
@@ -2064,6 +2137,8 @@ pub fn handleTableQueryRequest(
             error.Timeout => {
                 return try queryDependencyErrorOwnedResponse(alloc, 504, "query_timeout", "query timed out", true);
             },
+            error.ReembedBudgetExceeded => return try queryDependencyErrorOwnedResponse(alloc, 422, "reembed_budget_exceeded", "re-embedding budget exceeded; increase reembed_budget_ms or set it to zero", false),
+            error.ReembedSetupRetry => return try queryDependencyErrorOwnedResponse(alloc, 503, "reembed_setup_retry", "re-embedding provider setup temporarily unavailable", true),
             error.IncompletePublishedSnapshot => {
                 std.log.warn("public table query detected incomplete index generation table={s}", .{table_name});
                 return try queryTemporarilyUnavailableOwnedResponse(alloc, .index_rebuilding);
@@ -2446,6 +2521,16 @@ pub fn handleTableGetIndex(
 
 pub const inference_endpoint_access_denied_message = "embedder.api_url denied inference access; check endpoint credentials and permissions. For local Antfly inference omit embedder.api_url. An HTTP /ai/v1 endpoint requires public_inference.enabled and inference permissions.";
 
+pub fn embeddingValidationFailureResponse(alloc: std.mem.Allocator, err: anyerror) !OwnedResponse {
+    const failure = inference_validation_errors.classify(err) orelse return error.InvalidArgument;
+    return .{
+        .status = failure.status,
+        .body = try failure.bodyAlloc(alloc),
+        .json = true,
+        .retry_after_seconds = failure.retry_after_seconds,
+    };
+}
+
 pub fn handleTableCreateIndex(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -2475,12 +2560,8 @@ pub fn handleTableCreateIndex(
             .json = true,
             .retry_after_seconds = 1,
         },
-        error.ProbeUnavailable => return .{
-            .status = 503,
-            .body = try alloc.dupe(u8, "{\"error\":\"index_probe_unavailable\",\"message\":\"index validation probe unavailable\",\"retryable\":true}"),
-            .json = true,
-            .retry_after_seconds = 1,
-        },
+        error.ResourceLimitExceeded, error.MemoryBudgetExceeded => return embeddingValidationFailureResponse(alloc, err),
+        error.ProbeUnavailable => return embeddingValidationFailureResponse(alloc, err),
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"model_not_found\",\"message\":\"model not found\",\"retryable\":false}"), .json = true },
         error.Backpressured => return .{
             .status = 429,
@@ -2567,13 +2648,23 @@ pub fn handlePutArtifactEnrichment(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "table mutation conflict; retry request") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.ResourceLimitExceeded, error.MemoryBudgetExceeded => return embeddingValidationFailureResponse(alloc, err),
+        error.ProbeUnavailable => return embeddingValidationFailureResponse(alloc, err),
+        error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"model_not_found\",\"message\":\"model not found while validating the enrichment or existing table configuration; inspect authenticated model discovery\",\"retryable\":false}"), .json = true },
+        error.AmbiguousModelIdentifier => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"ambiguous_model\",\"message\":\"model selection matches multiple installed artifacts; specify a variant and revision\",\"retryable\":false}"), .json = true },
+        error.InferenceEndpointAccessDenied => return .{ .status = 400, .body = try alloc.dupe(u8, inference_endpoint_access_denied_message) },
         error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
         error.MissingEmbeddingArtifactEnrichment => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding index source has no matching embedding enrichment") },
         error.MissingEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding enrichment has no producer configuration") },
         error.InvalidEmbeddingArtifactProducer => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding enrichment producer is not runnable") },
         error.EmbeddingArtifactDimensionRequired => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding enrichment must declare positive expected_dims") },
         error.ConflictingEmbeddingArtifactDimensions => return .{ .status = 400, .body = try alloc.dupe(u8, "embedding index sources declare different dimensions") },
-        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment update failed") },
+        error.InternalFailure => return .{ .status = 500, .body = try std.json.Stringify.valueAlloc(alloc, .{
+            .@"error" = "internal_error",
+            .message = "artifact enrichment update failed; inspect server logs using request_id",
+            .request_id = api.request.request_id,
+            .retryable = false,
+        }, .{}), .json = true },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
 }
@@ -2626,6 +2717,16 @@ pub fn handleDocumentArtifactManifest(
         error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
         error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
         error.StorageReadTemporarilyUnavailable => return try storageReadTemporarilyUnavailableOwnedResponse(alloc),
+        error.ResourceBudgetExceeded => return .{
+            .status = 413,
+            .json = true,
+            .body = try std.json.Stringify.valueAlloc(alloc, .{
+                .code = "inspection_limit_exceeded",
+                .retryable = false,
+                .message = "Dense index inspection exceeds supported limits; use a smaller source or recipe.",
+                .limits = db_mod.types.dense_index_inspection_limits,
+            }, .{}),
+        },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact manifest lookup failed") },
     };
     defer manifest.deinit(alloc);
@@ -2887,6 +2988,7 @@ pub fn handleReprocessDocumentArtifact(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.InferenceUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "{\"error\":\"artifact_inference_unavailable\",\"message\":\"Artifact inference is temporarily unavailable\",\"retryable\":true}") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact reprocess failed") },
     };
     return .{
@@ -3709,6 +3811,48 @@ test "public table batch handler returns concise dense repair backpressure" {
     try std.testing.expectEqual(@as(u32, 1000), parsed.value.retry_after_ms);
 }
 
+test "public table batch handler returns actionable descriptor pressure" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteBatchError!void {
+            return error.StorageDescriptorPressure;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expect(resp.json);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "storage_descriptor_pressure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "RLIMIT_NOFILE") != null);
+    try std.testing.expectEqual(@as(?u32, 1), resp.retry_after_seconds);
+}
+
 test "public table batch handler maps unavailable errors" {
     const Backend = struct {
         fn iface() TableApi {
@@ -4284,6 +4428,12 @@ test "public table query handler preserves structured filter and hierarchy diagn
         try std.testing.expect(!parsed.value.retryable);
     }
 
+    var graph_backend = Backend{ .err = error.UnsupportedNodeFilterQuery };
+    var graph_resp = try handleTableQueryRequest(std.testing.allocator, "docs", "{}", null, graph_backend.iface());
+    defer graph_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), graph_resp.status);
+    try std.testing.expectEqualStrings("unsupported graph node_filter.filter_query", graph_resp.body);
+
     var hierarchy_backend = Backend{ .err = error.UnsupportedHierarchyGrouping };
     var hierarchy_resp = try handleTableQueryRequest(
         std.testing.allocator,
@@ -4341,7 +4491,7 @@ test "public table query handler preserves retryable failure status" {
     @import("antfly_test_error_logs").expectErrorLogs(2);
 
     const Backend = struct {
-        err: TableApi.ExecuteQueryError,
+        err: ?TableApi.ExecuteQueryError,
 
         fn iface(self: *@This()) TableApi {
             return .{
@@ -4363,14 +4513,15 @@ test "public table query handler preserves retryable failure status" {
 
         fn executeTableQueryRequest(
             ptr: *anyopaque,
-            _: std.mem.Allocator,
+            alloc: std.mem.Allocator,
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
             _: operation.RequestContext,
         ) TableApi.ExecuteQueryError![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.err;
+            if (self.err) |err| return err;
+            return alloc.dupe(u8, "{\"hits\":[]}") catch return error.InternalFailure;
         }
     };
     const Case = struct {
@@ -4400,6 +4551,8 @@ test "public table query handler preserves retryable failure status" {
         .{ .err = error.HierarchyCursorStale, .status = 409, .body = "{\"status\":409,\"error\":\"hierarchy_cursor_stale\",\"message\":\"the source hierarchy changed after this cursor was issued\",\"action\":\"restart_hierarchy_traversal\",\"restart_without\":\"search_after\",\"retryable\":false}", .json = true },
         .{ .err = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
         .{ .err = error.CorruptInput, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"CorruptInput\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
+        .{ .err = error.ReembedBudgetExceeded, .status = 422, .body = "{\"code\":\"reembed_budget_exceeded\",\"error\":\"reembed_budget_exceeded\",\"message\":\"re-embedding budget exceeded; increase reembed_budget_ms or set it to zero\",\"retryable\":false}", .json = true },
+        .{ .err = error.ReembedSetupRetry, .status = 503, .body = "{\"code\":\"reembed_setup_retry\",\"error\":\"reembed_setup_retry\",\"message\":\"re-embedding provider setup temporarily unavailable\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.IncompletePublishedSnapshot, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
     };
 
@@ -4417,6 +4570,15 @@ test "public table query handler preserves retryable failure status" {
         }
         try std.testing.expectEqual(tc.json, resp.json);
         try std.testing.expectEqual(tc.retry_after_seconds, resp.retry_after_seconds);
+        if (tc.err == error.ReembedSetupRetry) {
+            backend.err = null;
+            var retry = try handleTableQueryRequest(std.testing.allocator, "docs",
+                \\{"query":{"match_all":{}}}
+            , null, backend.iface());
+            defer retry.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u16, 200), retry.status);
+            try std.testing.expectEqualStrings("{\"hits\":[]}", retry.body);
+        }
     }
 }
 
@@ -5303,11 +5465,11 @@ test "unsupported graph diagnostics identify the rejected operation feature acro
             .start_nodes = .{ .identities = &.{.{ .table = "concepts", .key = "antfly" }} },
             .params = .{ .direction = .in },
         } },
-        .{ .name = "seed_paths", .query = .{
+        .{ .name = "weighted_incoming", .query = .{
             .query_type = .traverse,
             .index_name = "knowledge",
             .start_nodes = .{ .identities = &.{.{ .table = "concepts", .key = "antfly" }} },
-            .params = .{ .direction = .in, .deduplicate = false },
+            .params = .{ .direction = .in, .weight_mode = .min_weight },
         } },
     };
     const req: db_mod.types.SearchRequest = .{
@@ -5318,15 +5480,15 @@ test "unsupported graph diagnostics identify the rejected operation feature acro
     // Planning probes must not publish a rejection into another execution.
     try std.testing.expect(graph_query_diagnostic.take() == null);
     try std.testing.expectError(error.GraphQueryModeUnsupported, distributed_graph.rejectUnsupportedCrossRange(req));
-    const body = try graphQueryUnsupportedBody(std.testing.allocator,
-        \\{"graph_queries":{"supported_incoming":{"index":"knowledge","traverse":{"start":{"identities":[{"table":"concepts","key":"antfly"}]},"direction":"in"}},"seed_paths":{"index":"knowledge","traverse":{"start":{"identities":[{"table":"concepts","key":"antfly"}]},"direction":"in","deduplicate_nodes":false}}}}
-    );
+    // The typed execution diagnostic must survive without reverse-engineering
+    // the original request, including strategies from non-canonical callers.
+    const body = try graphQueryUnsupportedBody(std.testing.allocator, "{}");
     defer std.testing.allocator.free(body);
     var parsed = try ant_json.parseFromSlice(metadata_openapi.GraphQueryUnsupportedError, std.testing.allocator, body, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("seed_paths", parsed.value.operation);
+    try std.testing.expectEqualStrings("weighted_incoming", parsed.value.operation);
     try std.testing.expectEqualStrings("traverse", parsed.value.feature);
-    try std.testing.expectEqualStrings("deduplicate_nodes_must_be_true", parsed.value.reason);
+    try std.testing.expectEqualStrings("weight_mode_must_be_min_hops", parsed.value.reason);
 }
 
 test "runtime graph capability diagnostics preserve the failing named operation" {
@@ -6399,6 +6561,7 @@ test "public document artifact manifest handler returns summary and raw state" {
         ) TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
             if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
             if (!std.mem.eql(u8, doc_key, "doc:a")) return error.InternalFailure;
+            if (std.mem.eql(u8, artifact_name, "oversized")) return error.ResourceBudgetExceeded;
             if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
             return makeManifest(alloc, doc_key, artifact_name);
         }
@@ -6423,6 +6586,15 @@ test "public document artifact manifest handler returns summary and raw state" {
             };
         }
     };
+
+    var limited = try handleDocumentArtifactManifest(std.testing.allocator, "docs", "doc:a", "oversized", .{ .detail = .raw }, Backend.iface());
+    defer limited.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 413), limited.status);
+    const limit_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, limited.body, .{});
+    defer limit_json.deinit();
+    try std.testing.expectEqualStrings("inspection_limit_exceeded", limit_json.value.object.get("code").?.string);
+    try std.testing.expect(!limit_json.value.object.get("retryable").?.bool);
+    try std.testing.expectEqual(@as(i64, 512), limit_json.value.object.get("limits").?.object.get("scan_visits").?.integer);
 
     var resp = try handleDocumentArtifactManifest(
         std.testing.allocator,
@@ -6523,6 +6695,7 @@ test "public document artifact reprocess handler returns accepted" {
             _: operation.RequestContext,
         ) TableApi.ExecuteReprocessDocumentArtifactError!void {
             if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
+            if (std.mem.eql(u8, doc_key, "doc:retry")) return error.InferenceUnavailable;
             if (!std.mem.eql(u8, doc_key, "doc:a")) return error.InternalFailure;
             if (!std.mem.eql(u8, artifact_name, "document_units_v1")) return error.InternalFailure;
         }
@@ -6539,6 +6712,13 @@ test "public document artifact reprocess handler returns accepted" {
 
     try std.testing.expectEqual(@as(u16, 202), resp.status);
     try std.testing.expectEqualStrings("{\"reprocess\":\"triggered\"}", resp.body);
+    var retry = try handleReprocessDocumentArtifact(std.testing.allocator, "docs", "doc:retry", "document_units_v1", Backend.iface());
+    defer retry.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), retry.status);
+    var body = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, retry.body, .{});
+    defer body.deinit();
+    try std.testing.expectEqualStrings("artifact_inference_unavailable", body.value.object.get("error").?.string);
+    try std.testing.expect(body.value.object.get("retryable").?.bool);
 }
 
 test "public document artifact range reprocess handler returns bounded summary" {
@@ -6735,4 +6915,137 @@ test "public table create index explains embedding endpoint access rejection" {
     try std.testing.expectEqual(@as(u16, 400), response.status);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "embedder.api_url") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "public_inference.enabled") != null);
+}
+
+test "public table create index preserves permanent inference budget identity" {
+    const Denied = struct {
+        fn create(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: @FieldType(TableApi, "request")) TableApi.ExecuteCreateIndexError![]u8 {
+            return error.ResourceLimitExceeded;
+        }
+    };
+    const api: TableApi = .{ .ptr = undefined, .request = .{}, .vtable = &.{
+        .execute_table_batch = unsupportedBatch,
+        .execute_table_query_request = unsupportedQueryRequest,
+        .execute_table_query_view = unsupportedQueryView,
+        .execute_table_backup = unsupportedBackup,
+        .execute_table_restore = unsupportedRestore,
+        .execute_table_list_indexes = unsupportedListIndexes,
+        .execute_table_get_index = unsupportedGetIndex,
+        .execute_table_create_index = Denied.create,
+        .execute_table_delete_index = unsupportedDeleteIndex,
+    } };
+    var response = try handleTableCreateIndex(std.testing.allocator, "docs", "semantic", "{}", api);
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), response.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", parsed.value.object.get("error").?.string);
+    try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.object.get("message").?.string, "scratch") != null);
+}
+
+test "public table query returns hierarchy validation pointers without leaking between requests" {
+    @import("antfly_test_error_logs").expectErrorLogs(2);
+    const Backend = struct {
+        fn query(_: *anyopaque, a: std.mem.Allocator, table: []const u8, body: []const u8, _: ?[]const u8, _: operation.RequestContext) TableApi.ExecuteQueryError![]u8 {
+            var parsed = query_contract.parseQueryRequest(a, null, table, body) catch return error.InvalidQueryRequest;
+            defer parsed.deinit(a);
+            return a.dupe(u8, "{}") catch return error.InternalFailure;
+        }
+    };
+    const api: TableApi = .{ .ptr = undefined, .request = .{}, .vtable = &.{
+        .execute_table_batch = unsupportedBatch,
+        .execute_table_query_request = Backend.query,
+        .execute_table_query_view = unsupportedQueryView,
+        .execute_table_backup = unsupportedBackup,
+        .execute_table_restore = unsupportedRestore,
+        .execute_table_list_indexes = unsupportedListIndexes,
+        .execute_table_get_index = unsupportedGetIndex,
+        .execute_table_create_index = unsupportedCreateIndex,
+        .execute_table_delete_index = unsupportedDeleteIndex,
+    } };
+    var response = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"fields":[],"hierarchy":{"group_by":{"level":"source","matches":{}}}}
+    , null, api);
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), response.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("/hierarchy/group_by/matches/fields", parsed.value.object.get("pointer").?.string);
+    try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
+    var next = try handleTableQueryRequest(std.testing.allocator, "docs", "{\"bad\":true}", null, api);
+    defer next.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, next.body, "/hierarchy/") == null);
+}
+
+test "public artifact enrichment preserves permanent inference budget and retryable probes" {
+    const Backend = struct {
+        failure: TableApi.ExecutePutArtifactEnrichmentError,
+        fn put(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: operation.RequestContext) TableApi.ExecutePutArtifactEnrichmentError!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+    };
+    var backend = Backend{ .failure = error.ResourceLimitExceeded };
+    const api: TableApi = .{ .ptr = &backend, .request = .{}, .vtable = &.{
+        .execute_table_batch = unsupportedBatch,
+        .execute_table_query_request = unsupportedQueryRequest,
+        .execute_table_query_view = unsupportedQueryView,
+        .execute_table_backup = unsupportedBackup,
+        .execute_table_restore = unsupportedRestore,
+        .execute_table_list_indexes = unsupportedListIndexes,
+        .execute_table_get_index = unsupportedGetIndex,
+        .execute_table_create_index = unsupportedCreateIndex,
+        .execute_table_delete_index = unsupportedDeleteIndex,
+        .execute_put_artifact_enrichment = Backend.put,
+    } };
+    for ([_]TableApi.ExecutePutArtifactEnrichmentError{ error.ResourceLimitExceeded, error.MemoryBudgetExceeded, error.ProbeUnavailable }) |failure| {
+        backend.failure = failure;
+        var response = try handlePutArtifactEnrichment(std.testing.allocator, "docs", "vectors", "{}", api);
+        defer response.deinit(std.testing.allocator);
+        const retryable = failure == error.ProbeUnavailable;
+        try std.testing.expectEqual(@as(u16, if (retryable) 503 else 400), response.status);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(retryable, parsed.value.object.get("retryable").?.bool);
+        try std.testing.expectEqualStrings(if (retryable) "index_probe_unavailable" else "MODEL_RESOURCE_LIMIT", parsed.value.object.get("error").?.string);
+    }
+}
+
+test "public artifact enrichment preserves missing ambiguous and internal failures" {
+    const Backend = struct {
+        failure: TableApi.ExecutePutArtifactEnrichmentError,
+        fn put(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: operation.RequestContext) TableApi.ExecutePutArtifactEnrichmentError!void {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).failure;
+        }
+    };
+    var backend = Backend{ .failure = error.ModelNotFound };
+    const api: TableApi = .{ .ptr = &backend, .request = .{ .request_id = "enrichment-test" }, .vtable = &.{
+        .execute_table_batch = unsupportedBatch,
+        .execute_table_query_request = unsupportedQueryRequest,
+        .execute_table_query_view = unsupportedQueryView,
+        .execute_table_backup = unsupportedBackup,
+        .execute_table_restore = unsupportedRestore,
+        .execute_table_list_indexes = unsupportedListIndexes,
+        .execute_table_get_index = unsupportedGetIndex,
+        .execute_table_create_index = unsupportedCreateIndex,
+        .execute_table_delete_index = unsupportedDeleteIndex,
+        .execute_put_artifact_enrichment = Backend.put,
+    } };
+    for ([_]struct { anyerror, u16, []const u8 }{
+        .{ error.ModelNotFound, 404, "model_not_found" },
+        .{ error.AmbiguousModelIdentifier, 409, "ambiguous_model" },
+        .{ error.InternalFailure, 500, "internal_error" },
+    }) |case| {
+        backend.failure = @errorCast(case[0]);
+        var response = try handlePutArtifactEnrichment(std.testing.allocator, "docs", "ocr", "{}", api);
+        defer response.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case[1], response.status);
+        try std.testing.expect(response.json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case[2], parsed.value.object.get("error").?.string);
+        try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
+        if (case[0] == error.InternalFailure) try std.testing.expectEqualStrings("enrichment-test", parsed.value.object.get("request_id").?.string);
+    }
 }

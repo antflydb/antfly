@@ -49,3 +49,18 @@ test "system catalog bounded transfer and outbox discovery" {
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+// Focused readiness filters must import the service even when the broad
+// unnamed import test is filtered out.
+test "selected owner readiness transition index discovery" {
+    _ = service;
+}
+
+test "catalog projection cancellation and publication discovery" {
+    _ = @import("metadata/catalog_projection_reader.zig");
+}
+
+test "index alias metadata HTTP discovery" {
+    _ = http_server;
+    _ = http_client;
+}

@@ -186,16 +186,11 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
     var changes = Mutations.init(a, &manager, storage);
     defer changes.deinit();
     changes.addition_first = true;
-    changes.forest.policy = .addition_first;
-    changes.private_pages.phase = store.io_phase;
     var reverse = Mutations.init(a, &manager, storage);
     defer reverse.deinit();
-    reverse.private_pages.phase = store.io_phase;
     var extrema = Mutations.init(a, &manager, storage);
     defer extrema.deinit();
     extrema.addition_first = true;
-    extrema.forest.policy = .addition_first;
-    extrema.private_pages.phase = store.io_phase;
     const layout = try record.Layout.init(a, recipe);
     defer layout.deinit(a);
     var dirty: reductions.Dirty = .empty;
@@ -294,12 +289,11 @@ fn buildInner(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, b
     var row_state: artifact.RowState = .{ .rows = try changes.finish(if (old) |seed_| seed_.rows.rows else null), .reverse = try reverse.finish(if (old) |seed_| seed_.rows.reverse else null), .extrema_version = 1, .extrema = try extrema.finish(if (old) |seed_| seed_.rows.extrema else null) };
     if ((if (row_state.rows) |root| root.records else 0) != provider.source.inventory.files[file].row_count or (if (row_state.reverse) |root| root.records else 0) != provider.source.inventory.files[file].row_count) return error.InvalidNativeAggregateArtifact;
     if (needsReductions(recipe)) {
-        row_state.reductions = try reductions.repair(a, &manager, storage, row_state.rows, if (old) |before| (if (before.rows.reductions_version == reductions.version) before.rows.reductions else null) else null, &dirty, provider.source.inventory.files[file].row_count, &layout, store.io_phase);
+        row_state.reductions = try reductions.repair(a, &manager, storage, row_state.rows, if (old) |before| (if (before.rows.reductions_version == reductions.version) before.rows.reductions else null) else null, &dirty, provider.source.inventory.files[file].row_count, &layout);
         row_state.reductions_version = reductions.version;
     }
     var result_changes = Mutations.init(a, &manager, storage);
     defer result_changes.deinit();
-    result_changes.private_pages.phase = store.io_phase;
     var iterator = groups.iterator();
     while (iterator.next()) |item| {
         const group = item.key_ptr;

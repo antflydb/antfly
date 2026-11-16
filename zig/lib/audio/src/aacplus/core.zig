@@ -34250,6 +34250,10 @@ pub const tPVMP4AudioDecoderExternal = extern struct {
 pub const tPVMP4AudioDecoderOutputFormat = enum_ePVMP4AudioDecoderOutputFormat;
 
 pub fn tns_ar_filter(arg_spec: [*c]Int32, spec_length: Int, direction: Int, arg_lpc: [*c]const Int32, Q_lpc: Int, order: Int) Int {
+    // Sum feedback with wrapping additions, then subtract it once from the
+    // input. LLVM's optimized subtract-reduction unrolling can invert the
+    // input accumulator; a negative impulse with zero history must retain its
+    // sign. The positive sum preserves the reference's fixed-point arithmetic.
     var spec = arg_spec;
     _ = &spec;
     _ = &spec_length;
@@ -34290,7 +34294,8 @@ pub fn tns_ar_filter(arg_spec: [*c]Int32, spec_length: Int, direction: Int, arg_
         {
             i = order;
             while (i != @as(c_int, 0)) : (i -= 1) {
-                y0 = pv_shr(p_spec.*, shift_down_amount);
+                const input = pv_shr(p_spec.*, shift_down_amount);
+                y0 = 0;
                 p_lpc = lpc;
                 {
                     j = order;
@@ -34301,7 +34306,7 @@ pub fn tns_ar_filter(arg_spec: [*c]Int32, spec_length: Int, direction: Int, arg_
                             ref.* += 1;
                             break :blk tmp;
                         }).*;
-                        y0 -= pv_shl(fxp_mul32_Q31(temp, (blk: {
+                        y0 +%= pv_shl(fxp_mul32_Q31(temp, (blk: {
                             const ref = &p_lpc;
                             const tmp = ref.*;
                             ref.* += 1;
@@ -34315,14 +34320,15 @@ pub fn tns_ar_filter(arg_spec: [*c]Int32, spec_length: Int, direction: Int, arg_
                     const tmp = ref.*;
                     ref.* -= 1;
                     break :blk tmp;
-                }).* = y0;
+                }).* = input -% y0;
             }
         }
         if (spec_length > order) {
             {
                 i = spec_length - order;
                 while (i != @as(c_int, 0)) : (i -= 1) {
-                    y0 = pv_shr(p_spec.*, shift_down_amount);
+                    const input = pv_shr(p_spec.*, shift_down_amount);
+                    y0 = 0;
                     p_lpc = &lpc[@as(c_int, 0)];
                     {
                         j = order;
@@ -34333,7 +34339,7 @@ pub fn tns_ar_filter(arg_spec: [*c]Int32, spec_length: Int, direction: Int, arg_
                                 ref.* += 1;
                                 break :blk tmp;
                             }).*;
-                            y0 -= pv_shl(fxp_mul32_Q31(temp, (blk: {
+                            y0 +%= pv_shl(fxp_mul32_Q31(temp, (blk: {
                                 const ref = &p_lpc;
                                 const tmp = ref.*;
                                 ref.* += 1;
@@ -34347,7 +34353,7 @@ pub fn tns_ar_filter(arg_spec: [*c]Int32, spec_length: Int, direction: Int, arg_
                         const tmp = ref.*;
                         ref.* -= 1;
                         break :blk tmp;
-                    }).* = y0;
+                    }).* = input -% y0;
                 }
             }
         }
@@ -34360,7 +34366,7 @@ pub fn tns_ar_filter(arg_spec: [*c]Int32, spec_length: Int, direction: Int, arg_
                 {
                     j = order;
                     while (j > i) : (j -= 1) {
-                        y0 -= fxp_mul32_Q31((blk: {
+                        y0 +%= fxp_mul32_Q31((blk: {
                             const ref = &p_state;
                             const tmp = ref.*;
                             ref.* -= 1;
@@ -34374,7 +34380,7 @@ pub fn tns_ar_filter(arg_spec: [*c]Int32, spec_length: Int, direction: Int, arg_
                     }
                 }
                 p_state = p_spec;
-                p_spec.* = (pv_shr(p_spec.*, shift_down_amount)) + (pv_shl(y0, shift_up));
+                p_spec.* = (pv_shr(p_spec.*, shift_down_amount)) +% (pv_shl(-%y0, shift_up));
                 p_spec += 1;
             }
         }
@@ -34387,7 +34393,7 @@ pub fn tns_ar_filter(arg_spec: [*c]Int32, spec_length: Int, direction: Int, arg_
                     {
                         j = order;
                         while (j != @as(c_int, 0)) : (j -= 1) {
-                            y0 -= fxp_mul32_Q31((blk: {
+                            y0 +%= fxp_mul32_Q31((blk: {
                                 const ref = &p_state;
                                 const tmp = ref.*;
                                 ref.* -= 1;
@@ -34401,7 +34407,7 @@ pub fn tns_ar_filter(arg_spec: [*c]Int32, spec_length: Int, direction: Int, arg_
                         }
                     }
                     p_state = p_spec;
-                    p_spec.* = (pv_shr(p_spec.*, shift_down_amount)) + (pv_shl(y0, shift_up));
+                    p_spec.* = (pv_shr(p_spec.*, shift_down_amount)) +% (pv_shl(-%y0, shift_up));
                     p_spec += 1;
                 }
             }

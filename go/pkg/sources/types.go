@@ -32,6 +32,7 @@ const (
 	ProviderGoogleDrive        = "google_drive"
 	ProviderGCS                = "gcs"
 	ProviderS3                 = "s3"
+	ProviderLocal              = "local"
 	ProviderSlack              = "slack"
 	ProviderDiscord            = "discord"
 	ProviderGoogleWorkspace    = "google_workspace"
@@ -56,9 +57,25 @@ type Item struct {
 	// ContentRef is a private acquisition checkpoint, never document metadata.
 	ContentRef                                              string `json:",omitempty"`
 	ID, Path, Filename, Revision, URL, SourceKind, ReadMode string
-	Size                                                    int64
-	Metadata                                                map[string]any
-	ObjectIndex                                             int
+	// RelativeKey is this item's key relative to the source's own root,
+	// independent of connection or bucket/prefix configuration: local and S3
+	// strip their configured prefix, GCS strips its configured prefix, and
+	// providers with no path-like key of their own (Drive, GitHub, and other
+	// collaboration surfaces) leave this empty, in which case it defaults to
+	// the item's native ID (see relativeKeyFor in document.go) since moving
+	// such an item across providers is never meaningful anyway. Used, together
+	// with a source's identity.namespace, to key a row by content location
+	// instead of by acquisition revision metadata (ID/Revision), so a
+	// namespace-scoped source's rows survive a connection or provider change.
+	// Bucket prefixes are literal: suffixes retain every slash. Use a trailing
+	// slash in a directory prefix to produce directory-relative keys.
+	RelativeKey string
+	// RelativeKeySet distinguishes an explicit empty bucket-prefix suffix from
+	// an older checkpoint or a connector that uses its native ID as the key.
+	RelativeKeySet bool `json:",omitempty"`
+	Size           int64
+	Metadata       map[string]any
+	ObjectIndex    int
 }
 type DiagnosticSource struct{ Key, SourceKind, Revision string }
 type Diagnostic struct {
@@ -91,6 +108,14 @@ type RevisionChangedError struct{ Expected, Actual string }
 func (e *RevisionChangedError) Error() string {
 	return fmt.Sprintf("source revision changed while reading: enumerated %q, read %q", e.Expected, e.Actual)
 }
+
+type restartRequiredError struct{ cause error }
+
+func (e *restartRequiredError) Error() string {
+	return e.cause.Error() + "; restart the sync with a fresh inventory"
+}
+func (e *restartRequiredError) Unwrap() error { return e.cause }
+
 func decodeSourceConfig[T any](raw SourceConfig) (T, error) {
 	var out T
 	if len(raw) == 0 || string(raw) == "null" {

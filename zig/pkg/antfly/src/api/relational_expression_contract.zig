@@ -244,13 +244,13 @@ pub fn canonicalizeOwnedSchema(alloc: std.mem.Allocator, schema: *wire.TableSche
     if (schema.checks) |items| for (@constCast(items)) |*item| {
         if (item.expression) |*expression| try canonicalizeOwnedExpression(alloc, expression);
         if (item.column) |column| {
-            if (item.value) |value| item.value = try columns.canonicalValue(alloc, column, value);
+            if (item.value.valueOrNull()) |value| item.value = .{ .value = try columns.canonicalValue(alloc, column, value) };
         }
     };
     if (schema.relational_indexes) |indexes| for (@constCast(indexes)) |*index| {
         for (@constCast(index.keys)) |*key| if (key.expression) |*expression| try canonicalizeOwnedExpression(alloc, expression);
         if (index.where) |conditions| for (@constCast(conditions)) |*condition| {
-            if (condition.value) |value| condition.value = try columns.canonicalValue(alloc, condition.column, value);
+            if (condition.value.valueOrNull()) |value| condition.value = .{ .value = try columns.canonicalValue(alloc, condition.column, value) };
         };
     };
 }

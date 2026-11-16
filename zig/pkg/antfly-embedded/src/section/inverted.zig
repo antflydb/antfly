@@ -6244,7 +6244,13 @@ fn writeMappedInvertedSection(
     defer if (!stream_norms) alloc.free(merged_norms);
     if (!stream_norms) @memset(merged_norms, 0);
     const serialize_scratch = &workspace.compact_scratch;
-    var dict_builder = try StreamingTermDictionaryBuilder.init(alloc, config.wireVersion());
+    // Navigation already proves a vocabulary upper bound. Do not reserve the
+    // maximum FST registry for every tiny merge (notably metadata fields).
+    var term_upper_bound: usize = 0;
+    for (readers, reader_present) |*reader, present| if (present) {
+        term_upper_bound +|= reader.dictionaryTermUpperBound();
+    };
+    var dict_builder = try StreamingTermDictionaryBuilder.initWithHint(alloc, term_upper_bound, config.wireVersion());
     defer dict_builder.deinit();
     var merged_term = std.ArrayListUnmanaged(u8).empty;
     defer merged_term.deinit(alloc);
@@ -9675,6 +9681,11 @@ pub const ScopedInvertedIndexReader = struct {
         self.* = undefined;
     }
 
+    fn dictionaryTermUpperBound(self: *const ScopedInvertedIndexReader) usize {
+        const blocks = if (self.contiguous) |*reader| reader.dict_block_count else self.context.?.native.block_count;
+        return @as(usize, blocks) *| term_dict_block_max_entries;
+    }
+
     pub fn layoutStats(self: *const ScopedInvertedIndexReader) !InvertedIndexReader.LayoutStats {
         if (self.contiguous) |reader| return reader.layoutStats();
         return self.context.?.native.layoutStats();
@@ -9693,6 +9704,24 @@ pub const ScopedInvertedIndexReader = struct {
         if (self.contiguous) |reader| return reader.docLength(doc);
         const context = self.context.?;
         return context.native.docLength(doc);
+    }
+
+    /// Resolve a bounded query term batch, then issue independent posting
+    /// headers before the first scorer waits for one term. Inline hits need no I/O.
+    pub fn prefetchTerms(self: *const ScopedInvertedIndexReader, terms: []const []const u8) !void {
+        const context = self.context orelse return;
+        const view = context.native.view;
+        if (view.source != .ranges or view.source.ranges.prefetch == null) return;
+        if (context.over_budget) return error.SegmentReadBudgetExceeded;
+        // Norms are independently addressable once the section header is open.
+        if (context.native.norms_length != 0) view.source.prefetch(view.offset + context.native.norms_offset, @min(64 * 1024, context.native.norms_length));
+        for (terms[0..@min(terms.len, 64)]) |term| {
+            const value = (try context.native.lookupValue(term, &context.dictionary)) orelse continue;
+            if (fstValIs1Hit(value)) continue;
+            const start = std.math.add(u64, v7_header_size, value) catch return error.InvalidData;
+            if (start >= context.native.norms_offset) return error.InvalidData;
+            view.source.prefetch(view.offset + start, @min(64 * 1024, context.native.norms_offset - start));
+        }
     }
 
     pub fn lookup(self: *const ScopedInvertedIndexReader, term: []const u8) !?LookupResult {
@@ -10657,7 +10686,7 @@ test "streamed positions preserve decoded prefix across packed crossover" {
     }
 }
 
-test "native scoped postings preserve prefetch through caches and translate section offsets" {
+test "external lake bounded window profiles native scoped postings preserve prefetch through caches and translate section offsets" {
     const a = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(a, .{});
     defer builder.deinit();
@@ -10690,6 +10719,9 @@ test "native scoped postings preserve prefetch through caches and translate sect
     defer concurrent.deinit();
     var scoped = try ScopedInvertedIndexReader.initRanges(a, try sources.View.init(concurrent.borrowedSource(), prefix, bytes.len), .{});
     defer scoped.deinit();
+    state.hints = 0;
+    try scoped.prefetchTerms(&.{ "common", "missing" });
+    try std.testing.expect(state.hints >= 2); // independent norms and posting header
     const lookup = (try scoped.lookup("common")).?;
     var iterator = try lookup.iterator(a);
     defer iterator.deinit();

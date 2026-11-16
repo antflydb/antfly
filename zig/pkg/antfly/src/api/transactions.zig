@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
-const batch_api = @import("antfly_local_sources").api_batch;
+const batch_api = @import("antfly_local_sources").api_internal_batch;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const distributed_txn = @import("distributed_txn.zig");
 const backend_erased = @import("antfly_local_sources").storage_backend_erased;
@@ -81,6 +81,9 @@ pub const TableCommitRequest = struct {
     table_name: []u8,
     relational_schema_version: ?u32 = null,
     batch: batch_api.OwnedBatchRequest = .{},
+    // The batch field retains only an explicit table override. This floor
+    // retains the strongest effective prerequisite already selected by a stage.
+    commit_requires_floor: ?db_mod.types.CommitRequires = null,
     predicates: std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate) = .empty,
 
     pub fn deinit(self: *TableCommitRequest, alloc: std.mem.Allocator) void {
@@ -98,6 +101,7 @@ pub const TableCommitRequest = struct {
             .table_name = try alloc.dupe(u8, self.table_name),
             .schema_version = self.schema_version,
             .relational_schema_version = self.relational_schema_version,
+            .commit_requires_floor = self.commit_requires_floor,
         };
         errdefer out.deinit(alloc);
         out.batch = try cloneBatchRequest(alloc, self.batch);
@@ -108,6 +112,10 @@ pub const TableCommitRequest = struct {
     }
 
     pub fn mergeFrom(self: *TableCommitRequest, alloc: std.mem.Allocator, other: TableCommitRequest) !void {
+        // Staged statements may strengthen admission, never erase an earlier
+        // prerequisite while coalescing the final table postimage.
+        self.commit_requires_floor = db_mod.types.CommitRequires.strongest(self.commit_requires_floor, other.commit_requires_floor);
+        self.batch.req.commit_requires = db_mod.types.CommitRequires.strongest(self.batch.req.commit_requires, other.batch.req.commit_requires);
         if (other.range_guards) |guards| try self.mergeRangeGuards(alloc, guards.value);
         if (other.conflict_guards) |guards| try self.mergeConflictGuards(alloc, guards.value);
         if (self.schema_version != null and other.schema_version != null and self.schema_version != other.schema_version) return error.CatalogGenerationChanged;
@@ -117,6 +125,7 @@ pub const TableCommitRequest = struct {
         try appendBatchWrites(alloc, &self.batch, other.batch.writes);
         try appendBatchDeletes(alloc, &self.batch, other.batch.deletes);
         try appendBatchTransforms(alloc, &self.batch, other.batch.transforms);
+        try @import("transaction_graph_effects.zig").merge(alloc, &self.batch, other.batch.graph_writes, other.batch.graph_deletes);
         try appendPredicates(alloc, &self.predicates, other.predicates.items);
         syncTableBatch(self);
     }
@@ -175,6 +184,9 @@ pub const OwnedTransactionCommitRequest = struct {
     read_set: []TransactionReadItem = &.{},
     tables: []TableCommitRequest = &.{},
     sync_level: db_mod.types.SyncLevel = .propose,
+    // Retain the request default until integrity expansion has enlisted all
+    // mutation participants, including tables absent from the submitted JSON.
+    commit_requires: ?db_mod.types.CommitRequires = null,
 
     pub fn setConstraintTiming(self: *@This(), alloc: std.mem.Allocator, mode: @import("antfly_local_sources").storage_relational_index.ConstraintTiming) !void {
         if (mode.generation == null) self.constraint_timing.clearRetainingCapacity();
@@ -235,6 +247,7 @@ pub const OwnedTransactionCommitRequest = struct {
     pub fn clone(self: OwnedTransactionCommitRequest, alloc: std.mem.Allocator) !OwnedTransactionCommitRequest {
         var out: OwnedTransactionCommitRequest = .{
             .sync_level = self.sync_level,
+            .commit_requires = self.commit_requires,
         };
         errdefer out.deinit(alloc);
         try out.constraint_timing.appendSlice(alloc, self.constraint_timing.items);
@@ -266,7 +279,15 @@ pub const OwnedTransactionCommitRequest = struct {
         return out;
     }
 
+    fn retainCommitRequires(self: *OwnedTransactionCommitRequest) void {
+        for (self.tables) |*table| table.commit_requires_floor = db_mod.types.CommitRequires.strongest(
+            table.commit_requires_floor,
+            table.batch.req.commit_requires orelse self.commit_requires,
+        );
+    }
+
     pub fn mergeFrom(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, other: *const OwnedTransactionCommitRequest) !void {
+        self.commit_requires = db_mod.types.CommitRequires.strongest(self.commit_requires, other.commit_requires);
         for (other.constraint_timing.items) |mode| try self.setConstraintTiming(alloc, mode);
         for (other.catalog_bindings.items) |binding| try self.bind(alloc, binding.logical, binding.physical);
         try appendReadSet(alloc, self, other.read_set);
@@ -283,6 +304,9 @@ pub const OwnedTransactionCommitRequest = struct {
                 try appendTable(alloc, self, table);
             }
         }
+        // Apply the strengthened default after this statement's explicit
+        // overrides, while retaining floors selected by earlier statements.
+        self.retainCommitRequires();
     }
 
     /// Caller-owned descriptors borrowing this request's payloads. The request
@@ -316,6 +340,8 @@ pub const OwnedTransactionCommitRequest = struct {
             offset += table_writes.len;
             out[i] = .{
                 .table_name = self.physicalName(table.table_name),
+                .commit_requires = db_mod.types.CommitRequires.strongest(table.commit_requires_floor, table.batch.req.commit_requires orelse self.commit_requires),
+                .default_commit_requires = self.commit_requires,
                 .schema_version = table.schema_version,
                 .relational_schema_version = table.relational_schema_version,
                 .relational_integrity_generation_set = if (table.conflict_guards) |guards| guards.value.generation_set else null,
@@ -324,6 +350,8 @@ pub const OwnedTransactionCommitRequest = struct {
                 .writes = table_writes,
                 .deletes = table.batch.deletes,
                 .transforms = table.batch.transforms,
+                .graph_writes = table.batch.graph_writes,
+                .graph_deletes = table.batch.graph_deletes,
                 .predicates = table.predicates.items,
             };
         }
@@ -542,6 +570,9 @@ pub const StageDeleteRequest = struct {
 };
 
 pub const SessionInfo = struct {
+    // Captured before dispatch under the session lock. A later retry rejection
+    // cannot prove that an earlier execution of this ID had no durable effect.
+    commit_execution_started: bool = false,
     txn_id: db_mod.types.TxnId,
     begin_timestamp: u64,
     sync_level: db_mod.types.SyncLevel,
@@ -990,6 +1021,7 @@ pub const Session = struct {
     pub fn info(self: Session) SessionInfo {
         return .{
             .txn_id = self.txn_id,
+            .commit_execution_started = self.commit_execution_started,
             .begin_timestamp = self.begin_timestamp,
             .sync_level = self.sync_level,
         };
@@ -1046,8 +1078,62 @@ pub const Session = struct {
 pub const DurableSessionStore = struct {
     alloc: std.mem.Allocator,
     backend: Backend,
+    // Local facade state and fallback for providers whose write transactions
+    // already serialize internally. mutationMutex selects shared backend gates.
+    mutation_mutex: std.atomic.Mutex = .unlocked,
+    reserved_registrations: usize = 0,
+    registration_issuer: ?u64 = null,
+
+    // Captured before this store allocates its first reference. Only earlier
+    // references can belong to a dead process; never sweep a live collector.
+    registration_recovery_before: ?u64 = null,
+    registration_locks: [64]std.atomic.Mutex = @splat(.unlocked),
     fail_writes_for_test: bool = false,
     fail_lease_transition_after_session_write_for_test: bool = false,
+
+    fn writeSerialization(self: *const DurableSessionStore) backend_erased.WriteSerialization {
+        return switch (self.backend) {
+            .docstore => |store| store.writeSerialization(),
+            .runtime => |store| store.writeSerialization(),
+        };
+    }
+
+    pub fn supportsSharedMutations(self: *const DurableSessionStore) bool {
+        return self.writeSerialization() != .unsupported;
+    }
+
+    /// All read/modify/write operations on a shared runtime namespace use its
+    /// backend's gate. A configured Store.write_gate already surrounds writes,
+    /// so its caller retains only the local lock and avoids recursive locking.
+    pub fn mutationMutex(self: *DurableSessionStore) *std.atomic.Mutex {
+        switch (self.writeSerialization()) {
+            .gate => |gate| return gate,
+            .intrinsic, .unsupported => {},
+        }
+        return &self.mutation_mutex;
+    }
+
+    // A facade owns one issuer for its entire lifetime. Sharing the physical
+    // transaction store is supported; rebinding a live facade is not.
+    pub fn bindRegistrationIssuer(self: *DurableSessionStore, issuer: u64) !void {
+        // Anonymous node-local stores retain their exclusive-facade contract.
+        // Shared issuers must prove transaction-wide coordination before they
+        // can advertise SQL completion or allocate a durable consumer.
+        if (issuer != 0 and !self.supportsSharedMutations())
+            return error.CompletionOwnerUnavailable;
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
+        if (self.registration_issuer) |bound| {
+            if (bound != issuer) return error.CompletionWrongOwner;
+        } else {
+            if (issuer != 0 and (self.registration_recovery_before != null or self.reserved_registrations != 0)) return error.CompletionWrongOwner;
+            self.registration_issuer = issuer;
+        }
+    }
+    fn registrationOutbox(self: *DurableSessionStore) @import("completion_outbox.zig").Namespace {
+        return .{ .issuer = self.registration_issuer orelse 0 };
+    }
 
     const Backend = union(enum) {
         docstore: *docstore_mod.DocStore,
@@ -1068,6 +1154,9 @@ pub const DurableSessionStore = struct {
     }
 
     pub fn save(self: *DurableSessionStore, session: Session, max_record_bytes: ?usize) !void {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         const key = try makeSessionKey(self.alloc, session.txn_id);
         defer self.alloc.free(key);
@@ -1105,6 +1194,9 @@ pub const DurableSessionStore = struct {
         require_expired: bool,
         max_record_bytes: ?usize,
     ) !bool {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         return switch (self.backend) {
             .docstore => |store| blk: {
@@ -1192,6 +1284,8 @@ pub const DurableSessionStore = struct {
         }
         const expiry_key = try makeSessionExpiryKey(self.alloc, session.last_touched_timestamp, session.txn_id);
         defer self.alloc.free(expiry_key);
+        try self.rejectReferencedResurrection(txn, session);
+        try self.preserveCompletionTxn(txn, session, false);
         try txn.put(session_key, session_value);
         try txn.put(expiry_key, &.{});
         if (sessionNeedsRecovery(session)) {
@@ -1226,7 +1320,358 @@ pub const DurableSessionStore = struct {
         return try decodeSessionRecord(self.alloc, txn_id, value);
     }
 
+    // Compact completion facts outlive the expiring session payload and its
+    // quota/index entries. No TTL may erase a proof still held by a caller.
+    pub fn completionSettled(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !bool {
+        const key = try makeSessionCompletionKey(self.alloc, txn_id);
+        defer self.alloc.free(key);
+        const value = switch (self.backend) {
+            .docstore => |store| store.get(self.alloc, key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                const raw = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => return false,
+                    else => return err,
+                };
+                break :blk try self.alloc.dupe(u8, raw);
+            },
+        };
+        defer self.alloc.free(value);
+        return std.mem.eql(u8, value, "settled-v1");
+    }
+
+    fn rejectReferencedResurrection(self: *DurableSessionStore, txn: anytype, session: Session) !void {
+        const key = try makeSessionKey(self.alloc, session.txn_id);
+        defer self.alloc.free(key);
+        _ = txn.get(key) catch |err| switch (err) {
+            error.NotFound => {
+                const directory = try completionDirectoryKey(self.alloc, session.txn_id);
+                defer self.alloc.free(directory);
+                _ = txn.get(directory) catch |missing| switch (missing) {
+                    error.NotFound => return,
+                    else => return missing,
+                };
+                return error.SqlTransactionOutcomeUnknown;
+            },
+            else => return err,
+        };
+    }
+
+    // References belong to consumers, rather than the lifetime of a session.
+    // Only pending receipts allocate these keys. Terminal publication and
+    // session retirement settle every registered consumer atomically.
+    fn preserveCompletionTxn(self: *DurableSessionStore, txn: anytype, session: Session, retiring: bool) !void {
+        if (!sessionCompletionSettled(session) and !(retiring and !session.commit_execution_started)) return;
+        const directory = try completionDirectoryKey(self.alloc, session.txn_id);
+        defer self.alloc.free(directory);
+        const bytes = txn.get(directory) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        var refs = try std.json.parseFromSlice([][16]u8, self.alloc, bytes, .{});
+        defer refs.deinit();
+        for (refs.value) |reference| {
+            const key = try completionReferenceKey(self.alloc, session.txn_id, reference);
+            defer self.alloc.free(key);
+            try txn.put(key, "settled-v1");
+        }
+    }
+
+    pub fn managedCompletion(self: *DurableSessionStore, id: [16]u8, reference: [16]u8, acknowledge: bool, retired_through: u64) !bool {
+        return self.mutateCompletionReference(id, reference, acknowledge, retired_through);
+    }
+    pub fn lockRegistration(self: *DurableSessionStore, reference: [16]u8) *std.atomic.Mutex {
+        const lock = &self.registration_locks[reference[15] % self.registration_locks.len];
+        platform_sync.lockYielding(lock);
+        return lock;
+    }
+    const Outbox = @import("completion_outbox.zig");
+    const RegistrationMutation = union(enum) {
+        create: struct { seed: [8]u8, outcome: @import("../pgwire/completion.zig").Outcome, reserved: bool = false, prepared: bool = false, local_transaction_id: ?[16]u8 = null },
+        put: struct { reference: [16]u8, record: Outbox.Record },
+        remove: [16]u8,
+        retire_local: struct { reference: [16]u8, transaction_id: [16]u8 },
+    };
+    fn registrationMutationTxn(self: *DurableSessionStore, txn: anytype, action: RegistrationMutation) ![16]u8 {
+        if (self.registration_recovery_before == null)
+            self.registration_recovery_before = (try self.registrationOutbox().producer(txn, self.alloc, @splat(0))).next;
+        switch (action) {
+            .create => |value| {
+                if (value.reserved and self.reserved_registrations == 0) return error.SessionLimitExceeded;
+                const held = self.reserved_registrations - @as(usize, if (value.reserved) 1 else 0);
+                if (try self.registrationOutbox().available(txn, self.alloc) <= held) return error.SessionLimitExceeded;
+                const floor = (try self.registrationOutbox().producer(txn, self.alloc, value.seed)).retired_through;
+                const reference = try self.registrationOutbox().create(txn, self.alloc, value.seed, value.outcome, value.prepared);
+                if (value.local_transaction_id) |id| {
+                    // Fold the local handoff into the intent allocation batch:
+                    // no remote RPC or intermediate WAL commits are necessary.
+                    _ = try self.completionReferenceTxn(txn, id, reference, false, floor, .prepare);
+                    try self.registrationOutbox().put(txn, self.alloc, reference, .{ .outcome = value.outcome, .prepared = true, .execution_admitted = true, .phase = .registered });
+                }
+                return reference;
+            },
+            .put => |value| try self.registrationOutbox().put(txn, self.alloc, value.reference, value.record),
+            .remove => |reference| try self.registrationOutbox().remove(txn, self.alloc, reference),
+            .retire_local => |value| {
+                const floor = (try self.registrationOutbox().producer(txn, self.alloc, @splat(0))).retired_through;
+                if (!try self.completionReferenceTxn(txn, value.transaction_id, value.reference, true, floor, .pin)) return error.CompletionUnavailable;
+                try self.registrationOutbox().remove(txn, self.alloc, value.reference);
+            },
+        }
+        return @splat(0);
+    }
+    fn registrationMutation(self: *DurableSessionStore, action: RegistrationMutation) ![16]u8 {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
+        if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
+        const result = switch (self.backend) {
+            .docstore => |store| blk: {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                const reference = try self.registrationMutationTxn(&txn, action);
+                try txn.commit();
+                break :blk reference;
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                const reference = try self.registrationMutationTxn(&txn, action);
+                try txn.commit();
+                break :blk reference;
+            },
+        };
+        if (action == .create and action.create.reserved) self.reserved_registrations -= 1;
+        return result;
+    }
+    pub fn reserveRegistrations(self: *DurableSessionStore, count: usize) !void {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
+        const free = switch (self.backend) {
+            .docstore => |store| blk: {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                break :blk try self.registrationOutbox().available(&txn, self.alloc);
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                break :blk try self.registrationOutbox().available(&txn, self.alloc);
+            },
+        };
+        if (count > free or self.reserved_registrations > free - count) return error.SessionLimitExceeded;
+        self.reserved_registrations += count;
+    }
+    pub fn releaseRegistrations(self: *DurableSessionStore, count: usize) void {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
+        std.debug.assert(count <= self.reserved_registrations);
+        self.reserved_registrations -= count;
+    }
+    pub fn createReservedRegistration(self: *DurableSessionStore, seed: [8]u8, outcome: @import("../pgwire/completion.zig").Outcome) ![16]u8 {
+        return self.registrationMutation(.{ .create = .{ .seed = seed, .outcome = outcome, .reserved = true } });
+    }
+    pub fn retireLocalPreparedRegistration(self: *DurableSessionStore, reference: [16]u8, id: [16]u8) !void {
+        _ = try self.registrationMutation(.{ .retire_local = .{ .reference = reference, .transaction_id = id } });
+    }
+    pub fn createLocalPreparedRegistration(self: *DurableSessionStore, seed: [8]u8, outcome: @import("../pgwire/completion.zig").Outcome, id: [16]u8) ![16]u8 {
+        return self.registrationMutation(.{ .create = .{ .seed = seed, .outcome = outcome, .reserved = true, .prepared = true, .local_transaction_id = id } });
+    }
+    pub fn createPreparedRegistration(self: *DurableSessionStore, seed: [8]u8, outcome: @import("../pgwire/completion.zig").Outcome) ![16]u8 {
+        return self.registrationMutation(.{ .create = .{ .seed = seed, .outcome = outcome, .reserved = true, .prepared = true } });
+    }
+    pub fn createRegistration(self: *DurableSessionStore, seed: [8]u8, outcome: @import("../pgwire/completion.zig").Outcome) ![16]u8 {
+        return self.registrationMutation(.{ .create = .{ .seed = seed, .outcome = outcome } });
+    }
+    pub fn putRegistration(self: *DurableSessionStore, reference: [16]u8, record: Outbox.Record) !void {
+        _ = try self.registrationMutation(.{ .put = .{ .reference = reference, .record = record } });
+    }
+    pub fn removeRegistration(self: *DurableSessionStore, reference: [16]u8) !void {
+        _ = try self.registrationMutation(.{ .remove = reference });
+    }
+    pub fn loadRegistration(self: *DurableSessionStore, alloc: std.mem.Allocator, reference: [16]u8) !?std.json.Parsed(Outbox.Record) {
+        return switch (self.backend) {
+            .docstore => |store| blk: {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                break :blk try self.registrationOutbox().load(&txn, alloc, reference);
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                break :blk try self.registrationOutbox().load(&txn, alloc, reference);
+            },
+        };
+    }
+    pub fn registrationRecoveryPage(self: *DurableSessionStore, alloc: std.mem.Allocator, after: u64, limit: usize) !Outbox.RecoveryPage {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
+        return switch (self.backend) {
+            .docstore => |store| blk: {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                if (self.registration_recovery_before == null) self.registration_recovery_before = (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).next;
+                break :blk try self.registrationOutbox().recoveryPage(&txn, alloc, self.registration_recovery_before.?, after, limit);
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                if (self.registration_recovery_before == null) self.registration_recovery_before = (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).next;
+                break :blk try self.registrationOutbox().recoveryPage(&txn, alloc, self.registration_recovery_before.?, after, limit);
+            },
+        };
+    }
+    pub fn registrationFloor(self: *DurableSessionStore) !u64 {
+        return switch (self.backend) {
+            .docstore => |store| blk: {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                break :blk (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).retired_through;
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                break :blk (try self.registrationOutbox().producer(&txn, self.alloc, @splat(0))).retired_through;
+            },
+        };
+    }
+
+    pub fn pinCompletion(self: *DurableSessionStore, id: db_mod.types.TxnId, reference: [16]u8) !void {
+        _ = try self.mutateCompletionReference(id, reference, false, null);
+    }
+    pub fn acknowledgeCompletion(self: *DurableSessionStore, id: db_mod.types.TxnId, reference: [16]u8) !bool {
+        return self.mutateCompletionReference(id, reference, true, null);
+    }
+    fn mutateCompletionReference(self: *DurableSessionStore, id: db_mod.types.TxnId, reference: [16]u8, acknowledge: bool, retired_through: ?u64) !bool {
+        return self.changeCompletionReference(id, reference, acknowledge, retired_through, .pin);
+    }
+    pub const CompletionMode = enum { pin, prepare, quiesce, abandon, forget };
+    pub fn changeCompletionReference(self: *DurableSessionStore, id: [16]u8, reference: [16]u8, acknowledge: bool, retired_through: ?u64, mode: CompletionMode) !bool {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
+        if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
+        return switch (self.backend) {
+            .docstore => |store| blk: {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                const result = try self.completionReferenceTxn(&txn, id, reference, acknowledge, retired_through, mode);
+                try txn.commit();
+                break :blk result;
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginWrite();
+                errdefer txn.abort();
+                const result = try self.completionReferenceTxn(&txn, id, reference, acknowledge, retired_through, mode);
+                try txn.commit();
+                break :blk result;
+            },
+        };
+    }
+    fn completionReferenceTxn(self: *DurableSessionStore, txn: anytype, id: db_mod.types.TxnId, reference: [16]u8, acknowledge: bool, retired_through: ?u64, mode: CompletionMode) !bool {
+        const retiring = acknowledge or mode == .forget;
+        const retirement = @import("completion_retirement.zig");
+        if (retired_through) |floor| {
+            const observed = try retirement.advance(txn, self.alloc, "\x00\x00__api_completion_retired__:", reference, floor);
+            if (retirement.sequence(reference) <= observed) {
+                if (retiring or mode == .abandon or mode == .quiesce) return true;
+                return error.CompletionAcknowledged;
+            }
+        }
+        const key = try completionReferenceKey(self.alloc, id, reference);
+        defer self.alloc.free(key);
+        const existing = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (existing) |value| if (std.mem.eql(u8, value, retirement.marker)) {
+            if (retiring or mode == .abandon or mode == .quiesce) return true;
+            return error.CompletionAcknowledged;
+        };
+        if (acknowledge and existing == null) return true;
+        if (acknowledge and !std.mem.eql(u8, existing.?, "settled-v1")) return false;
+        if (!retiring and mode == .abandon) {
+            // The issuer durably joined without admitting execution. Publish a
+            // proof even if the target session was retired before preparation.
+            try txn.put(key, "settled-v1");
+            return true;
+        }
+        if (!retiring and mode == .quiesce) {
+            if (existing == null) return false;
+            if (std.mem.eql(u8, existing.?, "settled-v1")) return true;
+            var session = (try self.loadSessionTxn(txn, id)) orelse return false;
+            defer session.deinit(self.alloc);
+            if (sessionCompletionSettled(session) or !session.commit_execution_started) {
+                try txn.put(key, "settled-v1");
+                return true;
+            }
+            return false;
+        }
+        if (!retiring and existing != null) return true;
+        const directory = try completionDirectoryKey(self.alloc, id);
+        defer self.alloc.free(directory);
+        const bytes = txn.get(directory) catch |err| switch (err) {
+            error.NotFound => "[]",
+            else => return err,
+        };
+        var parsed = try std.json.parseFromSlice([][16]u8, self.alloc, bytes, .{});
+        defer parsed.deinit();
+        var refs: std.ArrayList([16]u8) = .empty;
+        defer refs.deinit(self.alloc);
+        for (parsed.value) |old| if (!retiring or !std.mem.eql(u8, &old, &reference)) {
+            try refs.append(self.alloc, old);
+        };
+        if (retiring) {
+            if (retired_through != null) try retirement.acknowledge(txn, self.alloc, "\x00\x00__api_completion_retired__:", reference, key) else try txn.delete(key);
+        } else {
+            if (refs.items.len >= 4096) return error.SessionLimitExceeded;
+            var session = (try self.loadSessionTxn(txn, id)) orelse return error.SqlTransactionOutcomeUnknown;
+            defer session.deinit(self.alloc);
+            try refs.append(self.alloc, reference);
+            try txn.put(key, if (sessionCompletionSettled(session) or (mode != .prepare and !session.commit_execution_started)) "settled-v1" else "pending-v1");
+        }
+        if (refs.items.len == 0) {
+            try txn.delete(directory);
+        } else {
+            const encoded = try std.json.Stringify.valueAlloc(self.alloc, refs.items, .{});
+            defer self.alloc.free(encoded);
+            try txn.put(directory, encoded);
+        }
+        return true;
+    }
+    pub fn completionReferenceSettled(self: *DurableSessionStore, id: db_mod.types.TxnId, reference: [16]u8) !bool {
+        const key = try completionReferenceKey(self.alloc, id, reference);
+        defer self.alloc.free(key);
+        const bytes = switch (self.backend) {
+            .docstore => |store| store.get(self.alloc, key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            },
+            .runtime => |store| blk: {
+                var txn = try store.beginRead();
+                defer txn.abort();
+                const value = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => return false,
+                    else => return err,
+                };
+                break :blk try self.alloc.dupe(u8, value);
+            },
+        };
+        defer self.alloc.free(bytes);
+        return std.mem.eql(u8, bytes, "settled-v1");
+    }
+
     pub fn delete(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !void {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         const key = try makeSessionKey(self.alloc, txn_id);
         defer self.alloc.free(key);
@@ -1250,6 +1695,9 @@ pub const DurableSessionStore = struct {
     /// unexecuted transaction and detach its exact connection in the same
     /// native transaction. Neither side may become visible alone.
     pub fn deleteAndDetachConnection(self: *DurableSessionStore, txn_id: db_mod.types.TxnId, connection_id: [32]u8, commit_settings: bool) !void {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         if (self.fail_writes_for_test) return error.InjectedSessionStoreFailure;
         const key = try makeSessionKey(self.alloc, txn_id);
         defer self.alloc.free(key);
@@ -1324,6 +1772,8 @@ pub const DurableSessionStore = struct {
         }
         const expiry_key = try makeSessionExpiryKey(self.alloc, session.last_touched_timestamp, session.txn_id);
         defer self.alloc.free(expiry_key);
+        try self.rejectReferencedResurrection(txn, session);
+        try self.preserveCompletionTxn(txn, session, false);
         try txn.put(key, value);
         try txn.put(expiry_key, &.{});
         if (sessionNeedsRecovery(session)) {
@@ -1340,6 +1790,9 @@ pub const DurableSessionStore = struct {
         }) |raw| {
             var previous = try decodeSessionRecord(self.alloc, txn_id, raw);
             defer previous.deinit(self.alloc);
+            // Deletion and its terminal witness share one storage commit.
+            if (previous.commit_execution_started and !sessionCompletionSettled(previous)) return error.SqlTransactionOutcomeUnknown;
+            try self.preserveCompletionTxn(txn, previous, true);
             const expiry_key = try makeSessionExpiryKey(self.alloc, previous.last_touched_timestamp, txn_id);
             defer self.alloc.free(expiry_key);
             txn.delete(expiry_key) catch |err| switch (err) {
@@ -1460,6 +1913,9 @@ pub const DurableSessionStore = struct {
     /// Rechecks the current durable row under a write transaction before
     /// backfilling its index entry, avoiding stale audit results.
     pub fn refreshRecoveryIndex(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !void {
+        const mutation = self.mutationMutex();
+        platform_sync.lockYielding(mutation);
+        defer mutation.unlock();
         const session_key = try makeSessionKey(self.alloc, txn_id);
         defer self.alloc.free(session_key);
         const recovery_key = try makeSessionRecoveryKey(self.alloc, txn_id);
@@ -1642,6 +2098,7 @@ pub const OpenedSessionStore = struct {
     }
 
     pub fn leaseStore(self: *OpenedSessionStore) *SessionLeaseStore {
+        self.lease.mutation_mutex = self.durable.mutationMutex();
         return &self.lease;
     }
 };
@@ -1658,16 +2115,21 @@ pub const SessionStoreScope = enum {
 pub const SessionLeaseStore = struct {
     alloc: std.mem.Allocator,
     backend: DurableSessionStore.Backend,
+    mutation_mutex: ?*std.atomic.Mutex = null,
 
     pub fn init(alloc: std.mem.Allocator, store: *docstore_mod.DocStore) SessionLeaseStore {
         return .{
             .alloc = alloc,
             .backend = .{ .docstore = store },
+            .mutation_mutex = switch (store.writeSerialization()) {
+                .gate => |gate| gate,
+                .intrinsic, .unsupported => null,
+            },
         };
     }
 
     pub fn initFromDurable(durable: *DurableSessionStore) SessionLeaseStore {
-        return .{ .alloc = durable.alloc, .backend = durable.backend };
+        return .{ .alloc = durable.alloc, .backend = durable.backend, .mutation_mutex = durable.mutationMutex() };
     }
 
     pub fn load(self: *const SessionLeaseStore, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?lease_mod.LeaseRecord {
@@ -1682,6 +2144,8 @@ pub const SessionLeaseStore = struct {
     }
 
     pub fn renew(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64, now_ms: u64, ttl_ms: u64) !bool {
+        if (self.mutation_mutex) |mutex| platform_sync.lockYielding(mutex);
+        defer if (self.mutation_mutex) |mutex| mutex.unlock();
         const key = try makeSessionLeaseKey(self.alloc, txn_id);
         defer self.alloc.free(key);
         var lease = switch (self.backend) {
@@ -1695,6 +2159,8 @@ pub const SessionLeaseStore = struct {
     }
 
     pub fn release(self: *const SessionLeaseStore, txn_id: db_mod.types.TxnId, owner_node_id: u64) !bool {
+        if (self.mutation_mutex) |mutex| platform_sync.lockYielding(mutex);
+        defer if (self.mutation_mutex) |mutex| mutex.unlock();
         const key = try makeSessionLeaseKey(self.alloc, txn_id);
         defer self.alloc.free(key);
         var lease = switch (self.backend) {
@@ -1707,6 +2173,20 @@ pub const SessionLeaseStore = struct {
         return try lease.release(owner_id);
     }
 };
+
+// Typed native rejection outcomes that public stable-COMMIT already reports
+// as safe failures. Never infer abort from transport, cancellation, allocation,
+// propagation or generic execution errors.
+pub const CommitRejection = enum { none, fresh, ambiguous };
+
+pub fn classifyCommitRejection(before_dispatch: SessionInfo, err: anyerror) CommitRejection {
+    const rejected = switch (err) {
+        error.TransactionTooLarge, error.InvalidBatchRequest, error.InvalidArgument, error.InvalidGraphEdges, error.UnsupportedTransformOperation, error.TopologyChanged, error.DecisionConflict, error.DocIdentityNamespaceMismatch, error.UnsupportedOperation, error.TableNotFound, error.UnknownGroup => true,
+        else => false,
+    };
+    if (!rejected) return .none;
+    return if (before_dispatch.commit_execution_started) .ambiguous else .fresh;
+}
 
 pub const SessionRegistry = struct {
     const session_lock_count = 64;
@@ -1842,6 +2322,14 @@ pub const SessionRegistry = struct {
         connection_id: ?[32]u8,
         txn_id: db_mod.types.TxnId,
     ) !SessionInfo {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        if (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) |existing| {
+            var duplicate = existing;
+            duplicate.deinit(alloc);
+            return error.CypherWriteRequestAlreadyUsed;
+        }
         const now = nextTxnTimestamp();
         var session: Session = .{
             .txn_id = txn_id,
@@ -1914,6 +2402,13 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
 
+        if (self.durableMissIsAuthoritative()) {
+            const durable = self.durable.?;
+            var current = (try durable.load(txn_id)) orelse return .missing;
+            defer current.deinit(durable.alloc);
+            return if (principalsEqual(current.principal, principal)) .allowed else .denied;
+        }
+
         self.mutex.lock();
         if (self.sessions.getPtr(txn_id)) |session| {
             const allowed = principalsEqual(session.principal, principal);
@@ -1932,6 +2427,12 @@ pub const SessionRegistry = struct {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
+        if (self.durableMissIsAuthoritative()) {
+            const durable = self.durable.?;
+            var current = (durable.load(txn_id) catch return null) orelse return null;
+            defer current.deinit(durable.alloc);
+            return current.info();
+        }
         self.mutex.lock();
         if (self.sessions.getPtr(txn_id)) |existing| {
             const info = existing.info();
@@ -2153,6 +2654,7 @@ pub const SessionRegistry = struct {
             try appendBatchWrites(alloc, &replacement, writes.items);
             try appendBatchDeletes(alloc, &replacement, deletes.items);
             syncBatchReq(&replacement);
+            replacement.req.commit_requires = target.batch.req.commit_requires;
             target.batch.deinit(alloc);
             target.batch = replacement;
         }
@@ -2193,7 +2695,7 @@ pub const SessionRegistry = struct {
         if (candidate.sql) |metadata| {
             if (metadata.failed) return error.SqlTransactionAborted;
             if (metadata.mode == .read_only) for (req.tables) |table| {
-                if (table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0) return error.SqlReadOnlyTransaction;
+                if (table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0 or table.batch.graph_writes.len != 0 or table.batch.graph_deletes.len != 0) return error.SqlReadOnlyTransaction;
             };
         }
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
@@ -2330,7 +2832,7 @@ pub const SessionRegistry = struct {
         if (candidate.sql) |metadata| {
             if (metadata.failed) return error.SqlTransactionAborted;
             if (metadata.mode == .read_only and extra_req != null) for (extra_req.?.tables) |table| {
-                if (table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0) return error.SqlReadOnlyTransaction;
+                if (table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0 or table.batch.graph_writes.len != 0 or table.batch.graph_deletes.len != 0) return error.SqlReadOnlyTransaction;
             };
         }
         const body_digest = try commitBodyDigest(alloc, extra_req);
@@ -3040,6 +3542,12 @@ pub const SessionRegistry = struct {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
+        if (self.durableMissIsAuthoritative()) {
+            const durable = self.durable.?;
+            var current = (try durable.load(txn_id)) orelse return null;
+            defer current.deinit(durable.alloc);
+            return current.owner_node_id;
+        }
         self.mutex.lock();
         if (self.sessions.getPtr(txn_id)) |session| {
             const owner_node_id = session.owner_node_id;
@@ -3137,6 +3645,8 @@ pub const SessionRegistry = struct {
 
         var removed_count: usize = 0;
         for (expired_ids.items) |txn_id| {
+            const execution = self.tryAcquireCommitExecution(txn_id) orelse continue;
+            defer execution.release();
             const session_lock = self.sessionLock(txn_id);
             session_lock.lock();
             defer session_lock.unlock();
@@ -3148,6 +3658,7 @@ pub const SessionRegistry = struct {
             // would turn an uncertain connection into unrecoverable quota
             // debt. Keep both active and terminal records while referenced.
             if (try self.connectionReferencesTxn(alloc, current)) continue;
+            if (current.commit_execution_started and !sessionCompletionSettled(current)) continue;
             if (current.terminal_commit) |terminal| {
                 if (terminal.coordinator_group_id != null and !terminal.coordinator_acknowledged) continue;
             }
@@ -3338,6 +3849,34 @@ pub const SessionRegistry = struct {
     /// The caller holds the txn stripe. Durable reads happen without the global
     /// registry mutex; publication is a short double-checked map operation.
     fn loadSessionCloneAssumeStripe(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?Session {
+        if (self.durableMissIsAuthoritative()) {
+            const durable = self.durable.?;
+            var loaded = (try durable.load(txn_id)) orelse {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                if (self.sessions.fetchRemove(txn_id)) |old| {
+                    var value = old.value;
+                    value.deinit(alloc);
+                }
+                return null;
+            };
+            defer loaded.deinit(durable.alloc);
+            var cloned = try loaded.clone(alloc);
+            errdefer cloned.deinit(alloc);
+            var cached = try loaded.clone(alloc);
+            var cached_owned = true;
+            defer if (cached_owned) cached.deinit(alloc);
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            try self.sessions.ensureUnusedCapacity(alloc, 1);
+            if (self.sessions.fetchRemove(txn_id)) |old| {
+                var value = old.value;
+                value.deinit(alloc);
+            }
+            self.sessions.putAssumeCapacity(txn_id, cached);
+            cached_owned = false;
+            return cloned;
+        }
         self.mutex.lock();
         if (self.sessions.getPtr(txn_id)) |session| {
             const cloned = session.clone(alloc) catch |err| {
@@ -3850,7 +4389,8 @@ pub fn parseMultiBatchRequest(alloc: std.mem.Allocator, body: []const u8) !Owned
     var fields = root.iterator();
     while (fields.next()) |field| {
         if (!std.mem.eql(u8, field.key_ptr.*, "tables") and
-            !std.mem.eql(u8, field.key_ptr.*, "sync_level"))
+            !std.mem.eql(u8, field.key_ptr.*, "sync_level") and
+            !std.mem.eql(u8, field.key_ptr.*, "commit_requires"))
         {
             return error.InvalidTransactionCommitRequest;
         }
@@ -3859,6 +4399,9 @@ pub fn parseMultiBatchRequest(alloc: std.mem.Allocator, body: []const u8) !Owned
     var req: OwnedTransactionCommitRequest = .{};
     errdefer req.deinit(alloc);
     req.tables = try parseTables(alloc, root.get("tables") orelse return error.InvalidTransactionCommitRequest);
+    const requirement = if (root.get("commit_requires")) |value| try db_mod.types.parseCommitRequires(value) else null;
+    req.commit_requires = requirement;
+    req.retainCommitRequires();
     if (req.tables.len == 0) return error.InvalidTransactionCommitRequest;
     if (root.get("sync_level")) |sync_level_value| {
         req.sync_level = parseSyncLevel(sync_level_value) orelse return error.InvalidTransactionCommitRequest;
@@ -3870,7 +4413,7 @@ pub fn parseMultiBatchRequest(alloc: std.mem.Allocator, body: []const u8) !Owned
         }
     }
     var operation_count: usize = 0;
-    for (req.tables) |table| operation_count += table.batch.writes.len + table.batch.deletes.len + table.batch.transforms.len;
+    for (req.tables) |table| operation_count += table.batch.writes.len + table.batch.deletes.len + table.batch.transforms.len + table.batch.graph_writes.len + table.batch.graph_deletes.len;
     if (operation_count == 0) return error.InvalidTransactionCommitRequest;
     return req;
 }
@@ -3881,6 +4424,10 @@ pub fn encodeCommitRequest(alloc: std.mem.Allocator, req: OwnedTransactionCommit
 fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommitRequest, trusted: bool) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
+    const versioned = trusted and (req.commit_requires != null or for (req.tables) |table| {
+        if (table.commit_requires_floor != null or table.batch.req.commit_requires != null) break true;
+    } else false);
+    if (versioned) try out.appendSlice(alloc, "[\"commit-requirements-request-v1\",");
     try out.appendSlice(alloc, "{\"read_set\":[");
     for (req.read_set, 0..) |item, i| {
         if (i > 0) try out.append(alloc, ',');
@@ -3899,13 +4446,30 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
         if (i > 0) try out.append(alloc, ',');
         try appendJsonString(alloc, &out, table.table_name);
         try out.append(alloc, ':');
-        const batch_json = try encodeTableBatchRequest(alloc, table);
+        var encoded_table = table;
+        // Public round trips retain an irrevocable direct floor. Trusted
+        // persistence stores provenance separately instead of flattening it.
+        if (!trusted and table.commit_requires_floor == .direct_enrichments)
+            encoded_table.batch.req.commit_requires = .direct_enrichments;
+        const batch_json = try encodeTableBatchRequest(alloc, encoded_table);
         defer alloc.free(batch_json);
         try out.appendSlice(alloc, batch_json);
     }
     try out.append(alloc, '}');
+    if (req.commit_requires) |requirement| try out.print(alloc, ",\"commit_requires\":\"{s}\"", .{@tagName(requirement)});
     try out.appendSlice(alloc, ",\"sync_level\":");
     try appendJsonString(alloc, &out, syncLevelText(req.sync_level));
+    if (versioned) {
+        try out.appendSlice(alloc, ",\"commit_requires_floors\":{");
+        var first_floor = true;
+        for (req.tables) |table| if (table.commit_requires_floor) |requirement| {
+            if (!first_floor) try out.append(alloc, ',');
+            first_floor = false;
+            try appendJsonString(alloc, &out, table.table_name);
+            try out.print(alloc, ":\"{s}\"", .{@tagName(requirement)});
+        };
+        try out.append(alloc, '}');
+    }
     if (trusted and req.constraint_timing.items.len != 0) {
         try out.appendSlice(alloc, ",\"constraint_timing\":");
         const timing = try std.json.Stringify.valueAlloc(alloc, req.constraint_timing.items, .{});
@@ -4007,6 +4571,7 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
         try out.append(alloc, '}');
     }
     try out.append(alloc, '}');
+    if (versioned) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -4168,9 +4733,29 @@ fn parseReadSet(alloc: std.mem.Allocator, value: std.json.Value) ![]TransactionR
     return out;
 }
 
-fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedTransactionCommitRequest {
+fn parseStoredCommitValue(alloc: std.mem.Allocator, encoded: std.json.Value) !OwnedTransactionCommitRequest {
+    const value = if (encoded == .array) blk: {
+        const fields = encoded.array.items;
+        if (fields.len != 2 or fields[0] != .string or !std.mem.eql(u8, fields[0].string, "commit-requirements-request-v1") or fields[1] != .object)
+            return error.InvalidTransactionSessionRecord;
+        break :blk fields[1];
+    } else encoded;
+    if (encoded == .array and !value.object.contains("commit_requires_floors")) return error.InvalidTransactionSessionRecord;
     var request = try parseCommitValue(alloc, value);
     errdefer request.deinit(alloc);
+    if (value.object.get("commit_requires_floors")) |floors| {
+        if (floors != .object) return error.InvalidTransactionSessionRecord;
+        var entries = floors.object.iterator();
+        while (entries.next()) |entry| {
+            const table = for (request.tables) |*table| {
+                if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
+            } else return error.InvalidTransactionSessionRecord;
+            const floor = (try db_mod.types.parseCommitRequires(entry.value_ptr.*)) orelse return error.InvalidTransactionSessionRecord;
+            if (table.batch.req.commit_requires == .direct_enrichments and floor != .direct_enrichments)
+                return error.InvalidTransactionSessionRecord;
+            table.commit_requires_floor = floor;
+        }
+    }
     if (value.object.get("constraint_timing")) |timing| {
         if (timing != .array or timing.array.items.len > 4096) return error.InvalidTransactionSessionRecord;
         var parsed = try std.json.parseFromValue([]const @import("antfly_local_sources").storage_relational_index.ConstraintTiming, alloc, timing, .{});
@@ -4291,6 +4876,8 @@ fn parseCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedTrans
         else => return error.InvalidTransactionCommitRequest,
     };
 
+    const default_requirement = if (root.get("commit_requires")) |requirement_value| try db_mod.types.parseCommitRequires(requirement_value) else null;
+
     var req: OwnedTransactionCommitRequest = .{};
     errdefer req.deinit(alloc);
 
@@ -4299,6 +4886,8 @@ fn parseCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedTrans
 
     const tables_value = root.get("tables") orelse return error.InvalidTransactionCommitRequest;
     req.tables = try parseTables(alloc, tables_value);
+    req.commit_requires = default_requirement;
+    req.retainCommitRequires();
 
     if (root.get("sync_level")) |sync_level_value| {
         req.sync_level = parseSyncLevel(sync_level_value) orelse return error.InvalidTransactionCommitRequest;
@@ -4360,6 +4949,7 @@ fn encodeTableBatchRequest(alloc: std.mem.Allocator, table: TableCommitRequest) 
     }
     if (table.batch.transforms.len > 0) {
         if (!first) try out.append(alloc, ',');
+        first = false;
         try out.appendSlice(alloc, "\"transforms\":[");
         for (table.batch.transforms, 0..) |transform, i| {
             if (i > 0) try out.append(alloc, ',');
@@ -4383,6 +4973,40 @@ fn encodeTableBatchRequest(alloc: std.mem.Allocator, table: TableCommitRequest) 
             try out.append(alloc, '}');
         }
         try out.append(alloc, ']');
+    }
+    inline for (.{ "graph_writes", "graph_deletes" }) |field| {
+        const effects = @field(table.batch, field);
+        if (effects.len != 0) {
+            if (!first) try out.append(alloc, ',');
+            first = false;
+            try appendJsonString(alloc, &out, field);
+            try out.append(alloc, ':');
+            const Wire = struct {
+                items: @TypeOf(effects),
+                pub fn jsonStringify(self: @This(), stream: anytype) !void {
+                    try stream.beginArray();
+                    for (self.items) |edge| {
+                        try stream.beginObject();
+                        inline for (@typeInfo(@TypeOf(edge)).@"struct".field_names) |name| {
+                            const omitted = if (comptime std.mem.eql(u8, name, "edge_id") or std.mem.eql(u8, name, "owner_document") or std.mem.eql(u8, name, "owner")) @field(edge, name).len == 0 else false;
+                            if (!omitted) {
+                                try stream.objectField(name);
+                                try stream.write(@field(edge, name));
+                            }
+                        }
+                        try stream.endObject();
+                    }
+                    try stream.endArray();
+                }
+            };
+            const encoded = try std.json.Stringify.valueAlloc(alloc, Wire{ .items = effects }, .{});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        }
+    }
+    if (table.batch.req.commit_requires) |requirement| {
+        if (!first) try out.append(alloc, ',');
+        try out.print(alloc, "\"commit_requires\":\"{s}\"", .{@tagName(requirement)});
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
@@ -4499,19 +5123,28 @@ fn participantPhaseText(phase: distributed_txn.ParticipantPhase) []const u8 {
 
 fn cloneBatchRequest(alloc: std.mem.Allocator, batch: batch_api.OwnedBatchRequest) !batch_api.OwnedBatchRequest {
     var out: batch_api.OwnedBatchRequest = .{};
+    out.req.commit_requires = batch.req.commit_requires;
+    out.req.sync_level = batch.req.sync_level;
     errdefer out.deinit(alloc);
     try appendBatchWrites(alloc, &out, batch.writes);
     try appendBatchDeletes(alloc, &out, batch.deletes);
     try appendBatchTransforms(alloc, &out, batch.transforms);
+    try @import("transaction_graph_effects.zig").merge(alloc, &out, batch.graph_writes, batch.graph_deletes);
     syncBatchReq(&out);
     return out;
 }
 
 fn syncBatchReq(batch: *batch_api.OwnedBatchRequest) void {
+    const requirement = batch.req.commit_requires;
+    const sync_level = batch.req.sync_level;
     batch.req = .{
+        .commit_requires = requirement,
+        .sync_level = sync_level,
         .writes = batch.writes,
         .deletes = batch.deletes,
         .transforms = batch.transforms,
+        .graph_writes = batch.graph_writes,
+        .graph_deletes = batch.graph_deletes,
     };
 }
 
@@ -4931,9 +5564,9 @@ pub fn isEmptySessionCommitBody(body: []const u8) bool {
 }
 
 fn parseTableBatch(alloc: std.mem.Allocator, value: std.json.Value) !batch_api.OwnedBatchRequest {
-    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(encoded);
-    return try batch_api.parseBatchRequest(alloc, encoded);
+    var owned = try batch_api.public_codec.parseBatchValue(alloc, value);
+    errdefer owned.deinit(alloc);
+    return batch_api.takePublic(&owned);
 }
 
 fn applyReadSetPredicates(alloc: std.mem.Allocator, req: *OwnedTransactionCommitRequest) !void {
@@ -5636,6 +6269,17 @@ test "multi batch parser accepts the public batch envelope without a read set" {
     try std.testing.expectEqual(@as(usize, 1), req.tables[0].batch.writes.len);
     try std.testing.expectEqualStrings("audit", req.tables[1].table_name);
     try std.testing.expectEqual(@as(usize, 1), req.tables[1].batch.deletes.len);
+}
+
+test "multi batch commit requirements survive transaction planning" {
+    const a = std.testing.allocator;
+    var gated = try parseMultiBatchRequest(a, "{\"tables\":{\"docs\":{\"inserts\":{\"a\":{}},\"commit_requires\":\"direct_enrichments\"}}}");
+    defer gated.deinit(a);
+    var distributed = try gated.distributedTables(a);
+    defer distributed.deinit();
+    try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, distributed.tables[0].commit_requires.?);
+    var no_gate = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"commit_requires\":\"none\"}}}");
+    defer no_gate.deinit(a);
 }
 
 test "multi batch parser derives strongest per-table sync level" {
@@ -7426,4 +8070,392 @@ test "lake SQL session cuts survive savepoint rollback and durable record recove
     var recovered = (try cloneReadSnapshotForKey(a, &restored.lake_cuts, "events", "accepted")).?;
     defer recovered.deinit(a);
     try std.testing.expectEqualStrings(held.document_json.?, recovered.document_json.?);
+}
+
+test "transaction graph effects preserve clone merge and durable encoding" {
+    const a = std.testing.allocator;
+    var original = try parseCommitRequest(a,
+        \\{"read_set":[],"tables":{"docs":{"graph_writes":[{"index_name":"g","source":"a","target":"b","edge_type":"R","edge_id":"edge-1","metadata_json":"{\"value\":9223372036854775807}"}]}}}
+    );
+    defer original.deinit(a);
+    var copy = try original.clone(a);
+    defer copy.deinit(a);
+    const tables = try copy.distributedTables(a);
+    defer tables.deinit();
+    try std.testing.expectEqual(@as(usize, 1), tables.tables[0].graph_writes.len);
+    const encoded = try encodeCommitRequest(a, copy);
+    defer a.free(encoded);
+    var restored = try parseCommitRequest(a, encoded);
+    defer restored.deinit(a);
+    try std.testing.expectEqualStrings("{\"value\":9223372036854775807}", restored.tables[0].batch.graph_writes[0].metadata_json);
+    var deleting = try parseCommitRequest(a,
+        \\{"read_set":[],"tables":{"docs":{"graph_deletes":[{"index_name":"g","source":"a","target":"b","edge_type":"R","edge_id":"edge-1"}]}}}
+    );
+    defer deleting.deinit(a);
+    try restored.mergeFrom(a, &deleting);
+    try std.testing.expectEqual(@as(usize, 0), restored.tables[0].batch.graph_writes.len);
+    try std.testing.expectEqual(@as(usize, 1), restored.tables[0].batch.graph_deletes.len);
+}
+
+test "transaction graph effects client IDs never overwrite an admitted principal" {
+    const a = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(a);
+    const id: db_mod.types.TxnId = @splat(7);
+    _ = try registry.beginForPrincipalWithSettingsAndId(a, .{}, 17, "user:a", &.{}, null, id);
+    try std.testing.expectError(error.CypherWriteRequestAlreadyUsed, registry.beginForPrincipalWithSettingsAndId(a, .{}, 42, "user:b", &.{}, null, id));
+    try std.testing.expectEqual(@as(u64, 17), registry.sessions.get(id).?.owner_node_id);
+    try std.testing.expectEqual(SessionRegistry.PrincipalAccess.allowed, try registry.principalAccess(a, id, "user:a"));
+    try std.testing.expectEqual(SessionRegistry.PrincipalAccess.denied, try registry.principalAccess(a, id, "user:b"));
+}
+
+fn sessionCompletionSettled(session: Session) bool {
+    if (session.terminal_abort) return true;
+    const terminal = session.terminal_commit orelse return false;
+    return terminal.status == .committed and !terminal.repair_required;
+}
+fn makeSessionCompletionKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) ![]u8 {
+    const encoded = std.fmt.bytesToHex(txn_id, .lower);
+    return std.fmt.allocPrint(alloc, "\x00\x00__api_txn_completion__:{s}", .{&encoded});
+}
+
+fn completionDirectoryKey(alloc: std.mem.Allocator, id: db_mod.types.TxnId) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__api_completion_consumers__:{s}", .{&std.fmt.bytesToHex(id, .lower)});
+}
+fn completionReferenceKey(alloc: std.mem.Allocator, id: db_mod.types.TxnId, reference: [16]u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__api_completion_reference__:{s}:{s}", .{ &std.fmt.bytesToHex(id, .lower), &std.fmt.bytesToHex(reference, .lower) });
+}
+
+test "durable session mutations publish only after persistence succeeds: concurrent completion consumers and retirement checkpoints" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "system/concurrent-completion-consumers" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(a, &store);
+    var registry = SessionRegistry.init(&durable);
+    defer registry.deinit(a);
+    const session = try registry.begin(a, .{ .sync_level = .write }, 0);
+    var request = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{\"value\":1}}}}}");
+    defer request.deinit(a);
+    var sealed = (try registry.cloneCommitRequest(a, session.txn_id, &request)).?;
+    sealed.deinit(a);
+    _ = (try registry.markCommitExecutionStarted(a, session.txn_id)).?;
+    const Job = struct {
+        fn run(storage: *DurableSessionStore, id: [16]u8, start: u8) !void {
+            for (0..16) |offset| try storage.pinCompletion(id, @splat(start + @as(u8, @intCast(offset))));
+        }
+        fn finish(sessions: *SessionRegistry, id: [16]u8) !void {
+            _ = try sessions.recordTerminalAbort(std.testing.allocator, id);
+        }
+    };
+    var one = try std.testing.io.concurrent(Job.run, .{ &durable, session.txn_id, @as(u8, 1) });
+    var two = try std.testing.io.concurrent(Job.run, .{ &durable, session.txn_id, @as(u8, 33) });
+    var terminal = try std.testing.io.concurrent(Job.finish, .{ &registry, session.txn_id });
+    try one.await(std.testing.io);
+    try two.await(std.testing.io);
+    try terminal.await(std.testing.io);
+    _ = try registry.cleanupExpired(a, std.math.maxInt(u64));
+    for ([_]u8{ 1, 33 }) |start| for (0..16) |offset| {
+        const reference: [16]u8 = @splat(start + @as(u8, @intCast(offset)));
+        try std.testing.expect(try durable.completionReferenceSettled(session.txn_id, reference));
+        try std.testing.expect(try durable.acknowledgeCompletion(session.txn_id, reference));
+    };
+}
+
+test "durable session mutations publish only after persistence succeeds: durable registration outbox and bounded retirement" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "system/completion-registration-outbox" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(a, &store);
+    var registry = SessionRegistry.init(&durable);
+    defer registry.deinit(a);
+    const session = try registry.begin(a, .{ .sync_level = .write }, 0);
+    const id = std.fmt.bytesToHex(session.txn_id, .lower);
+    const first = try durable.createRegistration(@splat(3), .{ .transaction_id = &id });
+    const second = try durable.createRegistration(@splat(9), .{ .transaction_id = &id });
+    try std.testing.expectEqualSlices(u8, first[0..8], second[0..8]);
+    _ = try durable.managedCompletion(session.txn_id, first, false, 0);
+    _ = try durable.managedCompletion(session.txn_id, second, false, 0);
+    try std.testing.expect(try durable.managedCompletion(session.txn_id, second, true, 0));
+    try durable.removeRegistration(second);
+    try std.testing.expectEqual(@as(u64, 0), try durable.registrationFloor());
+    try std.testing.expectError(error.CompletionAcknowledged, durable.managedCompletion(session.txn_id, second, false, 0));
+    try std.testing.expect(try durable.managedCompletion(session.txn_id, first, true, 0));
+    try durable.removeRegistration(first);
+    try std.testing.expectEqual(@as(u64, 2), try durable.registrationFloor());
+    // Re-open the producer facade: sequence and pending state are durable.
+    var restarted = DurableSessionStore.initRuntime(a, &store);
+    const third = try restarted.createRegistration(@splat(7), .{ .transaction_id = &id });
+    try std.testing.expectEqual(@as(u64, 3), @import("completion_retirement.zig").sequence(third));
+    _ = try restarted.managedCompletion(session.txn_id, third, false, try restarted.registrationFloor());
+    // Retired markers have been collected, but stale registrations stay rejected.
+    try std.testing.expectError(error.CompletionAcknowledged, restarted.managedCompletion(session.txn_id, first, false, 0));
+    try std.testing.expectError(error.CompletionAcknowledged, restarted.managedCompletion(session.txn_id, second, false, 0));
+    var pending = (try restarted.loadRegistration(a, third)).?;
+    defer pending.deinit();
+    try std.testing.expectEqualStrings(&id, pending.value.outcome.transaction_id.?);
+    try std.testing.expect(pending.value.phase == .registering);
+}
+
+test "SQL pgwire native commit rejection requires a fresh execution" {
+    const fresh: SessionInfo = .{ .txn_id = @splat(1), .begin_timestamp = 1, .sync_level = .write };
+    var replay = fresh;
+    replay.commit_execution_started = true;
+    for ([_]anyerror{ error.TableNotFound, error.TopologyChanged, error.TransactionTooLarge, error.UnknownGroup }) |err| {
+        try std.testing.expectEqual(CommitRejection.fresh, classifyCommitRejection(fresh, err));
+        try std.testing.expectEqual(CommitRejection.ambiguous, classifyCommitRejection(replay, err));
+    }
+    try std.testing.expectEqual(CommitRejection.none, classifyCommitRejection(fresh, error.CommitDecisionUnknown));
+    const session: Session = .{ .txn_id = @splat(1), .owner_node_id = 0, .begin_timestamp = 1, .last_touched_timestamp = 1, .sync_level = .write, .commit_execution_started = true };
+    try std.testing.expect(session.info().commit_execution_started);
+}
+
+test "durable session mutations publish only after persistence succeeds: shared runtime facades retain both consumers after terminal cleanup" {
+    const regression_allocator = std.testing.allocator;
+    const FixtureRun = struct {
+        fn run(a: std.mem.Allocator, memory: bool, configured_gate: bool, document_facades: bool) !void {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/shared-runtime-review", .{tmp.sub_path});
+            defer a.free(path);
+            var mem = mem_backend.Backend.init(a, .{});
+            defer mem.close();
+            var lsm = if (!memory) try @import("antfly_local_sources").storage_lsm_backend.Backend.open(a, path, .{}) else null;
+            defer if (lsm) |*backend| backend.close();
+            var runtime = if (lsm) |*backend| try backend.runtimeStore(a, .{ .name = "system/shared-completion" }) else try mem.runtimeStore(a, .{ .name = "system/shared-completion" });
+            var second_runtime = if (lsm) |*backend| try backend.runtimeStore(a, .{ .name = "system/shared-completion" }) else try mem.runtimeStore(a, .{ .name = "system/shared-completion" });
+            defer second_runtime.deinit();
+            if (configured_gate) second_runtime.write_gate = second_runtime.writeSerialization().gate;
+            // An erased wrapper must preserve whether its underlying callbacks already
+            // hold the gate; acquiring that gate twice would deadlock this case.
+            var wrapped_runtime = try backend_erased.storeFrom(a, second_runtime);
+            defer wrapped_runtime.deinit();
+            defer runtime.deinit();
+            var original_docs = if (document_facades) try docstore_mod.DocStore.openRuntime(a, &runtime) else null;
+            defer if (original_docs) |*docs| docs.close();
+            var original = if (original_docs) |*docs| DurableSessionStore.init(a, docs) else DurableSessionStore.initRuntime(a, &runtime);
+            var registry = SessionRegistry.init(&original);
+            defer registry.deinit(a);
+            const session = try registry.begin(a, .{}, 1);
+            var request = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{\"n\":1}}}}}");
+            defer request.deinit(a);
+            var staged = (try registry.cloneCommitRequest(a, session.txn_id, &request)).?;
+            staged.deinit(a);
+            _ = (try registry.markCommitExecutionStarted(a, session.txn_id)).?;
+            const Fixture = struct {
+                store: *backend_erased.Store,
+                first_read: std.Io.Event = .unset,
+                release_first: std.Io.Event = .unset,
+                second_started: std.Io.Event = .unset,
+                second_done: std.Io.Event = .unset,
+                const Outer = @This();
+                const Wrapped = struct {
+                    original: backend_erased.WriteTxn,
+                    fixture: *Outer,
+                    fn get(ptr: *anyopaque, key: []const u8) ![]const u8 {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        const result = self.original.get(key);
+                        if (std.mem.indexOf(u8, key, "\x00\x00__api_completion_consumers__:") != null) {
+                            self.fixture.first_read.set(std.testing.io);
+                            self.fixture.release_first.waitUncancelable(std.testing.io);
+                        }
+                        return result;
+                    }
+                    fn openCursor(_: std.mem.Allocator, ptr: *anyopaque) !backend_erased.Cursor {
+                        return @as(*@This(), @ptrCast(@alignCast(ptr))).original.openCursor();
+                    }
+                    fn put(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
+                        return @as(*@This(), @ptrCast(@alignCast(ptr))).original.put(key, value);
+                    }
+                    fn delete(ptr: *anyopaque, key: []const u8) !void {
+                        return @as(*@This(), @ptrCast(@alignCast(ptr))).original.delete(key);
+                    }
+                    fn commit(alloc: std.mem.Allocator, ptr: *anyopaque) !void {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        try self.original.commit();
+                        alloc.destroy(self);
+                    }
+                    fn abort(alloc: std.mem.Allocator, ptr: *anyopaque) void {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        self.original.abort();
+                        alloc.destroy(self);
+                    }
+                };
+                fn beginWrite(alloc: std.mem.Allocator, ptr: *anyopaque) !backend_erased.WriteTxn {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    const wrapped = try alloc.create(Wrapped);
+                    errdefer alloc.destroy(wrapped);
+                    wrapped.* = .{ .original = try self.store.beginWrite(), .fixture = self };
+                    return .{ .allocator = alloc, .ptr = wrapped, .vtable = &.{ .get = Wrapped.get, .put = Wrapped.put, .delete = Wrapped.delete, .commit = Wrapped.commit, .abort = Wrapped.abort, .open_cursor = Wrapped.openCursor } };
+                }
+                fn pin(store: *DurableSessionStore, id: [16]u8, reference: [16]u8, fctx: ?*@This()) !void {
+                    if (fctx) |f| f.second_started.set(std.testing.io);
+                    defer if (fctx) |f| f.second_done.set(std.testing.io);
+                    try store.pinCompletion(id, reference);
+                }
+            };
+            var fixture: Fixture = .{ .store = &runtime };
+            var vtable = runtime.vtable.*;
+            vtable.begin_write = Fixture.beginWrite;
+            var intercepted = runtime;
+            intercepted.ptr = &fixture;
+            intercepted.vtable = &vtable;
+            var first_docs = if (document_facades) try docstore_mod.DocStore.openRuntime(a, &intercepted) else null;
+            defer if (first_docs) |*docs| docs.close();
+            var second_docs = if (document_facades) try docstore_mod.DocStore.openRuntime(a, &wrapped_runtime) else null;
+            defer if (second_docs) |*docs| docs.close();
+            // Cross the document adapter and erasure boundary for the second
+            // facade, so coordination must survive every wrapper in the stack.
+            var erased_docs = if (second_docs) |*docs| try backend_erased.storeFrom(a, docs.backendStore()) else null;
+            defer if (erased_docs) |*store| store.deinit();
+            var first = if (first_docs) |*docs| DurableSessionStore.init(a, docs) else DurableSessionStore.initRuntime(a, &intercepted);
+            var second = if (erased_docs) |*store| DurableSessionStore.initRuntime(a, store) else DurableSessionStore.initRuntime(a, &wrapped_runtime);
+            try first.bindRegistrationIssuer(1);
+            try second.bindRegistrationIssuer(2);
+            const ref_a: [16]u8 = @splat(0x41);
+            const ref_b: [16]u8 = @splat(0x42);
+            var one = try std.testing.io.concurrent(Fixture.pin, .{ &first, session.txn_id, ref_a, @as(?*Fixture, null) });
+            defer {
+                fixture.release_first.set(std.testing.io);
+                one.cancel(std.testing.io) catch {};
+            }
+            fixture.first_read.waitUncancelable(std.testing.io);
+            var two = try std.testing.io.concurrent(Fixture.pin, .{ &second, session.txn_id, ref_b, @as(?*Fixture, &fixture) });
+            defer two.cancel(std.testing.io) catch {};
+            fixture.second_started.waitUncancelable(std.testing.io);
+            std.testing.io.sleep(.fromMilliseconds(50), .awake) catch {};
+            const escaped = fixture.second_done.isSet();
+            fixture.release_first.set(std.testing.io);
+            try one.await(std.testing.io);
+            try two.await(std.testing.io);
+            try std.testing.expect(!escaped);
+            _ = (try registry.recordTerminalAbort(a, session.txn_id)).?;
+            _ = try registry.cleanupExpired(a, std.math.maxInt(u64));
+            const settled_a = try original.completionReferenceSettled(session.txn_id, ref_a);
+            const settled_b = try original.completionReferenceSettled(session.txn_id, ref_b);
+            try std.testing.expect((try original.load(session.txn_id)) == null);
+            try std.testing.expect(settled_a and settled_b);
+            try std.testing.expect(try original.acknowledgeCompletion(session.txn_id, ref_a));
+            try std.testing.expect(try original.acknowledgeCompletion(session.txn_id, ref_b));
+        }
+    };
+    for ([_]bool{ false, true }) |document_facades| {
+        try FixtureRun.run(regression_allocator, true, false, document_facades);
+        try FixtureRun.run(regression_allocator, false, false, document_facades);
+        try FixtureRun.run(regression_allocator, false, true, document_facades);
+    }
+}
+
+test "durable session mutations publish only after persistence succeeds: shared completion rejects uncoordinated runtime providers" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "system/uncoordinated" });
+    defer runtime.deinit();
+    runtime.write_serialization = .unsupported;
+    var durable = DurableSessionStore.initRuntime(a, &runtime);
+    try std.testing.expectError(error.CompletionOwnerUnavailable, durable.bindRegistrationIssuer(1));
+    // Custom intrinsically serializable providers can explicitly declare that
+    // contract, and callers can supply Store.write_gate for other providers.
+    runtime.write_serialization = .intrinsic;
+    try durable.bindRegistrationIssuer(1);
+}
+
+test "commit requirements survive transaction session cloning persistence and statement merging" {
+    const a = std.testing.allocator;
+    var request = try parseCommitRequest(a, "{\"read_set\":[],\"commit_requires\":\"direct_enrichments\",\"tables\":{\"docs\":{\"inserts\":{\"a\":{}}},\"audit\":{\"inserts\":{\"b\":{}},\"commit_requires\":\"none\"}}}");
+    defer request.deinit(a);
+    const encoded = try encodeCommitRequest(a, request);
+    defer a.free(encoded);
+    var recovered = try parseCommitRequest(a, encoded);
+    defer recovered.deinit(a);
+    var view = try recovered.distributedTables(a);
+    defer view.deinit();
+    for (view.tables) |table| try std.testing.expectEqual(if (std.mem.eql(u8, table.table_name, "docs")) db_mod.types.CommitRequires.direct_enrichments else .none, table.commit_requires.?);
+    try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, recovered.commit_requires.?);
+    for (view.tables) |table| try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, table.default_commit_requires.?);
+    var cloned = try recovered.clone(a);
+    defer cloned.deinit(a);
+    var weaker = try parseMultiBatchRequest(a, "{\"commit_requires\":\"none\",\"tables\":{\"later\":{\"inserts\":{\"c\":{}}}}}");
+    defer weaker.deinit(a);
+    try cloned.mergeFrom(a, &weaker);
+    try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, cloned.commit_requires.?);
+    const stored = try encodeCommitRequestMode(a, cloned, true);
+    defer a.free(stored);
+    var parsed_stored = try std.json.parseFromSlice(std.json.Value, a, stored, .{});
+    defer parsed_stored.deinit();
+    var restored = try parseStoredCommitValue(a, parsed_stored.value);
+    defer restored.deinit(a);
+    try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, restored.commit_requires.?);
+    var staged = try request.tables[0].clone(a);
+    defer staged.deinit(a);
+    var next = try parseMultiBatchRequest(a, "{\"commit_requires\":\"none\",\"tables\":{\"docs\":{\"inserts\":{\"c\":{}}}}}");
+    defer next.deinit(a);
+    try staged.mergeFrom(a, next.tables[0]);
+    try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, staged.commit_requires_floor.?);
+    try std.testing.expectEqual(@as(usize, 2), staged.batch.writes.len);
+    try cloned.mergeFrom(a, &next);
+    try SessionRegistry.normalizeSqlStage(undefined, a, &recovered, &cloned, &next);
+    for (cloned.tables) |table| if (std.mem.eql(u8, table.table_name, "docs")) {
+        try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, table.batch.req.commit_requires.?);
+        try std.testing.expectEqual(@as(usize, 2), table.batch.writes.len);
+    };
+}
+
+test "commit requirements inherited defaults strengthen without becoming explicit overrides" {
+    const a = std.testing.allocator;
+    var staged = try parseCommitRequest(a, "{\"read_set\":[],\"commit_requires\":\"none\",\"tables\":{\"docs\":{\"inserts\":{\"a\":{}}},\"audit\":{\"inserts\":{\"b\":{}},\"commit_requires\":\"none\"}}}");
+    defer staged.deinit(a);
+    var overridden = try staged.clone(a);
+    defer overridden.deinit(a);
+    var explicit_stage = try parseCommitRequest(a, "{\"read_set\":[],\"commit_requires\":\"direct_enrichments\",\"tables\":{\"docs\":{\"commit_requires\":\"none\"}}}");
+    defer explicit_stage.deinit(a);
+    try overridden.mergeFrom(a, &explicit_stage);
+    var overridden_view = try overridden.distributedTables(a);
+    defer overridden_view.deinit();
+    for (overridden_view.tables) |table| try std.testing.expectEqual(db_mod.types.CommitRequires.none, table.commit_requires.?);
+    // Exercise the exact representation persisted by a staged session.
+    const encoded = try encodeCommitRequestMode(a, staged, true);
+    defer a.free(encoded);
+    try std.testing.expectError(error.InvalidTransactionCommitRequest, parseCommitRequest(a, encoded));
+    var json = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+    defer json.deinit();
+    var restored = try parseStoredCommitValue(a, json.value);
+    defer restored.deinit(a);
+    var stronger = try parseCommitRequest(a, "{\"read_set\":[],\"commit_requires\":\"direct_enrichments\",\"tables\":{}}");
+    defer stronger.deinit(a);
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(a);
+    const info = try registry.begin(a, .{}, 1);
+    _ = (try registry.stage(a, info.txn_id, &staged)).?;
+    var commit = (try registry.cloneCommitRequest(a, info.txn_id, &stronger)).?;
+    defer commit.deinit(a);
+    const session_bytes = try encodeSessionRecord(a, registry.sessions.get(info.txn_id).?);
+    defer a.free(session_bytes);
+    var recovered_session = try decodeSessionRecord(a, info.txn_id, session_bytes);
+    defer recovered_session.deinit(a);
+    var session_view = try recovered_session.staged.?.distributedTables(a);
+    defer session_view.deinit();
+    for (session_view.tables) |table| try std.testing.expectEqual(if (std.mem.eql(u8, table.table_name, "docs")) db_mod.types.CommitRequires.direct_enrichments else .none, table.commit_requires.?);
+    try restored.mergeFrom(a, &stronger);
+    var view = try restored.distributedTables(a);
+    defer view.deinit();
+    for (view.tables) |table| try std.testing.expectEqual(if (std.mem.eql(u8, table.table_name, "docs")) db_mod.types.CommitRequires.direct_enrichments else .none, table.commit_requires.?);
+    // A later explicit none cannot weaken a direct prerequisite already
+    // selected for the retained source postimage.
+    var weaker = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"c\":{}},\"commit_requires\":\"none\"}}}");
+    defer weaker.deinit(a);
+    try restored.mergeFrom(a, &weaker);
+    const persisted = try encodeCommitRequestMode(a, restored, true);
+    defer a.free(persisted);
+    var persisted_json = try std.json.parseFromSlice(std.json.Value, a, persisted, .{});
+    defer persisted_json.deinit();
+    var final = try parseStoredCommitValue(a, persisted_json.value);
+    defer final.deinit(a);
+    var final_view = try final.distributedTables(a);
+    defer final_view.deinit();
+    for (final_view.tables) |table| try std.testing.expectEqual(if (std.mem.eql(u8, table.table_name, "docs")) db_mod.types.CommitRequires.direct_enrichments else .none, table.commit_requires.?);
 }

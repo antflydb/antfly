@@ -61,6 +61,8 @@ check_memory() {
 }
 
 check_sources() {
+  # Native source integration consumes the shared E2E executable in
+  # source-sdk-native. Keep this lane limited to portable Go checks.
   section "Checking portable source ingestion"
   (
     cd "$repo_root/go/pkg/sources"

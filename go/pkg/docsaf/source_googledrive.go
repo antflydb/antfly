@@ -186,6 +186,16 @@ func (s *GoogleDriveSource) BaseURL() string {
 // Traverse lists files in the Google Drive folder and yields content items
 // in lexicographic path order (depth-first, sorted by name within each folder).
 func (s *GoogleDriveSource) Traverse(ctx context.Context) (<-chan ContentItem, <-chan error) {
+	return s.traverse(ctx, false)
+}
+
+// List enumerates Drive metadata without downloading blobs or exporting
+// Workspace documents. MIME types describe the original provider object.
+func (s *GoogleDriveSource) List(ctx context.Context) (<-chan ContentItem, <-chan error) {
+	return s.traverse(ctx, true)
+}
+
+func (s *GoogleDriveSource) traverse(ctx context.Context, metadataOnly bool) (<-chan ContentItem, <-chan error) {
 	items := make(chan ContentItem)
 	errs := make(chan error, 1)
 
@@ -193,7 +203,7 @@ func (s *GoogleDriveSource) Traverse(ctx context.Context) (<-chan ContentItem, <
 		defer close(items)
 		defer close(errs)
 
-		if err := s.traverseFolder(ctx, s.config.FolderID, "", items); err != nil {
+		if err := s.traverseFolder(ctx, s.config.FolderID, "", items, metadataOnly); err != nil {
 			errs <- err
 		}
 	}()
@@ -215,7 +225,7 @@ type downloadResult struct {
 // traverseFolder recursively lists files in a folder and sends them to the items channel.
 // Files are emitted in name-sorted order within each folder (depth-first traversal).
 // Downloads happen concurrently for performance, but results are emitted in order.
-func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPrefix string, items chan<- ContentItem) error {
+func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPrefix string, items chan<- ContentItem, metadataOnly bool) error {
 	var pageToken string
 	for {
 		select {
@@ -270,10 +280,10 @@ func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPr
 			}
 
 			// Skip non-exportable Workspace types
-			if workspaceSkipTypes[file.MimeType] {
+			if !metadataOnly && workspaceSkipTypes[file.MimeType] {
 				continue
 			}
-			if strings.HasPrefix(file.MimeType, "application/vnd.google-apps.") {
+			if !metadataOnly && strings.HasPrefix(file.MimeType, "application/vnd.google-apps.") {
 				if _, ok := workspaceExportFormats[file.MimeType]; !ok {
 					continue
 				}
@@ -302,9 +312,33 @@ func (s *GoogleDriveSource) traverseFolder(ctx context.Context, folderID, pathPr
 				return ctx.Err()
 			default:
 			}
-			if err := s.traverseFolder(ctx, folder.file.Id, folder.relPath, items); err != nil {
+			if err := s.traverseFolder(ctx, folder.file.Id, folder.relPath, items, metadataOnly); err != nil {
 				return err
 			}
+		}
+
+		if metadataOnly {
+			for _, fe := range files {
+				f := fe.file
+				sourceURL := f.WebViewLink
+				if sourceURL == "" {
+					sourceURL = fmt.Sprintf("https://drive.google.com/file/d/%s/view", f.Id)
+				}
+				item := ContentItem{Path: fe.relPath, SourceURL: sourceURL, ContentType: f.MimeType,
+					Metadata: map[string]any{"source_type": "google_drive", "drive_file_id": f.Id,
+						"version": fmt.Sprint(f.Version), "mime_type": f.MimeType, "size": f.Size,
+						"md5_checksum": f.Md5Checksum, "modified_time": f.ModifiedTime}}
+				select {
+				case items <- item:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			pageToken = fileList.NextPageToken
+			if pageToken == "" {
+				break
+			}
+			continue
 		}
 
 		// Download files concurrently but emit in name-sorted order.

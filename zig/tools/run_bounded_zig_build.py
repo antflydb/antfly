@@ -163,6 +163,39 @@ def build_command(
     return command
 
 
+def execute_build(command: list[str], report: Path | None = None) -> int:
+    if report is None:
+        return subprocess.run(command, check=False).returncode
+    # Reuse the ownership audit's process-tree attribution and cgroup sampler.
+    # Progress is committed every 30s even if Actions ends the outer job before
+    # the compiler can print its final summary. Keep the existing two-hour cap.
+    from check_storage_compilation import measured_build, write_report
+
+    report.parent.mkdir(parents=True, exist_ok=True)
+
+    def progress(record):
+        write_report(report, [{"status": "running", **record}])
+
+    result, output, metrics = measured_build(
+        command,
+        Path.cwd(),
+        timeout_seconds=7200,
+        progress=progress,
+    )
+    write_report(
+        report,
+        [
+            {
+                "status": "completed" if result == 0 else "failed",
+                "returncode": result,
+                **metrics,
+            }
+        ],
+    )
+    print(output, end="", flush=True)
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zig", default="zig", help="Zig executable")
@@ -177,6 +210,11 @@ def main() -> int:
         help="cap the detected aggregate scheduler budget to this byte count",
     )
     parser.add_argument("build_arguments", nargs=argparse.REMAINDER)
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="persist process-tree CPU/RSS progress on POSIX hosts",
+    )
     args = parser.parse_args()
     if args.print_max_rss:
         if args.build_arguments:
@@ -198,20 +236,19 @@ def main() -> int:
     max_rss = detect_max_rss(args.max_rss_cap) if needs_budget else None
 
     if not needs_runner:
-        return subprocess.run(
-            build_command(args.zig, build_arguments, None, max_rss),
-            check=False,
-        ).returncode
+        return execute_build(
+            build_command(args.zig, build_arguments, None, max_rss), args.report
+        )
 
     with tempfile.TemporaryDirectory(prefix="antfly-zig-build-runner-") as temporary:
         patched_runner = prepare_build_runner(
             args.zig,
             Path(temporary) / "build_runner.zig",
         )
-        return subprocess.run(
+        return execute_build(
             build_command(args.zig, build_arguments, patched_runner, max_rss),
-            check=False,
-        ).returncode
+            args.report,
+        )
 
 
 if __name__ == "__main__":

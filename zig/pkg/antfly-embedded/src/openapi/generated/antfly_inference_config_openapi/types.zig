@@ -4,6 +4,7 @@
 const std = @import("std");
 const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
+const antfly_resources_openapi = @import("antfly_resources_openapi");
 const antfly_s3_openapi = @import("antfly_s3_openapi");
 const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
@@ -36,13 +37,60 @@ pub const A4bResidencyMode = enum {
     }
 };
 
-/// Process-local foreground request admission settings.
-pub const AdmissionConfig = struct {
-    inference: ?RequestAdmissionConfig = null,
+pub const AudioChunkConfig = antfly_chunking_api_openapi.InferenceAudioChunkConfig;
+
+pub const AudioReadCapabilities = struct {
+    forced_language: bool,
+    detected_language: bool,
+    timestamps: bool,
+    diarization: bool,
+    windowing: bool,
+    /// Maximum duration for this backend in milliseconds. Null means windowed recognition bounded by source and execution budgets.
+    max_duration_ms: OpenApiOptionalNullable(i64) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("forced_language");
+        try jw.write(self.forced_language);
+        try jw.objectField("detected_language");
+        try jw.write(self.detected_language);
+        try jw.objectField("timestamps");
+        try jw.write(self.timestamps);
+        try jw.objectField("diarization");
+        try jw.write(self.diarization);
+        try jw.objectField("windowing");
+        try jw.write(self.windowing);
+        switch (self.max_duration_ms) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max_duration_ms");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max_duration_ms");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// Recognition evidence for the audio track only. Video frames are not captioned. Absent segments and speakers make no alignment or speaker claim.
+pub const AudioReadMetadata = struct {
+    /// Decoded recording duration in milliseconds. Null when a remote recognition provider does not report duration.
+    duration_ms: ?i64,
+    language: OpenApiOptionalNullable([]const u8) = .absent,
+    language_source: ?[]const u8 = null,
+    segments: OpenApiOptionalNullable([]const AudioReadSegment) = .absent,
+    speakers: OpenApiOptionalNullable([]const []const u8) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "inference", "inference", true },
+        .{ "duration_ms", "duration_ms", false },
+        .{ "language", "language", false },
+        .{ "language_source", "language_source", true },
+        .{ "segments", "segments", false },
+        .{ "speakers", "speakers", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -55,15 +103,143 @@ pub const AdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.inference) |value| {
-            try jw.objectField("inference");
+        try jw.objectField("duration_ms");
+        try jw.write(self.duration_ms);
+        switch (self.language) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("language");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("language");
+                try jw.write(value);
+            },
+        }
+        if (self.language_source) |value| {
+            try jw.objectField("language_source");
+            try jw.write(value);
+        }
+        switch (self.segments) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("segments");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("segments");
+                try jw.write(value);
+            },
+        }
+        switch (self.speakers) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("speakers");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("speakers");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// Recognition options, checked against every selected backend and fallback before inference. Whisper supports all options and pause-aware windowing of long recordings. Gemma supports transcription up to 30 seconds and rejects language, timestamps and diarization requests. No backend is substituted to satisfy an option.
+pub const AudioReadOptions = struct {
+    /// Force recognition in this language (e.g. en). Omitted means detect language where supported; this is not a translation or cleanup request. Gemma does not support language control or detection metadata.
+    language: ?[]const u8 = null,
+    /// Request phrase timestamps in milliseconds relative to the original source recording. Defaults to false. Does not imply word alignment.
+    timestamps: ?bool = null,
+    /// Request speaker labels and temporal segments. Defaults to false. Whisper requires the local speaker embedding model; unavailable models cause an explicit error. Implies timestamp decoding.
+    diarization: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "language", "language", true },
+        .{ "timestamps", "timestamps", true },
+        .{ "diarization", "diarization", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
+            try jw.write(value);
+        }
+        if (self.diarization) |value| {
+            try jw.objectField("diarization");
             try jw.write(value);
         }
         try jw.endObject();
     }
 };
 
-pub const AudioChunkConfig = antfly_chunking_api_openapi.InferenceAudioChunkConfig;
+pub const AudioReadSegment = struct {
+    text: []const u8,
+    /// phrase uses recognizer-supplied phrase clocks; window provides only the original recognition-window bounds. Neither claims word alignment. Absent means unspecified.
+    granularity: OpenApiOptionalNullable([]const u8) = .absent,
+    /// Start in milliseconds relative to the original recording.
+    start_ms: i64,
+    /// Exclusive end in milliseconds relative to the original recording.
+    end_ms: i64,
+    /// Start UTF-8 byte offset in the containing read result text.
+    text_start: i64,
+    /// Exclusive end UTF-8 byte offset in the containing read result text.
+    text_end: i64,
+    /// Speaker label when diarization was requested and established.
+    speaker: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        switch (self.granularity) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("granularity");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("granularity");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("start_ms");
+        try jw.write(self.start_ms);
+        try jw.objectField("end_ms");
+        try jw.write(self.end_ms);
+        try jw.objectField("text_start");
+        try jw.write(self.text_start);
+        try jw.objectField("text_end");
+        try jw.write(self.text_end);
+        switch (self.speaker) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("speaker");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("speaker");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
 
 /// Runtime backends compiled into this inference server.
 pub const BackendRuntimes = struct {
@@ -190,177 +366,6 @@ pub const ChunkResponse = struct {
     cache_hit: bool,
 };
 
-pub const Config = struct {
-    /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
-    max_concurrent_requests: ?i64 = null,
-    /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
-    api_url: ?[]const u8 = null,
-    /// API key used when calling an authenticated shared Antfly inference API.
-    api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
-    models_dir: ?[]const u8 = null,
-    /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
-    ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
-    content_security: ?antfly_scraping_openapi.ContentSecurityConfig = null,
-    /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
-    s3_credentials: ?antfly_s3_openapi.Credentials = null,
-    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
-    keep_alive: ?[]const u8 = null,
-    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
-    max_loaded_models: ?i64 = null,
-    /// Legacy compatibility field. The current Zig inference runtime does not create per-model pipeline pools from this setting; configuring it has no effect.
-    pool_size: ?i64 = null,
-    /// Native generator prompt KV cache settings.
-    prompt_cache: ?PromptCacheConfig = null,
-    kernel_jit: ?KernelJitConfig = null,
-    /// Legacy compatibility field. The current Zig inference runtime selects a backend from model metadata, explicit preload settings, and compiled capabilities; configuring this list has no effect.
-    backend_priority: ?[]const []const u8 = null,
-    /// Legacy Go-runtime queue setting. The current Zig runtime does not retain excess inference requests in memory and ignores this field.
-    max_queue_size: ?i64 = null,
-    /// Legacy Go-runtime queue/request timeout. The current Zig runtime ignores this field; its HTTP listener applies a separate fixed transport timeout.
-    request_timeout: ?[]const u8 = null,
-    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind. When runtime kernel JIT is enabled, every vision, audio, and projection session declared by a preloaded model is also loaded without running media inference. Runtime kernel JIT `required` mode rejects an empty preload list.
-    preload: ?[]const ModelRef = null,
-    /// Legacy compatibility field. The current Zig runtime uses explicit host, backend, combined, KV, and scratch budgets instead and ignores this field.
-    max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map load on demand. keep_alive controls their idle eviction; setting it to "0" disables idle eviction but does not preload or pin them. When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
-    model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Legacy compatibility field controlling whether dashboards show model download commands. It defaults to true for standalone deployments; managed deployments historically set it to false. Download-command availability is a build-time setting in the current Zig runtime, so configuring this field has no effect.
-    allow_downloads: ?bool = null,
-    /// Legacy inference-local logging field. The current unified Zig runtime ignores it; configure the top-level `log` object instead.
-    log: ?std.json.Value = null,
-    admission: ?AdmissionConfig = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "max_concurrent_requests", "max_concurrent_requests", true },
-        .{ "api_url", "api_url", true },
-        .{ "api_key", "api_key", true },
-        .{ "models_dir", "models_dir", true },
-        .{ "ml_dir", "ml_dir", true },
-        .{ "content_security", "content_security", false },
-        .{ "s3_credentials", "s3_credentials", false },
-        .{ "keep_alive", "keep_alive", true },
-        .{ "max_loaded_models", "max_loaded_models", true },
-        .{ "pool_size", "pool_size", true },
-        .{ "prompt_cache", "prompt_cache", true },
-        .{ "kernel_jit", "kernel_jit", true },
-        .{ "backend_priority", "backend_priority", true },
-        .{ "max_queue_size", "max_queue_size", true },
-        .{ "request_timeout", "request_timeout", true },
-        .{ "preload", "preload", true },
-        .{ "max_memory_mb", "max_memory_mb", true },
-        .{ "model_strategies", "model_strategies", true },
-        .{ "allow_downloads", "allow_downloads", true },
-        .{ "log", "log", true },
-        .{ "admission", "admission", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.max_concurrent_requests) |value| {
-            try jw.objectField("max_concurrent_requests");
-            try jw.write(value);
-        }
-        if (self.api_url) |value| {
-            try jw.objectField("api_url");
-            try jw.write(value);
-        }
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.models_dir) |value| {
-            try jw.objectField("models_dir");
-            try jw.write(value);
-        }
-        if (self.ml_dir) |value| {
-            try jw.objectField("ml_dir");
-            try jw.write(value);
-        }
-        if (self.content_security) |value| {
-            try jw.objectField("content_security");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("content_security");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.s3_credentials) |value| {
-            try jw.objectField("s3_credentials");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("s3_credentials");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.keep_alive) |value| {
-            try jw.objectField("keep_alive");
-            try jw.write(value);
-        }
-        if (self.max_loaded_models) |value| {
-            try jw.objectField("max_loaded_models");
-            try jw.write(value);
-        }
-        if (self.pool_size) |value| {
-            try jw.objectField("pool_size");
-            try jw.write(value);
-        }
-        if (self.prompt_cache) |value| {
-            try jw.objectField("prompt_cache");
-            try jw.write(value);
-        }
-        if (self.kernel_jit) |value| {
-            try jw.objectField("kernel_jit");
-            try jw.write(value);
-        }
-        if (self.backend_priority) |value| {
-            try jw.objectField("backend_priority");
-            try jw.write(value);
-        }
-        if (self.max_queue_size) |value| {
-            try jw.objectField("max_queue_size");
-            try jw.write(value);
-        }
-        if (self.request_timeout) |value| {
-            try jw.objectField("request_timeout");
-            try jw.write(value);
-        }
-        if (self.preload) |value| {
-            try jw.objectField("preload");
-            try jw.write(value);
-        }
-        if (self.max_memory_mb) |value| {
-            try jw.objectField("max_memory_mb");
-            try jw.write(value);
-        }
-        if (self.model_strategies) |value| {
-            try jw.objectField("model_strategies");
-            try jw.write(value);
-        }
-        if (self.allow_downloads) |value| {
-            try jw.objectField("allow_downloads");
-            try jw.write(value);
-        }
-        if (self.log) |value| {
-            try jw.objectField("log");
-            try jw.write(value);
-        }
-        if (self.admission) |value| {
-            try jw.objectField("admission");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 /// A content part for multimodal input (text, image URL, or inline media)
 pub const ContentPart = union(enum) {
     media_content_part: *MediaContentPart,
@@ -460,7 +465,7 @@ pub const DocumentSource = struct {
     /// Inline data URI or location allowed by the deployment content security policy.
     url: []const u8,
     media_type: []const u8,
-    /// Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide.
+    /// Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide. Audio/video recordings are one source unit and do not accept page selection.
     pages: ?[]const i64 = null,
     /// Include slide speaker notes as separate evidence, never silently as visible slide text.
     include_notes: ?bool = null,
@@ -1227,6 +1232,41 @@ pub const ImageURLContentPart = struct {
     image_url: ImageURL,
 };
 
+pub const InferenceServerConfig = struct {
+    resources: ?antfly_resources_openapi.ResourcesConfig = null,
+    inference: ?RuntimeConfig = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "resources", "resources", false },
+        .{ "inference", "inference", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.resources) |value| {
+            try jw.objectField("resources");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("resources");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.inference) |value| {
+            try jw.objectField("inference");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Runtime Metal and CUDA kernel JIT configuration. Live compilation and GPU qualification run only for models in the configured startup `preload` list, before serving begins. A cold dynamic model load never benchmarks against an in-use GPU: `on` and `shadow` retain bundled kernels, while `required` rejects the load. When runtime JIT is enabled, startup also materializes every vision, audio, and projection session declared by each preloaded model without running media inference. Preload every model that must use runtime-JIT kernels; `required` rejects an empty preload list.
 pub const KernelJitConfig = struct {
     mode: ?KernelJitMode = null,
@@ -1428,8 +1468,15 @@ pub const ModelFormat = enum {
 
 /// Information about a model including its capabilities
 pub const ModelInfo = struct {
+    audio_read: ?AudioReadCapabilities = null,
     /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
     qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Whether this artifact can run in the current build. `incompatible` artifacts are rejected before load; a model whose directory cannot be read is listed as `incompatible` with `error` set.
+    compatibility: ?[]const u8 = null,
+    /// False when this deployment rejects public execution (`public_inference_enabled: false`); the model is installed and listed, but public calls return 403. Omitted when it can be invoked.
+    invocable: ?bool = null,
+    /// Why the model is unusable, set when its directory could not be read. Other models still list.
+    @"error": ?std.json.Value = null,
     /// List of capabilities this model supports (omitted when empty)
     capabilities: ?[]const []const u8 = null,
     /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
@@ -1437,7 +1484,11 @@ pub const ModelInfo = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "audio_read", "audio_read", true },
         .{ "qualified_limits", "qualified_limits", true },
+        .{ "compatibility", "compatibility", true },
+        .{ "invocable", "invocable", true },
+        .{ "error", "error", true },
         .{ "capabilities", "capabilities", true },
         .{ "inputs", "inputs", true },
     };
@@ -1452,8 +1503,24 @@ pub const ModelInfo = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.audio_read) |value| {
+            try jw.objectField("audio_read");
+            try jw.write(value);
+        }
         if (self.qualified_limits) |value| {
             try jw.objectField("qualified_limits");
+            try jw.write(value);
+        }
+        if (self.compatibility) |value| {
+            try jw.objectField("compatibility");
+            try jw.write(value);
+        }
+        if (self.invocable) |value| {
+            try jw.objectField("invocable");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
             try jw.write(value);
         }
         if (self.capabilities) |value| {
@@ -1549,6 +1616,8 @@ pub const ModelRef = struct {
     kind: ModelKind,
     /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
     name: []const u8,
+    /// Keep a successfully preloaded model pinned against eviction. Set false to warm the ordinary evictable cache before serving; idle and model-count policy still apply.
+    pin: ?bool = null,
     backend: ?ModelBackend = null,
     format: ?ModelFormat = null,
     quantization: ?ModelQuantization = null,
@@ -1561,6 +1630,7 @@ pub const ModelRef = struct {
     pub const openApiFieldMetadata = .{
         .{ "kind", "kind", false },
         .{ "name", "name", false },
+        .{ "pin", "pin", true },
         .{ "backend", "backend", true },
         .{ "format", "format", true },
         .{ "quantization", "quantization", true },
@@ -1582,6 +1652,10 @@ pub const ModelRef = struct {
         try jw.write(self.kind);
         try jw.objectField("name");
         try jw.write(self.name);
+        if (self.pin) |value| {
+            try jw.objectField("pin");
+            try jw.write(value);
+        }
         if (self.backend) |value| {
             try jw.objectField("backend");
             try jw.write(value);
@@ -1688,24 +1762,29 @@ pub const PromptCacheConfig = struct {
     }
 };
 
-/// Read exactly one of images or documents. The server rejects absent or simultaneous input forms before inference.
+/// Read exactly one of images, documents, or audio using capability-aware reader dispatch, with provenance and completion status. Supported video containers are read from their audio track only.
 pub const ReadRequest = struct {
-    /// Name of reader model from models_dir/readers/
+    /// Explicit reader, ASR, audio-capable generator, named target, or composed document model. ASR storage remains models_dir/transcribers/.
     model: []const u8,
+    audio_options: ?AudioReadOptions = null,
+    /// Base64-encoded audio, a data URI, or a supported source URL, mutually exclusive with images and documents. Audio tracks in supported video containers are transcribed; frames are not captioned. Whisper preserves long-recording windowing; Gemma is bounded to 30 seconds. All audio reads use document orchestration, artifacts and durable jobs.
+    audio: ?[]const u8 = null,
     /// Request an opaque, process-local reading handle for extraction reuse. Retention is best effort; inspect document.artifact_id and artifact_ttl_ms.
     retain_artifact: ?bool = null,
     /// Complete documents, mutually exclusive with images. Each source is independent; selected pages are read in original source order.
     documents: ?[]const DocumentSource = null,
     /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
     images: ?[]const ImageURL = null,
-    /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
+    /// Optional task prompt for document understanding models. - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning
     prompt: ?[]const u8 = null,
-    /// Maximum tokens to generate
+    /// Maximum output tokens per page. When omitted, the selected reader model supplies its default, bounded by deployment limits. Explicit values override the model default and must fit model and server limits. Audio generator backends accept this option; Whisper uses its recognition and execution budgets and rejects an explicit max_tokens.
     max_tokens: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
+        .{ "audio_options", "audio_options", true },
+        .{ "audio", "audio", true },
         .{ "retain_artifact", "retain_artifact", true },
         .{ "documents", "documents", true },
         .{ "images", "images", true },
@@ -1725,6 +1804,14 @@ pub const ReadRequest = struct {
         try jw.beginObject();
         try jw.objectField("model");
         try jw.write(self.model);
+        if (self.audio_options) |value| {
+            try jw.objectField("audio_options");
+            try jw.write(value);
+        }
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
         if (self.retain_artifact) |value| {
             try jw.objectField("retain_artifact");
             try jw.write(value);
@@ -1794,6 +1881,7 @@ pub const ReadResponse = struct {
 };
 
 pub const ReadResult = struct {
+    audio: OpenApiOptionalNullable(AudioReadMetadata) = .absent,
     /// Original document source ID.
     source_id: ?[]const u8 = null,
     /// One-based original page or slide number.
@@ -1825,6 +1913,7 @@ pub const ReadResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "audio", "audio", false },
         .{ "source_id", "source_id", true },
         .{ "number", "number", true },
         .{ "kind", "kind", true },
@@ -1853,6 +1942,17 @@ pub const ReadResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        switch (self.audio) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("audio");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("audio");
+                try jw.write(value);
+            },
+        }
         if (self.source_id) |value| {
             try jw.objectField("source_id");
             try jw.write(value);
@@ -1927,33 +2027,6 @@ pub const ReadResult = struct {
         }
         if (self.regions) |value| {
             try jw.objectField("regions");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const RequestAdmissionConfig = struct {
-    /// Maximum concurrent inference requests in this process. The same value also sizes the weighted work budget shared by every executing inference endpoint: each request consumes one request slot and at least one unit, while request body size, generation workload, and image byte/count reservations can consume more than one unit. The request count can therefore never exceed this value, while expensive requests may exhaust weighted capacity sooner. Read and image-extraction admission reserves the effective downloaded-byte ceiling at 16 MiB per unit and at least one unit per two images. A positive capacity also clamps each such request's downloaded-image ceiling to 16 MiB times this value. When either ceiling is exhausted, new HTTP requests are rejected immediately with 503 Service Unavailable and Retry-After: 1; they are not retained in an in-process queue. Set to 0 to disable both ceilings, admission unit accounting, and the capacity-derived clamp. The default is 32.
-    max_concurrent_requests: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "max_concurrent_requests", "max_concurrent_requests", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.max_concurrent_requests) |value| {
-            try jw.objectField("max_concurrent_requests");
             try jw.write(value);
         }
         try jw.endObject();
@@ -2058,20 +2131,24 @@ pub const Role = enum {
 };
 
 pub const RuntimeConfig = struct {
-    /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
-    max_concurrent_requests: ?i64 = null,
+    /// Encoded HTTP inference body ceiling in MiB, independent of decoded-media resource policy.
+    http_max_body_mb: ?i64 = null,
     /// URL of an out-of-process Antfly inference service that the Antfly server should call for embedding, chunking, reranking, and generation. Omit it to use the in-process inference runtime (the default in standalone mode). `antfly inference run` ignores this field; it configures the client side only.
     api_url: ?[]const u8 = null,
-    /// API key used when calling an authenticated shared Antfly inference API.
+    /// Client-only API key used when calling an authenticated shared Antfly inference API. Both standalone inference executables accept and ignore this field when serving models.
     api_key: ?[]const u8 = null,
     /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/{owner}/{name}/` - Models fetched with `antfly inference pull owner/name` - `{models_dir}/embedders/` - Embedding models - `{models_dir}/rerankers/` - Reranking models - `{models_dir}/extractors/` - Entity, relation, and structured extraction models - `{models_dir}/rewriters/` - Seq2Seq rewriter models Defaults to `$ANTFLY_INFERENCE_MODELS_DIR` when set, otherwise `~/.antfly/inference/models` (`./models` when `$HOME` is unset). The `--models-dir` flag overrides both. The built-in `fixed` chunker needs no models.
     models_dir: ?[]const u8 = null,
     /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
     ml_dir: ?[]const u8 = null,
-    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when admission.inference.max_concurrent_requests is positive—16 MiB times that capacity; zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
+    /// Configured fields are merged individually over a fail-closed inference baseline. Omitted or empty policies deny HTTP(S), file, and S3 while allowing data URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists even when another field is configured. Enable remote sources only with explicit allowlists. block_private_ips defaults to true; while enabled, IP literals and every address resolved from an allowlisted DNS hostname must be globally routable, and the connection is pinned to a vetted address. Setting it to false explicitly opts into private and special destinations. Across generate, dense embed, multimodal rerank, and batch generation, downloaded and inline encoded media is capped cumulatively per request at the lower of 100 MiB, max_download_size_bytes, and—when resources.inference.admission.max_work_units is positive—16 MiB times that effective work capacity (which defaults to request concurrency when max_work_units is omitted); zero max_download_size_bytes disables nonempty media. Remote URL byte potential is reserved before fetch, while inline sources use their actual encoded size. Accepted image inputs also undergo header-only dimension and aggregate decoded-pixel admission before model execution. Batch generation accepts bounded image and audio media parts and rejects malformed or unsupported parts before dispatch. Embedded direct transcription and extraction use the configured encoded-media per-call ceiling, and direct dense embedding also applies pre-allocation and decoded-image admission. In unified Antfly configuration, an empty inference policy may first inherit a nonempty remote_content security policy, which is then merged over this baseline.
     content_security: ?antfly_scraping_openapi.ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?antfly_s3_openapi.Credentials = null,
+    /// Opt-in interleaving of independently owned requests on backends declaring safe step sharing. Independent of row batching; graph, prefix-cache, speculative and multimodal routes remain exclusive. Currently qualified for at most two active E4B CUDA requests with one row per step.
+    cooperative_execution: ?std.json.Value = null,
+    /// Experimental row batching; independent from cooperative_execution. Mode on explicitly enables qualified CUDA row scheduling. Resource and request ceilings still apply.
+    generation_batching: ?std.json.Value = null,
     /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
     keep_alive: ?[]const u8 = null,
     /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited. Defaults to 10.
@@ -2100,13 +2177,15 @@ pub const RuntimeConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "max_concurrent_requests", "max_concurrent_requests", true },
+        .{ "http_max_body_mb", "http_max_body_mb", true },
         .{ "api_url", "api_url", true },
         .{ "api_key", "api_key", true },
         .{ "models_dir", "models_dir", true },
         .{ "ml_dir", "ml_dir", true },
         .{ "content_security", "content_security", false },
         .{ "s3_credentials", "s3_credentials", false },
+        .{ "cooperative_execution", "cooperative_execution", true },
+        .{ "generation_batching", "generation_batching", true },
         .{ "keep_alive", "keep_alive", true },
         .{ "max_loaded_models", "max_loaded_models", true },
         .{ "pool_size", "pool_size", true },
@@ -2132,8 +2211,8 @@ pub const RuntimeConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.max_concurrent_requests) |value| {
-            try jw.objectField("max_concurrent_requests");
+        if (self.http_max_body_mb) |value| {
+            try jw.objectField("http_max_body_mb");
             try jw.write(value);
         }
         if (self.api_url) |value| {
@@ -2165,6 +2244,14 @@ pub const RuntimeConfig = struct {
         } else if (jw.options.emit_null_optional_fields) {
             try jw.objectField("s3_credentials");
             try jw.write(@as(?u8, null));
+        }
+        if (self.cooperative_execution) |value| {
+            try jw.objectField("cooperative_execution");
+            try jw.write(value);
+        }
+        if (self.generation_batching) |value| {
+            try jw.objectField("generation_batching");
+            try jw.write(value);
         }
         if (self.keep_alive) |value| {
             try jw.objectField("keep_alive");
@@ -2443,80 +2530,6 @@ pub const ToolCallFunctionDelta = struct {
 
 /// Controls how the model uses tools. Options: - "auto": Model decides whether to call a tool (default) - "none": Model will not call any tools - "required": Model must call at least one tool - object: Force a specific function to be called
 pub const ToolChoice = std.json.Value;
-
-pub const TranscribeRequest = struct {
-    /// Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
-    model: []const u8,
-    /// Base64-encoded audio data (WAV, MP3, FLAC, etc.)
-    audio: []const u8,
-    /// Force specific language for transcription (optional, model-dependent)
-    language: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "audio", "audio", false },
-        .{ "language", "language", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        try jw.objectField("audio");
-        try jw.write(self.audio);
-        if (self.language) |value| {
-            try jw.objectField("language");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const TranscribeResponse = struct {
-    /// Name of model used for transcription
-    model: []const u8,
-    /// Transcribed text from the audio
-    text: []const u8,
-    /// Detected or forced language
-    language: ?[]const u8 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "text", "text", false },
-        .{ "language", "language", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        try jw.objectField("text");
-        try jw.write(self.text);
-        if (self.language) |value| {
-            try jw.objectField("language");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
 
 pub const VADOptions = antfly_chunking_api_openapi.VADOptions;
 

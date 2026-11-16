@@ -130,6 +130,11 @@ def walk_refs(value: object, rename_schema) -> object:
                     out[key] = prefix + rename_schema(child[len(prefix) :])
                 elif child.startswith(shared_generating_prefix):
                     out[key] = prefix + child[len(shared_generating_prefix) :]
+                elif child.startswith("./config.yaml#/"):
+                    out[key] = (
+                        "specs/openapi/inference/config.yaml#/"
+                        + child.split("#/", 1)[1]
+                    )
                 elif child.startswith(ai_extraction_prefix):
                     out[key] = (
                         "specs/openapi/ai/extraction.yaml#/components/schemas/"
@@ -375,6 +380,7 @@ def join_specs() -> dict:
 
 
 def dump_yaml(data: dict, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as fh:
         yaml.dump(
             data, fh, Dumper=Dumper, sort_keys=False, allow_unicode=True, width=100

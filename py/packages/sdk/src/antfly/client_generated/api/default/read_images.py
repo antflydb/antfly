@@ -101,18 +101,27 @@ def sync_detailed(
     client: AuthenticatedClient | Client,
     body: InferenceReadRequest,
 ) -> Response[InferenceError | InferenceReadResponse | InferenceTransientCapacityError]:
-    """Read text from images (OCR/document understanding)
+    """Read text from images, documents, or audio
 
-     Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+     Reads text from images and documents with a local reader model. OCR and document-reading tasks can
+    also run on a vision-capable generator or a connected provider.
+
+    Audio input dispatches to Whisper ASR or an audio-capable generator such as Gemma 4 using the same
+    document service and read envelope. Whisper supports language control, timestamps, diarization and
+    long-recording windowing. Gemma supports recordings up to 30 seconds and rejects unsupported audio
+    options. Supported video
+    containers are transcribed from their audio track. Results report truncation;
+    generated text does not imply word alignment or speaker identification.
 
     ## Models
 
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **TrOCR**: Pure OCR for printed/handwritten text
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+    - **PaddleOCR**: Text detection and recognition with page-space regions
     - **Donut**: Document understanding with structured output (receipts, forms)
-    - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
     fields
@@ -132,12 +141,13 @@ def sync_detailed(
     weighted capacity unit and at least one unit per two declared images. The effective
     ceiling is the minimum of the configured per-image limit times image count, the
     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-    `admission.inference.max_concurrent_requests`. Admission happens before model resolution or
+    `resources.inference.admission.max_work_units`. Admission happens before model resolution or
     download.
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
+    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+    capacity
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -148,8 +158,9 @@ def sync_detailed(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
-            absent or simultaneous input forms before inference.
+        body (InferenceReadRequest): Read exactly one of images, documents, or audio using
+            capability-aware reader dispatch, with provenance and completion status. Supported video
+            containers are read from their audio track only.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -175,18 +186,27 @@ def sync(
     client: AuthenticatedClient | Client,
     body: InferenceReadRequest,
 ) -> InferenceError | InferenceReadResponse | InferenceTransientCapacityError | None:
-    """Read text from images (OCR/document understanding)
+    """Read text from images, documents, or audio
 
-     Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+     Reads text from images and documents with a local reader model. OCR and document-reading tasks can
+    also run on a vision-capable generator or a connected provider.
+
+    Audio input dispatches to Whisper ASR or an audio-capable generator such as Gemma 4 using the same
+    document service and read envelope. Whisper supports language control, timestamps, diarization and
+    long-recording windowing. Gemma supports recordings up to 30 seconds and rejects unsupported audio
+    options. Supported video
+    containers are transcribed from their audio track. Results report truncation;
+    generated text does not imply word alignment or speaker identification.
 
     ## Models
 
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **TrOCR**: Pure OCR for printed/handwritten text
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+    - **PaddleOCR**: Text detection and recognition with page-space regions
     - **Donut**: Document understanding with structured output (receipts, forms)
-    - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
     fields
@@ -206,12 +226,13 @@ def sync(
     weighted capacity unit and at least one unit per two declared images. The effective
     ceiling is the minimum of the configured per-image limit times image count, the
     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-    `admission.inference.max_concurrent_requests`. Admission happens before model resolution or
+    `resources.inference.admission.max_work_units`. Admission happens before model resolution or
     download.
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
+    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+    capacity
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -222,8 +243,9 @@ def sync(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
-            absent or simultaneous input forms before inference.
+        body (InferenceReadRequest): Read exactly one of images, documents, or audio using
+            capability-aware reader dispatch, with provenance and completion status. Supported video
+            containers are read from their audio track only.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -244,18 +266,27 @@ async def asyncio_detailed(
     client: AuthenticatedClient | Client,
     body: InferenceReadRequest,
 ) -> Response[InferenceError | InferenceReadResponse | InferenceTransientCapacityError]:
-    """Read text from images (OCR/document understanding)
+    """Read text from images, documents, or audio
 
-     Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+     Reads text from images and documents with a local reader model. OCR and document-reading tasks can
+    also run on a vision-capable generator or a connected provider.
+
+    Audio input dispatches to Whisper ASR or an audio-capable generator such as Gemma 4 using the same
+    document service and read envelope. Whisper supports language control, timestamps, diarization and
+    long-recording windowing. Gemma supports recordings up to 30 seconds and rejects unsupported audio
+    options. Supported video
+    containers are transcribed from their audio track. Results report truncation;
+    generated text does not imply word alignment or speaker identification.
 
     ## Models
 
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **TrOCR**: Pure OCR for printed/handwritten text
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+    - **PaddleOCR**: Text detection and recognition with page-space regions
     - **Donut**: Document understanding with structured output (receipts, forms)
-    - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
     fields
@@ -275,12 +306,13 @@ async def asyncio_detailed(
     weighted capacity unit and at least one unit per two declared images. The effective
     ceiling is the minimum of the configured per-image limit times image count, the
     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-    `admission.inference.max_concurrent_requests`. Admission happens before model resolution or
+    `resources.inference.admission.max_work_units`. Admission happens before model resolution or
     download.
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
+    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+    capacity
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -291,8 +323,9 @@ async def asyncio_detailed(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
-            absent or simultaneous input forms before inference.
+        body (InferenceReadRequest): Read exactly one of images, documents, or audio using
+            capability-aware reader dispatch, with provenance and completion status. Supported video
+            containers are read from their audio track only.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -316,18 +349,27 @@ async def asyncio(
     client: AuthenticatedClient | Client,
     body: InferenceReadRequest,
 ) -> InferenceError | InferenceReadResponse | InferenceTransientCapacityError | None:
-    """Read text from images (OCR/document understanding)
+    """Read text from images, documents, or audio
 
-     Extracts text from images using Vision2Seq models like TrOCR, Donut, Florence-2, or Pix2Struct.
+     Reads text from images and documents with a local reader model. OCR and document-reading tasks can
+    also run on a vision-capable generator or a connected provider.
+
+    Audio input dispatches to Whisper ASR or an audio-capable generator such as Gemma 4 using the same
+    document service and read envelope. Whisper supports language control, timestamps, diarization and
+    long-recording windowing. Gemma supports recordings up to 30 seconds and rejects unsupported audio
+    options. Supported video
+    containers are transcribed from their audio track. Results report truncation;
+    generated text does not imply word alignment or speaker identification.
 
     ## Models
 
     Models are auto-discovered from `models_dir/readers/` at startup.
     Use the `/ai/v1/models` endpoint to list available models.
 
-    - **TrOCR**: Pure OCR for printed/handwritten text
+    - **LightOnOCR-3** (recommended): Document OCR to Markdown, including tables and formulas
+    - **Florence-2**: Lightweight OCR, captioning, and visual question answering
+    - **PaddleOCR**: Text detection and recognition with page-space regions
     - **Donut**: Document understanding with structured output (receipts, forms)
-    - **Florence-2**: Multi-task vision model (OCR, captioning, VQA)
     - **Pix2Struct**: Visual question answering with natural-language prompts
     - **Moondream**: Decoder-only vision-language reader that can return text plus optional flattened
     fields
@@ -347,12 +389,13 @@ async def asyncio(
     weighted capacity unit and at least one unit per two declared images. The effective
     ceiling is the minimum of the configured per-image limit times image count, the
     read-batch limit (256 MiB by default), and—when admission is bounded—16 MiB times
-    `admission.inference.max_concurrent_requests`. Admission happens before model resolution or
+    `resources.inference.admission.max_work_units`. Admission happens before model resolution or
     download.
 
     After download, image headers are validated before model loading. Decoded source
     pixels are admitted at a conservative 16 bytes per pixel against the lower of
-    512 MiB or 16 MiB times a positive `admission.inference.max_concurrent_requests`; a zero concurrency
+    512 MiB or 16 MiB times a positive `resources.inference.admission.max_work_units`; a zero work
+    capacity
     setting still uses the finite 512 MiB ceiling. The reservation grows atomically
     from downloaded-byte admission before inference. `max_image_dimension` limits
     each source edge; malformed images return 400 and dimension or aggregate excess
@@ -363,8 +406,9 @@ async def asyncio(
     execution, and rejects malformed or unsupported parts before dispatch.
 
     Args:
-        body (InferenceReadRequest): Read exactly one of images or documents. The server rejects
-            absent or simultaneous input forms before inference.
+        body (InferenceReadRequest): Read exactly one of images, documents, or audio using
+            capability-aware reader dispatch, with provenance and completion status. Supported video
+            containers are read from their audio track only.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

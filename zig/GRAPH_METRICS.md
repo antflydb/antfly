@@ -839,6 +839,11 @@ scores explicitly, with the default being `nulls_last`.
 Before the first publish, direct metric ranking paths should not try to rank all
 nodes as missing. They should fail with `MetricNotReady`.
 
+For mention graphs, use fresh seeded PageRank with `direction: "both"` in
+`graph_metric` or `graph_metric_rerank`. The default is `out`. Directional
+personalization requires seeds and `metric_freshness: "fresh"`; it changes
+neither the graph's stored edges nor the published global metric.
+
 ## Progress and Recovery
 
 Jobs should persist enough state to recover after restart:

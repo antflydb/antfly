@@ -76,4 +76,4 @@ function Section({
   );
 }
 
-export { Inline, Section, Stack, inlineVariants, sectionVariants, stackVariants };
+export { Inline, inlineVariants, Section, Stack, sectionVariants, stackVariants };

@@ -80,8 +80,12 @@ pub const resolver_projection_bindings_reader_version: u32 = 13;
 pub const resolver_projection_work_reader_version: u32 = 14;
 pub const resolver_projection_delta_reader_version: u32 = 15;
 pub const resolver_static_profiles_reader_version: u32 = 19;
-pub const resolver_pin_index_reader_version: u32 = 23;
-pub const supported_reader_version: u32 = resolver_pin_index_reader_version;
+pub const resolver_pin_index_reader_version: u32 = 29;
+/// Durable decision producers and adjudication policies with cascade deciders.
+pub const decider_cascade_reader_version: u32 = 30;
+pub const cascade_agreement_reader_version: u32 = 31;
+pub const candidate_key_prefix_reader_version: u32 = 32;
+pub const supported_reader_version: u32 = candidate_key_prefix_reader_version;
 
 const reader_version_encodings = blk: {
     @setEvalBranchQuota(10000);
@@ -129,6 +133,10 @@ pub fn catalogEncoding(a: Allocator, data: []const u8) !CatalogEncoding {
                 defer config.deinit();
                 if (config.value == .object) if (config.value.object.get("decider")) |decider| if (decider == .object) if (decider.object.get("decision_method")) |method| {
                     if (method == .string and std.mem.eql(u8, method.string, "generated")) required = @max(required, generated_producers_reader_version);
+                    if (method == .string and std.mem.eql(u8, method.string, "cascade")) {
+                        const agreement = @import("antfly_decisions").cascade.requiresAgreement(decider.object.get("cascade") orelse .null);
+                        required = @max(required, if (agreement) cascade_agreement_reader_version else decider_cascade_reader_version);
+                    }
                 };
             }
         }
@@ -139,6 +147,9 @@ pub fn catalogEncoding(a: Allocator, data: []const u8) !CatalogEncoding {
                 if (state.value == .object and (state.value.object.contains("redirect_origins") or state.value.object.contains("proposals"))) required = @max(required, curation_provenance_reader_version);
                 if (state.value == .object and state.value.object.contains("receipt_scope")) required = @max(required, scoped_curation_reader_version);
             }
+        }
+        if (entry.object.get("candidate_key_prefix")) |prefix| {
+            if (prefix == .string and prefix.string.len > 0) required = @max(required, candidate_key_prefix_reader_version);
         }
         if (entry.object.contains("namespace_curation_table_id")) required = @max(required, resolver_projection_bindings_reader_version);
         if (entry.object.contains("namespace_curation_generation")) required = @max(required, namespace_curation_reader_version);
@@ -430,6 +441,9 @@ pub const ResolverConfig = struct {
     candidate_ann_index: []const u8 = "",
     /// Maximum ANN candidates to request. Zero uses the runtime default.
     candidate_limit: u32 = 0,
+    /// Optional canonical key namespace. Blocking applies it before limits;
+    /// redirects and final decisions cannot escape it or the target table.
+    candidate_key_prefix: []const u8 = "",
     /// Embedding model name used to backfill a mention's name embedding (for
     /// `cosine` scoring / `ann` blocking) when the extraction artifact carries
     /// none. Empty disables backfill. Must match the embedding the entity table
@@ -571,7 +585,7 @@ pub const ResolverConfig = struct {
         inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
             if (comptime !std.mem.eql(u8, field, "merges") and !std.mem.eql(u8, field, "shared_projection") and !std.mem.eql(u8, field, "validation_proof")) {
                 const omit = switch (comptime @field(ResolverConfigField, field)) {
-                    .adjudicate_json, .suppress_json, .curation_json => @field(self, field).len == 0,
+                    .adjudicate_json, .suppress_json, .curation_json, .candidate_key_prefix => @field(self, field).len == 0,
                     .namespace_curation_missing, .retired => !@field(self, field),
                     .namespace_curation_table_id, .namespace_curation_generation, .curation_revision, .merge_generation, .merge_state_version, .resolution_generation, .namespace_generation => @field(self, field) == 0,
                     .aliases, .admission_profile, .replacement_index, .replacement_resolver => @field(self, field).len == 0,
@@ -728,6 +742,7 @@ pub const ResolverConfig = struct {
         if (self.suppress_json.len > 0) alloc.free(self.suppress_json);
         if (self.candidate_search.len > 0) alloc.free(@constCast(self.candidate_search));
         if (self.candidate_ann_index.len > 0) alloc.free(@constCast(self.candidate_ann_index));
+        if (self.candidate_key_prefix.len > 0) alloc.free(@constCast(self.candidate_key_prefix));
         if (self.name_embedding.len > 0) alloc.free(@constCast(self.name_embedding));
         if (self.fusion_combine.len > 0) alloc.free(@constCast(self.fusion_combine));
         if (self.admission_profile.len > 0) alloc.free(self.admission_profile);
@@ -782,6 +797,10 @@ pub const ResolverConfig = struct {
             for (self.labels[0..i]) |prior| {
                 if (std.mem.eql(u8, prior, label)) return error.InvalidResolverConfig;
             }
+        }
+        if (self.candidate_key_prefix.len > 0) {
+            if (!std.mem.endsWith(u8, self.candidate_key_prefix, "/") or std.mem.indexOfAny(u8, self.candidate_key_prefix, "{}\x00\r\n") != null or !std.mem.startsWith(u8, self.key_template, self.candidate_key_prefix)) return error.InvalidResolverConfig;
+            for (self.aliases) |alias| if (!std.mem.startsWith(u8, alias.key, self.candidate_key_prefix) or !std.mem.startsWith(u8, alias.target, self.candidate_key_prefix)) return error.InvalidResolverConfig;
         }
         if (self.candidate_search.len > 0 and
             !std.mem.eql(u8, self.candidate_search, "exact_key") and
@@ -855,6 +874,8 @@ pub fn serializeCatalogWithEncoding(alloc: Allocator, resolvers: []const Resolve
     var projections: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (resolvers) |cfg| {
         var stored = cfg;
+        if (try @import("antfly_decisions").cascade.normalizeDisabledAgreementJson(a, cfg.adjudicate_json, &.{"decider"})) |normalized|
+            stored.adjudicate_json = normalized;
         if (cfg.namespace_curation_table_id != 0) {
             stored.merges = &.{};
             stored.curation_json = "";
@@ -1374,6 +1395,41 @@ test "resolver adjudication catalogs fence old readers and redact public credent
     try std.testing.expect(public.object.contains("adjudicate"));
 }
 
+test "resolver adjudication catalogs fence old readers from cascade deciders and redact stage credentials" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"{{_entity.text}}","scorer":{"comparisons":[]},"adjudicate":{"decider":{"decision_method":"cascade","cascade":{"stages":[{"name":"fast","decider":{"provider":"jev","api_key":"private-stage-key"}},{"name":"strong","decider":{"provider":"antfly","model":"fixture"},"when":{"probability_between":[0.3,0.9]}}]}},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), raw, .{});
+    const parsed = try ResolverConfig.parseValue(a, value);
+    defer parsed.deinit();
+    try parsed.value.validate();
+    const catalog = try serializeCatalog(a, &.{parsed.value});
+    defer a.free(catalog);
+    try std.testing.expectEqual(decider_cascade_reader_version, try catalogReaderVersion(a, catalog));
+    const public = try parsed.value.publicValue(arena.allocator());
+    const public_json = try std.json.Stringify.valueAlloc(a, public, .{});
+    defer a.free(public_json);
+    try std.testing.expect(std.mem.indexOf(u8, public_json, "private-stage-key") == null);
+    for ([_]bool{ false, true }) |enabled| {
+        const guarded = try std.mem.replaceOwned(u8, arena.allocator(), raw, "\"when\":", if (enabled) "\"require_agreement\":true,\"when\":" else "\"require_agreement\":false,\"when\":");
+        const cfg = try ResolverConfig.parseValue(a, try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), guarded, .{}));
+        defer cfg.deinit();
+        const encoded = try serializeCatalog(a, &.{cfg.value});
+        defer a.free(encoded);
+        try std.testing.expectEqual(if (enabled) cascade_agreement_reader_version else decider_cascade_reader_version, try catalogReaderVersion(a, encoded));
+        if (!enabled) try std.testing.expectEqualStrings(catalog, encoded);
+        const reopened = try deserializeCatalog(a, encoded);
+        defer {
+            for (reopened) |*cfg_row| cfg_row.deinit(a);
+            a.free(reopened);
+        }
+        try std.testing.expect((std.mem.indexOf(u8, reopened[0].adjudicate_json, "require_agreement") != null) == enabled);
+    }
+}
+
 test "ordered artifact inventory resolver catalog serialization preserves explicit envelope" {
     const a = std.testing.allocator;
     for (1..supported_reader_version + 1) |reader_version| {
@@ -1517,4 +1573,55 @@ test "resolver catalog encoding preserves optional empty projection dictionaries
             try std.testing.expectEqualStrings(data, encoded);
         }
     }
+}
+
+/// Decode resolver declarations without importing provisioners or inference providers.
+pub fn collectDesiredResolvers(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    out: *std.ArrayListUnmanaged(ResolverConfig),
+) !void {
+    switch (value) {
+        .object => |object| {
+            if (object.get("resolvers")) |resolvers| {
+                if (resolvers == .array) {
+                    for (resolvers.array.items) |item| {
+                        if (item != .object) continue;
+                        const parsed = try ResolverConfig.parseValue(alloc, item);
+                        // `parsed.value` is owned by the parse arena; clone with
+                        // `alloc` so `out`'s entries free correctly (and so they
+                        // outlive the arena).
+                        defer parsed.deinit();
+                        try out.append(alloc, try ResolverConfig.clone(alloc, parsed.value));
+                    }
+                }
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or @import("../../../api/index_metadata.zig").isOpaqueEntry(entry.key_ptr.*)) continue;
+                try collectDesiredResolvers(alloc, entry.value_ptr.*, out);
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| try collectDesiredResolvers(alloc, item, out);
+        },
+        else => {},
+    }
+}
+
+test "resolver config persists and reader-fences candidate namespaces" {
+    const a = std.testing.allocator;
+    const cfg = ResolverConfig{ .name = "facts", .table = "entities", .source_artifact = "input", .resolution_artifact = "output", .key_template = "source/ours/{{ slug _entity.text }}", .candidate_key_prefix = "source/ours/" };
+    try cfg.validate();
+    var owned = try ResolverConfig.clone(a, cfg);
+    defer owned.deinit(a);
+    try std.testing.expectEqualStrings(cfg.candidate_key_prefix, owned.candidate_key_prefix);
+    const encoded = try serializeCatalog(a, &.{owned});
+    defer a.free(encoded);
+    try std.testing.expectEqual(candidate_key_prefix_reader_version, try catalogReaderVersion(a, encoded));
+    var bad = cfg;
+    bad.candidate_key_prefix = "source/foreign/";
+    try std.testing.expectError(error.InvalidResolverConfig, bad.validate());
+    bad.candidate_key_prefix = "source/ours";
+    try std.testing.expectError(error.InvalidResolverConfig, bad.validate());
 }

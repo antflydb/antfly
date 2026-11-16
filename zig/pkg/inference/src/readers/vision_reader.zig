@@ -31,6 +31,8 @@ const InferenceExecutionControl = @import("../execution_control.zig").InferenceE
 pub const PreprocessorConfig = vision_config.PreprocessorConfig;
 
 pub const LoadedVisionReader = struct {
+    preparation_owner: ?*const @import("../backends/admitted_allocator.zig").AdmittedAllocator = null,
+    preparation_parent: ?*const @import("../pipelines/preprocessing_memory.zig").Scope = null,
     allocator: std.mem.Allocator,
     encoder_session: backends.Session,
     decoder_session: backends.Session,
@@ -60,19 +62,51 @@ pub const LoadedVisionReader = struct {
         model_manager: *model_manager_mod.ModelManager,
         control: ?InferenceExecutionControl,
     ) !LoadedVisionReader {
-        if (control) |active| try active.check();
-        if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
+        const io = if (control) |active| active.io orelse session_manager.io orelse std.Options.debug_io else session_manager.io orelse std.Options.debug_io;
+        var lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, io, model_path);
+        defer lease.deinit(io);
+        if (control) |active| try active.verifyModelSelection(allocator, io, model_path);
+        var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, io, model_path, if (control) |active| if (active.model_selection) |selected| .{ .publication = selected.publication } else null else null);
+        defer artifacts.deinit();
+        if (enc_dec_mod.findEncoderDecoderPathsWithArtifacts(allocator, model_path, &artifacts)) |paths| {
             defer allocator.free(paths.encoder);
             defer allocator.free(paths.decoder);
 
-            const dec_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
+            for ([_][]const u8{ paths.encoder, paths.decoder }) |path| {
+                if (!std.mem.endsWith(u8, path, ".onnx")) continue;
+                try artifacts.verifyOnnx(path);
+            }
+            const config_bytes = artifacts.read("config.json", 16 * 1024 * 1024) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            defer if (config_bytes) |bytes| allocator.free(bytes);
+            const dec_config = if (config_bytes) |bytes| try enc_dec_mod.parseDecoderConfig(bytes) else enc_dec_mod.DecoderConfig{};
+            const preproc_bytes = artifacts.read("preprocessor_config.json", 16 * 1024 * 1024) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            defer if (preproc_bytes) |bytes| allocator.free(bytes);
+            const preproc = if (preproc_bytes) |bytes| try vision_config.parsePreprocessorConfig(allocator, bytes) else PreprocessorConfig{};
+            // Tokenizer construction reopens this pathname under our lease.
+            const tok = (try artifacts.resolve("tokenizer.json")) orelse return error.NoTokenizerFound;
+            defer allocator.free(tok);
+            try artifacts.verifyFile("tokenizer.json");
             var loader = try model_manager.componentLoaderForPaths(
                 model_path,
                 session_manager.preferred_backends,
                 &.{ paths.encoder, paths.decoder },
             );
-            return loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, loadPreprocessorConfig(allocator, model_path), &loader, null, control);
-        } else |_| {}
+            loader = loader.withArtifacts(&artifacts);
+            var reader = try loadEncoderDecoderPaths(allocator, model_path, paths.encoder, paths.decoder, dec_config, preproc, &loader, null, control);
+            errdefer reader.deinit();
+            try artifacts.verify();
+            if (control) |active| try active.verifyModelSelection(allocator, io, model_path);
+            return reader;
+        } else |err| switch (err) {
+            error.EncoderModelNotFound => {},
+            else => return err,
+        }
 
         var model_handle = (if (control) |active|
             model_manager.acquireFromDirWithControl(model_path, active)
@@ -331,6 +365,8 @@ pub const LoadedVisionReader = struct {
             self.florence_final_logits_bias_zero,
         );
         reader_pipeline.execution_control = options.execution_control;
+        reader_pipeline.preparation_parent = self.preparation_parent;
+        reader_pipeline.preparation_owner = self.preparation_owner;
         if (self.loaded_model) |model| {
             if (reading_pipeline_mod.nativeFlorencePreprocessOverlapEnabled(self.encoder_session))
                 reader_pipeline.native_execution_lane = &model.native_reader_execution_lane;

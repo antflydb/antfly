@@ -402,11 +402,7 @@ fn sha256FileHex(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn jsonEscape(writer: *std.Io.Writer, text: []const u8) !void {
-    for (text) |c| switch (c) {
-        '"' => try writer.writeAll("\\\""),
-        '\\' => try writer.writeAll("\\\\"),
-        else => try writer.writeByte(c),
-    };
+    try std.json.Stringify.encodeJsonStringChars(text, .{}, writer);
 }
 
 test "EmbeddingGemma 2 export validates strict PEFT contract" {
@@ -549,4 +545,17 @@ test "EmbeddingGemma 2 export preserves untouched bytes and publishes PEFT text-
     const actual_merged_identity = try sha256FileHex(allocator, merged_path);
     defer allocator.free(actual_merged_identity);
     try std.testing.expectEqualStrings(actual_merged_identity, merged_identity.string);
+}
+
+test "EmbeddingGemma 2 export JSON escaping round-trips control characters" {
+    const a = std.testing.allocator;
+    const raw = "nul\x00bell\x07esc\x1bnewline\nquote\"slash\\";
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try out.writer.writeByte('"');
+    try jsonEscape(&out.writer, raw);
+    try out.writer.writeByte('"');
+    const parsed = try std.json.parseFromSlice([]const u8, a, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(raw, parsed.value);
 }

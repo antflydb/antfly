@@ -203,6 +203,16 @@ def main():
             "MemorySupersessionCandidateRequest",
         ),
         ("MemoryEvaluationPolicyInput", "recall", "MemoryRecallRequest"),
+        ("MemoryEvaluationPolicyInput", "brief", "MemoryBriefRequest"),
+        ("MemoryStoredEvidence", "evidence", "MemoryEvidence"),
+        ("MemoryStoredEvidence", "materialization", "MemoryIntakeMaterialization"),
+        ("MemoryResolvedEntity", "entity", "MemoryEntity"),
+        ("MemoryResolvedEntity", "resource_ref", "ResourceReference"),
+        ("MemoryBriefItem", "utility", "MemoryUtility"),
+        ("MemoryConsolidation", "stats", "MemorySpaceStats"),
+        ("MemoryInspection", "statistics", "MemoryStatistics"),
+        ("MemoryStatistics", "stats", "MemorySpaceStats"),
+        ("MemoryUsage", "utility", "MemoryUtility"),
     ):
         schemas[owner]["properties"][field] = ref(target)
     for owner, field, target in (
@@ -216,6 +226,13 @@ def main():
         ("MemoryEvaluationTaskPage", "items", "MemoryEvaluationJudgeTask"),
         ("MemoryEvaluationSubmit", "verdicts", "MemoryEvaluationVerdict"),
         ("MemoryEvaluationResultPage", "items", "MemoryEvaluationResultEntry"),
+        ("MemoryBrief", "items", "MemoryBriefItem"),
+        ("MemoryBrief", "subjects", "MemorySubjectCount"),
+        ("MemorySpaceStats", "by_kind", "MemoryCount"),
+        ("MemorySpaceStats", "by_lifecycle", "MemoryCount"),
+        ("MemorySpaceStats", "by_stability", "MemoryCount"),
+        ("MemorySpaceStats", "by_producer", "MemoryCount"),
+        ("MemoryConsolidation", "findings", "MemoryFinding"),
     ):
         schemas[owner]["properties"][field]["items"] = ref(target)
     for field in (
@@ -294,6 +311,8 @@ def main():
             "listMemoryEntityProposals",
             "listMemoryEpisodes",
             "getMemoryEpisode",
+            "getMemoryBrief",
+            "getMemorySpace",
         ):
             fields = {
                 "cursor": {"type": "string"},
@@ -319,6 +338,20 @@ def main():
                     "type": "integer",
                     "format": "int64",
                     "x-go-type": "int64",
+                }
+            if name == "getMemoryBrief":
+                brief = schemas["MemoryBriefRequest"]["properties"]
+                fields = {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 64},
+                    "token_budget": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": brief["token_budget"]["maximum"],
+                    },
+                    "scope": {"type": "string"},
+                    "task": {"type": "string"},
+                    "environment": {"type": "string"},
+                    "include_provisional": {"type": "boolean"},
                 }
             if name == "listMemories":
                 fields.update(
@@ -371,7 +404,7 @@ def main():
             "tags": ["memory"],
             "parameters": params,
             "responses": {
-                "201" if name == "createMemorySpace" else "200": {
+                "201" if name in ("createMemorySpace", "putMemorySpace") else "200": {
                     "description": "Accepted durable operation or requested memory result.",
                     "content": {"application/json": {"schema": ref(response)}},
                 }
@@ -393,7 +426,20 @@ def main():
     operation(
         prefix, "post", "createMemorySpace", "MemoryCreateSpaceRequest", mutation=True
     )
+    operation(
+        prefix + "/{space}",
+        "put",
+        "putMemorySpace",
+        "MemorySpaceConfig",
+        mutation=True,
+    )
     operation(prefix + "/{space}", "get", "getMemorySpace", response="MemoryInspection")
+    operation(
+        prefix + "/{space}/memories/{id}/usage",
+        "get",
+        "getMemoryUsage",
+        response="MemoryUsage",
+    )
     operation(
         prefix + "/{space}",
         "patch",
@@ -408,6 +454,13 @@ def main():
         ("corrections", "correctMemory", "MemoryCorrection"),
         ("forget", "forgetMemory", "MemoryForgetRequest"),
         ("outcomes", "recordMemoryOutcome", "MemoryOutcome"),
+        ("pins", "pinMemory", "MemoryPin"),
+        ("accesses", "recordMemoryAccess", "MemoryAccess"),
+        (
+            "consolidation-proposals",
+            "prepareMemoryConsolidation",
+            "MemoryConsolidationRequest",
+        ),
     ):
         operation(prefix + "/{space}/" + suffix, "post", name, request, mutation=True)
     operation(
@@ -631,6 +684,23 @@ def main():
         prefix + "/{space}/memories", "get", "listMemories", response="MemoryRecordPage"
     )
     operation(
+        prefix + "/{space}/brief", "get", "getMemoryBrief", response="MemoryBrief"
+    )
+    operation(
+        prefix + "/{space}/brief",
+        "post",
+        "briefMemory",
+        "MemoryBriefRequest",
+        "MemoryBrief",
+    )
+    operation(
+        prefix + "/{space}/consolidation",
+        "post",
+        "consolidateMemory",
+        "MemoryConsolidationRequest",
+        "MemoryConsolidation",
+    )
+    operation(
         prefix + "/{space}/memories/{id}", "get", "getMemory", response="MemoryRecord"
     )
     operation(
@@ -664,7 +734,7 @@ def main():
         prefix + "/{space}/evidence/{id}",
         "get",
         "getMemoryEvidence",
-        response="MemoryResult",
+        response="MemoryStoredEvidence",
     )
     operation(
         prefix + "/{space}/entity-corrections",
@@ -677,7 +747,7 @@ def main():
         prefix + "/{space}/entities/{id}",
         "get",
         "resolveMemoryEntity",
-        response="MemoryResult",
+        response="MemoryResolvedEntity",
     )
     operation(
         prefix + "/{space}/entities",
@@ -707,8 +777,8 @@ def main():
     mcp_target = ROOT / "zig/pkg/antfly/src/api/generated/mcp_memory_tools.zig"
     mcp_output = (
         "// Generated by scripts/generate_memory_openapi.py from native operation contracts.\n"
-        "// Copyright 2026 Antfly, Inc.\n// SPDX-License-Identifier: Elastic-2.0\n"
-        "pub const Tool = struct { action: []const u8, name: []const u8, description: []const u8, input_schema_json: []const u8 };\n"
+        "// Copyright 2026 Antfly, Inc.\n// SPDX-License-Identifier: Apache-2.0\n"
+        "pub const Tool = struct { action: []const u8, name: []const u8, description: []const u8, input_schema_json: []const u8, agent: bool, agent_description: []const u8, agent_input_schema_json: []const u8 };\n"
         "pub const tools = [_]Tool{\n"
         + "".join(
             "    .{ "

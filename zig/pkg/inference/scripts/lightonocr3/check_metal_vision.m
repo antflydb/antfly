@@ -150,6 +150,9 @@ int main(void) {
         run_case(r, make_case(r, 1, 4095), YES);
         run_case(r, make_case(r, 1, 4096), YES);
         for (size_t heads = 12; heads <= 16; heads += 4) {
+            run_case(r, make_case_heads(r, 1, 4097, heads), YES);
+            run_case(r, make_case_heads(r, 1, 6528, heads), YES);
+            run_case(r, make_case_heads(r, 1, 16384, heads), YES);
             VisionCheck *invalid = make_case_heads(r, 1, 578, heads);
             ((float *)invalid->q.contents)[4 + 3] = NAN;
             ((float *)invalid->k.contents)[4 + ((578 / 2) * heads + 5) * 64 + 31] = INFINITY;

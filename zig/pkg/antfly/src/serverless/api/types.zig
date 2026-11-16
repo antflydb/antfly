@@ -27,6 +27,10 @@ pub const MutationKind = enum(u8) {
     checkpoint = 3,
     /// Internal self-contained derived output carrying admitted source cost.
     enriched = 4,
+    /// Atomic primary postimage plus direct outputs; private WAL format v5.
+    prepared = 5,
+    /// Durable catalog transition intent; private HEAD format 8.
+    catalog = 6,
 };
 
 pub const DocumentMutation = struct {
@@ -42,6 +46,7 @@ pub const DocumentMutation = struct {
 };
 
 pub const IngestBatchRequest = struct {
+    operation_id: ?[]const u8 = null,
     namespace: []const u8,
     timestamp_ns: u64,
     mutations: []const DocumentMutation,
@@ -252,6 +257,7 @@ pub const TableIngestBatchRequest = struct {
 /// paths, so it intentionally does not carry public JSON shape semantics.
 pub const TableIngestBatchDomainRequest = struct {
     table_name: []const u8,
+    operation_id: ?[]const u8 = null,
     timestamp_ns: u64,
     mutations: []const DocumentMutation,
 };

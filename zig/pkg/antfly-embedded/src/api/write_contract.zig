@@ -210,9 +210,7 @@ pub fn objectIsModelBackedAssetEnrichment(alloc: std.mem.Allocator, object: std.
     if (producer_cfg.type == .document_extraction) {
         var extraction_cfg = document_extraction_mod.parseConfig(alloc, producer_cfg.config_json) catch return false;
         defer extraction_cfg.deinit(alloc);
-        return extraction_cfg.ocr_enabled or
-            extraction_cfg.ocr_pdf_fallback_enabled or
-            extraction_cfg.transcription_enabled;
+        return extraction_cfg.ocr_enabled or extraction_cfg.transcription_enabled;
     }
     return producer_cfg.type != .copy;
 }

@@ -21,9 +21,14 @@ export interface SqlDiagnostic {
 }
 export class SqlError extends Error {
   readonly sqlstate: string;
+  /**
+   * @param outcomeReceipt Set when an autocommit write ended with an unknown
+   *   outcome; resolve it later with `Database.outcomeReceiptStatus()`.
+   */
   constructor(
     readonly diagnostic: SqlDiagnostic,
-    readonly transactionId?: string
+    readonly transactionId?: string,
+    readonly outcomeReceipt?: string
   ) {
     super(`${diagnostic.code}: ${diagnostic.message}`);
     this.name = "SqlError";
@@ -33,12 +38,16 @@ export class SqlError extends Error {
 export interface SqlColumn {
   name: string;
   type: string;
+  element_type?: string;
 }
 export interface SqlResult<Row = Record<string, unknown>> {
   columns: readonly SqlColumn[];
   rows: Row[];
   rowsAffected: bigint;
   commandTag: string;
+  /** Native write disposition; callers must not retry an uncertain write. */
+  mutationOutcome?: string | null;
+  ddlReceipt?: Readonly<Record<string, unknown>> | null;
 }
 export interface WireResult {
   columns: SqlColumn[];
@@ -46,4 +55,6 @@ export interface WireResult {
   sql_nulls: boolean[][] | null;
   rows_affected: number;
   command_tag: string;
+  mutation_outcome?: string | null;
+  ddl_receipt?: Readonly<Record<string, unknown>> | null;
 }

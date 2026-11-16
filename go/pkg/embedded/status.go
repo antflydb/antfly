@@ -135,6 +135,7 @@ type Capabilities struct {
 // work. The nested maintenance telemetry is intentionally retained as raw JSON
 // because it is operational detail rather than control-plane contract.
 type PendingWorkStatus struct {
+	BackgroundPublications              json.RawMessage   `json:"background_publications,omitempty"`
 	DerivedTargetSequence               uint64            `json:"derived_target_sequence"`
 	HasAsyncIndexes                     bool              `json:"has_async_indexes"`
 	PortableImportPublicationInProgress bool              `json:"portable_import_publication_in_progress"`

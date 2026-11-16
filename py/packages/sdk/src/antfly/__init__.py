@@ -8,6 +8,7 @@ from .client import (
     CreateIndexRequest,
     EmbedderConfig,
     EmbedderProvider,
+    GraphExecutionError,
     GraphQueriesInput,
     GraphQueryInput,
     IndexEmbedderConfig,
@@ -16,6 +17,7 @@ from .client import (
     antfly_embedder,
 )
 from .client_generated.models import (
+    CommitRequires,
     CreateAlgebraicIndexRequest,
     CreateAlgebraicIndexRequestType,
     CreatedAlgebraicIndex,
@@ -48,6 +50,16 @@ from .client_generated.models import (
     EntityDistinctRequest,
     EntitySuppressRequest,
     EntitySuppressRequestAbsorbed,
+    GraphCatalogEntry,
+    GraphDefinition,
+    GraphLabelMapping,
+    GraphQueryLimits,
+    GraphQueryRequest,
+    GraphQueryResult,
+    GraphQueryStats,
+    GraphRelationshipMapping,
+    GraphWireValue,
+    GraphWriteReceipt,
     IndexMaintenanceOwnerProof,
     IndexMaintenanceRequest,
     IndexMaintenanceResponse,
@@ -138,11 +150,26 @@ from .index_config import (
 )
 from .native_kv import NativeKvCheckpoint
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 from .read_requirements import read_after_write
 
 __all__ = [
+    "CommitRequires",
+    "GraphCatalogEntry",
+    "GraphDefinition",
+    "GraphLabelMapping",
+    "GraphRelationshipMapping",
+    "GraphQueryRequest",
+    "GraphQueryResult",
+    "GraphQueryLimits",
+    "GraphQueryStats",
+    "GraphWireValue",
+    "GraphWriteReceipt",
+    "GraphExecutionError",
+    "GraphOperations",
+    "encode_graph_parameter",
+    "decode_graph_value",
     "NativeKvCheckpoint",
     "CurationOriginOrigin",
     "CurationProposalAction",
@@ -294,6 +321,7 @@ from .client_generated.models import (
     ResolverUnmergeRequest,
     ResolverWait,
 )
+from .cypher import GraphOperations, decode_graph_value, encode_graph_parameter
 from .resolvers import CurationProposalOperations, EntityOperations, ResolverOperations
 
 __all__ += [
@@ -331,3 +359,7 @@ __all__ += ["resource_reference", "trace_event"]
 from .exceptions import AntflyHTTPError, AntflyNotFoundError, AntflyResponseError
 
 __all__ += ["AntflyHTTPError", "AntflyNotFoundError", "AntflyResponseError"]
+
+from .time_series import fixed_duration_nanoseconds, series_query
+
+__all__ += ["fixed_duration_nanoseconds", "series_query"]

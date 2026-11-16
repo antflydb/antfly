@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "antfly-sdk"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "http",
@@ -94,6 +94,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "syn",
  "tokio",
 ]

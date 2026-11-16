@@ -21,6 +21,7 @@
 //! or retaining a second heap copy.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 
 const Allocator = std.mem.Allocator;
 const magic: [4]u8 = "AFCD".*;
@@ -153,6 +154,60 @@ pub const Writer = struct {
     }
 };
 
+/// Emits the existing directory format while retaining one centroid block.
+/// The caller supplies a seekable atomic sink for the final fixed header.
+pub const StreamingWriter = struct {
+    buffered: Writer,
+    offset: usize,
+    prefix: usize = 0,
+
+    pub const Finish = struct { offset: usize, len: usize, checksum: u32 };
+
+    pub fn init(alloc: Allocator, sink: anytype, dims: usize, metric: u8, block_size: usize) !StreamingWriter {
+        var buffered = try Writer.init(alloc, dims, metric, block_size);
+        errdefer buffered.deinit();
+        const offset = sink.len();
+        try sink.appendSlice(buffered.out.items);
+        buffered.out.clearRetainingCapacity();
+        try appendZeros(alloc, &buffered.out, header_size);
+        return .{ .buffered = buffered, .offset = offset, .prefix = header_size };
+    }
+
+    pub fn deinit(self: *StreamingWriter) void {
+        self.buffered.deinit();
+    }
+
+    pub fn append(self: *StreamingWriter, sink: anytype, id: u64, radius: f32, centroid: []const f32, measure: f32) !void {
+        try self.buffered.append(id, radius, centroid, measure);
+        if (self.buffered.posting_ids.items.len == 0) try self.drain(sink);
+    }
+
+    fn drain(self: *StreamingWriter, sink: anytype) !void {
+        try sink.appendSlice(self.buffered.out.items[self.prefix..]);
+        self.buffered.out.clearRetainingCapacity();
+        self.prefix = (sink.len() - self.offset) % block_alignment;
+        try appendZeros(self.buffered.alloc, &self.buffered.out, self.prefix);
+    }
+
+    pub fn finish(self: *StreamingWriter, sink: anytype) !Finish {
+        if (self.buffered.finished) return error.CentroidDirectoryWriterFinished;
+        try self.buffered.flushBlock();
+        try self.drain(sink);
+        self.buffered.finished = true;
+        var header: [header_size]u8 = @splat(0);
+        @memcpy(header[0..4], &magic);
+        writeU16(&header, 4, version);
+        header[6] = self.buffered.metric;
+        writeU32(&header, 8, @intCast(self.buffered.dims));
+        writeU32(&header, 12, @intCast(self.buffered.block_size));
+        writeU64(&header, 16, self.buffered.posting_count);
+        writeU32(&header, 24, self.buffered.block_count);
+        try sink.writeAt(self.offset, &header);
+        const len = sink.len() - self.offset;
+        return .{ .offset = self.offset, .len = len, .checksum = try sink.crc32Range(self.offset, len) };
+    }
+};
+
 pub const Block = struct {
     posting_ids: []const u64,
     covering_radii: []const f32,
@@ -280,4 +335,45 @@ test "exact centroid directory rejects truncation" {
     const encoded = try writer.build();
     defer alloc.free(encoded);
     try std.testing.expectError(error.InvalidCentroidDirectory, Reader.init(encoded[0 .. encoded.len - 1]));
+}
+
+test "streaming centroid directory preserves the existing format across blocks" {
+    const Sink = struct {
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        fn len(self: *@This()) usize {
+            return self.bytes.items.len;
+        }
+        fn appendSlice(self: *@This(), bytes: []const u8) !void {
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+        fn writeAt(self: *@This(), offset: usize, bytes: []const u8) !void {
+            @memcpy(self.bytes.items[offset..][0..bytes.len], bytes);
+        }
+        fn crc32Range(self: *@This(), offset: usize, length: usize) !u32 {
+            return Crc32.hash(self.bytes.items[offset..][0..length]);
+        }
+    };
+    for ([_]usize{ 0, 1, 3, 4, 7 }) |count| {
+        var sink: Sink = .{};
+        defer sink.bytes.deinit(std.testing.allocator);
+        try sink.bytes.appendNTimes(std.testing.allocator, 0, 64);
+        var streamed = try StreamingWriter.init(std.testing.allocator, &sink, 2, 0, 3);
+        defer streamed.deinit();
+        var buffered = try Writer.init(std.testing.allocator, 2, 0, 3);
+        defer buffered.deinit();
+        for (0..count) |i| {
+            const centroid = [_]f32{ @floatFromInt(i), 1 };
+            try streamed.append(&sink, i + 1, 2, &centroid, 3);
+            try buffered.append(i + 1, 2, &centroid, 3);
+        }
+        const finish = try streamed.finish(&sink);
+        const expected = try buffered.build();
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqual(@as(usize, 64), finish.offset);
+        try std.testing.expectEqualSlices(u8, expected, sink.bytes.items[64..]);
+        try std.testing.expectEqual(Crc32.hash(expected), finish.checksum);
+        const reader = try Reader.init(sink.bytes.items[64..]);
+        try std.testing.expectEqual(count, reader.posting_count);
+        try std.testing.expectError(error.CentroidDirectoryWriterFinished, streamed.finish(&sink));
+    }
 }

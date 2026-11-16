@@ -5,7 +5,7 @@ go 1.26.0
 replace github.com/antflydb/antfly/go/pkg/sdk => ../../sdk
 
 require (
-	github.com/antflydb/antfly/go/pkg/sdk v0.0.1
+	github.com/antflydb/antfly/go/pkg/sdk v0.2.0
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/firebase/genkit/go v1.5.0
 	github.com/stretchr/testify v1.11.1

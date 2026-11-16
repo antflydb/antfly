@@ -1856,7 +1856,7 @@ pub const Executor = struct {
         defer self.alloc.free(dsn_z);
         const conn = self.pqconnectdb(dsn_z.ptr) orelse return error.ForeignConnectionFailed;
         if (self.pqstatus(conn) != CONNECTION_OK) {
-            _ = self.pqerrorMessage(conn);
+            self.logConnectFailure(conn, dsn);
             self.pqfinish(conn);
             return error.ForeignConnectionFailed;
         }
@@ -1864,6 +1864,25 @@ pub const Executor = struct {
         errdefer self.alloc.free(owned_dsn);
         try self.connections.put(self.alloc, owned_dsn, conn);
         return conn;
+    }
+
+    /// Keep PostgreSQL's reason (for example "permission denied to start WAL
+    /// sender" or "connection refused") in the Antfly log; the returned error
+    /// only names the class. libpq's conninfo/URI parsers can echo raw
+    /// credential text in their diagnostics -- an invalid percent-encoded
+    /// byte inside a URI password, for instance, is reported by quoting that
+    /// password token verbatim -- and `dsn` may already carry a secret
+    /// resolved from the keystore, so the message is sanitized before it
+    /// ever reaches the log rather than trusted to omit credentials.
+    fn logConnectFailure(self: *@This(), conn: *PGconn, dsn: []const u8) void {
+        const message = std.mem.trim(u8, std.mem.span(self.pqerrorMessage(conn)), " \t\r\n");
+        if (message.len == 0) return;
+        const sanitized = sanitizeConnectionErrorAlloc(self.alloc, message, dsn) catch {
+            std.log.warn("postgres libpq connect failed: [redacted: could not sanitize connection error]", .{});
+            return;
+        };
+        defer self.alloc.free(sanitized);
+        std.log.warn("postgres libpq connect failed: {s}", .{sanitized});
     }
 
     fn connectWithDeadline(self: *@This(), dsn: []const u8, execution_deadline_ns: ?u64) !?*PGconn {
@@ -1883,7 +1902,10 @@ pub const Executor = struct {
         while (true) {
             const polling_status = self.pqconnectPoll(conn);
             switch (polling_status) {
-                0 => return error.ForeignConnectionFailed,
+                0 => {
+                    self.logConnectFailure(conn, dsn);
+                    return error.ForeignConnectionFailed;
+                },
                 1 => try self.waitForSocket(conn, std.posix.POLL.IN, deadline_ns),
                 2 => try self.waitForSocket(conn, std.posix.POLL.OUT, deadline_ns),
                 3 => break,
@@ -1894,7 +1916,10 @@ pub const Executor = struct {
                 else => return error.ForeignConnectionFailed,
             }
         }
-        if (self.pqstatus(conn) != CONNECTION_OK) return error.ForeignConnectionFailed;
+        if (self.pqstatus(conn) != CONNECTION_OK) {
+            self.logConnectFailure(conn, dsn);
+            return error.ForeignConnectionFailed;
+        }
         if (self.pqsetnonblocking(conn, 0) != 0) return error.ForeignConnectionFailed;
 
         const owned_dsn = try self.alloc.dupe(u8, dsn);
@@ -1924,7 +1949,10 @@ pub const Executor = struct {
         while (true) {
             try ensureNotCancelled(cancellation);
             switch (self.pqconnectPoll(conn)) {
-                0 => return error.ForeignConnectionFailed,
+                0 => {
+                    self.logConnectFailure(conn, dsn);
+                    return error.ForeignConnectionFailed;
+                },
                 1 => try self.waitForSocketCancellable(conn, std.posix.POLL.IN, execution_deadline_ns, cancellation),
                 2 => try self.waitForSocketCancellable(conn, std.posix.POLL.OUT, execution_deadline_ns, cancellation),
                 3 => break,
@@ -1935,7 +1963,10 @@ pub const Executor = struct {
                 else => return error.ForeignConnectionFailed,
             }
         }
-        if (self.pqstatus(conn) != CONNECTION_OK) return error.ForeignConnectionFailed;
+        if (self.pqstatus(conn) != CONNECTION_OK) {
+            self.logConnectFailure(conn, dsn);
+            return error.ForeignConnectionFailed;
+        }
         return conn;
     }
 
@@ -2003,7 +2034,7 @@ pub const Executor = struct {
         defer alloc.free(dsn_z);
         const conn = self.pqconnectdb(dsn_z.ptr) orelse return error.ForeignConnectionFailed;
         if (self.pqstatus(conn) != CONNECTION_OK) {
-            _ = self.pqerrorMessage(conn);
+            self.logConnectFailure(conn, dsn);
             self.pqfinish(conn);
             return error.ForeignConnectionFailed;
         }
@@ -2905,6 +2936,1082 @@ pub const Executor = struct {
         );
     }
 };
+
+// --- Connection-error sanitization -----------------------------------------
+//
+// libpq's conninfo and URI parsers can put raw credential text straight into
+// their diagnostic messages. For example, an invalid percent-encoded byte in
+// a URI password is reported by quoting that password token verbatim (e.g.
+// `invalid percent-encoded token: "p%zzw0rd"`, or just `"%z"` for a
+// one-character password), and some conninfo errors quote the whole
+// offending connection string. Any of that text may also be a secret
+// resolved from the keystore, since by the time it reaches libpq the DSN
+// has already had `${secret:...}` references substituted in. None of this
+// can be fixed by trusting libpq to omit passwords, so every connection-
+// error message is sanitized here before it is logged.
+//
+// Two different matching strategies are combined because they trade off
+// safety against coverage in opposite directions:
+//   - Blanket literal substring matching (`redactLiteralSecretsAlloc`) can
+//     scan the whole free-form message, but is only safe for credentials at
+//     or above `min_blanket_literal_secret_len`: a one- or two-character
+//     credential would also match incidental characters inside unrelated
+//     words (an "u" username turning "refused" into "ref[redacted]sed").
+//   - Quoted-token matching (`redactQuotedCredentialTokensAlloc`) is safe at
+//     any length, including a single character, because it only touches
+//     text libpq has already set off in quotes as an echoed token -- it
+//     never reaches into unquoted free text, so it cannot mangle a word
+//     like "refused" or a quoted hostname like `"host"`.
+// Together they catch both a long password sitting in plain text and a
+// short one libpq only ever shows inside a quoted diagnostic token.
+
+/// Upper bound on the sanitized connection-error text handed to the log.
+const max_sanitized_connection_error_len: usize = 300;
+
+/// Minimum credential length eligible for blanket free-text literal
+/// redaction. See the module comment above for why short credentials are
+/// instead left to the quoted-token and structural passes.
+const min_blanket_literal_secret_len: usize = 3;
+
+/// Redacts credential material from a libpq connection-error `message`
+/// produced while attempting to connect with `dsn`. Returns a newly
+/// allocated, length-bounded string that keeps the useful parts of the
+/// error (host, port, database, libpq's stated reason) but never contains
+/// the password, the user when it carries a password, or the full
+/// connection string.
+fn sanitizeConnectionErrorAlloc(alloc: Allocator, message: []const u8, dsn: []const u8) ![]u8 {
+    var secrets: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (secrets.items) |secret| alloc.free(secret);
+        secrets.deinit(alloc);
+    }
+    try collectDsnSecretsAlloc(alloc, dsn, &secrets);
+
+    var quoted_candidates: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (quoted_candidates.items) |candidate| alloc.free(candidate);
+        quoted_candidates.deinit(alloc);
+    }
+    try collectDsnQuotedCandidatesAlloc(alloc, dsn, &quoted_candidates);
+
+    // `working` changes owner at every reassignment below: the old buffer is
+    // freed explicitly right after each pass succeeds, immediately before
+    // `working` is pointed at the new one, so there is never a moment where
+    // `working` names a stale or already-freed buffer. That means a single
+    // `errdefer` registered here, naming the variable (not a snapshot of its
+    // current value), correctly frees whichever buffer is live if any later
+    // pass fails -- including the truncation path at the end of this
+    // function, which allocates one more buffer before freeing `working`.
+    var working = try redactLiteralSecretsAlloc(alloc, message, secrets.items);
+    errdefer alloc.free(working);
+
+    const quoted_redacted = try redactQuotedCredentialTokensAlloc(alloc, working, quoted_candidates.items);
+    alloc.free(working);
+    working = quoted_redacted;
+
+    const uri_redacted = try redactUriCredentialsAlloc(alloc, working);
+    alloc.free(working);
+    working = uri_redacted;
+
+    const kv_redacted = try redactConninfoPasswordFieldsAlloc(alloc, working);
+    alloc.free(working);
+    working = kv_redacted;
+
+    // Defensive final pass: some libpq conninfo diagnostics quote the whole
+    // attempted connection string rather than just the offending field.
+    if (dsn.len > 0) {
+        const literal: [1][]const u8 = .{dsn};
+        const dsn_redacted = try redactLiteralSecretsAlloc(alloc, working, &literal);
+        alloc.free(working);
+        working = dsn_redacted;
+    }
+
+    if (working.len <= max_sanitized_connection_error_len) return working;
+    const ellipsis = "...";
+    const truncated = try alloc.alloc(u8, max_sanitized_connection_error_len);
+    @memcpy(truncated, working[0..max_sanitized_connection_error_len]);
+    if (truncated.len > ellipsis.len) {
+        @memcpy(truncated[truncated.len - ellipsis.len ..], ellipsis);
+    }
+    alloc.free(working);
+    return truncated;
+}
+
+/// Extracts the literal credential substrings carried by `dsn` that are
+/// long enough to redact as blanket free-text literals (see
+/// `min_blanket_literal_secret_len`) -- the password for URI-style DSNs, or
+/// the `password=` value for key/value conninfo strings -- so they can be
+/// redacted wherever they appear in a libpq error message, even if libpq
+/// echoes only a fragment rather than the whole connection string. The
+/// username is deliberately never included here; `redactUriCredentialsAlloc`
+/// redacts it structurally instead, only when it appears as part of a
+/// `user:password@` URI fragment.
+fn collectDsnSecretsAlloc(alloc: Allocator, dsn: []const u8, out: *std.ArrayListUnmanaged([]const u8)) !void {
+    if (isPostgresUri(dsn)) {
+        try collectUriCredentialsAlloc(alloc, dsn, min_blanket_literal_secret_len, false, out);
+    } else {
+        try collectConninfoCredentialsAlloc(alloc, dsn, min_blanket_literal_secret_len, out);
+    }
+}
+
+/// Extracts credential text from `dsn` for matching against text libpq has
+/// already set off in quotes as an echoed token (see
+/// `redactQuotedCredentialTokensAlloc`). Unlike `collectDsnSecretsAlloc`,
+/// there is no minimum length -- a quoted match is safe at any length,
+/// including a single character -- and the full `user:password` userinfo is
+/// included for URI-style DSNs in case libpq quotes it together rather than
+/// the password alone.
+fn collectDsnQuotedCandidatesAlloc(alloc: Allocator, dsn: []const u8, out: *std.ArrayListUnmanaged([]const u8)) !void {
+    if (isPostgresUri(dsn)) {
+        try collectUriCredentialsAlloc(alloc, dsn, 1, true, out);
+    } else {
+        try collectConninfoCredentialsAlloc(alloc, dsn, 1, out);
+    }
+}
+
+fn isPostgresUri(dsn: []const u8) bool {
+    return std.mem.startsWith(u8, dsn, "postgres://") or std.mem.startsWith(u8, dsn, "postgresql://");
+}
+
+/// Index just past the end of the authority component (host[:port], plus an
+/// optional "user[:password]@" prefix) of a URI with its scheme stripped off.
+fn uriAuthorityLen(rest: []const u8) usize {
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        switch (rest[i]) {
+            '/', '?' => return i,
+            else => {},
+        }
+    }
+    return rest.len;
+}
+
+/// Extracts the password (and, when `include_userinfo` is set, the full
+/// `user:password` userinfo text) from a URI-style `dsn`, plus any
+/// credential-bearing query parameter (see `collectUriQueryCredentialsAlloc`).
+/// Only candidates at least `min_password_len` long are collected, letting
+/// callers choose between a safety floor for blanket free-text matching and
+/// no floor at all for quoted-token matching.
+fn collectUriCredentialsAlloc(
+    alloc: Allocator,
+    dsn: []const u8,
+    min_password_len: usize,
+    include_userinfo: bool,
+    out: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const scheme_end = std.mem.indexOf(u8, dsn, "://") orelse return;
+    const authority_start = scheme_end + 3;
+    if (authority_start > dsn.len) return;
+    const rest = dsn[authority_start..];
+    const authority_len = uriAuthorityLen(rest);
+    const authority = rest[0..authority_len];
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| {
+        const userinfo = authority[0..at];
+        if (userinfo.len != 0) {
+            if (include_userinfo) try appendOwnedDupe(alloc, out, userinfo);
+            if (std.mem.indexOfScalar(u8, userinfo, ':')) |colon| {
+                const password = userinfo[colon + 1 ..];
+                if (password.len >= min_password_len) try appendOwnedDupe(alloc, out, password);
+            }
+        }
+    }
+    // The authority may carry no "user[:password]@" prefix at all, but a
+    // query-string password can still be present, e.g.
+    // `postgresql://localhost/db?password=secret`; `rest[authority_len..]`
+    // is the `/path?query` tail that follows the authority. libpq has no
+    // fragment component: a literal # remains part of its current field.
+    try collectUriQueryCredentialsAlloc(alloc, rest[authority_len..], min_password_len, out);
+}
+
+/// Duplicates `value` and appends it to `out`, transferring ownership of the
+/// duplicate to `out` only once the append has actually succeeded. Appending
+/// `try alloc.dupe(...)` directly as a call argument would instead leak the
+/// duplicate if `dupe` succeeds but the list's subsequent growth fails.
+fn appendOwnedDupe(alloc: Allocator, out: *std.ArrayListUnmanaged([]const u8), value: []const u8) !void {
+    const owned = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned);
+    try out.append(alloc, owned);
+}
+
+/// Duplicates `value` moved out of `buf` (whose storage `buf.toOwnedSlice`
+/// transfers) and appends it to `out`, freeing the slice rather than leaking
+/// it if the append fails.
+fn appendOwnedSlice(alloc: Allocator, out: *std.ArrayListUnmanaged([]const u8), buf: *std.ArrayListUnmanaged(u8)) !void {
+    const owned = try buf.toOwnedSlice(alloc);
+    errdefer alloc.free(owned);
+    try out.append(alloc, owned);
+}
+
+/// libpq URI query-parameter keywords that carry credential material: the
+/// database `password`, and `sslpassword`, the passphrase used to decrypt a
+/// client certificate private key named by `sslkey`. See
+/// `conninfo_uri_parse_params` in libpq's fe-connect.c for the full set of
+/// keywords a URI query string may carry; these are the only two that hold a
+/// secret libpq might echo back in a diagnostic. libpq's own keyword lookup
+/// (`conninfo_find`, used after `conninfo_uri_decode` has decoded the key)
+/// is a case-sensitive `strcmp` against exactly these lowercase spellings.
+const uri_query_credential_keys = [_][]const u8{ "password", "sslpassword" };
+
+/// Case-insensitive check against `uri_query_credential_keys`. Used as a
+/// conservative baseline for a key exactly as written in the query string
+/// (no percent-decoding involved): libpq itself would reject an
+/// unexpectedly-cased *literal* key like `Password=...` as an unrecognized
+/// URI query parameter (case-sensitive `strcmp` in `conninfo_find`) and
+/// never treat its value as a real credential, but redacting it anyway
+/// costs nothing and errs on the side of caution.
+fn isUriQueryCredentialKeyIgnoreCase(key: []const u8) bool {
+    for (uri_query_credential_keys) |candidate_key| {
+        if (std.ascii.eqlIgnoreCase(key, candidate_key)) return true;
+    }
+    return false;
+}
+
+/// Case-sensitive check against `uri_query_credential_keys`, matching
+/// libpq's own `conninfo_find` (`strcmp`). Used for a key that has already
+/// been percent-decoded: at that point its casing is exactly what libpq
+/// would compare, so matching libpq's case sensitivity here (rather than
+/// the looser `isUriQueryCredentialKeyIgnoreCase` above) correctly leaves
+/// `%50assword` (which decodes to `Password`) unflagged -- see the test
+/// "...a decoded key libpq would reject as unrecognized due to case...".
+/// libpq would fail that connection attempt with "invalid URI query
+/// parameter" quoting the *key*, never touching the value as a credential.
+fn isUriQueryCredentialKeyExact(key: []const u8) bool {
+    for (uri_query_credential_keys) |candidate_key| {
+        if (std.mem.eql(u8, key, candidate_key)) return true;
+    }
+    return false;
+}
+
+/// Best-effort fallback for a URI query key whose percent-encoding is
+/// malformed, so `percentDecodeIfValidAlloc` fails with
+/// `error.InvalidPercentEncoding` -- the same condition under which libpq's
+/// `conninfo_uri_decode` aborts the whole connection attempt, quoting the
+/// raw key text itself rather than any value. We cannot know what the
+/// malformed escape was meant to decode to, so -- conservatively --
+/// percent-decode only the leading run of well-formed escapes (stopping at
+/// the first malformed one) and treat the key as a possible credential key
+/// if that decoded prefix is, case-insensitively, a prefix of (or equal to)
+/// one of `uri_query_credential_keys`. This catches realistic cases like
+/// `password%zz` (decoded prefix is the whole word "password") or
+/// `pass%zzword` (decoded prefix "pass" is a prefix of "password"), at the
+/// cost of being unable to recognize a malformed escape that would, if
+/// well-formed, fall strictly before the matching text (e.g. `%zzpassword`).
+fn couldDecodeToCredentialKeyAlloc(alloc: Allocator, key: []const u8) !bool {
+    var decoded_prefix: std.ArrayListUnmanaged(u8) = .empty;
+    defer decoded_prefix.deinit(alloc);
+    var i: usize = 0;
+    while (i < key.len) {
+        if (key[i] == '%') {
+            if (i + 2 < key.len) {
+                const hi = std.fmt.charToDigit(key[i + 1], 16) catch null;
+                const lo = std.fmt.charToDigit(key[i + 2], 16) catch null;
+                if (hi != null and lo != null) {
+                    try decoded_prefix.append(alloc, @intCast(hi.? * 16 + lo.?));
+                    i += 3;
+                    continue;
+                }
+            }
+            break; // malformed escape: stop decoding, keep what we have so far
+        }
+        try decoded_prefix.append(alloc, key[i]);
+        i += 1;
+    }
+    if (decoded_prefix.items.len == 0) return false;
+    for (uri_query_credential_keys) |candidate_key| {
+        if (decoded_prefix.items.len > candidate_key.len) continue;
+        if (std.ascii.eqlIgnoreCase(decoded_prefix.items, candidate_key[0..decoded_prefix.items.len])) return true;
+    }
+    return false;
+}
+
+/// Extracts credential values from the query-string portion of a URI-style
+/// DSN (`path_query` is everything after the authority, i.e.
+/// `/path?query`, possibly with no query at all). For each
+/// credential-bearing key (see `uri_query_credential_keys`) -- decoded
+/// first, the same way libpq's `conninfo_uri_parse_params` decodes the key
+/// before ever comparing it against a known keyword, so a percent-encoded
+/// key like `%70assword` is recognized as `password` -- collects the value
+/// exactly as written -- which is what libpq's `conninfo_uri_decode`
+/// echoes verbatim when the value contains an invalid percent-encoded
+/// sequence, e.g. `invalid percent-encoded token: "supersecret%zz"` -- and,
+/// separately, the percent-decoded value whenever the encoding is
+/// well-formed, since a successfully decoded password can surface in other
+/// diagnostics (for example an authentication failure reported with the
+/// decoded value). Malformed encoding is left undecoded rather than guessed
+/// at; only the raw form is collected for it. Only candidates at least
+/// `min_password_len` long are collected, matching
+/// `collectUriCredentialsAlloc`'s callers.
+fn collectUriQueryCredentialsAlloc(
+    alloc: Allocator,
+    path_query: []const u8,
+    min_password_len: usize,
+    out: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const query_start = std.mem.indexOfScalar(u8, path_query, '?') orelse return;
+    // libpq does not recognize URI fragments; # is literal credential text.
+    var query = path_query[query_start + 1 ..];
+    while (query.len > 0) {
+        const amp = std.mem.indexOfScalar(u8, query, '&');
+        const pair = if (amp) |idx| query[0..idx] else query;
+        query = if (amp) |idx| query[idx + 1 ..] else "";
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = pair[0..eq];
+        const value = pair[eq + 1 ..];
+        if (value.len == 0) continue;
+
+        // Conservative baseline: the key exactly as written, matched
+        // case-insensitively (see `isUriQueryCredentialKeyIgnoreCase`).
+        var is_credential = isUriQueryCredentialKeyIgnoreCase(key);
+        if (!is_credential) {
+            // Decode the key the way libpq does before comparing it, so
+            // e.g. `%70assword` is recognized as `password`. If the key's
+            // own encoding is malformed, libpq would abort the whole parse
+            // right there (quoting the key, not this value) -- but decide
+            // conservatively rather than assume the value is safe.
+            decode_key: {
+                var decoded_key = percentDecodeIfValidAlloc(alloc, key) catch |err| switch (err) {
+                    error.InvalidPercentEncoding => {
+                        is_credential = try couldDecodeToCredentialKeyAlloc(alloc, key);
+                        break :decode_key;
+                    },
+                    else => return err,
+                };
+                defer decoded_key.deinit(alloc);
+                is_credential = isUriQueryCredentialKeyExact(decoded_key.items);
+            }
+        }
+        if (!is_credential) continue;
+
+        if (value.len >= min_password_len) try appendOwnedDupe(alloc, out, value);
+
+        var decoded = percentDecodeIfValidAlloc(alloc, value) catch |err| switch (err) {
+            error.InvalidPercentEncoding => continue,
+            else => return err,
+        };
+        defer decoded.deinit(alloc);
+        if (decoded.items.len >= min_password_len and !std.mem.eql(u8, decoded.items, value)) {
+            try appendOwnedSlice(alloc, out, &decoded);
+        }
+    }
+}
+
+/// Percent-decodes `s`, returning `error.InvalidPercentEncoding` if any `%`
+/// is not followed by two valid hex digits -- matching libpq's
+/// `conninfo_uri_decode`, which treats that as malformed and echoes the
+/// original (undecoded) text rather than attempting a partial decode.
+fn percentDecodeIfValidAlloc(alloc: Allocator, s: []const u8) !std.ArrayListUnmanaged(u8) {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '%') {
+            if (i + 2 >= s.len) return error.InvalidPercentEncoding;
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch return error.InvalidPercentEncoding;
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch return error.InvalidPercentEncoding;
+            try out.append(alloc, @intCast(hi * 16 + lo));
+            i += 3;
+        } else {
+            try out.append(alloc, s[i]);
+            i += 1;
+        }
+    }
+    return out;
+}
+
+/// Extracts the `password=...` value from a key/value conninfo string,
+/// supporting both the quoted form (with backslash escapes) and the bare
+/// unquoted form. Collects both the raw-as-written and decoded forms, since
+/// libpq's diagnostics are not consistent about which one they echo. Only
+/// candidates at least `min_password_len` long are collected; see
+/// `collectUriCredentialsAlloc` for why callers choose different floors.
+fn collectConninfoCredentialsAlloc(alloc: Allocator, dsn: []const u8, min_password_len: usize, out: *std.ArrayListUnmanaged([]const u8)) !void {
+    var i: usize = 0;
+    while (i < dsn.len) {
+        while (i < dsn.len and std.ascii.isWhitespace(dsn[i])) i += 1;
+        if (i >= dsn.len) break;
+        const key_start = i;
+        while (i < dsn.len and dsn[i] != '=' and !std.ascii.isWhitespace(dsn[i])) i += 1;
+        const key = dsn[key_start..i];
+        while (i < dsn.len and std.ascii.isWhitespace(dsn[i])) i += 1;
+        if (i >= dsn.len or dsn[i] != '=') break; // not a well-formed token; stop rather than guess
+        i += 1;
+        while (i < dsn.len and std.ascii.isWhitespace(dsn[i])) i += 1;
+        const is_password = std.ascii.eqlIgnoreCase(key, "password");
+        if (i < dsn.len and (dsn[i] == '\'' or dsn[i] == '"')) {
+            const quote = dsn[i];
+            const raw_start = i + 1;
+            i += 1;
+            var decoded: std.ArrayListUnmanaged(u8) = .empty;
+            defer decoded.deinit(alloc);
+            while (i < dsn.len and dsn[i] != quote) {
+                if (dsn[i] == '\\' and i + 1 < dsn.len) {
+                    if (is_password) try decoded.append(alloc, dsn[i + 1]);
+                    i += 2;
+                } else {
+                    if (is_password) try decoded.append(alloc, dsn[i]);
+                    i += 1;
+                }
+            }
+            const raw_end = i;
+            if (i < dsn.len) i += 1; // consume closing quote
+            if (is_password) {
+                const raw = dsn[raw_start..raw_end];
+                if (raw.len >= min_password_len) try appendOwnedDupe(alloc, out, raw);
+                if (decoded.items.len >= min_password_len) {
+                    try appendOwnedSlice(alloc, out, &decoded);
+                }
+            }
+        } else {
+            const value_start = i;
+            while (i < dsn.len and !std.ascii.isWhitespace(dsn[i])) i += 1;
+            if (is_password) {
+                const value = dsn[value_start..i];
+                if (value.len >= min_password_len) try appendOwnedDupe(alloc, out, value);
+            }
+        }
+    }
+}
+
+/// Replaces every occurrence of any `secrets` entry in `message` with
+/// `[redacted]`, preferring the longest match at each position so that, for
+/// example, a captured "user:password" fragment is not left half-redacted by
+/// a shorter overlapping match.
+fn redactLiteralSecretsAlloc(alloc: Allocator, message: []const u8, secrets: []const []const u8) ![]u8 {
+    if (secrets.len == 0) return try alloc.dupe(u8, message);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < message.len) {
+        var matched_len: usize = 0;
+        for (secrets) |secret| {
+            if (secret.len == 0 or secret.len <= matched_len) continue;
+            if (i + secret.len <= message.len and std.mem.eql(u8, message[i .. i + secret.len], secret)) {
+                matched_len = secret.len;
+            }
+        }
+        if (matched_len > 0) {
+            try out.appendSlice(alloc, "[redacted]");
+            i += matched_len;
+        } else {
+            try out.append(alloc, message[i]);
+            i += 1;
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Redacts a quoted (`"..."` or `'...'`) token in `message` whenever its
+/// content is found inside one of `candidates` (the DSN's password and,
+/// for URI-style DSNs, the full `user:password` userinfo). This has no
+/// minimum length -- see the module comment above -- because it only ever
+/// touches text libpq has already set off in quotes as an echoed token, for
+/// example `invalid percent-encoded token: "%z"`; it never reaches into
+/// unquoted free text, so a one-character password is caught without
+/// risking a short username mangling unrelated words like "refused" or an
+/// unrelated quoted token like a hostname.
+fn redactQuotedCredentialTokensAlloc(alloc: Allocator, message: []const u8, candidates: []const []const u8) ![]u8 {
+    if (candidates.len == 0) return try alloc.dupe(u8, message);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < message.len) {
+        const quote = message[i];
+        if (quote != '"' and quote != '\'') {
+            try out.append(alloc, message[i]);
+            i += 1;
+            continue;
+        }
+        const span_len = conninfoValueLen(message[i..]);
+        // `conninfoValueLen` returns the whole message tail when it never
+        // finds a closing quote; only treat this as a quoted token when a
+        // matching close was actually found.
+        if (span_len < 2 or message[i + span_len - 1] != quote) {
+            try out.append(alloc, message[i]);
+            i += 1;
+            continue;
+        }
+        const token = message[i + 1 .. i + span_len - 1];
+        var matched = false;
+        if (token.len > 0) {
+            for (candidates) |candidate| {
+                if (candidate.len == 0) continue;
+                if (std.mem.indexOf(u8, candidate, token) != null) {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if (matched) {
+            try out.append(alloc, quote);
+            try out.appendSlice(alloc, "[redacted]");
+            try out.append(alloc, quote);
+        } else {
+            try out.appendSlice(alloc, message[i .. i + span_len]);
+        }
+        i += span_len;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn matchUriSchemeLen(s: []const u8) ?usize {
+    if (std.mem.startsWith(u8, s, "postgresql://")) return "postgresql://".len;
+    if (std.mem.startsWith(u8, s, "postgres://")) return "postgres://".len;
+    return null;
+}
+
+/// Index just past the end of a URI-looking token embedded in free-form text
+/// (a libpq error message), i.e. up to the next whitespace, closing
+/// quote/bracket, or comma.
+fn uriTokenLen(s: []const u8) usize {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        switch (s[i]) {
+            ' ', '\t', '\r', '\n', '"', '\'', ')', ']', ',' => return i,
+            else => {},
+        }
+    }
+    return s.len;
+}
+
+/// Scans `message` for `postgres://` / `postgresql://` tokens and redacts
+/// the userinfo (user and password) of each one in place, leaving the
+/// scheme, host, port, database, and query string untouched. This catches
+/// credentials in a connection URI even when they were not captured from the
+/// attempted DSN itself (for example, a message that names a different or
+/// only partially-parsed URI).
+fn redactUriCredentialsAlloc(alloc: Allocator, message: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < message.len) {
+        const scheme_len = matchUriSchemeLen(message[i..]) orelse {
+            try out.append(alloc, message[i]);
+            i += 1;
+            continue;
+        };
+        const token_len = uriTokenLen(message[i..]);
+        const token = message[i .. i + token_len];
+        const rest = token[scheme_len..];
+        const authority_len = uriAuthorityLen(rest);
+        const authority = rest[0..authority_len];
+        try out.appendSlice(alloc, token[0..scheme_len]);
+        if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| {
+            if (at > 0) try out.appendSlice(alloc, "[redacted]");
+            try out.appendSlice(alloc, "@");
+            try out.appendSlice(alloc, authority[at + 1 ..]);
+        } else {
+            try out.appendSlice(alloc, authority);
+        }
+        try out.appendSlice(alloc, rest[authority_len..]);
+        i += token_len;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Percent-decodes `s`, passing any malformed `%` escape through literally
+/// (just the `%` character, so decoding continues past it) rather than
+/// failing. Unlike `percentDecodeIfValidAlloc`, this never errors -- it is
+/// only used to decide, conservatively, whether free-form message text
+/// that libpq would itself treat as malformed could still read as a
+/// credential-bearing key; it never recovers an actual credential value.
+fn lenientPercentDecodeAlloc(alloc: Allocator, s: []const u8) !std.ArrayListUnmanaged(u8) {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '%' and i + 2 < s.len) {
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch null;
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch null;
+            if (hi != null and lo != null) {
+                try out.append(alloc, @intCast(hi.? * 16 + lo.?));
+                i += 3;
+                continue;
+            }
+        }
+        try out.append(alloc, s[i]);
+        i += 1;
+    }
+    return out;
+}
+
+/// True if `s`, compared case-insensitively, ends with "password". This is
+/// deliberately a suffix check rather than an exact-match one so a single
+/// test also covers `sslpassword` (which ends in "password") the same way
+/// `matchCredentialKeyLen` below covers both of `uri_query_credential_keys`
+/// with one check, while still rejecting a look-alike like
+/// "password_hash" (which does not end in "password").
+fn endsWithPasswordIgnoreCase(s: []const u8) bool {
+    const needle = "password";
+    if (s.len < needle.len) return false;
+    return std.ascii.eqlIgnoreCase(s[s.len - needle.len ..], needle);
+}
+
+/// Characters that can appear in a conninfo key or a URI query-string key,
+/// whether or not it is percent-encoded.
+fn credentialKeyTokenLen(s: []const u8) usize {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        switch (s[i]) {
+            'a'...'z', 'A'...'Z', '0'...'9', '%', '-', '_', '.', '~' => {},
+            else => break,
+        }
+    }
+    return i;
+}
+
+/// Returns the length of a conninfo/URI-query key token at the start of
+/// `s` whose decoded form ends in "password" -- covering both `password`
+/// and `sslpassword` (see `endsWithPasswordIgnoreCase`) -- including when
+/// the token is percent-encoded, e.g. `%70assword` or `%73slpassword`.
+/// This is defense in depth on top of `collectUriQueryCredentialsAlloc`:
+/// it scans the libpq-produced message text directly, so it also catches a
+/// credential-bearing key that message happens to quote even when it was
+/// not recognized while parsing `dsn` (for example a different URI quoted
+/// in the message, or a key `dsn`'s own parse never reached). A malformed
+/// escape inside the token is passed through literally rather than
+/// rejected (see `lenientPercentDecodeAlloc`), matching the conservative
+/// stance taken in `couldDecodeToCredentialKeyAlloc`.
+fn matchCredentialKeyLen(alloc: Allocator, s: []const u8) !?usize {
+    const token_len = credentialKeyTokenLen(s);
+    if (token_len == 0) return null;
+    const token = s[0..token_len];
+    if (std.mem.indexOfScalar(u8, token, '%') == null) {
+        // Fast, allocation-free path for the common literal case.
+        return if (endsWithPasswordIgnoreCase(token)) token_len else null;
+    }
+    var decoded = try lenientPercentDecodeAlloc(alloc, token);
+    defer decoded.deinit(alloc);
+    return if (endsWithPasswordIgnoreCase(decoded.items)) token_len else null;
+}
+
+/// Index just past the end of a conninfo-style value starting at `s`:
+/// a quoted (optionally backslash-escaped) run, or an unquoted run bounded
+/// by whitespace or a URI query-string separator.
+fn conninfoValueLen(s: []const u8) usize {
+    if (s.len == 0) return 0;
+    if (s[0] == '\'' or s[0] == '"') {
+        const quote = s[0];
+        var i: usize = 1;
+        while (i < s.len) {
+            if (s[i] == '\\' and i + 1 < s.len) {
+                i += 2;
+                continue;
+            }
+            if (s[i] == quote) {
+                i += 1;
+                break;
+            }
+            i += 1;
+        }
+        return i;
+    }
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        switch (s[i]) {
+            ' ', '\t', '\r', '\n', '&', ')', ']', ',' => return i,
+            else => {},
+        }
+    }
+    return s.len;
+}
+
+/// Redacts `password=value` (quoted or unquoted) fragments anywhere in
+/// `message`, such as a conninfo key/value pair or a URI query parameter --
+/// including a percent-encoded key spelling like `%70assword=` (see
+/// `matchCredentialKeyLen`). The key and `=` are kept so the reader can
+/// still see a password was present; only the value is replaced.
+fn redactConninfoPasswordFieldsAlloc(alloc: Allocator, message: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < message.len) {
+        // Consume each token once. Retrying at every suffix would repeatedly
+        // scan and percent-decode a long malformed key (quadratic work) before
+        // the final output-length cap is applied.
+        const token_len = credentialKeyTokenLen(message[i..]);
+        if (token_len == 0) {
+            try out.append(alloc, message[i]);
+            i += 1;
+            continue;
+        }
+        const token = message[i .. i + token_len];
+        const key_len = (try matchCredentialKeyLen(alloc, token)) orelse {
+            try out.appendSlice(alloc, token);
+            i += token_len;
+            continue;
+        };
+        var j = i + key_len;
+        while (j < message.len and (message[j] == ' ' or message[j] == '\t')) j += 1;
+        if (j >= message.len or message[j] != '=') {
+            try out.appendSlice(alloc, token);
+            i += token_len;
+            continue;
+        }
+        j += 1;
+        while (j < message.len and (message[j] == ' ' or message[j] == '\t')) j += 1;
+        const value_len = conninfoValueLen(message[j..]);
+        try out.appendSlice(alloc, message[i .. i + key_len]);
+        try out.appendSlice(alloc, "=[redacted]");
+        i = j + value_len;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+test "postgres libpq connection-error sanitizer redacts a malformed percent-encoded URI password" {
+    const alloc = std.testing.allocator;
+    const dsn = "postgres://u:p%zzw0rd@h/db";
+    const message = "invalid percent-encoded token: \"p%zzw0rd\"";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "p%zzw0rd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "invalid percent-encoded token") != null);
+}
+
+test "postgres libpq connection-error sanitizer redacts a one-character malformed-escape password" {
+    const alloc = std.testing.allocator;
+    const dsn = "postgres://u:%z@h/db";
+    const message = "invalid percent-encoded token: \"%z\"";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "%z") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "invalid percent-encoded token") != null);
+}
+
+test "postgres libpq connection-error sanitizer redacts a two-character trailing-escape password" {
+    const alloc = std.testing.allocator;
+    const dsn = "postgres://u:a%@h/db";
+    const message = "invalid percent-encoded token: \"a%\"";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "a%") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "invalid percent-encoded token") != null);
+}
+
+test "postgres libpq connection-error sanitizer keeps an unrelated quoted token intact with a one-character username" {
+    const alloc = std.testing.allocator;
+    const dsn = "postgres://u:a-genuinely-long-realistic-password-123@host:5432/db";
+    const message = "connection to server at \"host\" (1.2.3.4), port 5432 failed: Connection refused\n" ++
+        "\tIs the server running on that host and accepting TCP/IP connections?";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "a-genuinely-long-realistic-password-123") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "Connection refused") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "\"host\"") != null);
+}
+
+test "postgres libpq connection-error sanitizer redacts credentials from an embedded malformed URI" {
+    const alloc = std.testing.allocator;
+    const dsn = "postgres://u:p%zzw0rd@h/db";
+    const message = "invalid percent-encoded token: \"postgres://u:p%zzw0rd@h/db\"";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "p%zzw0rd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "u:p") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "h/db") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "invalid percent-encoded token") != null);
+}
+
+test "postgres libpq connection-error sanitizer keeps the reason for an unrelated failure with a valid password" {
+    const alloc = std.testing.allocator;
+    const dsn = "postgres://u:realpass@host:5432/db";
+    const message = "connection to server at \"host\" (1.2.3.4), port 5432 failed: Connection refused\n" ++
+        "\tIs the server running on that host and accepting TCP/IP connections?";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "realpass") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "Connection refused") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "port 5432") != null);
+}
+
+test "postgres libpq connection-error sanitizer redacts key/value conninfo password fragments" {
+    const alloc = std.testing.allocator;
+    const dsn = "host=h dbname=db user=u password='sec ret'";
+    const message = "connection info string contains password='sec ret' near \"password\": " ++
+        "FATAL: password authentication failed";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "sec ret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "password authentication failed") != null);
+}
+
+test "postgres libpq connection-error sanitizer redacts a secret-store-resolved password literal" {
+    const alloc = std.testing.allocator;
+    const secret_value = "kv-resolved-S3cr3t!";
+    const dsn = try std.fmt.allocPrint(alloc, "postgres://svc:{s}@db.internal:5432/app", .{secret_value});
+    defer alloc.free(dsn);
+    const message = try std.fmt.allocPrint(alloc, "could not parse connection string: \"{s}\"", .{dsn});
+    defer alloc.free(message);
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, secret_value) == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "could not parse connection string") != null);
+}
+
+test "postgres libpq connection-error sanitizer bounds output length" {
+    const alloc = std.testing.allocator;
+    const dsn = "postgres://u:realpass@host/db";
+    var long: std.ArrayListUnmanaged(u8) = .empty;
+    defer long.deinit(alloc);
+    try long.appendSlice(alloc, "connection failed: realpass ");
+    while (long.items.len < 1000) try long.appendSlice(alloc, "padding ");
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, long.items, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(sanitized.len <= max_sanitized_connection_error_len);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "realpass") == null);
+}
+
+test "postgres libpq connection-error sanitizer handles a real libpq conninfo parse error" {
+    const alloc = std.testing.allocator;
+    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    defer executor.deinit();
+    const dsn = "postgres://u:p%zzw0rd@h/db";
+    const dsn_z = try alloc.dupeSentinel(u8, dsn, 0);
+    defer alloc.free(dsn_z);
+    const conn = executor.pqconnectdb(dsn_z.ptr) orelse return error.SkipZigTest;
+    defer executor.pqfinish(conn);
+    if (executor.pqstatus(conn) == CONNECTION_OK) return error.SkipZigTest;
+    const raw = std.mem.trim(u8, std.mem.span(executor.pqerrorMessage(conn)), " \t\r\n");
+    if (raw.len == 0) return error.SkipZigTest;
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, raw, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "p%zzw0rd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "u:p%zzw0rd") == null);
+}
+
+test "postgres libpq connection-error sanitizer redacts a malformed percent-encoded URI query password" {
+    const alloc = std.testing.allocator;
+    const dsn = "postgresql://localhost/db?password=supersecret%zz";
+    const message = "invalid percent-encoded token: \"supersecret%zz\"";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "supersecret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "invalid percent-encoded token") != null);
+}
+
+test "postgres libpq connection-error sanitizer redacts a short malformed URI query password" {
+    const alloc = std.testing.allocator;
+    const dsn = "postgresql://localhost/db?password=%z";
+    const message = "invalid percent-encoded token: \"%z\"";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "%z") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "invalid percent-encoded token") != null);
+}
+
+test "postgres libpq connection-error sanitizer redacts a URI query password alongside other params" {
+    const alloc = std.testing.allocator;
+    const dsn = "postgresql://localhost/db?sslmode=require&password=supersecret%zz&connect_timeout=5";
+    const message = "invalid percent-encoded token: \"supersecret%zz\"";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "supersecret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "invalid percent-encoded token") != null);
+}
+
+test "postgres libpq connection-error sanitizer redacts password= structurally inside a quoted URI query string" {
+    const alloc = std.testing.allocator;
+    const dsn = "postgresql://localhost/db?password=realquerysecret";
+    const message = "could not parse connection string: \"postgresql://localhost/db?password=realquerysecret\"";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "realquerysecret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "password=[redacted]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "could not parse connection string") != null);
+}
+
+test "postgres libpq connection-error sanitizer handles a real libpq malformed URI query password" {
+    const alloc = std.testing.allocator;
+    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    defer executor.deinit();
+    const dsn = "postgresql://localhost/db?password=supersecret%zz";
+    const dsn_z = try alloc.dupeSentinel(u8, dsn, 0);
+    defer alloc.free(dsn_z);
+    const conn = executor.pqconnectdb(dsn_z.ptr) orelse return error.SkipZigTest;
+    defer executor.pqfinish(conn);
+    if (executor.pqstatus(conn) == CONNECTION_OK) return error.SkipZigTest;
+    const raw = std.mem.trim(u8, std.mem.span(executor.pqerrorMessage(conn)), " \t\r\n");
+    if (raw.len == 0) return error.SkipZigTest;
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, raw, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "supersecret") == null);
+}
+
+test "postgres libpq connection-error sanitizer redacts a malformed value behind a percent-encoded password key" {
+    // libpq's conninfo_uri_parse_params decodes the *key* before comparing
+    // it against known keywords: `%70assword` decodes to `password`, which
+    // is why libpq accepts it as the password option at all, and why its
+    // (malformed) value is then quoted verbatim in the decode error.
+    const alloc = std.testing.allocator;
+    const dsn = "postgresql://localhost/db?%70assword=supersecret%zz";
+    const message = "invalid percent-encoded token: \"supersecret%zz\"";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "supersecret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "invalid percent-encoded token") != null);
+}
+
+test "postgres libpq connection-error sanitizer redacts a malformed value behind a percent-encoded sslpassword key" {
+    const alloc = std.testing.allocator;
+    const dsn = "postgresql://localhost/db?%73slpassword=supersecret%zz";
+    const message = "invalid percent-encoded token: \"supersecret%zz\"";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "supersecret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "invalid percent-encoded token") != null);
+}
+
+test "postgres libpq connection-error sanitizer matches libpq's case-sensitive decoded URI query key lookup" {
+    // libpq's own keyword lookup (`conninfo_find`) is a case-sensitive
+    // `strcmp` against the registered option names, which are lowercase.
+    // `%50assword` decodes to "Password", which libpq rejects as an
+    // unrecognized URI query parameter rather than as the `password`
+    // option -- it never uses that value as a real credential, quoting
+    // only the key (not the value) in its error. `isUriQueryCredentialKeyExact`
+    // mirrors that case sensitivity for a key already decoded by
+    // `collectUriQueryCredentialsAlloc`, unlike the case-insensitive
+    // `isUriQueryCredentialKeyIgnoreCase` baseline used for a key exactly
+    // as written (not percent-encoded), which stays deliberately
+    // over-cautious. See the structural test below for the defense-in-depth
+    // pass, which still catches this case independently.
+    try std.testing.expect(!isUriQueryCredentialKeyExact("Password"));
+    try std.testing.expect(isUriQueryCredentialKeyExact("password"));
+    try std.testing.expect(isUriQueryCredentialKeyExact("sslpassword"));
+}
+
+test "postgres libpq connection-error sanitizer still redacts a mixed-case percent-encoded key structurally" {
+    // Even though `%50assword` does not match libpq's case-sensitive
+    // `password` keyword (see the test above), the structural
+    // `password=` redaction pass matches case-insensitively -- the same
+    // deliberately conservative choice already made for a literal,
+    // non-percent-encoded key -- so a message that echoes this query
+    // fragment verbatim (e.g. a quoted connection string) still has its
+    // value redacted.
+    const alloc = std.testing.allocator;
+    const dsn = "postgresql://localhost/db?%50assword=realquerysecret";
+    const message = "could not parse connection string: \"postgresql://localhost/db?%50assword=realquerysecret\"";
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, message, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "realquerysecret") == null);
+}
+
+test "postgres libpq connection-error sanitizer handles a real libpq percent-encoded-key query password" {
+    const alloc = std.testing.allocator;
+    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    defer executor.deinit();
+    const dsn = "postgresql://localhost/db?%70assword=supersecret%zz";
+    const dsn_z = try alloc.dupeSentinel(u8, dsn, 0);
+    defer alloc.free(dsn_z);
+    const conn = executor.pqconnectdb(dsn_z.ptr) orelse return error.SkipZigTest;
+    defer executor.pqfinish(conn);
+    if (executor.pqstatus(conn) == CONNECTION_OK) return error.SkipZigTest;
+    const raw = std.mem.trim(u8, std.mem.span(executor.pqerrorMessage(conn)), " \t\r\n");
+    if (raw.len == 0) return error.SkipZigTest;
+    const sanitized = try sanitizeConnectionErrorAlloc(alloc, raw, dsn);
+    defer alloc.free(sanitized);
+    try std.testing.expect(std.mem.indexOf(u8, sanitized, "supersecret") == null);
+}
+
+test "postgres libpq connection-error sanitizer redacts literal hash characters in credentials" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "postgresql://localhost/db?password=abc#supersecret%zz",
+        "postgresql://localhost/db?%73slpassword=abc#supersecret%zz",
+        "postgresql://u:abc#supersecret%zz@localhost/db",
+    }) |dsn| {
+        const sanitized = try sanitizeConnectionErrorAlloc(alloc, "invalid percent-encoded token: \"abc#supersecret%zz\"", dsn);
+        defer alloc.free(sanitized);
+        try std.testing.expectEqualStrings("invalid percent-encoded token: \"[redacted]\"", sanitized);
+    }
+}
+
+test "postgres libpq connection-error sanitizer handles real libpq credentials containing a hash" {
+    const alloc = std.testing.allocator;
+    var executor = Executor.init(alloc) catch return error.SkipZigTest;
+    defer executor.deinit();
+    for ([_][]const u8{
+        "postgresql://localhost/db?password=abc#supersecret%zz",
+        "postgresql://localhost/db?sslpassword=abc#supersecret%zz",
+        "postgresql://u:abc#supersecret%zz@localhost/db",
+    }) |dsn| {
+        const dsn_z = try alloc.dupeSentinel(u8, dsn, 0);
+        defer alloc.free(dsn_z);
+        const conn = executor.pqconnectdb(dsn_z.ptr) orelse return error.TestUnexpectedResult;
+        defer executor.pqfinish(conn);
+        try std.testing.expect(executor.pqstatus(conn) != CONNECTION_OK);
+        const raw = std.mem.trim(u8, std.mem.span(executor.pqerrorMessage(conn)), " \t\r\n");
+        try std.testing.expect(std.mem.indexOf(u8, raw, "supersecret") != null);
+        const sanitized = try sanitizeConnectionErrorAlloc(alloc, raw, dsn);
+        defer alloc.free(sanitized);
+        try std.testing.expect(std.mem.indexOf(u8, sanitized, "supersecret") == null);
+    }
+}
+
+test "postgres libpq connection-error sanitizer bounds allocation work for long malformed keys" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 1024, 8192 }) |len| {
+        const key = try alloc.alloc(u8, len);
+        defer alloc.free(key);
+        @memset(key, 'a');
+        const dsn = try std.fmt.allocPrint(alloc, "postgresql://localhost/db?{s}%zz=x", .{key});
+        defer alloc.free(dsn);
+        const message = try std.fmt.allocPrint(alloc, "invalid percent-encoded token: \"{s}%zz\"", .{key});
+        defer alloc.free(message);
+        // Count cumulative allocation bytes rather than wall-clock time: a
+        // malformed key must not be decoded again at every character offset.
+        var counting = std.testing.FailingAllocator.init(alloc, .{});
+        const sanitized = try sanitizeConnectionErrorAlloc(counting.allocator(), message, dsn);
+        defer counting.allocator().free(sanitized);
+        try std.testing.expect(counting.allocated_bytes <= 64 * message.len);
+        try std.testing.expect(sanitized.len <= max_sanitized_connection_error_len);
+    }
+}
+
+fn sanitizeConnectionErrorAllocationFixture(alloc: Allocator) !void {
+    const Case = struct { dsn: []const u8, message: []const u8 };
+    const cases = [_]Case{
+        .{
+            .dsn = "postgresql://localhost/db?password=abc#supersecret%zz",
+            .message = "invalid percent-encoded token: \"abc#supersecret%zz\"",
+        },
+        .{
+            .dsn = "postgresql://u:abc#supersecret%zz@localhost/db",
+            .message = "invalid percent-encoded token: \"abc#supersecret%zz\"",
+        },
+        .{
+            .dsn = "postgres://u:p%zzw0rd@h/db",
+            .message = "invalid percent-encoded token: \"p%zzw0rd\"",
+        },
+        .{
+            .dsn = "postgresql://localhost/db?password=supersecret%zz",
+            .message = "invalid percent-encoded token: \"supersecret%zz\"",
+        },
+        .{
+            .dsn = "postgresql://localhost/db?sslmode=require&password=sup%zzer&connect_timeout=5",
+            .message = "invalid percent-encoded token: \"sup%zzer\"",
+        },
+        .{
+            .dsn = "postgresql://localhost/db?%70assword=supersecret%zz",
+            .message = "invalid percent-encoded token: \"supersecret%zz\"",
+        },
+        .{
+            .dsn = "host=h dbname=db user=u password='sec ret'",
+            .message = "connection info string contains password='sec ret' near \"password\": " ++
+                "FATAL: password authentication failed",
+        },
+        .{
+            .dsn = "postgres://u:realpass@host:5432/db",
+            .message = "connection to server at \"host\" (1.2.3.4), port 5432 failed: Connection refused",
+        },
+    };
+    for (cases) |case| {
+        const sanitized = try sanitizeConnectionErrorAlloc(alloc, case.message, case.dsn);
+        alloc.free(sanitized);
+    }
+}
+
+test "postgres libpq connection-error sanitizer is allocation-failure safe" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sanitizeConnectionErrorAllocationFixture, .{});
+}
 
 /// Drive libpq's nonblocking command protocol without ever calling
 /// PQgetResult while libpq still needs socket input. In particular, flushing

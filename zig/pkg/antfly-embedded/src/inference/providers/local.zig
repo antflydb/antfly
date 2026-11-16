@@ -28,6 +28,7 @@ const template_mod = @import("antfly_template_content");
 const EmbedWireRequest = struct {
     model: []const u8,
     model_identity: ?[]const u8 = null,
+    model_revision: ?[]const u8 = null,
     dimensions: ?u32 = null,
     input: std.json.Value,
     encoding_format: []const u8 = "float",
@@ -129,6 +130,21 @@ fn addRequestSize(total: *usize, amount: usize) !void {
     total.* = std.math.add(usize, total.*, amount) catch return error.OutOfMemory;
 }
 
+const PartsMode = enum {
+    items,
+    group,
+
+    fn resultCount(self: PartsMode, count: usize) usize {
+        return if (self == .group) 1 else count;
+    }
+
+    fn groupsParts(self: PartsMode, count: usize) bool {
+        // A singleton is already one logical input. Preserve unimodal model
+        // compatibility just as the native bridge does for a single image.
+        return self == .group and count > 1;
+    }
+};
+
 fn embedPartsRequestSize(
     model: []const u8,
     parts: []const template_mod.ContentPart,
@@ -136,8 +152,11 @@ fn embedPartsRequestSize(
     instruction: ?[]const u8,
     model_identity: ?[]const u8,
     dimensions: ?u32,
+    model_revision: ?[32]u8,
+    mode: PartsMode,
 ) !usize {
     var total: usize = "{\"model\":".len + ",\"input\":[".len + "],\"encoding_format\":\"float\"}".len;
+    if (mode.groupsParts(parts.len)) try addRequestSize(&total, "{\"content\":[".len + "]}".len);
     try addRequestSize(&total, try jsonStringEncodedSize(model));
     for (parts, 0..) |part, index| {
         if (index > 0) try addRequestSize(&total, 1);
@@ -165,6 +184,7 @@ fn embedPartsRequestSize(
         try addRequestSize(&total, ",\"instruction\":".len);
         try addRequestSize(&total, try jsonStringEncodedSize(value));
     }
+    if (model_revision != null) try addRequestSize(&total, ",\"model_revision\":".len + 66);
     if (model_identity) |value| {
         try addRequestSize(&total, ",\"model_identity\":".len);
         try addRequestSize(&total, try jsonStringEncodedSize(value));
@@ -187,16 +207,23 @@ fn embedPartsRequestJsonAlloc(
     instruction: ?[]const u8,
     model_identity: ?[]const u8,
     dimensions: ?u32,
+    model_revision: ?[32]u8,
+    mode: PartsMode,
 ) ![]u8 {
     var output: std.Io.Writer.Allocating = try .initCapacity(
         alloc,
-        try embedPartsRequestSize(model, parts, task_type, instruction, model_identity, dimensions),
+        try embedPartsRequestSize(model, parts, task_type, instruction, model_identity, dimensions, model_revision, mode),
     );
     defer output.deinit();
     var stringify: std.json.Stringify = .{ .writer = &output.writer };
     try stringify.beginObject();
     try stringify.objectField("model");
     try stringify.write(model);
+    if (model_revision) |revision| {
+        try stringify.objectField("model_revision");
+        const hex = std.fmt.bytesToHex(revision, .lower);
+        try stringify.write(@as([]const u8, &hex));
+    }
     if (model_identity) |value| {
         try stringify.objectField("model_identity");
         try stringify.write(value);
@@ -207,6 +234,11 @@ fn embedPartsRequestJsonAlloc(
     }
     try stringify.objectField("input");
     try stringify.beginArray();
+    if (mode.groupsParts(parts.len)) {
+        try stringify.beginObject();
+        try stringify.objectField("content");
+        try stringify.beginArray();
+    }
     for (parts) |part| {
         try stringify.beginObject();
         switch (part) {
@@ -240,6 +272,10 @@ fn embedPartsRequestJsonAlloc(
                 try stringify.write(binary_part.mime_type);
             },
         }
+        try stringify.endObject();
+    }
+    if (mode.groupsParts(parts.len)) {
+        try stringify.endArray();
         try stringify.endObject();
     }
     try stringify.endArray();
@@ -280,6 +316,8 @@ fn embedPartsAttachmentEnvelopeAlloc(
     instruction: ?[]const u8,
     model_identity: ?[]const u8,
     dimensions: ?u32,
+    model_revision: ?[32]u8,
+    mode: PartsMode,
 ) !SegmentedAttachmentBody {
     var attachments = std.ArrayListUnmanaged(httpx.attachment_envelope.Attachment).empty;
     defer attachments.deinit(alloc);
@@ -289,6 +327,11 @@ fn embedPartsAttachmentEnvelopeAlloc(
     try stringify.beginObject();
     try stringify.objectField("model");
     try stringify.write(model);
+    if (model_revision) |revision| {
+        try stringify.objectField("model_revision");
+        const hex = std.fmt.bytesToHex(revision, .lower);
+        try stringify.write(@as([]const u8, &hex));
+    }
     if (model_identity) |value| {
         try stringify.objectField("model_identity");
         try stringify.write(value);
@@ -299,6 +342,11 @@ fn embedPartsAttachmentEnvelopeAlloc(
     }
     try stringify.objectField("input");
     try stringify.beginArray();
+    if (mode.groupsParts(parts.len)) {
+        try stringify.beginObject();
+        try stringify.objectField("content");
+        try stringify.beginArray();
+    }
     for (parts) |part| {
         try stringify.beginObject();
         switch (part) {
@@ -329,6 +377,10 @@ fn embedPartsAttachmentEnvelopeAlloc(
                 try stringify.write(attachment_index);
             },
         }
+        try stringify.endObject();
+    }
+    if (mode.groupsParts(parts.len)) {
+        try stringify.endArray();
         try stringify.endObject();
     }
     try stringify.endArray();
@@ -451,6 +503,7 @@ fn rerankDocumentsRequestJsonAlloc(
 pub const Provider = struct {
     model_identity: ?[]const u8 = null,
     requested_dense_dimensions: ?u32 = null,
+    model_revision: ?[32]u8 = null,
     allocator: std.mem.Allocator,
     http: *httpx.Client,
     attempt_observer: ?httpx.AttemptObserver = null,
@@ -595,6 +648,7 @@ pub const Provider = struct {
     ) httpx.RequestOptions {
         return .{
             .attempt_observer = self.attempt_observer,
+            .follow_redirects = false,
             .json = json_body,
             .headers = self.requestHeaders(),
             .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
@@ -618,6 +672,7 @@ pub const Provider = struct {
         self.request_header_storage[count] = .{ "Content-Type", content_type_value };
         return .{
             .attempt_observer = self.attempt_observer,
+            .follow_redirects = false,
             .borrowed_body_segments = body_segments,
             .headers = self.request_header_storage[0 .. count + 1],
             .timeout_ms = self.request_timeout_ms orelse fallback_timeout_ms,
@@ -706,9 +761,11 @@ pub const Provider = struct {
         var input_array = std.json.Array.init(alloc);
         defer input_array.deinit();
         for (inputs) |input| try input_array.append(.{ .string = input });
+        const revision = if (self.model_revision) |value| std.fmt.bytesToHex(value, .lower) else null;
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, EmbedWireRequest{
             .model = model,
             .model_identity = self.model_identity,
+            .model_revision = if (revision) |*hex| hex else null,
             .input = .{ .array = input_array },
         });
         defer self.allocator.free(json_body);
@@ -719,9 +776,10 @@ pub const Provider = struct {
         if (!resp.ok()) {
             logEmbedFailure("sparse", url, resp.status.code, resp.body);
             if (isCapabilityStaleResponse(resp)) return error.InferenceCapabilitiesStale;
-            return mapEmbedStatus(resp.status.code);
+            return mapEmbedResponse(alloc, resp.status.code, resp.body);
         }
 
+        try self.validateRevisionResponse(resp);
         const body = resp.body orelse return error.EmptyResponse;
 
         return try parseSparseJsonResponseAlloc(alloc, body, self.model_identity);
@@ -739,8 +797,19 @@ pub const Provider = struct {
         task_type: ?[]const u8,
         instruction: ?[]const u8,
     ) !inference.EmbedResult {
+        return self.embedPartsMode(alloc, model, parts, task_type, instruction, .items);
+    }
+
+    /// One joint embedding from ordered parts. Independent item batches retain
+    /// their existing wire shape and cardinality through embedPartsWithTask.
+    pub fn embedGroupWithTask(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart, task_type: ?[]const u8, instruction: ?[]const u8) !inference.EmbedResult {
+        if (parts.len == 0) return error.EmptyResponse;
+        return self.embedPartsMode(alloc, model, parts, task_type, instruction, .group);
+    }
+
+    fn embedPartsMode(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart, task_type: ?[]const u8, instruction: ?[]const u8, mode: PartsMode) !inference.EmbedResult {
         if (self.framed_attachments and hasBinaryPart(parts)) {
-            var body = try embedPartsAttachmentEnvelopeAlloc(alloc, model, parts, task_type, instruction, self.model_identity, self.requested_dense_dimensions);
+            var body = try embedPartsAttachmentEnvelopeAlloc(alloc, model, parts, task_type, instruction, self.model_identity, self.requested_dense_dimensions, self.model_revision, mode);
             defer body.deinit(alloc);
             return try self.embedBody(
                 alloc,
@@ -749,12 +818,12 @@ pub const Provider = struct {
                     httpx.attachment_envelope.content_type,
                     null,
                 ),
-                parts.len,
+                mode.resultCount(parts.len),
             );
         }
-        const json_body = try embedPartsRequestJsonAlloc(alloc, model, parts, task_type, instruction, self.model_identity, self.requested_dense_dimensions);
+        const json_body = try embedPartsRequestJsonAlloc(alloc, model, parts, task_type, instruction, self.model_identity, self.requested_dense_dimensions, self.model_revision, mode);
         defer alloc.free(json_body);
-        return try self.embedJsonBody(alloc, json_body, parts.len);
+        return try self.embedJsonBody(alloc, json_body, mode.resultCount(parts.len));
     }
 
     pub fn embedWithTask(
@@ -791,9 +860,11 @@ pub const Provider = struct {
         task_type: ?[]const u8,
         instruction: ?[]const u8,
     ) !inference.EmbedResult {
+        const revision = if (self.model_revision) |value| std.fmt.bytesToHex(value, .lower) else null;
         const json_body = try httpx.json.Json.stringifyRequest(alloc, EmbedWireRequest{
             .model = model,
             .model_identity = self.model_identity,
+            .model_revision = if (revision) |*hex| hex else null,
             .dimensions = self.requested_dense_dimensions,
             .input = input,
             .task_type = task_type,
@@ -805,6 +876,13 @@ pub const Provider = struct {
 
     fn embedJsonBody(self: *Provider, alloc: std.mem.Allocator, json_body: []const u8, expected_count: usize) !inference.EmbedResult {
         return self.embedBody(alloc, self.controlledJsonRequest(json_body, null), expected_count);
+    }
+
+    fn validateRevisionResponse(self: *const Provider, response: httpx.Response) !void {
+        const expected = self.model_revision orelse return;
+        const raw = response.headers.get(httpx.embedding_revision.response_header) orelse return error.InferenceCapabilitiesStale;
+        const actual = httpx.embedding_revision.parse(raw) catch return error.InferenceCapabilitiesStale;
+        try httpx.embedding_revision.require(expected, actual);
     }
 
     fn embedBody(
@@ -822,10 +900,10 @@ pub const Provider = struct {
         if (!resp.ok()) {
             logEmbedFailure("dense", url, resp.status.code, resp.body);
             if (isCapabilityStaleResponse(resp)) return error.InferenceCapabilitiesStale;
-            if (isInferenceAdmissionDenied(resp)) return error.QueueFull;
-            return mapEmbedStatus(resp.status.code);
+            return mapEmbedResponse(alloc, resp.status.code, resp.body);
         }
 
+        try self.validateRevisionResponse(resp);
         const body = resp.body orelse return error.EmptyResponse;
         if (resp.contentType()) |ct| if (std.ascii.eqlIgnoreCase(ct, httpx.numeric_response.content_type)) {
             // Numeric frames carry no model identity. A server ignoring JSON
@@ -1039,6 +1117,30 @@ pub const Provider = struct {
     };
 };
 
+// Interpret only Antfly's explicit resource envelope. Bare HTTP 503/507 and
+// malformed bodies retain ordinary provider-failure accounting.
+fn mapEmbedResponse(alloc: std.mem.Allocator, status: u16, body: ?[]const u8) anyerror {
+    if (body) |bytes| {
+        if (bytes.len > 4096) return mapEmbedStatus(status);
+        const parsed = std.json.parseFromSlice(struct {
+            @"error": []const u8 = "",
+            reason: ?[]const u8 = null,
+            retryable: ?bool = null,
+        }, alloc, bytes, .{ .ignore_unknown_fields = true }) catch return mapEmbedStatus(status);
+        defer parsed.deinit();
+        const code = parsed.value.@"error";
+        if (status == 503 and parsed.value.retryable == true and std.mem.eql(u8, parsed.value.reason orelse "", "inference_admission"))
+            return error.QueueFull;
+        if (status == 503 and parsed.value.retryable == true and std.mem.eql(u8, code, "MODEL_RESOURCE_BUSY"))
+            return error.EmbedAdmissionRefused;
+        if (parsed.value.retryable != true) {
+            if (status == 400 and std.mem.eql(u8, code, "MODEL_RESOURCE_LIMIT")) return error.ResourceLimitExceeded;
+            if (status == 507 and std.mem.eql(u8, code, "MEMORY_BUDGET_EXCEEDED")) return error.MemoryBudgetExceeded;
+        }
+    }
+    return mapEmbedStatus(status);
+}
+
 fn mapEmbedStatus(status: u16) anyerror {
     return switch (status) {
         429 => error.EmbedRateLimited,
@@ -1174,24 +1276,33 @@ test "antfly embed parts request sizing is exact for escaped strings" {
         .{ .media_url = "https://example.invalid/a\\b.png" },
         .{ .binary = .{ .mime_type = "image/png", .data = &[_]u8{ 1, 2, 3 } } },
     };
-    const body = try embedPartsRequestJsonAlloc(
-        std.testing.allocator,
-        "clip\"clap",
-        &parts,
-        "RETRIEVAL_DOCUMENT",
-        "find diagrams",
-        null,
-        128,
-    );
-    defer std.testing.allocator.free(body);
-    try std.testing.expectEqual(
-        try embedPartsRequestSize("clip\"clap", &parts, "RETRIEVAL_DOCUMENT", "find diagrams", null, 128),
-        body.len,
-    );
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value == .object);
-    try std.testing.expectEqual(@as(i64, 128), parsed.value.object.get("dimensions").?.integer);
+    for ([_]PartsMode{ .items, .group }) |mode| {
+        const body = try embedPartsRequestJsonAlloc(
+            std.testing.allocator,
+            "clip\"clap",
+            &parts,
+            "RETRIEVAL_DOCUMENT",
+            "find diagrams",
+            null,
+            128,
+            null,
+            mode,
+        );
+        defer std.testing.allocator.free(body);
+        try std.testing.expectEqual(
+            try embedPartsRequestSize("clip\"clap", &parts, "RETRIEVAL_DOCUMENT", "find diagrams", null, 128, null, mode),
+            body.len,
+        );
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        try std.testing.expectEqual(@as(i64, 128), parsed.value.object.get("dimensions").?.integer);
+        const input = parsed.value.object.get("input").?.array.items;
+        try std.testing.expectEqual(mode.resultCount(parts.len), input.len);
+        const actual_parts = if (mode.groupsParts(parts.len)) input[0].object.get("content").?.array.items else input;
+        try std.testing.expectEqual(parts.len, actual_parts.len);
+        try std.testing.expectEqualStrings(parts[0].text, actual_parts[0].object.get("text").?.string);
+    }
 }
 
 test "antfly dense JSON response cleanup is allocation-failure safe" {
@@ -1836,4 +1947,157 @@ test "antfly embed treats service unavailability as transient" {
     group.await(io) catch {};
 
     try std.testing.expectEqual(error.EmbedTransientFailure, result_err);
+}
+
+test "embedding HTTP preserves admission and permanent resource identities" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(error.EmbedAdmissionRefused, mapEmbedResponse(a, 503, "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true}"));
+    try std.testing.expectEqual(error.QueueFull, mapEmbedResponse(a, 503, "{\"error\":\"SERVICE_UNAVAILABLE\",\"reason\":\"inference_admission\",\"retryable\":true}"));
+    try std.testing.expectEqual(error.EmbedTransientFailure, mapEmbedResponse(a, 503, "{\"error\":\"SERVICE_UNAVAILABLE\",\"reason\":\"inference_admission\",\"retryable\":false}"));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, mapEmbedResponse(a, 400, "{\"error\":\"MODEL_RESOURCE_LIMIT\",\"retryable\":false}"));
+    // Older inference servers omitted retryable for permanent model limits.
+    try std.testing.expectEqual(error.ResourceLimitExceeded, mapEmbedResponse(a, 400, "{\"error\":\"MODEL_RESOURCE_LIMIT\"}"));
+    try std.testing.expectEqual(error.MemoryBudgetExceeded, mapEmbedResponse(a, 507, "{\"error\":\"MEMORY_BUDGET_EXCEEDED\",\"retryable\":false}"));
+    for ([_]?[]const u8{ null, "", "unavailable", "{}", "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":false}", "{\"error\":\"OTHER_FAILURE\",\"retryable\":true}" }) |body| {
+        try std.testing.expectEqual(error.EmbedTransientFailure, mapEmbedResponse(a, 503, body));
+        try std.testing.expectEqual(error.EmbedTransientFailure, mapEmbedResponse(a, 507, body));
+    }
+}
+
+test "embedding HTTP dense and sparse share admission failure accounting" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const cases = [_]struct { status: u16, body: []const u8, expected: anyerror }{
+        .{ .status = 503, .body = "{\"error\":\"SERVICE_UNAVAILABLE\",\"reason\":\"inference_admission\",\"retryable\":true}", .expected = error.QueueFull },
+        .{ .status = 503, .body = "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true}", .expected = error.EmbedAdmissionRefused },
+        .{ .status = 503, .body = "unavailable", .expected = error.EmbedTransientFailure },
+        .{ .status = 503, .body = "{\"reason\":\"inference_admission\",\"retryable\":false}", .expected = error.EmbedTransientFailure },
+        .{ .status = 400, .body = "{\"error\":\"MODEL_RESOURCE_LIMIT\",\"retryable\":false}", .expected = error.ResourceLimitExceeded },
+        .{ .status = 507, .body = "{\"error\":\"MEMORY_BUDGET_EXCEEDED\",\"retryable\":false}", .expected = error.MemoryBudgetExceeded },
+    };
+    const Worker = struct {
+        fn run(a: std.mem.Allocator, test_io: std.Io, base: []const u8, sparse: bool, failure: *?anyerror) std.Io.Cancelable!void {
+            var client = httpx.Client.initWithConfig(a, test_io, .{ .keep_alive = false });
+            defer client.deinit();
+            var provider = Provider.init(a, &client, base);
+            defer provider.deinit();
+            if (sparse) {
+                var result = provider.embedSparse(a, "model", &.{"hello"}) catch |err| {
+                    failure.* = err;
+                    return;
+                };
+                result.deinit();
+            } else {
+                var result = provider.embedWithTask(a, "model", &.{"hello"}, null, null) catch |err| {
+                    failure.* = err;
+                    return;
+                };
+                result.deinit();
+            }
+        }
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |sparse| {
+        var server = try httpx.TestServer.start(alloc, io, &.{.{ .method = .POST, .path = "/embed", .respond = .{ .status = case.status, .body = case.body, .content_type = "application/json" } }});
+        defer server.deinit();
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        var failure: ?anyerror = null;
+        try group.concurrent(io, Worker.run, .{ alloc, io, server.baseUrl(), sparse, &failure });
+        try server.handleOne();
+        try group.await(io);
+        try std.testing.expectEqual(@as(?anyerror, case.expected), failure);
+    };
+}
+
+pub fn testGroupedEmbeddingHttpTransports() !void {
+    for ([_]bool{ false, true }) |framed| {
+        for ([_]bool{ false, true }) |numeric| {
+            try testGroupedEmbeddingHttp(framed, numeric, false);
+        }
+        try testGroupedEmbeddingHttp(framed, false, true);
+    }
+}
+
+fn testGroupedEmbeddingHttp(framed: bool, numeric: bool, surplus: bool) !void {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Assert = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            const framed_request = std.mem.eql(u8, req.header("Content-Type") orelse "", httpx.attachment_envelope.content_type);
+            // Decode the exact production body without changing attachment ownership.
+            if (framed_request) {
+                var decoded = try httpx.attachment_envelope.parseAlloc(std.testing.allocator, req.body, .{});
+                defer decoded.deinit();
+                try std.testing.expectEqual(@as(usize, 1), decoded.attachments.len);
+                try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, decoded.attachments[0].data);
+                try metadata(decoded.metadata, true);
+            } else try metadata(req.body, false);
+        }
+        fn metadata(body: []const u8, framed_request: bool) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            try std.testing.expectEqualStrings("RETRIEVAL_QUERY", root.get("task_type").?.string);
+            try std.testing.expectEqualStrings("find diagrams", root.get("instruction").?.string);
+            const input = root.get("input").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), input.len);
+            const parts = input[0].object.get("content").?.array.items;
+            try std.testing.expectEqual(@as(usize, 3), parts.len);
+            try std.testing.expectEqualStrings("first", parts[0].object.get("text").?.string);
+            try std.testing.expectEqualStrings("last", parts[2].object.get("text").?.string);
+            if (framed_request) {
+                try std.testing.expectEqual(@as(i64, 0), parts[1].object.get("attachment_index").?.integer);
+            } else try std.testing.expectEqualStrings("AQID", parts[1].object.get("data").?.string);
+        }
+    };
+    const frame = try httpx.numeric_response.allocFrame(a, .dense, 1, 2);
+    defer a.free(frame);
+    try httpx.numeric_response.setValue(frame, 0, 1);
+    try httpx.numeric_response.setValue(frame, 1, 0);
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/embed", .assert_request = Assert.request, .respond = .{
+        .body = if (numeric) frame else if (surplus) "{\"data\":[{\"embedding\":[1,0]},{\"embedding\":[0,1]}]}" else "{\"data\":[{\"embedding\":[1,0]}]}",
+        .content_type = if (numeric) httpx.numeric_response.content_type else "application/json",
+    } }});
+    defer server.deinit();
+    const Worker = struct {
+        fn run(alloc: std.mem.Allocator, context_io: std.Io, base: []const u8, use_framed: bool, expected_surplus: bool) !void {
+            var client = httpx.Client.initWithConfig(alloc, context_io, .{ .keep_alive = false });
+            defer client.deinit();
+            var provider = Provider.init(alloc, &client, base);
+            defer provider.deinit();
+            provider.setFramedAttachments(use_framed);
+            const parts = [_]template_mod.ContentPart{ .{ .text = "first" }, .{ .binary = .{ .mime_type = "image/png", .data = &.{ 1, 2, 3 } } }, .{ .text = "last" } };
+            if (expected_surplus) {
+                try std.testing.expectError(error.InvalidEmbeddingResponse, provider.embedGroupWithTask(alloc, "model", &parts, "RETRIEVAL_QUERY", "find diagrams"));
+                return;
+            }
+            var result = try provider.embedGroupWithTask(alloc, "model", &parts, "RETRIEVAL_QUERY", "find diagrams");
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.vectors.len);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, result.vectors[0]);
+        }
+    };
+    var worker = try io.concurrent(Worker.run, .{ a, io, server.baseUrl(), framed, surplus });
+    defer worker.cancel(io) catch {};
+    try server.handleOne();
+    try worker.await(io);
+}
+
+pub fn testGroupedEmbeddingSingleton() !void {
+    const a = std.testing.allocator;
+    const parts = [_]template_mod.ContentPart{.{ .binary = .{ .mime_type = "image/png", .data = &.{ 1, 2, 3 } } }};
+    const item = try embedPartsRequestJsonAlloc(a, "clip", &parts, null, null, null, null, null, .items);
+    defer a.free(item);
+    const group = try embedPartsRequestJsonAlloc(a, "clip", &parts, null, null, null, null, null, .group);
+    defer a.free(group);
+    try std.testing.expectEqualStrings(item, group);
+    var framed_item = try embedPartsAttachmentEnvelopeAlloc(a, "clip", &parts, null, null, null, null, null, .items);
+    defer framed_item.deinit(a);
+    var framed_group = try embedPartsAttachmentEnvelopeAlloc(a, "clip", &parts, null, null, null, null, null, .group);
+    defer framed_group.deinit(a);
+    try std.testing.expectEqualStrings(framed_item.metadata, framed_group.metadata);
 }

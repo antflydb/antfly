@@ -33,22 +33,43 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         if ((declaration.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(declaration.artifact.metadata_version)) or declaration.artifact.kind == .ordered_row_index) break true;
     } else false;
     if (!eligible and publication.directory == null) return &.{};
-    // A replica attempts bounded navigation warming before reporting an index
-    // queryable. Concurrent checks do not duplicate warm I/O. Failure/timeout
-    // is an optional cache miss and does not weaken the source proof below.
-    @import("lake_index_navigation_warming.zig").warmPublicationWithin(a, server, table, request) catch |err| {
-        if (err == error.NavigationWarmupInProgress) return &.{};
+    // Required cut recovery and optional cache warming have different failure
+    // semantics. A failed active cut must never advertise legacy-index readiness.
+    @import("lake_index_text_query.zig").refreshOwnedCut(a, server, table, request) catch {
+        try request.ensureActive();
+        if (try @import("lake_source_owner.zig").lookup(sa, server, table, request)) |owner| if (owner.enabled) return &.{};
+    };
+    if (try @import("lake_source_owner.zig").lookup(sa, server, table, request)) |owner| if (owner.enabled) {
+        const cut = owner.current orelse return &.{};
+        if (!cut.canIssue(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(server.cfg.node_config))) return &.{};
+    };
+    @import("lake_index_navigation_warming.zig").warmNavigationWithin(a, server, table, request) catch {
         try request.ensureActive();
     };
+    // Only consumers supported by native cut admission may avoid a fresh
+    // provider catalog walk. Mixed/vector/materialization tables keep the
+    // existing strict path so readiness cannot overstate their coverage.
+    const definitions = try std.json.parseFromSliceLeaky(std.json.Value, sa, table.indexes_json, .{});
+    const owner = try @import("lake_source_owner.zig").lookup(sa, server, table, request);
+    if (owner != null and owner.?.enabled and nativeReadinessCompatible(definitions)) {
+        const prepared = @import("lake_index_text_query.zig").prepareReadiness(a, server, table, request) catch |err| {
+            try request.ensureActive();
+            if (err == error.OutOfMemory) return err;
+            return &.{};
+        };
+        defer prepared.deinit();
+        return validatedNames(a, sa, server, table, request, prepared.sql_table, &prepared.store, prepared.selected, prepared.context);
+    }
     const normalized = try request.platformDeadline();
     var context: local.serverless_query_lake_read_context.Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
     var sql_table = try server.sql_schema_cache.resolve(server.embedding_provider_runtime.io, sa, table.schema_json, table.table_id, table.name);
-    sql_table.external_indexes = .{ .catalog_json = table.lake_index_catalog_json, .indexes_json = table.indexes_json, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table) };
-    const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store };
+    sql_table.external_indexes = .{ .catalog_json = table.lake_index_catalog_json, .indexes_json = table.indexes_json, .desired = try local.metadata_lake_index_catalog.desiredFingerprint(a, table) };
+    const transport = try server.lakeProviderTransport();
+    const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = transport.io, .requests = transport.requests, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store };
     try server.prepareLakeCache();
     var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = sql_table.external_base_source }, options.lakeOptions(), context, &server.lake_read_cache);
     defer source.deinit();
-    var store = try @import("lake_index_store.zig").Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+    var store = try @import("lake_index_store.zig").Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
     defer store.deinit();
     var reader_lease: ?*@import("lake_index_reader_lease.zig").Handle = null;
     defer if (reader_lease) |lease| lease.deinit();
@@ -79,6 +100,20 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         return &.{};
     }) orelse return &.{};
     defer selected.deinit();
+    return validatedNames(a, sa, server, table, request, sql_table, &store, selected, context);
+}
+fn nativeReadinessCompatible(definitions: std.json.Value) bool {
+    if (definitions != .object) return false;
+    var iterator = definitions.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* != .object) return false;
+        const kind = entry.value_ptr.object.get("type") orelse return false;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "full_text")) return false;
+    }
+    return true;
+}
+fn validatedNames(a: A, sa: A, server: *@import("http_server.zig").ApiHttpServer, table: local.common_topology_records.TableRecord, request: local.api_operation.RequestContext, sql_table: local.sql_catalog.Table, store: *@import("lake_index_store.zig").Store, selected: @import("lake_index_selection.zig").Selected, context: local.serverless_query_lake_read_context.Context) ![]const []const u8 {
+    const normalized = try request.platformDeadline();
     const definitions = try std.json.parseFromSliceLeaky(std.json.Value, sa, table.indexes_json, .{});
     if (definitions != .object) return error.InvalidTableIndexMetadata;
     var result: std.ArrayList([]const u8) = .empty;
@@ -95,9 +130,9 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         if (std.mem.eql(u8, kind.string, "embeddings") and (if (config.object.get("sparse")) |sparse| sparse == .bool and sparse.bool else false)) {
             const native = @import("lake_index_native_sparse.zig");
             const declaration = for (selected.publication().declarations) |decl| {
-                if (decl.artifact.kind == .sparse_segment and decl.artifact.metadata_version == native.metadata_version and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
+                if (decl.artifact.kind == .sparse_segment and native.supportsMetadata(decl.artifact.metadata_version) and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
             } else continue;
-            const root = native.loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const root = native.loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 continue;
@@ -114,9 +149,9 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         if (std.mem.eql(u8, kind.string, "embeddings")) {
             const native = @import("lake_index_native_dense.zig");
             const declaration = for (selected.publication().declarations) |decl| {
-                if (decl.artifact.kind == .vector_segment and decl.artifact.metadata_version == native.metadata_version and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
+                if (decl.artifact.kind == .vector_segment and native.supportsMetadata(decl.artifact.metadata_version) and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
             } else continue;
-            const root = native.loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const root = native.loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 continue;
@@ -135,7 +170,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             const declaration = for (selected.publication().declarations) |decl| {
                 if (decl.artifact.kind == .text_segment and decl.artifact.metadata_version == native_text.metadata_version and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
             } else continue;
-            const root = native_text.loadRootDirectory(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const root = native_text.loadRootDirectory(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 continue;
@@ -158,11 +193,11 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             if (name != .string) break false;
             const identity = try recipes.recipeIdentity(sa, recipe);
             const declaration = for (selected.publication().declarations) |decl| {
-                if (decl.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(decl.artifact.metadata_version) and std.mem.eql(u8, decl.binding.index_config_hash, identity) and try @import("lake_index_names.zig").matches(sa, decl.name, entry.key_ptr.*, name.string, decl.artifact.metadata_version)) break decl;
+                if (decl.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(decl.artifact.metadata_version) and std.mem.eql(u8, decl.binding.index_config_hash, identity) and try @import("lake_index_names.zig").matches(sa, decl.name, entry.key_ptr.*, name.string)) break decl;
             } else break false;
             // A bounded root check proves the reader's contract, not merely a
             // successful upload. Descendant blocks are verified as SQL drains.
-            const reader = artifacts.Reader.openWithCache(a, store.artifactStore(), declaration.artifact, recipe, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const reader = artifacts.Reader.openWithCache(a, store.artifactStore(), declaration.artifact, recipe, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 break false;
@@ -194,7 +229,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             defer tuple.deinit();
             var predicate: ?local.storage_db_relational_index_predicate.Plan = if (index.where.len == 0) null else try local.storage_db_relational_index_predicate.Plan.init(a, runtime, &layout, index.where);
             defer if (predicate) |*plan| plan.deinit();
-            const root = @import("lake_index_ordered_rows.zig").loadRootLazy(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context }) catch |err| {
+            const root = @import("lake_index_ordered_rows.zig").loadRootLazy(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context }) catch |err| {
                 try context.ensureActive();
                 if (err == error.OutOfMemory) return err;
                 continue;
@@ -211,4 +246,12 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
     }
     try context.ensureActive();
     return result.toOwnedSlice(a);
+}
+
+test "owned readiness keeps unsupported consumers on strict catalog qualification" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "{}", "{\"search\":{\"type\":\"full_text\"}}" }) |json| try std.testing.expect(nativeReadinessCompatible(try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{})));
+    for ([_][]const u8{ "null", "{\"search\":{\"type\":\"embeddings\"}}", "{\"search\":{\"type\":\"algebraic\"}}", "{\"search\":{}}" }) |json| try std.testing.expect(!nativeReadinessCompatible(try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{})));
 }

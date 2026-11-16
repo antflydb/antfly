@@ -3,6 +3,7 @@ ARG BASE_IMAGE=gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:cde9dbd556
 FROM ${BASE_IMAGE}
 COPY qualification-linux/bin/antfly /app/antfly
 COPY examples/hackernews/serve.py /app/serve.py
+COPY examples/hackernews/managed_api.py /app/managed_api.py
 COPY examples/hackernews/web /app/web
 RUN mkdir -p /app/empty-models
 USER 1000:1000

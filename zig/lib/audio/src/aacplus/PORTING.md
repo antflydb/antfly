@@ -21,6 +21,13 @@ pointer trees. Fixed-point MAC and QMF sample additions explicitly wrap as in th
 reference's ARM arithmetic; syntax/index/control arithmetic retains runtime checks.
 Failures retire the decoder before any retry can reuse partially advanced state.
 
+TNS feedback uses a wrapping sum followed by one subtraction from the input.
+This preserves the fixed-point recurrence while avoiding an LLVM optimized
+subtract-reduction sign inversion observed in macOS AArch64 ReleaseFast builds.
+Signed-impulse and independent wide-integer recurrence regressions run in
+ReleaseFast through inference's `test-audio-tns` target, including default and
+audio-specific test suites.
+
 Five owned 44.1/48 kHz HE-AAC/PS fixtures compare complete trimmed PCM against
 independent FFmpeg output at a 50 dB SNR floor. See [AUDIO.md](../../AUDIO.md) for
 the bounded profile contract and regression commands. This is conformance evidence

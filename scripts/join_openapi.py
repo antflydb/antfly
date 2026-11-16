@@ -26,7 +26,7 @@ from pathlib import Path
 import yaml
 from openapi_spec_validator import validate_spec
 
-from openapi_inputs import record_dependencies
+from openapi_inputs import SAFE_LOADER, record_dependencies
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -117,12 +117,12 @@ def load_order_reference(output: Path) -> dict | None:
         result = None
 
     if result is not None:
-        loaded = yaml.safe_load(result.stdout)
+        loaded = yaml.load(result.stdout, Loader=SAFE_LOADER)
         return loaded if isinstance(loaded, dict) else None
 
     if output.exists():
         with output.open("r", encoding="utf-8") as fh:
-            loaded = yaml.safe_load(fh)
+            loaded = yaml.load(fh, Loader=SAFE_LOADER)
         return loaded if isinstance(loaded, dict) else None
 
     return None

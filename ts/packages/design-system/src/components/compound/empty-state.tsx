@@ -1,5 +1,12 @@
 import type * as React from "react";
 import { Anty } from "@/components/brand/anty";
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+} from "@/components/ui/empty";
 import { cn } from "@/lib/utils";
 
 interface EmptyStateProps extends Omit<React.HTMLAttributes<HTMLDivElement>, "title"> {
@@ -18,24 +25,26 @@ export function EmptyState({
   ...props
 }: EmptyStateProps) {
   return (
-    <div
+    <Empty
       className={cn(
-        "flex flex-col items-center justify-center rounded-none border-(length:--border-width) border-dashed border-border/70 bg-muted/30 px-6 py-16 text-center",
+        "gap-0 border-(length:--border-width) border-border/70 bg-muted/30 px-6 py-16",
         className
       )}
       {...props}
     >
-      {icon ? (
-        <div className="mb-4 grid size-12 place-items-center rounded-none bg-background text-muted-foreground">
-          {icon}
-        </div>
-      ) : null}
-      <h3 className="font-display text-xl text-foreground">{title}</h3>
-      {description ? (
-        <p className="mt-2 max-w-md text-sm text-muted-foreground">{description}</p>
-      ) : null}
-      {action ? <div className="mt-6">{action}</div> : null}
-    </div>
+      <EmptyHeader className="max-w-md gap-0">
+        {icon ? (
+          <EmptyMedia className="mb-4 grid size-12 place-items-center rounded-md bg-background text-muted-foreground">
+            {icon}
+          </EmptyMedia>
+        ) : null}
+        <h3 data-slot="empty-title" className="font-display text-xl text-foreground">
+          {title}
+        </h3>
+        {description ? <EmptyDescription className="mt-2">{description}</EmptyDescription> : null}
+      </EmptyHeader>
+      {action ? <EmptyContent className="mt-6 w-auto max-w-none">{action}</EmptyContent> : null}
+    </Empty>
   );
 }
 

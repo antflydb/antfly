@@ -1,0 +1,82 @@
+---
+title: Anthropic
+description: Claude models as Antfly generators
+order: 10
+---
+
+The `anthropic` provider calls the Anthropic Messages API for generation.
+
+## What It Provides
+
+| Component | Inputs | Notes |
+|---|---|---|
+| Generator | Text, images | Streaming, function tools, and structured output |
+
+Images can be JPEG, PNG, GIF, or WebP, in user messages only. Other media is
+rejected before the request is sent.
+
+## Credentials
+
+`api_key`, defaulting to `ANTHROPIC_API_KEY`. The endpoint defaults to
+`https://api.anthropic.com/v1`.
+
+## Example
+
+```json
+{
+  "generators": {
+    "claude": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5-5",
+      "api_key": "${secret:anthropic.api_key}",
+      "max_tokens": 1024
+    }
+  }
+}
+```
+
+## Extraction
+
+Use `anthropic` as an extraction provider: name the model and the schema, and
+Antfly runs a generated extractor on that model. As an `extractor` producer on an
+enrichment:
+
+```json
+{
+  "type": "extractor",
+  "config": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-5-5",
+    "api_key": "${secret:anthropic.api_key}",
+    "schema": {
+      "entities": ["person", "company"],
+      "relations": [{"type": "works_for"}]
+    }
+  }
+}
+```
+
+The schema takes `entities` and `relations`. Admitted model families: Claude 3 and later (`opus`, `sonnet`, `haiku`, and `fable`), including dated snapshots. Claude Opus 5.5, Sonnet 5.5, and Fable 5.1 use native JSON-schema output because those models reject forced tool selection. Other admitted Claude models use a forced tool call.
+Other models, and task variants such as audio, image, search, or embedding
+models, are rejected when the config is saved. Scores are verdict-only.
+
+To set instructions, output mode, probabilities, or batching, use the
+generated form instead, which takes the same generator config under
+`generator`:
+
+```json
+{
+  "method": "generated",
+  "generator": {"provider": "anthropic", "model": "claude-sonnet-5-5", "api_key": "${secret:anthropic.api_key}"},
+  "probabilities": "verdict_only",
+  "instructions": "Only extract people named in the signature block.",
+  "schema": {"entities": ["person"]}
+}
+```
+
+The generated form, with `inputs` added, is also what `/ai/v1/extract` accepts.
+
+## Related
+
+- [Named inference gateway](https://github.com/antflydb/antfly/blob/main/docs/reference/inference-gateway.md#direct-anthropic-generation): direct Anthropic generation details
+- [Provider rate limits](/docs/guides/providers/rate-limits)

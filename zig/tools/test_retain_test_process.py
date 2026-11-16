@@ -29,7 +29,12 @@ SPEC.loader.exec_module(retention)
 
 class RetainTestProcess(unittest.TestCase):
     def test_preserves_named_and_anonymous_tests_with_exact_arguments(self):
-        for name in ("test", "metadata-unit-lane-a-tests"):
+        for name in (
+            "test",
+            "test-local",
+            "metadata-unit-lane-a-tests",
+            "storage-db-core-tests-local",
+        ):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 executable = root / name

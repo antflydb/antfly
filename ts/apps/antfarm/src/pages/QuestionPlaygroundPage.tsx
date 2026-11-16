@@ -17,6 +17,9 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  Field,
+  FieldDescription,
+  FieldLabel,
   FormActions,
   Input,
   Label,
@@ -26,9 +29,9 @@ import {
   SelectTrigger,
   SelectValue,
   Skeleton,
+  Spinner,
   Textarea,
 } from "@antfly/design-system";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import { Clock, HelpCircle, ListPlus, MessageCircle, Plus, RotateCcw, Zap } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -309,7 +312,7 @@ const RewritingPlaygroundPage: React.FC = () => {
           return part.toLowerCase() === answer.toLowerCase() ? (
             <span
               key={key}
-              className="bg-amber-200 dark:bg-amber-900/50 text-amber-900 dark:text-amber-100 px-1 rounded-none"
+              className="bg-amber-200 dark:bg-amber-900/50 text-amber-900 dark:text-amber-100 px-1 rounded-sm"
             >
               {part}
             </span>
@@ -334,7 +337,7 @@ const RewritingPlaygroundPage: React.FC = () => {
     <DashboardPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Rewriting Playground</DashboardPageTitle>
+          <DashboardPageTitle>Rewriting Playground</DashboardPageTitle>
           <DashboardPageDescription>
             Transform text using Seq2Seq models (question generation, paraphrasing, etc.)
           </DashboardPageDescription>
@@ -362,8 +365,8 @@ const RewritingPlaygroundPage: React.FC = () => {
         <CardContent>
           <div className="grid grid-cols-1 gap-4">
             {/* Model Selection */}
-            <div className="space-y-2">
-              <Label htmlFor="model">Model</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="model">Model</FieldLabel>
               <Select
                 value={selectedModel}
                 onValueChange={setSelectedModel}
@@ -388,7 +391,7 @@ const RewritingPlaygroundPage: React.FC = () => {
                   ))}
                 </SelectContent>
               </Select>
-            </div>
+            </Field>
           </div>
           <FormActions>
             <Button
@@ -397,7 +400,7 @@ const RewritingPlaygroundPage: React.FC = () => {
             >
               {isLoading ? (
                 <>
-                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
+                  <Spinner className="h-4 w-4 mr-2" />
                   Generating
                 </>
               ) : (
@@ -413,7 +416,7 @@ const RewritingPlaygroundPage: React.FC = () => {
 
       {/* Error Display */}
       {error && (
-        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -443,8 +446,8 @@ const RewritingPlaygroundPage: React.FC = () => {
           </CardHeader>
           <CardContent className="flex-1 space-y-4">
             {/* Context */}
-            <div className="space-y-2">
-              <Label htmlFor="context">Context Passage</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="context">Context Passage</FieldLabel>
               <Textarea
                 id="context"
                 placeholder="Enter a passage of text containing the answer..."
@@ -452,11 +455,11 @@ const RewritingPlaygroundPage: React.FC = () => {
                 value={context}
                 onChange={(e) => setContext(e.target.value)}
               />
-            </div>
+            </Field>
 
             {/* Answer */}
-            <div className="space-y-2">
-              <Label htmlFor="answer">Answer</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="answer">Answer</FieldLabel>
               <Textarea
                 id="answer"
                 placeholder="Enter the answer that the question should target..."
@@ -464,10 +467,10 @@ const RewritingPlaygroundPage: React.FC = () => {
                 value={answer}
                 onChange={(e) => setAnswer(e.target.value)}
               />
-              <p className="text-xs text-muted-foreground">
+              <FieldDescription className="text-xs">
                 The answer should appear in the context passage above.
-              </p>
-            </div>
+              </FieldDescription>
+            </Field>
           </CardContent>
         </Card>
 
@@ -491,7 +494,7 @@ const RewritingPlaygroundPage: React.FC = () => {
                     textArray.map((question) => (
                       <div
                         key={`q-${question}`}
-                        className="p-4 bg-primary/5 border border-primary/20 rounded-none"
+                        className="p-4 bg-primary/5 border border-primary/20 rounded-lg"
                       >
                         <div className="flex items-start gap-3">
                           <MessageCircle className="h-5 w-5 text-primary mt-0.5 shrink-0" />
@@ -518,7 +521,7 @@ const RewritingPlaygroundPage: React.FC = () => {
                   <Label className="text-sm text-muted-foreground">
                     Context (answer highlighted)
                   </Label>
-                  <div className="p-3 bg-muted/50 rounded-none border text-sm leading-relaxed">
+                  <div className="p-3 bg-muted/50 rounded-lg border text-sm leading-relaxed">
                     {renderHighlightedContext()}
                   </div>
                 </div>
@@ -526,7 +529,7 @@ const RewritingPlaygroundPage: React.FC = () => {
                 {/* Answer */}
                 <div className="space-y-2">
                   <Label className="text-sm text-muted-foreground">Target Answer</Label>
-                  <div className="p-3 bg-amber-100 dark:bg-amber-900/30 rounded-none border border-amber-300 dark:border-amber-700 text-sm font-medium">
+                  <div className="p-3 bg-amber-100 dark:bg-amber-900/30 rounded-lg border border-amber-300 dark:border-amber-700 text-sm font-medium">
                     {answer}
                   </div>
                 </div>
@@ -562,7 +565,7 @@ const RewritingPlaygroundPage: React.FC = () => {
           </DialogHeader>
           <div className="space-y-4 py-4">
             {/* Show the Q+A pair */}
-            <div className="space-y-2 p-3 bg-muted/50 rounded-none text-sm">
+            <div className="space-y-2 p-3 bg-muted/50 rounded-lg text-sm">
               <div>
                 <span className="font-medium">Q:</span> {selectedQuestion}
               </div>
@@ -573,8 +576,8 @@ const RewritingPlaygroundPage: React.FC = () => {
 
             {/* Select existing eval set */}
             {getEvalSetNames().length > 0 && (
-              <div className="space-y-2">
-                <Label>Select Eval Set</Label>
+              <Field className="gap-2">
+                <FieldLabel>Select Eval Set</FieldLabel>
                 <Select value={selectedEvalSet} onValueChange={setSelectedEvalSet}>
                   <SelectTrigger>
                     <SelectValue placeholder="Choose an eval set..." />
@@ -587,12 +590,12 @@ const RewritingPlaygroundPage: React.FC = () => {
                     ))}
                   </SelectContent>
                 </Select>
-              </div>
+              </Field>
             )}
 
             {/* Or create new */}
-            <div className="space-y-2">
-              <Label>Or Create New</Label>
+            <Field className="gap-2">
+              <FieldLabel>Or Create New</FieldLabel>
               <div className="flex gap-2">
                 <Input
                   value={newEvalSetName}
@@ -615,7 +618,7 @@ const RewritingPlaygroundPage: React.FC = () => {
                   <Plus className="h-4 w-4" />
                 </Button>
               </div>
-            </div>
+            </Field>
           </div>
           <DialogFooter>
             {evalSetSuccess ? (

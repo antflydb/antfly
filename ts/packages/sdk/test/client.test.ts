@@ -791,6 +791,7 @@ describe("AntflyClient", () => {
       mockGet.mockResolvedValueOnce({
         data: mockDocument,
         error: undefined,
+        response: new Response(null, { status: 200 }),
       });
 
       const result = await client.tables.lookup("users", "user:123");
@@ -813,6 +814,7 @@ describe("AntflyClient", () => {
       mockGet.mockResolvedValueOnce({
         data: mockDocument,
         error: undefined,
+        response: new Response(null, { status: 200 }),
       });
 
       const result = await client.tables.lookup("users", "user:123", {
@@ -831,6 +833,7 @@ describe("AntflyClient", () => {
       mockGet.mockResolvedValueOnce({
         data: undefined,
         error: { error: "Key not found" },
+        response: new Response(null, { status: 404 }),
       });
 
       await expect(client.tables.lookup("users", "nonexistent")).rejects.toThrow(

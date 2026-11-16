@@ -145,6 +145,8 @@ fn applyBounded(a: std.mem.Allocator, req: types.SearchRequest, result: *types.S
         initialized += 1;
         if (hit.computed_json) |bytes| a.free(bytes);
         hit.computed_json = null;
+        if (hit.computed_receipt) |receipt| a.destroy(receipt);
+        hit.computed_receipt = null;
         hit.computed_json = try std.json.Stringify.valueAlloc(a, evaluations[index].computed, .{});
     }
     const summary = try std.json.Stringify.valueAlloc(a, .{

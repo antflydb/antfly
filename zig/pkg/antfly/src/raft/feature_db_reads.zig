@@ -73,7 +73,19 @@ pub const FeatureDBReads = struct {
         artifact_name: []const u8,
         consistency: read_gate.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
-        try self.reads.prepareLookupWithConsistency(self.group_id, doc_key, .{}, consistency);
+        return documentArtifactManifestWithConsistencyControlled(self, alloc, db, doc_key, artifact_name, consistency, .{});
+    }
+
+    pub fn documentArtifactManifestWithConsistencyControlled(
+        self: FeatureDBReads,
+        alloc: std.mem.Allocator,
+        db: *db_mod.DB,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: read_gate.ReadConsistency,
+        opts: db_mod.types.LookupOptions,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        try self.reads.prepareLookupWithConsistency(self.group_id, doc_key, opts, consistency);
         return try db.getDocumentArtifactManifest(alloc, doc_key, artifact_name);
     }
 

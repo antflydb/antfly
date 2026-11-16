@@ -30,6 +30,100 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ZigValidationScopeTests(unittest.TestCase):
+    def test_sdk_zig_outputs_use_the_existing_build_volume(self):
+        workflow = (ROOT / ".github/workflows/sdks-ci.yml").read_text()
+        block = workflow.split("      - name: Prepare SDK build caches\n", 1)[1]
+        command = textwrap.dedent(
+            block.split("run: |\n", 1)[1].split("\n      - name:", 1)[0]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, volume = root / "checkout", root / "volume"
+            (checkout / "zig").mkdir(parents=True)
+            env_file = root / "env"
+            subprocess.run(
+                ["bash", "-c", command],
+                cwd=checkout,
+                check=True,
+                env={
+                    **os.environ,
+                    "GITHUB_WORKSPACE": str(checkout),
+                    "SDK_CI_WORK_DIR": str(volume),
+                    "GITHUB_ENV": str(env_file),
+                },
+            )
+            for local, destination in (
+                (".zig-cache", "zig-cache"),
+                ("zig-out", "zig-out"),
+            ):
+                output = checkout / "zig" / local / "probe"
+                output.write_text("artifact")
+                self.assertEqual(
+                    (volume / destination / "probe").read_text(), "artifact"
+                )
+            self.assertIn(
+                f"ZIG_GLOBAL_CACHE_DIR={checkout}/zig/.zig-cache/global",
+                env_file.read_text(),
+            )
+
+    def test_owner_cache_policy_overrides_setup_zig_defaults(self):
+        workflow = (ROOT / ".github/workflows/zig-owner-qualification.yml").read_text()
+        jobs = dict(
+            re.findall(r"\n  ([\w-]+):\n(.*?)(?=\n  [\w-]+:\n|\Z)", workflow, re.DOTALL)
+        )
+        selected = [
+            block
+            for block in jobs.values()
+            if "Place compiler caches on the build runner volume" in block
+        ]
+        self.assertEqual(len(selected), 3)
+        for index, block in enumerate(selected):
+            self.assertLess(
+                block.index("uses: mlugg/setup-zig"),
+                block.index("Place compiler caches"),
+            )
+            step = block.split(
+                "      - name: Place compiler caches on the build runner volume\n", 1
+            )[1]
+            command = textwrap.dedent(
+                step.split("run: |\n", 1)[1].split("\n      - ", 1)[0]
+            )
+            with self.subTest(job=index), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                checkout, volume = root / "checkout", root / "volume"
+                (checkout / "zig").mkdir(parents=True)
+                volume.mkdir()
+                env_file = root / "env"
+                # Reproduce the preceding action's cache override. The step
+                # must replace it rather than relying on workflow-level env.
+                env_file.write_text(
+                    f"ZIG_LOCAL_CACHE_DIR={checkout}/.zig-cache\nZIG_GLOBAL_CACHE_DIR={checkout}/.zig-cache\n"
+                )
+                subprocess.run(
+                    ["bash", "-c", command.replace("/mnt/cache", str(volume))],
+                    cwd=checkout,
+                    check=True,
+                    env={
+                        **os.environ,
+                        "GITHUB_WORKSPACE": str(checkout),
+                        "GITHUB_ENV": str(env_file),
+                    },
+                )
+                actual = dict(
+                    line.split("=", 1) for line in env_file.read_text().splitlines()
+                )
+                self.assertEqual(
+                    actual["ZIG_LOCAL_CACHE_DIR"], str(checkout / "zig/.zig-cache")
+                )
+                self.assertEqual(
+                    Path(actual["ZIG_LOCAL_CACHE_DIR"]).resolve(),
+                    (volume / "operation-owners/zig-cache").resolve(),
+                )
+                self.assertEqual(
+                    actual["ZIG_GLOBAL_CACHE_DIR"],
+                    str(checkout / "zig/.zig-cache/global"),
+                )
+
     def test_vopr_qualification_is_an_optional_admitted_suite(self):
         config = json.loads((ROOT / ".github/scripts/pr-ci-config.json").read_text())
         suite = next(suite for suite in config["suites"] if suite["id"] == "vopr")
@@ -106,7 +200,13 @@ class ZigValidationScopeTests(unittest.TestCase):
         )
 
         def selected(
-            job, *, full=False, pr="7", event="workflow_dispatch", **overrides
+            job,
+            *,
+            full=False,
+            pr="7",
+            event="workflow_dispatch",
+            matrix=False,
+            **overrides,
         ):
             values = {
                 "inputs.full_validation": full,
@@ -123,13 +223,18 @@ class ZigValidationScopeTests(unittest.TestCase):
                 "needs.changes.outputs.trace_validate": "true",
                 "needs.changes.outputs.e2e": "true",
                 "needs.e2e-base-build.result": "success" if pr else "skipped",
-                "needs.e2e-base-plan.result": "success"
-                if pr and not full
-                else "skipped",
+                "needs.e2e-base-plan.result": "success",
                 "needs.e2e-full-build.result": "skipped" if pr else "success",
             }
             values.update(overrides)
-            condition = blocks[job].split("${{", 1)[1].split("}}", 1)[0]
+            condition = (
+                blocks[job]
+                .split("include: >-", 1)[1]
+                .split("fromJSON(", 1)[1]
+                .split(") }}", 1)[0]
+                if matrix
+                else blocks[job].split("${{", 1)[1].split("}}", 1)[0]
+            )
             condition = re.sub(
                 r"\b(?:inputs|github|needs)\.[\w.-]+",
                 lambda m: repr(values[m[0]]),
@@ -145,7 +250,68 @@ class ZigValidationScopeTests(unittest.TestCase):
                 .replace("&&", " and ")
                 .replace("||", " or ")
             )
-            return bool(eval(" ".join(condition.split()), {"__builtins__": {}}))
+            result = eval(" ".join(condition.split()), {"__builtins__": {}})
+            return json.loads(result) if matrix else bool(result)
+
+        # Grep selects one profile for the same admitted suite as its gate.
+        # Full validation must not rerun the base compile/test job as well.
+        grep_profiles = (
+            ({}, "base", 500),
+            ({"full": True}, "full", 5000),
+            ({"pr": "", "event": "push"}, "full", 5000),
+            ({"pr": "", "event": "merge_group"}, "full", 5000),
+            ({"pr": ""}, "full", 5000),
+            (
+                {"pr": "", "event": "schedule", "github.event.schedule": "0 8 * * *"},
+                "full",
+                5000,
+            ),
+            (
+                {"pr": "", "event": "schedule", "github.event.schedule": "0 3 * * 0"},
+                "base",
+                500,
+            ),
+        )
+        for context, suite, count in grep_profiles:
+            with self.subTest(grep_context=context):
+                self.assertTrue(selected("grep-qualification", **context))
+                self.assertEqual(
+                    selected("grep-qualification", matrix=True, **context),
+                    [{"suite": suite, "cases": count}],
+                )
+        for context in (
+            {"needs.admission.result": "failure"},
+            {"github.run_attempt": 2},
+            {
+                "needs.changes.outputs.zig_tests": "false",
+                "needs.changes.outputs.model_check": "false",
+                "needs.changes.outputs.trace_validate": "false",
+            },
+            {"pr": "", "inputs.validation_scope": "inference-e2e"},
+            {"pr": "", "event": "push", "github.ref": "refs/heads/other"},
+        ):
+            with self.subTest(grep_skipped=context):
+                self.assertFalse(selected("grep-qualification", **context))
+        grep = blocks["grep-qualification"]
+        self.assertIn("name: zig-${{ matrix.suite }} / grep", grep)
+        self.assertIn("needs: [admission, changes]", grep)
+        self.assertIn("DIFFERENTIAL_CASES: ${{ matrix.cases }}", grep)
+        self.assertIn('--cases "$DIFFERENTIAL_CASES"', grep)
+        self.assertIn("grep grep-test", grep)
+        self.assertIn("test_grep_packaging.py", grep)
+        benchmarks = grep.split(
+            "      - name: Benchmark native CPU and cache configurations\n", 1
+        )[1].split("\n      - ", 1)[0]
+        self.assertIn("if: matrix.suite == 'full'", benchmarks)
+        self.assertIn("--extended --codecs", benchmarks)
+        self.assertIn("for jobs in 1 2 4 8;", benchmarks)
+        self.assertIn("name: zig-${{ matrix.suite }}-grep", grep)
+        for gate in ("zig-base", "zig-full"):
+            self.assertIn("grep-qualification]", blocks[gate])
+            self.assertIn(
+                "GREP_RESULT: ${{ needs.grep-qualification.result }}", blocks[gate]
+            )
+            self.assertIn('test "$GREP_RESULT" = "success"', blocks[gate])
 
         full_jobs = [
             "zig-full-tests",
@@ -160,10 +326,22 @@ class ZigValidationScopeTests(unittest.TestCase):
             "zig-base-wasm",
             "zig-base-lite-models",
             "zig-base",
-            "e2e-base-plan",
             "e2e-base-tests",
             "e2e-base",
         ]
+        self.assertTrue(selected("e2e-base-plan"))
+        self.assertTrue(selected("e2e-base-plan", full=True))
+        self.assertTrue(selected("e2e-base-plan", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "e2e-base-plan", full=True, **{"needs.admission.result": "failure"}
+            )
+        )
+        self.assertFalse(
+            selected(
+                "e2e-full-tests", full=True, **{"needs.e2e-base-plan.result": "failure"}
+            )
+        )
         for job in full_jobs:
             with self.subTest(job=job):
                 self.assertTrue(selected(job, full=True))
@@ -208,11 +386,13 @@ class ZigValidationScopeTests(unittest.TestCase):
         # coverage. Full validation must not hide a failed specialized lane.
         aggregate = blocks["e2e-full"]
         self.assertIn(
-            "e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]",
+            "e2e-base-low-fd, embedded-sdk-native, source-sdk-native, pgwire-driver-conformance, better-auth]",
             aggregate,
         )
         self.assertIn("LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}", aggregate)
-        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1])
+        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1]).split(
+            "\n- uses:", 1
+        )[0]
         for build, tests, low_fd, required, native, success in (
             ("success", "success", "success", "true", "success", True),
             ("success", "success", "failure", "true", "success", False),
@@ -232,16 +412,43 @@ class ZigValidationScopeTests(unittest.TestCase):
                         **os.environ,
                         "BUILD_RESULT": build,
                         "TEST_RESULT": tests,
+                        "PLAN_RESULT": "success",
                         "LOW_FD_RESULT": low_fd,
                         "REQUIRE_LOW_FD": required,
                         "NATIVE_SDK_RESULT": native,
+                        "SOURCE_SDK_RESULT": "success",
                         "PGWIRE_DRIVER_RESULT": "success",
+                        "BETTER_AUTH_RESULT": "success",
                     },
                     check=False,
                     capture_output=True,
                 )
                 self.assertEqual(result.returncode == 0, success, result.stderr)
 
+        self.assertTrue(selected("better-auth"))
+        self.assertTrue(selected("better-auth", full=True))
+        self.assertTrue(selected("better-auth", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "better-auth",
+                **{
+                    "needs.e2e-base-build.result": "failure",
+                    "needs.e2e-full-build.result": "skipped",
+                },
+            )
+        )
+        self.assertTrue(selected("source-sdk-native"))
+        self.assertTrue(selected("source-sdk-native", full=True))
+        self.assertTrue(selected("source-sdk-native", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "source-sdk-native",
+                **{
+                    "needs.e2e-base-build.result": "failure",
+                    "needs.e2e-full-build.result": "skipped",
+                },
+            )
+        )
         self.assertTrue(selected("embedded-sdk-native"))
         self.assertTrue(selected("embedded-sdk-native", full=True))
         self.assertTrue(selected("embedded-sdk-native", pr="", event="push"))
@@ -271,9 +478,16 @@ class ZigValidationScopeTests(unittest.TestCase):
         # cannot be hidden by otherwise successful E2E and native SDK results.
         for job in ("e2e-base", "e2e-full"):
             command = textwrap.dedent(blocks[job].split("run: |\n", 1)[1])
-            if job == "e2e-base":
-                command = command.split("\n- uses:", 1)[0]
-            for driver in ("success", "failure", "skipped"):
+            command = command.split("\n- uses:", 1)[0]
+            for driver, auth, source in (
+                ("success", "success", "success"),
+                ("failure", "success", "success"),
+                ("skipped", "success", "success"),
+                ("success", "failure", "success"),
+                ("success", "skipped", "success"),
+                ("success", "success", "failure"),
+                ("success", "success", "skipped"),
+            ):
                 with self.subTest(job=job, driver=driver):
                     result = subprocess.run(
                         ["bash", "-c", command],
@@ -285,13 +499,17 @@ class ZigValidationScopeTests(unittest.TestCase):
                             "LOW_FD_RESULT": "success",
                             "REQUIRE_LOW_FD": "true",
                             "NATIVE_SDK_RESULT": "success",
+                            "SOURCE_SDK_RESULT": source,
                             "PGWIRE_DRIVER_RESULT": driver,
+                            "BETTER_AUTH_RESULT": auth,
                         },
                         check=False,
                         capture_output=True,
                     )
                     self.assertEqual(
-                        result.returncode == 0, driver == "success", result.stderr
+                        result.returncode == 0,
+                        driver == auth == source == "success",
+                        result.stderr,
                     )
 
     def test_base_native_wasm_and_model_qualification_have_independent_owners(self):
@@ -316,15 +534,25 @@ class ZigValidationScopeTests(unittest.TestCase):
             self.assertNotIn(name, native)
         for command in (
             "node pkg/antfly-embedded/wasm_client_test.mjs",
-            "build wasm-test inference-wasm",
-            "zig build inference-wasm -Dwebgpu=true",
-            "zig build inference-wasm -Dwasm-memory-model=wasm64",
-            "zig build wasm -Dwasm=true -j1",
-            "zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64",
+            "build wasm-test -Dmetal=false -j1",
+            "build inference-wasm -Dmetal=false -j1",
+            "--report reports/wasm-webgpu-build.json build inference-wasm -Dwebgpu=true",
+            "--report reports/wasm-inference64-build.json build inference-wasm -Dwasm-memory-model=wasm64",
+            "--report ../../reports/wasm-abi32-build.json build wasm -Dwasm=true -j1",
+            "--report ../../reports/wasm-abi64-build.json build wasm -Dwasm=true -Dwasm-memory-model=wasm64",
             "node web/test-wasm-abi.mjs wasm32",
             "node web/test-wasm-abi.mjs wasm64",
         ):
             self.assertIn(command, wasm)
+        self.assertIn("Install glibc-linked Zig", wasm)
+        self.assertNotIn("mlugg/setup-zig", wasm)
+        self.assertIn("--report reports/wasm-embedded-build.json", wasm)
+        self.assertIn("--report reports/wasm-inference-build.json", wasm)
+        self.assertLess(
+            wasm.index("build wasm-test -Dmetal=false -j1"),
+            wasm.index("build inference-wasm -Dmetal=false -j1"),
+        )
+        self.assertIn("path: zig/reports/wasm-*-build.json", wasm)
         libraries, evaluation = models.split(
             "      - name: Exercise real Lite extraction through public graph APIs", 1
         )
@@ -350,7 +578,9 @@ class ZigValidationScopeTests(unittest.TestCase):
             0
         ]
         self.assertIn("zig-base-wasm, zig-base-lite-models", aggregate)
-        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1])
+        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1]).split(
+            "\n- uses:", 1
+        )[0]
         healthy = {
             "CHANGES_RESULT": "success",
             "X86_64_RESULT": "success",
@@ -447,7 +677,7 @@ class ZigValidationScopeTests(unittest.TestCase):
             "\n  e2e-full:\n", 1
         )[0]
         self.assertIn("name: Download ingestion native library", full)
-        self.assertIn("if: matrix.suite == 'antfly'", full)
+        self.assertIn("if: startsWith(matrix.suite, 'antfly-')", full)
         self.assertIn(
             "libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}",
             full,
@@ -483,6 +713,9 @@ class ZigValidationScopeTests(unittest.TestCase):
             "zig/pkg/antfly-embedded/src/capi/sql.zig",
             "scripts/ci/test-embedded-sdk-native.sh",
             "scripts/ci/test_embedded_sdk_native.py",
+            "scripts/ci/check_source_native.py",
+            "go/pkg/sources/native_integration_test.go",
+            "examples/grepstein/main.go",
             "scripts/pgwire_drivers/rust/src/main.rs",
             "scripts/test_pgwire_drivers.py",
         }

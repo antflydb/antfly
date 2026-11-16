@@ -115,6 +115,26 @@ pub fn estimateEncodedArtifactDeviceBytes(encoded_bytes: usize) !usize {
     );
 }
 
+/// Once an eager mirrored model has uploaded every immutable weight, its
+/// measured weight inventory can replace the format-agnostic construction
+/// estimate. Keep alignment/metadata headroom; never increase the load lease
+/// or count cached scratch as weights. Lazy/expert stores cannot use this.
+pub fn retainedEagerMirrorBytes(construction_bytes: usize, weight_bytes: usize) !usize {
+    if (weight_bytes == 0 or weight_bytes > construction_bytes) return error.ResourceLimitExceeded;
+    const margin = @max(weight_bytes / 16, 64 * 1024 * 1024);
+    const padded = std.math.add(usize, weight_bytes, margin) catch return error.ResourceLimitExceeded;
+    return @min(construction_bytes, padded);
+}
+
+test "CUDA eager mirror retention separates weight inventory from construction peak" {
+    const mib = 1024 * 1024;
+    try std.testing.expectEqual(@as(usize, 1088 * mib), try retainedEagerMirrorBytes(4096 * mib, 1024 * mib));
+    try std.testing.expectEqual(@as(usize, 1024 * mib), try retainedEagerMirrorBytes(1024 * mib, 1000 * mib));
+    try std.testing.expectError(error.ResourceLimitExceeded, retainedEagerMirrorBytes(1024, 2048));
+    try std.testing.expectError(error.ResourceLimitExceeded, retainedEagerMirrorBytes(1024, 0));
+    try std.testing.expectError(error.ResourceLimitExceeded, retainedEagerMirrorBytes(std.math.maxInt(usize), std.math.maxInt(usize)));
+}
+
 test "CUDA load plan accounts for packed and expanded weight residency" {
     const encoded: usize = 1024;
     try std.testing.expectEqual(

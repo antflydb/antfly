@@ -311,7 +311,7 @@ func loadCmd(args []string) error {
 	embeddingDims := fs.Int("embedding-dims", 0, "Expected embedding dimensions; 0 lets Antfly probe the embedder")
 	ocrConfigJSON := fs.String("ocr-config-json", "", "Reader provider config JSON for selective server-side PDF OCR (table creation only; requires --create-table)")
 	ocrRenderDPI := fs.Int("ocr-render-dpi", 150, "PDF OCR render DPI (table creation only; requires --create-table)")
-	ocrMinContentChars := fs.Int("ocr-min-content-chars", docsaf.DefaultOCRMinContent, "Embedded-text threshold for PDF OCR fallback (table creation only; requires --create-table)")
+	ocrMinChars := fs.Int("ocr-min-chars", docsaf.DefaultOCRMinContent, "Minimum native text characters before automatic OCR is skipped (table creation only; requires --create-table)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
@@ -343,7 +343,7 @@ func loadCmd(args []string) error {
 
 	if *createTable {
 		fmt.Printf("Creating table '%s' with derived document hierarchy indexes...\n", *tableName)
-		indexes, err := createHierarchyIndexes(*chunkSize, *chunkOverlap, *embeddingProvider, *embeddingModel, *embeddingConfigJSON, *embeddingDims, *ocrConfigJSON, *ocrRenderDPI, *ocrMinContentChars)
+		indexes, err := createHierarchyIndexes(*chunkSize, *chunkOverlap, *embeddingProvider, *embeddingModel, *embeddingConfigJSON, *embeddingDims, *ocrConfigJSON, *ocrRenderDPI, *ocrMinChars)
 		if err != nil {
 			return fmt.Errorf("building hierarchy index config: %w", err)
 		}
@@ -387,7 +387,7 @@ func syncCmd(args []string) error {
 	embeddingDims := fs.Int("embedding-dims", 0, "Expected embedding dimensions; 0 lets Antfly probe the embedder")
 	ocrConfigJSON := fs.String("ocr-config-json", "", "Reader provider config JSON for selective server-side PDF OCR (table creation only; requires --create-table)")
 	ocrRenderDPI := fs.Int("ocr-render-dpi", 150, "PDF OCR render DPI (table creation only; requires --create-table)")
-	ocrMinContentChars := fs.Int("ocr-min-content-chars", docsaf.DefaultOCRMinContent, "Embedded-text threshold for PDF OCR fallback (table creation only; requires --create-table)")
+	ocrMinChars := fs.Int("ocr-min-chars", docsaf.DefaultOCRMinContent, "Minimum native text characters before automatic OCR is skipped (table creation only; requires --create-table)")
 	sourceFlags := registerSourceFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
@@ -415,7 +415,7 @@ func syncCmd(args []string) error {
 
 	if *createTable {
 		fmt.Printf("Creating table '%s' with derived document hierarchy indexes...\n", *tableName)
-		indexes, err := createHierarchyIndexes(*chunkSize, *chunkOverlap, *embeddingProvider, *embeddingModel, *embeddingConfigJSON, *embeddingDims, *ocrConfigJSON, *ocrRenderDPI, *ocrMinContentChars)
+		indexes, err := createHierarchyIndexes(*chunkSize, *chunkOverlap, *embeddingProvider, *embeddingModel, *embeddingConfigJSON, *embeddingDims, *ocrConfigJSON, *ocrRenderDPI, *ocrMinChars)
 		if err != nil {
 			return fmt.Errorf("building hierarchy index config: %w", err)
 		}
@@ -468,7 +468,7 @@ func printDocumentSample(docs []docsaf.SourceDocument) {
 	fmt.Printf("\n")
 }
 
-func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingProvider, embeddingModel, embeddingConfigJSON string, embeddingDims int, ocrConfigJSON string, ocrRenderDPI, ocrMinContentChars int) (map[string]any, error) {
+func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingProvider, embeddingModel, embeddingConfigJSON string, embeddingDims int, ocrConfigJSON string, ocrRenderDPI, ocrMinChars int) (map[string]any, error) {
 	sourceConfig := map[string]any{
 		"filename_field":     "filename",
 		"content_type_field": "mime_type",
@@ -488,7 +488,7 @@ func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingProvider, embe
 		if ocrRenderDPI < 72 || ocrRenderDPI > 600 {
 			return nil, fmt.Errorf("OCR render DPI must be between 72 and 600")
 		}
-		if ocrMinContentChars < 0 {
+		if ocrMinChars < 0 {
 			return nil, fmt.Errorf("OCR minimum content characters cannot be negative")
 		}
 		var readerConfig map[string]any
@@ -496,12 +496,11 @@ func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingProvider, embe
 			return nil, fmt.Errorf("parse OCR reader config JSON: %w", err)
 		}
 		extractionConfig["ocr"] = map[string]any{
-			"enabled":    true,
-			"render_dpi": ocrRenderDPI,
-			"quality": map[string]any{
-				"min_content_chars": ocrMinContentChars,
-			},
-			"config": readerConfig,
+			"render": map[string]any{"dpi": ocrRenderDPI},
+			"reader": readerConfig,
+		}
+		extractionConfig["native_text"] = map[string]any{
+			"quality": map[string]any{"min_chars": ocrMinChars},
 		}
 	}
 

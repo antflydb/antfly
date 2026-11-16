@@ -67,14 +67,11 @@ fn buildInnerExtended(a: A, pages: *Pages, manager: *local.sql_spill.Manager, or
     if (prior != null and !prior.?.ranked and previous != null and previous_original != null) return changedOriginal(a, pages, manager, original, current, previous.?, previous_original.?, prior.?, context);
     if (prior != null and !prior.?.ranked and previous != null and previous.?.rows == current.rows) {
         var forward = Mutations.init(a, manager, pages.store());
-        forward.private_pages.phase = pages.artifacts.io_phase;
         defer forward.deinit();
         var reverse = Mutations.init(a, manager, pages.store());
-        reverse.private_pages.phase = pages.artifacts.io_phase;
         // Swaps delete an address and insert another ID at that address.
-        // Additions must win across both sort batches and forest levels.
+        // Additions must win across every private spill run.
         reverse.addition_first = true;
-        reverse.forest.policy = .addition_first;
         defer reverse.deinit();
         const Visitor = struct {
             a: A,
@@ -160,14 +157,10 @@ fn changedOriginal(a: A, pages: *Pages, manager: *local.sql_spill.Manager, origi
     tree.visitDifferences(a, cache.store(), previous.by_id, current.by_id, &visitor) catch |err| return identity.derivedReadFailure(err);
     tree.visitDifferences(a, cache.store(), old_original.by_id, original.by_id, &visitor) catch |err| return identity.derivedReadFailure(err);
     var forward = Mutations.init(a, manager, pages.store());
-    forward.private_pages.phase = pages.artifacts.io_phase;
     forward.addition_first = true;
-    forward.forest.policy = .addition_first;
     defer forward.deinit();
     var reverse = Mutations.init(a, manager, pages.store());
-    reverse.private_pages.phase = pages.artifacts.io_phase;
     reverse.addition_first = true;
-    reverse.forest.policy = .addition_first;
     defer reverse.deinit();
     var reader: identity.Reader = .{ .root = undefined, .pages = pages, .cache = &cache };
     var scratch = std.heap.ArenaAllocator.init(a);

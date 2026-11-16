@@ -33,11 +33,13 @@ test {
     _ = @import("api/relational_activation_worker.zig");
     _ = @import("api/relational_retirement_worker.zig");
     _ = @import("metadata/storage/raft_apply_store.zig");
-    _ = @import("antfly_local_sources").api_batch;
+    _ = @import("antfly_local_sources").api_internal_batch;
     _ = distributed_entity_sink;
     _ = internal_group_operations;
     _ = restore_catalog;
     _ = transactions;
+    _ = @import("api/graph_execution.zig");
+    _ = @import("api/http_server.zig");
 }
 
 /// Implementation source choices for this compilation root.

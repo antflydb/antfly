@@ -356,25 +356,27 @@ def build_server_config(
     memory_budget_mb: int,
 ) -> dict[str, Any]:
     return {
-        "models_dir": str(models_dir.resolve()),
-        "max_loaded_models": 1,
-        "admission": {"inference": {"max_concurrent_requests": 1}},
-        "generation_batching": {
-            "mode": "off",
-            "max_step_items": 1,
-            "max_step_query_tokens": 128,
-            "max_idle_prefill_chunk_size": 128,
+        "resources": {"inference": {"admission": {"max_concurrent_requests": 1}}},
+        "inference": {
+            "models_dir": str(models_dir.resolve()),
+            "max_loaded_models": 1,
+            "generation_batching": {
+                "mode": "off",
+                "max_step_items": 1,
+                "max_step_query_tokens": 128,
+                "max_idle_prefill_chunk_size": 128,
+            },
+            "prompt_cache": {"enabled": False},
+            "preload": [
+                {
+                    "kind": "generator",
+                    "name": model_id,
+                    "backend": "metal",
+                    "residency_mode": residency_mode,
+                    "memory_budget_mb": memory_budget_mb,
+                }
+            ],
         },
-        "prompt_cache": {"enabled": False},
-        "preload": [
-            {
-                "kind": "generator",
-                "name": model_id,
-                "backend": "metal",
-                "residency_mode": residency_mode,
-                "memory_budget_mb": memory_budget_mb,
-            }
-        ],
     }
 
 

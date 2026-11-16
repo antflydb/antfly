@@ -1,0 +1,9 @@
+{
+  "abi_version": 2,
+  "architecture": "arm64",
+  "schema_version": 1,
+  "sdk_version": "27.0",
+  "sha256": "496b066b7ddb963ab714661b9904be2ed40c982ae08185d78d2d3693949ba1bb",
+  "source_commit": "efcb964314bb9184ed8a4611cdd2404fc2c549b2",
+  "source_sha256": "fc7c5628c191c676bca01de3f08a43f351466c49e4541bac74394f1bfafedd9d"
+}

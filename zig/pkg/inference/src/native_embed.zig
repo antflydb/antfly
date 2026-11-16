@@ -409,7 +409,7 @@ fn runEmbeddingGemma2(allocator: std.mem.Allocator, writer: *std.Io.Writer, mode
         for (opts.order.items, 0..) |item, index| parts[index] = switch (item.modality) {
             .text => .{ .text = opts.texts.items[item.index] },
             .image => .{ .image = images[item.index] },
-            .audio => .{ .audio = .{ .bytes = audio[item.index] } },
+            .audio => .{ .audio = .{ .bytes = audio[item.index], .decode_options = .{ .file_name_hint = opts.audio_paths.items[item.index] } } },
             .video => .{ .video = videos[item.index] },
         };
         if (opts.combined or opts.group) {
@@ -437,7 +437,7 @@ fn runEmbeddingGemma2(allocator: std.mem.Allocator, writer: *std.Io.Writer, mode
             for (group.content, parts) |part, *dest| dest.* = switch (part) {
                 .text => |text| .{ .text = text },
                 .image => |image| .{ .image = image },
-                .audio => |audio| .{ .audio = audio.bytes },
+                .audio => |clip| if (clip.pcm) |pcm| .{ .pcm = pcm } else .{ .audio = .{ .bytes = clip.bytes, .decode_options = clip.decode_options } },
                 .video => |video| .{ .video = video },
             };
             const result = try grouped.embed(allocator, model.session, model.getTokenizer(), .{ .title = opts.title, .content = parts }, .{ .task_type = task_type, .dimensions = dimensions orelse 768 }, model.embeddingExecutionLock(), pipeline.execution_control);
@@ -567,7 +567,7 @@ fn embedGemma2(a: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, model: 
     for (opts.order.items, parts) |item, *part| part.* = switch (item.modality) {
         .text => .{ .text = opts.texts.items[item.index] },
         .image => .{ .image = images[item.index] },
-        .audio => .{ .audio = audio[item.index] },
+        .audio => .{ .audio = .{ .bytes = audio[item.index], .decode_options = .{ .file_name_hint = opts.audio_paths.items[item.index] } } },
         .video => return error.UnsupportedVideoBackend,
     };
     var lease = model.acquireEmbeddingAssetLease(false);

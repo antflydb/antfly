@@ -32,6 +32,7 @@ const ApiTypes = public.ApiTypes;
 const search_wire = public.search_wire;
 const kernel_owner_abi = shared.kernel_owner_abi;
 const kernel_error_identity = server_api.kernel_error_identity;
+const remote_content_services = server_api.kernel_runtime_services;
 const local_query_client = shared.local_query_client;
 const capi_build_options = shared.capi_build_options;
 const kernel_wal_owner = server_api.kernel_wal_owner;
@@ -889,7 +890,7 @@ test "capi lite AddIndexJSON registers a graph config's nested resolvers" {
     // JSON (metadata_table_provisioner.ensureResolvers); a native Lite
     // handle admits one index at a time, so registerLiteIndexResolvers
     // harvests the graph config's own "resolvers" array — the shape
-    // examples/dogfood's knowledgeGraphIndexJSON declares. Re-adding the
+    // examples/antfly-docs-knowledge-base's knowledgeGraphIndexJSON declares. Re-adding the
     // same index must be idempotent (upsertResolver observes an unchanged
     // config), matching the enrichment path's contract.
     var test_tmp = try TestDirectory.init("capi");
@@ -1611,7 +1612,9 @@ test "capi SQL mutations fence exact primary bytes with unchanged TTL and schema
         , .{mode});
         defer alloc.free(schema);
         try database.setSchemaJson(alloc, schema);
-        try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
+        // Legacy replicated writes can retain the same timestamp while their
+        // bytes change. Exercise the digest fence independently of revision_v1.
+        try database.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "a", .value = "{\"n\":1,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
         var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "items" };
         const backend = adapter.backend();
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1624,7 +1627,7 @@ test "capi SQL mutations fence exact primary bytes with unchanged TTL and schema
         try std.testing.expectEqual(@as(usize, 1), page.rows.len);
         const before = page.rows[0];
         try std.testing.expect(before.expected_content_digest != null);
-        try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
+        try database.batch(.{ .document_version_scheme = .legacy, .timestamp_ns = 123, .writes = &.{.{ .key = "a", .value = "{\"n\":2,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
         try std.testing.expectEqual(before.version, try database.getTimestamp(alloc, "a"));
         try std.testing.expectError(error.SqlWriteConflict, backend.vtable.mutate(backend.ptr, arena.allocator(), alloc, table, &.{.{ .key = "a", .expected_version = before.version, .expected_content_digest = before.expected_content_digest, .row = null }}));
         try std.testing.expectError(error.PreparedGenerationChanged, database.batch(.{ .schema_version = 2, .deletes = &.{"a"} }));
@@ -5144,6 +5147,25 @@ test "capi SQL background embedding releases the file gate and fences stale resu
                 idle = true;
                 break;
             }
+            // Serving refresh can replace the runtime (and its clock). Drive
+            // the admitted owner's actual retry deadline instead of advancing
+            // a discarded fixture clock or spinning before backoff is due.
+            const delay_ms = delay: {
+                const probe = public.enterHandle(handle, .read).?;
+                defer probe.leave();
+                const runtime = probe.handle.db.enrichment_runtime orelse break :delay @as(u64, 0);
+                const stats = runtime.stats();
+                break :delay if (stats.retrying) @min(stats.next_retry_at_ms -| runtime.clock.nowRealtimeMs(), 250) else @as(u64, 0);
+            };
+            if (delay_ms != 0) try shared.handleLockIo().sleep(.fromMilliseconds(@intCast(delay_ms)), .awake);
+        }
+        if (!idle) {
+            const probe = public.enterHandle(handle, .read).?;
+            defer probe.leave();
+            const stats = probe.handle.db.pendingWorkStats();
+            const runtime = probe.handle.db.enrichment_runtime.?;
+            std.debug.print("detached embedding runtime: workers={} future={} runtime_now={d} backend_now={d} retries={d} fingerprint={d} maintenance_error={?s}\n", .{ probe.handle.db.local_execution.optional_runtime_workers_enabled, runtime.future != null, runtime.clock.nowRealtimeMs(), probe.handle.db.backend_runtime.clock().nowRealtimeMs(), runtime.consecutive_retry_count, runtime.retry_failure_fingerprint, connection.publication_stats.last_maintenance_error });
+            std.debug.print("detached embedding did not publish: changed={} calls={d} writes={d} target={d} enrichment={d}/{d} retrying={} retry_at={d} now={d} worker_failed={} lease={} acquired={d} lost={d} owner_pending={} storage_pending={}\n", .{ source_changed, gate.calls.load(.monotonic), foreground.writes.load(.monotonic), stats.derived_target_sequence, stats.enrichment.applied_sequence, stats.enrichment.target_sequence, stats.enrichment.retrying, stats.enrichment.next_retry_at_ms, runtime.clock.nowRealtimeMs(), stats.enrichment.worker_failed, stats.enrichment.has_lease, stats.enrichment.acquisition_count, stats.enrichment.lost_leases, connection.maintenance_pending, connection.maintenance_storage_pending });
         }
         try std.testing.expect(idle);
         // One original computation and one new document: retry reused the first
@@ -5256,6 +5278,10 @@ test "capi native idle maintenance verifies allocator outside connection and wri
             var handle: ?*anyopaque = null;
             try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
             defer antfly_db_close(handle);
+            const marker_path = try std.fmt.allocPrint(a, "{s}/.aflite-lease-0123456789abcdef0123456789abcdef", .{std.fs.path.dirname(path).?});
+            defer a.free(marker_path);
+            const marker = try std.Io.Dir.cwd().createFile(shared.handleLockIo(), marker_path, .{});
+            marker.close(shared.handleLockIo());
             const owner = blk: {
                 const guard = public.enterHandle(handle, .exclusive).?;
                 defer guard.leave();
@@ -5292,6 +5318,15 @@ test "capi native idle maintenance verifies allocator outside connection and wri
                         self.owner.collectRetired();
                         try std.testing.expectEqual(@as(usize, 1), self.owner.retired.items.len);
                     }
+                    if (!replace) {
+                        const file = &self.owner.current.?.owned_lite_backend.?.native_docstore.?.file;
+                        file.defer_allocator_verification = true;
+                        defer file.defer_allocator_verification = false;
+                        const current = self.owner.current.?;
+                        try file.putCatalogRecord("proof/local-append", "foreground progress");
+                        try std.testing.expect(try self.owner.refresh() == current);
+                        try std.testing.expect(!file.free_pages_verified);
+                    }
                     if (cancel) self.owner.verification_cancel.request();
                 }
             };
@@ -5303,13 +5338,14 @@ test "capi native idle maintenance verifies allocator outside connection and wri
             } else {
                 try std.testing.expect(try owner.maintenanceTurnForTest());
             }
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(shared.handleLockIo(), marker_path, .{}));
             if (probe.failure) |err| return err;
             try std.testing.expectEqual(@as(usize, 1), probe.calls);
             // Completion must release the retired proof owner before another API call.
             try std.testing.expectEqual(@as(usize, 0), owner.retired.items.len);
             const guard = public.enterHandle(handle, .read).?;
             defer guard.leave();
-            // Reopening can change the header fence; only inherit an exact proof.
+            // A foreign reopen breaks lineage; locally authored appends preserve it.
             if (!replace) try std.testing.expectEqual(!cancel, guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
             try std.testing.expectEqual(@as(usize, 0), guard.handle.maintenance_references);
             try std.testing.expectEqual(@as(usize, 0), guard.handle.allocator_verification_references);
@@ -6488,13 +6524,17 @@ test "capi native replacement wait observes its background owner without rebuild
     };
     const before = try Reservation.bytes(a, handle);
     defer a.free(before);
+    const rounds_before = owner.publication_stats.maintenance_rounds;
     try std.testing.expectEqual(capi.ErrorCode.busy, antfly_db_add_index_json(handle, .fromSlice(
         \\{"name":"new","type":"graph","replaces":"old","wait":{"timeout_ms":1000},"edge_types":[{"name":"R","field":"links"}]}
     )));
     const after = try Reservation.bytes(a, handle);
     defer a.free(after);
     try std.testing.expectEqualStrings(before, after);
+    // Foreground status/waits do not impersonate a background scheduler round.
+    try std.testing.expectEqual(rounds_before, owner.publication_stats.maintenance_rounds);
     for (0..32) |_| if (!try owner.maintenanceTurnForTest()) break;
+    try std.testing.expect(owner.publication_stats.maintenance_rounds > rounds_before);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .fromSlice(
         \\{"name":"new","type":"graph","replaces":"old","wait":{"timeout_ms":0},"edge_types":[{"name":"R","field":"links"}]}
     )));
@@ -6770,6 +6810,223 @@ test "capi native resolver maintenance retries transient inference and survives 
     try std.testing.expectEqual(@as(?[]const u8, null), owner.publication_stats.last_maintenance_error);
 }
 
+test "capi native bounded admission coalesces allocator proof outside publication gates" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-capacity-proof");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    var second: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &second));
+    defer antfly_db_close(second);
+    var limit: u64 = 0;
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const store = guard.handle.owned_lite_backend.?.native_docstore.?;
+        const file = &store.file;
+        try file.completeAllocatorVerification();
+        const large: [32768]u8 = @splat('v');
+        var keys: [32][32]u8 = undefined;
+        var batch: [32]lite_backend.native.CatalogMutation = undefined;
+        for (&batch, &keys, 0..) |*mutation, *key, i| mutation.* = .{ .key = try std.fmt.bufPrint(key, "test/free-{d}", .{i}), .value = &large };
+        try file.putCatalogBatch(&batch);
+        for (&batch) |*mutation| mutation.* = .{ .key = mutation.key, .is_delete = true };
+        try file.putCatalogBatch(&batch);
+        for (0..8) |_| _ = try file.reclaimPages(4096);
+        try std.testing.expect((try file.allocatorStats()).?.reusable_pages > 64);
+        limit = (try file.file.stat(file.runtime())).size;
+        store.maintenance_policy.options.max_storage_bytes = limit;
+        file.max_file_bytes = limit;
+        file.free_pages_verified = false;
+        owner.maintenance_storage_pending = true;
+    }
+    const Probe = struct {
+        owner: @TypeOf(owner),
+        path: []const u8,
+        second: ?*anyopaque,
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        worker: ?std.Thread = null,
+        worker_failure: ?anyerror = null,
+        waiting: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        fn write(self: *@This()) !void {
+            const guard = public.enterHandle(self.second, .exclusive).?;
+            defer guard.leave();
+            try std.testing.expect(guard.entry_error == null);
+            try std.testing.expect(guard.connection.?.owner == self.owner);
+            try guard.handle.db.batch(.{ .writes = &.{.{ .key = "second", .value = "{\"body\":\"waits for reader teardown\"}" }}, .sync_level = .write });
+        }
+        fn run(self: *@This()) void {
+            self.write() catch |err| {
+                self.worker_failure = err;
+            };
+            self.done.store(true, .release);
+        }
+        fn onWait(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waiting.store(true, .release);
+        }
+        fn check(self: *@This(), reader: *lite_backend.native.NativeFile) !void {
+            try std.testing.expect(self.owner.gate.mutex.tryLock());
+            self.owner.gate.mutex.unlock(shared.handleLockIo());
+            var lease = try lite_backend.native.lockWriterPathWithIo(a, shared.handleLockIo(), self.path);
+            lease.close();
+            // The worker yields to the admission proof instead of duplicating
+            // its graph walk or waiting for it while holding the owner gate.
+            for (0..2) |_| try std.testing.expect(try self.owner.maintenanceTurnForTest());
+            try std.testing.expect(!self.owner.current.?.owned_lite_backend.?.native_docstore.?.file.free_pages_verified);
+            const cursor = self.owner.maintenance_table_cursor;
+            self.owner.maintenance_table_cursor = 1;
+            defer self.owner.maintenance_table_cursor = cursor;
+            try std.testing.expect(self.owner.maintenanceWaitMillisForTest(true) >= 100);
+            try std.testing.expectEqual(@as(usize, 1), self.calls);
+            // Reproduce the interval after publishing verification but before
+            // closing its reader. The second connection must still queue off
+            // the publication gates, rather than fail to reuse at the cap.
+            try reader.completeAllocatorVerification();
+            self.owner.gate.mutex.lockUncancelable(shared.handleLockIo());
+            {
+                defer self.owner.gate.mutex.unlock(shared.handleLockIo());
+                var publication = try lite_backend.native.lockWriterPathWithIo(a, shared.handleLockIo(), self.path);
+                defer publication.close();
+                try self.owner.current.?.owned_lite_backend.?.native_docstore.?.file.inheritAllocatorVerification(reader);
+            }
+            self.worker = try std.Thread.spawn(.{}, run, .{self});
+            const io = shared.handleLockIo();
+            const deadline = std.Io.Clock.awake.now(io).nanoseconds + 5 * std.time.ns_per_s;
+            while (!self.waiting.load(.acquire) and !self.done.load(.acquire)) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return error.CapacityWaitTimeout;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expect(self.waiting.load(.acquire));
+            try std.testing.expect(!self.done.load(.acquire));
+            try std.testing.expect(self.owner.gate.mutex.tryLock());
+            self.owner.gate.mutex.unlock(io);
+            var available = try lite_backend.native.lockWriterPathWithIo(a, io, self.path);
+            available.close();
+        }
+        fn notify(raw: *anyopaque, reader: *lite_backend.native.NativeFile) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.check(reader) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var probe = Probe{ .owner = owner, .path = path, .second = second };
+    defer if (probe.worker) |worker| worker.join();
+    owner.test_allocator_wait = .{ .ptr = &probe, .notify = Probe.onWait };
+    defer owner.test_allocator_wait = null;
+    owner.test_after_allocator_capture = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_after_allocator_capture = null;
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+        try std.testing.expect(file.free_pages_verified);
+        const reused = (try file.allocatorStats()).?.reused_pages;
+        try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"reuses capacity\"}" }}, .sync_level = .write });
+        try std.testing.expect((try file.allocatorStats()).?.reused_pages > reused);
+        try std.testing.expect((try file.file.stat(file.runtime())).size <= limit);
+        try std.testing.expect((try file.check()).valid);
+    }
+    if (probe.worker) |worker| {
+        worker.join();
+        probe.worker = null;
+    }
+    if (probe.failure) |err| return err;
+    if (probe.worker_failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    // Completion restores immediate progress between namespaces, rather than
+    // charging every table another wait quantum.
+    const cursor = owner.maintenance_table_cursor;
+    owner.maintenance_table_cursor = 1;
+    defer owner.maintenance_table_cursor = cursor;
+    try std.testing.expectEqual(@as(i64, 0), owner.maintenanceWaitMillisForTest(true));
+}
+
+test "capi native close certifies allocator before the next process opens sources" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-certified-reopen");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    for (0..3) |process| {
+        var handle: ?*anyopaque = null;
+        const result = if (process == 0) antfly_db_create_with_options(path, &options, &handle) else antfly_db_open_with_options(path, &options, &handle);
+        try std.testing.expectEqual(capi.ErrorCode.ok, result);
+        defer if (handle != null) antfly_db_close(handle);
+        const owner = blk: {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            break :blk guard.connection.?.owner;
+        };
+        owner.stopping.store(true, .release);
+        owner.wake.set(shared.handleLockIo());
+        owner.worker.?.join();
+        owner.worker = null;
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+            if (process == 0) try file.completeAllocatorVerification() else try std.testing.expect(file.free_pages_verified);
+            const reused = (try file.allocatorStats()).?.reused_pages;
+            const large: [32768]u8 = @splat('x');
+            for (0..12) |_| try file.putCatalogRecord("test/free-pool", &large);
+            try file.deleteCatalogRecord("test/free-pool");
+            _ = try file.reclaimPages(4096);
+            if (process != 0) try std.testing.expect((try file.allocatorStats()).?.reused_pages > reused);
+            try std.testing.expect((try file.check()).valid);
+            try std.testing.expect(file.free_pages_verified);
+        }
+        // Exercise the certificate with real managed SQL index sources too;
+        // opening their read leases must preserve inherited verification.
+        if (process == 0) try sqlFkRecoveryStatement(handle, "CREATE TABLE certified(n BIGINT PRIMARY KEY)");
+        var statement: [160]u8 = undefined;
+        try sqlFkRecoveryStatement(handle, try std.fmt.bufPrint(&statement, "INSERT INTO certified(_id,n) VALUES ('row-{d}',{d})", .{ process, process }));
+        {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+            try std.testing.expect(file.free_pages_verified);
+            try std.testing.expect((try file.check()).valid);
+        }
+        antfly_db_close(handle);
+        handle = null;
+        var probe = try lite_backend.native.NativeFile.openWithIo(a, shared.handleLockIo(), path, .{ .read_only = true, .internal_reader = true });
+        defer probe.close();
+        try std.testing.expect(try probe.inheritAllocatorCertificate());
+    }
+}
+
 test "capi native foreground reuses free pages during a captured worker turn" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -6985,6 +7242,9 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
         }
         const manager = owner.current.?.db.core.index_manager;
         std.debug.print("idle maintenance did not settle: debt={f} lsm_hint={d} lsm_score={d} stats={f}\n", .{ std.json.fmt(debts, .{}), manager.lsmMaintenanceDebtHint(), manager.lsmMaintenanceScore(), std.json.fmt(owner.publication_stats, .{}) });
+        for (manager.text_indexes.items) |entry| {
+            std.debug.print("idle index={s} maintenance={f}\n", .{ entry.config.name, std.json.fmt(entry.persistent.snapshotLsmMaintenanceStats(), .{}) });
+        }
     }
     try std.testing.expect(settled);
     owner.wake.reset();
@@ -7242,6 +7502,71 @@ test "capi lite inference producer retry is visible in graph replacement status"
     const row = parsed.value.object.get("replacements").?.array.items[0].object;
     try std.testing.expect(row.get("blocked_reason").? == .null);
     try std.testing.expect(row.get("upstream_last_error").? == .null);
+}
+
+test "capi SQL detached index publication rejects a recreated table namespace" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-named-publication-fence");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE docs (body TEXT)");
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const table = &guard.handle.embedded_tables.get("docs").?.db;
+        try table.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+    }
+    const Probe = struct {
+        handle: ?*anyopaque,
+        failure: ?anyerror = null,
+        rejected: bool = false,
+        fn notify(ptr: *anyopaque, root: *shared.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.check(root) catch |err| {
+                self.failure = err;
+            };
+        }
+        fn check(self: *@This(), root: *shared.Handle) !void {
+            const table = &root.embedded_tables.get("docs").?.db;
+            const file = try std.fmt.allocPrint(std.testing.allocator, "{s}/body_text/prepared.bin", .{table.core.index_manager.base_path});
+            defer std.testing.allocator.free(file);
+            try sqlFkRecoveryStatement(self.handle, "DROP TABLE docs");
+            try sqlFkRecoveryStatement(self.handle, "CREATE TABLE docs (body TEXT)");
+            table.core.index_manager.text_lsm_storage.?.writeFileAbsolute(file, "old namespace") catch |err| {
+                try std.testing.expectEqual(@as(anyerror, error.EnrichmentSourceChanged), err);
+                self.rejected = true;
+                return;
+            };
+            return error.TestUnexpectedResult;
+        }
+    };
+    var probe: Probe = .{ .handle = handle };
+    owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_after_capture = null;
+    owner.maintenance_table_cursor = 1;
+    owner.maintenance_pending = true;
+    _ = try owner.maintenanceTurnForTest();
+    if (probe.failure) |err| return err;
+    try std.testing.expect(probe.rejected);
 }
 
 test "capi SQL visibility waits for physical graph indexes and normalized vector text filters" {
@@ -7688,4 +8013,353 @@ test "storage owner remote content source refreshes policy and retains in-flight
     const recovered = try remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config);
     defer alloc.free(recovered);
     try std.testing.expect(std.mem.indexOf(u8, recovered, "image/png") != null);
+}
+
+test "capi storage owner candidate batches release native views through their owning adapter" {
+    const Fixture = struct {
+        source: db_mod.CandidateSource = undefined,
+        invalid: bool = false,
+        released: usize = 0,
+        reads: usize = 0,
+        fn legacyGet(_: ?*anyopaque, _: kernel_owner_abi.BorrowedBytes, _: kernel_owner_abi.BorrowedBytes, _: ?*anyopaque, _: kernel_owner_abi.ResolutionCandidateConsumeFn) callconv(.c) kernel_owner_abi.Status {
+            return .ok;
+        }
+        fn nativeGet(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return null;
+        }
+        fn release(ptr: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.released += 1;
+        }
+        fn begin(ptr: ?*anyopaque, _: ?[*]const kernel_owner_abi.BorrowedBytes, _: u64, output: *kernel_owner_abi.ResolutionCandidateConfig) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            const bytes = std.mem.asBytes(&self.source);
+            output.* = .{
+                .callback_ctx = self,
+                .native_view = .fromSlice(if (self.invalid) bytes[0..1] else bytes),
+                .native_view_contract = .fromSlice(db_mod.CandidateSource.nativeContractBytes()),
+                .release_fn = release,
+            };
+            return .ok;
+        }
+    };
+    for ([_]bool{ false, true }) |invalid| {
+        var fixture: Fixture = .{ .invalid = invalid };
+        fixture.source = .{ .ptr = &fixture, .vtable = &.{ .get = Fixture.nativeGet } };
+        var hooks: StorageOwnerRuntimeHooks = .{ .config = .{ .resolution_candidates = .{ .callback_ctx = &fixture, .get_fn = Fixture.legacyGet, .begin_batch_fn = Fixture.begin } }, .group_id = 1 };
+        const source = (try server_api.test_support.candidateSource(&hooks)).?;
+        if (invalid) {
+            try std.testing.expectError(error.InvalidAbiVersion, source.beginBatch(std.testing.allocator, &.{"entities"}));
+        } else {
+            const batch = try source.beginBatch(std.testing.allocator, &.{"entities"});
+            defer batch.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&fixture)), batch.source.ptr);
+            try std.testing.expect(batch.release_context.? != batch.source.ptr);
+            try std.testing.expectEqual(@as(?[]u8, null), try batch.source.get(std.testing.allocator, "entities", "key"));
+            try std.testing.expectEqual(@as(usize, 1), fixture.reads);
+        }
+        try std.testing.expectEqual(@as(usize, 1), fixture.released);
+    }
+    var fallback: StorageOwnerRuntimeHooks = .{ .config = .{ .resolution_candidates = .{ .get_fn = Fixture.legacyGet } }, .group_id = 1 };
+    const source = (try server_api.test_support.candidateSource(&fallback)).?;
+    const batch = try source.beginBatch(std.testing.allocator, &.{"entities"});
+    defer batch.deinit(std.testing.allocator);
+    try std.testing.expect(batch.release == null);
+}
+
+test "storage owner remote content source preserves scoped GCS connections and snapshot lifetime" {
+    const Source = struct {
+        config: *@import("antfly_local_sources").common_config.Config,
+        fn acquire(raw: *anyopaque, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = @import("antfly_local_sources").common_config.remoteContentSnapshotJsonAlloc(std.testing.allocator, &self.config.remote_content.?) catch return .out_of_memory;
+            out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+            return .ok;
+        }
+        fn release(_: *anyopaque, bytes: kernel_owner_abi.OwnedBytes) callconv(.c) void {
+            std.testing.allocator.free(bytes.slice());
+        }
+    };
+    const alloc = std.testing.allocator;
+    var config = try @import("antfly_local_sources").common_config.Config.parseFromSlice(alloc,
+        \\{"connections":{"archive":{"kind":"external_io","capabilities":["content.fetch"],"external_io":{"protocol":"gcs","buckets":["originals"],"prefix":"objects/sha256","credentials":{"source":"bearer_token","bearer_token":"${secret:missing-gcs-reader}"}}}}}
+    );
+    defer config.deinit();
+    var source = Source{ .config = &config };
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextCreate(&.{}, &context));
+    defer std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextDestroy(context)) catch unreachable;
+    const callbacks = server_api.kernel_runtime_services.RemoteContentSource{ .version = 2, .context = &source, .acquire = Source.acquire, .release = Source.release };
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextConfigureRemoteContentSource(context, &callbacks));
+    const owner = asStorageOwnerContext(context).?;
+    owner.acquire();
+    defer owner.release();
+    const facade = owner.remoteContent().?;
+    var before = try facade.acquire();
+    defer before.deinit();
+    const connection = before.config.gcs_connections.get("archive").?;
+    try std.testing.expectEqualStrings("originals", connection.buckets[0]);
+    try std.testing.expectEqualStrings("objects/sha256", connection.prefix.?);
+    try std.testing.expectEqualStrings("${secret:missing-gcs-reader}", connection.credentials.bearer_token.?);
+    const remote = @import("antfly_local_sources").template_remote;
+    const render_config = remote.RenderConfig{ .remote_content = facade, .io = std.testing.io };
+    // Scope rejection must precede resolution of the deliberately missing secret.
+    try std.testing.expectError(error.GcsConnectionNotFoundOrOutOfScope, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "gs://originals/elsewhere/doc.pdf?generation=123", "archive"));
+    // An authorized locator reaches credential resolution through the owner facade.
+    try std.testing.expectError(error.SecretNotFound, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "gs://originals/objects/sha256/doc.pdf?generation=123", "archive"));
+    config.remote_content.?.gcs_connections.clearRetainingCapacity();
+    var after = try facade.acquire();
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after.config.gcs_connections.count());
+    try std.testing.expectEqualStrings("objects/sha256", before.config.gcs_connections.get("archive").?.prefix.?);
+    try std.testing.expectError(error.GcsConnectionNotFoundOrOutOfScope, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "gs://originals/objects/sha256/doc.pdf?generation=123", "archive"));
+}
+
+test "storage owner remote content source preserves S3 and HTTP credentials" {
+    const Source = struct {
+        config: *@import("antfly_local_sources").common_config.Config,
+        fn acquire(raw: *anyopaque, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = @import("antfly_local_sources").common_config.remoteContentSnapshotJsonAlloc(std.testing.allocator, &self.config.remote_content.?) catch return .out_of_memory;
+            out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+            return .ok;
+        }
+        fn release(_: *anyopaque, bytes: kernel_owner_abi.OwnedBytes) callconv(.c) void {
+            std.testing.allocator.free(bytes.slice());
+        }
+    };
+    const alloc = std.testing.allocator;
+    // The shape Colony renders for an attached S3-compatible storage key and a
+    // GitHub installation: unresolved secret references plus a default S3 name.
+    var config = try @import("antfly_local_sources").common_config.Config.parseFromSlice(alloc,
+        \\{"remote_content":{"default_s3":"r2","s3":{"r2":{"endpoint":"account.r2.cloudflarestorage.com","region":"auto","use_ssl":true,"buckets":["media"],"access_key_id":"${secret:missing-r2-access}","secret_access_key":"${secret:missing-r2-secret}"}},"http":{"github":{"base_url":"https://api.github.com/repos/acme/","headers":{"Authorization":"${secret:missing-github-token}"},"security":{"allowed_hosts":["api.github.com"]}}}}}
+    );
+    defer config.deinit();
+    var source = Source{ .config = &config };
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextCreate(&.{}, &context));
+    defer std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextDestroy(context)) catch unreachable;
+    const callbacks = server_api.kernel_runtime_services.RemoteContentSource{ .version = 2, .context = &source, .acquire = Source.acquire, .release = Source.release };
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextConfigureRemoteContentSource(context, &callbacks));
+    const owner = asStorageOwnerContext(context).?;
+    owner.acquire();
+    defer owner.release();
+    const facade = owner.remoteContent().?;
+    const remote = @import("antfly_local_sources").template_remote;
+    const render_config = remote.RenderConfig{ .remote_content = facade, .io = std.testing.io };
+    // An unnamed s3:// locator selects the default credential and reaches
+    // secret resolution instead of failing with MissingS3Credentials.
+    try std.testing.expectError(error.SecretNotFound, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "s3://media/sources/clip.gif", null));
+    // Scope rejection still precedes resolution of the missing secret.
+    try std.testing.expectError(error.S3CredentialNotFoundOrOutOfScope, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "s3://elsewhere/clip.gif", "r2"));
+    // A matching HTTP base URL resolves its header secrets before any request.
+    try std.testing.expectError(error.SecretNotFound, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "https://api.github.com/repos/acme/widgets/contents/README.md", null));
+
+    var snapshot = try facade.acquire();
+    defer snapshot.deinit();
+    try std.testing.expectEqualStrings("r2", snapshot.config.default_s3.?);
+    const s3 = snapshot.config.getS3("r2").?;
+    try std.testing.expectEqualStrings("account.r2.cloudflarestorage.com", s3.endpoint.?);
+    try std.testing.expectEqualStrings("media", s3.buckets.?[0]);
+    try std.testing.expectEqualStrings("${secret:missing-r2-access}", s3.access_key_id.?);
+    const http = snapshot.config.getHttp("github").?;
+    try std.testing.expectEqualStrings("https://api.github.com/repos/acme/", http.base_url.?);
+    try std.testing.expectEqualStrings("${secret:missing-github-token}", http.headers.get("Authorization").?);
+    try std.testing.expectEqualStrings("api.github.com", http.security.?.allowed_hosts.?[0]);
+}
+
+test "storage owner remote content source caches revisions without hiding errors or invalidating readers" {
+    const Source = struct {
+        revision: std.atomic.Value(u8) = .init(1),
+        payloads: std.atomic.Value(usize) = .init(0),
+        releases: std.atomic.Value(usize) = .init(0),
+        failure: kernel_owner_abi.Status = .ok,
+        malformed: bool = false,
+        block_probe: std.atomic.Value(bool) = .init(false),
+        probe_started: std.atomic.Value(bool) = .init(false),
+        resume_probe: std.atomic.Value(bool) = .init(false),
+
+        fn acquire(_: *anyopaque, _: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+            // v3 must use the conditional callback.
+            return .invalid_argument;
+        }
+        fn probe(raw: *anyopaque, out: *remote_content_services.CachedRemoteContentSource.Revision) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.failure != .ok) return self.failure;
+            if (self.block_probe.swap(false, .acq_rel)) {
+                self.probe_started.store(true, .release);
+                while (!self.resume_probe.load(.acquire)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+            out.* = .{ .value = @splat(self.revision.load(.acquire)), .known = 1 };
+            return .ok;
+        }
+        fn acquireIfChanged(raw: *anyopaque, previous: ?*const [32]u8, out: *remote_content_services.CachedRemoteContentSource.Update) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.failure != .ok) return self.failure;
+            const revision: [32]u8 = @splat(self.revision.load(.acquire));
+            out.* = .{ .revision = revision };
+            if (previous) |old| if (std.mem.eql(u8, old, &revision)) return .ok;
+            const json = if (self.malformed) "{invalid" else if (revision[0] == 1)
+                \\{"default_s3":"r2","s3":[{"name":"r2","credential":{"buckets":["old"],"secret_access_key":"${secret:old}"}}],"http":[{"name":"github","headers":[{"name":"Authorization","value":"${secret:old}"}]}]}
+            else
+                \\{"default_s3":"r2","s3":[{"name":"r2","credential":{"buckets":["new"],"secret_access_key":"${secret:new}"}}],"http":[{"name":"github","headers":[{"name":"Authorization","value":"${secret:new}"}]}]}
+            ;
+            const bytes = std.testing.allocator.dupe(u8, json) catch return .out_of_memory;
+            out.bytes = .{ .ptr = bytes.ptr, .len = bytes.len };
+            _ = self.payloads.fetchAdd(1, .monotonic);
+            return .ok;
+        }
+        fn release(raw: *anyopaque, bytes: kernel_owner_abi.OwnedBytes) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.testing.allocator.free(bytes.slice());
+            _ = self.releases.fetchAdd(1, .monotonic);
+        }
+    };
+    var source: Source = .{};
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextCreate(&.{}, &context));
+    defer std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextDestroy(context)) catch unreachable;
+    const callbacks = remote_content_services.CachedRemoteContentSource{
+        .source = .{ .version = 3, .context = &source, .acquire = Source.acquire, .release = Source.release },
+        .probe = Source.probe,
+        .acquire_if_changed = Source.acquireIfChanged,
+    };
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextConfigureRemoteContentSource(context, &callbacks.source));
+    const facade = asStorageOwnerContext(context).?.remoteContent().?;
+    var before = try facade.acquire();
+    defer before.deinit();
+    for (0..1000) |_| {
+        var held = try facade.acquire();
+        defer held.deinit();
+        try std.testing.expectEqual(before.config, held.config);
+    }
+    try std.testing.expectEqual(@as(usize, 1), source.payloads.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), source.releases.load(.acquire));
+
+    const Acquisition = struct {
+        facade: *const server_api.scraping.RemoteContentConfig,
+        completed: std.atomic.Value(bool) = .init(false),
+        failed: bool = false,
+        fn run(self: *@This()) void {
+            defer self.completed.store(true, .release);
+            var held = self.facade.acquire() catch {
+                self.failed = true;
+                return;
+            };
+            held.deinit();
+        }
+    };
+    // Hold one publisher acquisition open, as a slow file refresh would. A
+    // second acquisition of the current revision must finish before release.
+    source.block_probe.store(true, .release);
+    var blocked = Acquisition{ .facade = facade };
+    var blocked_task = try std.testing.io.concurrent(Acquisition.run, .{&blocked});
+    defer {
+        source.resume_probe.store(true, .release);
+        blocked_task.await(std.testing.io);
+    }
+    for (0..1000) |_| {
+        if (source.probe_started.load(.acquire)) break;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(source.probe_started.load(.acquire));
+    var independent = Acquisition{ .facade = facade };
+    var independent_task = try std.testing.io.concurrent(Acquisition.run, .{&independent});
+    defer {
+        source.resume_probe.store(true, .release);
+        independent_task.await(std.testing.io);
+    }
+    for (0..1000) |_| {
+        if (independent.completed.load(.acquire)) break;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const completed_while_blocked = independent.completed.load(.acquire);
+    source.resume_probe.store(true, .release);
+    blocked_task.await(std.testing.io);
+    independent_task.await(std.testing.io);
+    try std.testing.expect(completed_while_blocked);
+    try std.testing.expect(!blocked.failed and !independent.failed);
+
+    source.failure = .timeout;
+    try std.testing.expectError(error.Timeout, facade.acquire());
+    source.failure = .out_of_memory;
+    try std.testing.expectError(error.OutOfMemory, facade.acquire());
+    source.failure = .cancelled;
+    try std.testing.expectError(error.Canceled, facade.acquire());
+    source.failure = .resource_temporarily_unavailable;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, facade.acquire());
+    source.failure = .ok;
+    source.revision.store(2, .release);
+    source.malformed = true;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, facade.acquire());
+    source.malformed = false;
+    var after = try facade.acquire();
+    defer after.deinit();
+    try std.testing.expect(before.config != after.config);
+    try std.testing.expectEqualStrings("new", after.config.getS3("r2").?.buckets.?[0]);
+    try std.testing.expectEqualStrings("${secret:new}", after.config.getHttp("github").?.headers.get("Authorization").?);
+    try std.testing.expectEqualStrings("old", before.config.getS3("r2").?.buckets.?[0]);
+    try std.testing.expectEqualStrings("${secret:old}", before.config.getHttp("github").?.headers.get("Authorization").?);
+
+    const Reader = struct {
+        facade: *const server_api.scraping.RemoteContentConfig,
+        round: std.atomic.Value(usize) = .init(0),
+        completed: std.atomic.Value(usize) = .init(0),
+        stop: std.atomic.Value(bool) = .init(false),
+        invalid: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            for (1..21) |round| {
+                while (self.round.load(.acquire) < round) {
+                    if (self.stop.load(.acquire)) return;
+                    std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                }
+                var held = self.facade.acquire() catch {
+                    self.invalid.store(true, .release);
+                    _ = self.completed.fetchAdd(1, .release);
+                    continue;
+                };
+                defer held.deinit();
+                const s3 = held.config.getS3("r2").?.secret_access_key.?;
+                const http = held.config.getHttp("github").?.headers.get("Authorization").?;
+                const expected = if (round % 2 == 1) "${secret:old}" else "${secret:new}";
+                if (!std.mem.eql(u8, s3, http) or !std.mem.eql(u8, s3, expected)) self.invalid.store(true, .release);
+                _ = self.completed.fetchAdd(1, .release);
+            }
+        }
+    };
+    var reader = Reader{ .facade = facade };
+    var first = try std.testing.io.concurrent(Reader.run, .{&reader});
+    defer {
+        reader.stop.store(true, .release);
+        first.await(std.testing.io);
+    }
+    var second = try std.testing.io.concurrent(Reader.run, .{&reader});
+    defer {
+        reader.stop.store(true, .release);
+        second.await(std.testing.io);
+    }
+    const payloads_before_rounds = source.payloads.load(.acquire);
+    for (0..20) |i| {
+        source.revision.store(@intCast(1 + i % 2), .release);
+        reader.round.store(i + 1, .release);
+        var held = try facade.acquire();
+        held.deinit();
+        for (0..1000) |_| {
+            if (reader.completed.load(.acquire) >= 2 * (i + 1)) break;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(2 * (i + 1), reader.completed.load(.acquire));
+    }
+    first.await(std.testing.io);
+    second.await(std.testing.io);
+    try std.testing.expect(!reader.invalid.load(.acquire));
+    try std.testing.expectEqual(payloads_before_rounds + 20, source.payloads.load(.acquire));
+    try std.testing.expectEqual(source.payloads.load(.acquire), source.releases.load(.acquire));
+
+    // Reconfiguration drops only the cache's reference, not outstanding leases.
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextConfigureRemoteContentSecurity(context, .fromSlice("{}")));
+    try std.testing.expectEqualStrings("${secret:old}", before.config.getHttp("github").?.headers.get("Authorization").?);
+    try std.testing.expectEqualStrings("${secret:new}", after.config.getHttp("github").?.headers.get("Authorization").?);
 }

@@ -45,7 +45,8 @@ class InferenceModelsResponse:
         readers (InferenceModelsResponseReaders): Available reader/OCR models from models_dir/readers/
         transcribers (InferenceModelsResponseTranscribers): Available transcriber/speech-to-text models from
             models_dir/transcribers/
-        public_inference_enabled (bool | Unset): Whether public inference execution is enabled on this deployment.
+        public_inference_enabled (bool | Unset): Whether public inference execution is enabled on this deployment. When
+            false, locally installed models are still listed with `invocable: false` and remote upstreams are not probed.
             Internal database inference is independent. Omitted by standalone inference runtimes without deployment policy.
     """
 

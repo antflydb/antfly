@@ -1,0 +1,21 @@
+{
+  "name": "@antfly/example-express-auth",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild client.ts --bundle --format=esm --outfile=public/client.js",
+    "start": "node --env-file-if-exists=.env server.ts"
+  },
+  "dependencies": {
+    "@antfly/better-auth": "workspace:*",
+    "@antfly/embedded": "workspace:*",
+    "better-auth": "1.7.14",
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.12"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

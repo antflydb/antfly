@@ -24,7 +24,6 @@ const http_common = @import("../common/http/http_common.zig");
 const std_http_listener = @import("../common/http/std_http_listener.zig");
 const inference_chunker = @import("inference_chunker");
 const chunk_provider = @import("provider.zig");
-const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const inference_work = @import("antfly_inference_work");
 const execution_context = @import("antfly_inference_execution_context");
@@ -34,30 +33,12 @@ const Allocator = std.mem.Allocator;
 const remote_chunk_max_response_bytes: usize = 16 << 20;
 const remote_chunk_max_timeout_ms: u64 = 300_000;
 
-const ChunkInputFn = *const fn (
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    input: inference_chunker.Input,
-    config: chunking_types.Config,
-) anyerror![]inference_chunker.Chunk;
-const ChunkInputWithContextFn = *const fn (
-    ptr: *anyopaque,
-    alloc: Allocator,
-    model: []const u8,
-    input: inference_chunker.Input,
-    config: chunking_types.Config,
-    context: execution_context.RequestContext,
-) anyerror![]inference_chunker.Chunk;
+const ChunkInputFn = chunk_provider.ChunkInputFn;
+const ChunkInputWithContextFn = chunk_provider.ChunkInputWithContextFn;
 pub const ChunkPage = inference_chunker.types.ChunkPage;
 pub const RemoteMetadata = inference_chunker.types.ModelMetadata;
-const ChunkPageWithContextFn = *const fn (*anyopaque, Allocator, []const u8, inference_chunker.Input, chunking_types.Config, execution_context.RequestContext) anyerror!ChunkPage;
-const ChunkProviderVTable = struct {
-    chunk_page_with_context: ?ChunkPageWithContextFn = null,
-    chunk_input: ?ChunkInputFn = null,
-    chunk_input_with_context: ?ChunkInputWithContextFn = null,
-};
-const ChunkProviderBoundary = runtime_callback_abi.Boundary(ChunkProviderVTable);
+const ChunkPageWithContextFn = chunk_provider.ChunkPageWithContextFn;
+const ChunkProviderBoundary = chunk_provider.CallbackBoundary;
 
 pub const RemoteChunk = inference_chunker.Chunk;
 pub const RemoteInput = inference_chunker.Input;
@@ -209,6 +190,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         .binary => |binary| if (binary.data.len == 0) return try alloc.alloc(RemoteChunk, 0),
     };
     const execution: execution_context.Context = if (antfly_provider) |provider| provider.execution else .{};
+    const accounting = if (antfly_provider) |provider| provider.dispatch_accounting else null;
     try execution.check(platform_time.monotonicNs());
     const linked_callback_available = if (antfly_provider) |provider|
         if (paged) provider.chunk_page_with_context_callback != null else provider.chunk_input_with_context_callback != null or provider.chunk_input_callback != null
@@ -232,6 +214,8 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
             std.Io.Threaded.global_single_threaded.io();
         const request_context = execution.requestContext(io);
         try request_context.check();
+        const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
+        defer if (accounting) |hook| hook.finish(hook.ptr, started);
         if (paged) {
             const callback: ChunkPageWithContextFn = @ptrCast(@alignCast(provider.chunk_page_with_context_callback orelse return error.InvalidChunkProvider));
             var page = try ChunkProviderBoundary.call("chunk_page_with_context", dispatch, callback, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg, request_context });
@@ -304,17 +288,31 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     const boundary = if (resolved_outputs) |value| try value.value.boundary() else null;
     const model = if (boundary) |value| value.model else if (cfg.embedding) |target| target.model else if (cfg.model.len > 0) cfg.model else "fixed";
     const capability_task: inference_work.Operation = if (boundary) |value| if (value.kind == .transcribe) .transcribe else .embed else if (cfg.embedding != null) .embed else .chunk;
-    var routing_header_storage: [1][2][]const u8 = undefined;
-    const routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, 0);
+    // The node default credential accompanies only the node default endpoint
+    // (chunkers carry no credential of their own); discovery and the chunk
+    // call authenticate identically.
+    const authorization = try execution.defaultAuthorizationAlloc(alloc, endpoint_raw);
+    defer if (authorization) |value| alloc.free(value);
+    var routing_header_storage: [2][2][]const u8 = undefined;
+    var routing_header_count: usize = 0;
+    if (authorization) |value| {
+        routing_header_storage[0] = .{ "Authorization", value };
+        routing_header_count = 1;
+    }
+    routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, routing_header_count);
     const routing_headers = routing_header_storage[0..routing_header_count];
-    var capability_lease = try capability_cache.?.getOrDiscoverLeaseWithContext(
-        http,
-        endpoint,
-        model,
-        capability_task,
-        routing_headers,
-        execution.waitContext(),
-    );
+    var capability_lease = dispatch: {
+        const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
+        defer if (accounting) |hook| hook.finish(hook.ptr, started);
+        break :dispatch try capability_cache.?.getOrDiscoverLeaseWithContext(
+            http,
+            endpoint,
+            model,
+            capability_task,
+            routing_headers,
+            execution.waitContext(),
+        );
+    };
     var attachment_transport: inference_work.AttachmentTransport = .base64_payload;
     if (capability_lease.capabilities) |capabilities| {
         if (cfg.isModelAware() and !capabilities.model_aware_chunking_v1) return error.ModelAwareChunkProviderRequired;
@@ -350,7 +348,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
     var body = try encodeChunkRequest(alloc, cfg, input, attachment_transport);
     defer body.deinit(alloc);
 
-    var header_storage: [4][2][]const u8 = undefined;
+    var header_storage: [5][2][]const u8 = undefined;
     var header_count: usize = 0;
     for (routing_headers) |header| {
         header_storage[header_count] = header;
@@ -368,17 +366,22 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         header_storage[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
         header_count += 1;
     }
-    var resp = try http.post(url, .{
-        .json = if (attachment_transport == .segmented_framed_binary) null else body.metadata_or_json,
-        .borrowed_body_segments = if (body.envelope) |envelope| envelope.segments else null,
-        .headers = header_storage[0..header_count],
-        .timeout_ms = try execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_chunk_max_timeout_ms),
-        .max_response_size = execution.boundedResponseBytes(remote_chunk_max_response_bytes),
-        .cancellation = httpx.CancellationToken.fromCallback(
-            execution.cancellation.ptr,
-            execution.cancellation.is_cancelled_fn,
-        ),
-    });
+    var resp = dispatch: {
+        const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
+        defer if (accounting) |hook| hook.finish(hook.ptr, started);
+        break :dispatch try http.post(url, .{
+            .follow_redirects = false,
+            .json = if (attachment_transport == .segmented_framed_binary) null else body.metadata_or_json,
+            .borrowed_body_segments = if (body.envelope) |envelope| envelope.segments else null,
+            .headers = header_storage[0..header_count],
+            .timeout_ms = try execution.remainingTimeoutMs(platform_time.monotonicNs(), remote_chunk_max_timeout_ms),
+            .max_response_size = execution.boundedResponseBytes(remote_chunk_max_response_bytes),
+            .cancellation = httpx.CancellationToken.fromCallback(
+                execution.cancellation.ptr,
+                execution.cancellation.is_cancelled_fn,
+            ),
+        });
+    };
     defer resp.deinit();
     if (!resp.ok()) {
         // Never log the request payload (it embeds the full source document)
@@ -502,6 +505,7 @@ fn chunkInputDirect(alloc: Allocator, cfg: chunking_types.Config, input: RemoteI
     if (cfg.model.len > 0) fixed_cfg.model = cfg.model;
     if (cfg.max_chunks > 0) fixed_cfg.max_chunks = @intCast(cfg.max_chunks);
     fixed_cfg.threshold = cfg.threshold;
+    fixed_cfg.text.min_chars = cfg.text.min_chars;
     if (cfg.text.target_tokens > 0) fixed_cfg.text.target_tokens = @intCast(cfg.text.target_tokens);
     if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0) fixed_cfg.text.overlap_tokens = @intCast(cfg.text.overlap_tokens);
     if (cfg.text.separator.len > 0) fixed_cfg.text.separator = cfg.text.separator;
@@ -588,9 +592,10 @@ fn encodeChunkRequest(
         .model = cfg.model,
         .max_chunks = if (cfg.replay != null and !cfg.page) 1 else if (cfg.max_chunks > 0) cfg.max_chunks else null,
         .threshold = cfg.threshold,
-        .text = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0 or cfg.text.separator.len > 0) .{
+        .text = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0 or cfg.text.min_chars > 0 or cfg.text.separator.len > 0) .{
             .target_tokens = if (cfg.text.target_tokens > 0) cfg.text.target_tokens else null,
             .overlap_tokens = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0) cfg.text.overlap_tokens else null,
+            .min_chars = if (cfg.text.min_chars > 0) cfg.text.min_chars else null,
             .separator = if (cfg.text.separator.len > 0) cfg.text.separator else null,
         } else null,
         .audio = if (cfg.audio.window_duration_ms > 0 or cfg.audio.overlap_duration_ms > 0) .{
@@ -738,7 +743,7 @@ fn parseChunkResponse(alloc: Allocator, response_body: []const u8) ![]RemoteChun
 fn responsePolicy(raw: @TypeOf(@as(inference_api.ChunkEmbeddingResponse, undefined).policy)) !inference_chunker.planning.Policy {
     var policy = inference_chunker.planning.Policy{};
     inline for (@typeInfo(inference_chunker.planning.Policy).@"struct".field_names) |name| if (@field(raw, name)) |n| {
-        @field(policy, name) = std.math.cast(@TypeOf(@field(policy, name)), n) orelse return error.InvalidChunkerResponse;
+        @field(policy, name) = if (@TypeOf(@field(policy, name)) == bool) n else std.math.cast(@TypeOf(@field(policy, name)), n) orelse return error.InvalidChunkerResponse;
     };
     try policy.validate();
     return policy;
@@ -776,7 +781,7 @@ fn parseModelChunks(a: Allocator, body: []const u8, replay: ?chunking_types.Repl
         if (!std.mem.eql(u8, item.descriptor.id, (inference_chunker.planning.Identity{ .plan = plan, .source = source }).cursor(ordinal, &cursor))) return error.InvalidChunkerResponse;
         const raw = item.descriptor.coordinates;
         var coordinates = inference_chunker.planning.Coordinates{ .kind = std.meta.stringToEnum(inference_chunker.planning.Kind, raw.kind) orelse return error.InvalidChunkerResponse };
-        inline for (.{ "start_byte", "end_byte", "page", "start_ns", "end_ns", "first_picture", "picture_count", "start_sample", "end_sample", "sample_rate", "start_tick", "end_tick", "timescale", "page_rotation", "raster_width", "raster_height" }) |name| {
+        inline for (.{ "start_byte", "end_byte", "page", "start_ns", "end_ns", "first_picture", "picture_count", "start_sample", "end_sample", "sample_rate", "start_tick", "end_tick", "timescale", "page_rotation", "speaker_index", "raster_width", "raster_height" }) |name| {
             if (@field(raw, name)) |number| @field(coordinates, name) = std.math.cast(@typeInfo(@TypeOf(@field(coordinates, name))).optional.child, number) orelse return error.InvalidChunkerResponse;
         }
         var owned_pictures: ?[]u64 = null;
@@ -802,7 +807,7 @@ fn parseModelChunks(a: Allocator, body: []const u8, replay: ?chunking_types.Repl
         try coordinates.validate();
         var policy = inference_chunker.planning.Policy{};
         inline for (@typeInfo(inference_chunker.planning.Policy).@"struct".field_names) |name| if (@field(response.policy, name)) |n| {
-            @field(policy, name) = std.math.cast(@TypeOf(@field(policy, name)), n) orelse return error.InvalidChunkerResponse;
+            @field(policy, name) = if (@TypeOf(@field(policy, name)) == bool) n else std.math.cast(@TypeOf(@field(policy, name)), n) orelse return error.InvalidChunkerResponse;
         };
         try policy.validate();
         if (item.embedding) |vector| {

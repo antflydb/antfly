@@ -78,6 +78,7 @@ pub fn resolve(a: A, table: local.sql_catalog.Table, source: *local.serverless_q
 
 pub fn dependencies(a: A, table: local.sql_catalog.Table, filter: graph.CompiledPatternFilter, fields: *std.ArrayList([]const u8)) !bool {
     switch (filter) {
+        .logical_value => return false,
         .match_all, .match_none, .doc_id => {},
         .conjuncts, .disjuncts => |items| for (items) |item| {
             if (!try dependencies(a, table, item, fields)) return false;

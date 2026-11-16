@@ -93,6 +93,14 @@ pub const SegmentAttention = struct {
     keys: usize,
     num_heads: usize,
     head_dim: usize,
+    /// Optional row-segment hint: `[start, len]` pairs that tile the
+    /// queries (== keys) in order, each query attending within its own row
+    /// at row-local positions. `ranges`/positions must describe the same
+    /// visibility; backends without a row path ignore it.
+    row_spans: ?[]const u32 = null,
+    /// Opt in to the F16-staged row flash kernel for `row_spans` (F32
+    /// accumulation). Off by default: only GLiDE requests it.
+    f16_row_flash: bool = false,
 };
 /// Grouped K/V rows retain their original head count. Optional compact-head
 /// contract: a declined request uses the caller's existing expanded-head path.
@@ -635,6 +643,10 @@ pub const GlinerLabelGruCombinedRequest = struct {
     label_embeddings: CT,
     num_labels: usize,
     hidden_size: usize,
+    /// CountLSTMv2 consumes the GRU output with its label-state skip
+    /// connection. CountLSTMv1 consumes the raw GRU state before concatenating
+    /// the original label state into its projector.
+    add_residual: bool = true,
 };
 
 pub const GlinerGatherConcatReluRequest = struct {
@@ -1580,6 +1592,8 @@ pub const TrainingRuntimeStats = struct {
     download_last_bytes: u64 = 0,
     download_previous_bytes: u64 = 0,
     to_float32_calls: u64 = 0,
+    gliner_label_gru_calls: u64 = 0,
+    gliner_label_gru_no_residual_calls: u64 = 0,
     download_alloc_calls: u64 = 0,
     stream_synchronizations: u64 = 0,
     upload_synchronizations: u64 = 0,
@@ -1682,6 +1696,26 @@ pub const ComputeBackend = struct {
     /// `forwardWithControl` entry point.
     execution_control: ?InferenceExecutionControl = null,
     embedding_stage: ?*const EmbeddingStageControl = null,
+    /// Cooperative GPU handles bind their request budget only while owning
+    /// the model step mutex. The shared compute never retains an idle peer's
+    /// pointer, and retiring one handle cannot unbind another active peer.
+    execution_budget: ?*runtime.tier.memory.RunBudget = null,
+    execution_budget_bind: ?*const fn (*anyopaque, ?*runtime.tier.memory.RunBudget) void = null,
+    /// Only an execution scope transitions a shared backend under its mutex.
+    execution_owner: u64 = 0,
+    execution_batch_rows: ?*const fn (*anyopaque, usize) void = null,
+    execution_batch_drain: ?*const fn (*anyopaque) anyerror!void = null,
+    execution_enter: ?*const fn (*anyopaque, u64) anyerror!void = null,
+    execution_cleanup: ?*const fn (*anyopaque, u64) void = null,
+    execution_release: ?*const fn (*anyopaque, u64) void = null,
+
+    pub fn bindExecutionBudget(self: *const ComputeBackend) void {
+        if (self.execution_budget_bind) |bind| bind(self.ptr, self.execution_budget);
+    }
+
+    pub fn clearExecutionBudget(self: *const ComputeBackend) void {
+        if (self.execution_budget_bind) |bind| bind(self.ptr, null);
+    }
 
     pub fn checkExecutionControl(self: *const ComputeBackend) !void {
         if (self.execution_control) |control| try control.check();
@@ -1850,6 +1884,14 @@ pub const ComputeBackend = struct {
         return op(self.ptr, tensor, target);
     }
 
+    /// Request-local replay intent. Other backend implementations and
+    /// interleaved execution owners keep the ordinary eager dispatch order.
+    pub fn debugCudaGraphReplayRequested(self: *const ComputeBackend) bool {
+        if (self.kind() != .cuda or self.execution_owner != 0) return false;
+        const op = self.vtable.debugCudaGraphReplayRequested orelse return false;
+        return op(self.ptr);
+    }
+
     pub fn debugCudaGraphCaptureBegin(self: *const ComputeBackend, label: []const u8) !bool {
         const op = self.vtable.debugCudaGraphCaptureBegin orelse return false;
         return op(self.ptr, label);
@@ -1967,6 +2009,7 @@ pub const ComputeBackend = struct {
         elementwiseLossGradient: ?*const fn (ctx: *anyopaque, request: *const elementwise_loss_math.Request) anyerror!void = null,
         glinerBoundaryDownload: ?*const fn (ctx: *anyopaque, tensor: CT, output: []f32) anyerror!void = null,
 
+        debugCudaGraphReplayRequested: ?*const fn (ctx: *anyopaque) bool = null,
         debugCudaGraphCaptureBegin: ?*const fn (ctx: *anyopaque, label: []const u8) anyerror!bool = null,
         debugCudaGraphPrepareDecodeScalars: ?*const fn (ctx: *anyopaque, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize, kv_position_offset: usize) anyerror!bool = null,
         debugCudaTraceTensor: ?*const fn (ctx: *anyopaque, label: []const u8, tensor: CT) anyerror!void = null,
@@ -2040,9 +2083,9 @@ pub const ComputeBackend = struct {
         // the GLiNER span head). No-op on backends without the concept.
         preferEagerQuantMirrors: ?*const fn (ctx: *anyopaque, enabled: bool) void = null,
 
-        /// GLiNER-specific CountLSTM GRU step plus skip connection:
-        /// returns `gru(label_embeddings, pos0) + label_embeddings` as
-        /// [num_labels, hidden_size].
+        /// GLiNER-specific CountLSTM GRU step at position zero. The request
+        /// selects either the raw GRU state or the CountLSTMv2 label-state
+        /// skip connection. Returns [num_labels, hidden_size].
         glinerLabelGruCombined: ?*const fn (ctx: *anyopaque, request: *const GlinerLabelGruCombinedRequest) anyerror!?CT = null,
 
         /// GLiNER span-head gather of start/end projected word rows, concat on
@@ -2226,6 +2269,7 @@ pub const ComputeBackend = struct {
         packedQkvRope: ?*const fn (ctx: *anyopaque, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) anyerror!?SplitLastDim3Result = null,
         ensureDeviceResident: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
         conv1dIm2col: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, in_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize, time_major: bool) anyerror!?CT = null,
+        whisperPrepareCrossKv: ?*const fn (ctx: *anyopaque, k: CT, v: CT) anyerror!?LinearNoBiasPairResult = null,
         whisperLogitsStatsEncode: ?*const fn (ctx: *anyopaque, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool = null,
         whisperLogitsStatsRead: ?*const fn (ctx: *anyopaque, slot: usize, out: *WhisperLogitsStatsRaw) bool = null,
         whisperGrammarWrite: ?*const fn (ctx: *anyopaque, state: *const WhisperGrammarState) bool = null,
@@ -3549,11 +3593,16 @@ pub const ComputeBackend = struct {
     }
 
     pub fn glinerLabelGruCombined(self: *const ComputeBackend, label_embeddings: CT, num_labels: usize, hidden_size: usize) !?CT {
+        return self.glinerLabelGru(label_embeddings, num_labels, hidden_size, true);
+    }
+
+    pub fn glinerLabelGru(self: *const ComputeBackend, label_embeddings: CT, num_labels: usize, hidden_size: usize, add_residual: bool) !?CT {
         if (self.vtable.glinerLabelGruCombined) |op| {
             return op(self.ptr, &.{
                 .label_embeddings = label_embeddings,
                 .num_labels = num_labels,
                 .hidden_size = hidden_size,
+                .add_residual = add_residual,
             });
         }
         return null;
@@ -4237,6 +4286,13 @@ pub const ComputeBackend = struct {
 
     pub fn packedQkvRope(self: *const ComputeBackend, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) !?SplitLastDim3Result {
         if (self.vtable.packedQkvRope) |f| return f(self.ptr, input, positions, hidden, head_dim, theta);
+        return null;
+    }
+
+    /// Return new immutable, backend-preferred cross-attention caches.
+    /// Inputs remain owned by the caller; null retains their current format.
+    pub fn whisperPrepareCrossKv(self: *const ComputeBackend, k: CT, v: CT) !?LinearNoBiasPairResult {
+        if (self.vtable.whisperPrepareCrossKv) |f| return f(self.ptr, k, v);
         return null;
     }
 
@@ -6352,6 +6408,33 @@ fn fallbackLinearLoRA(
     _ = rank;
     _ = .{ self, input, base_weight, bias, lora_a, lora_b, alpha, rows, in_dim, out_dim };
     return error.LinearLoRANotImplemented;
+}
+
+test "GLiNER label GRU preserves residual mode through the backend API" {
+    const Probe = struct {
+        modes: [2]bool = undefined,
+        calls: usize = 0,
+        marker: u8 = 0,
+
+        fn run(raw: *anyopaque, request: *const GlinerLabelGruCombinedRequest) !?CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 3), request.num_labels);
+            try std.testing.expectEqual(@as(usize, 8), request.hidden_size);
+            self.modes[self.calls] = request.add_residual;
+            self.calls += 1;
+            return @ptrCast(&self.marker);
+        }
+    };
+    var probe = Probe{};
+    var vtable: ComputeBackend.VTable = undefined;
+    vtable.glinerLabelGruCombined = Probe.run;
+    const cb = ComputeBackend{ .ptr = &probe, .vtable = &vtable };
+    const label_embeddings: CT = @ptrCast(&probe.marker);
+
+    try std.testing.expect((try cb.glinerLabelGruCombined(label_embeddings, 3, 8)) != null);
+    try std.testing.expect((try cb.glinerLabelGru(label_embeddings, 3, 8, false)) != null);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, &probe.modes);
 }
 
 test "DeBERTa embeddings forward controls and release cancelled backend outputs" {

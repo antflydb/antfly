@@ -1,0 +1,10 @@
+{
+  "source": "https://images.nasa.gov/details/KSC-20250731-PH-RNS01_0007",
+  "url": "https://images-assets.nasa.gov/image/KSC-20250731-PH-RNS01_0007/KSC-20250731-PH-RNS01_0007~orig.jpg",
+  "sha256": "df9ac37cc26e9d72a25017709c1b2b20d9bb0dc54206b6b5df178e9a7de72323",
+  "bytes": 5956364,
+  "width": 6000,
+  "height": 4000,
+  "credit": "NASA/Rad Sinyak",
+  "cache_path": "~/.cache/antfly/conformance-fixtures/multimodal/nasa-artemis-6000x4000.jpg"
+}

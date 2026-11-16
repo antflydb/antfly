@@ -16,9 +16,11 @@
 const std = @import("std");
 pub const cloudflare = @import("antfly_cloudflare_config");
 const audio = @import("antfly_audio_openapi");
+const audio_codec = @import("inference_audio");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
 const google_auth = @import("antfly_google").auth;
+pub const CredentialManager = google_auth.CredentialManager;
 const scraping = @import("antfly_scraping");
 pub const apple_native = @import("antfly_apple_native");
 
@@ -31,36 +33,7 @@ pub const Segment = audio.TranscriptSegment;
 pub const WordTimestamp = audio.WordTimestamp;
 pub const Speaker = audio.Speaker;
 
-pub const Provider = enum {
-    antfly,
-    openai,
-    cloudflare,
-    vertex,
-    apple,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.write(switch (self) {
-            .antfly => "antfly",
-            .cloudflare => "cloudflare",
-            .openai => "openai",
-            .vertex => "vertex",
-            .apple => "apple",
-        });
-    }
-
-    pub fn jsonParse(_: Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const raw = switch (try source.next()) {
-            .string => |value| value,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, raw, "antfly")) return .antfly;
-        if (std.mem.eql(u8, raw, "cloudflare")) return .cloudflare;
-        if (std.mem.eql(u8, raw, "openai")) return .openai;
-        if (std.mem.eql(u8, raw, "vertex")) return .vertex;
-        if (std.mem.eql(u8, raw, "apple")) return .apple;
-        return error.UnexpectedToken;
-    }
-};
+pub const Provider = @import("types.zig").Provider;
 
 pub const Config = struct {
     account_id: ?[]const u8 = null,
@@ -73,6 +46,10 @@ pub const Config = struct {
     capability_revision: ?[]const u8 = null,
     /// Runtime-resolved Antfly capability; ignored by third-party providers.
     framed_attachments: bool = false,
+    /// Provider-declared hard total-token ceiling for one recognition call.
+    /// Document reading charges this entire allowance when usage is unavailable.
+    /// Set from the selected deployment/model's limits, never from file size.
+    max_total_tokens: ?u64 = null,
     base_url: ?[]const u8 = null,
     url: ?[]const u8 = null,
     api_url: ?[]const u8 = null,
@@ -111,10 +88,102 @@ pub const Config = struct {
         if (self.max_download_bytes) |limit| if (limit > default_max_download_bytes) return error.AppleNativeInputTooLarge;
     }
 
+    /// Model sent to the provider. Identity and adapter dispatch must use the
+    /// same defaults so explicit and implicit aliases cannot verify each other.
+    pub fn effectiveModel(self: Config) ?[]const u8 {
+        return self.model orelse switch (self.provider) {
+            .openai => "whisper-1",
+            .vertex => "latest_long",
+            else => null,
+        };
+    }
+
+    pub fn effectiveLocation(self: Config) ?[]const u8 {
+        return if (self.provider == .vertex) self.location orelse "global" else null;
+    }
+
+    pub fn effectiveProjectId(self: Config, alloc: Allocator) !?[]const u8 {
+        if (self.provider != .vertex) return null;
+        return if (self.project_id) |value| try alloc.dupe(u8, value) else try vertexProjectIdFromConfigAlloc(alloc, self.credentials_path);
+    }
+
+    /// Owned endpoint with provider-specific defaults resolved by transport.
+    pub fn effectiveEndpointAlloc(self: Config, alloc: Allocator) !?[]u8 {
+        const native = if (self.provider == .cloudflare) try @import("antfly_cloudflare").nativeEndpointAlloc(alloc, .{
+            .account_id = self.account_id orelse return error.InvalidCloudflareConfig,
+            .model = self.effectiveModel() orelse return error.UnsupportedCloudflareModel,
+            .api_key = "",
+            .url = self.effectiveEndpoint(),
+        }) else null;
+        defer if (native) |value| alloc.free(value);
+        const endpoint = native orelse self.effectiveEndpoint() orelse return null;
+        return try canonicalEndpointAlloc(alloc, endpoint, self.provider != .cloudflare);
+    }
+
+    /// Only routing fields consumed by the adapter may distinguish physical
+    /// recognizers. Credentials and ignored provider options never do.
+    pub fn modelIdentity(self: Config, alloc: Allocator) ![32]u8 {
+        const project = try self.effectiveProjectId(alloc);
+        defer if (project) |value| alloc.free(value);
+        const endpoint = try self.effectiveEndpointAlloc(alloc);
+        defer if (endpoint) |value| alloc.free(value);
+        const bytes = try std.json.Stringify.valueAlloc(alloc, .{
+            .provider = self.provider,
+            .model = self.effectiveModel(),
+            .endpoint = endpoint,
+            .project = project,
+            .location = self.effectiveLocation(),
+        }, .{});
+        defer alloc.free(bytes);
+        var identity: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &identity, .{});
+        return identity;
+    }
+
+    /// Endpoint actually used by each adapter, including provider defaults.
+    pub fn effectiveEndpoint(self: Config) ?[]const u8 {
+        return switch (self.provider) {
+            .openai => self.base_url orelse "https://api.openai.com/v1",
+            .vertex => self.base_url orelse "https://speech.googleapis.com/v2",
+            .cloudflare => self.base_url orelse self.url,
+            .antfly => self.resolvedUrl() orelse "http://127.0.0.1:8080",
+            .apple => null,
+        };
+    }
+
     pub fn resolvedUrl(self: Config) ?[]const u8 {
         return self.url orelse self.api_url;
     }
 };
+
+/// Canonicalize the URL consumed by transport, rather than maintaining a
+/// separate identity-only interpretation. Preserve routing paths and queries;
+/// scheme/host case, default ports and fragments cannot distinguish models.
+fn canonicalEndpointAlloc(a: Allocator, endpoint: []const u8, base: bool) ![]u8 {
+    var uri = std.Uri.parse(endpoint) catch return error.InvalidTranscribingConfig;
+    const secure = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    if (!secure and !std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InvalidTranscribingConfig;
+    if (uri.user != null or uri.password != null) return error.InvalidTranscribingConfig;
+    const host = uri.host orelse return error.InvalidTranscribingConfig;
+    if (host.isEmpty()) return error.InvalidTranscribingConfig;
+    const lower_host = try std.ascii.allocLowerString(a, host.percent_encoded);
+    defer a.free(lower_host);
+    uri.scheme = if (secure) "https" else "http";
+    uri.host = .{ .percent_encoded = lower_host };
+    if (uri.port == @as(u16, if (secure) 443 else 80)) uri.port = null;
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    uri.writeToStream(&output.writer, .{ .scheme = true, .authentication = true, .authority = true }) catch return error.OutOfMemory;
+    // Base endpoints are prefixes for /read, /audio/transcriptions or the
+    // Vertex resource path. Trim separators here before adapters append them.
+    const path = uri.path.percent_encoded;
+    output.writer.writeAll(if (base) std.mem.trimEnd(u8, path, "/") else if (path.len == 0) "/" else path) catch return error.OutOfMemory;
+    if (uri.query) |query| {
+        output.writer.writeByte('?') catch return error.OutOfMemory;
+        query.formatQuery(&output.writer) catch return error.OutOfMemory;
+    }
+    return output.toOwnedSlice();
+}
 
 /// A one hour recording is about 30 MB as 64 kbps AAC (a phone voice memo)
 /// and about 58 MB as 128 kbps MP3 (a podcast), so the default fetch ceiling
@@ -129,6 +198,14 @@ pub const default_max_download_bytes: usize = 128 << 20;
 pub fn effectiveMaxDownloadBytes(max_download_bytes: ?usize) usize {
     const configured = if (max_download_bytes) |value| (if (value == 0) null else value) else null;
     return configured orelse default_max_download_bytes;
+}
+
+/// Download collection can temporarily retain capacity beyond the final
+/// recording length, including encoded bytes while inflating compressed HTTP.
+/// Keep this contract at the adapter boundary so callers do not duplicate the
+/// downloader's allocation policy. Borrowed recordings need none of this space.
+pub fn audioDownloadMemoryPeakBytes(max_download_bytes: ?usize) error{Overflow}!usize {
+    return scraping.downloadMemoryPeakBytes(effectiveMaxDownloadBytes(max_download_bytes), scraping.default_download_transport_memory_bytes);
 }
 
 fn remoteFetchSecurity(max_download_bytes: ?usize) scraping.ContentSecurityConfig {
@@ -214,6 +291,11 @@ pub fn getActiveRuntime() ?*const Runtime {
     return active_runtime;
 }
 
+/// Deployment-owned audio leaves available to document orchestration.
+/// Names stay in the transcribers namespace; credentials never enter requests
+/// or document definitions.
+pub const NamedConfig = struct { name: []const u8, config: Config };
+
 pub const Registry = struct {
     allocator: Allocator,
     configs: std.StringArrayHashMapUnmanaged(Config) = .{},
@@ -221,6 +303,16 @@ pub const Registry = struct {
 
     pub fn init(alloc: Allocator) Registry {
         return .{ .allocator = alloc };
+    }
+
+    /// Borrow configuration strings for the lifetime of this registry.
+    pub fn hostedReaders(self: *const Registry, a: Allocator) ![]NamedConfig {
+        var out = std.ArrayList(NamedConfig).empty;
+        errdefer out.deinit(a);
+        for (self.configs.keys(), self.configs.values()) |name, cfg| {
+            if (cfg.provider != .antfly) try out.append(a, .{ .name = name, .config = cfg });
+        }
+        return out.toOwnedSlice(a);
     }
 
     pub fn deinit(self: *Registry) void {
@@ -310,6 +402,7 @@ pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
 /// (`SPEAKER_00: ...`) when diarization labelled any segment; otherwise the
 /// plain text. Caller frees the result.
 pub fn speakerAttributedTextAlloc(alloc: Allocator, response: *const Response) ![]u8 {
+    try requireComplete(response.*);
     const segments = response.segments orelse return try alloc.dupe(u8, response.text orelse "");
     var any_speaker = false;
     for (segments) |segment| {
@@ -344,6 +437,26 @@ pub fn speakerAttributedTextAlloc(alloc: Allocator, response: *const Response) !
     return try out.toOwnedSlice(alloc);
 }
 
+/// Text-only consumers cannot retain a completion status. Refuse explicitly
+/// incomplete recognition before it becomes ordinary evidence or template text.
+pub fn requireComplete(response: Response) !void {
+    if (response.status) |status| {
+        if (std.mem.eql(u8, status, "complete")) return;
+        if (std.mem.eql(u8, status, "truncated")) return error.ReadOutputTruncated;
+        if (std.mem.eql(u8, status, "unresolved")) return error.DocumentUnresolved;
+        return error.InvalidInferenceResponse;
+    }
+}
+
+test "audio read plain text consumers refuse incomplete recognition" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.ReadOutputTruncated, speakerAttributedTextAlloc(a, &.{ .text = "partial", .status = "truncated" }));
+    try std.testing.expectError(error.DocumentUnresolved, speakerAttributedTextAlloc(a, &.{ .text = "", .status = "unresolved" }));
+    const silence = try speakerAttributedTextAlloc(a, &.{ .text = "", .status = "complete" });
+    defer a.free(silence);
+    try std.testing.expectEqualStrings("", silence);
+}
+
 test "speaker attributed text joins consecutive phrases of one speaker" {
     const segments = [_]Segment{
         .{ .text = "Hello there.", .speaker = "SPEAKER_00" },
@@ -367,6 +480,7 @@ test "speaker attributed text joins consecutive phrases of one speaker" {
 }
 
 pub fn deinitResponse(alloc: Allocator, response: *Response) void {
+    freeOpt(alloc, response.status);
     freeOpt(alloc, response.text);
     freeOpt(alloc, response.language);
     if (response.segments) |segments| {
@@ -388,11 +502,13 @@ pub fn deinitResponse(alloc: Allocator, response: *Response) void {
 
 fn cloneResponse(alloc: Allocator, value: Response) !Response {
     var result = value;
+    result.status = null;
     result.text = null;
     result.language = null;
     result.segments = null;
     result.speakers = null;
     errdefer deinitResponse(alloc, &result);
+    result.status = try dupOpt(alloc, value.status);
     result.text = try dupOpt(alloc, value.text);
     result.language = try dupOpt(alloc, value.language);
     if (value.segments) |segments| {
@@ -414,6 +530,15 @@ fn cloneResponse(alloc: Allocator, value: Response) !Response {
                     copy.word = try dupOpt(alloc, word.word);
                 }
             }
+        }
+    }
+    if (value.speakers) |speakers| {
+        const owned = try alloc.alloc(Speaker, speakers.len);
+        for (owned) |*speaker| speaker.* = .{};
+        result.speakers = owned;
+        for (speakers, owned) |source, *target| {
+            target.id = try dupOpt(alloc, source.id);
+            target.label = try dupOpt(alloc, source.label);
         }
     }
     return result;
@@ -452,9 +577,14 @@ fn deinitSpeaker(alloc: Allocator, speaker: *Speaker) void {
 }
 
 pub const RemoteOptions = struct {
+    /// Runtime-owned credential cache. Only credential identity and scope are
+    /// retained there; request buffers, deadlines and cancellation stay local.
+    credential_manager: ?*CredentialManager = null,
     /// Trusted caller-owned recording already resolved under the document source
     /// policy. Borrowed only for this invocation; never parsed from provider JSON.
     resolved_audio: ?[]const u8 = null,
+    /// MIME evidence for a borrowed recording, used by framed transports.
+    resolved_audio_content_type: ?[]const u8 = null,
     source_table: []const u8 = "",
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
@@ -655,6 +785,7 @@ pub fn transcribeWithConfig(
 
 const AntflyTranscriberState = struct {
     alloc: Allocator,
+    options: RemoteOptions,
     http: *httpx.Client,
     api_url: []const u8,
     auth_header: ?[2][]const u8 = null,
@@ -665,7 +796,6 @@ const AntflyTranscriberState = struct {
     language_code: ?[]const u8 = null,
     max_response_bytes: ?usize = null,
     max_download_bytes: ?usize = null,
-    timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
     framed_attachments: bool = false,
     /// Provider-level default for speaker labels; a request may override it.
@@ -679,7 +809,7 @@ const AntflyTranscriberState = struct {
         const state = try alloc.create(AntflyTranscriberState);
         errdefer alloc.destroy(state);
 
-        const api_url = try alloc.dupe(u8, cfg.resolvedUrl() orelse "http://127.0.0.1:8080");
+        const api_url = (try cfg.effectiveEndpointAlloc(alloc)).?;
         errdefer alloc.free(api_url);
         const model = try alloc.dupe(u8, model_name);
         errdefer alloc.free(model);
@@ -697,6 +827,7 @@ const AntflyTranscriberState = struct {
 
         state.* = .{
             .alloc = alloc,
+            .options = options,
             .http = http,
             .api_url = api_url,
             .model = model,
@@ -706,7 +837,6 @@ const AntflyTranscriberState = struct {
             .language_code = language_code,
             .max_response_bytes = cfg.max_response_bytes,
             .max_download_bytes = cfg.max_download_bytes,
-            .timeout_ms = options.timeout_ms,
             .cancellation = options.cancellation,
             .framed_attachments = cfg.framed_attachments,
             .diarization = cfg.diarization,
@@ -747,31 +877,17 @@ const AntflyTranscriberState = struct {
 
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *AntflyTranscriberState = @ptrCast(@alignCast(ptr));
-        var audio_content = try resolveAudioContentAlloc(alloc, req.url, self.max_download_bytes);
+        const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
+        var audio_content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
         defer audio_content.deinit(alloc);
-        var encoded: ?[]u8 = null;
-        defer if (encoded) |value| alloc.free(value);
-        const audio_field = if (self.framed_attachments)
-            "attachment:0"
-        else blk: {
-            const encoded_len = std.base64.standard.Encoder.calcSize(audio_content.data.len);
-            encoded = try alloc.alloc(u8, encoded_len);
-            _ = std.base64.standard.Encoder.encode(encoded.?, audio_content.data);
-            break :blk encoded.?;
-        };
-
-        const url = try std.fmt.allocPrint(alloc, "{s}/transcribe", .{self.api_url});
+        const audio_bytes = audio_content.bytes();
+        const url = try std.fmt.allocPrint(alloc, "{s}/read", .{self.api_url});
         defer alloc.free(url);
-
-        const body = try httpx.json.Json.stringify(alloc, inference_api.types.TranscribeRequest{
-            .model = self.model,
-            .audio = audio_field,
+        const body = try antflyAudioReadBodyAlloc(alloc, self.model, .{
             .language = req.language orelse self.language_code,
             .timestamps = req.timestamps orelse self.timestamps,
-            // Local and remote execution must honour the same options: the
-            // inference node cannot label speakers it was never asked for.
             .diarization = req.diarization orelse self.diarization,
-        });
+        }, audio_bytes, self.framed_attachments);
         defer alloc.free(body);
 
         var header_buf: [5][2][]const u8 = undefined;
@@ -796,8 +912,11 @@ const AntflyTranscriberState = struct {
         defer if (framed_body) |*value| value.deinit();
         if (self.framed_attachments) {
             framed_body = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, body, &.{.{
-                .mime_type = audio_content.content_type,
-                .data = audio_content.data,
+                .mime_type = try audioContentType(audio_bytes, switch (audio_content) {
+                    .owned => |content| content.content_type,
+                    .borrowed => self.options.resolved_audio_content_type,
+                }),
+                .data = audio_bytes,
             }});
             header_buf[header_count] = .{ "Content-Type", httpx.attachment_envelope.content_type };
             header_count += 1;
@@ -807,7 +926,7 @@ const AntflyTranscriberState = struct {
             .json = if (self.framed_attachments) null else body,
             .borrowed_body_segments = if (framed_body) |value| value.segments else null,
             .headers = headers,
-            .timeout_ms = self.timeout_ms,
+            .timeout_ms = try control.remainingTimeoutMs(),
             .max_response_size = self.max_response_bytes,
             .cancellation = self.cancellation,
         });
@@ -817,30 +936,218 @@ const AntflyTranscriberState = struct {
             if (resp.status.code == 409 and stale != null and
                 std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale.?, " \t"), "true"))
                 return error.InferenceCapabilitiesStale;
-            return error.TranscribeRequestFailed;
+            return audioReadResponseError(alloc, resp.body orelse "");
         }
 
         const payload = resp.body orelse return error.EmptyResponse;
-        var parsed = try std.json.parseFromSlice(inference_api.types.TranscribeResponse, alloc, payload, .{
+        var parsed = try std.json.parseFromSlice(inference_api.types.ReadResponse, alloc, payload, .{
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();
 
         const first = if (parsed.value.data.len > 0) parsed.value.data[0] else return error.EmptyResponse;
-        var response = Response{
-            .text = try alloc.dupe(u8, first.text),
-            .duration_ms = first.duration_ms,
-        };
-        errdefer deinitResponse(alloc, &response);
-        response.language = try dupOpt(alloc, first.language);
-        if (first.segments) |api_segments| response.segments = try antflySegmentsAlloc(alloc, api_segments);
-        if (first.speakers) |api_speakers| response.speakers = try antflySpeakersAlloc(alloc, api_speakers);
-        return response;
+        return fromReadObjectAlloc(alloc, first);
     }
 };
 
+/// Keep one exact-sized JSON request body. Encoding into a separate base64
+/// string would retain two recording-sized buffers and violate the public
+/// boundary's base64-payload memory contract.
+const Base64Audio = struct {
+    bytes: []const u8,
+    pub fn jsonStringify(value: @This(), jw: *std.json.Stringify) !void {
+        try jw.beginWriteRaw();
+        try jw.writer.writeByte('"');
+        try std.base64.standard.Encoder.encodeWriter(jw.writer, value.bytes);
+        try jw.writer.writeByte('"');
+        jw.endWriteRaw();
+    }
+};
+
+fn audioJsonBodyAlloc(a: Allocator, metadata: anytype, body_value: anytype, bytes: []const u8) ![]u8 {
+    const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+    const empty = try std.json.Stringify.valueAlloc(a, metadata, options);
+    defer a.free(empty);
+    const size = try std.math.add(usize, empty.len, std.base64.standard.Encoder.calcSize(bytes.len));
+    const body = try a.alloc(u8, size);
+    errdefer a.free(body);
+    var output = std.Io.Writer.fixed(body);
+    try std.json.Stringify.value(body_value, options, &output);
+    std.debug.assert(output.end == body.len);
+    return body;
+}
+
+fn antflyAudioReadBodyAlloc(a: Allocator, model: []const u8, options: inference_api.AudioReadOptions, bytes: []const u8, framed: bool) ![]u8 {
+    if (framed) return std.json.Stringify.valueAlloc(a, .{ .model = model, .audio_options = options, .audio = "attachment:0" }, .{ .emit_null_optional_fields = false });
+    return audioJsonBodyAlloc(a, .{ .model = model, .audio_options = options, .audio = "" }, .{ .model = model, .audio_options = options, .audio = Base64Audio{ .bytes = bytes } }, bytes);
+}
+
+/// Resolve MIME from shared native format detection when a caller has no MIME
+/// evidence. Preserve explicit audio/container declarations for the receiver's
+/// codec-aware validation; never invent a generic binary audio attachment.
+pub fn audioContentType(bytes: []const u8, hint: ?[]const u8) ![]const u8 {
+    if (hint) |mime| {
+        const essence = try scraping.data_uri.mediaTypeEssence(mime);
+        if (audio_codec.detectFormatFromMime(essence) != null) return mime;
+        if (!std.ascii.eqlIgnoreCase(essence, "application/octet-stream")) return error.UnsupportedAudioFormat;
+    }
+    return audio_codec.mimeForBytes(bytes);
+}
+
+/// URL-only local callbacks share this compatibility boundary. The source is
+/// borrowed until return; only its inline transport representation is owned.
+pub fn inlineAudioSourceAlloc(a: Allocator, bytes: []const u8, mime_hint: ?[]const u8, max_bytes: ?usize) ![]u8 {
+    if (bytes.len > effectiveMaxDownloadBytes(max_bytes)) return error.ResponseTooLarge;
+    const mime = try audioContentType(bytes, mime_hint);
+    const prefix_len = "data:;base64,".len + mime.len;
+    const result = try a.alloc(u8, try std.math.add(usize, prefix_len, std.base64.standard.Encoder.calcSize(bytes.len)));
+    errdefer a.free(result);
+    _ = try std.fmt.bufPrint(result[0..prefix_len], "data:{s};base64,", .{mime});
+    _ = std.base64.standard.Encoder.encode(result[prefix_len..], bytes);
+    return result;
+}
+
+fn audioReadResponseError(alloc: Allocator, body: []const u8) anyerror {
+    if (body.len > 4096) return error.TranscribeRequestFailed;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.TranscribeRequestFailed;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TranscribeRequestFailed;
+    const failure = parsed.value.object.get("error") orelse return error.TranscribeRequestFailed;
+    const code = if (failure == .string) failure.string else if (failure == .object) blk: {
+        const value = failure.object.get("code") orelse return error.TranscribeRequestFailed;
+        break :blk if (value == .string) value.string else return error.TranscribeRequestFailed;
+    } else return error.TranscribeRequestFailed;
+    if (std.mem.eql(u8, code, "AUDIO_TOO_LONG")) return error.AudioTooLong;
+    if (std.mem.eql(u8, code, "AUDIO_TOO_LARGE")) return error.AudioTooLarge;
+    inline for (.{ error.UnsupportedAudioReadCapability, error.AudioTooLong, error.InvalidTranscriptionLanguage, error.SpeakerModelUnavailable, error.DocumentUnresolved }) |err| {
+        if (std.mem.eql(u8, code, @errorName(err))) return err;
+    }
+    return error.TranscribeRequestFailed;
+}
+
+test "audio read adapter preserves native capability failures" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(error.UnsupportedAudioReadCapability, audioReadResponseError(a, "{\"error\":\"UnsupportedAudioReadCapability\"}"));
+    try std.testing.expectEqual(error.AudioTooLong, audioReadResponseError(a, "{\"error\":{\"code\":\"AudioTooLong\"}}"));
+    try std.testing.expectEqual(error.AudioTooLong, audioReadResponseError(a, "{\"error\":\"AUDIO_TOO_LONG\"}"));
+    try std.testing.expectEqual(error.TranscribeRequestFailed, audioReadResponseError(a, "not JSON"));
+}
+
+/// Validate the features implemented by the selected provider adapter before
+/// downloading media or submitting recognition. Antfly validates its own
+/// selected backend, including every configured fallback.
+pub fn validateReadOptions(cfg: Config, options: inference_api.AudioReadOptions) !void {
+    if (options.language) |language| if (std.mem.trim(u8, language, " \t\r\n").len == 0) return error.InvalidTranscriptionLanguage;
+    if (cfg.provider == .antfly) return;
+    if ((options.diarization orelse false) and cfg.provider != .vertex) return error.UnsupportedAudioReadCapability;
+    if ((options.timestamps orelse false) and cfg.provider == .openai and
+        !std.mem.eql(u8, std.mem.trim(u8, cfg.effectiveModel().?, " \t\r\n"), "whisper-1")) return error.UnsupportedAudioReadCapability;
+}
+
+/// A hosted recognizer participates in read through the same STT adapter used
+/// by internal consumers. Keep measured timing and status; unavailable duration
+/// and usage remain explicitly unknown instead of being synthesized.
+pub fn readResponseJsonAlloc(a: Allocator, model: []const u8, cfg: Config, response: Response, options: inference_api.AudioReadOptions) ![]u8 {
+    try validateReadOptions(cfg, options);
+    if (response.duration_ms) |duration| if (duration < 0) return error.InvalidInferenceResponse;
+    const text = response.text orelse "";
+    var segments = std.ArrayList(inference_api.AudioReadSegment).empty;
+    defer segments.deinit(a);
+    var speakers = std.ArrayList([]const u8).empty;
+    defer speakers.deinit(a);
+    const alignment = (options.timestamps orelse false) or (options.diarization orelse false);
+    if (alignment) {
+        const phrases = response.segments orelse if (text.len == 0) &.{} else return error.UnsupportedAudioReadCapability;
+        var cursor: usize = 0;
+        for (phrases) |phrase| {
+            const content = std.mem.trim(u8, phrase.text orelse "", " \t\r\n");
+            if (content.len == 0) continue;
+            const start = phrase.start_ms orelse return error.InvalidInferenceResponse;
+            const end = phrase.end_ms orelse return error.InvalidInferenceResponse;
+            if (start < 0 or end < start) return error.InvalidInferenceResponse;
+            if (response.duration_ms) |duration| if (end > duration) return error.InvalidInferenceResponse;
+            const offset = std.mem.indexOfPos(u8, text, cursor, content) orelse return error.InvalidInferenceResponse;
+            cursor = offset + content.len;
+            const speaker = if (options.diarization orelse false) phrase.speaker orelse return error.UnsupportedAudioReadCapability else null;
+            if (speaker) |label| {
+                var known = false;
+                for (speakers.items) |existing| if (std.mem.eql(u8, existing, label)) {
+                    known = true;
+                    break;
+                };
+                if (!known) try speakers.append(a, label);
+            }
+            try segments.append(a, .{ .text = content, .granularity = .{ .value = "phrase" }, .text_start = @intCast(offset), .text_end = @intCast(cursor), .start_ms = start, .end_ms = end, .speaker = .fromNullable(speaker) });
+        }
+        if (text.len > 0 and segments.items.len == 0) return error.UnsupportedAudioReadCapability;
+    }
+    const items = [_]inference_api.ReadObject{.{
+        .object = "read",
+        .index = 0,
+        .source_id = "audio-0",
+        .number = 1,
+        .kind = "audio",
+        .coordinate_space = "none",
+        .origin = "transcription",
+        .text = text,
+        .status = response.status orelse if (text.len == 0) "unresolved" else "complete",
+        .audio = .{ .value = .{
+            .duration_ms = response.duration_ms,
+            .language = .fromNullable(options.language orelse response.language),
+            .language_source = if (options.language != null) "forced" else if (response.language != null and (cfg.provider == .openai or cfg.provider == .cloudflare)) "detected" else "unknown",
+            .segments = .fromNullable(if (alignment) segments.items else null),
+            .speakers = .fromNullable(if (options.diarization orelse false) speakers.items else null),
+        } },
+    }};
+    return std.json.Stringify.valueAlloc(a, inference_api.ReadResponse{ .object = "list", .model = model, .data = &items, .usage = null }, .{});
+}
+
+test "audio read hosted adapters preserve temporal evidence and reject unsupported features" {
+    const a = std.testing.allocator;
+    const cfg = Config{ .provider = .openai, .model = "whisper-1" };
+    try validateReadOptions(cfg, .{ .language = "en", .timestamps = true });
+    try std.testing.expectError(error.UnsupportedAudioReadCapability, validateReadOptions(cfg, .{ .diarization = true }));
+    try std.testing.expectError(error.UnsupportedAudioReadCapability, validateReadOptions(.{ .provider = .openai, .model = "gpt-4o-mini-transcribe" }, .{ .timestamps = true }));
+    const json = try readResponseJsonAlloc(a, "transcribers/meeting", cfg, .{
+        .text = "hello",
+        .status = "truncated",
+        .duration_ms = 90000,
+        .segments = &.{.{ .text = "hello", .start_ms = 65000, .end_ms = 66000 }},
+    }, .{ .language = "en", .timestamps = true });
+    defer a.free(json);
+    var parsed = try std.json.parseFromSlice(inference_api.ReadResponse, a, json, .{});
+    defer parsed.deinit();
+    const item = parsed.value.data[0];
+    try std.testing.expectEqualStrings("truncated", item.status.?);
+    try std.testing.expectEqualStrings("forced", item.audio.valueOrNull().?.language_source.?);
+    try std.testing.expectEqual(@as(i64, 65000), item.audio.valueOrNull().?.segments.valueOrNull().?[0].start_ms);
+    try std.testing.expectEqual(@as(i64, 5), item.audio.valueOrNull().?.segments.valueOrNull().?[0].text_end);
+    try std.testing.expect(parsed.value.usage == null);
+    const unknown = try readResponseJsonAlloc(a, "speech", cfg, .{ .text = "" }, .{});
+    defer a.free(unknown);
+    var empty = try std.json.parseFromSlice(inference_api.ReadResponse, a, unknown, .{});
+    defer empty.deinit();
+    try std.testing.expectEqualStrings("unresolved", empty.value.data[0].status.?);
+    try std.testing.expect(empty.value.data[0].audio.valueOrNull().?.duration_ms == null);
+    try std.testing.expectError(error.InvalidInferenceResponse, readResponseJsonAlloc(a, "speech", cfg, .{ .text = "", .duration_ms = -1 }, .{}));
+}
+
+pub fn fromReadObjectAlloc(alloc: Allocator, first: inference_api.types.ReadObject) !Response {
+    const metadata = first.audio.valueOrNull();
+    var response = Response{
+        .text = try alloc.dupe(u8, first.text),
+        .duration_ms = if (metadata) |value| value.duration_ms else null,
+    };
+    errdefer deinitResponse(alloc, &response);
+    response.status = try dupOpt(alloc, first.status);
+    response.language = try dupOpt(alloc, if (metadata) |value| value.language.valueOrNull() else null);
+    if (if (metadata) |value| value.segments.valueOrNull() else null) |api_segments| response.segments = try antflySegmentsAlloc(alloc, api_segments);
+    if (if (metadata) |value| value.speakers.valueOrNull() else null) |api_speakers| response.speakers = try antflySpeakersAlloc(alloc, api_speakers);
+    return response;
+}
+
 /// The inference service's timestamped phrases as shared transcript segments.
-fn antflySegmentsAlloc(alloc: Allocator, api_segments: []const inference_api.types.DictationSegment) ![]Segment {
+fn antflySegmentsAlloc(alloc: Allocator, api_segments: []const inference_api.types.AudioReadSegment) ![]Segment {
     const segments = try alloc.alloc(Segment, api_segments.len);
     var filled: usize = 0;
     errdefer {
@@ -851,29 +1158,16 @@ fn antflySegmentsAlloc(alloc: Allocator, api_segments: []const inference_api.typ
         alloc.free(segments);
     }
     for (api_segments, 0..) |api_segment, i| {
-        const words = try alloc.alloc(WordTimestamp, api_segment.words.len);
-        var words_filled: usize = 0;
-        errdefer {
-            for (words[0..words_filled]) |word| {
-                var owned = word;
-                deinitWordTimestamp(alloc, &owned);
-            }
-            alloc.free(words);
-        }
-        for (api_segment.words, 0..) |api_word, j| {
-            words[j] = .{
-                .word = try alloc.dupe(u8, api_word.word),
-                .start_ms = api_word.start_ms,
-                .end_ms = api_word.end_ms,
-            };
-            words_filled += 1;
-        }
+        const words = try alloc.alloc(WordTimestamp, 0);
+        errdefer alloc.free(words);
+        const text = try alloc.dupe(u8, api_segment.text);
+        errdefer alloc.free(text);
         segments[i] = .{
-            .text = try alloc.dupe(u8, api_segment.text),
+            .text = text,
             .start_ms = api_segment.start_ms,
             .end_ms = api_segment.end_ms,
             .words = words,
-            .speaker = try dupOpt(alloc, api_segment.speaker),
+            .speaker = try dupOpt(alloc, api_segment.speaker.valueOrNull()),
         };
         filled += 1;
     }
@@ -923,36 +1217,36 @@ const CloudflareTranscriberState = struct {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (req.diarization orelse false) return error.UnsupportedTranscriptionOptions;
         const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        const work = arena.allocator();
-        const content = try resolveAudioContentWithContext(work, self.http.io, req.url, self.cfg.max_download_bytes, self.options, control);
-        const encoded = try work.alloc(u8, std.base64.standard.Encoder.calcSize(content.data.len));
-        _ = std.base64.standard.Encoder.encode(encoded, content.data);
+        var content = try resolveAudioContentWithContext(a, self.http.io, req.url, self.cfg.max_download_bytes, self.options, control);
+        defer content.deinit(a);
+        const bytes = content.bytes();
+        const language = req.language orelse self.cfg.language_code;
+        const wire = try audioJsonBodyAlloc(a, .{ .audio = "", .language = language }, .{ .audio = Base64Audio{ .bytes = bytes }, .language = language }, bytes);
+        defer a.free(wire);
         const cf = @import("antfly_cloudflare");
-        const wire = try std.json.Stringify.valueAlloc(work, cloudflare.wire.types.WhisperLargeV3TurboInput{
-            .audio = cf.string(encoded),
-            .language = req.language orelse self.cfg.language_code,
-        }, .{ .emit_null_optional_fields = false });
-        const payload = try std.json.parseFromSliceLeaky(std.json.Value, work, wire, .{ .parse_numbers = false });
-        const value = try cf.invokeNative(self.http, work, .{
+        const endpoint = try self.cfg.effectiveEndpointAlloc(a);
+        defer if (endpoint) |value| a.free(value);
+        var response = try cf.postNativeEncoded(self.http, a, .{
             .account_id = self.cfg.account_id.?,
             .model = self.cfg.model.?,
             .api_key = self.cfg.bearer_token orelse self.cfg.api_key orelse return error.MissingCloudflareCredentials,
             .gateway_id = self.cfg.gateway_id,
-            .url = self.cfg.base_url orelse self.cfg.url,
-        }, payload, .{
+            .url = endpoint,
+        }, wire, .{
             .max_response_bytes = self.cfg.max_response_bytes orelse httpx.types.default_max_body_size,
             .timeout_ms = try control.remainingTimeoutMs(),
             .cancellation = self.options.cancellation,
         });
+        defer response.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const value = try cf.decodeNative(arena.allocator(), response.body orelse return error.InvalidCloudflareResponse);
         return cloudflareTranscript(a, value, req.timestamps orelse self.cfg.timestamps orelse true);
     }
 };
 
 fn cloudflareTimestamp(seconds: f64) !i64 {
-    if (!std.math.isFinite(seconds) or seconds < 0 or seconds >= 9e15) return error.InvalidCloudflareResponse;
-    return @intFromFloat(@round(seconds * 1000));
+    return secondsToMs(seconds) catch return error.InvalidCloudflareResponse;
 }
 
 fn cloudflareTranscript(a: Allocator, value: std.json.Value, timestamps: bool) !Response {
@@ -1030,12 +1324,17 @@ const OpenAiTranscriberState = struct {
             .alloc = alloc,
             .options = options,
             .http = http,
-            .base_url = try alloc.dupe(u8, cfg.base_url orelse "https://api.openai.com/v1"),
-            .model = try alloc.dupe(u8, cfg.model orelse "whisper-1"),
-            .language_code = try dupOpt(alloc, cfg.language_code),
+            .base_url = "",
+            .model = "",
+            .language_code = null,
             .max_response_bytes = cfg.max_response_bytes,
             .max_download_bytes = cfg.max_download_bytes,
         };
+        errdefer state.deinitState();
+        state.base_url = (try cfg.effectiveEndpointAlloc(alloc)).?;
+        state.model = try alloc.dupe(u8, cfg.effectiveModel().?);
+        state.language_code = try dupOpt(alloc, cfg.language_code);
+
         if (cfg.bearer_token orelse cfg.api_key) |token| try state.setBearer(token);
 
         return .{
@@ -1049,11 +1348,15 @@ const OpenAiTranscriberState = struct {
 
     pub fn deinit(ptr: *anyopaque) void {
         const self: *OpenAiTranscriberState = @ptrCast(@alignCast(ptr));
+        self.deinitState();
+        self.alloc.destroy(self);
+    }
+
+    fn deinitState(self: *OpenAiTranscriberState) void {
         self.alloc.free(self.base_url);
         self.alloc.free(self.model);
         freeOpt(self.alloc, self.language_code);
         if (self.auth_header) |header| self.alloc.free(header[1]);
-        self.alloc.destroy(self);
     }
 
     fn setBearer(self: *OpenAiTranscriberState, token: []const u8) !void {
@@ -1068,14 +1371,15 @@ const OpenAiTranscriberState = struct {
         const self: *OpenAiTranscriberState = @ptrCast(@alignCast(ptr));
         if (req.diarization orelse false) return error.UnsupportedTranscriptionOptions;
         const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
-        const content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
-        defer alloc.free(content.content_type);
-        const audio_bytes = content.data;
-        defer alloc.free(audio_bytes);
+        var content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
+        defer content.deinit(alloc);
+        const audio_bytes = content.bytes();
 
         const content_type = "application/octet-stream";
-        const multipart = try buildOpenAiMultipartAlloc(alloc, self.model, req.language orelse self.language_code, audio_bytes, content_type);
-        defer alloc.free(multipart.body);
+        const multipart = try buildOpenAiMultipartAlloc(alloc, self.http.io, self.model, req.language orelse self.language_code, audio_bytes, content_type);
+        defer alloc.free(multipart.prefix);
+        defer alloc.free(multipart.suffix);
+        const segments = [_][]const u8{ multipart.prefix, audio_bytes, multipart.suffix };
         defer alloc.free(multipart.content_type);
 
         const url = try std.fmt.allocPrint(alloc, "{s}/audio/transcriptions", .{self.base_url});
@@ -1087,7 +1391,7 @@ const OpenAiTranscriberState = struct {
         if (self.auth_header) |header| try headers.append(alloc, header);
 
         var resp = try self.http.post(url, .{
-            .body = multipart.body,
+            .borrowed_body_segments = &segments,
             .headers = headers.items,
             .max_response_size = self.max_response_bytes,
             .timeout_ms = try control.remainingTimeoutMs(),
@@ -1120,9 +1424,10 @@ fn parseOpenAiVerboseResponseAlloc(alloc: Allocator, payload: []const u8) !Respo
     };
     var parsed = try std.json.parseFromSlice(Body, alloc, payload, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
+    const duration_ms = if (parsed.value.duration) |seconds| try secondsToMs(seconds) else null;
     var response = Response{
         .text = try dupOpt(alloc, parsed.value.text),
-        .duration_ms = if (parsed.value.duration) |seconds| secondsToMs(seconds) else null,
+        .duration_ms = duration_ms,
     };
     errdefer deinitResponse(alloc, &response);
     response.language = try dupOpt(alloc, parsed.value.language);
@@ -1137,10 +1442,13 @@ fn parseOpenAiVerboseResponseAlloc(alloc: Allocator, payload: []const u8) !Respo
             alloc.free(segments);
         }
         for (parsed.value.segments, 0..) |segment, i| {
+            const start_ms = try secondsToMs(segment.start);
+            const end_ms = try secondsToMs(segment.end);
+            if (end_ms < start_ms) return error.InvalidInferenceResponse;
             segments[i] = .{
                 .text = try dupOpt(alloc, if (segment.text) |text| std.mem.trim(u8, text, " ") else null),
-                .start_ms = secondsToMs(segment.start),
-                .end_ms = secondsToMs(segment.end),
+                .start_ms = start_ms,
+                .end_ms = end_ms,
             };
             filled += 1;
         }
@@ -1149,9 +1457,12 @@ fn parseOpenAiVerboseResponseAlloc(alloc: Allocator, payload: []const u8) !Respo
     return response;
 }
 
-fn secondsToMs(seconds: f64) i64 {
-    if (!std.math.isFinite(seconds) or seconds <= 0) return 0;
-    return @intFromFloat(@round(seconds * 1000.0));
+fn secondsToMs(seconds: f64) !i64 {
+    if (!std.math.isFinite(seconds) or seconds < 0) return error.InvalidInferenceResponse;
+    const milliseconds = @round(seconds * 1000.0);
+    // f64(maxInt(i64)) rounds up to 2^63, which is already out of range.
+    if (!std.math.isFinite(milliseconds) or milliseconds >= 0x1p63) return error.InvalidInferenceResponse;
+    return @intFromFloat(milliseconds);
 }
 
 const VertexTranscriberState = struct {
@@ -1161,6 +1472,7 @@ const VertexTranscriberState = struct {
     base_url: []const u8,
     auth_header: ?[2][]const u8 = null,
     token_source: ?*google_auth.CachedTokenSource = null,
+    credentials_path: ?[]const u8 = null,
     project_id: []const u8,
     location: []const u8,
     model: []const u8,
@@ -1182,11 +1494,11 @@ const VertexTranscriberState = struct {
             .alloc = alloc,
             .options = options,
             .http = http,
-            .base_url = try alloc.dupe(u8, cfg.base_url orelse "https://speech.googleapis.com/v2"),
-            .project_id = if (cfg.project_id) |value| try alloc.dupe(u8, value) else (try vertexProjectIdFromConfigAlloc(alloc, cfg.credentials_path) orelse return error.InvalidTranscribingConfig),
-            .location = try alloc.dupe(u8, cfg.location orelse "global"),
-            .model = try alloc.dupe(u8, cfg.model orelse "latest_long"),
-            .language_code = try alloc.dupe(u8, cfg.language_code orelse "en-US"),
+            .base_url = "",
+            .project_id = "",
+            .location = "",
+            .model = "",
+            .language_code = "",
             .enable_automatic_punctuation = cfg.enable_automatic_punctuation,
             .max_response_bytes = cfg.max_response_bytes,
             .max_download_bytes = cfg.max_download_bytes,
@@ -1194,9 +1506,16 @@ const VertexTranscriberState = struct {
             .diarization = cfg.diarization,
         };
         errdefer state.deinitState();
+        state.base_url = (try cfg.effectiveEndpointAlloc(alloc)).?;
+        state.project_id = try cfg.effectiveProjectId(alloc) orelse return error.InvalidTranscribingConfig;
+        state.location = try alloc.dupe(u8, cfg.effectiveLocation().?);
+        state.model = try alloc.dupe(u8, cfg.effectiveModel().?);
+        state.language_code = try alloc.dupe(u8, cfg.language_code orelse "en-US");
 
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
+        } else if (options.credential_manager != null) {
+            state.credentials_path = try dupOpt(alloc, cfg.credentials_path);
         } else {
             state.token_source = try initVertexTokenSource(alloc, cfg.credentials_path);
         }
@@ -1213,6 +1532,7 @@ const VertexTranscriberState = struct {
     fn deinitState(self: *VertexTranscriberState) void {
         self.alloc.free(self.base_url);
         self.alloc.free(self.project_id);
+        freeOpt(self.alloc, self.credentials_path);
         self.alloc.free(self.location);
         self.alloc.free(self.model);
         self.alloc.free(self.language_code);
@@ -1248,7 +1568,11 @@ const VertexTranscriberState = struct {
             try headers.append(alloc, header);
             return;
         }
-        if (self.token_source) |source| {
+        const token_source = if (self.options.credential_manager) |manager|
+            manager.tokenSourceWithControl(self.credentials_path, vertex_auth_scope, control) catch |err| return if (err == error.MissingGoogleCredentials) error.MissingVertexCredentials else err
+        else
+            self.token_source;
+        if (token_source) |source| {
             minted_auth.* = try source.authorizationValueAllocWithControl(alloc, control);
             try headers.append(alloc, .{ "Authorization", minted_auth.*.? });
         }
@@ -1257,15 +1581,9 @@ const VertexTranscriberState = struct {
     fn transcribe(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *VertexTranscriberState = @ptrCast(@alignCast(ptr));
         const control = google_auth.RequestControl.fromTimeout(self.options.timeout_ms, self.options.cancellation);
-        const content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
-        defer alloc.free(content.content_type);
-        const audio_bytes = content.data;
-        defer alloc.free(audio_bytes);
-
-        const encoded_len = std.base64.standard.Encoder.calcSize(audio_bytes.len);
-        const encoded = try alloc.alloc(u8, encoded_len);
-        defer alloc.free(encoded);
-        _ = std.base64.standard.Encoder.encode(encoded, audio_bytes);
+        var content = try resolveAudioContentWithContext(alloc, self.http.io, req.url, self.max_download_bytes, self.options, control);
+        defer content.deinit(alloc);
+        const audio_bytes = content.bytes();
 
         const language = req.language orelse self.language_code;
         const DiarizationConfig = struct {
@@ -1278,15 +1596,12 @@ const VertexTranscriberState = struct {
             diarizationConfig: ?DiarizationConfig = null,
         };
         const RecognitionConfig = struct {
-            explicitDecodingConfig: struct {} = .{},
+            autoDecodingConfig: struct {} = .{},
             model: []const u8,
             languageCodes: []const []const u8,
             features: RecognitionFeatures,
         };
-        const RequestBody = struct {
-            config: RecognitionConfig,
-            content: []const u8,
-        };
+
         const languages = [_][]const u8{language};
         // Word offsets are what segment timing is rebuilt from, so they are
         // requested whenever timestamps are wanted; speaker labels ride on
@@ -1295,18 +1610,22 @@ const VertexTranscriberState = struct {
         // the default.
         const want_timestamps = req.timestamps orelse self.timestamps orelse true;
         const want_diarization = req.diarization orelse self.diarization orelse false;
-        const body = try httpx.json.Json.stringifyRequest(alloc, RequestBody{
-            .config = .{
-                .model = self.model,
-                .languageCodes = &languages,
-                .features = .{
-                    .enableWordTimeOffsets = want_timestamps or want_diarization,
-                    .enableAutomaticPunctuation = self.enable_automatic_punctuation,
-                    .diarizationConfig = if (want_diarization) DiarizationConfig{} else null,
-                },
+        const recognition_config: RecognitionConfig = .{
+            .model = self.model,
+            .languageCodes = &languages,
+            .features = .{
+                .enableWordTimeOffsets = want_timestamps or want_diarization,
+                .enableAutomaticPunctuation = self.enable_automatic_punctuation,
+                .diarizationConfig = if (want_diarization) DiarizationConfig{} else null,
             },
-            .content = encoded,
-        });
+        };
+        var headers = std.ArrayList([2][]const u8).empty;
+        defer headers.deinit(alloc);
+        var minted_auth: ?[]u8 = null;
+        defer if (minted_auth) |value| alloc.free(value);
+        try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
+
+        const body = try audioJsonBodyAlloc(alloc, .{ .config = recognition_config, .content = "" }, .{ .config = recognition_config, .content = Base64Audio{ .bytes = audio_bytes } }, audio_bytes);
         defer alloc.free(body);
 
         const url = try std.fmt.allocPrint(
@@ -1315,12 +1634,6 @@ const VertexTranscriberState = struct {
             .{ self.base_url, self.project_id, self.location },
         );
         defer alloc.free(url);
-
-        var headers = std.ArrayList([2][]const u8).empty;
-        defer headers.deinit(alloc);
-        var minted_auth: ?[]u8 = null;
-        defer if (minted_auth) |value| alloc.free(value);
-        try self.appendAuthHeaders(alloc, &headers, &minted_auth, control);
 
         var resp = try self.http.post(url, .{
             .json = body,
@@ -1390,9 +1703,11 @@ fn parseVertexRecognizeResponseAlloc(alloc: Allocator, payload: []const u8) !Res
         }
         if (alternative.words.len == 0) {
             if (transcript.len == 0) continue;
-            const end_ms = if (result.resultEndOffset) |offset| vertexDurationToMs(offset) orelse last_end_ms else last_end_ms;
+            const end_ms = if (result.resultEndOffset) |offset| try vertexDurationToMs(offset) else last_end_ms;
+            const segment_text = try alloc.dupe(u8, transcript);
+            errdefer alloc.free(segment_text);
             try segments.append(alloc, .{
-                .text = try alloc.dupe(u8, transcript),
+                .text = segment_text,
                 .start_ms = last_end_ms,
                 .end_ms = @max(end_ms, last_end_ms),
             });
@@ -1437,8 +1752,8 @@ fn parseVertexRecognizeResponseAlloc(alloc: Allocator, payload: []const u8) !Res
                         slice_end = scan;
                     }
                 }
-                const start_ms = if (word.startOffset) |offset| vertexDurationToMs(offset) orelse last_end_ms else last_end_ms;
-                const end_ms = if (word.endOffset) |offset| vertexDurationToMs(offset) orelse start_ms else start_ms;
+                const start_ms = if (word.startOffset) |offset| try vertexDurationToMs(offset) else last_end_ms;
+                const end_ms = if (word.endOffset) |offset| try vertexDurationToMs(offset) else start_ms;
                 words[filled] = .{
                     .word = try alloc.dupe(u8, spelled),
                     .start_ms = start_ms,
@@ -1473,10 +1788,13 @@ fn parseVertexRecognizeResponseAlloc(alloc: Allocator, payload: []const u8) !Res
 
     var response = Response{
         .text = try alloc.dupe(u8, text.items),
-        .language = try dupOpt(alloc, results[0].languageCode),
-        .duration_ms = if (last_end_ms > 0) last_end_ms else null,
+        .language = null,
+        // Recognition endpoints describe evidence positions, not the source
+        // recording's duration (which may include leading/trailing silence).
+        .duration_ms = null,
     };
     errdefer deinitResponse(alloc, &response);
+    response.language = try dupOpt(alloc, results[0].languageCode);
     if (segments.items.len > 0) response.segments = try segments.toOwnedSlice(alloc);
     if (speakers_seen.count() > 0) {
         const speakers = try alloc.alloc(Speaker, speakers_seen.count());
@@ -1486,7 +1804,9 @@ fn parseVertexRecognizeResponseAlloc(alloc: Allocator, payload: []const u8) !Res
             alloc.free(speakers);
         }
         for (speakers_seen.keys()) |label| {
-            speakers[filled] = .{ .id = try alloc.dupe(u8, label), .label = try alloc.dupe(u8, label) };
+            const id = try alloc.dupe(u8, label);
+            errdefer alloc.free(id);
+            speakers[filled] = .{ .id = id, .label = try alloc.dupe(u8, label) };
             filled += 1;
         }
         response.speakers = speakers;
@@ -1500,13 +1820,24 @@ fn sameSpeaker(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
-/// Parses a protobuf JSON duration such as `"1.500s"` or `"12s"` into
-/// milliseconds; anything else is treated as absent.
-fn vertexDurationToMs(text: []const u8) ?i64 {
-    const trimmed = std.mem.trimEnd(u8, text, "s");
-    if (trimmed.len == 0 or trimmed.len == text.len) return null;
-    const seconds = std.fmt.parseFloat(f64, trimmed) catch return null;
-    return secondsToMs(seconds);
+/// Protobuf duration offsets use integer seconds and at most nine fractional
+/// digits. Parse without floating-point loss, then round once to milliseconds.
+fn vertexDurationToMs(text: []const u8) !i64 {
+    if (text.len < 2 or text[text.len - 1] != 's') return error.InvalidInferenceResponse;
+    var parts = std.mem.splitScalar(u8, text[0 .. text.len - 1], '.');
+    const whole = parts.next().?;
+    if (whole.len == 0) return error.InvalidInferenceResponse;
+    for (whole) |ch| if (!std.ascii.isDigit(ch)) return error.InvalidInferenceResponse;
+    const seconds = std.fmt.parseInt(u64, whole, 10) catch return error.InvalidInferenceResponse;
+    if (seconds > 315576000000) return error.InvalidInferenceResponse;
+    var nanos: u32 = 0;
+    if (parts.next()) |fraction| {
+        if (fraction.len == 0 or fraction.len > 9 or parts.next() != null) return error.InvalidInferenceResponse;
+        for (fraction) |ch| if (!std.ascii.isDigit(ch)) return error.InvalidInferenceResponse;
+        nanos = std.fmt.parseInt(u32, fraction, 10) catch return error.InvalidInferenceResponse;
+        for (fraction.len..9) |_| nanos *= 10;
+    }
+    return @intCast(seconds * 1000 + (nanos + 500000) / 1000000);
 }
 
 test "vertex recognize response yields speaker turns with word timing" {
@@ -1524,7 +1855,7 @@ test "vertex recognize response yields speaker turns with word timing" {
     defer deinitResponse(alloc, &response);
     try std.testing.expectEqualStrings("hello there how are you fine thanks", response.text.?);
     try std.testing.expectEqualStrings("en-US", response.language.?);
-    try std.testing.expectEqual(@as(?i64, 3250), response.duration_ms);
+    try std.testing.expectEqual(@as(?i64, null), response.duration_ms);
     const segments = response.segments.?;
     try std.testing.expectEqual(@as(usize, 3), segments.len);
     try std.testing.expectEqualStrings("hello there", segments[0].text.?);
@@ -1701,10 +2032,10 @@ test "a zero download ceiling is treated as unset" {
 }
 
 test "vertex durations parse protobuf seconds" {
-    try std.testing.expectEqual(@as(?i64, 1500), vertexDurationToMs("1.500s"));
-    try std.testing.expectEqual(@as(?i64, 12000), vertexDurationToMs("12s"));
-    try std.testing.expectEqual(@as(?i64, null), vertexDurationToMs("12"));
-    try std.testing.expectEqual(@as(?i64, null), vertexDurationToMs("s"));
+    try std.testing.expectEqual(@as(i64, 1500), try vertexDurationToMs("1.500s"));
+    try std.testing.expectEqual(@as(i64, 12000), try vertexDurationToMs("12s"));
+    try std.testing.expectError(error.InvalidInferenceResponse, vertexDurationToMs("12"));
+    try std.testing.expectError(error.InvalidInferenceResponse, vertexDurationToMs("s"));
 }
 
 fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*google_auth.CachedTokenSource {
@@ -1728,7 +2059,8 @@ fn vertexProjectIdFromConfigAlloc(alloc: Allocator, credentials_path: ?[]const u
 
 const MultipartBody = struct {
     content_type: []u8,
-    body: []u8,
+    prefix: []u8,
+    suffix: []u8,
 };
 
 /// OpenAI's transcription models do not share one response format.
@@ -1743,27 +2075,50 @@ fn openAiResponseFormat(model: []const u8) []const u8 {
     return "verbose_json";
 }
 
+// Randomized metadata plus an exact payload check gives a collision-free
+// delimiter without hashing/copying the full recording. The nonce also makes
+// progress under deterministic or entropy-free test I/O authorities.
+fn selectMultipartBoundary(boundary_buf: *[69]u8, seed: [32]u8, audio_bytes: []const u8, model: []const u8, language: ?[]const u8) ![]const u8 {
+    var nonce: u64 = 0;
+    return while (true) : (nonce += 1) {
+        var candidate_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        candidate_hash.update(&seed);
+        candidate_hash.update(std.mem.asBytes(&nonce));
+        var candidate: [32]u8 = undefined;
+        candidate_hash.final(&candidate);
+        const value = try std.fmt.bufPrint(boundary_buf, "afly-{s}", .{std.fmt.bytesToHex(candidate, .lower)});
+        if (std.mem.indexOf(u8, audio_bytes, value) == null and
+            std.mem.indexOf(u8, model, value) == null and
+            std.mem.indexOf(u8, language orelse "", value) == null)
+            break value;
+    };
+}
+
 fn buildOpenAiMultipartAlloc(
     alloc: Allocator,
+    io: std.Io,
     model: []const u8,
     language: ?[]const u8,
     audio_bytes: []const u8,
     audio_content_type: []const u8,
 ) !MultipartBody {
-    const boundary = "antfly-zig-audio-boundary";
+    var seed: [32]u8 = undefined;
+    io.random(&seed);
+    var boundary_buf: [69]u8 = undefined;
+    const boundary = try selectMultipartBoundary(&boundary_buf, seed, audio_bytes, model, language);
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(alloc);
 
     try appendMultipartField(&buf, alloc, boundary, "model", model);
     if (language) |lang| try appendMultipartField(&buf, alloc, boundary, "language", lang);
     try appendMultipartField(&buf, alloc, boundary, "response_format", openAiResponseFormat(model));
-    try appendMultipartFile(&buf, alloc, boundary, "file", "audio", audio_content_type, audio_bytes);
-    try buf.print(alloc, "--{s}--\r\n", .{boundary});
+    try buf.print(alloc, "--{s}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio\"\r\nContent-Type: {s}\r\n\r\n", .{ boundary, audio_content_type });
 
-    return .{
-        .content_type = try std.fmt.allocPrint(alloc, "multipart/form-data; boundary={s}", .{boundary}),
-        .body = try buf.toOwnedSlice(alloc),
-    };
+    const content_type = try std.fmt.allocPrint(alloc, "multipart/form-data; boundary={s}", .{boundary});
+    errdefer alloc.free(content_type);
+    const suffix = try std.fmt.allocPrint(alloc, "\r\n--{s}--\r\n", .{boundary});
+    errdefer alloc.free(suffix);
+    return .{ .content_type = content_type, .prefix = try buf.toOwnedSlice(alloc), .suffix = suffix };
 }
 
 fn appendMultipartField(
@@ -1780,33 +2135,36 @@ fn appendMultipartField(
     );
 }
 
-fn appendMultipartFile(
-    buf: *std.ArrayList(u8),
-    alloc: Allocator,
-    boundary: []const u8,
-    name: []const u8,
-    filename: []const u8,
-    content_type: []const u8,
-    content: []const u8,
-) !void {
-    try buf.print(
-        alloc,
-        "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"; filename=\"{s}\"\r\nContent-Type: {s}\r\n\r\n",
-        .{ boundary, name, filename, content_type },
-    );
-    try buf.appendSlice(alloc, content);
-    try buf.appendSlice(alloc, "\r\n");
-}
+/// Trusted document sources remain owned by their caller until recognition
+/// returns. Downloads and decoded data URIs retain their explicit cleanup owner.
+const ResolvedAudioContent = union(enum) {
+    borrowed: []const u8,
+    owned: scraping.DownloadedContent,
 
-fn resolveAudioContentWithContext(a: Allocator, io: std.Io, url: []const u8, max_bytes: ?usize, options: RemoteOptions, control: google_auth.RequestControl) !scraping.DownloadedContent {
+    fn bytes(self: @This()) []const u8 {
+        return switch (self) {
+            .borrowed => |data| data,
+            .owned => |content| content.data,
+        };
+    }
+    fn deinit(self: *@This(), a: Allocator) void {
+        switch (self.*) {
+            .borrowed => {},
+            .owned => |*content| content.deinit(a),
+        }
+        self.* = undefined;
+    }
+};
+
+fn resolveAudioContentWithContext(a: Allocator, io: std.Io, url: []const u8, max_bytes: ?usize, options: RemoteOptions, control: google_auth.RequestControl) !ResolvedAudioContent {
     try control.check();
     if (options.resolved_audio) |bytes| {
         if (bytes.len > effectiveMaxDownloadBytes(max_bytes)) return error.ResponseTooLarge;
-        return .{ .data = try a.dupe(u8, bytes), .content_type = try a.dupe(u8, "audio/wav") };
+        return .{ .borrowed = bytes };
     }
-    if (scraping.data_uri.hasScheme(url)) return resolveAudioContentAlloc(a, url, max_bytes);
+    if (scraping.data_uri.hasScheme(url)) return .{ .owned = try resolveAudioContentAlloc(a, url, max_bytes) };
     const security = remoteFetchSecurity(max_bytes);
-    return scraping.downloadContentAllocWithContext(a, .{ .io = io, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = if (options.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null }, url, &security, null);
+    return .{ .owned = try scraping.downloadContentAllocWithContext(a, .{ .io = io, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = if (options.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null }, url, &security, null) };
 }
 
 fn resolveAudioInputAlloc(alloc: Allocator, url: []const u8, max_download_bytes: ?usize) ![]u8 {
@@ -1823,7 +2181,8 @@ fn resolveAudioContentAlloc(alloc: Allocator, url: []const u8, max_download_byte
         const parsed = try scraping.data_uri.parseRequired(url);
         if (!parsed.has_explicit_media_type or
             !(std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "audio/") or
-                std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "video/")))
+                std.ascii.startsWithIgnoreCase(parsed.media_type_essence, "video/") or
+                std.ascii.eqlIgnoreCase(parsed.media_type_essence, "application/octet-stream")))
             return error.InvalidDataUri;
         return try scraping.downloadContentAlloc(alloc, url, &security, null);
     }
@@ -1836,49 +2195,6 @@ fn resolveAudioContentAlloc(alloc: Allocator, url: []const u8, max_download_byte
         },
         .ok => |response| return response,
     }
-}
-
-fn cloneSegments(alloc: Allocator, segments: ?[]const Segment) !?[]Segment {
-    const src = segments orelse return null;
-    const out = try alloc.alloc(Segment, src.len);
-    errdefer alloc.free(out);
-    for (src, 0..) |segment, i| {
-        out[i] = .{
-            .text = try dupOpt(alloc, segment.text),
-            .start_ms = segment.start_ms,
-            .end_ms = segment.end_ms,
-            .speaker = try dupOpt(alloc, segment.speaker),
-            .words = try cloneWords(alloc, segment.words),
-        };
-    }
-    return out;
-}
-
-fn cloneWords(alloc: Allocator, words: ?[]const WordTimestamp) !?[]WordTimestamp {
-    const src = words orelse return null;
-    const out = try alloc.alloc(WordTimestamp, src.len);
-    errdefer alloc.free(out);
-    for (src, 0..) |word, i| {
-        out[i] = .{
-            .word = try dupOpt(alloc, word.word),
-            .start_ms = word.start_ms,
-            .end_ms = word.end_ms,
-        };
-    }
-    return out;
-}
-
-fn cloneSpeakers(alloc: Allocator, speakers: ?[]const Speaker) !?[]Speaker {
-    const src = speakers orelse return null;
-    const out = try alloc.alloc(Speaker, src.len);
-    errdefer alloc.free(out);
-    for (src, 0..) |speaker, i| {
-        out[i] = .{
-            .id = try dupOpt(alloc, speaker.id),
-            .label = try dupOpt(alloc, speaker.label),
-        };
-    }
-    return out;
 }
 
 fn dupOpt(alloc: Allocator, value: ?[]const u8) !?[]const u8 {
@@ -1966,14 +2282,15 @@ test "transcribing runtime loads antfly provider and transcribes data uri input"
             try expectAntflyTranscriberBearer(req);
             const parsed_request = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
             defer parsed_request.deinit();
-            try std.testing.expectEqualStrings("fr", parsed_request.value.object.get("language").?.string);
-            try std.testing.expect(parsed_request.value.object.get("timestamps").?.bool);
-            try std.testing.expect(parsed_request.value.object.get("diarization").?.bool);
+            const options = parsed_request.value.object.get("audio_options").?.object;
+            try std.testing.expectEqualStrings("fr", options.get("language").?.string);
+            try std.testing.expect(options.get("timestamps").?.bool);
+            try std.testing.expect(options.get("diarization").?.bool);
         }
     };
     var server = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/transcribe", .assert_request = Check.request, .respond = .{
-            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"hello from antfly\",\"language\":\"en\"}],\"model\":\"openai/whisper-base\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":3,\"total_tokens\":3}}",
+        .{ .method = .POST, .path = "/read", .assert_request = Check.request, .respond = .{
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"hello from antfly\",\"status\":\"complete\",\"audio\":{\"duration_ms\":0,\"language\":\"en\"}}],\"model\":\"openai/whisper-base\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":3,\"total_tokens\":3}}",
         } },
     });
     defer server.deinit();
@@ -2033,17 +2350,17 @@ test "transcribing runtime loads antfly provider and transcribes data uri input"
     try std.testing.expectEqualStrings("en", response.?.language.?);
 }
 
-test "Antfly transcriber sends negotiated framed audio attachments" {
+test "Antfly transcriber sends negotiated framed audio attachments and infers missing MIME" {
     const allocator = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var server = try httpx.TestServer.start(allocator, io, &.{.{
         .method = .POST,
-        .path = "/transcribe",
+        .path = "/read",
         .assert_request = expectAntflyTranscriberFramed,
         .respond = .{
-            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"framed\"}],\"model\":\"whisper\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}",
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"framed\",\"status\":\"complete\",\"audio\":{\"duration_ms\":0}}],\"model\":\"whisper\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":1,\"total_tokens\":1}}",
         },
     }});
     defer server.deinit();
@@ -2062,7 +2379,7 @@ test "Antfly transcriber sends negotiated framed audio attachments" {
                 .model = "whisper",
                 .url = url,
                 .framed_attachments = true,
-            }, .{ .url = "data:audio/wav;base64,ZmFrZQ==" }, .{}) catch |err| {
+            }, .{ .url = "gs://private/must-not-fetch.wav" }, .{ .resolved_audio = framed_audio_fixture }) catch |err| {
                 err_out.* = err;
                 return;
             };
@@ -2088,7 +2405,9 @@ test "transcribing runtime loads openai provider and transcribes data uri input"
     });
     defer server.deinit();
 
-    const base_url = try std.fmt.allocPrint(alloc, "{s}", .{server.baseUrl()});
+    // Normalization must also reach transport, so the fixture still sees
+    // /audio/transcriptions rather than a doubled path separator.
+    const base_url = try std.fmt.allocPrint(alloc, "{s}/", .{server.baseUrl()});
     defer alloc.free(base_url);
     const cfg_json = try std.fmt.allocPrint(
         alloc,
@@ -2280,11 +2599,12 @@ test "openai response format follows the model's capability" {
     try std.testing.expectEqualStrings("json", openAiResponseFormat("gpt-4o-transcribe"));
     try std.testing.expectEqualStrings("json", openAiResponseFormat("gpt-4o-mini-transcribe"));
 
-    const multipart = try buildOpenAiMultipartAlloc(std.testing.allocator, "gpt-4o-transcribe", null, "fake", "audio/wav");
+    const multipart = try buildOpenAiMultipartAlloc(std.testing.allocator, std.testing.io, "gpt-4o-transcribe", null, "fake", "audio/wav");
     defer std.testing.allocator.free(multipart.content_type);
-    defer std.testing.allocator.free(multipart.body);
-    try std.testing.expect(std.mem.indexOf(u8, multipart.body, "name=\"response_format\"\r\n\r\njson\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, multipart.body, "verbose_json") == null);
+    defer std.testing.allocator.free(multipart.prefix);
+    defer std.testing.allocator.free(multipart.suffix);
+    try std.testing.expect(std.mem.indexOf(u8, multipart.prefix, "name=\"response_format\"\r\n\r\njson\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, multipart.prefix, "verbose_json") == null);
 }
 
 test "a json-only openai response still yields its transcript" {
@@ -2303,10 +2623,10 @@ test "remote antfly transcription asks for diarization and keeps the labels" {
     const io = io_impl.io();
     var server = try httpx.TestServer.start(allocator, io, &.{.{
         .method = .POST,
-        .path = "/transcribe",
+        .path = "/read",
         .assert_request = expectAntflyTranscriberDiarization,
         .respond = .{
-            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"hello there\",\"segments\":[{\"text\":\"hello\",\"start_ms\":0,\"end_ms\":500,\"words\":[],\"speaker\":\"SPEAKER_00\"},{\"text\":\"there\",\"start_ms\":500,\"end_ms\":900,\"words\":[],\"speaker\":\"SPEAKER_01\"}],\"speakers\":[\"SPEAKER_00\",\"SPEAKER_01\"]}],\"model\":\"whisper\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2,\"total_tokens\":2}}",
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"hello there\",\"status\":\"complete\",\"audio\":{\"duration_ms\":0,\"segments\":[{\"text\":\"hello\",\"start_ms\":0,\"end_ms\":500,\"speaker\":\"SPEAKER_00\",\"text_start\":0,\"text_end\":5},{\"text\":\"there\",\"start_ms\":500,\"end_ms\":900,\"speaker\":\"SPEAKER_01\",\"text_start\":6,\"text_end\":11}],\"speakers\":[\"SPEAKER_00\",\"SPEAKER_01\"]}}],\"model\":\"whisper\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2,\"total_tokens\":2}}",
         },
     }});
     defer server.deinit();
@@ -2324,7 +2644,7 @@ test "remote antfly transcription asks for diarization and keeps the labels" {
                 .provider = .antfly,
                 .model = "whisper",
                 .url = url,
-            }, .{ .url = "data:audio/wav;base64,ZmFrZQ==", .diarization = true }, .{}) catch |err| {
+            }, .{ .url = "gs://private/must-not-fetch.wav", .diarization = true }, .{ .resolved_audio = "fake", .resolved_audio_content_type = "audio/wav" }) catch |err| {
                 err_out.* = err;
                 return;
             };
@@ -2353,9 +2673,12 @@ test "remote antfly transcription asks for diarization and keeps the labels" {
 }
 
 fn expectAntflyTranscriberDiarization(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"audio\":\"ZmFrZQ==\"") != null);
     try std.testing.expectEqual(httpx.Method.POST, req.method);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"diarization\":true") != null);
 }
+
+const framed_audio_fixture = "RIFF\x26\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00data\x02\x00\x00\x00\x00\x00";
 
 fn expectAntflyTranscriberFramed(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqualStrings(
@@ -2366,7 +2689,7 @@ fn expectAntflyTranscriberFramed(req: httpx.testing_mod.RequestInfo) !void {
     defer envelope.deinit();
     try std.testing.expectEqual(@as(usize, 1), envelope.attachments.len);
     try std.testing.expectEqualStrings("audio/wav", envelope.attachments[0].mime_type);
-    try std.testing.expectEqualStrings("fake", envelope.attachments[0].data);
+    try std.testing.expectEqualStrings(framed_audio_fixture, envelope.attachments[0].data);
     try std.testing.expect(std.mem.indexOf(u8, envelope.metadata, "\"audio\":\"attachment:0\"") != null);
 }
 
@@ -2390,4 +2713,320 @@ test "transcribing named defaults preserve explicit request overrides" {
     try std.testing.expectEqualStrings("de", overridden.language.?);
     try std.testing.expect(!overridden.timestamps.?);
     try std.testing.expect(!overridden.diarization.?);
+}
+
+test "audio read normalized base64 transport obeys source limits and rejects non-audio declarations" {
+    const a = std.testing.allocator;
+    var content = try resolveAudioContentAlloc(a, "data:application/octet-stream;base64,ZmFrZQ==", 4);
+    defer content.deinit(a);
+    try std.testing.expectEqualStrings("fake", content.data);
+    try std.testing.expectError(error.InvalidDataUri, resolveAudioContentAlloc(a, "data:image/png;base64,ZmFrZQ==", 4));
+}
+
+test "transcription effective model uses the provider adapter defaults" {
+    try std.testing.expectEqualStrings("whisper-1", (Config{ .provider = .openai }).effectiveModel().?);
+    try std.testing.expectEqualStrings("latest_long", (Config{ .provider = .vertex }).effectiveModel().?);
+    try std.testing.expectEqualStrings("custom", (Config{ .provider = .openai, .model = "custom" }).effectiveModel().?);
+    try std.testing.expect((Config{ .provider = .apple }).effectiveModel() == null);
+}
+
+test "transcription physical identity resolves Vertex resource defaults" {
+    const a = std.testing.allocator;
+    const implicit = Config{ .provider = .vertex, .project_id = "project" };
+    const explicit = Config{ .provider = .vertex, .project_id = "project", .location = "global", .model = "latest_long", .api_key = "different-credential" };
+    try std.testing.expectEqual(try implicit.modelIdentity(a), try explicit.modelIdentity(a));
+}
+
+test "audio read Cloudflare physical identity shares transport endpoint resolution" {
+    const a = std.testing.allocator;
+    const implicit = Config{ .provider = .cloudflare, .account_id = "account", .model = "@cf/openai/whisper-large-v3-turbo" };
+    const endpoint = (try implicit.effectiveEndpointAlloc(a)).?;
+    defer a.free(endpoint);
+    var explicit = implicit;
+    explicit.base_url = endpoint;
+    explicit.gateway_id = "logging-gateway";
+    explicit.api_key = "different-credential";
+    try std.testing.expectEqual(try implicit.modelIdentity(a), try explicit.modelIdentity(a));
+    // On an explicit full URL the account field does not select the endpoint.
+    explicit.account_id = "other-account";
+    try std.testing.expectEqual(try implicit.modelIdentity(a), try explicit.modelIdentity(a));
+    explicit.base_url = "https://other.example/recognizer";
+    try std.testing.expect(!std.mem.eql(u8, &try implicit.modelIdentity(a), &try explicit.modelIdentity(a)));
+}
+
+test "audio read Vertex duration remains unknown while evidence clocks survive" {
+    const a = std.testing.allocator;
+    var response = try parseVertexRecognizeResponseAlloc(a,
+        \\{"results":[{"alternatives":[{"transcript":"hello"}],"resultEndOffset":"2s","languageCode":"en-US"}]}
+    );
+    defer deinitResponse(a, &response);
+    try std.testing.expectEqual(@as(?i64, null), response.duration_ms);
+    const wire = try readResponseJsonAlloc(a, "speech", .{ .provider = .vertex, .project_id = "project" }, response, .{ .timestamps = true });
+    defer a.free(wire);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, wire, .{});
+    defer parsed.deinit();
+    const metadata = parsed.value.object.get("data").?.array.items[0].object.get("audio").?.object;
+    try std.testing.expect(metadata.get("duration_ms").? == .null);
+    try std.testing.expectEqual(@as(i64, 2000), metadata.get("segments").?.array.items[0].object.get("end_ms").?.integer);
+}
+
+test "audio read endpoint identity and dispatch share canonical URL resolution" {
+    const a = std.testing.allocator;
+    const openai = Config{ .provider = .openai };
+    const expected = try openai.modelIdentity(a);
+    for ([_][]const u8{ "https://api.openai.com:443/v1", "HTTPS://API.OPENAI.COM/v1/", "https://api.openai.com:443/v1/#ignored" }) |url| {
+        const config = Config{ .provider = .openai, .base_url = url };
+        try std.testing.expectEqual(expected, try config.modelIdentity(a));
+        const endpoint = (try config.effectiveEndpointAlloc(a)).?;
+        defer a.free(endpoint);
+        try std.testing.expectEqualStrings("https://api.openai.com/v1", endpoint);
+    }
+    const vertex = Config{ .provider = .vertex, .project_id = "project" };
+    try std.testing.expectEqual(try vertex.modelIdentity(a), try (Config{ .provider = .vertex, .project_id = "project", .base_url = "HTTPS://SPEECH.GOOGLEAPIS.COM:443/v2/" }).modelIdentity(a));
+    const antfly = Config{ .provider = .antfly, .model = "speech", .url = "http://localhost/ai/v1" };
+    try std.testing.expectEqual(try antfly.modelIdentity(a), try (Config{ .provider = .antfly, .model = "speech", .url = "HTTP://LOCALHOST:80/ai/v1/" }).modelIdentity(a));
+    const cf_config = Config{ .provider = .cloudflare, .account_id = "account", .model = "@cf/openai/whisper-large-v3-turbo" };
+    try std.testing.expectEqual(try cf_config.modelIdentity(a), try (Config{ .provider = .cloudflare, .account_id = "account", .model = "@cf/openai/whisper-large-v3-turbo", .base_url = "HTTPS://API.CLOUDFLARE.COM:443/client/v4/accounts/account/ai/run/@cf/openai/whisper-large-v3-turbo#ignored" }).modelIdentity(a));
+    for ([_][]const u8{ "http://api.openai.com/v1", "https://api.openai.com:8443/v1", "https://api.openai.com/v2", "https://other.example/v1" }) |url| {
+        try std.testing.expect(!std.mem.eql(u8, &expected, &try (Config{ .provider = .openai, .base_url = url }).modelIdentity(a)));
+    }
+    const ipv6 = (try (Config{ .provider = .openai, .base_url = "HTTP://[::1]:8080/v1/" }).effectiveEndpointAlloc(a)).?;
+    defer a.free(ipv6);
+    try std.testing.expectEqualStrings("http://[::1]:8080/v1", ipv6);
+    for ([_][]const u8{ "file:///tmp/speech", "https:///v1", "https://user:password@example.com/v1" }) |url| {
+        try std.testing.expectError(error.InvalidTranscribingConfig, (Config{ .provider = .openai, .base_url = url }).effectiveEndpointAlloc(a));
+    }
+}
+
+test "audio read Vertex runtime credentials reuse tokens across calls and refresh without retaining cancellation" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var manager = CredentialManager.init(a, io);
+    defer manager.deinit();
+    var upstream = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/token", .respond = .{ .body = "{\"access_token\":\"vertex-token\",\"expires_in\":3600,\"token_type\":\"Bearer\"}" } },
+        .{ .method = .POST, .path = "/projects/proj-from-json/locations/global/recognizers/_:recognize", .assert_request = expectVertexBearer, .respond = .{ .body = "{\"results\":[{\"alternatives\":[{\"transcript\":\"hello\"}],\"languageCode\":\"en-US\"}]}" } },
+    });
+    defer upstream.deinit();
+    const token_uri = try std.fmt.allocPrint(a, "{s}/token", .{upstream.baseUrl()});
+    defer a.free(token_uri);
+    const credentials = try fakeVertexCredentialsJsonAlloc(a, token_uri);
+    defer a.free(credentials);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "credentials.json", .data = credentials });
+    const path = try tmp.dir.realPathFileAlloc(io, "credentials.json", a);
+    defer a.free(path);
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    const cfg = Config{ .provider = .vertex, .project_id = "proj-from-json", .base_url = upstream.baseUrl(), .credentials_path = path, .timestamps = false };
+    var cancelled = false;
+    const Cancel = struct {
+        fn check(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    var options = RemoteOptions{ .credential_manager = &manager, .resolved_audio = "recording", .timeout_ms = 5000, .cancellation = httpx.CancellationToken.fromCallback(&cancelled, Cancel.check) };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    var failure: ?anyerror = null;
+    const Serve = struct {
+        fn run(server: *httpx.TestServer, err: *?anyerror) std.Io.Cancelable!void {
+            // Two OAuth exchanges (initial and expired), three recognitions.
+            for (0..5) |_| server.handleOne() catch |problem| {
+                err.* = problem;
+                return;
+            };
+        }
+    };
+    try group.concurrent(io, Serve.run, .{ &upstream, &failure });
+    for (0..3) |index| {
+        if (index == 1) {
+            cancelled = true;
+            try std.testing.expectError(error.Cancelled, transcribeWithConfig(a, &client, cfg, .{ .url = "antfly:resolved-audio" }, options));
+            // The previous request stays cancelled. The next request must not
+            // inherit its callback through the credential/token cache.
+            options.cancellation = null;
+        }
+        if (index == 2) {
+            const source = try manager.tokenSource(path, vertex_auth_scope);
+            source.cached_token.?.expires_at_s = 0;
+        }
+        var response = try transcribeWithConfig(a, &client, cfg, .{ .url = "antfly:resolved-audio" }, options);
+        defer deinitResponse(a, &response);
+        try std.testing.expectEqualStrings("hello", response.text.?);
+        try std.testing.expectEqual(@as(usize, if (index == 2) 2 else 1), upstream.routeHitCount(0));
+    }
+    try group.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 3), upstream.routeHitCount(1));
+    try std.testing.expectEqual(@as(usize, 1), manager.sources.count());
+}
+
+test "audio read resolved recording is borrowed with constant memory and keeps limits and cancellation" {
+    const a = std.testing.allocator;
+    const recording = try a.alloc(u8, 8 * 1024 * 1024);
+    defer a.free(recording);
+    @memset(recording, 0);
+    var scratch: [64]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&scratch);
+    var content = try resolveAudioContentWithContext(bounded.allocator(), std.testing.io, "http://127.0.0.1:1/must-not-fetch", null, .{ .resolved_audio = recording }, .{});
+    try std.testing.expect(content == .borrowed);
+    try std.testing.expect(content.bytes().ptr == recording.ptr);
+    try std.testing.expectEqual(recording.len, content.bytes().len);
+    content.deinit(bounded.allocator());
+    try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
+    // Caller ownership survives provider cleanup, including writable storage.
+    recording[0] = 42;
+    try std.testing.expectEqual(@as(u8, 42), recording[0]);
+    try std.testing.expectError(error.ResponseTooLarge, resolveAudioContentWithContext(bounded.allocator(), std.testing.io, "unused", recording.len - 1, .{ .resolved_audio = recording }, .{}));
+    const Cancel = struct {
+        fn check(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, resolveAudioContentWithContext(bounded.allocator(), std.testing.io, "unused", null, .{ .resolved_audio = recording }, .{ .cancellation = httpx.CancellationToken.fromCallback(recording.ptr, Cancel.check) }));
+    try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
+}
+
+test "audio read owned inline content releases every allocation" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var content = try resolveAudioContentWithContext(a, std.testing.io, "data:Audio/Wav;base64,ZmFrZQ==", null, .{}, .{});
+            defer content.deinit(a);
+            try std.testing.expect(content == .owned);
+            try std.testing.expectEqualStrings("fake", content.bytes());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "borrowed audio MIME uses native headers without decoding and preserves container evidence" {
+    const wav = "RIFF\x24\x00\x00\x00WAVEfmt ";
+    try std.testing.expectEqualStrings("audio/wav", try audioContentType(wav, null));
+    try std.testing.expectEqualStrings("audio/wav", try audioContentType(wav, "application/octet-stream"));
+    try std.testing.expectEqualStrings("audio/x-wav", try audioContentType(wav, "audio/x-wav"));
+    try std.testing.expectEqualStrings("audio/opus", try audioContentType("OggS00000000OpusHead", null));
+    try std.testing.expectError(error.UnsupportedAudioFormat, audioContentType("#!AMR\n", null));
+    try std.testing.expectError(error.UnsupportedAudioFormat, audioContentType(wav, "image/png"));
+}
+
+test "Antfly audio JSON encoding owns one exactly sized body under a tight allocator" {
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, 65536);
+    defer a.free(bytes);
+    @memset(bytes, 42);
+    const capacity = std.base64.standard.Encoder.calcSize(bytes.len) + 1024;
+    const buffer = try a.alloc(u8, capacity);
+    defer a.free(buffer);
+    var fixed = std.heap.FixedBufferAllocator.init(buffer);
+    const body = try antflyAudioReadBodyAlloc(fixed.allocator(), "owner/escaped\"model", .{ .timestamps = true }, bytes, false);
+    const value = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer value.deinit();
+    try std.testing.expectEqualStrings("owner/escaped\"model", value.value.object.get("model").?.string);
+    const encoded = value.value.object.get("audio").?.string;
+    const decoded = try a.alloc(u8, bytes.len);
+    defer a.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, encoded);
+    try std.testing.expectEqualSlices(u8, bytes, decoded);
+}
+
+test "OpenAI multipart preserves recordings containing the old boundary" {
+    const a = std.testing.allocator;
+    const recording =
+        "\x52\x49\x46\x46\x86\x00\x00\x00\x57\x41\x56\x45\x66\x6d\x74\x20\x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00\x64\x61\x74\x61\x62\x00\x00\x00" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++
+        "\r\n--antfly-zig-audio-boundary--\r\n" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const multipart = try buildOpenAiMultipartAlloc(a, std.testing.io, "whisper-1", "en", recording, "audio/wav");
+    defer a.free(multipart.prefix);
+    defer a.free(multipart.content_type);
+    defer a.free(multipart.suffix);
+    const boundary = multipart.content_type["multipart/form-data; boundary=".len..];
+    try std.testing.expect(boundary.len <= 70);
+    try std.testing.expect(std.mem.indexOf(u8, recording, boundary) == null);
+    const body = try std.mem.concat(a, u8, &.{ multipart.prefix, recording, multipart.suffix });
+    defer a.free(body);
+    const file_header = "Content-Type: audio/wav\r\n\r\n";
+    const start = (std.mem.indexOf(u8, body, file_header) orelse return error.MissingFile) + file_header.len;
+    const end = std.mem.indexOfPos(u8, body, start, multipart.suffix) orelse return error.MissingFileEnd;
+    try std.testing.expectEqualSlices(u8, recording, body[start..end]);
+}
+
+test "multipart boundary selection retries actual payload collisions" {
+    var first: [69]u8 = undefined;
+    var second: [69]u8 = undefined;
+    const seed: [32]u8 = @splat(0);
+    const original = try selectMultipartBoundary(&first, seed, "", "whisper-1", null);
+    const selected = try selectMultipartBoundary(&second, seed, original, "whisper-1", null);
+    try std.testing.expect(!std.mem.eql(u8, original, selected));
+    try std.testing.expect(std.mem.indexOf(u8, original, selected) == null);
+}
+
+test "transcription constructors release every partial allocation" {
+    const Case = struct {
+        fn run(a: Allocator, cfg: Config) !void {
+            var http = httpx.Client.init(a, std.testing.io);
+            defer http.deinit();
+            const transcriber = try initTranscriberWithOptions(a, &http, cfg, .{ .source_table = "fixture" });
+            defer transcriber.deinit();
+        }
+    };
+    const cases = [_]Config{
+        .{ .provider = .openai, .api_key = "fixture", .language_code = "en", .base_url = "http://localhost/v1?fixture=yes" },
+        .{ .provider = .vertex, .project_id = "fixture", .api_key = "fixture", .language_code = "en" },
+        .{ .provider = .antfly, .model = "speech", .api_key = "fixture", .language_code = "en" },
+        .{ .provider = .cloudflare, .account_id = "fixture", .model = "@cf/openai/whisper-large-v3-turbo", .api_key = "fixture" },
+    };
+    for (cases) |cfg| try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{cfg});
+}
+
+test "transcription result builders release every partial allocation" {
+    const Case = struct {
+        fn run(a: Allocator, kind: usize) !void {
+            var response = switch (kind) {
+                0 => try parseVertexRecognizeResponseAlloc(a,
+                    \\{"results":[{"alternatives":[{"transcript":"hello"}],"languageCode":"en-US","resultEndOffset":"1s"},{"alternatives":[{"transcript":"there"}],"resultEndOffset":"2s"}]}
+                ),
+                1 => try parseVertexRecognizeResponseAlloc(a,
+                    \\{"results":[{"alternatives":[{"transcript":"hello there","words":[{"word":"hello","startOffset":"0s","endOffset":"1s","speakerLabel":"1"},{"word":"there","startOffset":"1s","endOffset":"2s","speakerLabel":"2"}]}],"languageCode":"en-US"}]}
+                ),
+                2 => try fromReadObjectAlloc(a, .{ .object = "read", .index = 0, .text = "hello there", .audio = .{ .value = .{ .duration_ms = null, .segments = .{ .value = &.{ .{ .text = "hello", .start_ms = 0, .end_ms = 100, .text_start = 0, .text_end = 5, .granularity = .{ .value = "phrase" }, .speaker = .fromNullable("speaker") }, .{ .text = "there", .start_ms = 100, .end_ms = 200, .text_start = 6, .text_end = 11, .granularity = .{ .value = "phrase" }, .speaker = .fromNullable("speaker") } } }, .speakers = .{ .value = &.{"speaker"} } } } }),
+                else => try parseOpenAiVerboseResponseAlloc(a, "{\"text\":\"hello\",\"language\":\"en\",\"duration\":1,\"segments\":[{\"text\":\"hello\",\"start\":0,\"end\":1}]}"),
+            };
+            defer deinitResponse(a, &response);
+        }
+    };
+    for (0..4) |kind| try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{kind});
+}
+
+test "provider timestamps reject nonfinite negative and overflowing values" {
+    for ([_]f64{ -1, 1e300, 1e308, std.math.inf(f64), std.math.nan(f64), 0x1p63 / 1000.0 }) |value| {
+        try std.testing.expectError(error.InvalidInferenceResponse, secondsToMs(value));
+        try std.testing.expectError(error.InvalidCloudflareResponse, cloudflareTimestamp(value));
+    }
+    try std.testing.expectEqual(@as(i64, 1235), try secondsToMs(1.2345));
+    try std.testing.expectEqual(@as(i64, 0), try secondsToMs(0));
+    try std.testing.expectEqual(@as(i64, 9223372036854773760), try secondsToMs(9223372036854774.0));
+    try std.testing.expectEqual(@as(i64, 1000), try vertexDurationToMs("0.999999999s"));
+    try std.testing.expectEqual(@as(i64, 1235), try vertexDurationToMs("1.234500000s"));
+    try std.testing.expectEqual(@as(i64, 315576000000000), try vertexDurationToMs("315576000000s"));
+    for ([_][]const u8{ "1e300s", "-1s", "NaNs", "1ss", "1.s", ".1s", "1.1234567890s", "315576000001s", "18446744073709551615s" }) |offset| try std.testing.expectError(error.InvalidInferenceResponse, vertexDurationToMs(offset));
+    try std.testing.expectError(error.InvalidInferenceResponse, parseOpenAiVerboseResponseAlloc(std.testing.allocator, "{\"text\":\"hello\",\"duration\":1e300}"));
+    try std.testing.expectError(error.InvalidInferenceResponse, parseOpenAiVerboseResponseAlloc(std.testing.allocator, "{\"text\":\"hello there\",\"segments\":[{\"text\":\"hello\",\"start\":0,\"end\":1},{\"text\":\"there\",\"start\":1,\"end\":1e300}]}"));
+    try std.testing.expectError(error.InvalidInferenceResponse, parseVertexRecognizeResponseAlloc(std.testing.allocator, "{\"results\":[{\"alternatives\":[{\"transcript\":\"hello\"}],\"resultEndOffset\":\"1e300s\"}]}"));
+}
+
+test "native transcription clones every evidence field with allocation rollback" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var response = try cloneResponse(a, .{ .text = "hello", .status = "complete", .language = "en", .duration_ms = 100, .segments = &.{.{ .text = "hello", .speaker = "1", .start_ms = 0, .end_ms = 100, .words = &.{.{ .word = "hello", .start_ms = 0, .end_ms = 100 }} }}, .speakers = &.{.{ .id = "1", .label = "Speaker 1" }} });
+            defer deinitResponse(a, &response);
+            try std.testing.expectEqualStrings("Speaker 1", response.speakers.?[0].label.?);
+            try std.testing.expectEqualStrings("hello", response.segments.?[0].words.?[0].word.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

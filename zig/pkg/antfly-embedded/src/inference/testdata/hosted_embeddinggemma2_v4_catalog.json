@@ -1,0 +1,99 @@
+{
+  "embedders": {
+    "google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b": {
+      "capabilities": [
+        "embedding_similarity"
+      ],
+      "chunking_limits": {
+        "max_working_bytes": 536870912,
+        "max_output_bytes": 104857600,
+        "max_event_bytes": 16777216,
+        "max_chunks": 4096,
+        "max_dependency_packets": 8192,
+        "max_coded_window_bytes": 67108864,
+        "max_index_packets": 1000000,
+        "remote_fetched_bytes": 536870912,
+        "remote_requests": 100000,
+        "remote_cache_bytes": 262144
+      },
+      "compatibility": "compatible",
+      "inference_capabilities": {
+        "accepted_mime_types": [
+          "text/plain",
+          "video/mp4",
+          "image/png",
+          "image/jpeg",
+          "image/webp",
+          "audio/wav",
+          "audio/mpeg",
+          "audio/aac",
+          "audio/mp4",
+          "audio/ogg",
+          "audio/opus",
+          "audio/flac",
+          "audio/aiff",
+          "audio/caf",
+          "audio/basic",
+          "video/mp4",
+          "video/quicktime",
+          "video/webm",
+          "video/mp2t"
+        ],
+        "batch": {
+          "max_decoded_pixels": 33554432,
+          "max_encoded_media_bytes": 104857600,
+          "max_items": 64,
+          "max_media_parts_per_item": 16,
+          "mode": "serial_compatibility",
+          "per_item_failures": true,
+          "preferred_items": 8
+        },
+        "borrowed_attachments": false,
+        "framed_attachments": true,
+        "generation_grammar_v1": false,
+        "generation_token_logprobs_v1": false,
+        "image_transform": null,
+        "input_granularity": "page",
+        "input_modalities": [
+          "text",
+          "image",
+          "audio",
+          "video"
+        ],
+        "model_aware_chunking_v1": true,
+        "numeric_responses_v1": true,
+        "output": "embedding",
+        "prompt_policy": "explicit",
+        "rerank_documents_v1": false,
+        "result_cardinality": "one_per_item",
+        "task": "embed",
+        "task_limits": {
+          "max_candidates_per_request": null,
+          "max_input_tokens_per_item": null,
+          "max_output_tokens_per_item": null,
+          "max_schema_bytes": 1048576,
+          "max_text_bytes_per_item": 8192
+        },
+        "transport_limits": {
+          "framed_attachments": {
+            "max_attachments": 1024,
+            "max_metadata_bytes": 16777216,
+            "max_mime_bytes": 1024,
+            "max_request_bytes": 134217728,
+            "requires_content_length": true
+          },
+          "json": {
+            "max_request_bytes": 8388608
+          }
+        },
+        "version": 4
+      },
+      "inputs": [
+        "text",
+        "image",
+        "audio",
+        "video"
+      ]
+    }
+  }
+}

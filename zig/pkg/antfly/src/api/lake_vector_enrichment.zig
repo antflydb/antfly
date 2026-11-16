@@ -112,7 +112,7 @@ pub const Producer = struct {
         for (vector) |component| if (!std.math.isFinite(component)) return error.InvalidVectorValue;
         if (self.memo) |memo| {
             const value = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, vector, .{}), .{});
-            return try materializedDense(a, try memo.write(a, key.?, probe.etag, value), dims);
+            return try materializedDense(a, try memo.write(a, key.?, probe.revision, value), dims);
         }
         return vector;
     }
@@ -137,7 +137,7 @@ pub const Producer = struct {
             for (vector) |component| if (!std.math.isFinite(component)) return error.InvalidVectorValue;
             if (self.memo) |memo| {
                 const payload = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, vector, .{}), .{});
-                return try materializedDense(a, try memo.write(a, key.?, probe.etag, payload), dims);
+                return try materializedDense(a, try memo.write(a, key.?, probe.revision, payload), dims);
             }
             return vector;
         }
@@ -157,7 +157,7 @@ pub const Producer = struct {
             const vector = try owner.sparseInterface().embedSparse(a, self.name, value.string);
             if (self.memo) |memo| {
                 const payload = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, vector, .{}), .{});
-                return try materializedSparse(a, try memo.write(a, key.?, probe.etag, payload));
+                return try materializedSparse(a, try memo.write(a, key.?, probe.revision, payload));
             }
             return vector;
         }
@@ -174,7 +174,7 @@ fn materializedSparse(a: A, value: V) !local.storage_db_enrichment_embedder.Spar
     const vector = try local.storage_db_document_mapper.parseSparseValue(a, value);
     return .{ .indices = vector.indices, .values = vector.values };
 }
-const Probe = struct { vector: ?V = null, etag: ?[]const u8 = null };
+const Probe = struct { vector: ?V = null, revision: ?@import("objectstore").ObjectRevision = null };
 const Record = struct { version: u16 = 1, expires_ms: u64, recipe: [32]u8, vector: V };
 /// Per-input durable enrichment completion. A retry/restart assembles already
 /// computed vectors instead of reissuing the same vendor work from row zero.
@@ -194,22 +194,22 @@ pub const Memo = struct {
     fn read(self: Memo, a: A, path: []const u8) !Probe {
         try self.context.ensureActive();
         var client = self.store.opened.client;
-        var saved = client.getObject(self.store.opened.bucket, path, .{ .max_response_bytes = 2 * 1024 * 1024, .cancellation = if (self.context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
+        var saved = client.getObject(self.store.opened.bucket, path, .{ .skip_metadata_probe = true, .max_response_bytes = 2 * 1024 * 1024, .cancellation = if (self.context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
             error.NotFound, error.ObjectNotFound, error.FileNotFound => return .{},
             else => return err,
         };
         defer saved.deinit(client.allocator);
         const record = try std.json.parseFromSliceLeaky(Record, a, saved.body, .{ .allocate = .alloc_always });
         if (record.version != 1 or !std.mem.eql(u8, &record.recipe, &self.recipe)) return error.InvalidEnrichmentMemo;
-        return .{ .vector = if (record.expires_ms > @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) record.vector else null, .etag = if (saved.metadata.etag) |etag| try a.dupe(u8, etag) else return error.MissingObjectEtag };
+        return .{ .vector = if (record.expires_ms > @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) record.vector else null, .revision = try (saved.metadata.writeRevision() orelse return error.MissingObjectRevision).clone(a) };
     }
-    fn write(self: Memo, a: A, path: []const u8, etag: ?[]const u8, vector: V) !V {
+    fn write(self: Memo, a: A, path: []const u8, revision: ?@import("objectstore").ObjectRevision, vector: V) !V {
         try self.context.ensureActive();
         var client = self.store.opened.client;
         const record: Record = .{ .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms +| 7 * 24 * 60 * 60 * 1000, .recipe = self.recipe, .vector = vector };
         const bytes = try std.json.Stringify.valueAlloc(a, record, .{});
         defer a.free(bytes);
-        var saved = client.putObject(self.store.opened.bucket, path, bytes, .{ .if_none_match = etag == null, .if_match_etag = etag, .cancellation = if (self.context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
+        var saved = client.compareAndPut(self.store.opened.bucket, path, bytes, revision, .{ .cancellation = if (self.context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
             error.PreconditionFailed, error.ObjectAlreadyExists => return (try self.read(a, path)).vector orelse error.EnrichmentMemoConflict,
             else => return err,
         };

@@ -20,7 +20,10 @@ const local = @import("antfly_local_sources");
 const A = std.mem.Allocator;
 const V = std.json.Value;
 const Response = @import("contextual_operations.zig").OwnedResponse;
+pub const SourceRequest = @import("composed_query_batch.zig").Request;
+pub const SourceBatch = @import("composed_query_batch.zig").Batch;
 pub const Executor = struct {
+    execute_many: ?*const fn (*anyopaque, A, []const SourceRequest) anyerror!SourceBatch = null,
     ptr: *anyopaque,
     execute: *const fn (*anyopaque, A, []const u8, []const u8) anyerror!Response,
     checkpoint: *const fn (*anyopaque) anyerror!void,
@@ -224,14 +227,22 @@ const Stream = struct {
     failed: ?Response = null,
     fn refill(self: *Stream, stable: A, response_a: A, root: V, orders: []const Order, rrf: bool, executor: Executor) !void {
         try executor.checkpoint(executor.ptr);
+        return self.accept(stable, response_a, orders, rrf, executor, try executor.execute(executor.ptr, response_a, self.position.table, try self.requestBody(root, rrf)));
+    }
+    fn requestBody(self: *Stream, root: V, rrf: bool) ![]const u8 {
         // Small public pages should not hydrate/highlight an entire 128-row
         // batch per source. Fully suppressed overlay batches grow geometrically
         // to preserve bounded archive-scale traversal and amortize refill I/O.
         if (self.hidden.len != 0) {
-            const fully_hidden = for (self.hidden) |hidden| {
-                if (!hidden) break false;
-            } else true;
-            if (fully_hidden) self.page_rows = @min(batch_size, self.page_rows * 2);
+            var visible: usize = 0;
+            for (self.hidden) |hidden| if (!hidden) {
+                visible += 1;
+            };
+            // Partial suppression is common for archive/current overlays too.
+            // Estimate the physical window needed for one visible public page;
+            // a zero-density batch has no estimate and grows geometrically.
+            const next = if (visible == 0) self.page_rows * 2 else std.math.divCeil(usize, self.page_rows * self.hidden.len, visible) catch batch_size;
+            self.page_rows = @min(batch_size, @max(self.page_rows, next));
         }
         _ = self.arena.reset(.free_all);
         const pa = self.arena.allocator();
@@ -243,7 +254,11 @@ const Stream = struct {
         }
         if (self.position.after.len != 0) try request.object.put(pa, "search_after", try clone(pa, self.position.after, V));
         if (self.position.remote_snapshot) |token| try request.object.put(pa, "remote_snapshot", .{ .string = token });
-        var response = try executor.execute(executor.ptr, response_a, self.position.table, try std.json.Stringify.valueAlloc(pa, request, .{}));
+        return std.json.Stringify.valueAlloc(pa, request, .{});
+    }
+    fn accept(self: *Stream, stable: A, response_a: A, orders: []const Order, rrf: bool, executor: Executor, owned: Response) !void {
+        const pa = self.arena.allocator();
+        var response = owned;
         if (response.status != 200) {
             self.failed = response;
             return error.ComposedLeafFailed;
@@ -413,15 +428,29 @@ fn maskTombstones(stream: *Stream, field: []const u8) !void {
 fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []const u8, kinds: []const KeyKind, tombstone: []const u8, fields: ?V, orders: []const Order, rrf: bool, overlay: bool, limit: usize, offset: usize, count: bool, cursor: ?V, expression: []const u8, aggregations: ?V, graph_spec: ?V, executor: Executor, budget: *local.sql_memory_budget) !Response {
     if (aggregations == null and graph_spec == null and count and !overlay) {
         var total: usize = 0;
+        const requests = try scratch.alloc(SourceRequest, leaves.len);
         var seen: std.StringHashMapUnmanaged(void) = .empty;
-        for (leaves) |leaf| {
+        for (leaves, requests) |leaf, *source_request| {
             try executor.checkpoint(executor.ptr);
             if (leaf != .object or leaf.object.count() != 1) return error.InvalidQueryRequest;
             const name = leaf.object.get("table") orelse return error.InvalidQueryRequest;
             if (name != .string or (try seen.getOrPut(scratch, name.string)).found_existing) return error.InvalidQueryRequest;
             var request = try clone(scratch, root, V);
             try request.object.put(scratch, "count", .{ .bool = true });
-            var response = try executor.execute(executor.ptr, a, name.string, try std.json.Stringify.valueAlloc(scratch, request, .{}));
+            source_request.* = .{ .table = name.string, .body = try std.json.Stringify.valueAlloc(scratch, request, .{}) };
+        }
+        var batch: ?SourceBatch = if (executor.execute_many) |execute_many| try execute_many(executor.ptr, a, requests) else null;
+        defer if (batch) |*owned| owned.deinit(a);
+        if (batch) |*owned| {
+            if (owned.responses.len != requests.len) return error.InvalidQueryRequest;
+            if (owned.failed) |i| {
+                if (i >= requests.len) return error.InvalidQueryRequest;
+                return owned.take(i);
+            }
+        }
+        for (requests, 0..) |request, i| {
+            try executor.checkpoint(executor.ptr);
+            var response = if (batch) |*owned| try owned.take(i) else try executor.execute(executor.ptr, a, request.table, request.body);
             if (response.status != 200) return response;
             defer response.deinit(a);
             var page_arena = std.heap.ArenaAllocator.init(budget.allocator());
@@ -466,7 +495,27 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
         // Version 2 only admitted exact counts, which also marked first binding.
         if (restored != null and restored.?.version == 2) stream.position.identity_pinned = stream.position.total != null;
         if (!std.mem.eql(u8, stream.position.table, name.string) or stream.position.raw_count < stream.position.visible_count or (stream.position.total != null and stream.position.raw_count > stream.position.total.?)) return error.InvalidQueryRequest;
-        // Reauthorize even exhausted leaves. A previous page cannot freeze grants.
+    }
+    // Reauthorize even exhausted leaves. A previous page cannot freeze grants.
+    if (executor.execute_many) |execute_many| {
+        const requests = try scratch.alloc(SourceRequest, streams.len);
+        for (streams, requests) |*stream, *request_| request_.* = .{ .table = stream.position.table, .body = try stream.requestBody(root, rrf) };
+        try executor.checkpoint(executor.ptr);
+        var batch = try execute_many(executor.ptr, a, requests);
+        defer batch.deinit(a);
+        if (batch.responses.len != streams.len) return error.InvalidQueryRequest;
+        if (batch.failed) |i| {
+            if (i >= streams.len) return error.InvalidQueryRequest;
+            return batch.take(i);
+        }
+        for (streams, 0..) |*stream, i| stream.accept(scratch, a, orders, rrf, executor, try batch.take(i)) catch |err| {
+            if (stream.failed) |response| {
+                stream.failed = null;
+                return response;
+            }
+            return err;
+        };
+    } else for (streams) |*stream| {
         stream.refill(scratch, a, root, orders, rrf, executor) catch |err| {
             if (stream.failed) |response| {
                 stream.failed = null;
@@ -818,6 +867,7 @@ const ArchiveOverlayFixture = struct {
     checks: usize = 0,
     cancel_after: ?usize = null,
     lower_bounds: bool = false,
+    visible_every: usize = 0,
     fn checkpoint(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.checks += 1;
@@ -844,7 +894,7 @@ const ArchiveOverlayFixture = struct {
         } else if (request.object.get("filter_query")) |filter| {
             for (filter.object.get("disjuncts").?.array.items) |clause| {
                 const id = clause.object.get("conjuncts").?.array.items[0].object.get("term").?.object.get("value").?.integer;
-                if (id >= 5000) continue;
+                if (id >= 5000 or (self.visible_every != 0 and @mod(@as(usize, @intCast(id)), self.visible_every) == 0)) continue;
                 const value = try std.json.Stringify.valueAlloc(pa, .{ ._id = try std.fmt.allocPrint(pa, "c{d}", .{id}), ._source = .{ .id = id, .deleted = @mod(id, 2) == 0, .body = "new nonmatching version" } }, .{});
                 try hits.append(pa, try std.json.parseFromSliceLeaky(V, pa, value, .{}));
             }
@@ -1051,4 +1101,141 @@ test "external lake composition accepts an exact empty terminal window after unk
     try std.testing.expect(stream.done());
     try std.testing.expectEqual(@as(usize, 7), stream.position.total.?);
     try std.testing.expectEqual(@as(usize, 0), stream.hits.len);
+}
+
+test "external lake composition partial suppression bounds physical refills and preserves continuation ranks" {
+    const a = std.testing.allocator;
+    var fixture: ArchiveOverlayFixture = .{ .visible_every = 10 };
+    const body = "{\"source\":{\"overlay\":{\"base\":{\"table\":\"history\"},\"changes\":{\"table\":\"current\"},\"key\":[\"id\"]}},\"source_ranking\":\"rrf\",\"limit\":20}";
+    var first = try execute(a, body, fixture.executor());
+    defer first.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pa = arena.allocator();
+    const result = (try std.json.parseFromSliceLeaky(V, pa, first.body, .{})).object.get("responses").?.array.items[0];
+    const hits = result.object.get("hits").?.object.get("hits").?.array.items;
+    try std.testing.expectEqual(@as(usize, 20), hits.len);
+    try std.testing.expectEqual(@as(i64, 10004), hits[0].object.get("_source").?.object.get("id").?.integer);
+    for (hits[1..], 0..) |hit, i| try std.testing.expectEqual(@as(i64, @intCast(i * 10)), hit.object.get("_source").?.object.get("id").?.integer);
+    // Fixed small batches require about twenty source/probe round trips here.
+    try std.testing.expect(fixture.calls <= 8);
+    var request = try std.json.parseFromSliceLeaky(V, pa, body, .{});
+    try request.object.put(pa, "source_cursor", result.object.get("next_source_cursor").?);
+    var next = try execute(a, try std.json.Stringify.valueAlloc(pa, request, .{}), fixture.executor());
+    defer next.deinit(a);
+    const continuation = (try std.json.parseFromSliceLeaky(V, pa, next.body, .{})).object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items;
+    for (continuation, 0..) |hit, i| try std.testing.expectEqual(@as(i64, @intCast(190 + i * 10)), hit.object.get("_source").?.object.get("id").?.integer);
+}
+
+test "external lake composition probes buffered changes to reject duplicate replacements" {
+    const Fixture = struct {
+        probes: usize = 0,
+        fn checkpoint(_: *anyopaque) !void {}
+        fn run(raw: *anyopaque, a: A, _: []const u8, body: []const u8) !Response {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.probes += 1;
+            var parsed = try std.json.parseFromSlice(V, a, body, .{});
+            defer parsed.deinit();
+            const clauses = parsed.value.object.get("filter_query").?.object.get("disjuncts").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), clauses.len);
+            // One matching replacement is buffered; a second can be outside
+            // that ranked window. Only the unfiltered probe proves uniqueness.
+            return @import("contextual_operations.zig").json(try a.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":2,\"hits\":[{\"_source\":{\"id\":1}},{\"_source\":{\"id\":1}}]}}]}"), false);
+        }
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pa = arena.allocator();
+    const one = try std.json.parseFromSliceLeaky(V, pa, "{\"_source\":{\"id\":1}}", .{});
+    var rows = [_]Hit{.{ .value = one, .table = "history", .id = "h1", .score = 0, .keys = &.{} }};
+    var hidden = [_]bool{false};
+    var base: Stream = .{ .position = .{ .table = "history" }, .arena = .init(a), .position_arena = .init(a), .hits = &rows, .hidden = &hidden };
+    defer base.arena.deinit();
+    defer base.position_arena.deinit();
+    var changes: Stream = .{ .position = .{ .table = "current" }, .arena = .init(a), .position_arena = .init(a), .hits = &rows };
+    defer changes.arena.deinit();
+    defer changes.position_arena.deinit();
+    var fixture: Fixture = .{};
+    const executor: Executor = .{ .ptr = &fixture, .execute = Fixture.run, .checkpoint = Fixture.checkpoint };
+    const root = try std.json.parseFromSliceLeaky(V, pa, "{}", .{});
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, maskBatch(&base, &changes, &.{"id"}, &.{}, root, a, executor));
+    try std.testing.expectEqual(@as(usize, 1), fixture.probes);
+}
+
+const WaveFixture = struct {
+    base: TestExecutor = .{},
+    contexts: [2]Context = undefined,
+    scheduler: local.sql_parallel_scheduler.Scheduler = .{},
+    batches: usize = 0,
+    const Context = struct { owner: *WaveFixture, canceled: std.atomic.Value(bool) = .init(false) };
+    fn serial(raw: *anyopaque, a: A, table: []const u8, body: []const u8) !Response {
+        const self: *WaveFixture = @ptrCast(@alignCast(raw));
+        return TestExecutor.run(&self.base, a, table, body);
+    }
+    fn prepare(raw: *anyopaque, table: []const u8) !*anyopaque {
+        const self: *WaveFixture = @ptrCast(@alignCast(raw));
+        const index: usize = if (std.mem.eql(u8, table, "history")) 0 else 1;
+        self.contexts[index] = .{ .owner = self };
+        return &self.contexts[index];
+    }
+    fn leaf(raw: *anyopaque, a: A, table: []const u8, body: []const u8) !Response {
+        const context: *Context = @ptrCast(@alignCast(raw));
+        if (context.canceled.load(.acquire)) return error.Canceled;
+        return serial(context.owner, a, table, body);
+    }
+    fn cancel(raw: *anyopaque) void {
+        const context: *Context = @ptrCast(@alignCast(raw));
+        context.canceled.store(true, .release);
+    }
+    fn finish(_: *anyopaque) void {}
+    fn batch(raw: *anyopaque, a: A, inputs: []const SourceRequest) !SourceBatch {
+        const self: *WaveFixture = @ptrCast(@alignCast(raw));
+        self.batches += 1;
+        return @import("composed_query_batch.zig").run(a, std.heap.page_allocator, std.testing.io, inputs, .{ .ptr = self, .prepare = prepare, .execute = leaf, .cancel = cancel, .finish = finish }, &self.scheduler);
+    }
+    fn executor(self: *WaveFixture) Executor {
+        return .{ .ptr = self, .execute = serial, .execute_many = batch, .checkpoint = TestExecutor.checkpoint };
+    }
+};
+
+test "external lake independent source pages preserve serial overlay union and retained cursor results" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |overlay| {
+        var serial: TestExecutor = .{ .overlay = overlay };
+        var parallel: WaveFixture = .{ .base = .{ .overlay = overlay } };
+        const body = if (overlay)
+            "{\"source\":{\"overlay\":{\"base\":{\"table\":\"history\"},\"changes\":{\"table\":\"current\"},\"key\":[\"id\"]}},\"source_ranking\":\"rrf\",\"fields\":[\"body\"],\"limit\":1}"
+        else
+            "{\"source\":{\"union\":[{\"table\":\"history\"},{\"table\":\"current\"}]},\"source_ranking\":\"rrf\",\"limit\":1}";
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var request = try std.json.parseFromSliceLeaky(V, arena.allocator(), body, .{});
+        var pages: usize = 0;
+        while (true) {
+            const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), request, .{});
+            var expected = try execute(a, encoded, serial.executor());
+            defer expected.deinit(a);
+            var actual = try execute(a, encoded, parallel.executor());
+            defer actual.deinit(a);
+            try std.testing.expectEqualStrings(expected.body, actual.body);
+            pages += 1;
+            const decoded = try std.json.parseFromSliceLeaky(V, arena.allocator(), actual.body, .{});
+            const next = decoded.object.get("responses").?.array.items[0].object.get("next_source_cursor") orelse break;
+            if (next == .null) break;
+            try std.testing.expect(pages < 3);
+            try request.object.put(arena.allocator(), "source_cursor", next);
+        }
+        try std.testing.expectEqual(pages, parallel.batches);
+        try std.testing.expectEqual(@as(usize, 0), parallel.scheduler.pull_workers);
+    }
+    var serial: TestExecutor = .{};
+    var parallel: WaveFixture = .{};
+    const count = "{\"source\":{\"union\":[{\"table\":\"history\"},{\"table\":\"current\"}]},\"source_ranking\":\"rrf\",\"count\":true}";
+    var expected = try execute(a, count, serial.executor());
+    defer expected.deinit(a);
+    var actual = try execute(a, count, parallel.executor());
+    defer actual.deinit(a);
+    try std.testing.expectEqualStrings(expected.body, actual.body);
+    try std.testing.expectEqual(@as(usize, 1), parallel.batches);
 }

@@ -12,6 +12,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { TableSchema } from "../api";
 import TableSchemaForm from "../components/schema-builder/TableSchemaForm";
+import { TimeSeriesPreset } from "../components/table/TimeSeriesPreset";
 import { useApi } from "../hooks/use-api-config";
 import { useTable } from "../hooks/use-table";
 import { createIndexArguments } from "../lib/create-index";
@@ -52,7 +53,7 @@ const CreateTablePage: React.FC = () => {
       <div className="relative isolate">
         <DashboardPageHeader>
           <div>
-            <DashboardPageTitle className="font-aeonik">Create New Table</DashboardPageTitle>
+            <DashboardPageTitle>Create New Table</DashboardPageTitle>
             <DashboardPageDescription>
               Define the schema for your new table.
             </DashboardPageDescription>
@@ -64,6 +65,7 @@ const CreateTablePage: React.FC = () => {
           <AlertDescription>{createError}</AlertDescription>
         </Alert>
       )}
+      <TimeSeriesPreset />
       <TableSchemaForm onSubmit={handleCreateTable} theme={theme} />
     </DashboardPage>
   );

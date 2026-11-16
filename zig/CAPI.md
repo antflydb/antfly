@@ -112,11 +112,10 @@ handlers:
 | `antfly_inference_decide_json` | `POST /decisions` |
 | `antfly_inference_extract_json` | `POST /extract` |
 | `antfly_inference_read_json` | `POST /read` (OCR) |
-| `antfly_inference_transcribe_json` | `POST /transcribe` |
 | `antfly_inference_list_models_json` | `GET /models` |
 
 For decision question types, answer semantics, and SQL providers, see the
-[typed decision guide](../docs/guides/decisions.md).
+[typed decision guide](../docs/reference/decisions.md).
 
 - Images and audio go inline in the JSON, as base64 or `data:` URIs.
 - The `_json` calls return complete responses. To stream,
@@ -288,6 +287,63 @@ every sidecar creator takes the exclusive inode fence before installing it.
 Reopened native writers discover pending generated enrichment in the durable
 journals of all tables and resume it through their shared maintenance owner.
 
+The busy timeout is an admission retry budget, not a deadline for the whole
+operation. Capacity-limited reads can need allocator verification too; they
+receive the same pre-execution admission retry as mutations. An expired budget
+prevents further contention waits and new attempts after backoff. A detached
+allocator proof already in progress can still admit the request after the
+budget expires when the tip is unchanged and the path lease is immediately
+available. The finished proof remains attached to that verified tip. A changed
+tip still requires a new proof; an exhausted budget returns `ANTFLY_BUSY` safely.
+A cancelled backoff returns before another lease acquisition or proof starts.
+Mutation bodies are never replayed by admission retries.
+
+The budget covers waiting only, and once per exported call: the cross-process
+writer queue and kernel lock, backoff between attempts, and waiting for another
+thread's allocator proof. It excludes active work: SQL parsing and preparation
+(before admission), this call's own allocator proof walk, and anything the call
+does between suspending and resuming admission (for example inference in
+resolve-query or memory). A resumed admission receives what is left of the
+original budget, plus the time its earlier admissions spent on their own proof.
+
+Ordinary admission retries release registry references between attempts, so a
+concurrent close may invalidate the handle before it is reacquired. Prepared
+SQL retains its original references until its plan and shared preparation-budget
+bytes are freed. Close can therefore wait through SQL backoff or a slow proof,
+as with another in-flight call. Those references keep the connection and budget
+owner alive, not a foreground runtime generation; API/path locks are released
+during backoff so runtime refresh and competing publications can proceed.
+
+`antfly_db_pending_work_stats_json` exposes process-owner lifetime totals under
+`background_publications`: `allocator_proof_walks`, `allocator_proof_failures`,
+`allocator_proof_ns`, and `allocator_proof_max_ns`. These count completed detached
+graph walks from foreground and maintenance work, including failed/cancelled
+walks. Wall-clock nanoseconds measure the graph walk itself, excluding queue/lease waits
+and reader teardown. Totals survive foreground runtime refresh and are local to
+the process, not persistent file-wide counters. Reading diagnostics performs
+normal read admission and may itself require a proof on a capacity-limited tip.
+The same object reports `mutation_admission_count`, `mutation_admission_ns`,
+`mutation_admission_max_ns`, and `mutation_admission_log2_ns`. These measure
+successful mutation admission with a positive busy timeout, before the mutation
+body runs, including queueing, retries, and proof work. Resuming an operation
+after it suspends admission (for example, during inference) records another
+admission; these are not counts of unique exported calls. Zero-timeout calls keep
+their existing fast path and are not sampled. Reads and diagnostic calls are
+excluded. Histogram bucket `i` covers `[2^i, 2^(i+1)-1]` nanoseconds (bucket zero
+also includes zero; bucket 63 ends at `UINT64_MAX`), so percentile estimates are
+ranges rather than exact timings. A successfully admitted mutation can still
+fail later in its body; these counters do not assert mutation success.
+
+`foreground_lease` and `maintenance_lease` time the cross-process writer lease
+for exported calls and for background publication, replay and reclamation:
+`acquisitions` split into `uncontended`, `queued` (waited in the FIFO) and
+`handoffs` (passed directly from another thread of this process); `busy` and
+`busy_wait_ns` for refusals at the deadline; `wait_ns`, `wait_max_ns` and
+`wait_log2_ns` from the start of acquisition to holding the lease; and `holds`,
+`hold_ns`, `hold_max_ns` and `hold_log2_ns` from acquisition to release or
+handoff. `gate_wait_ns` and `gate_wait_max_ns` measure time exported calls spent
+queued behind other threads of the same process before that.
+
 After an external commit or atomic file replacement, the shared owner reopens
 its cached runtime before the next operation. An in-process handoff between
 compatible connections reuses the live runtime. Streaming SQL cursors retain the
@@ -309,6 +365,68 @@ conversion, reclamation, and historical index backfill to that owner. Lease-scop
 fences new read pins until page reuse and checkpoint publication finish; temporary
 lock contention reports `ANTFLY_BUSY` and SQLSTATE `55P03`.
 
+After a native writer publishes to a revision-4 Lite file, its last clean close
+lets an in-flight allocator proof finish and publishes a checked certificate
+when the inode and checkpoints still match. It does not cancel and restart that
+walk. If no proof started, close may bootstrap a file of at most 4 MiB; larger
+files and legacy revision-3 files do not start a shutdown proof. A failed or
+canceled walk is never restarted at close. Close can wait for an existing proof,
+but never launches a second large scan. The walk and reader teardown run outside
+both publication locks. Subsequent processes inherit a valid certificate before opening index
+sources. Owners that make no publications require no new proof at close.
+Queued replay and storage maintenance recheck shutdown after acquiring the
+owner gate. A historical proof attempt does not keep queued maintenance alive.
+
+Before admitting a mutation, native writers with a nonempty unverified free pool
+complete or join the detached allocator proof. Admission releases the owner gate
+and path lease while waiting, then refreshes and revalidates the current tip.
+Before using a verified pool, admission also waits for an active proof to finish
+closing its reader fence. An uncertain publication returns `OutcomeUnknown`
+before starting a proof, or before adopting one if the outcome became uncertain
+during the scan. Admission never rescans an unchanged uncertain checkpoint.
+This applies without a storage limit: a large request must not append its whole
+volume while a completed proof waits for the same gate. Empty unbounded pools
+retain append-first admission, pure queries do not demand reuse proof, and
+verified pools require no graph walk. Bounded owners also retain their capacity
+admission and proof-reader fence.
+
+Storage intent is separate from API locking. Materialized SQL compiles its
+schema-independent statement once before admission, then reuses that plan for
+execution. Handle registry references are pinned before preparation, so close
+waits for accepted requests and their allocation refunds. Preparation charges
+actual live allocator bytes to a shared 256 MiB cap on the canonical path gate
+(or the root handle for directory storage). This includes plans waiting for the
+writer gate and survives serving-runtime replacement. Small requests can still
+prepare concurrently; a request that exceeds shared headroom reports SQLSTATE
+`53200` and releases its partial allocations. Refunds admit subsequent requests;
+errors inside a transaction retain the usual failed-transaction semantics.
+Plan teardown runs outside the API/path gates while registry pins protect its
+shared admission owner. SELECT and nonexecuting EXPLAIN retain exclusive session access
+without demanding allocator verification. Streaming cursors accept SELECT only;
+describe and session creation also use read-only storage intent. DML, DDL, and
+COMMIT request mutation admission. EXPLAIN ANALYZE accepts read-only SELECT
+only; mutating plans are rejected without allocator admission.
+
+Pending append-only proof lineage survives reopening an identical unchecked
+generation on the same inode. This does not enable reuse early: the original
+fenced proof must complete before foreground writes can reuse pages. Foreign
+publication and inode replacement still invalidate inheritance.
+
+Directory marker sweep progress belongs to the connection owner and survives
+foreground runtime replacement, including turns when allocator verification is
+busy. Each turn still examines at most 64 directory entries and preserves locked
+live markers. The focused regression set is:
+
+```sh
+cd zig
+zig build capi-test -Dembedded-only=true \
+  -Dtest-filter='capi native short lived writers' \
+  -Dtest-filter='capi native unbounded writer admits reusable pool' \
+  -Dtest-filter='capi native marker sweep' \
+  -Dtest-filter='capi native allocator proof survives close' \
+  -Dtest-filter='capi native close bounds proof work'
+```
+
 Entity curation commits policy to the destination namespace before returning.
 `antfly_db_resolver_curation_json` and `antfly_db_render_resolver_key_json`
 read that committed policy immediately, even while source projections and graph
@@ -319,6 +437,26 @@ identify the observed policy incarnation and revision. `config_generation`
 retains its existing resolver-generation meaning. A curation `wait` releases
 writer admission while observing the captured sources and destination; `applied`
 requires their policy projection and resolution/promotion replay to complete.
+
+Entity mutation and proposal-decision responses report cascaded keys and their
+`release` or `suppress` dispositions in `namespaces[].absorbed`, once per
+namespace. Match a consumer summary in `results` to its outcome using
+`key_template`. Consumer summaries contain replay progress; they do not repeat
+absorbed keys. Direct edit retries report empty absorbed lists when there is no
+new cascade; already-decided proposal retries return their receipt and progress.
+
+For example, collect the unique keys affected across matching namespaces:
+
+```python
+response = db.curate_entity(
+    "default", "concept/note", {"action": "suppress", "absorbed": "suppress"}
+)
+absorbed_keys = sorted({
+    item["key"]
+    for namespace in response.get("namespaces", [])
+    for item in namespace["absorbed"]
+})
+```
 
 This follows SQLite's separation of connection lifetime from writer ownership;
 it does not claim SQLite WAL concurrency or change Antfly SQL's existing
@@ -560,7 +698,73 @@ Interrupted preparation is aborted on recovery; decided commits finish
 participant intent resolution without replaying SQL. A committed-pending
 outcome remains committed. An unknown decision returns SQLSTATE 40003 and a
 transaction receipt; do not replay it. Close and reopen the database to
-recover/reconcile that receipt. Commit responses reserve a fallback buffer
+recover/reconcile that receipt.
+
+An INSERT, UPDATE, DELETE, COMMIT or `antfly_db_batch*` call ends in exactly
+one of three ways. Each is assigned at the commit boundary that knows it, from
+storage state rather than from an error's name:
+
+- **Applied.** Success, possibly with `mutation_outcome` `committed_pending` or
+  `committed_repair_required`. Once a batch's primary write is durable, or a
+  COMMIT's coordinator decision reads back as committed, any later failure is
+  reported this way. Batch exports return `ANTFLY_STALLED` with a "committed; do
+  not retry" detail. A batch response that fails to encode after commit is
+  reported the same way.
+- **Not applied.** The failure happened before the decision: before the primary
+  write (autocommit and batches), before `commitTransaction`, or with the
+  decision still pending and no checkpoint publication in flight (it is then
+  aborted, so recovery can never commit it). Specific diagnostics keep their
+  codes (40001 conflicts, 55P03 locks, 57014 cancellation, constraint codes).
+  Contention and backpressure become 55P03 (`ANTFLY_BUSY`), storage exhaustion
+  53100, and any other cause 58000 ("not applied; safe to retry"). None
+  carries a transaction receipt.
+- **Unknown.** The checkpoint publication that would make the decision durable
+  failed or was cancelled part-way (40003, `ANTFLY_OUTCOME_UNKNOWN`). On
+  directory (LSM) handles, any failure after the WAL append was attempted or
+  the memtable was published is also unknown: the record may be durable, and a
+  later flush, rotation or manifest step can fail after the write is visible.
+  COMMIT and
+  coordinated autocommit include the `transaction_id` receipt; reconcile it and
+  do not replay. Plain autocommit and batch calls return an outcome receipt
+  instead (below).
+
+### Outcome receipts
+
+When an autocommit SQL write or `antfly_db_batch*` returns
+`ANTFLY_OUTCOME_UNKNOWN`, call `antfly_last_error_outcome_receipt` on the same
+thread before any other Antfly call. SQL error bodies also carry it as
+`"outcome_receipt"`. Later, `antfly_db_outcome_receipt_status` on any handle for
+the same database answers `ANTFLY_OUTCOME_RECEIPT_APPLIED` or
+`ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED`, or returns `ANTFLY_STALLED` while the
+uncertain commit is not reconciled:
+
+- Lite connections reconcile on their next call; the status query itself enters
+  the connection, so retrying it settles.
+- Directory (LSM) databases settle only after the handle that issued the receipt
+  is closed and the database reopened (a durable WAL record may still be
+  unpublished). A clean close checkpoints and resets the WAL, so such a record
+  then resolves as not applied; after a crash, replay may apply it.
+
+How it works: each database handle owns a writer (a random id and a call
+sequence). Every tracked write commits the internal marker
+`writer -> sequence` atomically with its primary write. After an unknown
+outcome the handle retires that writer, so its marker never moves again;
+equal means applied, lower or absent means not applied. A SQL write to a named
+table commits the marker in that table's own database, and its receipt names
+the table and its durable table id, so status and forget read the database the
+write committed to. If that table has since been dropped, or dropped and
+recreated under the same name, status and forget fail with `ANTFLY_NOT_FOUND`:
+the write's outcome can no longer be read. The
+cost is one small internal key overwrite per exported write. A clean close removes the handle's
+current marker; `antfly_db_outcome_receipt_forget` removes a resolved
+receipt's marker, after which it can no longer be resolved.
+
+While an unknown outcome is unresolved, new statements and calls are refused
+before running, with SQLSTATE 55000 (`ANTFLY_STALLED`): they were not applied,
+and are not themselves of unknown outcome. Lite connections reconcile by
+reopening on their next call; other handles must be reopened.
+
+XX000 is reserved for internal defects and never reports a commit outcome. Commit responses reserve a fallback buffer
 before mutation, so response allocation cannot erase a committed outcome.
 
 `sql_open_cursor_json` pins a read statement without a total row limit.

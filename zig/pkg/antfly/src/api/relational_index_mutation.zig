@@ -55,8 +55,8 @@ pub fn configForDefinition(alloc: std.mem.Allocator, definition: wire.Relational
     };
     const conditions: ?[]const wire.RelationalIndexPredicate = if (definition.where) |where| blk: {
         const copies = try owned.dupe(wire.RelationalIndexPredicate, where);
-        for (copies) |*condition| if (condition.value) |value| {
-            condition.value = try columns.canonicalValue(owned, condition.column, value);
+        for (copies) |*condition| if (condition.value.valueOrNull()) |value| {
+            condition.value = .{ .value = try columns.canonicalValue(owned, condition.column, value) };
         };
         break :blk copies;
     } else null;
@@ -67,6 +67,12 @@ pub fn configForDefinition(alloc: std.mem.Allocator, definition: wire.Relational
 /// whole-definition CAS and then schedules normal schema reconciliation.
 pub fn create(alloc: std.mem.Allocator, table: records.TableRecord, name: []const u8, config_json: []const u8) !records.TableRecord {
     if (try indexes.hasIndexConfig(alloc, table.indexes_json, name)) return error.TableGenerationChanged;
+    var alias_catalog = try std.json.parseFromSlice(std.json.Value, alloc, if (table.indexes_json.len == 0) "{}" else table.indexes_json, .{});
+    defer alias_catalog.deinit();
+    if (alias_catalog.value.object.get(@import("antfly_local_sources").api_index_metadata.aliases.key)) |aliases| {
+        if (aliases != .object) return error.InvalidTableIndexMetadata;
+        if (aliases.object.contains(name)) return error.TableGenerationChanged;
+    }
     if (table.relational_retirement_json.len != 0 or table.restore_backup_id.len != 0) return error.TableTransitionActive;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -366,7 +372,7 @@ test "relational mutation partial predicates round trip unified indexes with typ
     defer parsed.deinit(alloc);
     const definition = parsed.relational_indexes.?.value[0];
     try std.testing.expectEqual(@as(usize, 2), definition.where.?.len);
-    try std.testing.expectEqualStrings("active", definition.where.?[0].value.?.string);
+    try std.testing.expectEqualStrings("active", definition.where.?[0].value.value.string);
     var columns: @import("relational_expression_contract.zig").ColumnTypes = .{ .alloc = alloc, .source = .{ .parsed = &parsed } };
     defer columns.deinit();
     const projected = try configForDefinition(alloc, definition, &columns);

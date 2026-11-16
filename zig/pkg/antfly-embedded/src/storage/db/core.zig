@@ -708,11 +708,16 @@ pub const DBCore = struct {
     pub fn updateRange(self: *DBCore, byte_range: types.ByteRange) !void {
         try self.index_manager.validateRangeTransition(byte_range);
         const start = try self.alloc.dupe(u8, byte_range.start);
-        errdefer self.alloc.free(start);
+        var start_owned = true;
+        errdefer if (start_owned) self.alloc.free(start);
         const end = try self.alloc.dupe(u8, byte_range.end);
-        errdefer self.alloc.free(end);
+        var end_owned = true;
+        errdefer if (end_owned) self.alloc.free(end);
         try range_state_mod.saveRange(self.store, .{ .start = start, .end = end });
         self.adoptRangeInMemoryOwned(start, end);
+        start_owned = false;
+        end_owned = false;
+        if (self.index_manager.leann_range_pending.load(.acquire)) try self.index_manager.dropLeannKeysOutOfRange();
     }
 
     pub fn adoptRangeInMemoryOwned(self: *DBCore, start: []u8, end: []u8) void {
@@ -2060,6 +2065,7 @@ pub const DBCore = struct {
             .max_weight = max_weight,
             .node_admission = node_admission,
             .work_budget = work_budget,
+            .max_intermediate_states = if (work_budget) |budget| budget.max_intermediate_states else graph_pattern_mod.default_max_intermediate_states,
             .owning_table = owning_table,
             // Same single-index justification as graphTraverseEdges above.
             .expand_cross_table_local = true,
@@ -2093,6 +2099,7 @@ pub const DBCore = struct {
             .max_weight = max_weight,
             .node_admission = node_admission,
             .work_budget = work_budget,
+            .max_intermediate_states = if (work_budget) |budget| budget.max_intermediate_states else graph_pattern_mod.default_max_intermediate_states,
             .owning_table = owning_table,
             // Same single-index justification as graphTraverseEdges above.
             .expand_cross_table_local = true,
@@ -2729,6 +2736,7 @@ fn buildRecoveryIntentBatch(
 ) !transactions_mod.ResolutionExtraBatch {
     const alloc = owner.allocator();
     owner.snapshot = try manager.collectIntentBatch(alloc, txn_id);
+    if (owner.snapshot.prepared_enrichments_json != null) return error.PreparedIntentRequiresMaterialization;
     const binding = owner.snapshot.schema_binding;
     const context_snapshot = blk: {
         identity_ctx.mutex.lockUncancelable(identity_ctx.io);
@@ -3140,6 +3148,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     const persisted_range = try range_state_mod.loadRange(alloc, store);
     defer range_state_mod.freeRange(alloc, persisted_range);
     shard_manager.* = try shard_mod.ShardManager.init(alloc, store, persisted_range);
+    errdefer shard_manager.deinit();
     const identity_namespace = try doc_identity.loadOrInitNamespaceWithPolicy(
         store,
         configured_identity_namespace,
@@ -3153,6 +3162,9 @@ pub fn openCoreResourcesFromPrimaryStore(
         index_base_path,
         index_backends,
     );
+    // A later schema/catalog failure must unregister cache reclaimers and
+    // release native scratch before the DB's resource manager is destroyed.
+    errdefer index_manager.deinit();
     index_manager.setAppliedSequenceCheckpointPath(applied_sequence_checkpoint_path);
     index_manager.updateRange(shard_manager.getByteRange());
 

@@ -18,7 +18,7 @@ const client = @import("client.zig");
 pub const Client = client.Client;
 pub const DenseEmbeddings = client.DenseEmbeddings;
 pub const RawClient = client.RawClient;
-pub const Transcription = client.Transcription;
+pub const Reading = client.Reading;
 pub const Types = client.Types;
 
 test {

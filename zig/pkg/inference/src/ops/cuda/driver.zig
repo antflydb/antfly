@@ -105,11 +105,15 @@ pub const CudaDriver = struct {
         cuDriverGetVersion: *const fn (driverVersion: *c_int) callconv(.c) CUresult,
         cuDeviceGetCount: *const fn (count: *c_int) callconv(.c) CUresult,
         cuDeviceGet: *const fn (device: *CUdevice, ordinal: c_int) callconv(.c) CUresult,
+        cuDeviceTotalMem: ?*const fn (bytes: *usize, dev: CUdevice) callconv(.c) CUresult = null,
         cuDeviceGetAttribute: ?*const fn (value: *c_int, attrib: c_int, device: CUdevice) callconv(.c) CUresult = null,
         cuDeviceGetName: *const fn (name: [*]u8, len: c_int, dev: CUdevice) callconv(.c) CUresult,
         cuDeviceComputeCapability: *const fn (major: *c_int, minor: *c_int, dev: CUdevice) callconv(.c) CUresult,
         cuDevicePrimaryCtxRetain: *const fn (pctx: *CUcontext, dev: CUdevice) callconv(.c) CUresult,
         cuDevicePrimaryCtxRelease: *const fn (dev: CUdevice) callconv(.c) CUresult,
+        cuDevicePrimaryCtxGetState: ?*const fn (dev: CUdevice, flags: *c_uint, active: *c_int) callconv(.c) CUresult = null,
+        cuCtxGetCurrent: ?*const fn (*CUcontext) callconv(.c) CUresult = null,
+        cuCtxSynchronize: ?*const fn () callconv(.c) CUresult = null,
         cuCtxSetCurrent: *const fn (ctx: CUcontext) callconv(.c) CUresult,
         cuStreamCreate: *const fn (phStream: *CUstream, flags: c_uint) callconv(.c) CUresult,
         cuStreamBeginCapture: *const fn (hStream: CUstream, mode: CUstreamCaptureMode) callconv(.c) CUresult,
@@ -127,6 +131,8 @@ pub const CudaDriver = struct {
         cuMemAlloc: *const fn (dptr: *CUdeviceptr, bytesize: usize) callconv(.c) CUresult,
         cuMemFree: *const fn (dptr: CUdeviceptr) callconv(.c) CUresult,
         cuMemAllocHost: ?*const fn (pp: *?*anyopaque, bytesize: usize) callconv(.c) CUresult,
+        cuMemHostAlloc: ?*const fn (pp: *?*anyopaque, bytesize: usize, flags: c_uint) callconv(.c) CUresult = null,
+        cuMemHostGetDevicePointer: ?*const fn (pdptr: *CUdeviceptr, p: ?*anyopaque, flags: c_uint) callconv(.c) CUresult = null,
         cuMemFreeHost: ?*const fn (p: ?*anyopaque) callconv(.c) CUresult,
         cuMemcpyHtoDAsync: *const fn (dstDevice: CUdeviceptr, srcHost: ?*const anyopaque, ByteCount: usize, hStream: CUstream) callconv(.c) CUresult,
         cuMemcpyDtoHAsync: *const fn (dstHost: ?*anyopaque, srcDevice: CUdeviceptr, ByteCount: usize, hStream: CUstream) callconv(.c) CUresult,
@@ -170,11 +176,15 @@ pub const CudaDriver = struct {
                 .cuDriverGetVersion = lookup(&lib, @TypeOf(@as(Table, undefined).cuDriverGetVersion), "cuDriverGetVersion") catch return error.CudaSymbolMissing,
                 .cuDeviceGetCount = lookup(&lib, @TypeOf(@as(Table, undefined).cuDeviceGetCount), "cuDeviceGetCount") catch return error.CudaSymbolMissing,
                 .cuDeviceGet = lookup(&lib, @TypeOf(@as(Table, undefined).cuDeviceGet), "cuDeviceGet") catch return error.CudaSymbolMissing,
+                .cuDeviceTotalMem = lookupOptional(&lib, *const fn (bytes: *usize, dev: CUdevice) callconv(.c) CUresult, "cuDeviceTotalMem_v2"),
                 .cuDeviceGetAttribute = lookupOptional(&lib, *const fn (value: *c_int, attrib: c_int, device: CUdevice) callconv(.c) CUresult, "cuDeviceGetAttribute"),
                 .cuDeviceGetName = lookup(&lib, @TypeOf(@as(Table, undefined).cuDeviceGetName), "cuDeviceGetName") catch return error.CudaSymbolMissing,
                 .cuDeviceComputeCapability = lookup(&lib, @TypeOf(@as(Table, undefined).cuDeviceComputeCapability), "cuDeviceComputeCapability") catch return error.CudaSymbolMissing,
                 .cuDevicePrimaryCtxRetain = lookup(&lib, @TypeOf(@as(Table, undefined).cuDevicePrimaryCtxRetain), "cuDevicePrimaryCtxRetain") catch return error.CudaSymbolMissing,
                 .cuDevicePrimaryCtxRelease = lookup(&lib, @TypeOf(@as(Table, undefined).cuDevicePrimaryCtxRelease), "cuDevicePrimaryCtxRelease") catch return error.CudaSymbolMissing,
+                .cuDevicePrimaryCtxGetState = lookupOptional(&lib, *const fn (CUdevice, *c_uint, *c_int) callconv(.c) CUresult, "cuDevicePrimaryCtxGetState"),
+                .cuCtxGetCurrent = lookupOptional(&lib, *const fn (*CUcontext) callconv(.c) CUresult, "cuCtxGetCurrent"),
+                .cuCtxSynchronize = lookupOptional(&lib, *const fn () callconv(.c) CUresult, "cuCtxSynchronize"),
                 .cuCtxSetCurrent = lookup(&lib, @TypeOf(@as(Table, undefined).cuCtxSetCurrent), "cuCtxSetCurrent") catch return error.CudaSymbolMissing,
                 .cuStreamCreate = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamCreate), "cuStreamCreate") catch return error.CudaSymbolMissing,
                 .cuStreamBeginCapture = lookup(&lib, @TypeOf(@as(Table, undefined).cuStreamBeginCapture), "cuStreamBeginCapture_v2") catch return error.CudaSymbolMissing,
@@ -192,6 +202,8 @@ pub const CudaDriver = struct {
                 .cuMemAlloc = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemAlloc), "cuMemAlloc_v2") catch return error.CudaSymbolMissing,
                 .cuMemFree = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemFree), "cuMemFree_v2") catch return error.CudaSymbolMissing,
                 .cuMemAllocHost = lookupOptional(&lib, *const fn (pp: *?*anyopaque, bytesize: usize) callconv(.c) CUresult, "cuMemAllocHost_v2"),
+                .cuMemHostAlloc = lookupOptional(&lib, *const fn (pp: *?*anyopaque, bytesize: usize, flags: c_uint) callconv(.c) CUresult, "cuMemHostAlloc"),
+                .cuMemHostGetDevicePointer = lookupOptional(&lib, *const fn (pdptr: *CUdeviceptr, p: ?*anyopaque, flags: c_uint) callconv(.c) CUresult, "cuMemHostGetDevicePointer_v2"),
                 .cuMemFreeHost = lookupOptional(&lib, *const fn (p: ?*anyopaque) callconv(.c) CUresult, "cuMemFreeHost"),
                 .cuMemcpyHtoDAsync = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemcpyHtoDAsync), "cuMemcpyHtoDAsync_v2") catch return error.CudaSymbolMissing,
                 .cuMemcpyDtoHAsync = lookup(&lib, @TypeOf(@as(Table, undefined).cuMemcpyDtoHAsync), "cuMemcpyDtoHAsync_v2") catch return error.CudaSymbolMissing,
@@ -213,6 +225,22 @@ pub const CudaDriver = struct {
                 .cuGetErrorString = lookup(&lib, @TypeOf(@as(Table, undefined).cuGetErrorString), "cuGetErrorString") catch return error.CudaSymbolMissing,
             },
         };
+    }
+
+    /// Capacity of the device selected by CudaContext.initDefault. No context
+    /// is created and no caller thread context is changed.
+    pub fn defaultDeviceMemory(self: *const CudaDriver) Error!struct { total_bytes: usize, unified: bool } {
+        try self.check(self.fns.cuInit(0));
+        var device: CUdevice = 0;
+        try self.check(self.fns.cuDeviceGet(&device, 0));
+        var bytes: usize = 0;
+        const total = self.fns.cuDeviceTotalMem orelse return error.CudaSymbolMissing;
+        try self.check(total(&bytes, device));
+        if (bytes == 0) return error.InvalidCudaState;
+        var integrated: c_int = 0;
+        const attribute = self.fns.cuDeviceGetAttribute orelse return error.CudaSymbolMissing;
+        try self.check(attribute(&integrated, 18, device)); // CU_DEVICE_ATTRIBUTE_INTEGRATED
+        return .{ .total_bytes = bytes, .unified = integrated != 0 };
     }
 
     pub fn deinit(self: *CudaDriver) void {

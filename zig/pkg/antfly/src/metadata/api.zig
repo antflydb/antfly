@@ -310,6 +310,36 @@ pub const CatalogRoutingSnapshot = struct {
     ranges: []table_manager.RangeRecord,
 };
 
+/// Selected physical owners, bound to the same namespace as their routing cut.
+pub const OwnerReadinessRequest = struct {
+    table_id: u64,
+    owners: []const Owner,
+    pub const Owner = struct { group_id: u64, shard_id: u64, range_id: u64 };
+};
+/// Selected roles only; catalog permission is not runtime reassignment state.
+pub const OwnerTransitionCheck = struct { id: u64, donor: bool = false, receiver: bool = false };
+
+pub const OwnerReadiness = struct {
+    // Required on wire: a legacy boolean reply cannot license a capture.
+    status: enum { ready, topology_changed, identity_unavailable },
+    metadata_group_id: u64 = 0,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
+};
+
+/// Fixed-size authoritative privacy binding; no schema, producer or job bytes.
+/// Required fields make unsupported/malformed replies fail closed.
+pub const PrivacyPolicyBinding = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation,
+    catalog_revision: u64,
+    policy_version: [64]u8,
+
+    pub fn validate(self: @This()) !void {
+        if (std.mem.allEqual(u8, &self.policy_version, 0)) return;
+        for (self.policy_version) |byte| if (!std.ascii.isHex(byte)) return error.InvalidPrivacyCatalog;
+    }
+};
+
 pub const CatalogRoutingChangeToken = struct {
     metadata_group_id: u64 = 0,
     metadata_incarnation: ?MetadataClusterIncarnation = null,

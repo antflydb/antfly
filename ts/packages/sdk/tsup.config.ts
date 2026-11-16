@@ -1,9 +1,10 @@
 import { defineConfig } from "tsup";
 
 export default defineConfig({
-  entry: ["src/index.ts"],
+  entry: ["src/index.ts", "src/sources-client.ts", "src/kysely.ts"],
   format: ["cjs", "esm"],
   dts: true,
+  external: ["kysely"],
   clean: true,
   // Bundle openapi-fetch into the output to avoid a CJS/ESM interop crash.
   // openapi-fetch is ESM-first; when tsup emits CJS that does

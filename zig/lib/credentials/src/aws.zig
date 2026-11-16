@@ -432,6 +432,7 @@ fn credentialHttpRequest(
     var options = options_in;
     options.timeout_ms = try context.remainingTimeoutMs(http.io);
     options.cookies_enabled = false;
+    options.follow_redirects = false;
     options.cancellation = context.httpCancellation();
     return http.request(method, url, options) catch |err| switch (err) {
         error.Timeout, error.Cancelled, error.Canceled => err,

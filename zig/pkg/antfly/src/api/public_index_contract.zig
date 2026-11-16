@@ -74,6 +74,7 @@ pub const CreatedObjectShape = enum {
     chunker_outputs,
     chunker_output_targets,
     chunker_output_target,
+    chunker_diarization,
     chunker_output_windows,
     chunker_output_window,
     index_execution,
@@ -108,6 +109,7 @@ pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
         .embeddings => std.mem.eql(u8, field, "publication_policy") or
             std.mem.eql(u8, field, "coverage_policy") or
             std.mem.eql(u8, field, "external") or
+            std.mem.eql(u8, field, "external_vector_space") or
             std.mem.eql(u8, field, "sparse") or
             std.mem.eql(u8, field, "dimension") or
             std.mem.eql(u8, field, "field") or
@@ -115,7 +117,11 @@ pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
             std.mem.eql(u8, field, "source_artifact_name") or
             std.mem.eql(u8, field, "template") or
             std.mem.eql(u8, field, "distance_metric") or
+            std.mem.eql(u8, field, "algorithm") or
+            std.mem.eql(u8, field, "leann") or
             std.mem.eql(u8, field, "mem_only") or
+            std.mem.eql(u8, field, "quantization_bits") or
+            std.mem.eql(u8, field, "quantization_refine") or
             std.mem.eql(u8, field, "embedder") or
             std.mem.eql(u8, field, "summarizer") or
             std.mem.eql(u8, field, "chunker") or
@@ -285,7 +291,7 @@ fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.Ob
         .relational_keys, .relational_predicates => &.{},
         .graph_metrics, .graph_metric, .graph_metric_filter => &.{},
         .enrichment_neighbor_context => &.{"graph_index"},
-        .unrestricted, .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers, .graph_scorer_comparisons, .graph_scorer_levels, .graph_scorer_combine, .graph_scorer_decision, .graph_nodes, .graph_edge, .graph_context, .graph_algebraic_planning, .chunker_text, .chunker_audio, .chunker_policy, .index_execution, .execution_policy => &.{},
+        .unrestricted, .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers, .graph_scorer_comparisons, .graph_scorer_levels, .graph_scorer_combine, .graph_scorer_decision, .graph_nodes, .graph_edge, .graph_context, .graph_algebraic_planning, .chunker_text, .chunker_audio, .chunker_policy, .chunker_diarization, .index_execution, .execution_policy => &.{},
     };
     for (required_fields) |field| {
         const value = object.get(field) orelse return false;
@@ -321,7 +327,7 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
         else
             .unrestricted,
         .chunker_outputs => if (std.mem.eql(u8, field, "targets")) .chunker_output_targets else .unrestricted,
-        .chunker_output_target => if (std.mem.eql(u8, field, "skip_windows")) .chunker_output_windows else .unrestricted,
+        .chunker_output_target => if (std.mem.eql(u8, field, "skip_windows")) .chunker_output_windows else if (std.mem.eql(u8, field, "diarization")) .chunker_diarization else .unrestricted,
         .index_execution => if (isAllowedIndexExecutionField(field)) .execution_policy else .unrestricted,
         .graph_artifact => if (std.mem.eql(u8, field, "source"))
             .graph_artifact_producer_source
@@ -355,7 +361,7 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
 pub fn isAllowedCreatedObjectField(shape: CreatedObjectShape, field: []const u8) bool {
     return switch (shape) {
         .algebraic_aggregates => false,
-        .algebraic_aggregate => std.mem.eql(u8, field, "name") or std.mem.eql(u8, field, "op") or std.mem.eql(u8, field, "group_by") or std.mem.eql(u8, field, "measure"),
+        .algebraic_aggregate => std.mem.eql(u8, field, "name") or std.mem.eql(u8, field, "op") or std.mem.eql(u8, field, "group_by") or std.mem.eql(u8, field, "measure") or std.mem.eql(u8, field, "time") or std.mem.eql(u8, field, "bucket"),
         .relational_keys, .relational_predicates, .relational_expression_args => false,
         .relational_key => std.mem.eql(u8, field, "column") or std.mem.eql(u8, field, "expression") or std.mem.eql(u8, field, "result_type") or std.mem.eql(u8, field, "direction") or std.mem.eql(u8, field, "nulls") or std.mem.eql(u8, field, "collation"),
         .relational_expression => std.mem.eql(u8, field, "op") or std.mem.eql(u8, field, "type") or std.mem.eql(u8, field, "column") or std.mem.eql(u8, field, "value") or std.mem.eql(u8, field, "args") or std.mem.eql(u8, field, "collation"),
@@ -395,7 +401,12 @@ pub fn isAllowedCreatedObjectField(shape: CreatedObjectShape, field: []const u8)
         .chunker_outputs => std.mem.eql(u8, field, "boundary_model") or std.mem.eql(u8, field, "targets"),
         .chunker_output_targets, .chunker_output_windows => false,
         .chunker_output_target => blk: {
-            inline for (.{ "name", "kind", "model", "execute", "skip_windows", "required", "model_identity", "task_type", "dimensions", "language", "diarize", "top_k" }) |allowed|
+            inline for (.{ "name", "kind", "model", "execute", "skip_windows", "required", "model_identity", "task_type", "dimensions", "language", "diarize", "diarization", "top_k" }) |allowed|
+                if (std.mem.eql(u8, field, allowed)) break :blk true;
+            break :blk false;
+        },
+        .chunker_diarization => blk: {
+            inline for (.{ "model", "model_identity", "similarity_threshold", "ambiguity_margin", "min_rms", "max_speakers" }) |allowed|
                 if (std.mem.eql(u8, field, allowed)) break :blk true;
             break :blk false;
         },
@@ -433,13 +444,18 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
             std.mem.eql(u8, field, "top_k") or
             std.mem.eql(u8, field, "chunk_size"))
             isInteger(value)
+        else if (std.mem.eql(u8, field, "quantization_bits"))
+            value == .integer and value.integer >= 1 and value.integer <= 8
         else if (std.mem.eql(u8, field, "min_weight"))
             isNumber(value)
         else if (std.mem.eql(u8, field, "embedder") or
             std.mem.eql(u8, field, "summarizer") or
             std.mem.eql(u8, field, "chunker") or
-            std.mem.eql(u8, field, "execution"))
+            std.mem.eql(u8, field, "execution") or
+            std.mem.eql(u8, field, "leann"))
             value == .object
+        else if (std.mem.eql(u8, field, "algorithm"))
+            value == .string and (std.mem.eql(u8, value.string, "hbc") or std.mem.eql(u8, value.string, "leann"))
         else
             isString(value),
         .graph => if (std.mem.eql(u8, field, "max_edges_per_document"))
@@ -525,10 +541,12 @@ pub fn createdFieldValueMatches(shape: CreatedObjectShape, field: []const u8, va
         .graph_scorer_combine, .graph_scorer_decision => isNumber(value),
         .chunker => chunkerFieldValueMatches(field, value),
         .chunker_text => if (std.mem.eql(u8, field, "separator")) isString(value) else isInteger(value),
-        .chunker_audio, .chunker_policy => isInteger(value),
+        .chunker_audio => isInteger(value),
+        .chunker_policy => if (std.mem.eql(u8, field, "audio_speaker_turns")) isBool(value) else isInteger(value),
         .chunker_outputs => if (std.mem.eql(u8, field, "targets")) createdValueMatchesShape(.chunker_output_targets, value) else isNonEmptyString(value),
         .chunker_output_targets, .chunker_output_windows => false,
         .chunker_output_target => chunkOutputTargetFieldValueMatches(field, value),
+        .chunker_diarization => chunkDiarizationFieldValueMatches(field, value),
         .chunker_output_window => unsignedIntegerMatches(value, if (std.mem.eql(u8, field, "ordinal")) std.math.maxInt(u64) else std.math.maxInt(u32)),
         .chunker_embedding => if (std.mem.eql(u8, field, "dimensions")) isInteger(value) else if (std.mem.eql(u8, field, "execute") or std.mem.eql(u8, field, "allow_partial")) isBool(value) else isString(value),
         .index_execution => value == .object,
@@ -588,6 +606,8 @@ fn providerFieldValueMatches(field: []const u8, value: std.json.Value) bool {
 }
 
 fn enrichmentFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "embedding_input")) return value == .string and
+        (std.mem.eql(u8, value.string, "text") or std.mem.eql(u8, value.string, "pdf_page_images"));
     if (std.mem.eql(u8, field, "source")) return groupedSourceMatches(value);
     if (std.mem.eql(u8, field, "prior_context")) return priorContextMatches(value);
     if (std.mem.eql(u8, field, "expected_dims") or
@@ -697,12 +717,25 @@ fn unsignedIntegerMatches(value: std.json.Value, max: u64) bool {
 
 fn chunkOutputTargetFieldValueMatches(field: []const u8, value: std.json.Value) bool {
     if (std.mem.eql(u8, field, "kind")) return isString(value) and
-        (std.mem.eql(u8, value.string, "embedding") or std.mem.eql(u8, value.string, "transcribe") or std.mem.eql(u8, value.string, "classify"));
+        (std.mem.eql(u8, value.string, "embedding") or std.mem.eql(u8, value.string, "transcribe") or std.mem.eql(u8, value.string, "classify") or std.mem.eql(u8, value.string, "diarize"));
     if (std.mem.eql(u8, field, "name") or std.mem.eql(u8, field, "model")) return isNonEmptyString(value);
     if (std.mem.eql(u8, field, "execute") or std.mem.eql(u8, field, "required") or std.mem.eql(u8, field, "diarize")) return isBool(value);
     if (std.mem.eql(u8, field, "dimensions") or std.mem.eql(u8, field, "top_k")) return isInteger(value);
     if (std.mem.eql(u8, field, "skip_windows")) return createdValueMatchesShape(.chunker_output_windows, value);
+    if (std.mem.eql(u8, field, "diarization")) return createdValueMatchesShape(.chunker_diarization, value);
     return isString(value);
+}
+
+fn chunkDiarizationFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "model")) return isString(value);
+    if (std.mem.eql(u8, field, "model_identity")) return isNonEmptyString(value);
+    if (std.mem.eql(u8, field, "max_speakers")) return isInteger(value) and value.integer >= 1 and value.integer <= 64;
+    const number: f64 = switch (value) {
+        .integer => |v| @floatFromInt(v),
+        .float => |v| v,
+        else => return false,
+    };
+    return std.math.isFinite(number) and number >= 0 and number <= 1;
 }
 
 fn chunkerFieldValueMatches(field: []const u8, value: std.json.Value) bool {
@@ -776,7 +809,7 @@ pub fn isAllowedChunkEmbeddingField(field: []const u8) bool {
 }
 
 pub fn isAllowedMediaChunkPolicyField(field: []const u8) bool {
-    inline for (.{ "max_text_bytes", "target_tokens", "overlap_tokens", "window_ns", "overlap_ns", "step_ns", "video_hold", "max_frames", "tile_width", "tile_height", "tile_overlap", "audio_pause_ns", "audio_pause_search_ns", "audio_silence_milli" }) |allowed|
+    inline for (.{ "max_text_bytes", "target_tokens", "overlap_tokens", "window_ns", "overlap_ns", "step_ns", "video_hold", "max_frames", "tile_width", "tile_height", "tile_overlap", "audio_speaker_turns", "audio_pause_ns", "audio_pause_search_ns", "audio_silence_milli" }) |allowed|
         if (std.mem.eql(u8, field, allowed)) return true;
     return false;
 }
@@ -784,6 +817,7 @@ pub fn isAllowedMediaChunkPolicyField(field: []const u8) bool {
 pub fn isAllowedChunkerTextField(field: []const u8) bool {
     return std.mem.eql(u8, field, "target_tokens") or
         std.mem.eql(u8, field, "overlap_tokens") or
+        std.mem.eql(u8, field, "min_chars") or
         std.mem.eql(u8, field, "separator");
 }
 
@@ -857,6 +891,7 @@ pub fn isAllowedGraphResolverField(field: []const u8) bool {
         std.mem.eql(u8, field, "scorer") or
         std.mem.eql(u8, field, "scorer_json") or
         std.mem.eql(u8, field, "candidate_search") or
+        std.mem.eql(u8, field, "candidate_key_prefix") or
         std.mem.eql(u8, field, "candidate_ann_index") or
         std.mem.eql(u8, field, "candidate_limit") or
         std.mem.eql(u8, field, "name_embedding") or
@@ -877,6 +912,7 @@ pub fn isAllowedCreatedEnrichmentField(field: []const u8) bool {
         std.mem.eql(u8, field, "source_artifact_name") or
         std.mem.eql(u8, field, "source") or
         std.mem.eql(u8, field, "prior_context") or
+        std.mem.eql(u8, field, "embedding_input") or
         std.mem.eql(u8, field, "expected_dims") or
         std.mem.eql(u8, field, "vector_space") or
         std.mem.eql(u8, field, "chunk_size") or

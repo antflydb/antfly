@@ -333,7 +333,7 @@ pub const Client = struct {
         return ApiResponse(types.PredictorsResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Read text from images (OCR/document understanding)
+    /// Read text from images, documents, or audio
     /// POST /read
     pub fn readImages(self: *@This(), body: types.ReadRequest) !ApiResponse(types.ReadResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/read", .{self.base_url});
@@ -384,17 +384,6 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.RewriteResponse).fromResponse(self.allocator, &resp);
-    }
-
-    /// Transcribe audio to text (speech-to-text)
-    /// POST /transcribe
-    pub fn transcribeAudio(self: *@This(), body: types.TranscribeRequest) !ApiResponse(types.TranscribeResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/transcribe", .{self.base_url});
-        defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
-        defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.TranscribeResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Open a streaming transcription session

@@ -73,6 +73,21 @@ pub const Table = struct {
     }
 };
 
+pub const max_reference_steps: usize = 64;
+
+pub const References = struct {
+    table: Table,
+    ready: bool,
+    referenced: []bool,
+    /// Work already charged to the shared marking/traversal quantum.
+    steps: usize = 0,
+    pub fn deinit(self: *References, a: std.mem.Allocator) void {
+        self.table.deinit(a);
+        a.free(self.referenced);
+        self.* = undefined;
+    }
+};
+
 pub const Commit = struct {
     /// Stable across retries/restarts. Reusing it with another payload fails.
     id: []const u8,

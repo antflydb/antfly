@@ -258,7 +258,7 @@ function DeviceCard({
       <div className="min-w-0">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <p className="text-[10px] font-mono uppercase tracking-widest text-muted-foreground">
+            <p className="text-xs font-medium text-muted-foreground">
               {connectionName} / configured hardware
             </p>
             <h2 className="mt-1 text-xl font-semibold">{device.name || "Your runtime device"}</h2>
@@ -348,7 +348,7 @@ function ConnectionProfiles({
               Explore quality, speed, context and memory on your device.
             </p>
           </div>
-          <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+          <span className="text-xs font-medium text-muted-foreground">
             {models.length} models / browser profiles
           </span>
         </div>

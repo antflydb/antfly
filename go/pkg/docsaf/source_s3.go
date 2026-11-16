@@ -183,6 +183,16 @@ func (s *S3Source) BaseURL() string {
 // lexicographic key order. S3 ListObjects returns keys sorted; we download
 // concurrently but emit items in listing order via ordered result channels.
 func (s *S3Source) Traverse(ctx context.Context) (<-chan ContentItem, <-chan error) {
+	return s.traverse(ctx, false)
+}
+
+// List enumerates S3 objects without content GETs. An ETag is a provider
+// validator, not necessarily an MD5 or SHA-256 digest.
+func (s *S3Source) List(ctx context.Context) (<-chan ContentItem, <-chan error) {
+	return s.traverse(ctx, true)
+}
+
+func (s *S3Source) traverse(ctx context.Context, metadataOnly bool) (<-chan ContentItem, <-chan error) {
 	items := make(chan ContentItem)
 	errs := make(chan error, 1)
 
@@ -192,7 +202,9 @@ func (s *S3Source) Traverse(ctx context.Context) (<-chan ContentItem, <-chan err
 
 		// List objects with the configured prefix.
 		// S3 returns objects in lexicographic key order.
-		objectCh := s.client.ListObjects(ctx, s.config.Bucket, minio.ListObjectsOptions{
+		listCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		objectCh := s.client.ListObjects(listCtx, s.config.Bucket, minio.ListObjectsOptions{
 			Prefix:    s.config.Prefix,
 			Recursive: true,
 		})
@@ -288,8 +300,8 @@ func (s *S3Source) Traverse(ctx context.Context) (<-chan ContentItem, <-chan err
 			}
 
 			if object.Err != nil {
-				log.Printf("Warning: Error listing objects: %v", object.Err)
-				continue
+				errs <- object.Err
+				return
 			}
 
 			if strings.HasSuffix(object.Key, "/") {
@@ -305,6 +317,23 @@ func (s *S3Source) Traverse(ctx context.Context) (<-chan ContentItem, <-chan err
 				continue
 			}
 			if !s.shouldInclude(relPath) {
+				continue
+			}
+
+			if metadataOnly {
+				item := ContentItem{
+					Path: relPath, SourceURL: s3ContentURI(s.config.Bucket, object.Key),
+					ContentType: DetectContentType(relPath, nil),
+					Metadata: map[string]any{"source_type": "s3", "bucket": s.config.Bucket,
+						"key": object.Key, "size": object.Size, "last_modified": object.LastModified,
+						"etag": object.ETag, "version_id": object.VersionID},
+				}
+				select {
+				case items <- item:
+				case <-ctx.Done():
+					errs <- ctx.Err()
+					return
+				}
 				continue
 			}
 
@@ -369,4 +398,9 @@ func (s *S3Source) shouldInclude(path string) bool {
 	}
 
 	return false
+}
+
+// s3ContentURI escapes keys while retaining path separators.
+func s3ContentURI(bucket, key string) string {
+	return (&url.URL{Scheme: "s3", Host: bucket, Path: "/" + key}).String()
 }

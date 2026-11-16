@@ -704,7 +704,7 @@ pub const RelationalCheckConstraint = struct {
     column: ?[]const u8 = null,
     op: ?RelationalComparisonOp = null,
     /// Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// String comparison collation; uses the same rules as ordered indexes.
     collation: ?[]const u8 = null,
     expression: ?RelationalScalarExpression = null,
@@ -714,7 +714,7 @@ pub const RelationalCheckConstraint = struct {
         .{ "name", "name", false },
         .{ "column", "column", true },
         .{ "op", "op", true },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "collation", "collation", true },
         .{ "expression", "expression", true },
     };
@@ -739,9 +739,16 @@ pub const RelationalCheckConstraint = struct {
             try jw.objectField("op");
             try jw.write(value);
         }
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.collation) |value| {
             try jw.objectField("collation");
@@ -1335,7 +1342,7 @@ pub const RelationalIndexPredicate = struct {
     column: []const u8,
     op: RelationalComparisonOp,
     /// Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     /// String comparison collation with the same semantics as ordered keys.
     collation: ?[]const u8 = null,
 
@@ -1343,7 +1350,7 @@ pub const RelationalIndexPredicate = struct {
     pub const openApiFieldMetadata = .{
         .{ "column", "column", false },
         .{ "op", "op", false },
-        .{ "value", "value", true },
+        .{ "value", "value", false },
         .{ "collation", "collation", true },
     };
 
@@ -1361,9 +1368,16 @@ pub const RelationalIndexPredicate = struct {
         try jw.write(self.column);
         try jw.objectField("op");
         try jw.write(self.op);
-        if (self.value) |value| {
-            try jw.objectField("value");
-            try jw.write(value);
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.collation) |value| {
             try jw.objectField("collation");
@@ -1713,6 +1727,8 @@ pub const SQLNumericModifier = struct {
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?u32 = null,
+    /// Physical document index order. Fields must have sortable scalar mappings. Changing the order requires rebuilding physical coverage. Relational tables use relational_indexes instead.
+    index_sort: ?[]const std.json.Value = null,
     storage_mode: ?TableStorageMode = null,
     /// External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables.
     base_source: ?ExternalLakeTableSource = null,
@@ -1746,6 +1762,7 @@ pub const TableSchema = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "version", "version", true },
+        .{ "index_sort", "index_sort", true },
         .{ "storage_mode", "storage_mode", true },
         .{ "base_source", "base_source", true },
         .{ "column_defaults", "column_defaults", true },
@@ -1775,6 +1792,10 @@ pub const TableSchema = struct {
         try jw.beginObject();
         if (self.version) |value| {
             try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.index_sort) |value| {
+            try jw.objectField("index_sort");
             try jw.write(value);
         }
         if (self.storage_mode) |value| {

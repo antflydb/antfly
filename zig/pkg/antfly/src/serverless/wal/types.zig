@@ -16,6 +16,23 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+pub const BatchResult = struct { start_lsn: u64, end_lsn: u64 };
+
+/// Catalog transitions and direct source admission share the WAL HEAD CAS.
+pub const CatalogFence = struct { latest_lsn: u64 = 0, epoch: u64 = 0, pending_lsn: ?u64 = null };
+/// Source reads are fenced independently of unrelated namespace appends.
+/// `after_lsn` is captured before those reads; delete/recreate ABA is a change.
+pub const PreparedReadSet = struct { after_lsn: u64, documents: []const []const u8 };
+
+pub const CatalogTransition = struct {
+    fence: CatalogFence,
+    payload: ?[]u8 = null,
+    pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        if (self.payload) |bytes| a.free(bytes);
+        self.* = undefined;
+    }
+};
+
 pub const Record = struct {
     lsn: u64,
     timestamp_ns: u64,
@@ -24,6 +41,33 @@ pub const Record = struct {
     /// Legacy records and stores that do not support that protocol leave it
     /// null.
     operation_id: ?[]u8 = null,
+};
+
+/// Immutable identities from a freshly captured WAL HEAD. Parent identity is
+/// published by the same atomic append, never supplied by a reader cache.
+pub const ReadSnapshot = struct {
+    latest_lsn: u64,
+    first_lsn: u64,
+    identity: [32]u8,
+    lineage: [32]u8,
+    parent_identity: ?[32]u8 = null,
+    parent_lsn: u64 = 0,
+    small_tail: bool = false,
+};
+pub const PointRead = struct { indexed: bool = false, record: ?Record = null };
+
+/// A captured, inclusive committed prefix. Exceeding any budget fails the
+/// entire read; consumers must never mistake a truncated page for fresh state.
+pub const ReadRange = struct {
+    start_lsn: u64,
+    end_lsn: u64,
+    max_records: usize = 4096,
+    max_bytes: usize = 8 * 1024 * 1024,
+    cancellation: ?@import("objectstore").CancellationToken = null,
+
+    pub fn check(self: @This()) !void {
+        if (self.cancellation) |token| try token.check();
+    }
 };
 
 pub fn freeRecords(alloc: Allocator, records: []Record) void {

@@ -1005,6 +1005,9 @@ pub const Store = struct {
     /// destination reauthorization retain their existing durable outcome;
     /// checking here under the store mutex avoids a probe/insert race.
     pub fn startRecoverableGuarded(self: *Store, alloc: std.mem.Allocator, request: StartRequest, allow_new: bool) !Admission {
+        return self.startRecoverableObserved(alloc, request, allow_new, null);
+    }
+    pub fn startRecoverableObserved(self: *Store, alloc: std.mem.Allocator, request: StartRequest, allow_new: bool, submitted: ?*bool) !Admission {
         var req = request;
         var generated_key_buf: [37]u8 = undefined;
         if (req.idempotency_key == null) {
@@ -1049,6 +1052,7 @@ pub const Store = struct {
                 const same_request = std.mem.eql(u8, parsed.value.request_fingerprint, fingerprint);
                 const reauthorize = destinationReauthorizationMatches(parsed.value, req);
                 if (!same_request and !reauthorize) return error.IdempotencyConflict;
+                if (submitted) |observed| observed.* = true;
                 if (reauthorize) {
                     if (parsed.value.staging_attempt_id != 0 and !std.mem.eql(u8, parsed.value.destination_authorization_principal, req.destination_authorization_principal)) return error.RestoreStagingPrincipalImmutable;
                     // A destination authorization failure is guaranteed to
@@ -1175,6 +1179,7 @@ pub const Store = struct {
             var retired_expired = false;
             while (true) {
                 self.fencePersistenceLocked(job_id);
+                if (submitted) |observed| observed.* = true;
                 const committed = (if (req.generation_plan_json orelse req.rewrite_plan_json) |plan|
                     replicated.createWithStaging(alloc, key, encoded, plan, self.replicated_leadership_term)
                 else
@@ -1230,6 +1235,9 @@ pub const Store = struct {
             return err;
         };
         defer admitted.deinit();
+        if (self.replicated == null) if (submitted) |observed| {
+            observed.* = true;
+        };
         self.storeOrCacheLocked(job_id, encoded, self.replicated == null) catch |err| {
             if (self.replicated != null) return .{ .unknown = encoded };
             return err;
@@ -5000,4 +5008,30 @@ test "restore job store rejects oversized request state" {
         .connection = "archive-reader",
         .idempotency_namespace = "principal:admin:cluster",
     }));
+}
+
+test "restore admission recovers generated identity with explicit submission evidence" {
+    const a = std.testing.allocator;
+    var persistence = TestReplicatedPersistence.init(a);
+    defer persistence.deinit();
+    var store = Store.initWithIo(a, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+    var req: StartRequest = .{ .scope = .table, .table_name = "docs", .backup_id = "daily", .location = "file:///backups", .connection = "backups", .idempotency_namespace = "phase-test", .idempotency_key = "once" };
+    var submitted = false;
+    req.location = "";
+    try std.testing.expectError(error.RestoreJobRecordTooLarge, store.startRecoverableObserved(a, req, true, &submitted));
+    try std.testing.expect(!submitted);
+    try std.testing.expectEqual(@as(usize, 0), persistence.rows.count());
+    req.location = "file:///backups";
+    persistence.timeout_after_create = true;
+    const uncertain = try store.startRecoverableObserved(a, req, true, &submitted);
+    defer a.free(uncertain.unknown);
+    try std.testing.expect(submitted and uncertain == .unknown);
+    persistence.timeout_after_create = false;
+    submitted = false;
+    const retried = try store.startRecoverableObserved(a, req, true, &submitted);
+    defer a.free(retried.accepted);
+    try std.testing.expect(submitted and retried == .accepted);
+    try std.testing.expectEqual(@as(usize, 1), persistence.rows.count());
 }

@@ -1,0 +1,1996 @@
+{
+  "schema_version": 1,
+  "native_binary_contains_semantic_abi": true,
+  "native_cache_rebuild_verification": "final source rebuilt and compared by SHA-256",
+  "portable_storage_tests": {
+    "path": "output/conditional-generic/linux/source-value-identity-tests",
+    "sha256": "5465b99dede04d105f31b79015da43deb002e4a721403e76eb5a28b71416ca1d",
+    "bytes": 24396672,
+    "source_commit": "611a4ce4ca",
+    "target": "aarch64-linux-gnu",
+    "optimize": "Debug",
+    "runtime": "existing Linux VM, two CPUs and 1 GiB RAM",
+    "passed": 18,
+    "leaks": 0
+  },
+  "scope": "Paired qualification of generic conditional-source changes; synthetic data, exact response equivalence, warm caches, no live model or independent native Linux host.",
+  "implementation_commit": "611a4ce4ca",
+  "baseline_pr_head": "85a9170ae0",
+  "native_baseline_build_commit": "9ca2e6e28f",
+  "native_baseline_main": "871c14378840c9fb4d2422464d95f35ba51c0814",
+  "qualification_main_merge": "0d3abed22e",
+  "main_merge_scope": "README-only #1268; production implementation hashes unchanged",
+  "merged_main": "c1bc94b174292447105e99f2a1b33efd3629ed7a",
+  "compiler": "0.17.0",
+  "native_host": {
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "cpu_count": 14
+  },
+  "native_build": {
+    "optimize": "ReleaseFast",
+    "strip": true,
+    "target": "aarch64-macos",
+    "cpu": "baseline"
+  },
+  "binaries": {
+    "native_baseline": {
+      "path": "output/conditional-main/macos/antfly",
+      "sha256": "25bd1ac46d75b0cf34ab184f8a56df307c984f2d25ade5a81eea8a3411d124c9",
+      "bytes": 211836616
+    },
+    "native_candidate": {
+      "path": "output/conditional-generic/macos/antfly",
+      "sha256": "ce7fe8f2c01ae47862a4899e3d6a9727ee1e469ff894448feb6cf59c814a8266",
+      "bytes": 211869352
+    },
+    "cli_macos": {
+      "path": "output/conditional-generic/macos/antfly-grep",
+      "sha256": "69eeb94bb25425a6c65a49adbb4c2f8cda7696a776174d5e5190d2c30c627e34",
+      "bytes": 7498008
+    },
+    "cli_linux": {
+      "path": "output/conditional-generic/linux/antfly-grep",
+      "sha256": "2c942a35eeddb9d76a9ad24d0244fe1ee0c7d6f3111019ff1cb94be7dbafed96",
+      "bytes": 7507576
+    },
+    "cli_windows_cross_build": {
+      "path": "zig/zig-out/bin/antfly-grep.exe",
+      "sha256": "10cac4036ce15c0c9c770ed5f272e2e7c8b4669af3070a80cce0e2f48e761b42",
+      "bytes": 8452608
+    }
+  },
+  "implementation_source_sha256": {
+    "zig/pkg/antfly-embedded/src/storage/conditional_source.zig": "b248382a0e529fccfbffa912a251439e64ba09005a86fedd3b238165e122d3bb",
+    "zig/pkg/antfly-embedded/src/storage/source_value_identity.zig": "8e281d9ae65f8e30118d3cdda8f251295515582a99e0e55cfcaee0bf1c58c763",
+    "zig/pkg/antfly-embedded/src/storage/document_projection.zig": "1a29a067d3313a1f8e4c18298aaae8dcb799f7e3cbe53549348892b8ff644223",
+    "zig/pkg/antfly-embedded/src/storage/document_mutation_revision.zig": "7b28cc90fa21e50e7c3dced8714335e03f848fb56380933b62fc190ede3c99df",
+    "zig/pkg/antfly-embedded/src/storage/logical_source.zig": "c09871b340756ef6c570d5324b93ded7cf7462169795fa9279e560c6443a58e7",
+    "zig/pkg/antfly-embedded/src/storage/db/db.zig": "3c13880ad982d62aace7e232c9fce6213f6a1ad6584b11fc02f93a97665f9b1f",
+    "zig/pkg/antfly-grep/src/indexed.zig": "ca40fb800b6e1273ef35ce2989b0418ab4f4ad40939517d6face4a8a871d8b34"
+  },
+  "limits": [
+    "Measurements are synthetic and host-dependent; medians are not universal speed or memory guarantees.",
+    "The constrained ARM64 Linux VM shares the same physical Mac; two CPUs and 1 GiB RAM.",
+    "CLI CPU/RSS excludes the Python fixture; request counts and transferred bytes are end-to-end fixture observations.",
+    "Tiny cold client CPU can increase despite fewer HTTP requests; warm and cold performance are reported separately. The final tiny mixed macOS comparison uses 15 alternating trials; other client cases use five.",
+    "Native process CPU includes background work; RSS is sampled every 5 ms, not an allocation bound.",
+    "Native caches are warm after ingestion; this does not qualify cold disk or remote object-store I/O. Native baseline is the recorded 9ca2 build; later PDF/inference/CI/README merges are included in the candidate, so measurements do not isolate every merge effect.",
+    "Repeated native reads are individually timed; response parsing/equivalence checks are outside elapsed timing.",
+    "Raw reports/logs remain local and unpublished under ignored output/."
+  ],
+  "client": [
+    {
+      "artifact": {
+        "path": "output/conditional-generic-final-shapes1-macos.json",
+        "sha256": "d190b650c18e826245479619b84978d6c35134b84d8f9e061a79a7203c09b518",
+        "bytes": 18472,
+        "availability": "local, unpublished"
+      },
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "rounds": 5,
+      "parents": 8,
+      "units": 2,
+      "shapes": 1,
+      "binaries": {
+        "baseline": {
+          "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/perf-grep-conditional-projection/output/conditional-latest/macos/antfly-grep",
+          "sha256": "faafe6832f4c44a74da8d07faf698de36bdf48119fcf898f573317712c9769ad",
+          "bytes": 8207864
+        },
+        "candidate": {
+          "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/perf-grep-conditional-projection/output/conditional-generic/macos/antfly-grep",
+          "sha256": "69eeb94bb25425a6c65a49adbb4c2f8cda7696a776174d5e5190d2c30c627e34",
+          "bytes": 7498008
+        }
+      },
+      "output_sha256": "7adbb8566f5dd8649159abf89df9578532fdaa9f5ae9b6dc59ac42fa72660d7a",
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 131647750,
+          "elapsed_range_ns": [
+            124532916,
+            161943625
+          ],
+          "child_cpu_ns": 29272000,
+          "first_stdout_ns": 126308375,
+          "peak_rss_bytes": 6144000,
+          "index_requests": 3,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 86413083,
+          "elapsed_range_ns": [
+            77220959,
+            130676917
+          ],
+          "child_cpu_ns": 11276000,
+          "first_stdout_ns": 83465375,
+          "peak_rss_bytes": 5505024,
+          "index_requests": 3,
+          "provider_requests": 0,
+          "projected_asset_bytes": 0
+        },
+        {
+          "variant": "baseline",
+          "phase": "question_miss",
+          "elapsed_ns": 151926167,
+          "elapsed_range_ns": [
+            135985125,
+            163274083
+          ],
+          "child_cpu_ns": 22355000,
+          "first_stdout_ns": 139577459,
+          "peak_rss_bytes": 6225920,
+          "index_requests": 3,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 124943625,
+          "elapsed_range_ns": [
+            112128292,
+            182444667
+          ],
+          "child_cpu_ns": 28225000,
+          "first_stdout_ns": 119455542,
+          "peak_rss_bytes": 6078464,
+          "index_requests": 3,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 83433167,
+          "elapsed_range_ns": [
+            80640291,
+            128173166
+          ],
+          "child_cpu_ns": 11068000,
+          "first_stdout_ns": 80782458,
+          "peak_rss_bytes": 5472256,
+          "index_requests": 3,
+          "provider_requests": 0,
+          "projected_asset_bytes": 0
+        },
+        {
+          "variant": "candidate",
+          "phase": "question_miss",
+          "elapsed_ns": 136011208,
+          "elapsed_range_ns": [
+            134688917,
+            154065417
+          ],
+          "child_cpu_ns": 23249000,
+          "first_stdout_ns": 132312958,
+          "peak_rss_bytes": 6078464,
+          "index_requests": 3,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "path": "output/conditional-generic-final-shapes2-macos.json",
+        "sha256": "dc6ec975402b4a7f5851d530ac40dc97727763ee48a06d3e9f56965a293debf2",
+        "bytes": 47832,
+        "availability": "local, unpublished"
+      },
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "rounds": 15,
+      "parents": 8,
+      "units": 2,
+      "shapes": 2,
+      "binaries": {
+        "baseline": {
+          "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/perf-grep-conditional-projection/output/conditional-latest/macos/antfly-grep",
+          "sha256": "faafe6832f4c44a74da8d07faf698de36bdf48119fcf898f573317712c9769ad",
+          "bytes": 8207864
+        },
+        "candidate": {
+          "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/perf-grep-conditional-projection/output/conditional-generic/macos/antfly-grep",
+          "sha256": "69eeb94bb25425a6c65a49adbb4c2f8cda7696a776174d5e5190d2c30c627e34",
+          "bytes": 7498008
+        }
+      },
+      "output_sha256": "7adbb8566f5dd8649159abf89df9578532fdaa9f5ae9b6dc59ac42fa72660d7a",
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 136364459,
+          "elapsed_range_ns": [
+            125579042,
+            141619792
+          ],
+          "child_cpu_ns": 17422000,
+          "first_stdout_ns": 132317666,
+          "peak_rss_bytes": 7241728,
+          "index_requests": 10,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 94740750,
+          "elapsed_range_ns": [
+            87629042,
+            97558208
+          ],
+          "child_cpu_ns": 8618000,
+          "first_stdout_ns": 91032250,
+          "peak_rss_bytes": 6766592,
+          "index_requests": 10,
+          "provider_requests": 0,
+          "projected_asset_bytes": 0
+        },
+        {
+          "variant": "baseline",
+          "phase": "question_miss",
+          "elapsed_ns": 137579334,
+          "elapsed_range_ns": [
+            130557958,
+            144480334
+          ],
+          "child_cpu_ns": 15710000,
+          "first_stdout_ns": 133369958,
+          "peak_rss_bytes": 7487488,
+          "index_requests": 10,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 133573584,
+          "elapsed_range_ns": [
+            128025208,
+            149204417
+          ],
+          "child_cpu_ns": 21367000,
+          "first_stdout_ns": 129219792,
+          "peak_rss_bytes": 6193152,
+          "index_requests": 4,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 91659208,
+          "elapsed_range_ns": [
+            79163166,
+            97029250
+          ],
+          "child_cpu_ns": 5808000,
+          "first_stdout_ns": 90461625,
+          "peak_rss_bytes": 5619712,
+          "index_requests": 4,
+          "provider_requests": 0,
+          "projected_asset_bytes": 0
+        },
+        {
+          "variant": "candidate",
+          "phase": "question_miss",
+          "elapsed_ns": 138811458,
+          "elapsed_range_ns": [
+            121985666,
+            148282334
+          ],
+          "child_cpu_ns": 14197000,
+          "first_stdout_ns": 136847666,
+          "peak_rss_bytes": 6275072,
+          "index_requests": 4,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "path": "output/conditional-generic-parallel-shapes8-macos.json",
+        "sha256": "5907e11939edda795996871c078a64bed78f6d0a8fd561761a9e51394f3b3512",
+        "bytes": 18499,
+        "availability": "local, unpublished"
+      },
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "rounds": 5,
+      "parents": 8,
+      "units": 2,
+      "shapes": 8,
+      "binaries": {
+        "baseline": {
+          "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/perf-grep-conditional-projection/output/conditional-latest/macos/antfly-grep",
+          "sha256": "faafe6832f4c44a74da8d07faf698de36bdf48119fcf898f573317712c9769ad",
+          "bytes": 8207864
+        },
+        "candidate": {
+          "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/perf-grep-conditional-projection/output/conditional-generic/macos/antfly-grep",
+          "sha256": "69eeb94bb25425a6c65a49adbb4c2f8cda7696a776174d5e5190d2c30c627e34",
+          "bytes": 7498008
+        }
+      },
+      "output_sha256": "7adbb8566f5dd8649159abf89df9578532fdaa9f5ae9b6dc59ac42fa72660d7a",
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 127169042,
+          "elapsed_range_ns": [
+            118985334,
+            154125000
+          ],
+          "child_cpu_ns": 16468000,
+          "first_stdout_ns": 125044000,
+          "peak_rss_bytes": 7208960,
+          "index_requests": 10,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 91857792,
+          "elapsed_range_ns": [
+            85298709,
+            97342167
+          ],
+          "child_cpu_ns": 10260000,
+          "first_stdout_ns": 86071792,
+          "peak_rss_bytes": 6733824,
+          "index_requests": 10,
+          "provider_requests": 0,
+          "projected_asset_bytes": 0
+        },
+        {
+          "variant": "baseline",
+          "phase": "question_miss",
+          "elapsed_ns": 134148750,
+          "elapsed_range_ns": [
+            124915916,
+            136795334
+          ],
+          "child_cpu_ns": 17464000,
+          "first_stdout_ns": 127721375,
+          "peak_rss_bytes": 7438336,
+          "index_requests": 10,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 129984875,
+          "elapsed_range_ns": [
+            124016500,
+            146700750
+          ],
+          "child_cpu_ns": 14713000,
+          "first_stdout_ns": 127735625,
+          "peak_rss_bytes": 7077888,
+          "index_requests": 10,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 93500500,
+          "elapsed_range_ns": [
+            86897375,
+            95074208
+          ],
+          "child_cpu_ns": 9655000,
+          "first_stdout_ns": 86712125,
+          "peak_rss_bytes": 6701056,
+          "index_requests": 10,
+          "provider_requests": 0,
+          "projected_asset_bytes": 0
+        },
+        {
+          "variant": "candidate",
+          "phase": "question_miss",
+          "elapsed_ns": 136344375,
+          "elapsed_range_ns": [
+            123417166,
+            139506041
+          ],
+          "child_cpu_ns": 16542000,
+          "first_stdout_ns": 132140833,
+          "peak_rss_bytes": 7225344,
+          "index_requests": 10,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "path": "output/conditional-generic-parallel-dense-macos.json",
+        "sha256": "bdfaac9f5356ef4c842f7ef983df5649b27b70f36f10733591c7539be3810628",
+        "bytes": 18912,
+        "availability": "local, unpublished"
+      },
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "rounds": 5,
+      "parents": 8,
+      "units": 16,
+      "shapes": 2,
+      "binaries": {
+        "baseline": {
+          "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/perf-grep-conditional-projection/output/conditional-latest/macos/antfly-grep",
+          "sha256": "faafe6832f4c44a74da8d07faf698de36bdf48119fcf898f573317712c9769ad",
+          "bytes": 8207864
+        },
+        "candidate": {
+          "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/perf-grep-conditional-projection/output/conditional-generic/macos/antfly-grep",
+          "sha256": "69eeb94bb25425a6c65a49adbb4c2f8cda7696a776174d5e5190d2c30c627e34",
+          "bytes": 7498008
+        }
+      },
+      "output_sha256": "5db0a0e8ce7b60c6e6fba878a0e422aa6fc66d653b5cdf8bf22de1e1cf150c02",
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 594712333,
+          "elapsed_range_ns": [
+            581118500,
+            642687167
+          ],
+          "child_cpu_ns": 236987000,
+          "first_stdout_ns": 364032209,
+          "peak_rss_bytes": 61112320,
+          "index_requests": 18,
+          "provider_requests": 20,
+          "projected_asset_bytes": 44742400
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 251468792,
+          "elapsed_range_ns": [
+            237295875,
+            264859792
+          ],
+          "child_cpu_ns": 20442000,
+          "first_stdout_ns": 170549917,
+          "peak_rss_bytes": 7602176,
+          "index_requests": 18,
+          "provider_requests": 0,
+          "projected_asset_bytes": 0
+        },
+        {
+          "variant": "baseline",
+          "phase": "question_miss",
+          "elapsed_ns": 613291792,
+          "elapsed_range_ns": [
+            596727834,
+            643555000
+          ],
+          "child_cpu_ns": 240716000,
+          "first_stdout_ns": 393914459,
+          "peak_rss_bytes": 62767104,
+          "index_requests": 18,
+          "provider_requests": 20,
+          "projected_asset_bytes": 44742400
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 580450958,
+          "elapsed_range_ns": [
+            562648250,
+            634888792
+          ],
+          "child_cpu_ns": 235605000,
+          "first_stdout_ns": 353660958,
+          "peak_rss_bytes": 61046784,
+          "index_requests": 18,
+          "provider_requests": 20,
+          "projected_asset_bytes": 44742400
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 222738834,
+          "elapsed_range_ns": [
+            215831041,
+            230532375
+          ],
+          "child_cpu_ns": 15273000,
+          "first_stdout_ns": 213218625,
+          "peak_rss_bytes": 7651328,
+          "index_requests": 12,
+          "provider_requests": 0,
+          "projected_asset_bytes": 0
+        },
+        {
+          "variant": "candidate",
+          "phase": "question_miss",
+          "elapsed_ns": 607900750,
+          "elapsed_range_ns": [
+            577809417,
+            625679000
+          ],
+          "child_cpu_ns": 236527000,
+          "first_stdout_ns": 377995292,
+          "peak_rss_bytes": 63176704,
+          "index_requests": 18,
+          "provider_requests": 21,
+          "projected_asset_bytes": 44742400
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "path": "output/conditional-generic-parallel-shapes2-linux.json",
+        "sha256": "2e3bed9001af98c0c1e2a07b7e387cccb127e79a4211bfa6791a53bc80d225fc",
+        "bytes": 18308,
+        "availability": "local, unpublished"
+      },
+      "platform": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.41",
+      "rounds": 5,
+      "parents": 8,
+      "units": 2,
+      "shapes": 2,
+      "binaries": {
+        "baseline": {
+          "path": "/work/output/conditional-latest/linux/antfly-grep",
+          "sha256": "9bfdd5b3cd713fefa56966390286a222d15d5d45cd669957e4f284636dac9c44",
+          "bytes": 31750296
+        },
+        "candidate": {
+          "path": "/work/output/conditional-generic/linux/antfly-grep",
+          "sha256": "2c942a35eeddb9d76a9ad24d0244fe1ee0c7d6f3111019ff1cb94be7dbafed96",
+          "bytes": 7507576
+        }
+      },
+      "output_sha256": "7adbb8566f5dd8649159abf89df9578532fdaa9f5ae9b6dc59ac42fa72660d7a",
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 101391792,
+          "elapsed_range_ns": [
+            82459667,
+            256155792
+          ],
+          "child_cpu_ns": 30458000,
+          "first_stdout_ns": 89204583,
+          "peak_rss_bytes": 12808192,
+          "index_requests": 10,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 73927667,
+          "elapsed_range_ns": [
+            57394875,
+            205677250
+          ],
+          "child_cpu_ns": 26323000,
+          "first_stdout_ns": 55599542,
+          "peak_rss_bytes": 12685312,
+          "index_requests": 10,
+          "provider_requests": 0,
+          "projected_asset_bytes": 0
+        },
+        {
+          "variant": "baseline",
+          "phase": "question_miss",
+          "elapsed_ns": 90066625,
+          "elapsed_range_ns": [
+            86129625,
+            110694583
+          ],
+          "child_cpu_ns": 29668000,
+          "first_stdout_ns": 84452208,
+          "peak_rss_bytes": 12816384,
+          "index_requests": 10,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 93999166,
+          "elapsed_range_ns": [
+            80393000,
+            113857333
+          ],
+          "child_cpu_ns": 34436000,
+          "first_stdout_ns": 90189500,
+          "peak_rss_bytes": 8921088,
+          "index_requests": 4,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 64837917,
+          "elapsed_range_ns": [
+            59939542,
+            91098583
+          ],
+          "child_cpu_ns": 11931000,
+          "first_stdout_ns": 62500834,
+          "peak_rss_bytes": 8941568,
+          "index_requests": 4,
+          "provider_requests": 0,
+          "projected_asset_bytes": 0
+        },
+        {
+          "variant": "candidate",
+          "phase": "question_miss",
+          "elapsed_ns": 94580667,
+          "elapsed_range_ns": [
+            87539250,
+            121957375
+          ],
+          "child_cpu_ns": 14139000,
+          "first_stdout_ns": 90178042,
+          "peak_rss_bytes": 9015296,
+          "index_requests": 4,
+          "provider_requests": 2,
+          "projected_asset_bytes": 2044
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "path": "output/conditional-generic-parallel-dense-linux.json",
+        "sha256": "ad6b7b3100b944071484ff75663aed6041abe25bdd582bfec7e4cedba54b26fd",
+        "bytes": 18765,
+        "availability": "local, unpublished"
+      },
+      "platform": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.41",
+      "rounds": 5,
+      "parents": 8,
+      "units": 16,
+      "shapes": 2,
+      "binaries": {
+        "baseline": {
+          "path": "/work/output/conditional-latest/linux/antfly-grep",
+          "sha256": "9bfdd5b3cd713fefa56966390286a222d15d5d45cd669957e4f284636dac9c44",
+          "bytes": 31750296
+        },
+        "candidate": {
+          "path": "/work/output/conditional-generic/linux/antfly-grep",
+          "sha256": "2c942a35eeddb9d76a9ad24d0244fe1ee0c7d6f3111019ff1cb94be7dbafed96",
+          "bytes": 7507576
+        }
+      },
+      "output_sha256": "5db0a0e8ce7b60c6e6fba878a0e422aa6fc66d653b5cdf8bf22de1e1cf150c02",
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 498480584,
+          "elapsed_range_ns": [
+            469560292,
+            585032667
+          ],
+          "child_cpu_ns": 285181000,
+          "first_stdout_ns": 324833958,
+          "peak_rss_bytes": 95883264,
+          "index_requests": 18,
+          "provider_requests": 19,
+          "projected_asset_bytes": 44742400
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 203517875,
+          "elapsed_range_ns": [
+            196400417,
+            214078917
+          ],
+          "child_cpu_ns": 15923000,
+          "first_stdout_ns": 143897875,
+          "peak_rss_bytes": 12161024,
+          "index_requests": 18,
+          "provider_requests": 0,
+          "projected_asset_bytes": 0
+        },
+        {
+          "variant": "baseline",
+          "phase": "question_miss",
+          "elapsed_ns": 495320084,
+          "elapsed_range_ns": [
+            484705500,
+            505751959
+          ],
+          "child_cpu_ns": 275597000,
+          "first_stdout_ns": 306932125,
+          "peak_rss_bytes": 95563776,
+          "index_requests": 18,
+          "provider_requests": 20,
+          "projected_asset_bytes": 44742400
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 516301334,
+          "elapsed_range_ns": [
+            479821333,
+            536426375
+          ],
+          "child_cpu_ns": 282579000,
+          "first_stdout_ns": 418183876,
+          "peak_rss_bytes": 94154752,
+          "index_requests": 18,
+          "provider_requests": 20,
+          "projected_asset_bytes": 44742400
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 189761583,
+          "elapsed_range_ns": [
+            180792583,
+            196445916
+          ],
+          "child_cpu_ns": 15490000,
+          "first_stdout_ns": 186066625,
+          "peak_rss_bytes": 13004800,
+          "index_requests": 12,
+          "provider_requests": 0,
+          "projected_asset_bytes": 0
+        },
+        {
+          "variant": "candidate",
+          "phase": "question_miss",
+          "elapsed_ns": 510136333,
+          "elapsed_range_ns": [
+            479737625,
+            527036459
+          ],
+          "child_cpu_ns": 274303000,
+          "first_stdout_ns": 325482917,
+          "peak_rss_bytes": 94584832,
+          "index_requests": 18,
+          "provider_requests": 20,
+          "projected_asset_bytes": 44742400
+        }
+      ]
+    }
+  ],
+  "native": [
+    {
+      "workload": "ascii",
+      "mask": "exact",
+      "artifact": {
+        "path": "output/conditional-generic-native-q10-ascii.json",
+        "sha256": "ff0fbd59121071c97894ec3af61c8affe2bb70e7ec414da3b9e8d73102369f1d",
+        "bytes": 89644,
+        "availability": "local, unpublished"
+      },
+      "rounds": 5,
+      "queries_per_phase": 10,
+      "documents": 8,
+      "value_bytes": 262144,
+      "corpus_sha256": "553c2ce85f669d008a3a8fb798b73166f2c5a6148069ab195026a202bbc625f2",
+      "output_sha256": {
+        "ordinary": "1b84ae889fef71fcd527efb40f190aafed9544861fde2b7210874784396d6681",
+        "full": "38a348f0497ea0dc4e4e4498d9c633ed2181a29cf13303c7413b2daaca8d20c9",
+        "conditional": "0466105df69a235c4b8f178e00924a7db5a0ce55cb4968cfc45beb2af6b20468"
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "ingest",
+          "elapsed_ns": 46708333,
+          "server_cpu_ns": 57649000,
+          "peak_rss_bytes": 154271744
+        },
+        {
+          "variant": "baseline",
+          "phase": "ordinary",
+          "elapsed_ns": 5330125.0,
+          "server_cpu_ns": 3756229.0,
+          "peak_rss_bytes": 156942336.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "full",
+          "elapsed_ns": 10673229.5,
+          "server_cpu_ns": 9242812.5,
+          "peak_rss_bytes": 162775040.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "conditional",
+          "elapsed_ns": 1086437.5,
+          "server_cpu_ns": 563791.5,
+          "peak_rss_bytes": 164036608.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "ingest",
+          "elapsed_ns": 42576167,
+          "server_cpu_ns": 54659208,
+          "peak_rss_bytes": 153927680
+        },
+        {
+          "variant": "candidate",
+          "phase": "ordinary",
+          "elapsed_ns": 5159354.0,
+          "server_cpu_ns": 3486125.0,
+          "peak_rss_bytes": 155820032.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "full",
+          "elapsed_ns": 10147688.0,
+          "server_cpu_ns": 8666166.5,
+          "peak_rss_bytes": 160333824.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "conditional",
+          "elapsed_ns": 983208.5,
+          "server_cpu_ns": 509354.0,
+          "peak_rss_bytes": 160530432.0
+        }
+      ],
+      "certificate_totals": {
+        "baseline": {
+          "hits": 800,
+          "fallbacks": 0
+        },
+        "candidate": {
+          "hits": 800,
+          "fallbacks": 0
+        }
+      }
+    },
+    {
+      "workload": "escaped",
+      "mask": "exact",
+      "artifact": {
+        "path": "output/conditional-generic-native-q10-escaped.json",
+        "sha256": "d80ac9d1b68a388fd8960f5fc1d9f517ba869eb6bccd79cad8cdc27be6d22402",
+        "bytes": 89750,
+        "availability": "local, unpublished"
+      },
+      "rounds": 5,
+      "queries_per_phase": 10,
+      "documents": 8,
+      "value_bytes": 262144,
+      "corpus_sha256": "0f11137b6368e47c873170ca92cba75351d030be3cd0d3a3ff48ab463b0fba84",
+      "output_sha256": {
+        "ordinary": "67da2c43ffd047457d9e4afef96ef79e436e3a32fd02bdae4e0f3ace8f8ee17e",
+        "full": "3a65efb985436dc2754bc4f722d831169ce3d81ee25dc72d803c779ae786dda0",
+        "conditional": "fe907a1b66cc59c7250025ce95a48e9f6951c4f7c84a3ceafbf492163df9bbe9"
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "ingest",
+          "elapsed_ns": 143250291,
+          "server_cpu_ns": 155204083,
+          "peak_rss_bytes": 170442752
+        },
+        {
+          "variant": "baseline",
+          "phase": "ordinary",
+          "elapsed_ns": 9324937.0,
+          "server_cpu_ns": 7660229.0,
+          "peak_rss_bytes": 174333952.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "full",
+          "elapsed_ns": 25058437.5,
+          "server_cpu_ns": 23712000.0,
+          "peak_rss_bytes": 181911552.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "conditional",
+          "elapsed_ns": 949208.0,
+          "server_cpu_ns": 468729.0,
+          "peak_rss_bytes": 184320000.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "ingest",
+          "elapsed_ns": 140903333,
+          "server_cpu_ns": 154037083,
+          "peak_rss_bytes": 170262528
+        },
+        {
+          "variant": "candidate",
+          "phase": "ordinary",
+          "elapsed_ns": 9305458.0,
+          "server_cpu_ns": 7674812.5,
+          "peak_rss_bytes": 173490176.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "full",
+          "elapsed_ns": 25189729.0,
+          "server_cpu_ns": 23724937.5,
+          "peak_rss_bytes": 181723136.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "conditional",
+          "elapsed_ns": 935562.0,
+          "server_cpu_ns": 475313.0,
+          "peak_rss_bytes": 182484992.0
+        }
+      ],
+      "certificate_totals": {
+        "baseline": {
+          "hits": 800,
+          "fallbacks": 0
+        },
+        "candidate": {
+          "hits": 800,
+          "fallbacks": 0
+        }
+      }
+    },
+    {
+      "workload": "unicode",
+      "mask": "exact",
+      "artifact": {
+        "path": "output/conditional-generic-native-q10-unicode.json",
+        "sha256": "6e480212c152ff95b87f5ee865fc3ecd72e4c3e881f26bfcf2bacaeb12662578",
+        "bytes": 89706,
+        "availability": "local, unpublished"
+      },
+      "rounds": 5,
+      "queries_per_phase": 10,
+      "documents": 8,
+      "value_bytes": 262144,
+      "corpus_sha256": "5b9aea3ce29a4871eed8eafe16f376d4f5697f607391488458d5d8abb79ac2f9",
+      "output_sha256": {
+        "ordinary": "71d27fbfc105b0c772282eae7e44ce0147865b1536eb99e7e84ab7df106aa3e1",
+        "full": "f7684790208db22ba36ce64a9e96763b709548413fec6314e0ee2dd067e5d1bd",
+        "conditional": "18c31b3908c502092ce6c2a0b51c6826793041ac4068135a9827bac672397a61"
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "ingest",
+          "elapsed_ns": 89306708,
+          "server_cpu_ns": 100444916,
+          "peak_rss_bytes": 160825344
+        },
+        {
+          "variant": "baseline",
+          "phase": "ordinary",
+          "elapsed_ns": 7692792.0,
+          "server_cpu_ns": 6190333.0,
+          "peak_rss_bytes": 159342592.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "full",
+          "elapsed_ns": 23859208.0,
+          "server_cpu_ns": 22720645.5,
+          "peak_rss_bytes": 162660352.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "conditional",
+          "elapsed_ns": 907083.0,
+          "server_cpu_ns": 470062.0,
+          "peak_rss_bytes": 163151872.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "ingest",
+          "elapsed_ns": 85500125,
+          "server_cpu_ns": 99939375,
+          "peak_rss_bytes": 160301056
+        },
+        {
+          "variant": "candidate",
+          "phase": "ordinary",
+          "elapsed_ns": 7766520.5,
+          "server_cpu_ns": 6224104.0,
+          "peak_rss_bytes": 158621696.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "full",
+          "elapsed_ns": 23863312.5,
+          "server_cpu_ns": 22660396.0,
+          "peak_rss_bytes": 162283520.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "conditional",
+          "elapsed_ns": 898771.0,
+          "server_cpu_ns": 449687.5,
+          "peak_rss_bytes": 163168256.0
+        }
+      ],
+      "certificate_totals": {
+        "baseline": {
+          "hits": 800,
+          "fallbacks": 0
+        },
+        "candidate": {
+          "hits": 800,
+          "fallbacks": 0
+        }
+      }
+    },
+    {
+      "workload": "numeric",
+      "mask": "exact",
+      "artifact": {
+        "path": "output/conditional-generic-native-q10-numeric.json",
+        "sha256": "357ab68a4185a4dec24c31e87c9eb600f2f0e6136aec0e47bbcbf73bad34b156",
+        "bytes": 88664,
+        "availability": "local, unpublished"
+      },
+      "rounds": 5,
+      "queries_per_phase": 10,
+      "documents": 8,
+      "value_bytes": 262144,
+      "corpus_sha256": "2e5da91e7bb4980b1cfb65eaaa2de9b176cf1f65e8849e5457b3fdaed1dc8bb4",
+      "output_sha256": {
+        "ordinary": "72ef793f9d201a04bf57cd607aa5d721e98e08d2baacab6c189cdbe377bdac9f",
+        "full": "10d4d311e72644f3553a6e0dfcc2e70619f64b6bd904d44cebfc0555fa4efb45",
+        "conditional": "1db8e36c85b4ed8611e16dc406cc55300b4c132eb21a3414a4626f116f13e5c4"
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "ingest",
+          "elapsed_ns": 38950084,
+          "server_cpu_ns": 52185292,
+          "peak_rss_bytes": 144015360
+        },
+        {
+          "variant": "baseline",
+          "phase": "ordinary",
+          "elapsed_ns": 2279604.5,
+          "server_cpu_ns": 1807041.5,
+          "peak_rss_bytes": 143720448.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "full",
+          "elapsed_ns": 738291.5,
+          "server_cpu_ns": 331854.5,
+          "peak_rss_bytes": 144801792.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "conditional",
+          "elapsed_ns": 791146.0,
+          "server_cpu_ns": 387812.5,
+          "peak_rss_bytes": 144900096.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "ingest",
+          "elapsed_ns": 36608041,
+          "server_cpu_ns": 49269875,
+          "peak_rss_bytes": 145719296
+        },
+        {
+          "variant": "candidate",
+          "phase": "ordinary",
+          "elapsed_ns": 2254729.0,
+          "server_cpu_ns": 1760458.5,
+          "peak_rss_bytes": 144277504.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "full",
+          "elapsed_ns": 715854.5,
+          "server_cpu_ns": 316958.5,
+          "peak_rss_bytes": 145375232.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "conditional",
+          "elapsed_ns": 735979.5,
+          "server_cpu_ns": 352146.0,
+          "peak_rss_bytes": 145424384.0
+        }
+      ],
+      "certificate_totals": {
+        "baseline": {
+          "hits": 800,
+          "fallbacks": 0
+        },
+        "candidate": {
+          "hits": 800,
+          "fallbacks": 0
+        }
+      }
+    },
+    {
+      "workload": "wide",
+      "mask": "exact",
+      "artifact": {
+        "path": "output/conditional-generic-native-q10-wide.json",
+        "sha256": "410ba11c94e322d5d2487144d389afe5742769f19a2242dc3e62dddfe743dc86",
+        "bytes": 89550,
+        "availability": "local, unpublished"
+      },
+      "rounds": 5,
+      "queries_per_phase": 10,
+      "documents": 8,
+      "value_bytes": 262144,
+      "corpus_sha256": "71669b0a9a48f6deb08febc1e4b287b6c336e6e91a1ce475eb434b679c30e6ee",
+      "output_sha256": {
+        "ordinary": "1b84ae889fef71fcd527efb40f190aafed9544861fde2b7210874784396d6681",
+        "full": "38a348f0497ea0dc4e4e4498d9c633ed2181a29cf13303c7413b2daaca8d20c9",
+        "conditional": "0466105df69a235c4b8f178e00924a7db5a0ce55cb4968cfc45beb2af6b20468"
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "ingest",
+          "elapsed_ns": 45277250,
+          "server_cpu_ns": 49660292,
+          "peak_rss_bytes": 156024832
+        },
+        {
+          "variant": "baseline",
+          "phase": "ordinary",
+          "elapsed_ns": 4870625.0,
+          "server_cpu_ns": 3364708.5,
+          "peak_rss_bytes": 157810688.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "full",
+          "elapsed_ns": 9878812.5,
+          "server_cpu_ns": 8603229.5,
+          "peak_rss_bytes": 162029568.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "conditional",
+          "elapsed_ns": 900667.0,
+          "server_cpu_ns": 497208.0,
+          "peak_rss_bytes": 162643968.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "ingest",
+          "elapsed_ns": 43025750,
+          "server_cpu_ns": 56342083,
+          "peak_rss_bytes": 152616960
+        },
+        {
+          "variant": "candidate",
+          "phase": "ordinary",
+          "elapsed_ns": 5004687.5,
+          "server_cpu_ns": 3559958.0,
+          "peak_rss_bytes": 154304512.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "full",
+          "elapsed_ns": 10023437.5,
+          "server_cpu_ns": 8727062.5,
+          "peak_rss_bytes": 159432704.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "conditional",
+          "elapsed_ns": 904000.5,
+          "server_cpu_ns": 472312.5,
+          "peak_rss_bytes": 159612928.0
+        }
+      ],
+      "certificate_totals": {
+        "baseline": {
+          "hits": 800,
+          "fallbacks": 0
+        },
+        "candidate": {
+          "hits": 800,
+          "fallbacks": 0
+        }
+      }
+    },
+    {
+      "workload": "opaque",
+      "mask": "exact",
+      "artifact": {
+        "path": "output/conditional-generic-native-q10-opaque.json",
+        "sha256": "c6408aab307bec15e23ace081b5c76eb215847b40e3f7c65fbe2ce78f3b1f835",
+        "bytes": 89691,
+        "availability": "local, unpublished"
+      },
+      "rounds": 5,
+      "queries_per_phase": 10,
+      "documents": 8,
+      "value_bytes": 262144,
+      "corpus_sha256": "c14623266a468fe93c58fdf4f9e8a4eac7108a1bb4dfe2bb121118e4d66ee9d6",
+      "output_sha256": {
+        "ordinary": "7fa487ba45d97aef37ebddb547fed3b515626e190b312358d78b2e7ca3e8cd54",
+        "full": "689d16082c283cf1aa63294fcf767ddcc4d2865ac8458b50ccae5ad8952d7447",
+        "conditional": "43fa3b993cfd4b8f1d753bcad28c1de5e28108af84524cf424d97feec883652b"
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "ingest",
+          "elapsed_ns": 40289166,
+          "server_cpu_ns": 52489459,
+          "peak_rss_bytes": 154943488
+        },
+        {
+          "variant": "baseline",
+          "phase": "ordinary",
+          "elapsed_ns": 4983625.0,
+          "server_cpu_ns": 3373834.0,
+          "peak_rss_bytes": 156893184.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "full",
+          "elapsed_ns": 9389542.0,
+          "server_cpu_ns": 7865833.5,
+          "peak_rss_bytes": 162693120.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "conditional",
+          "elapsed_ns": 4370646.0,
+          "server_cpu_ns": 3800312.0,
+          "peak_rss_bytes": 163266560.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "ingest",
+          "elapsed_ns": 41261000,
+          "server_cpu_ns": 54008625,
+          "peak_rss_bytes": 153845760
+        },
+        {
+          "variant": "candidate",
+          "phase": "ordinary",
+          "elapsed_ns": 5082791.5,
+          "server_cpu_ns": 3470687.0,
+          "peak_rss_bytes": 156205056.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "full",
+          "elapsed_ns": 9619749.5,
+          "server_cpu_ns": 8218146.0,
+          "peak_rss_bytes": 163815424.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "conditional",
+          "elapsed_ns": 4451208.5,
+          "server_cpu_ns": 3945458.5,
+          "peak_rss_bytes": 163905536.0
+        }
+      ],
+      "certificate_totals": {
+        "baseline": {
+          "hits": 0,
+          "fallbacks": 800
+        },
+        "candidate": {
+          "hits": 0,
+          "fallbacks": 800
+        }
+      }
+    },
+    {
+      "workload": "small",
+      "mask": "exact",
+      "artifact": {
+        "path": "output/conditional-generic-native-q10-small.json",
+        "sha256": "74b28a55937a5618ddc3be6e63fa5c85311d25d0bc3a8b059197e6928ba4d522",
+        "bytes": 88185,
+        "availability": "local, unpublished"
+      },
+      "rounds": 5,
+      "queries_per_phase": 10,
+      "documents": 8,
+      "value_bytes": 262144,
+      "corpus_sha256": "598aaac834e4feaebc11769f86bf24e754fd80bad034f482fd10951cdded9678",
+      "output_sha256": {
+        "ordinary": "195d2ac231f700c3bd45f2302530846d14b972fa117e39fd209ff51ccd0a69e8",
+        "full": "3dcd3e08f8def2551e161b3f5db128983f15bc17a195e67249a82fbbe7401861",
+        "conditional": "ccf812738ffc060ca6450add357e32a7754f36cff63f0abd9e42cc0f7a72167f"
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "ingest",
+          "elapsed_ns": 20311167,
+          "server_cpu_ns": 32509625,
+          "peak_rss_bytes": 117817344
+        },
+        {
+          "variant": "baseline",
+          "phase": "ordinary",
+          "elapsed_ns": 814083.5,
+          "server_cpu_ns": 286625.0,
+          "peak_rss_bytes": 120946688.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "full",
+          "elapsed_ns": 891042.0,
+          "server_cpu_ns": 376458.0,
+          "peak_rss_bytes": 122028032.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "conditional",
+          "elapsed_ns": 942854.0,
+          "server_cpu_ns": 426958.0,
+          "peak_rss_bytes": 122093568.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "ingest",
+          "elapsed_ns": 21828416,
+          "server_cpu_ns": 33526209,
+          "peak_rss_bytes": 118882304
+        },
+        {
+          "variant": "candidate",
+          "phase": "ordinary",
+          "elapsed_ns": 803396.0,
+          "server_cpu_ns": 288271.0,
+          "peak_rss_bytes": 121831424.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "full",
+          "elapsed_ns": 831125.0,
+          "server_cpu_ns": 367333.5,
+          "peak_rss_bytes": 122912768.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "conditional",
+          "elapsed_ns": 840729.0,
+          "server_cpu_ns": 386833.5,
+          "peak_rss_bytes": 122945536.0
+        }
+      ],
+      "certificate_totals": {
+        "baseline": {
+          "hits": 0,
+          "fallbacks": 800
+        },
+        "candidate": {
+          "hits": 0,
+          "fallbacks": 800
+        }
+      }
+    },
+    {
+      "workload": "mixed",
+      "mask": "exact",
+      "artifact": {
+        "path": "output/conditional-generic-native-q10-mixed.json",
+        "sha256": "91e1378c24e667f4401cda22c26a8cc357554e5f08a3ab0912bf64be03acf340",
+        "bytes": 89813,
+        "availability": "local, unpublished"
+      },
+      "rounds": 5,
+      "queries_per_phase": 10,
+      "documents": 8,
+      "value_bytes": 262144,
+      "corpus_sha256": "cc57df5147fc7911b18c740fe65433743fd0884a4630a6f9de07659a91bf2d97",
+      "output_sha256": {
+        "ordinary": "3af5a24af55c8e31e329b484e66a1f2873c8b267bda980480b33964e25b3f133",
+        "full": "8f3827885cdab0bbffcf18b55c214fc43b0179bba850cbc7ff35cce6b634bc74",
+        "conditional": "e7809a054e20d03b66839e3ee04025ff793fe66bd0b6819d33a8f4f2ee663fcc"
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "ingest",
+          "elapsed_ns": 61011333,
+          "server_cpu_ns": 71429042,
+          "peak_rss_bytes": 168034304
+        },
+        {
+          "variant": "baseline",
+          "phase": "ordinary",
+          "elapsed_ns": 5302354.0,
+          "server_cpu_ns": 3956770.5,
+          "peak_rss_bytes": 166092800.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "full",
+          "elapsed_ns": 11769333.5,
+          "server_cpu_ns": 10578062.5,
+          "peak_rss_bytes": 168476672.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "conditional",
+          "elapsed_ns": 1349708.0,
+          "server_cpu_ns": 905083.5,
+          "peak_rss_bytes": 168673280.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "ingest",
+          "elapsed_ns": 59857959,
+          "server_cpu_ns": 66909375,
+          "peak_rss_bytes": 162463744
+        },
+        {
+          "variant": "candidate",
+          "phase": "ordinary",
+          "elapsed_ns": 5281666.5,
+          "server_cpu_ns": 3964145.5,
+          "peak_rss_bytes": 163954688.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "full",
+          "elapsed_ns": 11791729.5,
+          "server_cpu_ns": 10567458.5,
+          "peak_rss_bytes": 169271296.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "conditional",
+          "elapsed_ns": 1489646.0,
+          "server_cpu_ns": 975354.5,
+          "peak_rss_bytes": 169443328.0
+        }
+      ],
+      "certificate_totals": {
+        "baseline": {
+          "hits": 600,
+          "fallbacks": 200
+        },
+        "candidate": {
+          "hits": 600,
+          "fallbacks": 200
+        }
+      }
+    },
+    {
+      "workload": "ascii",
+      "mask": "exact",
+      "artifact": {
+        "path": "output/conditional-generic-native-q10-ascii-1-exact.json",
+        "sha256": "8a8007dfeb9e873785b45a6d30f64f402984fb178a6a66ff0e00a17c93c4d757",
+        "bytes": 88748,
+        "availability": "local, unpublished"
+      },
+      "rounds": 5,
+      "queries_per_phase": 10,
+      "documents": 1,
+      "value_bytes": 262144,
+      "corpus_sha256": "cc28b1ea75b247cc2fd6bace70d9c23470aa5d2cd6f1b0a17871f7db59d15636",
+      "output_sha256": {
+        "ordinary": "3d9e6a11790e4e295794f7d338e0211eed6548a63a51064e07fe5aa18f689eb1",
+        "full": "589855589eb9a777847048c9eb69c750c2bc22ea45b2702c06ac006590c8db8d",
+        "conditional": "db1b7752cc983908c344c1b96cd3c866befbb9c20bc2858b06c69a64674bea8d"
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "ingest",
+          "elapsed_ns": 23369500,
+          "server_cpu_ns": 35750709,
+          "peak_rss_bytes": 125550592
+        },
+        {
+          "variant": "baseline",
+          "phase": "ordinary",
+          "elapsed_ns": 1336104.5,
+          "server_cpu_ns": 675562.5,
+          "peak_rss_bytes": 128434176.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "full",
+          "elapsed_ns": 1962854.0,
+          "server_cpu_ns": 1313729.5,
+          "peak_rss_bytes": 129892352.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "conditional",
+          "elapsed_ns": 661958.5,
+          "server_cpu_ns": 244166.5,
+          "peak_rss_bytes": 129941504.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "ingest",
+          "elapsed_ns": 22590791,
+          "server_cpu_ns": 32969417,
+          "peak_rss_bytes": 126271488
+        },
+        {
+          "variant": "candidate",
+          "phase": "ordinary",
+          "elapsed_ns": 1328708.5,
+          "server_cpu_ns": 654146.0,
+          "peak_rss_bytes": 129089536.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "full",
+          "elapsed_ns": 2064604.0,
+          "server_cpu_ns": 1396416.5,
+          "peak_rss_bytes": 130449408.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "conditional",
+          "elapsed_ns": 737896.0,
+          "server_cpu_ns": 266375.0,
+          "peak_rss_bytes": 130482176.0
+        }
+      ],
+      "certificate_totals": {
+        "baseline": {
+          "hits": 100,
+          "fallbacks": 0
+        },
+        "candidate": {
+          "hits": 100,
+          "fallbacks": 0
+        }
+      }
+    },
+    {
+      "workload": "ascii",
+      "mask": "exact",
+      "artifact": {
+        "path": "output/conditional-generic-native-q10-ascii-64-exact.json",
+        "sha256": "491fb62ae2268d7167fb520e4391cc6f8aef12412115128c24354dc04a2c899e",
+        "bytes": 89783,
+        "availability": "local, unpublished"
+      },
+      "rounds": 5,
+      "queries_per_phase": 10,
+      "documents": 64,
+      "value_bytes": 16384,
+      "corpus_sha256": "f3bc577209159a5845e617ffc83e25f1f8e22d3aa5e0b1439e6861ead8863611",
+      "output_sha256": {
+        "ordinary": "acbd2d5fd50a2aac972072f73b8564a8f5515601f19dfa2d2330bbc464d23e45",
+        "full": "01d1bed0a646a4ae8022d76ad815b94513cbcff28734110e0d25301407cb9940",
+        "conditional": "febf8f0417ef2c601bf09a5f070bfa2e37fd48388ee859a6017a8caf1736723d"
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "ingest",
+          "elapsed_ns": 36459375,
+          "server_cpu_ns": 47166500,
+          "peak_rss_bytes": 144867328
+        },
+        {
+          "variant": "baseline",
+          "phase": "ordinary",
+          "elapsed_ns": 3338250.0,
+          "server_cpu_ns": 2277874.5,
+          "peak_rss_bytes": 149700608.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "full",
+          "elapsed_ns": 6714875.0,
+          "server_cpu_ns": 5712541.0,
+          "peak_rss_bytes": 156319744.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "conditional",
+          "elapsed_ns": 2374875.0,
+          "server_cpu_ns": 1820541.5,
+          "peak_rss_bytes": 157253632.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "ingest",
+          "elapsed_ns": 36903083,
+          "server_cpu_ns": 49430125,
+          "peak_rss_bytes": 144982016
+        },
+        {
+          "variant": "candidate",
+          "phase": "ordinary",
+          "elapsed_ns": 3394791.5,
+          "server_cpu_ns": 2302854.0,
+          "peak_rss_bytes": 148570112.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "full",
+          "elapsed_ns": 6517416.5,
+          "server_cpu_ns": 5548416.5,
+          "peak_rss_bytes": 155893760.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "conditional",
+          "elapsed_ns": 2369854.5,
+          "server_cpu_ns": 1742562.5,
+          "peak_rss_bytes": 156336128.0
+        }
+      ],
+      "certificate_totals": {
+        "baseline": {
+          "hits": 6400,
+          "fallbacks": 0
+        },
+        "candidate": {
+          "hits": 6400,
+          "fallbacks": 0
+        }
+      }
+    },
+    {
+      "workload": "mixed",
+      "mask": "parent",
+      "artifact": {
+        "path": "output/conditional-generic-native-q10-mixed-8-parent.json",
+        "sha256": "246496f9bd725ff9e53840054de3a919c4173a76504f6a4177832f3e8b67d5d0",
+        "bytes": 89877,
+        "availability": "local, unpublished"
+      },
+      "rounds": 5,
+      "queries_per_phase": 10,
+      "documents": 8,
+      "value_bytes": 262144,
+      "corpus_sha256": "cc57df5147fc7911b18c740fe65433743fd0884a4630a6f9de07659a91bf2d97",
+      "output_sha256": {
+        "ordinary": "10619ea0539feba426f206b6277aa5c3cf24990854bfe4a33ca92a4b7b40dc4f",
+        "full": "c82093a959248c7f5214fcb87e2ab497eb08cce6cb40a4f8027b76d9d781ce1b",
+        "conditional": "8f3c35d9ee56b78c4d5d7c0f3c4cd7d46cb178b3a8f7719e3e591946056633d8"
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "ingest",
+          "elapsed_ns": 64375666,
+          "server_cpu_ns": 77119000,
+          "peak_rss_bytes": 162594816
+        },
+        {
+          "variant": "baseline",
+          "phase": "ordinary",
+          "elapsed_ns": 5413833.0,
+          "server_cpu_ns": 4012021.0,
+          "peak_rss_bytes": 164642816.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "full",
+          "elapsed_ns": 12256042.0,
+          "server_cpu_ns": 10965833.0,
+          "peak_rss_bytes": 168673280.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "conditional",
+          "elapsed_ns": 5956896.0,
+          "server_cpu_ns": 5299979.0,
+          "peak_rss_bytes": 169345024.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "ingest",
+          "elapsed_ns": 64043584,
+          "server_cpu_ns": 75470541,
+          "peak_rss_bytes": 162463744
+        },
+        {
+          "variant": "candidate",
+          "phase": "ordinary",
+          "elapsed_ns": 5323958.0,
+          "server_cpu_ns": 4022896.0,
+          "peak_rss_bytes": 162971648.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "full",
+          "elapsed_ns": 12162542.0,
+          "server_cpu_ns": 10952708.5,
+          "peak_rss_bytes": 166461440.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "conditional",
+          "elapsed_ns": 5753979.0,
+          "server_cpu_ns": 5168708.5,
+          "peak_rss_bytes": 166543360.0
+        }
+      ],
+      "certificate_totals": {
+        "baseline": {
+          "hits": 0,
+          "fallbacks": 800
+        },
+        "candidate": {
+          "hits": 0,
+          "fallbacks": 800
+        }
+      }
+    },
+    {
+      "workload": "mixed",
+      "mask": "wildcard",
+      "artifact": {
+        "path": "output/conditional-generic-native-q10-mixed-8-wildcard.json",
+        "sha256": "6dd8c816103dc9413bb651cf70833855e6a79bb6d0d05bf665664e729d7a3dcb",
+        "bytes": 89970,
+        "availability": "local, unpublished"
+      },
+      "rounds": 5,
+      "queries_per_phase": 10,
+      "documents": 8,
+      "value_bytes": 262144,
+      "corpus_sha256": "cc57df5147fc7911b18c740fe65433743fd0884a4630a6f9de07659a91bf2d97",
+      "output_sha256": {
+        "ordinary": "10619ea0539feba426f206b6277aa5c3cf24990854bfe4a33ca92a4b7b40dc4f",
+        "full": "c82093a959248c7f5214fcb87e2ab497eb08cce6cb40a4f8027b76d9d781ce1b",
+        "conditional": "8f3c35d9ee56b78c4d5d7c0f3c4cd7d46cb178b3a8f7719e3e591946056633d8"
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "ingest",
+          "elapsed_ns": 71618125,
+          "server_cpu_ns": 82016500,
+          "peak_rss_bytes": 146685952
+        },
+        {
+          "variant": "baseline",
+          "phase": "ordinary",
+          "elapsed_ns": 5527187.5,
+          "server_cpu_ns": 4073125.0,
+          "peak_rss_bytes": 147750912.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "full",
+          "elapsed_ns": 12590291.5,
+          "server_cpu_ns": 11318625.0,
+          "peak_rss_bytes": 150601728.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "conditional",
+          "elapsed_ns": 10380458.5,
+          "server_cpu_ns": 9843979.0,
+          "peak_rss_bytes": 115531776.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "ingest",
+          "elapsed_ns": 66269459,
+          "server_cpu_ns": 70423875,
+          "peak_rss_bytes": 148602880
+        },
+        {
+          "variant": "candidate",
+          "phase": "ordinary",
+          "elapsed_ns": 5558937.5,
+          "server_cpu_ns": 4156063.0,
+          "peak_rss_bytes": 149929984.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "full",
+          "elapsed_ns": 12559562.5,
+          "server_cpu_ns": 11304687.5,
+          "peak_rss_bytes": 153075712.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "conditional",
+          "elapsed_ns": 10362812.5,
+          "server_cpu_ns": 9874187.5,
+          "peak_rss_bytes": 152961024.0
+        }
+      ],
+      "certificate_totals": {
+        "baseline": {
+          "hits": 0,
+          "fallbacks": 0
+        },
+        "candidate": {
+          "hits": 0,
+          "fallbacks": 0
+        }
+      }
+    },
+    {
+      "workload": "mixed",
+      "mask": "exclude",
+      "artifact": {
+        "path": "output/conditional-generic-native-q10-mixed-8-exclude.json",
+        "sha256": "e23affa09aa801fa23174c9b4b809c423436fd551d4fee9ebd98acb752ebe2f5",
+        "bytes": 89972,
+        "availability": "local, unpublished"
+      },
+      "rounds": 5,
+      "queries_per_phase": 10,
+      "documents": 8,
+      "value_bytes": 262144,
+      "corpus_sha256": "cc57df5147fc7911b18c740fe65433743fd0884a4630a6f9de07659a91bf2d97",
+      "output_sha256": {
+        "ordinary": "10619ea0539feba426f206b6277aa5c3cf24990854bfe4a33ca92a4b7b40dc4f",
+        "full": "c82093a959248c7f5214fcb87e2ab497eb08cce6cb40a4f8027b76d9d781ce1b",
+        "conditional": "8f3c35d9ee56b78c4d5d7c0f3c4cd7d46cb178b3a8f7719e3e591946056633d8"
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "ingest",
+          "elapsed_ns": 61697667,
+          "server_cpu_ns": 75709750,
+          "peak_rss_bytes": 161546240
+        },
+        {
+          "variant": "baseline",
+          "phase": "ordinary",
+          "elapsed_ns": 5396062.5,
+          "server_cpu_ns": 3976749.5,
+          "peak_rss_bytes": 163594240.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "full",
+          "elapsed_ns": 12511854.0,
+          "server_cpu_ns": 11260916.5,
+          "peak_rss_bytes": 165150720.0
+        },
+        {
+          "variant": "baseline",
+          "phase": "conditional",
+          "elapsed_ns": 10247708.5,
+          "server_cpu_ns": 9756604.0,
+          "peak_rss_bytes": 165191680.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "ingest",
+          "elapsed_ns": 59316000,
+          "server_cpu_ns": 73565916,
+          "peak_rss_bytes": 165445632
+        },
+        {
+          "variant": "candidate",
+          "phase": "ordinary",
+          "elapsed_ns": 5527792.0,
+          "server_cpu_ns": 4066271.0,
+          "peak_rss_bytes": 166543360.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "full",
+          "elapsed_ns": 12488708.5,
+          "server_cpu_ns": 11160188.0,
+          "peak_rss_bytes": 169304064.0
+        },
+        {
+          "variant": "candidate",
+          "phase": "conditional",
+          "elapsed_ns": 10302729.5,
+          "server_cpu_ns": 9840396.0,
+          "peak_rss_bytes": 169459712.0
+        }
+      ],
+      "certificate_totals": {
+        "baseline": {
+          "hits": 0,
+          "fallbacks": 0
+        },
+        "candidate": {
+          "hits": 0,
+          "fallbacks": 0
+        }
+      }
+    }
+  ],
+  "native_materialization_policy": "equal-mask read groups, at most 64 authorities; coalesced retained range bytes or full primary sizes admitted under 1 MiB per fresh scope, with one-large-row progress; singleton reads reuse their metadata scope",
+  "validation": {
+    "macos_cli_passed": 287,
+    "macos_cli_skipped": 2,
+    "linux_vm_cli_passed": 286,
+    "linux_vm_cli_skipped": 3,
+    "query_contracts": 149,
+    "identity_publication_window": 18,
+    "linux_vm_identity_publication_window": 18,
+    "logical_fields_passed": 94,
+    "logical_fields_skipped": 1,
+    "contract_leaks": 0,
+    "native_integration_passed": 28,
+    "native_integration_skipped": 7,
+    "persisted_certificate_upgrade": "passed using the previous PR server and the new server on the same stored data",
+    "window_metadata_calls": "two sorted metadata batches per window; remaining reads grouped by exact mask and backend range capability, with 1 MiB admission, fresh per-chunk scopes, one-large-row progress and cancellation cleanup",
+    "windows_cross_compilation": "passed",
+    "apache_sources": 2203,
+    "host_resource_note": "An initial macOS suite run hit the unchanged watcher fallback assertion under concurrent fixture load; isolated rerun and the subsequent full suite both passed."
+  },
+  "reproduction": {
+    "native": "uv run --project zig/e2e/antfly python zig/e2e/antfly/bench_source_projection.py CANDIDATE --baseline BASELINE --rounds 5 --queries-per-phase 10 --documents 8 --value-bytes 262144 --workload WORKLOAD --output output/report.json",
+    "client": "python3 zig/pkg/antfly-grep/bench/visual_batches.py CANDIDATE --baseline BASELINE --fixture-library FIXTURE --rounds 5 --units 2 --parents 8 --page-size 8 --shapes SHAPES --stream --source-projection --question-miss --output output/report.json"
+  },
+  "validation_logs": {
+    "conditional-generic-cli-macos-final.log": {
+      "availability": "local, unpublished",
+      "sha256": "93c4e95114d15f93603590fe766ef07791d3555529f89186c6bcb3b2dce85974"
+    },
+    "conditional-generic-cli-linux.log": {
+      "availability": "local, unpublished",
+      "sha256": "bfcb46297a6ba17a5df68874ff949c5f4e8f8e28f0aa0716427945a841b5bd63"
+    },
+    "conditional-generic-scoped-final-contracts.log": {
+      "availability": "local, unpublished",
+      "sha256": "0d42131ab22deb08c0a73b7fd014835663a57e1462094a5e3c5aca7318e62cce"
+    },
+    "conditional-generic-scoped-storage-linux.log": {
+      "availability": "local, unpublished",
+      "sha256": "86677fd22f5427b522357f2aa56615044b0e632cac8eba107c89354919d5041b"
+    },
+    "conditional-generic-scoped-native-integration.log": {
+      "availability": "local, unpublished",
+      "sha256": "0dd3a5dad206771efa617b29b892e58acc48b20e8c8f16b11ae64e96569d0b0c"
+    },
+    "conditional-generic-final-boundary.log": {
+      "availability": "local, unpublished",
+      "sha256": "d419304086e969f41f709425c365ed1f01eaa5342262b6b6fc9831255afa4529"
+    },
+    "conditional-generic-windows-build.log": {
+      "availability": "local, unpublished",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "conditional-generic-scoped-native-cache-check.log": {
+      "availability": "local, unpublished",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+}

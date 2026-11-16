@@ -5,7 +5,8 @@ frame selection, surface lifetime and CPU/Metal preparation. It consumes
 [lib/media](../media/MEDIA.md). Inference adapters own model geometry, tokens,
 normalization and embedding policy. Runtime codec paths use maintained Zig source
 or explicit Apple platform APIs; FFmpeg, libvpx and dav1d are offline reference
-tools only. CUDA/NVDEC remains planned.
+tools only. CUDA/NVDEC remains planned for this library. Gemma 4 generation uses
+these routes on CPU and Metal, and its own NVDEC route on CUDA.
 
 See [the completion audit](../../../docs/plans/native-video-noncuda-audit.md) for
 qualification results, reproduction and limitations. This document describes the
@@ -20,7 +21,12 @@ current contracts; historical progress and raw reports live in Git history.
 | Portable VP8 | Versions 0–3, stateful interframes and hidden references; planar owned output. |
 | Portable VP9 | Profiles 0–3, 8/10/12-bit 4:2:0/4:2:2/4:4:4, interframes and superframes. |
 | Portable AV1 | Profiles 0–2, 8/10/12-bit monochrome and 4:2:0/4:2:2/4:4:4, interframes, show-existing and film grain; low-overhead and Annex B framing. |
-| Apple VideoToolbox | Eligible static progressive limited-range avc1 8-bit 4:2:0; fixed-format VP9/AV1 WebM 8/10-bit 4:2:0 with one visible picture per packet. Library hardware-only default; model automatic selection explicitly permits Apple software. |
+| Apple VideoToolbox | Eligible static progressive limited-range avc1 8-bit 4:2:0; fixed-format VP9/AV1 WebM 8/10-bit 4:2:0 with one visible picture per packet; AV1 MP4 through [mp4_coded](src/mp4_coded.zig); [HEVC MP4](src/backends/apple_hevc.zig) with out-of-band parameter sets, 8/10-bit 4:2:0. Library hardware-only default; model automatic selection explicitly permits Apple software. |
+
+AV1 in MP4 translates its container metadata onto the WebM lane, so it shares
+the portable and Apple AV1 routes. HEVC has no portable decoder: outside
+VideoToolbox and NVDEC, inference requests get a 400 `VIDEO_CODEC_UNAVAILABLE`
+that says to transcode or use a host with hardware decoding.
 
 Compile-time [capabilities](src/capabilities.zig) distinguish built routes from
 runtime hardware/profile availability. Unsupported tools fail explicitly; the
@@ -525,7 +531,7 @@ producer ownership and cancellation boundaries are unchanged. Cache admission
 failure retains bounded preparation; cache reclamation cannot invalidate active
 CPU borrowers or Metal commands. These mechanisms establish reuse and bounded
 lifetimes; speed comparisons require the pinned per-case performance gate in
-[the model guide](../../../docs/guides/embeddinggemma2.md#per-case-performance-gate).
+[the model guide](../../../docs/design/inference/history/embeddinggemma2/2026-10-22-model-guide-and-qualification.md#per-case-performance-gate).
 
 ### CUDA decoder cache accounting
 
@@ -1351,3 +1357,28 @@ probe with its effective parameter bootstrap. Failed append detaches the already
 admitted collector capacity to preserve the published metadata prefix without
 allocating rollback storage. Cohort teardown signals every producer before
 joining any member, so a queued preparation cannot strand a shared decoder lease.
+
+HEVC display/color metadata is resolved from each picture's PPS→SPS activation,
+not hvcC array order. Inspection reads sample zero plus bounded NAL-header probes;
+subsequent VCL payloads are skipped. The resolved reader carries a validation
+marker so preparation and cache planning reuse that work. Known parameter-set
+identities may switch when coded/display geometry, depth, SAR and color policy
+agree. Later parameter-set redefinitions or incompatible policy switches return
+`UnsupportedDynamicVideoConfig` before any frame is published; sparse VideoToolbox
+restarts currently use the initial configuration.
+
+HEVC sparse restarts discover IRAPs with one bounded NAL-header pass through the
+last selected packet, including pictures omitted from container sync hints.
+Only actual IRAP indexes are retained; compressed picture payloads are skipped.
+Generation admission uses an allocation-free MP4 metadata probe. Execution owns
+one bounded inspection scope shared by timestamp selection and decoding, under
+request cancellation and the reserved host scratch envelope.
+
+HEVC surface admission reserves 24 references at the active SPS's coded geometry
+and depth, plus one output at the requested container geometry and output depth.
+A conformance crop never shrinks reference storage. Generation initially admits
+only inspection host memory; the exact active reference/output envelope is then
+acquired from both local and shared budgets after controlled activation and
+before decoder creation. This avoids guessing from inactive or incomplete
+metadata. Failed upgrades refund both ledgers. CUDA and portable display planning share checked SAR geometry, including
+zero-rounded and greater-than-16384 widths; neither clamps the aspect ratio.

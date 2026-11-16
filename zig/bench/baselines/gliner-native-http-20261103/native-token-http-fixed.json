@@ -1,0 +1,159 @@
+{
+  "status": "complete",
+  "scope": "execution_capacity_only",
+  "endpoint": "http://127.0.0.1:18776/ai/v1/extract",
+  "word": "configuration_visibility_maintenance_acknowledgement ",
+  "word_tokens": 9,
+  "overhead": 10,
+  "dense_source_words": 1819,
+  "source_words": 1822,
+  "filler": "the ",
+  "filler_tokens": 1,
+  "filler_words": 3,
+  "probes": [
+    {
+      "duration_ns": 1361540334,
+      "request_sha256": "93daefbc19b75985080e85316a110d2fa5ee477d53b5966cb2599d8ab14d72e8",
+      "response_sha256": "89c6c720f041d76430854a0088dbf3e962c1edaacbd3982752bfb438ce57ebe4",
+      "output": {
+        "object": "extraction",
+        "model": "fastino/gliner2.5-base-v1",
+        "schema_version": 2,
+        "data": [
+          {
+            "offset_unit": "utf8_bytes",
+            "entities": [
+              {
+                "label": "concept",
+                "text": "configuration_visibility_maintenance_acknowledgement",
+                "start": 0,
+                "end": 52
+              }
+            ],
+            "long_document": {
+              "version": 1,
+              "window_count": 1,
+              "window_policy": "source_words_midpoint_ownership",
+              "classification_aggregation": "owned_word_weighted_mean_raw_logits",
+              "duplicate_score": "maximum_calibrated_score",
+              "natural_record_identity": "exact_source_anchor",
+              "other_record_identity": "occurrence",
+              "solver_optimality_scope": "retained_candidate_graph"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 19,
+          "completion_tokens": 0,
+          "total_tokens": 19
+        }
+      }
+    },
+    {
+      "duration_ns": 20813709,
+      "request_sha256": "a34331f50b32efc5814913eba2df0a8322330903f67e8994b74c4f5ee92384e8",
+      "response_sha256": "ad61755cffe2982eddb092008f29d1262aa71011423a3905ccde6d578deda5e0",
+      "output": {
+        "object": "extraction",
+        "model": "fastino/gliner2.5-base-v1",
+        "schema_version": 2,
+        "data": [
+          {
+            "offset_unit": "utf8_bytes",
+            "entities": [
+              {
+                "label": "concept",
+                "text": "configuration_visibility_maintenance_acknowledgement",
+                "start": 0,
+                "end": 52
+              },
+              {
+                "label": "concept",
+                "text": "configuration_visibility_maintenance_acknowledgement",
+                "start": 53,
+                "end": 105
+              }
+            ],
+            "long_document": {
+              "version": 1,
+              "window_count": 1,
+              "window_policy": "source_words_midpoint_ownership",
+              "classification_aggregation": "owned_word_weighted_mean_raw_logits",
+              "duplicate_score": "maximum_calibrated_score",
+              "natural_record_identity": "exact_source_anchor",
+              "other_record_identity": "occurrence",
+              "solver_optimality_scope": "retained_candidate_graph"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 28,
+          "completion_tokens": 0,
+          "total_tokens": 28
+        }
+      }
+    },
+    {
+      "duration_ns": 16610917,
+      "request_sha256": "0e97b06b5bfe58e42e43d1124db36390cd14db3d38266c68dbdce9f0ac130d00",
+      "response_sha256": "a699ba333ce0ce54e1d62f58fab408f8716fc79ab419fd4bf5d7a256872790cd",
+      "output": {
+        "object": "extraction",
+        "model": "fastino/gliner2.5-base-v1",
+        "schema_version": 2,
+        "data": [
+          {
+            "offset_unit": "utf8_bytes",
+            "entities": [],
+            "long_document": {
+              "version": 1,
+              "window_count": 1,
+              "window_policy": "source_words_midpoint_ownership",
+              "classification_aggregation": "owned_word_weighted_mean_raw_logits",
+              "duplicate_score": "maximum_calibrated_score",
+              "natural_record_identity": "exact_source_anchor",
+              "other_record_identity": "occurrence",
+              "solver_optimality_scope": "retained_candidate_graph"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 11,
+          "completion_tokens": 0,
+          "total_tokens": 11
+        }
+      }
+    }
+  ],
+  "capacity": {
+    "duration_ns": 204781922167,
+    "request_sha256": "f85eb478bf6e552b57a8980ef073d8d62ef38c5d2ef1f03a906646ca05bc625b",
+    "response_sha256": "e8851dece593ff46d498765acedc96b69ad8b35eb15d2aa720218e74490a431e",
+    "output": {
+      "object": "extraction",
+      "model": "fastino/gliner2.5-base-v1",
+      "schema_version": 2,
+      "data": [
+        {
+          "offset_unit": "utf8_bytes",
+          "entities": [],
+          "long_document": {
+            "version": 1,
+            "window_count": 1,
+            "window_policy": "source_words_midpoint_ownership",
+            "classification_aggregation": "owned_word_weighted_mean_raw_logits",
+            "duplicate_score": "maximum_calibrated_score",
+            "natural_record_identity": "exact_source_anchor",
+            "other_record_identity": "occurrence",
+            "solver_optimality_scope": "retained_candidate_graph"
+          }
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 16384,
+        "completion_tokens": 0,
+        "total_tokens": 16384
+      }
+    }
+  }
+}

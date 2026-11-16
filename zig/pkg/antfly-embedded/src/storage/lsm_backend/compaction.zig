@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const byte_copy = @import("../../common/byte_copy.zig");
 const work_budget = @import("work_budget.zig");
 const lsm_table_file = @import("../lsm/table_file.zig");
 const state_mod = @import("state.zig");
@@ -31,6 +32,17 @@ const resource_manager_mod = @import("../resource_manager.zig");
 
 const State = state_mod.State;
 const Run = repository_mod.Run;
+
+fn retainPersistedBloom(backend: anytype, filter: @import("bloom").OwnedFilter) ?@import("bloom").OwnedFilter {
+    if (comptime @hasField(@TypeOf(backend.options), "retain_bloom_filters")) {
+        if (!backend.options.retain_bloom_filters) {
+            var owned = filter;
+            owned.deinit(backend.allocator);
+            return null;
+        }
+    }
+    return filter;
+}
 
 test "resumable closure bounds discovery and emission and cleans up every allocation failure" {
     const Fixture = struct {
@@ -233,7 +245,7 @@ pub const PendingAdmission = struct {
             self.work.input_bytes +|= run.size_bytes;
             includeRunInWorkKeyRange(&self.work.key_range, plan.output_level, run);
         }
-        self.work.io_bytes = self.work.input_bytes +| self.work.input_bytes;
+        self.work.io_bytes = persistedMergeIoEstimate(self.work.input_bytes, self.work.input_runs);
         return self.prepared == count;
     }
 
@@ -1308,7 +1320,7 @@ pub const DomainIndex = struct {
                 const rhs = ctx.runs[b];
                 const ns = state_mod.compareNamespace(.{ .name = lhs.smallest_namespace_name }, .{ .name = rhs.smallest_namespace_name });
                 if (ns != .eq) return ns == .lt;
-                const domain = std.mem.order(u8, ctx.partition(lhs.smallest_key), ctx.partition(rhs.smallest_key));
+                const domain = byte_copy.orderBytes(ctx.partition(lhs.smallest_key), ctx.partition(rhs.smallest_key));
                 return if (domain == .eq) a < b else domain == .lt;
             }
         };
@@ -3395,7 +3407,7 @@ pub const PendingBulkPlan = struct {
             self.work.run_id_index.?.putAssumeCapacity(handle.run.id, {});
             self.work.input_runs += 1;
             self.work.input_bytes +|= handle.run.size_bytes;
-            self.work.io_bytes = self.work.input_bytes +| self.work.input_bytes;
+            self.work.io_bytes = persistedMergeIoEstimate(self.work.input_bytes, self.work.input_runs);
             includeRunInWorkKeyRange(&self.work.key_range, 0, handle.run.*);
             self.indices.?[self.emitted] = range.start + self.emitted;
             self.emitted += 1;
@@ -3896,7 +3908,7 @@ fn compactionWorkForSelectedPlanLocked(backend: anytype, plan: CompactionPlan, s
                     };
                 }
             }
-            work.io_bytes = work.input_bytes +| work.input_bytes;
+            work.io_bytes = persistedMergeIoEstimate(work.input_bytes, work.input_runs);
             break :blk work;
         };
         _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
@@ -3935,7 +3947,7 @@ fn compactionWorkForPlan(allocator: std.mem.Allocator, runs: anytype, plan: Comp
         .score = score,
         .input_runs = input_runs,
         .input_bytes = input_bytes,
-        .io_bytes = input_bytes +| input_bytes,
+        .io_bytes = persistedMergeIoEstimate(input_bytes, input_runs),
         .run_ids = run_ids,
         .key_range = key_range,
     };
@@ -4181,6 +4193,26 @@ pub fn setL0Sequence(runs: []Run, sequence: u64) void {
 
 fn compactPlanAt(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
     return try compactPlanAtWithForegroundPolicy(BackendType, backend, plan, false);
+}
+
+/// Consolidate a fresh, immutable L0 snapshot into a disjoint level. Existing
+/// merge cursors concatenate level files, so publication needs one live stream
+/// regardless of the number of output files. Mixed/live leveled stores retain
+/// their ordinary maintenance policy. Caller holds the backend write lock.
+pub fn consolidateFreshSnapshot(comptime BackendType: type, backend: *BackendType) !bool {
+    const count = run_store.count(backend);
+    if (count < 2 or countLeadingL0Runs(&backend.runs) != count) return false;
+    try compactPlanAt(BackendType, backend, .{
+        .source_level = 0,
+        .source_start = 0,
+        .source_len = count,
+        .target_start = count,
+        .target_len = 0,
+        .output_level = 1,
+    });
+    if (backend.root_dir != null and (backend.manifest_dirty or backend.obsolete_manifest_dirty))
+        try backend.persistManifestLocked();
+    return true;
 }
 
 fn compactPlanAtOptionalMaintenance(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
@@ -4501,9 +4533,9 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
         selected_run_ids[i] = run.id;
     }
     const input_bytes = sumRunPtrBytes(selected);
-    const reserved_run_ids = @max(@as(u64, 1), countRunPtrEntries(selected));
+    const reserved_run_ids = try persistedMergeIdReservation(countRunPtrEntries(selected), selected.len);
     const reserved_run_id_start = backend.next_run_id;
-    backend.next_run_id +|= reserved_run_ids;
+    backend.next_run_id = std.math.add(u64, backend.next_run_id, reserved_run_ids) catch return error.CompactionRunIdReservationExhausted;
     const reserved_run_id_end = backend.next_run_id;
 
     if (@hasDecl(BackendType, "retainReaderKind")) {
@@ -4616,9 +4648,10 @@ fn compactPinnedPlanWithUnlockedBuild(backend: anytype, plan: CompactionPlan, dr
             if (offset < handles.len) try io.sleep(.fromNanoseconds(1), .awake);
         }
     }
+    const reserved_ids = try persistedMergeIdReservation(entries, handles.len);
     _ = runtime_mod.lockBackend(BackendType, backend);
     const first_id = backend.next_run_id;
-    backend.next_run_id = std.math.add(u64, first_id, @max(@as(u64, 1), entries)) catch {
+    backend.next_run_id = std.math.add(u64, first_id, reserved_ids) catch {
         locked = true;
         return error.CompactionRunIdReservationExhausted;
     };
@@ -5679,8 +5712,22 @@ fn sumRunPtrBytes(runs: []const *Run) u64 {
 
 fn countRunPtrEntries(runs: anytype) usize {
     var total: usize = 0;
-    for (runs) |run| total +|= @intCast(inputRun(run).entry_count);
+    for (runs) |run| total +|= persistedInputEntries(run);
     return total;
+}
+
+fn persistedInputEntries(input: anytype) usize {
+    if (@TypeOf(input) == PersistedMergeGroup) return countRunEntries(input.runs.items);
+    return @intCast(inputRun(input).entry_count);
+}
+
+fn persistedInputBytes(input: anytype) u64 {
+    if (@TypeOf(input) == PersistedMergeGroup) {
+        var bytes: u64 = 0;
+        for (input.runs.items) |run| bytes +|= run.size_bytes;
+        return bytes;
+    }
+    return inputRun(input).size_bytes;
 }
 
 fn countRunEntries(runs: []const Run) usize {
@@ -6511,7 +6558,7 @@ fn rangesOverlapRun(lhs: Run, rhs: Run) bool {
 fn compareRunBound(lhs_namespace_name: ?[]const u8, lhs_key: []const u8, rhs_namespace_name: ?[]const u8, rhs_key: []const u8) std.math.Order {
     const namespace_order = state_mod.compareNamespace(.{ .name = lhs_namespace_name }, .{ .name = rhs_namespace_name });
     if (namespace_order != .eq) return namespace_order;
-    return std.mem.order(u8, lhs_key, rhs_key);
+    return byte_copy.orderBytes(lhs_key, rhs_key);
 }
 
 fn makeStateRunsFromSelectedRuns(comptime BackendType: type, backend: *BackendType, runs: []const *Run, level: u32, drop_tombstones: bool) !std.ArrayListUnmanaged(Run) {
@@ -6540,6 +6587,101 @@ pub fn makePersistedRunsFromSelectedRuns(comptime BackendType: type, backend: *B
     return makePersistedRunsFromSelectedRunsWithGc(BackendType, backend, window_runs, output_level, false);
 }
 
+// One intermediate is a complete sorted stream, even when the shared table
+// writer splits it into many files. Retain precedence by grouping contiguous
+// newest-first inputs; concatenate each group's disjoint files lazily.
+const persisted_merge_fan_in = 64;
+
+fn persistedMergeIoEstimate(input_bytes: u64, inputs: usize) u64 {
+    var streams = inputs;
+    var bytes = input_bytes +| input_bytes;
+    while (streams > persisted_merge_fan_in) {
+        streams = 1 + (streams - 1) / persisted_merge_fan_in;
+        bytes +|= input_bytes +| input_bytes;
+    }
+    return bytes;
+}
+
+fn persistedMergeIdReservation(entries: u64, inputs: usize) !u64 {
+    var streams = inputs;
+    var passes: u64 = 1;
+    while (streams > persisted_merge_fan_in) {
+        streams = 1 + (streams - 1) / persisted_merge_fan_in;
+        passes += 1;
+    }
+    // At worst each input entry becomes one physical output file per pass.
+    return std.math.mul(u64, @max(@as(u64, 1), entries), passes) catch error.CompactionRunIdReservationExhausted;
+}
+
+fn checkPersistedMergeActive(backend: anytype) !void {
+    if (comptime @hasField(@TypeOf(backend.options), "bulk_cancellation"))
+        try backend.options.bulk_cancellation.check();
+}
+
+const PersistedMergeGroup = struct {
+    runs: std.ArrayListUnmanaged(Run),
+    pointers: []*const Run,
+};
+
+fn releasePersistedMergeGroups(comptime BackendType: type, backend: *BackendType, groups: *std.ArrayListUnmanaged(PersistedMergeGroup)) void {
+    for (groups.items) |*group| {
+        backend.allocator.free(group.pointers);
+        discardOutputRuns(BackendType, backend, &group.runs);
+    }
+    groups.deinit(backend.allocator);
+    groups.* = .empty;
+}
+
+fn unlinkPersistedMergeGroups(backend: anytype, groups: []const PersistedMergeGroup) !void {
+    // No manifest has referenced these files, and the completed pass closed
+    // every input cursor. Release disk space before another pass; output
+    // tickets still own metadata/admission and perform idempotent cleanup.
+    for (groups) |group| for (group.runs.items) |run| {
+        repository_mod.deleteFileAbsoluteWithStorage(backend.storage.?, run.path.?) catch |err| switch (err) {
+            error.FileNotFound, error.NotFound => {},
+            else => return err,
+        };
+    };
+}
+
+fn persistedMergePass(comptime BackendType: type, backend: *BackendType, inputs: anytype, level: u32, yield_for_queries: bool) !std.ArrayListUnmanaged(PersistedMergeGroup) {
+    var groups: std.ArrayListUnmanaged(PersistedMergeGroup) = .empty;
+    errdefer releasePersistedMergeGroups(BackendType, backend, &groups);
+    var first: usize = 0;
+    while (first < inputs.len) {
+        try checkPersistedMergeActive(backend);
+        const end = @min(first + persisted_merge_fan_in, inputs.len);
+        try groups.ensureUnusedCapacity(backend.allocator, 1);
+        // Tombstones must survive every intermediate: older groups may still
+        // contain the value they shadow. Only the final merge may discard them.
+        var runs = try makePersistedRunsFromSelectedRunsWithForegroundPolicy(BackendType, backend, inputs[first..end], level, false, yield_for_queries);
+        errdefer discardOutputRuns(BackendType, backend, &runs);
+        const pointers = try backend.allocator.alloc(*const Run, runs.items.len);
+        for (runs.items, pointers) |*run, *pointer| pointer.* = run;
+        groups.appendAssumeCapacity(.{ .runs = runs, .pointers = pointers });
+        first = end;
+    }
+    return groups;
+}
+
+fn makeBoundedPersistedRuns(comptime BackendType: type, backend: *BackendType, inputs: anytype, level: u32, drop_tombstones: bool, yield_for_queries: bool) anyerror!std.ArrayListUnmanaged(Run) {
+    var groups = try persistedMergePass(BackendType, backend, inputs, level, yield_for_queries);
+    defer releasePersistedMergeGroups(BackendType, backend, &groups);
+    while (groups.items.len > persisted_merge_fan_in) {
+        var next = try persistedMergePass(BackendType, backend, groups.items, level, yield_for_queries);
+        errdefer releasePersistedMergeGroups(BackendType, backend, &next);
+        // Release each completed pass before beginning another. Original
+        // inputs remain pinned until the final atomic manifest publication.
+        try unlinkPersistedMergeGroups(backend, groups.items);
+        releasePersistedMergeGroups(BackendType, backend, &groups);
+        groups = next;
+    }
+    var result = try makePersistedRunsFromSelectedRunsWithForegroundPolicy(BackendType, backend, groups.items, level, drop_tombstones, yield_for_queries);
+    errdefer discardOutputRuns(BackendType, backend, &result);
+    try unlinkPersistedMergeGroups(backend, groups.items);
+    return result;
+}
+
 fn makePersistedRunsFromSelectedRunsWithGc(comptime BackendType: type, backend: *BackendType, window_runs: []const *Run, output_level: u32, drop_tombstones: bool) !std.ArrayListUnmanaged(Run) {
     return makePersistedRunsFromSelectedRunsWithForegroundPolicy(BackendType, backend, window_runs, output_level, drop_tombstones, false);
 }
@@ -6552,6 +6694,10 @@ fn makePersistedRunsFromSelectedRunsWithForegroundPolicy(
     drop_tombstones: bool,
     yield_for_foreground_queries: bool,
 ) !std.ArrayListUnmanaged(Run) {
+    if (window_runs.len > persisted_merge_fan_in)
+        return makeBoundedPersistedRuns(BackendType, backend, window_runs, output_level, drop_tombstones, yield_for_foreground_queries);
+    if (comptime @hasField(BackendType, "merge_inputs_observed"))
+        backend.merge_inputs_observed = @max(backend.merge_inputs_observed, window_runs.len);
     const allocator = backend.allocator;
     const expected_entries = countRunPtrEntries(window_runs);
 
@@ -6562,11 +6708,18 @@ fn makePersistedRunsFromSelectedRunsWithForegroundPolicy(
         allocator.free(cursors);
     }
     for (window_runs, 0..) |input, i| {
-        const run = inputRun(input);
-        const path = run.path orelse return error.RunStateUnavailable;
-        cursors[i] = try PersistedRunCursor.init(allocator, backend.storage.?, path);
+        cursors[i] = if (@TypeOf(input) == PersistedMergeGroup)
+            try PersistedRunCursor.initSeries(allocator, backend.storage.?, input.pointers)
+        else cursor: {
+            const run = inputRun(input);
+            const path = run.path orelse return error.RunStateUnavailable;
+            const cursor = try PersistedRunCursor.init(allocator, backend.storage.?, path);
+            break :cursor cursor;
+        };
         initialized_cursors += 1;
-        if (cursors[i].index.entry_count != run.entry_count) return error.InvalidTableFile;
+        if (@TypeOf(input) != PersistedMergeGroup) {
+            if (cursors[i].index.entry_count != inputRun(input).entry_count) return error.InvalidTableFile;
+        }
     }
 
     var runs = std.ArrayListUnmanaged(Run).empty;
@@ -6583,6 +6736,7 @@ fn makePersistedRunsFromSelectedRunsWithForegroundPolicy(
     defer heap.deinit();
 
     while (heap.peekSource()) |winner_source| {
+        if (consumed_entries % 256 == 0) try checkPersistedMergeActive(backend);
         if (yield_for_foreground_queries and consumed_entries % 256 == 0) {
             if (backend.options.resource_manager) |manager| {
                 manager.yieldOptionalMaintenanceForForegroundQuery();
@@ -6782,7 +6936,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 backend.allocator,
                 backend.root_dir.?,
                 run_id,
-                expected_entries,
+                @min(expected_entries, outputEntryLimit(backend)),
                 physicalRunFileLimit(BackendType, backend),
                 backend.options.bloom,
                 backend.options.table_block_compression,
@@ -6890,7 +7044,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 .entry_count = @intCast(persisted.entry_count),
                 .tombstone_count = self.tombstone_count,
                 .oldest_tombstone_unix_ns = if (self.tombstone_count != 0) gcNowNs() else 0,
-                .bloom_filter = persisted.filter,
+                .bloom_filter = retainPersistedBloom(self.backend, persisted.filter),
                 .state = null,
             };
         }
@@ -7151,6 +7305,25 @@ const PersistedRunCursor = struct {
     current_entry: ?lsm_table_file.Entry = null,
     loaded_window: ?lsm_table_file.EntryDataWindow = null,
     loaded_bytes: ?[]u8 = null,
+    series: []const *const Run = &.{},
+    series_next: usize = 0,
+    series_pending: bool = false,
+    series_storage: ?@import("storage_io.zig").Storage = null,
+
+    fn initSeries(allocator: std.mem.Allocator, storage: @import("storage_io.zig").Storage, runs: []const *const Run) !PersistedRunCursor {
+        if (runs.len == 0) return error.EmptyRun;
+        for (runs[1..], runs[0 .. runs.len - 1]) |next, previous| {
+            if (compareRunBound(previous.largest_namespace_name, previous.largest_key, next.smallest_namespace_name, next.smallest_key) != .lt)
+                return error.InvalidTableFile;
+        }
+        var cursor = try init(allocator, storage, runs[0].path orelse return error.RunStateUnavailable);
+        errdefer cursor.deinit();
+        if (cursor.index.entry_count != runs[0].entry_count) return error.InvalidTableFile;
+        cursor.series = runs;
+        cursor.series_next = 1;
+        cursor.series_storage = storage;
+        return cursor;
+    }
 
     fn init(
         allocator: std.mem.Allocator,
@@ -7185,6 +7358,17 @@ const PersistedRunCursor = struct {
     }
 
     fn currentEntry(self: *PersistedRunCursor) !?lsm_table_file.Entry {
+        if (self.series_pending) {
+            const run = self.series[self.series_next];
+            var next = try init(self.allocator, self.series_storage.?, run.path orelse return error.RunStateUnavailable);
+            errdefer next.deinit();
+            if (next.index.entry_count != run.entry_count) return error.InvalidTableFile;
+            next.series = self.series;
+            next.series_next = self.series_next + 1;
+            next.series_storage = self.series_storage;
+            self.deinit();
+            self.* = next;
+        }
         _ = self.position orelse return null;
         if (self.current_entry) |entry| return entry;
         try self.ensureCurrentWindow();
@@ -7218,7 +7402,11 @@ const PersistedRunCursor = struct {
             self.position = pos + 1;
         } else {
             if (self.block_index != self.index.blocks.len) return error.InvalidTableFile;
-            self.position = null;
+            // Keep the old value alive until duplicate-key resolution ends.
+            // Opening the successor here would invalidate the heap's borrowed
+            // winning key while it compares the remaining input streams.
+            self.series_pending = self.series_next < self.series.len;
+            self.position = if (self.series_pending) 0 else null;
         }
     }
 
@@ -7512,9 +7700,8 @@ fn estimatedCompactionOutputEntries(window_runs: anytype, target_bytes: usize) u
     var total_entries: u128 = 0;
     var total_bytes: u128 = 0;
     for (window_runs) |input| {
-        const run = inputRun(input);
-        total_entries +|= run.entry_count;
-        total_bytes +|= run.size_bytes;
+        total_entries +|= persistedInputEntries(input);
+        total_bytes +|= persistedInputBytes(input);
     }
     if (total_entries == 0) return 1;
 
@@ -7537,7 +7724,7 @@ fn ensureRunStateForBackend(comptime BackendType: type, backend: *BackendType, r
 fn compareTableEntry(lhs: lsm_table_file.Entry, rhs: lsm_table_file.Entry) std.math.Order {
     const namespace_order = state_mod.compareNamespace(.{ .name = lhs.namespace_name }, .{ .name = rhs.namespace_name });
     if (namespace_order != .eq) return namespace_order;
-    return std.mem.order(u8, lhs.key, rhs.key);
+    return byte_copy.orderBytes(lhs.key, rhs.key);
 }
 
 pub fn makeRun(comptime BackendType: type, backend: *BackendType, state: State) !Run {
@@ -7843,7 +8030,7 @@ fn makeRunFromSortedTableEntriesAtLevel(comptime BackendType: type, backend: *Ba
         .entry_count = @intCast(persisted.entry_count),
         .tombstone_count = countTombstones(entries),
         .oldest_tombstone_unix_ns = gcNowNs(),
-        .bloom_filter = persisted.filter,
+        .bloom_filter = retainPersistedBloom(backend, persisted.filter),
         .state = null,
     };
 }
@@ -8358,11 +8545,116 @@ const PersistedBoundsTestBackend = struct {
     storage: ?@import("storage_io.zig").Storage,
     root_dir: ?[]const u8 = "/persisted-bounds",
     next_run_id: u64 = 10,
+    merge_inputs_observed: usize = 0,
     options: @import("../lsm_backend.zig").Options = .{
         .table_block_compression = .none,
         .max_run_file_bytes = 4 * 1024 * 1024,
     },
 };
+
+test "persisted merge bounds output reservation by entry limit" {
+    const a = std.testing.allocator;
+    var memory = @import("storage_io.zig").MemoryStorage.init(a);
+    defer memory.deinit();
+    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = 512 * 1024 };
+    var backend: PersistedBoundsTestBackend = .{ .allocator = budget.allocator(), .storage = memory.storage() };
+    backend.options.max_run_file_entries = 7;
+    var output: PersistedOutputRunBuilder(PersistedBoundsTestBackend) = undefined;
+    // A large compaction estimate must not reserve a million-entry filter
+    // for each seven-entry output file. That alone exceeds this quota.
+    try output.initInPlace(&backend, 1, 1_000_000);
+    defer output.deinit();
+    for (0..7) |i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i, .big);
+        const entry: lsm_table_file.Entry = .{ .key = &key, .value = "value" };
+        try output.appendEntry(entry, tableEntryLogicalBytes(entry));
+    }
+    var run = try output.finish();
+    defer run.deinit(backend.allocator);
+    try std.testing.expectEqual(@as(u32, 7), run.entry_count);
+    try std.testing.expect(run.bloom_filter.?.bytes.len <= 128);
+    var state = try repository_mod.loadRunStateAllocWithStorage(memory.storage(), a, run.path.?);
+    defer state.deinit(a);
+    try std.testing.expectEqual(@as(usize, 7), state.entryCount());
+    try std.testing.expect(budget.peak <= budget.limit);
+}
+
+test "persisted merge bounds fan-in across split streams and retains tombstone precedence" {
+    const a = std.testing.allocator;
+    const count = 257;
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls >= 5) return error.Cancelled;
+        }
+    };
+    for ([_]bool{ false, true }) |drop_tombstones| {
+        var memory = @import("storage_io.zig").MemoryStorage.init(a);
+        defer memory.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const out = arena.allocator();
+        const sources = try out.alloc(Run, count);
+        const pointers = try out.alloc(*Run, count);
+        const value = try out.alloc(u8, 32 * 1024);
+        @memset(value, 7);
+        for (sources, pointers, 0..) |*run, *pointer, ordinal| {
+            std.mem.writeInt(u32, value[0..4], @intCast(ordinal), .little);
+            const left = try std.fmt.allocPrint(out, "id-{d:0>8}-a", .{ordinal});
+            const right = try std.fmt.allocPrint(out, "id-{d:0>8}-b", .{ordinal});
+            const encoded = try lsm_table_file.encodeAlloc(a, &.{
+                .{ .key = "common-a", .value = if (ordinal == 0) "" else "old", .tombstone = ordinal == 0 },
+                .{ .key = left, .value = value },
+                .{ .key = right, .value = value },
+                .{ .key = "shared-z", .value = value },
+            });
+            defer a.free(encoded);
+            const path = try std.fmt.allocPrint(out, "/persisted-bounds/input-{d}.tbl", .{ordinal});
+            try memory.storage().writeFileAbsolute(path, encoded);
+            run.* = .{ .id = count - ordinal, .level = 0, .size_bytes = encoded.len, .path = path, .smallest_namespace_name = null, .smallest_key = @constCast("common-a"), .largest_namespace_name = null, .largest_key = @constCast("shared-z"), .entry_count = 4, .bloom_filter = null, .state = null, .owns_metadata = false };
+            pointer.* = run;
+        }
+        var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+        var backend: PersistedBoundsTestBackend = .{ .allocator = budget.allocator(), .storage = memory.storage(), .next_run_id = 1000 };
+        backend.options.max_run_file_bytes = 64 * 1024;
+        backend.options.retain_bloom_filters = false;
+        var result = try makePersistedRunsFromSelectedRunsWithGc(PersistedBoundsTestBackend, &backend, pointers, 1, drop_tombstones);
+        defer discardOutputRuns(PersistedBoundsTestBackend, &backend, &result);
+        try std.testing.expect(result.items.len > persisted_merge_fan_in);
+        try std.testing.expect(backend.merge_inputs_observed <= persisted_merge_fan_in);
+        try std.testing.expect(budget.peak <= budget.limit);
+        var rows: usize = 0;
+        var deleted: usize = 0;
+        for (result.items) |run| {
+            try std.testing.expect(run.bloom_filter == null);
+            var state = try repository_mod.loadRunStateAllocWithStorage(memory.storage(), a, run.path.?);
+            defer state.deinit(a);
+            var cursor: State.EntryCursor = .{};
+            for (0..state.entryCount()) |ordinal| {
+                const entry = cursor.at(&state, ordinal);
+                rows += 1;
+                if (std.mem.eql(u8, entry.key, "common-a")) {
+                    try std.testing.expect(entry.tombstone);
+                    deleted += 1;
+                } else {
+                    const expected: u32 = if (std.mem.eql(u8, entry.key, "shared-z")) 0 else try std.fmt.parseInt(u32, entry.key[3..11], 10);
+                    try std.testing.expectEqual(expected, std.mem.readInt(u32, entry.value[0..4], .little));
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(usize, if (drop_tombstones) 0 else 1), deleted);
+        try std.testing.expectEqual(count * 2 + 1 + @as(usize, @intFromBool(!drop_tombstones)), rows);
+        const before_files = memory.files.count();
+        var cancel: Cancel = .{};
+        backend.options.bulk_cancellation = .{ .ptr = &cancel, .check_fn = Cancel.check };
+        try std.testing.expectError(error.Cancelled, makePersistedRunsFromSelectedRunsWithGc(PersistedBoundsTestBackend, &backend, pointers, 1, drop_tombstones));
+        try std.testing.expect(cancel.calls >= 5);
+        try std.testing.expectEqual(before_files, memory.files.count());
+    }
+}
 
 fn checkPersistedBoundsMerge(drop_tombstones: bool) !usize {
     const allocator = std.testing.allocator;
@@ -8576,4 +8868,54 @@ test "persisted compaction bounds allocation failure preserves prior run bounds"
         try std.testing.expectEqualSlices(u8, &larger_bounds, run.largest_namespace_name.?);
         try std.testing.expectEqualSlices(u8, &larger_bounds, run.largest_key);
     }
+}
+
+test "persisted merge bounds consolidated cursor fanout independently of file count" {
+    const a = std.testing.allocator;
+    const lsm = @import("../lsm_backend.zig");
+    var memory = @import("storage_io.zig").MemoryStorage.init(a);
+    defer memory.deinit();
+    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = 16 * 1024 * 1024 };
+    var cache = try lsm.Cache.initFallible(budget.allocator(), 64 * 1024);
+    defer cache.deinit();
+    var backend = try lsm.Backend.open(budget.allocator(), "/consolidated-cursor", .{
+        .storage = memory.storage(),
+        .cache = &cache,
+        .wal_enabled = false,
+        .retain_bloom_filters = false,
+        .table_block_compression = .none,
+        .max_run_file_bytes = 64 * 1024,
+        .compact_threshold_runs = std.math.maxInt(usize),
+        .l0_soft_limit_runs = std.math.maxInt(usize),
+        .l0_hard_limit_runs = std.math.maxInt(usize),
+    });
+    defer backend.close();
+    const count = 193;
+    const value: [32 * 1024]u8 = @splat(7);
+    try backend.beginBulkIngestSession();
+    for (0..count) |i| {
+        var key: [16]u8 = undefined;
+        try backend.ingestSortedTableEntries(&.{.{ .namespace_name = "rows", .key = try std.fmt.bufPrint(&key, "row-{d:0>8}", .{i}), .value = &value }});
+    }
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    try std.testing.expect(try backend.consolidateFreshSnapshot());
+    try std.testing.expect(backend.runs.count() > persisted_merge_fan_in);
+    try std.testing.expectEqual(@as(usize, 0), backend.runs.l0Files());
+    var txn = try backend.beginRead();
+    defer txn.abort();
+    var cursor = try txn.openCursor(.{ .name = "rows" });
+    defer cursor.close();
+    // One mutable source and one concatenated immutable level, rather than
+    // one live input buffer/index for each of the 193 physical files.
+    try std.testing.expectEqual(@as(usize, 2), cursor.source_blocks.len);
+    var entry = try cursor.first();
+    var seen: usize = 0;
+    while (entry) |row| : (entry = try cursor.next()) {
+        var key: [16]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&key, "row-{d:0>8}", .{seen}), row.key);
+        try std.testing.expectEqualSlices(u8, &value, row.value);
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, count), seen);
+    try std.testing.expect(budget.peak <= budget.limit);
 }

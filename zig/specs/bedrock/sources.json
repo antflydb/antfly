@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/aws/api-models-aws",
+  "commit": "d6bbb4d64e2c82927834dfa9791bebc0000f70c0",
+  "model_path": "models/bedrock-runtime/service/2023-09-30/bedrock-runtime-2023-09-30.json",
+  "model_sha256": "d3507d1a16239fd0a7dc10b5711adc57fbc246f6ce99c771d791a460a854e77c",
+  "openapi_sha256": "b51f6467c3cbd1e3183d98737e39e9c14a2e3b6e6da7c9bb8c75cc5d232d8e30",
+  "operations": [
+    "Converse",
+    "ConverseStream"
+  ],
+  "generator": "scripts/generate_bedrock_openapi.py"
+}

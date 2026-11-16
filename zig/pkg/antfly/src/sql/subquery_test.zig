@@ -358,6 +358,10 @@ test "SQL phase outputs preserve grouping and child cardinality diagnostics" {
 }
 
 test "SQL phase outputs release every allocation with prepared grouped demand" {
+    // Retain leak/safety checks and every fault position without collecting
+    // allocation/free stack traces on the successful allocation path.
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
     const Faults = struct {
         fn run(a: std.mem.Allocator) !void {
             var backend: Backend = .{};
@@ -370,7 +374,7 @@ test "SQL phase outputs release every allocation with prepared grouped demand" {
             try std.testing.expectEqualStrings("5", result.output.rows[0][1].string);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(checked.allocator(), Faults.run, .{});
 }
 
 test "SQL row bounds validate negative parameters at execution in their own domain" {
@@ -478,6 +482,12 @@ test "SQL nested join buffers own borrowed text and JSON across upstream pulls" 
 }
 
 test "SQL quantified subqueries match three valued comparison truth tables" {
+    // All 168 compiled queries and 672 truth-table cells remain covered.
+    // Avoid unwinding successful allocation stacks for every nested operator;
+    // retain poisoning/leak checks and opt-in allocation traces.
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const alloc = checked.allocator();
     const Set = struct { sql: []const u8, values: []const ?i64 };
     const sets = [_]Set{
         .{ .sql = "SELECT 1 AS y WHERE false", .values = &.{} },
@@ -492,11 +502,11 @@ test "SQL quantified subqueries match three valued comparison truth tables" {
     var backend: Backend = .{};
     for ([_][]const u8{ "=", "<>", "<", "<=", ">", ">=" }, 0..) |op, op_index| {
         for ([_]bool{ false, true }) |every| for (sets) |set| for ([_]bool{ false, true }) |boundary| {
-            const query = try std.fmt.allocPrint(std.testing.allocator, "SELECT x {s} {s} (SELECT y FROM ({s}) i{s}) FROM (SELECT 0 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT NULL) o", .{ op, if (every) "ALL" else "ANY", set.sql, if (boundary) " WHERE o.x IS NULL OR o.x IS NOT NULL ORDER BY i.y LIMIT 100" else "" });
-            defer std.testing.allocator.free(query);
-            var compiled = try compiler.compile(std.testing.allocator, query, .{});
+            const query = try std.fmt.allocPrint(alloc, "SELECT x {s} {s} (SELECT y FROM ({s}) i{s}) FROM (SELECT 0 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT NULL) o", .{ op, if (every) "ALL" else "ANY", set.sql, if (boundary) " WHERE o.x IS NULL OR o.x IS NOT NULL ORDER BY i.y LIMIT 100" else "" });
+            defer alloc.free(query);
+            var compiled = try compiler.compile(alloc, query, .{});
             defer compiled.deinit();
-            var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+            var result = try runtime.execute(alloc, backend.backend(), &compiled, &.{}, .{});
             defer result.deinit();
             try std.testing.expectEqual(operands.len, result.output.rows.len);
             for (operands, 0..) |operand, index| {

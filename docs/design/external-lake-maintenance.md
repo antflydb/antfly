@@ -123,6 +123,63 @@ that coordination.
 Receipts bind `protocol`, `provider`, `operation_id`, `request_hash` and
 `table_uuid`. State is `queued`, `running`, `complete` or `rejected`. Counts are
 `expired_snapshots`, `eligible_objects`, `deleted_objects` and `retained_objects`.
+Antfly-run (managed) vacuum results also report `remaining_snapshots`, the
+eligible snapshots left for the next bounded job, recomputed from current
+catalog metadata on every turn so saved-job retries preserve backlog reporting.
+Managed vacuum journals use version-two snapshot roots over shared, authenticated
+inventory chunks. Chunks stay with the immutable maintenance journal and are not
+part of the source-file sweep. Jobs cache at most 2 MiB of shared nodes in their
+root journal; larger inventories load bounded chunks on replay. Version-one inline
+jobs remain readable. Workers must be upgraded before they can resume new jobs;
+older workers reject the new journal schema without deleting files.
+Managed jobs checkpoint planning separately from the immutable expiry intent.
+Repeat the same operation ID while `complete` is false, including responses with
+`planning: true`. Input reads and spill uploads advance in bounded turns; small
+nodes are embedded before deciding which nodes need uploads. Planning cursors
+cover both snapshots and manifests, and the final intent rechecks fresh catalog
+references and protected snapshots, so ingestion can continue between turns.
+The managed catalog checkpoints an exact-metadata live-root proof independently
+of deletion traversal. Reachability and traversal share a 64-step mutation
+budget; bootstrap also bounds read-only shared-manifest edges at 4,096 and new
+Avro inputs at four, reserving time to publish its checkpoint.
+Immutable inventories use authenticated chunks packed in one object per source;
+cold workers seek directly to their chunk with range reads. Both selection and
+authoritative retirement reuse the complete proof across retirement-only HEAD
+changes. Append-only metadata changes preserve partial progress; removed or
+replaced roots rebuild the exact live set from cached inventories. A completed
+proof is usable immediately, with traversal limited to the remaining mutation
+budget. Continuous ingestion therefore need not leave an idle metadata turn.
+The final membership lookup is read-only; deadline-bound retirement consumes an
+already prepared proof, validates the current catalog version and publishes its
+fence through HEAD CAS.
+
+Planning uses the same inventory format in its private journal lane, with source
+and cache credentials kept separate. Large manifest lists are cached once, then
+resumed by chunk ranges. Crossing the soft read quantum cannot force each retry
+to reread the source list without advancing its manifest cursor. Temporary
+inputs are scoped to the operation. Planners register through a conditional
+admission record and use a maximum 60-second I/O deadline. Publishing the
+immutable job closes admission; collection waits for existing writers to release
+or for their deadline plus the same 30-second clock-skew grace used by snapshot
+pins. After source-file collection finishes, each turn removes at most 16 input
+objects plus the mutable planner. A compact closed-admission record prevents
+late registration. Completed snapshot-job replay uses the immutable job and
+execution receipt, so it does not require those temporary inputs. Old shared input caches
+are drained in bounded batches without touching other active operation scopes
+or authoritative catalog proof caches. A job reports `complete: false` until its
+input cleanup also completes, including no-op and definitively rejected jobs.
+Empty operations use a version-three no-op journal without mutating the catalog;
+version-one and version-two snapshot jobs retain their existing replay format.
+
+Execution checkpoints the reader-retirement barrier and each catalog-fenced
+physical deletion batch. The sweep stores its current frame, immutable parent
+frame pages and an authenticated paged visited-node set. Checkpoint size stays
+bounded even for deep graphs, and cold resumes never scan the completed prefix. Shared
+manifest subtrees are visited once; duplicate paths in different manifests remain
+safe under conditional ownership deletion. Version-one execution checkpoints
+upgrade by restarting traversal once while preserving any already fenced batch.
+Lost responses replay that batch safely. The scheduler
+continues checkpoint-only work even when no catalog metadata changed that turn.
 Pending receipts report no physical deletions; completed receipts report final
 counts. A dry run must report zero deletions. Rejection surfaces as a conflict;
 transport failure leaves the immutable journal available for exact retry.

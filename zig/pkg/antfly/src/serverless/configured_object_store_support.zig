@@ -37,6 +37,9 @@ pub fn openNativeArtifactObjectStoreAlloc(
     secret_store: ?*common_secrets.FileStore,
     read_only: bool,
 ) !object_store_support.OpenedObjectStore {
+    return openNativeArtifactObjectStoreWithTransportAlloc(alloc, node_config, secret_store, read_only, null);
+}
+pub fn openNativeArtifactObjectStoreWithTransportAlloc(alloc: Allocator, node_config: *const common_config.Config, secret_store: ?*common_secrets.FileStore, read_only: bool, transport: ?object_store_support.Transport) !object_store_support.OpenedObjectStore {
     const location = node_config.storage.artifacts;
     const connection_id = location.connection orelse return error.NativeArtifactStorageRequired;
     const bucket = location.bucket orelse return error.NativeArtifactStorageRequired;
@@ -45,8 +48,8 @@ pub fn openNativeArtifactObjectStoreAlloc(
     if (connection.kind != .external_io or !hasConnectionCapability(connection, "storage.primary")) return error.NativeArtifactStorageUnauthorized;
     const external_io = connection.external_io orelse return error.NativeArtifactStorageUnauthorized;
     return switch (external_io.protocol) {
-        .s3 => try openCredentialedS3PrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only),
-        .gcs => try openCredentialedGcsPrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only),
+        .s3 => try openCredentialedS3PrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only, transport),
+        .gcs => try openCredentialedGcsPrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only, transport),
         .filesystem => blk: {
             const root = external_io.root orelse return error.NativeArtifactStorageUnauthorized;
             try validateFilesystemSourceRelativePath(prefix);
@@ -60,18 +63,47 @@ pub fn openNativeArtifactObjectStoreAlloc(
     };
 }
 
+/// Native admission is installed only by an authenticated server adapter. Raw
+/// object-store callers cannot acknowledge writes to an owned source.
+pub const NativeSourceOwner = struct {
+    token: [16]u8,
+    ptr: *anyopaque,
+    table_id: u64,
+    object_generation: u64,
+    acknowledge: *const fn (*anyopaque, u64, u64, [16]u8, ?u64, lake_catalog.types.Context) anyerror!void,
+    pub fn committed(self: @This(), lsn: ?u64, context: lake_catalog.types.Context) !void {
+        // Remote durability has already succeeded. A native acknowledgement
+        // failure cannot be reported as a definite rejection or acceptance.
+        self.acknowledge(self.ptr, self.table_id, self.object_generation, self.token, lsn, context) catch return error.LakeCommitOutcomeUnknown;
+    }
+};
+/// A named capability keeps its reflected type identity stable when source
+/// options are compiled independently in the lake operation's caller/owner.
+/// Anonymous field structs receive compilation-local generated type names.
+pub const NativeSourceOwnerResolver = struct {
+    ptr: *anyopaque,
+    resolve: *const fn (*anyopaque, Allocator, u64, u64, lake_catalog.types.Context) anyerror!?NativeSourceOwner,
+};
 pub const BindingObjectStoreOpenOptions = struct {
+    pub fn resolveOwner(self: @This(), a: Allocator, context: lake_catalog.types.Context) !@This() {
+        var result = self;
+        if (result.native_owner == null and result.catalog_table_id != 0) if (self.native_owner_resolver) |resolver| {
+            result.native_owner = try resolver.resolve(resolver.ptr, a, result.catalog_table_id, result.catalog_generation, context);
+        };
+        return result;
+    }
     /// Borrowed options must outlive synchronous lake source opening.
     pub fn lakeOptions(self: *const @This()) @import("antfly_local_sources").serverless_lake_host.OpenOptions {
-        return .{ .file_bucket = self.file_bucket, .resolver = .{ .ptr = self, .open_fn = openLake }, .catalog_resolver = .{ .ptr = self, .load_fn = loadLakeCatalog }, .snapshot_pin_resolver = .{ .ptr = self, .acquire = acquireSnapshotPin } };
+        return .{ .file_bucket = self.file_bucket, .resolver = .{ .ptr = self, .open_fn = openLake }, .catalog_resolver = .{ .ptr = self, .load_fn = loadLakeCatalog }, .snapshot_pin_resolver = .{ .ptr = self, .acquire = acquireSnapshotPin }, .retained_manifest = self.retained_manifest };
     }
     fn acquireSnapshotPin(raw: *const anyopaque, a: Allocator, source: catalog_binding.Binding, snapshot: []const u8, uuid: []const u8, context: lake_catalog.types.Context) anyerror!?@import("antfly_local_sources").serverless_lake_host.SnapshotPin {
         _ = a;
         const pin_alloc = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator);
         const self: *const @This() = @ptrCast(@alignCast(raw));
+        if (self.native_reader_protected) return null;
         if (source.catalog == null or self.node_config == null or self.node_config.?.storage.artifacts.connection == null or snapshot.len == 0) return null;
         const pins = @import("lake_snapshot_pins.zig");
-        var opened = try openNativeArtifactObjectStoreAlloc(pin_alloc, self.node_config.?, self.secret_store, false);
+        var opened = try openNativeArtifactObjectStoreWithTransportAlloc(pin_alloc, self.node_config.?, self.secret_store, false, .{ .io = self.io, .requests = self.requests, .query_requests = self.query_requests });
         errdefer opened.deinit();
         const prefix = try pins.namespace(pin_alloc, opened.prefix, source, uuid);
         errdefer pin_alloc.free(prefix);
@@ -88,6 +120,11 @@ pub const BindingObjectStoreOpenOptions = struct {
     }
     fn loadLakeCatalog(raw: *const anyopaque, alloc: Allocator, source: catalog_binding.Binding, context: lake_catalog.types.Context) anyerror!lake_catalog.types.Table {
         const self: *const @This() = @ptrCast(@alignCast(raw));
+        if (self.authoritative_metadata) {
+            const retained = self.retained_catalog_metadata orelse return error.InvalidQueryRequest;
+            try context.ensureActive();
+            return std.json.parseFromSliceLeaky(lake_catalog.types.Table, alloc, try std.json.Stringify.valueAlloc(alloc, retained, .{}), .{ .allocate = .alloc_always });
+        }
         var result = try executeLakeCatalogAlloc(alloc, source, self.*, context, .load);
         if (self.retained_catalog_metadata) |retained| {
             defer result.deinit(alloc);
@@ -105,12 +142,24 @@ pub const BindingObjectStoreOpenOptions = struct {
         }
         return result.table;
     }
+    native_owner: ?NativeSourceOwner = null,
+    native_owner_resolver: ?NativeSourceOwnerResolver = null,
+    /// Only an authenticated, retained native serving cut may bypass mutable
+    /// source discovery. Its generation reader protects source files in vacuum.
+    authoritative_metadata: bool = false,
+    native_reader_protected: bool = false,
+    retained_manifest: ?[]const u8 = null,
     /// Server-authenticated metadata; load still verifies external incarnation.
     retained_catalog_metadata: ?lake_catalog.types.Table = null,
     file_bucket: []const u8 = "antfly",
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     read_only: bool = true,
+    /// Synchronous provider clients borrow this runtime. The native execution
+    /// bridge clears it and reconstructs from its checked IoBorrow.
+    io: ?std.Io = null,
+    requests: ?*@import("httpx").RequestLimit = null,
+    query_requests: ?*@import("httpx").RequestLimit = null,
     catalog_table_id: u64 = 0,
     catalog_generation: u64 = 0,
 };
@@ -120,21 +169,25 @@ pub const CatalogOperation = union(enum) {
     create: lake_catalog.types.Commit,
     commit: lake_catalog.types.Commit,
     retire: lake_catalog.managed.Retirement,
+    references: lake_catalog.managed.ReferenceRequest,
     resolve: struct { id: []const u8, hash: []const u8 },
 };
 pub const CatalogResult = union(enum) {
     table: lake_catalog.types.Table,
+    references: lake_catalog.types.References,
     outcome: lake_catalog.types.Outcome,
     pub fn deinit(self: *CatalogResult, a: Allocator) void {
         if (self.* == .table) self.table.deinit(a);
+        if (self.* == .references) self.references.deinit(a);
     }
 };
 
-pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, options: BindingObjectStoreOpenOptions, context: lake_catalog.types.Context, operation: CatalogOperation) !CatalogResult {
+pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, unresolved_options: BindingObjectStoreOpenOptions, context: lake_catalog.types.Context, operation: CatalogOperation) !CatalogResult {
     try context.ensureActive();
     try binding.validateSupported();
+    const options = try unresolved_options.resolveOwner(a, context);
     const config = binding.catalog orelse return error.InvalidLakeCatalog;
-    const mutation = operation == .create or operation == .commit or operation == .retire;
+    const mutation = operation == .create or operation == .commit or operation == .retire or operation == .references;
     if (mutation and binding.write_policy != .iceberg_writer) return error.ExternalLakeReadOnly;
     var source_options = options;
     source_options.read_only = !mutation or config.type == .rest;
@@ -142,8 +195,14 @@ pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, o
     defer opened.deinit();
     var catalog: lake_catalog.Catalog = undefined;
     if (config.type == .managed) {
-        catalog = .{ .managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri, .context = context } };
-        return executeCatalog(a, &catalog, operation);
+        catalog = .{ .managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri, .context = context, .native_owner = if (options.native_owner) |owner| owner.token else null } };
+        const result = try executeCatalog(a, &catalog, operation);
+        errdefer {
+            var failed = result;
+            failed.deinit(a);
+        }
+        if ((mutation and operation != .references) or (operation == .resolve and result == .outcome and result.outcome == .committed)) if (options.native_owner) |owner| try owner.committed(null, context);
+        return result;
     }
     const node = options.node_config orelse return error.LakeCatalogConnectionRequired;
     const connection = node.connections.get(config.connection.?) orelse return error.LakeCatalogConnectionRequired;
@@ -173,7 +232,7 @@ pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, o
     defer if (journal_store) |*store| store.deinit();
     var journal: ?lake_catalog.rest.Journal = null;
     if (mutation or operation == .resolve) {
-        journal_store = try openNativeArtifactObjectStoreAlloc(a, node, options.secret_store, !mutation);
+        journal_store = try openNativeArtifactObjectStoreWithTransportAlloc(a, node, options.secret_store, !mutation, .{ .io = options.io, .requests = options.requests, .query_requests = options.query_requests });
         const authority = try std.json.Stringify.valueAlloc(scratch, .{ .source = binding.source_uri, .catalog = config }, .{});
         const prefix = try std.fmt.allocPrint(scratch, "{s}/lake-catalog/{d}/{d}/{s}", .{ journal_store.?.prefix, options.catalog_table_id, options.catalog_generation, lake_catalog.types.digestHex(authority) });
         journal = .{ .client = journal_store.?.client, .bucket = journal_store.?.bucket, .prefix = prefix };
@@ -208,7 +267,7 @@ pub fn executeExternalMaintenanceAlloc(a: Allocator, binding: catalog_binding.Bi
         if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Idempotency-Key") or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Host") or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Length")) return error.LakeCatalogForbidden;
         try headers.append(scratch, .{ entry.key_ptr.*, value });
     }
-    var opened = try openNativeArtifactObjectStoreAlloc(a, node, options.secret_store, false);
+    var opened = try openNativeArtifactObjectStoreWithTransportAlloc(a, node, options.secret_store, false, .{ .io = options.io, .requests = options.requests, .query_requests = options.query_requests });
     defer opened.deinit();
     const identity = try std.json.Stringify.valueAlloc(scratch, .{ .source = binding.source_uri, .catalog = config, .uuid = uuid }, .{});
     const journal_prefix = try std.fmt.allocPrint(scratch, "{s}/lake-provider-maintenance/{d}/{d}/{s}", .{ opened.prefix, options.catalog_table_id, options.catalog_generation, lake_catalog.types.digestHex(identity) });
@@ -227,6 +286,7 @@ fn executeCatalog(a: Allocator, catalog: *lake_catalog.Catalog, operation: Catal
         .create => |c| .{ .table = try catalog.create(a, c.id, c.body, c.timestamp_ms) },
         .commit => |c| .{ .table = try catalog.commit(a, c) },
         .retire => |r| .{ .table = try catalog.retire(a, r) },
+        .references => |request| .{ .references = try catalog.references(a, request) },
         .resolve => |c| .{ .outcome = try catalog.resolve(a, c.id, c.hash) },
     };
 }
@@ -259,7 +319,7 @@ pub fn openBindingObjectStoreAlloc(
         alloc,
         binding.source_uri,
         options.file_bucket,
-        .{ .ensure_bucket = !options.read_only },
+        .{ .ensure_bucket = !options.read_only, .io = options.io, .requests = options.requests, .query_requests = options.query_requests },
     );
     return try openCredentialedBindingObjectStoreAlloc(alloc, binding, options);
 }
@@ -293,6 +353,7 @@ fn openCredentialedBindingObjectStoreAlloc(
                 value.bucket,
                 value.prefix,
                 options.read_only,
+                .{ .io = options.io, .requests = options.requests, .query_requests = options.query_requests },
             );
         },
         .gcs => |value| blk: {
@@ -304,6 +365,7 @@ fn openCredentialedBindingObjectStoreAlloc(
                 value.bucket,
                 value.prefix,
                 options.read_only,
+                .{ .io = options.io, .requests = options.requests, .query_requests = options.query_requests },
             );
         },
         .file => |path| blk: {
@@ -318,7 +380,7 @@ fn openCredentialedBindingObjectStoreAlloc(
                 alloc,
                 file_uri,
                 options.file_bucket,
-                .{ .ensure_bucket = !options.read_only },
+                .{ .ensure_bucket = !options.read_only, .io = options.io, .requests = options.requests, .query_requests = options.query_requests },
             );
         },
     };
@@ -331,6 +393,7 @@ fn openCredentialedS3PrefixAlloc(
     bucket: []const u8,
     prefix: []const u8,
     read_only: bool,
+    transport: ?object_store_support.Transport,
 ) !object_store_support.OpenedObjectStore {
     if (external_io.protocol != .s3) return error.UnsupportedExternalLakeCredentialRef;
     try ensureBucketAllowed(bucket, external_io.buckets);
@@ -362,7 +425,7 @@ fn openCredentialedS3PrefixAlloc(
                 .virtual_hosted => .virtual_hosted,
             },
         },
-        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing },
+        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .io = if (transport) |value| value.io else null, .requests = if (transport) |value| value.requests else null, .query_requests = if (transport) |value| value.query_requests else null, .speculative = if (transport) |value| value.speculative else false, .wait_for_speculative_io = if (transport) |value| value.wait_for_speculative_io else false },
     );
 }
 
@@ -373,6 +436,7 @@ fn openCredentialedGcsPrefixAlloc(
     bucket: []const u8,
     prefix: []const u8,
     read_only: bool,
+    transport: ?object_store_support.Transport,
 ) !object_store_support.OpenedObjectStore {
     if (external_io.protocol != .gcs) return error.UnsupportedExternalLakeCredentialRef;
     try ensureBucketAllowed(bucket, external_io.buckets);
@@ -391,7 +455,7 @@ fn openCredentialedGcsPrefixAlloc(
         bucket,
         prefix,
         bearer_token,
-        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing },
+        .{ .gcs_endpoint = resolved.endpoint, .gcs_upload_endpoint = resolved.upload_endpoint, .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .io = if (transport) |value| value.io else null, .requests = if (transport) |value| value.requests else null, .query_requests = if (transport) |value| value.query_requests else null, .speculative = if (transport) |value| value.speculative else false, .wait_for_speculative_io = if (transport) |value| value.wait_for_speculative_io else false },
     );
 }
 

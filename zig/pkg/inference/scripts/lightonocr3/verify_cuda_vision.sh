@@ -45,3 +45,5 @@ cmp "$pkg_root/src/ops/cuda/lighton_vision.ptx" "$output_dir/lighton_vision.ptx"
   --artifact "$output_dir/vision_oracle.ptx" --output "$output_dir/qualification.json"
 "${PYTHON:-python3}" "$pkg_root/scripts/lightonocr3/check_cuda_vision_qkv.py" \
   --artifact "$output_dir/vision_oracle.ptx" --output "$output_dir/qkv_qualification.json"
+"${PYTHON:-python3}" "$pkg_root/scripts/lightonocr3/check_cuda_vision_positions.py" \
+  --artifact "$output_dir/vision_oracle.ptx" --output "$output_dir/position_qualification.json"

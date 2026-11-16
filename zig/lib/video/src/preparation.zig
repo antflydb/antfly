@@ -105,6 +105,10 @@ pub const Options = struct {
     /// Geometry comes from the pinned processor adapter, never inferred from FPS.
     width: u32,
     height: u32,
+    /// Square-pixel display size after sample aspect and rotation, for adapters
+    /// that derive their own model geometry. Zero means the raster size.
+    presentation_width: u32 = 0,
+    presentation_height: u32 = 0,
     /// Required explicit SDR color matrix; range comes from the NV12 surface.
     matrix: Matrix,
     rotation: Rotation = .none,

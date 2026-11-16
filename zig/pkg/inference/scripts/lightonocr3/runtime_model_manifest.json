@@ -1,0 +1,1 @@
+{"type":"generator","tasks":["generate","read"],"inputs":["text","image"],"capabilities":["ocr","lightonocr3"]}

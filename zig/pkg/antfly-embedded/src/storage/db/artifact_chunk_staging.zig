@@ -40,7 +40,7 @@ fn configFor(a: Allocator, command: publication.Command, catalogs: inventory.Cat
             if (value.kind == .asset and std.mem.eql(u8, value.name, config.source_artifact_name)) break value;
         } else return error.InvalidBatchRequest;
         const producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(a, upstream.producer_json);
-        if (producer.type != .media_output) return error.OnlineMergeArtifactTailsUnsupported;
+        if (!@import("enrichment/asset_producer.zig").supportsScalarTextProjection(producer.type, upstream.content_type)) return error.OnlineMergeArtifactTailsUnsupported;
     }
     return .{ .config = config, .configs = configs };
 }
@@ -102,7 +102,7 @@ pub const Control = struct {
         // Collecting unselected private rows cannot change a sealed logical
         // source cut. Appends still obey the producer admission fence.
         if (self.command.mode != .prune_chunks) {
-            if (try @import("artifact_producer_obligations.zig").load(txn)) |obligations| if (obligations.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
+            if (try @import("artifact_producer_obligations.zig").loadMetadata(txn)) |obligations| if (obligations.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
         }
         if (self.command.mode == .append_chunks and self.append == null) {
             _ = try self.plan.begin(txn);

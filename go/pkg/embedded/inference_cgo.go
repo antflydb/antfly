@@ -386,17 +386,10 @@ func (inf *Inference) Extract(request []byte) ([]byte, error) {
 	})
 }
 
-// Read runs OCR via the inference API's POST /ai/v1/read.
+// Read reads images, documents, or audio via the inference API's POST /ai/v1/read.
 func (inf *Inference) Read(request []byte) ([]byte, error) {
 	return inf.call(request, func(handle unsafe.Pointer, input C.antfly_slice, out *C.antfly_buffer) C.antfly_error_code {
 		return C.antfly_inference_read_json((*C.antfly_inference)(handle), input, out)
-	})
-}
-
-// Transcribe runs the inference API's POST /ai/v1/transcribe.
-func (inf *Inference) Transcribe(request []byte) ([]byte, error) {
-	return inf.call(request, func(handle unsafe.Pointer, input C.antfly_slice, out *C.antfly_buffer) C.antfly_error_code {
-		return C.antfly_inference_transcribe_json((*C.antfly_inference)(handle), input, out)
 	})
 }
 

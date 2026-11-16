@@ -1,0 +1,639 @@
+{
+  "schema_version": 1,
+  "qualification": "Conditional source projection, bounded verified image descriptors, and cross-manifest indexed worker refill",
+  "source": {
+    "commit": "32315fef467a304e6eb5cb63ab3136f299a9b533",
+    "cli_implementation_commit": "f202b052b36ad261eabdcf3e952d3ab3f22f4662",
+    "merged_pr": 1248,
+    "merged_main": "f95a5a5820bdbe2b9fa404a1d87970b94462933e"
+  },
+  "build": {
+    "zig_version": "0.17.0",
+    "optimize": "ReleaseFast",
+    "macos_target": "aarch64-macos native",
+    "linux_target": "aarch64-linux-gnu",
+    "linux_environment": "Existing Docker Linux VM on the same Apple Silicon host; constrained container, not independent native Linux hardware",
+    "linux_container_cpus": 2,
+    "linux_container_memory_bytes": 1073741824
+  },
+  "limits": {
+    "descriptor_namespace": "verified-image-v1",
+    "descriptor_buckets": 256,
+    "descriptor_ways": 4,
+    "descriptor_slot_bytes": 1024,
+    "descriptor_disk_bytes_bound": 1048576,
+    "parent_lanes_max": 8,
+    "ordered_completion_slots": 16,
+    "shared_image_working_set_estimate_bytes": 67108864,
+    "point_pages_per_wave_max": 32
+  },
+  "method": {
+    "trials": "Five alternating baseline/candidate rounds; each round has an isolated cold cache and a second warm invocation",
+    "cpu": "Median of each CLI child process user+system CPU; excludes fixture-server and wrapper CPU",
+    "fixture": "Loopback reference query and provider fixtures; 20 ms artificial HTTP delay, constant scores, generated valid images",
+    "correctness": "Driver asserts identical ordered output SHA256 across baseline/candidate cold/warm runs",
+    "drivers": [
+      {
+        "path": "zig/pkg/antfly-grep/bench/visual_batches.py",
+        "sha256": "379f195ae1adfb1bb9a86071101a21e6a646dc2464502cd05bc42fd98470a838",
+        "bytes": 13397
+      },
+      {
+        "path": "zig/pkg/antfly-grep/bench/measure_process.py",
+        "sha256": "987b824fbf8f583d9b5a485224d37490646bdb95a8ce87c2a9a70adb64fb686a",
+        "bytes": 2566
+      },
+      {
+        "path": "zig/pkg/antfly-grep/tests/test_cli.py",
+        "sha256": "9217f348d46f138d4839a965982cd5758ce10fcaf2f2ebf8a79e84432fbd53b2",
+        "bytes": 414984
+      }
+    ]
+  },
+  "reports": [
+    {
+      "host": "macos",
+      "workload": "wide",
+      "raw_report": {
+        "path": "output/conditional-wide-macos-qualified.json",
+        "sha256": "33945c86a45047f14c9a7efc67632a9b31aea5006ac73c6b2e2832fa36dadd85",
+        "bytes": 12893
+      },
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "binaries": {
+        "baseline": {
+          "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/perf-grep-conditional-projection/output/grep-rolling/macos/final-antfly-grep",
+          "sha256": "76d49b626c3c60269f74c1fefc6f460c87085f76dd81a5a2e882d9374168ef04",
+          "bytes": 8189400
+        },
+        "candidate": {
+          "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/perf-grep-conditional-projection/output/conditional/macos/antfly-grep",
+          "sha256": "d43922ab35ed11d34893119d35c815a478b5052ff3b7fc7a52f65b9451d25594",
+          "bytes": 8207208
+        }
+      },
+      "output_sha256": "5db0a0e8ce7b60c6e6fba878a0e422aa6fc66d653b5cdf8bf22de1e1cf150c02",
+      "parameters": {
+        "units": 16,
+        "parents": 8,
+        "page_size": 16,
+        "requested_image_bytes": 262144,
+        "ranked": true,
+        "rounds": 5,
+        "per_request_delay_ms": 20,
+        "slow_first_ms": 0,
+        "batch_size": 8,
+        "conditional_source_projection": true
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 453784458,
+          "first_stdout_ns": 450174625,
+          "peak_rss_bytes": 63307776,
+          "provider_requests": 19,
+          "index_requests": 17,
+          "index_response_bytes": 44784593,
+          "projected_asset_bytes": 44742400,
+          "logical_provider_json_bytes": 44817335,
+          "evaluated_units": 128,
+          "child_cpu_ns": 167182000,
+          "elapsed_ns_range": [
+            419665916,
+            477032458
+          ],
+          "projected_asset_bytes_range": [
+            44742400,
+            44742400
+          ]
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 229084125,
+          "first_stdout_ns": 227644292,
+          "peak_rss_bytes": 25886720,
+          "provider_requests": 0,
+          "index_requests": 17,
+          "index_response_bytes": 44784593,
+          "projected_asset_bytes": 44742400,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 128,
+          "child_cpu_ns": 117611000,
+          "elapsed_ns_range": [
+            212009708,
+            245625291
+          ],
+          "projected_asset_bytes_range": [
+            44742400,
+            44742400
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 525304417,
+          "first_stdout_ns": 520502542,
+          "peak_rss_bytes": 59736064,
+          "provider_requests": 20,
+          "index_requests": 17,
+          "index_response_bytes": 44801025,
+          "projected_asset_bytes": 44742400,
+          "logical_provider_json_bytes": 44817660,
+          "evaluated_units": 128,
+          "child_cpu_ns": 181117000,
+          "elapsed_ns_range": [
+            508935750,
+            526762584
+          ],
+          "projected_asset_bytes_range": [
+            44742400,
+            44742400
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 204614709,
+          "first_stdout_ns": 203403625,
+          "peak_rss_bytes": 7405568,
+          "provider_requests": 0,
+          "index_requests": 17,
+          "index_response_bytes": 57073,
+          "projected_asset_bytes": 0,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 128,
+          "child_cpu_ns": 17051000,
+          "elapsed_ns_range": [
+            202521500,
+            219722541
+          ],
+          "projected_asset_bytes_range": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "host": "macos",
+      "workload": "pages",
+      "raw_report": {
+        "path": "output/conditional-pages-macos-qualified.json",
+        "sha256": "ae14a04c6bb9fdc5c6b30edb977465c056df1474c50656c7f26a25515af130ab",
+        "bytes": 12653
+      },
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "binaries": {
+        "baseline": {
+          "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/perf-grep-conditional-projection/output/grep-rolling/macos/final-antfly-grep",
+          "sha256": "76d49b626c3c60269f74c1fefc6f460c87085f76dd81a5a2e882d9374168ef04",
+          "bytes": 8189400
+        },
+        "candidate": {
+          "path": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/perf-grep-conditional-projection/output/conditional/macos/antfly-grep",
+          "sha256": "d43922ab35ed11d34893119d35c815a478b5052ff3b7fc7a52f65b9451d25594",
+          "bytes": 8207208
+        }
+      },
+      "output_sha256": "453a73cabd20fac553bf3651faf435061b18d630de2d7c5cf47d8fef8f0c67b2",
+      "parameters": {
+        "units": 1,
+        "parents": 24,
+        "page_size": 1,
+        "requested_image_bytes": 0,
+        "ranked": false,
+        "rounds": 5,
+        "per_request_delay_ms": 20,
+        "slow_first_ms": 500.0,
+        "batch_size": 1,
+        "conditional_source_projection": true
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 1872255542,
+          "first_stdout_ns": 636249958,
+          "peak_rss_bytes": 4931584,
+          "provider_requests": 24,
+          "index_requests": 49,
+          "index_response_bytes": 25943,
+          "projected_asset_bytes": 3324,
+          "logical_provider_json_bytes": 23868,
+          "evaluated_units": 24,
+          "child_cpu_ns": 21329000,
+          "elapsed_ns_range": [
+            1824869500,
+            1893651208
+          ],
+          "projected_asset_bytes_range": [
+            3324,
+            3324
+          ]
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 719778708,
+          "first_stdout_ns": 85906041,
+          "peak_rss_bytes": 4669440,
+          "provider_requests": 0,
+          "index_requests": 49,
+          "index_response_bytes": 25943,
+          "projected_asset_bytes": 3324,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 24,
+          "child_cpu_ns": 12297000,
+          "elapsed_ns_range": [
+            660682500,
+            739336250
+          ],
+          "projected_asset_bytes_range": [
+            3324,
+            3324
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 997640333,
+          "first_stdout_ns": 634915916,
+          "peak_rss_bytes": 6602752,
+          "provider_requests": 24,
+          "index_requests": 49,
+          "index_response_bytes": 29519,
+          "projected_asset_bytes": 3324,
+          "logical_provider_json_bytes": 23868,
+          "evaluated_units": 24,
+          "child_cpu_ns": 26045000,
+          "elapsed_ns_range": [
+            979086250,
+            1025032041
+          ],
+          "projected_asset_bytes_range": [
+            3324,
+            3324
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 673744250,
+          "first_stdout_ns": 92935416,
+          "peak_rss_bytes": 5079040,
+          "provider_requests": 0,
+          "index_requests": 49,
+          "index_response_bytes": 25955,
+          "projected_asset_bytes": 0,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 24,
+          "child_cpu_ns": 14930000,
+          "elapsed_ns_range": [
+            659715625,
+            698057667
+          ],
+          "projected_asset_bytes_range": [
+            0,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "host": "linux",
+      "workload": "wide",
+      "raw_report": {
+        "path": "output/conditional-wide-linux-qualified.json",
+        "sha256": "aaaf245f6fb966e5b283dc8be4864820cfdc89e20067f81f2e81ab3da6d146b9",
+        "bytes": 12792
+      },
+      "platform": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.41",
+      "binaries": {
+        "baseline": {
+          "path": "/work/output/grep-rolling/linux/final-antfly-grep",
+          "sha256": "ac372a68cd5fbe69495a02c5aad77ee9a1305323730b14ec6ddc79cae2b1b1f2",
+          "bytes": 31631232
+        },
+        "candidate": {
+          "path": "/work/output/conditional/linux/antfly-grep",
+          "sha256": "453f9606106a16cdce8c188b4f3f081e2d061319d16650a5ad6bf843cc8e8531",
+          "bytes": 31719872
+        }
+      },
+      "output_sha256": "5db0a0e8ce7b60c6e6fba878a0e422aa6fc66d653b5cdf8bf22de1e1cf150c02",
+      "parameters": {
+        "units": 16,
+        "parents": 8,
+        "page_size": 16,
+        "requested_image_bytes": 262144,
+        "ranked": true,
+        "rounds": 5,
+        "per_request_delay_ms": 20,
+        "slow_first_ms": 0,
+        "batch_size": 8,
+        "conditional_source_projection": true
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 415376708,
+          "first_stdout_ns": 411091416,
+          "peak_rss_bytes": 96129024,
+          "provider_requests": 19,
+          "index_requests": 17,
+          "index_response_bytes": 44784593,
+          "projected_asset_bytes": 44742400,
+          "logical_provider_json_bytes": 44817335,
+          "evaluated_units": 128,
+          "child_cpu_ns": 238302000,
+          "elapsed_ns_range": [
+            388576667,
+            463013416
+          ],
+          "projected_asset_bytes_range": [
+            44742400,
+            44742400
+          ]
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 209714334,
+          "first_stdout_ns": 208173042,
+          "peak_rss_bytes": 42127360,
+          "provider_requests": 0,
+          "index_requests": 17,
+          "index_response_bytes": 44784593,
+          "projected_asset_bytes": 44742400,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 128,
+          "child_cpu_ns": 187835000,
+          "elapsed_ns_range": [
+            202612792,
+            218851208
+          ],
+          "projected_asset_bytes_range": [
+            44742400,
+            44742400
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 474632584,
+          "first_stdout_ns": 471512875,
+          "peak_rss_bytes": 95252480,
+          "provider_requests": 20,
+          "index_requests": 17,
+          "index_response_bytes": 44801025,
+          "projected_asset_bytes": 44742400,
+          "logical_provider_json_bytes": 44817652,
+          "evaluated_units": 128,
+          "child_cpu_ns": 242413000,
+          "elapsed_ns_range": [
+            466404417,
+            493592541
+          ],
+          "projected_asset_bytes_range": [
+            44742400,
+            44742400
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 238649875,
+          "first_stdout_ns": 237659708,
+          "peak_rss_bytes": 17645568,
+          "provider_requests": 0,
+          "index_requests": 18,
+          "index_response_bytes": 5302612,
+          "projected_asset_bytes": 5243250,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 128,
+          "child_cpu_ns": 32979000,
+          "elapsed_ns_range": [
+            198486875,
+            393591958
+          ],
+          "projected_asset_bytes_range": [
+            349550,
+            5243250
+          ]
+        }
+      ]
+    },
+    {
+      "host": "linux",
+      "workload": "pages",
+      "raw_report": {
+        "path": "output/conditional-pages-linux-qualified.json",
+        "sha256": "7c111d3fd6dc48249b51fbfda7f5379f0aa59d27e74556bc9406c868a5c464e3",
+        "bytes": 12502
+      },
+      "platform": "Linux-7.0.14-linuxkit-aarch64-with-glibc2.41",
+      "binaries": {
+        "baseline": {
+          "path": "/work/output/grep-rolling/linux/final-antfly-grep",
+          "sha256": "ac372a68cd5fbe69495a02c5aad77ee9a1305323730b14ec6ddc79cae2b1b1f2",
+          "bytes": 31631232
+        },
+        "candidate": {
+          "path": "/work/output/conditional/linux/antfly-grep",
+          "sha256": "453f9606106a16cdce8c188b4f3f081e2d061319d16650a5ad6bf843cc8e8531",
+          "bytes": 31719872
+        }
+      },
+      "output_sha256": "453a73cabd20fac553bf3651faf435061b18d630de2d7c5cf47d8fef8f0c67b2",
+      "parameters": {
+        "units": 1,
+        "parents": 24,
+        "page_size": 1,
+        "requested_image_bytes": 0,
+        "ranked": false,
+        "rounds": 5,
+        "per_request_delay_ms": 20,
+        "slow_first_ms": 500.0,
+        "batch_size": 1,
+        "conditional_source_projection": true
+      },
+      "medians": [
+        {
+          "variant": "baseline",
+          "phase": "cold",
+          "elapsed_ns": 1767302793,
+          "first_stdout_ns": 593950291,
+          "peak_rss_bytes": 8916992,
+          "provider_requests": 24,
+          "index_requests": 49,
+          "index_response_bytes": 25943,
+          "projected_asset_bytes": 3324,
+          "logical_provider_json_bytes": 23868,
+          "evaluated_units": 24,
+          "child_cpu_ns": 37268000,
+          "elapsed_ns_range": [
+            1748008584,
+            1805764876
+          ],
+          "projected_asset_bytes_range": [
+            3324,
+            3324
+          ]
+        },
+        {
+          "variant": "baseline",
+          "phase": "warm",
+          "elapsed_ns": 689762167,
+          "first_stdout_ns": 57560167,
+          "peak_rss_bytes": 8916992,
+          "provider_requests": 0,
+          "index_requests": 49,
+          "index_response_bytes": 25943,
+          "projected_asset_bytes": 3324,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 24,
+          "child_cpu_ns": 22666000,
+          "elapsed_ns_range": [
+            679364375,
+            712018959
+          ],
+          "projected_asset_bytes_range": [
+            3324,
+            3324
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "cold",
+          "elapsed_ns": 922068126,
+          "first_stdout_ns": 583990250,
+          "peak_rss_bytes": 9015296,
+          "provider_requests": 24,
+          "index_requests": 49,
+          "index_response_bytes": 29519,
+          "projected_asset_bytes": 3324,
+          "logical_provider_json_bytes": 23868,
+          "evaluated_units": 24,
+          "child_cpu_ns": 43102000,
+          "elapsed_ns_range": [
+            905885292,
+            943319167
+          ],
+          "projected_asset_bytes_range": [
+            3324,
+            3324
+          ]
+        },
+        {
+          "variant": "candidate",
+          "phase": "warm",
+          "elapsed_ns": 657832500,
+          "first_stdout_ns": 72821750,
+          "peak_rss_bytes": 8908800,
+          "provider_requests": 0,
+          "index_requests": 49,
+          "index_response_bytes": 25955,
+          "projected_asset_bytes": 0,
+          "logical_provider_json_bytes": 0,
+          "evaluated_units": 24,
+          "child_cpu_ns": 25600000,
+          "elapsed_ns_range": [
+            632641417,
+            676436375
+          ],
+          "projected_asset_bytes_range": [
+            0,
+            0
+          ]
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "These are shared-host synthetic fixture measurements, not native Antfly server throughput or independent cross-host benchmarks.",
+    "The reference server reads and hashes selected values before conditional omission; server storage reads and hashing are not eliminated.",
+    "The bounded best-effort descriptor cache can evict or miss under collisions and concurrent writes; those cases correctly materialize full source. Linux wide warm trials include such fallback, so zero-transfer is not guaranteed.",
+    "Cold wide-image elapsed time increases on both platforms; identity generation and descriptor registration have a cost.",
+    "The Linux wide warm median elapsed time regresses despite lower child CPU and fewer image bytes; no universal latency win is claimed.",
+    "Cross-page overlap improves the slow-head cold fixture; tiny-image warm child CPU and some RSS increase.",
+    "Warm provider calls are already zero for the baseline. These results establish no additional live model token savings or relevance quality.",
+    "Raw logs, trials, fixture libraries and image payloads remain in ignored output; only this compact provenance/median summary is committed."
+  ],
+  "validation": {
+    "linux_cli": {
+      "result": "285 passed, 3 platform skips (288 total); final Linux binary; ripgrep 15.2 oracle",
+      "log": "output/conditional-cli-linux-qualified.log",
+      "log_sha256": "79f69a7d4741203361e2f47ac0c335b9bb9a6c23bb6f0332bc045a71387acef2"
+    },
+    "macos_media": {
+      "result": "28 passed; final native CLI binary",
+      "log": "output/conditional-media-macos-final.log",
+      "log_sha256": "10638fb61b4048a36ba6ea9b84b2886e6f5a2fd16d5cddbea5d99e3202f1c190"
+    },
+    "macos_full_cli": {
+      "result": "285 passed, 2 platform skips, 1 intermittent workspace-watcher assertion failed (288 total); same runtime implementation before final validator-fingerprint input addition",
+      "log": "output/conditional-cli-macos-qualified.log",
+      "log_sha256": "94d2443acb19f6b949ffea58df0dcb608976aaf9437b3187cb988a99718eae91"
+    },
+    "macos_watcher_rerun": {
+      "result": "Both affected watcher cases pass in isolation; assertions unchanged",
+      "log": "output/conditional-watcher-qualification.log",
+      "log_sha256": "9f98671efd70f1408d3e88bce7cff5c7a960c9e1b1b3058c282f0c883c650585"
+    },
+    "macos_watcher_baseline": {
+      "result": "Merged baseline reproduces the 4200-versus-0 inventory-visit failure in 1 of 6 repeated isolated runs; the other membership-reuse failure was not independently reproduced on baseline",
+      "log": "output/conditional-watcher-baseline.log",
+      "log_sha256": "a38cd736af557cbfb0c300614076c49edcef7be1a31a7cbd89f6f1392703af96"
+    },
+    "query_contract": {
+      "result": "148 owner-local tests plus 3 host tests passed, zero leaks; includes typed/column projection allocation-failure and cancellation coverage",
+      "log": "output/conditional-query-contract-complete.log",
+      "log_sha256": "aaddf345b751cc811f0a7259875423ab8a270d0c69168718fa1b0136537db021"
+    },
+    "mcp_schema": {
+      "result": "9 passed",
+      "log": "output/conditional-mcp-schema-tests.log",
+      "log_sha256": "9fa07126b0e4a2867fdaeb88fec5304571a97d20936ed16577d176870f45dc19"
+    },
+    "openapi_check": {
+      "result": "Passed generated drift, schema and Zig checks",
+      "log": "output/conditional-openapi-check.log",
+      "log_sha256": "32fa6f0b574bd656578843d3d090a83a5c9280209b36d2ab2c648c87ccd81a5b"
+    },
+    "go_sdk": {
+      "result": "All Go SDK packages passed",
+      "log": "output/conditional-go-sdk.log",
+      "log_sha256": "7b73a6eb4b6556de7b28ad9b38b5922b6bacc53fadc99ed6f767c8de12d1ca67"
+    },
+    "packaging": {
+      "result": "Archive contents, hashes and reproducibility test passed",
+      "log": "output/conditional-packaging.log",
+      "log_sha256": "0f2a1d5e7c2faa0387d6d929bd7c821fbabe31eb9bdf15eb5c1d0572f932a3a9"
+    },
+    "windows_cross_compile": {
+      "result": "Passed before final validator-fingerprint input addition; runtime source unchanged",
+      "log": "output/conditional-windows-build.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "license_boundary": {
+      "result": "2430 source files passed",
+      "log": "output/conditional-license-final.log",
+      "log_sha256": "e398b667c5ee443737a5c5a35dd80ef6fc835e589045fc8e9a26e687a02d7492"
+    },
+    "native_server": {
+      "result": "27 passed, 7 opt-in benchmark skips; final native server and CLI binaries; includes single-/two-shard conditions, warm CLI omission, changed values, revision and permission fences",
+      "log": "output/conditional-server-integration-final.log",
+      "log_sha256": "b8ec6fc8b10a3dde88ccae8308b2ca30515b52281a6df3e5bedc6507231950f0",
+      "test_source_sha256": "d0263e4d1ce71d45fbee944cd18da975bb53c30e7a2dd3db58b9e7481e16571e",
+      "server_binary": {
+        "path": "output/conditional/macos/antfly",
+        "sha256": "074dbee368bec483600bb29e65fbcfc915d305974243476bfac9ca58b49c7489",
+        "bytes": 211070856
+      },
+      "server_build": "ReleaseFast, strip=true, aarch64-macos baseline CPU, -j1; source commit 32315fef467a304e6eb5cb63ab3136f299a9b533"
+    }
+  }
+}

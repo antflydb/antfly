@@ -48,6 +48,100 @@ pub const Limits = struct {
     max_pool_pair_elements: usize = 1024 * 1024,
 };
 
+/// Native head admission needs only padded geometry, not encoder tensors.
+pub const Shape = struct { batch: usize, text_length: usize, queries: usize };
+pub const Plan = struct { intermediate_bytes: usize };
+
+const Charges = struct {
+    bytes: usize = 0,
+    limit: usize,
+    fn add(self: *Charges, comptime T: type, elements: usize) !void {
+        const size = std.math.mul(usize, @sizeOf(T), elements) catch return error.ResourceLimitExceeded;
+        const next = std.math.add(usize, self.bytes, size) catch return error.ResourceLimitExceeded;
+        if (next > self.limit) return error.ResourceLimitExceeded;
+        self.bytes = next;
+    }
+    fn floats(self: *Charges, dimensions: []const usize) !void {
+        var elements: usize = 1;
+        for (dimensions) |value| elements = try product(elements, value);
+        try self.add(f32, elements);
+    }
+};
+
+/// Exact cumulative NativeMath charges for forwardNative, including optional
+/// content/record/count/abstention paths. Shared-pool scratch has its own cap.
+/// No allocations, model reads, or backend dispatch occur during planning.
+pub fn planShape(config: *const boundary.Config, shape: Shape, limits: Limits) !Plan {
+    return planShapeChecked(config, shape, limits) catch |err| switch (err) {
+        error.Overflow => error.ResourceLimitExceeded,
+        else => err,
+    };
+}
+
+fn planShapeChecked(config: *const boundary.Config, shape: Shape, limits: Limits) !Plan {
+    try validateShape(config, shape, limits);
+    const settings = config.head;
+    const b = shape.batch;
+    const l = shape.text_length;
+    const q = shape.queries;
+    const n = try std.math.add(usize, l, 1);
+    const h: usize = config.encoder.hidden_size;
+    const d: usize = settings.boundary_dim;
+    const p: usize = settings.pair_dim;
+    const rows = try product(b, n);
+    const words = try product(b, l);
+    const bq = try product(b, q);
+    const bc = try product(b, settings.pool_size);
+    const scores = try product(bc, q);
+    var charges = Charges{ .limit = limits.max_intermediate_bytes };
+    // Boundary encoding: BOS/EOS, left/right states, and projections.
+    try charges.floats(&.{ 2, h });
+    try charges.floats(&.{ 2, rows, h });
+    try charges.add(bool, rows);
+    try charges.add(usize, b);
+    try charges.floats(&.{ 6, rows, d });
+    try charges.floats(&.{ settings.boundary_attention_layers, 9, rows, d });
+    const ffn: usize = @intFromFloat(@as(f64, @floatFromInt(d)) * settings.boundary_ffn_multiplier);
+    try charges.floats(&.{ settings.boundary_refinement_layers, rows, try std.math.add(usize, try product(2, d), try product(3, ffn)) });
+    // Marginal boundary/text/query projections and logits/prefix storage.
+    try charges.floats(&.{ 2, rows, d });
+    try charges.floats(&.{ 3, bq, d });
+    try charges.floats(&.{ words, d });
+    try charges.floats(&.{ 3, bq, n });
+    try charges.floats(&.{ bq, l });
+    try charges.add(bool, try product(bq, l));
+    try charges.floats(&.{bq});
+    // Pool projections, retained proposals, and the primitive's scratch cap.
+    try charges.floats(&.{ 2, rows, d });
+    try charges.add(primitives.Span, bc);
+    try charges.add(bool, bc);
+    try charges.floats(&.{ 2, bc });
+    const k = @min(n, settings.pool_boundary_top_k);
+    const pairs = try product(k, k);
+    const entries = try std.math.add(usize, try product(q, @min(settings.min_pool_per_query, pairs)), pairs);
+    if (pairs > limits.max_pool_pair_elements or entries > limits.max_pool_pair_elements) return error.ResourceLimitExceeded;
+    // Shared scorer: projections, priors, candidate features and FiLM scores.
+    try charges.floats(&.{ 2, rows, p });
+    try charges.floats(&.{ 3, bc });
+    try charges.floats(&.{ 4, bc, p });
+    if (settings.enable_span_content) {
+        const content: usize = settings.content_dim;
+        try charges.floats(&.{ words, content });
+        try charges.floats(&.{ b, n, content });
+        try charges.floats(&.{ 2, bc, content });
+        try charges.floats(&.{ bc, p });
+    }
+    try charges.floats(&.{ 3, bq, p });
+    try charges.floats(&.{ scores, try std.math.add(usize, p, 130) });
+    if (settings.enable_records) {
+        try charges.floats(&.{ 2, bc, d });
+        try charges.floats(&.{ bc, h });
+    }
+    if (settings.enable_abstention) try charges.floats(&.{bq});
+    if (settings.enable_count_head) try charges.floats(&.{bq});
+    return .{ .intermediate_bytes = charges.bytes };
+}
+
 pub const Marginals = struct {
     start_logits: []f32, // [B,Q,L+1]
     end_logits: []f32,
@@ -115,15 +209,14 @@ pub const NativeMath = struct {
     }
 
     pub fn charge(self: *NativeMath, comptime T: type, count: usize) !void {
-        try self.preflight(T, count);
-        const bytes = try std.math.mul(usize, @sizeOf(T), count);
-        self.allocated_bytes = try std.math.add(usize, self.allocated_bytes, bytes);
+        var charges = Charges{ .bytes = self.allocated_bytes, .limit = self.limits.max_intermediate_bytes };
+        try charges.add(T, count);
+        self.allocated_bytes = charges.bytes;
     }
 
     fn preflight(self: *const NativeMath, comptime T: type, count: usize) !void {
-        const bytes = try std.math.mul(usize, @sizeOf(T), count);
-        const next = try std.math.add(usize, self.allocated_bytes, bytes);
-        if (next > self.limits.max_intermediate_bytes) return error.ResourceLimitExceeded;
+        var charges = Charges{ .bytes = self.allocated_bytes, .limit = self.limits.max_intermediate_bytes };
+        try charges.add(T, count);
     }
 
     pub fn alloc(self: *NativeMath, comptime T: type, count: usize) ![]T {
@@ -232,7 +325,7 @@ fn dimension(value: usize) !i32 {
     return std.math.cast(i32, value) orelse error.InvalidInputShape;
 }
 
-pub fn validate(config: *const boundary.Config, input: Input, limits: Limits) !void {
+fn validateShape(config: *const boundary.Config, input: Shape, limits: Limits) !void {
     try config.head.validate();
     if (config.version != boundary.config_version or config.architecture_version != boundary.architecture_version)
         return error.UnsupportedGlinerBoundaryVersion;
@@ -242,6 +335,10 @@ pub fn validate(config: *const boundary.Config, input: Input, limits: Limits) !v
     if (input.batch == 0 or input.queries == 0 or config.encoder.hidden_size == 0) return error.InvalidInputShape;
     if (input.batch > limits.max_batch or input.queries > limits.max_queries or input.text_length > limits.max_text_words)
         return error.ResourceLimitExceeded;
+}
+
+pub fn validate(config: *const boundary.Config, input: Input, limits: Limits) !void {
+    try validateShape(config, .{ .batch = input.batch, .text_length = input.text_length, .queries = input.queries }, limits);
     const words = try product(input.batch, input.text_length);
     const queries = try product(input.batch, input.queries);
     if (input.text_states.len != try product(words, config.encoder.hidden_size) or
@@ -260,6 +357,7 @@ pub fn forwardNative(cb: *const compute.ComputeBackend, allocator: std.mem.Alloc
     try cb.checkExecutionControl();
     if (input.control) |control| try control.check();
     try validate(config, input, limits);
+    const admitted = try planShape(config, .{ .batch = input.batch, .text_length = input.text_length, .queries = input.queries }, limits);
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
     arena.* = std.heap.ArenaAllocator.init(allocator);
@@ -313,6 +411,8 @@ pub fn forwardNative(cb: *const compute.ComputeBackend, allocator: std.mem.Alloc
     else
         null;
     try ctx.math.check();
+    // Parity and learned execution in Debug catch planner/implementation drift.
+    std.debug.assert(ctx.math.allocated_bytes == admitted.intermediate_bytes);
     return .{
         .allocator = allocator,
         .arena = arena,
@@ -742,4 +842,92 @@ fn rotateEndpoints(values: []f32, batch: usize, positions: usize, dim: usize, th
             values[index + 1] = even * sine + odd * cosine;
         }
     };
+}
+
+test "native boundary head scalar admission checks exact and pool limits" {
+    const a = std.testing.allocator;
+    const fixtures = @import("boundary_parity_test.zig");
+    const config_bytes = try fixtures.fixtureBytes(a, "models/base/config.json");
+    defer a.free(config_bytes);
+    const encoder_bytes = try fixtures.fixtureBytes(a, "models/base/encoder_config.json");
+    defer a.free(encoder_bytes);
+    const config = try boundary.parseConfig(a, config_bytes, encoder_bytes);
+    const shape = Shape{ .batch = 2, .text_length = 4096, .queries = 1 };
+    const planned = try planShape(&config, shape, .{});
+    try std.testing.expect(planned.intermediate_bytes <= (Limits{}).max_intermediate_bytes);
+    _ = try planShape(&config, shape, .{ .max_intermediate_bytes = planned.intermediate_bytes });
+    try std.testing.expectError(error.ResourceLimitExceeded, planShape(&config, shape, .{ .max_intermediate_bytes = planned.intermediate_bytes - 1 }));
+    try std.testing.expectError(error.ResourceLimitExceeded, planShape(&config, shape, .{ .max_pool_pair_elements = 1023 }));
+    try std.testing.expectError(error.ResourceLimitExceeded, planShape(&config, .{ .batch = 4, .text_length = 4096, .queries = 1 }, .{}));
+    try std.testing.expectError(error.ResourceLimitExceeded, planShape(&config, .{ .batch = std.math.maxInt(usize), .text_length = 4096, .queries = 1 }, .{}));
+}
+
+test "native boundary head planned charges match learned optional paths" {
+    const a = std.testing.allocator;
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const factory = @import("../session_factory.zig");
+    const session = try factory.createNativeSession(a, directory);
+    defer session.close();
+    const base = try factory.getGlinerBoundaryConfig(session);
+    var managed = try factory.getManagedComputeBackend(session, a, null, null);
+    defer managed.deinit();
+    const shape = Shape{ .batch = 2, .text_length = 3, .queries = 2 };
+    const text = try a.alloc(f32, shape.batch * shape.text_length * base.encoder.hidden_size);
+    defer a.free(text);
+    @memset(text, 0);
+    const queries = try a.alloc(f32, shape.batch * shape.queries * base.encoder.hidden_size);
+    defer a.free(queries);
+    @memset(queries, 0);
+    for (0..16) |flags| {
+        var config = base;
+        config.head.enable_span_content = flags & 1 != 0;
+        config.head.enable_records = flags & 2 != 0;
+        config.head.enable_abstention = flags & 4 != 0;
+        config.head.enable_count_head = flags & 8 != 0;
+        const planned = try planShape(&config, shape, .{});
+        // Tight equality plus forwardNative's Debug assertion catches drift in
+        // either direction without requiring a second mirrored formula here.
+        var result = try forwardNative(&managed.backend, a, &config, .{
+            .batch = shape.batch,
+            .text_length = shape.text_length,
+            .queries = shape.queries,
+            .text_states = text,
+            .query_states = queries,
+            .text_lengths = &.{ 3, 1 },
+            .query_mask = &.{ true, true, true, false },
+        }, .{ .max_intermediate_bytes = planned.intermediate_bytes });
+        result.deinit();
+    }
+}
+
+test "native boundary head full context executes within its admitted budget" {
+    const a = std.testing.allocator;
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const factory = @import("../session_factory.zig");
+    const session = try factory.createNativeSession(a, directory);
+    defer session.close();
+    const config = try factory.getGlinerBoundaryConfig(session);
+    var managed = try factory.getManagedComputeBackend(session, a, null, null);
+    defer managed.deinit();
+    const shape = Shape{ .batch = 2, .text_length = 4096, .queries = 1 };
+    const planned = try planShape(&config, shape, .{});
+    const text = try a.alloc(f32, shape.batch * shape.text_length * config.encoder.hidden_size);
+    defer a.free(text);
+    @memset(text, 0);
+    const queries = try a.alloc(f32, shape.batch * shape.queries * config.encoder.hidden_size);
+    defer a.free(queries);
+    @memset(queries, 0);
+    var result = try forwardNative(&managed.backend, a, &config, .{
+        .batch = shape.batch,
+        .text_length = shape.text_length,
+        .queries = shape.queries,
+        .text_states = text,
+        .query_states = queries,
+        .text_lengths = &.{ 4096, 4096 },
+        .query_mask = &.{ true, true },
+    }, .{ .max_intermediate_bytes = planned.intermediate_bytes });
+    defer result.deinit();
+    try std.testing.expectEqual(shape.batch, result.batch);
+    try std.testing.expectEqual(shape.text_length, result.text_length);
+    std.debug.print("native-head learned full context: batch={} words={} charged_bytes={}\n", .{ shape.batch, shape.text_length, planned.intermediate_bytes });
 }

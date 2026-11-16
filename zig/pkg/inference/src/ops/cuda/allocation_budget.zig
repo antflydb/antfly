@@ -18,11 +18,19 @@
 //! visible here and requires separate deployment headroom.
 const std = @import("std");
 
+/// Physical DeviceBuffer bytes across all CUDA model contexts in this worker.
+/// The serving process may narrow this independently of per-owner quotas.
+/// Module storage, NVDEC and vendor-library-private allocations are excluded.
+pub var process_device_allocations: Budget = .{};
+
 pub const Budget = struct {
     mutex: std.atomic.Mutex = .unlocked,
     limit: usize = std.math.maxInt(usize),
     live: usize = 0,
     peak: usize = 0,
+    /// Stable identity used by the process allocation ledger across moves of
+    /// a model's CudaContext value. Assigned lazily under the ledger lock.
+    owner_id: u64 = 0,
 
     pub const Snapshot = struct { limit: usize, live: usize, peak: usize };
 

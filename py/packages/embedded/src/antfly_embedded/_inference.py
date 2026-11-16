@@ -334,11 +334,8 @@ class Inference:
         return self._json_call(self._lib.antfly_inference_extract_json, request, raw=raw)
 
     def read(self, request: JSONInput, *, raw: bool = False) -> Any:
-        """OCR."""
+        """Read images, documents, or audio with backend-specific audio options."""
         return self._json_call(self._lib.antfly_inference_read_json, request, raw=raw)
-
-    def transcribe(self, request: JSONInput, *, raw: bool = False) -> Any:
-        return self._json_call(self._lib.antfly_inference_transcribe_json, request, raw=raw)
 
     def list_models(self, *, raw: bool = False) -> Any:
         """The installed models, as returned by GET /ai/v1/models."""

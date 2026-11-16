@@ -14,6 +14,8 @@
 // limitations under the License.
 
 const engine = @import("engine.zig");
+const read_sessions = @import("read_session_provider.zig");
+const session_contract = @import("read_session_contract.zig");
 const std = @import("std");
 const native = @import("antfly_runtime_abi").native_abi;
 const Exports = @This();
@@ -52,6 +54,172 @@ fn close(self: *DB) engine.Outcome(void) {
     return .{ .value = self.close() };
 }
 
+const graph_mod = @import("../graph/graph.zig");
+fn hasPublicationReadLease(path: []const u8, io: ?native.IoBorrow) engine.Outcome(bool) {
+    const lifecycle = @import("db/generation_lifecycle.zig");
+    var receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = if (io) |borrow| borrow.receive() catch |err| return .{ .failure = .init(@errorName(err)) } else null;
+    return .{ .value = (if (receiver) |*value| lifecycle.hasPublishedGenerationReadWithIo(path, value.io()) else lifecycle.hasPublishedGenerationRead(path)) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn acquirePublicationReadLease(alloc: Allocator, path: []const u8, io: ?native.IoBorrow) engine.Outcome(?@import("read_session_values.zig").PublicationReadLease) {
+    const lifecycle = @import("db/generation_lifecycle.zig");
+    const Lease = @import("read_session_values.zig").PublicationReadLease;
+    const borrow = io orelse return .{ .value = lifecycle.acquirePublishedGenerationRead(alloc, path) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    // The receiver can outlive this acquisition call because the lease retains
+    // its file executor. Keep it at a stable address until the file closes.
+    const Owner = struct {
+        alloc: Allocator,
+        receiver: @import("antfly_runtime_abi").io_abi.Receiver,
+        lease: Lease,
+        fn close(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const allocator = self.alloc;
+            self.lease.deinit();
+            allocator.destroy(self);
+        }
+    };
+    const owner = alloc.create(Owner) catch |err| return .{ .failure = .init(@errorName(err)) };
+    owner.* = .{ .alloc = alloc, .receiver = borrow.receive() catch |err| {
+        alloc.destroy(owner);
+        return .{ .failure = .init(@errorName(err)) };
+    }, .lease = .{} };
+    const issued = lifecycle.acquirePublishedGenerationReadWithIo(alloc, path, owner.receiver.io()) catch |err| {
+        alloc.destroy(owner);
+        return .{ .failure = .init(@errorName(err)) };
+    };
+    if (issued) |lease| {
+        owner.lease = lease;
+        return .{ .value = Lease{ .context = owner, .close_fn = Owner.close } };
+    }
+    alloc.destroy(owner);
+    return .{ .value = null };
+}
+
+fn openCypherPinnedDocumentSession(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) engine.Outcome(session_contract.Handle) {
+    const session = self.openCypherPinnedDocumentSession(alloc, cut, from, to, opts) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = @import("read_session_provider.zig").retainDocument(session) };
+}
+
+fn openCypherPinnedRelationalSession(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) engine.Outcome(session_contract.Handle) {
+    const session = self.openCypherPinnedRelationalSession(alloc, cut, from, to, opts) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = @import("read_session_provider.zig").retainRelational(session) };
+}
+
+fn captureQueryCutAtStatementFence(self: *DB, request: @import("db/native_query_cut_contract.zig").Request, handle: session_contract.Handle, cancellation: types.CancellationToken) engine.Outcome(void) {
+    const fence = @import("read_session_provider.zig").resolveFence(handle, self) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = self.captureQueryCutAtStatementFence(request, fence, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn releaseStatementQueryCut(self: *DB, request: @import("db/native_query_cut_contract.zig").Request) engine.Outcome(void) {
+    return .{ .value = self.releaseStatementQueryCut(request) };
+}
+
+fn graphEdgesForCypherPageAt(
+    self: *DB,
+    alloc: Allocator,
+    index_name: []const u8,
+    key: []const u8,
+    edge_types: []const []const u8,
+    direction: graph_mod.EdgeDirection,
+    cursor: ?graph_mod.CypherEdgeScanCursor,
+    limits: graph_mod.EdgePageLimits,
+    ttl_now_ns: u64,
+) engine.Outcome(graph_mod.CypherEdgePage) {
+    return .{ .value = self.graphEdgesForCypherPageAt(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn graphEdgesForCypherPageAuthorizedAt(
+    self: *DB,
+    alloc: Allocator,
+    index_name: []const u8,
+    key: []const u8,
+    edge_types: []const []const u8,
+    direction: graph_mod.EdgeDirection,
+    cursor: ?graph_mod.CypherEdgeScanCursor,
+    limits: graph_mod.EdgePageLimits,
+    ttl_now_ns: u64,
+    principal_proof: []const u8,
+    database: []const u8,
+) engine.Outcome(graph_mod.CypherEdgePage) {
+    return .{ .value = self.graphEdgesForCypherPageAuthorizedAt(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn graphEdgesForCypherCapturePageAuthorizedAt(self: *DB, handle: session_contract.Handle, alloc: Allocator, index_name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits, ttl_now_ns: u64, principal_proof: []const u8, database: []const u8) engine.Outcome(graph_mod.CypherEdgePage) {
+    const fence = @import("read_session_provider.zig").resolveFence(handle, self) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = self.graphEdgesForCypherCapturePageAuthorizedAt(fence, alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn cypherDocumentScanOptions(self: *DB, alloc: Allocator, input: types.ScanOptions) engine.Outcome(types.ScanOptions) {
+    return .{ .value = self.cypherDocumentScanOptions(alloc, input) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn acquireCypherReadAuthority(self: *DB, alloc: Allocator, proof: []const u8, database: []const u8) engine.Outcome(DB.CypherReadLease) {
+    return .{ .value = self.acquireCypherReadAuthority(alloc, proof, database) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn permitsCypherDocument(self: *DB, alloc: Allocator, document: std.json.Value, json_null_fields: []const []const u8, proof: []const u8, database: []const u8) engine.Outcome(bool) {
+    return .{ .value = self.permitsCypherDocument(alloc, document, json_null_fields, proof, database) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn cypherFieldDerivedEdgeType(self: *const DB, index_name: []const u8, edge_type: []const u8) engine.Outcome(bool) {
+    return .{ .value = self.cypherFieldDerivedEdgeType(index_name, edge_type) };
+}
+
+fn getCypherPinnedDocument(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, key: []const u8, opts: types.LookupOptions) engine.Outcome(?types.LookupResult) {
+    return .{ .value = self.getCypherPinnedDocument(alloc, cut, key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn getCypherDocuments(self: *DB, alloc: Allocator, keys: []const []const u8, opts: types.ScanOptions, now: u64) engine.Outcome([]?types.LookupResult) {
+    return .{ .value = self.getCypherDocuments(alloc, keys, opts, now) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn getCypherPinnedDocuments(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, keys: []const []const u8, opts: types.ScanOptions) engine.Outcome([]?types.LookupResult) {
+    return .{ .value = self.getCypherPinnedDocuments(alloc, cut, keys, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn captureCypherSelectedSnapshot(self: *DB, alloc: Allocator, handle: session_contract.Handle, names: []const []const u8, now: u64, cancellation: types.CancellationToken) engine.Outcome(DB.CypherPinnedSnapshot) {
+    const fence = @import("read_session_provider.zig").resolveFence(handle, self) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = self.captureCypherSelectedSnapshot(alloc, fence, names, now, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn captureCypherPinnedSnapshot(self: *DB, alloc: Allocator, handle: session_contract.Handle, graph: @import("cypher").catalog.Graph, table: []const u8) engine.Outcome(DB.CypherPinnedSnapshot) {
+    const fence = @import("read_session_provider.zig").resolveFence(handle, self) catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = self.captureCypherPinnedSnapshot(alloc, fence, graph, table) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn visitCypherDocuments(self: *DB, alloc: Allocator, from: []const u8, to: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) engine.Outcome(void) {
+    return .{ .value = self.visitCypherDocuments(alloc, from, to, opts, visitor) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn visitCypherPinnedDocuments(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) engine.Outcome(void) {
+    return .{ .value = self.visitCypherPinnedDocuments(alloc, cut, from, to, opts, visitor) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn scanCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, from: []const u8, to: []const u8, opts: types.ScanOptions) engine.Outcome(types.ScanResult) {
+    return .{ .value = self.scanCypherPinnedSnapshot(alloc, cut, from, to, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn cypherAdjacencyRoutes(self: *DB, alloc: Allocator) engine.Outcome([]const @import("cypher").backend.AdjacencyRoute) {
+    return .{ .value = self.cypherAdjacencyRoutes(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn cypherPinnedAdjacencyRoutes(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot) engine.Outcome([]const @import("cypher").backend.AdjacencyRoute) {
+    return .{ .value = self.cypherPinnedAdjacencyRoutes(alloc, cut) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn graphEdgesForCypherPinnedSnapshot(self: *DB, alloc: Allocator, cut: *DB.CypherPinnedSnapshot, index: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.CypherEdgeScanCursor, limits: graph_mod.EdgePageLimits) engine.Outcome(graph_mod.CypherEdgePage) {
+    return .{ .value = self.graphEdgesForCypherPinnedSnapshot(alloc, cut, index, key, edge_types, direction, cursor, limits) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn cypherPinnedSnapshotDeinit(cut: *DB.CypherPinnedSnapshot) engine.Outcome(void) {
+    cut.deinit();
+    return .{ .value = {} };
+}
+fn cypherGraphIndexIdentity(self: *const DB, alloc: Allocator, index_name: []const u8) engine.Outcome(?@import("cypher").catalog.IndexIdentity) {
+    return .{ .value = self.cypherGraphIndexIdentity(alloc, index_name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn hasRetainedQueryCut(self: *const DB) engine.Outcome(bool) {
+    return .{ .value = self.hasRetainedQueryCut() };
+}
+
+fn searchCypherCut(self: *DB, alloc: Allocator, req: types.SearchRequest, proof: []const u8, database: []const u8) engine.Outcome(types.SearchResult) {
+    return .{ .value = self.searchCypherCut(alloc, req, proof, database) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn enqueueGeneratedArtifactCatalog(self: *DB) engine.Outcome(void) {
+    return .{ .value = self.enqueueGeneratedArtifactCatalog() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn closeOwned(self: *DB) engine.Outcome(void) {
     return .{ .value = self.closeOwned() };
 }
@@ -84,16 +252,6 @@ fn searchWithCapturedRequestAndExecutionContext(
     var received = req;
     if (source) |*predicate| received.native_key_predicate = predicate.receiver();
     var value = self.searchWithCapturedRequestAndExecutionContext(alloc, received, exec_ctx) catch |err| return .{ .failure = .init(@errorName(err)) };
-    // Captured requests retain caller-owned hooks, never the stack proxy.
-    value.request.native_key_predicate = req.native_key_predicate;
-    return .{ .value = value };
-}
-
-fn searchLease(lease: DB.QueryReadLease, alloc: Allocator, req: types.SearchRequest) engine.Outcome(SearchWithDenseProfileResult) {
-    var source = req.native_key_predicate;
-    var received = req;
-    if (source) |*predicate| received.native_key_predicate = predicate.receiver();
-    var value = lease.search(alloc, received) catch |err| return .{ .failure = .init(@errorName(err)) };
     // Captured requests retain caller-owned hooks, never the stack proxy.
     value.request.native_key_predicate = req.native_key_predicate;
     return .{ .value = value };
@@ -331,7 +489,7 @@ fn trySnapshotDenseSearch(self: *DB, alloc: std.mem.Allocator, req: types.Search
     return .{ .value = value };
 }
 
-fn snapshotInternal(self: *DB, id: []const u8, include_generated: bool, cancellation: types.CancellationToken, maintenance_deadline_ns: ?u64, expected_topology_fence: ?@import("db/relational_integrity_topology.zig").Fence, backup_seal_only: bool, query_cut: ?@import("db/native_query_cut.zig").Request) engine.Outcome(u64) {
+fn snapshotInternal(self: *DB, id: []const u8, include_generated: bool, cancellation: types.CancellationToken, maintenance_deadline_ns: ?u64, expected_topology_fence: ?@import("db/relational_integrity_topology.zig").Fence, backup_seal_only: bool, query_cut: ?@import("db/native_query_cut_contract.zig").Request) engine.Outcome(u64) {
     return .{ .value = self.snapshotInternal(id, include_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -391,11 +549,11 @@ fn batchNativeInitialChildApply(self: *DB, req: types.BatchRequest, receipt: db.
     return .{ .value = self.batchNativeInitialChildApply(req, receipt) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn captureQueryCut(self: *DB, request: @import("db/native_query_cut.zig").Request, cancellation: types.CancellationToken) engine.Outcome(void) {
+fn captureQueryCut(self: *DB, request: @import("db/native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) engine.Outcome(void) {
     return .{ .value = self.captureQueryCut(request, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn openQueryCut(self: *DB, request: @import("db/native_query_cut.zig").Request, cancellation: types.CancellationToken) engine.Outcome(DB) {
+fn openQueryCut(self: *DB, request: @import("db/native_query_cut_contract.zig").Request, cancellation: types.CancellationToken) engine.Outcome(DB) {
     return .{ .value = self.openQueryCut(request, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
@@ -621,28 +779,28 @@ fn waitForResolvedTransactionSyncTargetWithCancellation(self: *DB, sync_level: t
     return .{ .value = self.waitForResolvedTransactionSyncTargetWithCancellation(sync_level, sequence, phase, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn captureRelationalStatementSnapshot(self: *DB) engine.Outcome(DB.RelationalStatementSnapshot) {
-    return .{ .value = self.captureRelationalStatementSnapshot() catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn captureRelationalStatementSnapshot(self: *DB) engine.Outcome(session_contract.Statement) {
+    return .{ .value = read_sessions.capture(self) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn beginRelationalRows(self: *DB, alloc: std.mem.Allocator, request: @import("db/relational_rows.zig").Request) engine.Outcome(@import("db/relational_rows.zig").Reader) {
-    return .{ .value = self.beginRelationalRows(alloc, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn beginRelationalRows(self: *DB, alloc: std.mem.Allocator, request: @import("read_reader_values.zig").Request) engine.Outcome(session_contract.Handle) {
+    return .{ .value = read_sessions.beginReader(self, alloc, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn openDocumentReadSession(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) engine.Outcome(*DB.DocumentReadSession) {
-    return .{ .value = self.openDocumentReadSession(alloc, from_key, to_key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn openDocumentReadSession(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) engine.Outcome(session_contract.Handle) {
+    return .{ .value = read_sessions.openDocument(self, alloc, from_key, to_key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn openRelationalReadSessionAtSnapshot(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*DB.RelationalStatementSnapshot) engine.Outcome(*DB.RelationalReadSession) {
-    return .{ .value = self.openRelationalReadSessionAtSnapshot(alloc, from_key, to_key, opts, statement) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn openRelationalReadSessionAtSnapshot(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?session_contract.Handle) engine.Outcome(session_contract.Handle) {
+    return .{ .value = read_sessions.openRelational(self, alloc, from_key, to_key, opts, statement) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn tryStatementReadFence(self: *DB) engine.Outcome(?DB.StatementReadFence) {
-    return .{ .value = self.tryStatementReadFence() catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn tryStatementReadFence(self: *DB) engine.Outcome(?session_contract.Handle) {
+    return .{ .value = read_sessions.tryFence(self, false) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn tryEmbeddedBackupReadFence(self: *DB) engine.Outcome(?DB.StatementReadFence) {
-    return .{ .value = self.tryEmbeddedBackupReadFence() catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn tryEmbeddedBackupReadFence(self: *DB) engine.Outcome(?session_contract.Handle) {
+    return .{ .value = read_sessions.tryFence(self, true) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn catchUpPendingDerivedReplay(self: *DB) engine.Outcome(void) {
@@ -737,68 +895,6 @@ fn rollDenseAutoBulkIngestSessionWithOptions(self: *DB, options: @import("backen
     return .{ .value = self.rollDenseAutoBulkIngestSessionWithOptions(options) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn relationalReaderDeinit(self: *@import("db/relational_rows.zig").Reader) engine.Outcome(void) {
-    return .{ .value = self.deinit() };
-}
-
-fn relationalReaderNextPage(self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) engine.Outcome(@import("db/relational_rows.zig").Page) {
-    var receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = if (io) |borrow| borrow.receive() catch |err| return .{ .failure = .init(@errorName(err)) } else null;
-    const received_io: ?std.Io = if (receiver) |*value| value.io() else null;
-    return .{ .value = self.nextPage(alloc, received_io, budget) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalReaderNextTypedPage(self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) engine.Outcome(@import("db/relational_rows.zig").Page) {
-    var receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = if (io) |borrow| borrow.receive() catch |err| return .{ .failure = .init(@errorName(err)) } else null;
-    const received_io: ?std.Io = if (receiver) |*value| value.io() else null;
-    return .{ .value = self.nextTypedPage(alloc, received_io, budget) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalReaderLookupSqlBatch(self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, documents: []const []const u8, layout: *const @import("../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) engine.Outcome(@import("db/relational_rows.zig").Reader.Hydrated) {
-    return .{ .value = self.lookupSqlBatch(alloc, documents, layout, max_bytes) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalReaderLookupTypedRow(self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?*const @import("../sql/catalog.zig").Row.TypedLayout) engine.Outcome(?@import("db/relational_rows.zig").Row) {
-    return .{ .value = (if (native_cells) if (shared) |layout| self.lookupSqlRowWithLayout(alloc, document, layout) else self.lookupSqlRow(alloc, document) else self.lookupTypedRow(alloc, document)) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalSessionDeinit(session: *@import("db/relational_read_session.zig").Session) engine.Outcome(void) {
-    return .{ .value = session.deinit() };
-}
-
-fn relationalSessionCheckpoint(session: *const @import("db/relational_read_session.zig").Session) engine.Outcome(void) {
-    return .{ .value = session.checkpoint() catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalSessionRangeProofs(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator) engine.Outcome([]@import("range_protection.zig").Proof) {
-    return .{ .value = session.rangeProofs(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalSessionNextTypedPage(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) engine.Outcome(@import("db/relational_rows.zig").Page) {
-    var receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = if (io) |borrow| borrow.receive() catch |err| return .{ .failure = .init(@errorName(err)) } else null;
-    const received_io: ?std.Io = if (receiver) |*value| value.io() else null;
-    return .{ .value = session.nextTypedPage(alloc, received_io, budget) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn relationalSessionNormalizeRows(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, writes: []const types.BatchWrite) engine.Outcome([]types.BatchWrite) {
-    return .{ .value = session.normalizeRows(alloc, writes) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn documentSessionDeinit(self: *@import("db/document_rows.zig").Session) engine.Outcome(void) {
-    return .{ .value = self.deinit() };
-}
-
-fn documentSessionRangeProofs(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator) engine.Outcome([]@import("range_protection.zig").Proof) {
-    return .{ .value = self.rangeProofs(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn documentSessionNormalizeRows(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite) engine.Outcome([]types.BatchWrite) {
-    return .{ .value = self.normalizeRows(alloc, writes) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
-fn documentSessionNext(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, limit: u32) engine.Outcome(@import("relational_read_view.zig").View.Page) {
-    return .{ .value = self.next(alloc, limit) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-
 fn catchUpPendingDerivedReplayWithProgress(self: *DB, context: *anyopaque, hook: db.ReplayProgressHook, dispatch: @import("named_callback.zig").Dispatch) engine.Outcome(void) {
     const Proxy = struct {
         context: *anyopaque,
@@ -812,33 +908,7 @@ fn catchUpPendingDerivedReplayWithProgress(self: *DB, context: *anyopaque, hook:
     var proxy: Proxy = .{ .context = context, .hook = hook, .dispatch = dispatch };
     return .{ .value = self.catchUpPendingDerivedReplayWithProgress(&proxy, Proxy.progress) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
-fn relationalSnapshotDeinit(cut: *DB.RelationalStatementSnapshot) engine.Outcome(void) {
-    return .{ .value = cut.deinit() };
-}
-fn statementFenceRelease(fence: *DB.StatementReadFence) engine.Outcome(void) {
-    return .{ .value = fence.release() };
-}
-fn documentRowsUnderLease(lease: *const DB.QueryReadLease, alloc: Allocator, version: u32) engine.Outcome(DB.DocumentRows) {
-    return .{ .value = lease.documentRows(alloc, version) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-fn documentRowsLookupProjectedBatch(reader: *DB.DocumentRows, ids: []const []const u8, fields: []const []const u8, max_bytes: usize) engine.Outcome(DB.DocumentRows.ProjectedBatch) {
-    return .{ .value = reader.lookupProjectedBatch(ids, fields, max_bytes) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-fn documentRowsLookupBatch(reader: *DB.DocumentRows, ids: []const []const u8, max_bytes: usize) engine.Outcome(DB.DocumentRows.Batch) {
-    return .{ .value = reader.lookupBatch(ids, max_bytes) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-fn documentRowsLookup(reader: *DB.DocumentRows, key: []const u8) engine.Outcome([]const u8) {
-    return .{ .value = reader.lookup(key) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
-fn documentRowsReleasePage(reader: *DB.DocumentRows) engine.Outcome(void) {
-    return .{ .value = reader.releasePage() };
-}
-fn documentRowsDeinit(reader: *DB.DocumentRows) engine.Outcome(void) {
-    return .{ .value = reader.deinit() };
-}
-fn relationalRowsUnderLease(lease: *const DB.QueryReadLease, alloc: Allocator, fields: []const []const u8, version: u32) engine.Outcome(@import("db/relational_rows.zig").Reader) {
-    return .{ .value = lease.relationalRows(alloc, fields, version) catch |err| return .{ .failure = .init(@errorName(err)) } };
-}
+
 fn resolveNativeRestoreOpenPlan(target_path: []const u8, requested_options: db.OpenOptions) engine.Outcome(db.NativeRestoreOpenPlan) {
     return .{ .value = DB.resolveNativeRestoreOpenPlan(target_path, requested_options) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -995,6 +1065,11 @@ fn restoreSnapshotToStagedGeneration(staged_generation: *const @import("db/gener
 
 fn restoreIdentityPreservingSnapshotToStagedGeneration(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, expected_namespace: @import("db/doc_identity.zig").Namespace) engine.Outcome(void) {
     return .{ .value = DB.restoreIdentityPreservingSnapshotToStagedGeneration(staged_generation, alloc, snapshot_root, path, opts, expected_namespace) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn materializeRestoreSourceDecoder(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: Allocator, io: native.IoBorrow, path: []const u8, opts: db.OpenOptions, plan: @import("restore_decoder_contract.zig").Plan) engine.Outcome(void) {
+    var receiver = io.receive() catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = DB.materializeRestoreSourceDecoder(staged_generation, alloc, receiver.io(), path, opts, plan) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn openVerifiedRestoreSourceWithCancellation(staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, expected_namespace: @import("db/doc_identity.zig").Namespace, cancellation: types.CancellationToken) engine.Outcome(DB) {
@@ -1243,8 +1318,8 @@ fn ensureGeneratedCoverageRecoveryIntents(self: *DB, alloc: std.mem.Allocator) e
     return .{ .value = self.ensureGeneratedCoverageRecoveryIntents(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn beginQueryReadLease(self: *DB) engine.Outcome(DB.QueryReadLease) {
-    return .{ .value = self.beginQueryReadLease() catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn beginQueryReadLease(self: *DB) engine.Outcome(DB.QueryReadLease.Protocol.Handle) {
+    return .{ .value = read_sessions.beginQueryLease(self) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn searchRequestAtCurrentIdentityGeneration(self: *DB, req: types.SearchRequest) engine.Outcome(types.SearchRequest) {
@@ -1572,9 +1647,6 @@ fn runDenseArtifactRebuildMaintenanceWithProgress(self: *DB, alloc: Allocator, c
     }
     return .{ .value = self.runDenseArtifactRebuildMaintenanceWithProgress(alloc, context, null) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
-fn queryReadLeaseRelease(lease: *DB.QueryReadLease) engine.Outcome(void) {
-    return .{ .value = lease.release() };
-}
 
 fn batchReplicatedApply(self: *DB, req: types.BatchRequest) engine.Outcome(void) {
     return .{ .value = self.batchReplicatedApply(req) catch |err| return .{ .failure = .init(@errorName(err)) } };
@@ -1657,8 +1729,8 @@ fn importCohortPortableFileIntoUnpublishedEmpty(self: *DB, alloc: std.mem.Alloca
     return .{ .value = self.importCohortPortableFileIntoUnpublishedEmpty(alloc, received_io, file, file_size, proof, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn openRelationalReadSession(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) engine.Outcome(*DB.RelationalReadSession) {
-    return .{ .value = self.openRelationalReadSession(alloc, from_key, to_key, opts) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn openRelationalReadSession(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) engine.Outcome(session_contract.Handle) {
+    return .{ .value = read_sessions.openRelational(self, alloc, from_key, to_key, opts, null) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn search(self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest) engine.Outcome(types.SearchResult) {
@@ -1778,12 +1850,12 @@ fn writeConfigureRestoreOwnerDb(alloc: std.mem.Allocator, database: *@import("db
     return .{ .value = @import("write.zig").configureRestoreOwnerDb(alloc, database, bootstrap, allow_canceled, hot_standby_replay) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn writeCreateManagedDbEnrichments(allocator: std.mem.Allocator, raw_indexes_json: []const u8, runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, local_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, remote_capability_cache: ?*@import("antfly_inference_remote_capabilities").Cache, inference_api_url: ?[]const u8, source_table: []const u8, store: ?*@import("../common/secrets.zig").FileStore, remote: ?*const @import("write.zig").scraping.RemoteContentConfig) engine.Outcome(@import("write.zig").ManagedDbEnrichmentSet) {
-    return .{ .value = @import("write.zig").createManagedDbEnrichments(allocator, raw_indexes_json, runtime, local_provider, remote_capability_cache, inference_api_url, source_table, store, remote) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn writeCreateManagedDbEnrichments(allocator: std.mem.Allocator, raw_indexes_json: []const u8, runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, local_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, remote_capability_cache: ?*@import("antfly_inference_remote_capabilities").Cache, inference_api_url: ?[]const u8, inference_api_key: ?[]const u8, source_table: []const u8, store: ?*@import("../common/secrets.zig").FileStore, remote: ?*const @import("write.zig").scraping.RemoteContentConfig) engine.Outcome(@import("write.zig").ManagedDbEnrichmentSet) {
+    return .{ .value = @import("write.zig").createManagedDbEnrichments(allocator, raw_indexes_json, runtime, local_provider, remote_capability_cache, inference_api_url, inference_api_key, source_table, store, remote) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn writeReconfigureManagedDbEnrichmentRuntime(ignored_allocator: std.mem.Allocator, database: *@import("db/mod.zig").DB, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, remote_capability_cache: ?*@import("antfly_inference_remote_capabilities").Cache, inference_api_url: ?[]const u8, source_table: []const u8, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig) engine.Outcome(void) {
-    return .{ .value = @import("write.zig").reconfigureManagedDbEnrichmentRuntime(ignored_allocator, database, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, source_table, secret_store, remote_content) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn writeReconfigureManagedDbEnrichmentRuntime(ignored_allocator: std.mem.Allocator, database: *@import("db/mod.zig").DB, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, remote_capability_cache: ?*@import("antfly_inference_remote_capabilities").Cache, inference_api_url: ?[]const u8, inference_api_key: ?[]const u8, source_table: []const u8, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig) engine.Outcome(void) {
+    return .{ .value = @import("write.zig").reconfigureManagedDbEnrichmentRuntime(ignored_allocator, database, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, inference_api_key, source_table, secret_store, remote_content) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn writePrepareManagedSchemaBeforeIndexLoad(alloc: std.mem.Allocator, mode: @import("../api/write_contract.zig").ManagedDbOpenMode, schema_json: ?[]const u8) engine.Outcome(?@import("db/mod.zig").SchemaBeforeIndexLoad) {
@@ -1854,12 +1926,12 @@ fn writePrepareOwnerSchemaBeforeIndexLoad(alloc: std.mem.Allocator, schema_json:
     return .{ .value = @import("write.zig").prepareOwnerSchemaBeforeIndexLoad(alloc, schema_json) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn writeConfigureStorageKernelOwnerDb(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, installed: ?*@import("write.zig").OwnerManagedConfig) engine.Outcome(void) {
-    return .{ .value = @import("write.zig").configureStorageKernelOwnerDb(alloc, database, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, installed) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn writeConfigureStorageKernelOwnerDb(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig) engine.Outcome(void) {
+    return .{ .value = @import("write.zig").configureStorageKernelOwnerDb(alloc, database, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn writeConfigureStorageKernelOwnerDbAtOpen(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, installed: ?*@import("write.zig").OwnerManagedConfig, historical_ordered_apply: bool) engine.Outcome(bool) {
-    return .{ .value = @import("write.zig").configureStorageKernelOwnerDbAtOpen(alloc, database, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, installed, historical_ordered_apply) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn writeConfigureStorageKernelOwnerDbAtOpen(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig, historical_ordered_apply: u8) engine.Outcome(bool) {
+    return .{ .value = @import("write.zig").configureStorageKernelOwnerDbAtOpen(alloc, database, table_name, schema_json, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content, inference, installed, historical_ordered_apply) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn writeOpenStorageKernelRestoreDb(alloc: std.mem.Allocator, path: []const u8, indexes_json: []const u8, lsm_root_generation: u64, backend_runtime: *@import("db/mod.zig").background_runtime.BackendRuntime, identity_namespace: ?@import("db/doc_identity.zig").Namespace, prepared_restore: *const @import("backup_restore.zig").PreparedRestore) engine.Outcome(@import("db/mod.zig").DB) {
@@ -1870,8 +1942,8 @@ fn writeRepairStorageKernelRestoreDb(alloc: std.mem.Allocator, database: *@impor
     return .{ .value = @import("write.zig").repairStorageKernelRestoreDb(alloc, database, group_id, schema_json, indexes_json, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn writeReconcileStorageKernelOwnerDb(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, target_index_name: ?[]const u8, advance_index_repair: bool, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, installed: ?*@import("write.zig").OwnerManagedConfig) engine.Outcome(@import("../api/write_contract.zig").StorageKernelReconcileResult) {
-    return .{ .value = @import("write.zig").reconcileStorageKernelOwnerDb(alloc, database, table_name, schema_json, indexes_json, target_index_name, advance_index_repair, backend_runtime, antfly_provider, installed) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn writeReconcileStorageKernelOwnerDb(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, table_name: []const u8, schema_json: []const u8, indexes_json: []const u8, target_index_name: ?[]const u8, advance_index_repair: bool, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, inference: @import("write.zig").InferenceDefaults, installed: ?*@import("write.zig").OwnerManagedConfig) engine.Outcome(@import("../api/write_contract.zig").StorageKernelReconcileResult) {
+    return .{ .value = @import("write.zig").reconcileStorageKernelOwnerDb(alloc, database, table_name, schema_json, indexes_json, target_index_name, advance_index_repair, backend_runtime, antfly_provider, inference, installed) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn writeRepairStorageKernelOwnerDb(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, target_index_name: ?[]const u8, advance_index_repair: bool, options: @import("db/mod.zig").types.ArtifactRepairRunOptions) engine.Outcome(@import("../api/write_contract.zig").StorageKernelReconcileResult) {
@@ -1898,8 +1970,8 @@ fn writeRunGraphMetricMaintenanceOrActionJsonAlloc(alloc: std.mem.Allocator, dat
     return .{ .value = @import("write.zig").runGraphMetricMaintenanceOrActionJsonAlloc(alloc, database, body) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn writeReconfigureManagedDbEnrichmentRuntimePaused(ignored_allocator: std.mem.Allocator, database: *@import("db/mod.zig").DB, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, remote_capability_cache: ?*@import("antfly_inference_remote_capabilities").Cache, inference_api_url: ?[]const u8, source_table: []const u8, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig) engine.Outcome(void) {
-    return .{ .value = @import("write.zig").reconfigureManagedDbEnrichmentRuntimePaused(ignored_allocator, database, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, source_table, secret_store, remote_content) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn writeReconfigureManagedDbEnrichmentRuntimePaused(ignored_allocator: std.mem.Allocator, database: *@import("db/mod.zig").DB, indexes_json: []const u8, backend_runtime: ?*@import("db/mod.zig").background_runtime.BackendRuntime, antfly_provider: ?@import("../inference/managed_embedder.zig").AntflyProvider, remote_capability_cache: ?*@import("antfly_inference_remote_capabilities").Cache, inference_api_url: ?[]const u8, inference_api_key: ?[]const u8, source_table: []const u8, secret_store: ?*@import("../common/secrets.zig").FileStore, remote_content: ?*const @import("write.zig").scraping.RemoteContentConfig) engine.Outcome(void) {
+    return .{ .value = @import("write.zig").reconfigureManagedDbEnrichmentRuntimePaused(ignored_allocator, database, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, inference_api_key, source_table, secret_store, remote_content) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn writeExportPortableBackupFileWithSource(alloc: std.mem.Allocator, store: *@import("db/mod.zig").docstore.DocStore, path: []const u8, io: native.IoBorrow, sealed: ?@import("write.zig").PortableCohortSource) engine.Outcome(void) {
@@ -2070,12 +2142,45 @@ const descriptor: engine.Descriptor = .{
     .resource_manager_layout = engine.resource_manager_layout,
     .prepared_owner_layout = engine.prepared_owner_layout,
     .prepared_allocator_layout = engine.prepared_allocator_layout,
+    .prepared_commit_disposition_layout = engine.prepared_commit_disposition_layout,
+    .prepared_commit_disposition_state_layout = engine.prepared_commit_disposition_state_layout,
     .embedding_memo_layout = engine.embedding_memo_layout,
     .async_context_layout = engine.async_context_layout,
     .enrichment_runtime_layout = engine.enrichment_runtime_layout,
-    .relationalReader_layout = engine.relationalReader_layout,
-    .relationalSession_layout = engine.relationalSession_layout,
-    .documentSession_layout = engine.documentSession_layout,
+    .read_session_release_layout = engine.read_session_release_layout,
+    .read_reader_typed_cells_layout = engine.read_reader_typed_cells_layout,
+    .read_reader_datum_layout = engine.read_reader_datum_layout,
+    .read_numeric_value_layout = engine.read_numeric_value_layout,
+    .read_numeric_kind_layout = engine.read_numeric_kind_layout,
+    .read_array_value_layout = engine.read_array_value_layout,
+    .read_array_dimension_layout = engine.read_array_dimension_layout,
+    .read_array_element_type_layout = engine.read_array_element_type_layout,
+    .read_array_stored_view_layout = engine.read_array_stored_view_layout,
+    .read_array_stored_validation_layout = engine.read_array_stored_validation_layout,
+    .read_session_handle_layout = engine.read_session_handle_layout,
+    .retained_query_lease_layout = engine.retained_query_lease_layout,
+    .publication_read_lease_layout = engine.publication_read_lease_layout,
+    .query_read_lease_handle_layout = engine.query_read_lease_handle_layout,
+    .query_read_lease_operations_layout = engine.query_read_lease_operations_layout,
+    .read_reader_request_layout = engine.read_reader_request_layout,
+    .read_reader_filter_layout = engine.read_reader_filter_layout,
+    .read_reader_hydrated_layout = engine.read_reader_hydrated_layout,
+    .read_reader_typed_layout = engine.read_reader_typed_layout,
+    .read_reader_ordinal_view_layout = engine.read_reader_ordinal_view_layout,
+    .document_source_kind_layout = engine.document_source_kind_layout,
+    .document_source_layout = engine.document_source_layout,
+    .document_field_layout = engine.document_field_layout,
+    .document_batch_layout = engine.document_batch_layout,
+    .document_projected_batch_layout = engine.document_projected_batch_layout,
+    .read_session_kind_layout = engine.read_session_kind_layout,
+    .read_session_budget_layout = engine.read_session_budget_layout,
+    .read_session_operations_layout = engine.read_session_operations_layout,
+    .restore_decoder_plan_layout = engine.restore_decoder_plan_layout,
+    .restore_decoder_format_layout = engine.restore_decoder_format_layout,
+    .relational_page_layout = engine.relational_page_layout,
+    .relational_row_layout = engine.relational_row_layout,
+    .read_view_page_layout = engine.read_view_page_layout,
+    .read_view_row_layout = engine.read_view_row_layout,
 
     .index_manager_layout = engine.index_manager_layout,
     .index_manager_fields = engine.index_manager_fields.ptr,

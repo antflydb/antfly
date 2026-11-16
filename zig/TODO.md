@@ -149,8 +149,8 @@ None currently tracked as active full-suite failures.
   - [ ] deeper tree / RAG strategy coverage
   - [ ] remote-content parity
   - [ ] broader provider matrix / built-in provider parity
-  - [ ] evaluation/reporting behavior (research evaluators exist in evalaf;
-    retrieval judge metrics are still heuristic)
+  - [ ] evaluation/reporting behavior (retrieval judge metrics are still
+    heuristic)
   - [ ] session/conversation carry-forward semantics once JSON and SSE contracts
     are stable
 - [ ] Keep graph query depth current as the distributed graph implementation

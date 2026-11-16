@@ -63,6 +63,7 @@ pub const ObjectStore = struct {
     /// owns the separate bounded upload journal and never escapes its lease.
     cloud_retention_qualified: bool = false,
     cloud_io: ?std.Io = null,
+    cloud_cache: ?@import("cloud_generations.zig").ByteCache = null,
     cloud_cache_scope: [32]u8 = @splat(0),
     cloud_reader: ?*@import("cloud_generations.zig").Reader = null,
     version_operations: std.atomic.Value(u8) = .init(0),
@@ -199,10 +200,18 @@ pub const ObjectStore = struct {
 
     /// Borrow a configured client without widening its provisioning authority.
     /// Readers and require-existing writers must not create missing buckets.
-    pub fn initWithClientOptions(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8, options: struct { ensure_bucket: bool = false, read_only: bool = false, filesystem: ?*objectstore.FilesystemClient = null }) !ObjectStore {
+    pub fn initWithClientOptions(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8, options: struct {
+        ensure_bucket: bool = false,
+        read_only: bool = false,
+        /// Configured query adapters need object permissions, not permission to
+        /// inspect the bucket. Provisioning still probes before creating it;
+        /// otherwise the first object operation reports absence/access errors.
+        skip_bucket_probe: bool = false,
+        filesystem: ?*objectstore.FilesystemClient = null,
+    }) !ObjectStore {
         if (options.read_only and options.ensure_bucket) return error.InvalidArtifactStoreOptions;
         var owned_client = client;
-        if (!(try owned_client.bucketExists(bucket))) {
+        if ((options.ensure_bucket or !options.skip_bucket_probe) and !(try owned_client.bucketExists(bucket))) {
             if (!options.ensure_bucket) return error.ArtifactBucketNotFound;
             try owned_client.makeBucket(bucket);
         }
@@ -210,7 +219,7 @@ pub const ObjectStore = struct {
         errdefer alloc.free(owned_bucket);
         const owned_prefix = try alloc.dupe(u8, prefix);
         errdefer alloc.free(owned_prefix);
-        const inventory: ?@import("fs_store.zig").FsStore = if (options.filesystem) |fs| value: {
+        const inventory: ?@import("fs_store.zig").FsStore = if (comptime @import("builtin").os.tag == .freestanding) null else if (options.filesystem) |fs| value: {
             if (prefix.len != 0) {
                 if (std.fs.path.isAbsolute(prefix) or std.mem.indexOfScalar(u8, prefix, 0) != null or std.mem.indexOfScalar(u8, prefix, '\\') != null) return error.InvalidObjectPrefix;
                 var components = std.mem.splitScalar(u8, std.mem.trimEnd(u8, prefix, "/"), '/');
@@ -249,9 +258,9 @@ pub const ObjectStore = struct {
         self.verified_objects.deinit(self.alloc);
         self.verified_mu.unlock();
         if (self.owns_client) self.client.deinit();
-        if (self.fs_client) |fs| self.alloc.destroy(fs);
-        if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
-        if (self.s3_client) |s3| self.alloc.destroy(s3);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.fs_client) |fs| self.alloc.destroy(fs);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.s3_client) |s3| self.alloc.destroy(s3);
         self.alloc.free(self.bucket);
         self.alloc.free(self.prefix);
         self.* = undefined;
@@ -266,10 +275,13 @@ pub const ObjectStore = struct {
         self.version_operations.store(if (supported) 2 else 1, .release);
         return supported;
     }
-    fn generation(self: *ObjectStore, id: []const u8, token: CancellationToken) !?[]u8 {
+    fn generation(self: *ObjectStore, a: std.mem.Allocator, id: []const u8, token: CancellationToken) !?[]u8 {
+        if (comptime @import("builtin").os.tag == .freestanding) {
+            if (self.cloud_reader != null or self.cloud_writer != null) return error.HostedObjectVersionUnsupported;
+            return null;
+        }
         // Range reads may borrow an arena-owned store. Reclaim selectors after
         // every request rather than retaining one parse per posting block.
-        const a = std.heap.page_allocator;
         var record = if (self.cloud_writer) |writer| try writer.lookup(a, id, token) else null;
         if (record == null) if (self.cloud_reader) |reader| {
             record = try reader.lookup(a, id, token);
@@ -289,7 +301,7 @@ pub const ObjectStore = struct {
             .namespace_identity = self.namespace_identity,
             .allocator = self.alloc,
             .ptr = self,
-            .vtable = &vtable,
+            .vtable = if (@import("builtin").os.tag == .freestanding) &hosted_vtable else &vtable,
         };
     }
 
@@ -302,6 +314,15 @@ pub const ObjectStore = struct {
     }
 
     fn putInScope(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        const probe = @import("../../api/lake_execution_probe_hooks.zig");
+        const started = probe.start();
+        return self.putInScopeImpl(alloc, scope, contents, cancellation) catch |err| {
+            probe.failureTimed("artifact_create_and_capture", started, err);
+            return err;
+        };
+    }
+    fn putInScopeImpl(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        if (comptime @import("builtin").os.tag == .freestanding) return self.putHosted(alloc, scope, contents, cancellation);
         try cancellation.check();
         if (self.read_only) return error.ArtifactStoreReadOnly;
         const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
@@ -311,15 +332,23 @@ pub const ObjectStore = struct {
             break :scoped try alloc.dupe(u8, &id);
         } else try makeArtifactIdAlloc(alloc, checksum);
         errdefer alloc.free(artifact_id);
-        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
-        defer self.alloc.free(key);
+        const key = try keyForArtifactIdAlloc(alloc, self.prefix, artifact_id);
+        defer alloc.free(key);
 
+        // Keep local registration and physical publication on the same side
+        // of retirement. Shared barriers preserve parallel upload throughput.
+        var publication_io: ?std.Io.Threaded = if (scope != null and self.local_inventory != null) .init(self.alloc, .{}) else null;
+        defer if (publication_io) |*threaded| threaded.deinit();
+        var publication = if (scope) |upload| if (self.local_inventory) |*inventory| try inventory.publicationGuard(publication_io.?.io(), upload, .shared, cancellation) else null else null;
+        defer if (publication) |*guard| guard.deinit();
         if (scope) |upload| if (self.local_inventory) |*inventory| try inventory.registerScopedUpload(upload, checksum, cancellation);
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         _ = std.fmt.hexToBytes(&digest, checksum) catch unreachable;
         var checksum_base64_buf: [std.base64.standard.Encoder.calcSize(digest.len)]u8 = undefined;
         const checksum_base64 = std.base64.standard.Encoder.encode(&checksum_base64_buf, &digest);
-        var result = self.client.putObject(self.bucket, key, contents, .{
+        var client = self.client;
+        client.allocator = alloc;
+        var result = client.putObject(self.bucket, key, contents, .{
             .content_type = "application/octet-stream",
             .checksum_sha256_base64 = if (self.s3_client != null) checksum_base64 else null,
             // GCS exposes provider-computed CRC32C/MD5 metadata. A caller-owned
@@ -346,7 +375,7 @@ pub const ObjectStore = struct {
             },
             else => |normalized| return normalized,
         };
-        defer result.deinit(self.client.allocator);
+        defer result.deinit(alloc);
         try self.captureGeneration(artifact_id, contents.len, result.version_id, cancellation);
 
         return .{
@@ -355,6 +384,32 @@ pub const ObjectStore = struct {
             .byte_len = @intCast(contents.len),
             .checksum = checksum,
         };
+    }
+
+    fn putHosted(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        try cancellation.check();
+        if (self.read_only) return error.ArtifactStoreReadOnly;
+        const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
+        errdefer alloc.free(checksum);
+        const id = if (scope) |value| try alloc.dupe(u8, &try value.artifactId(checksum)) else try makeArtifactIdAlloc(alloc, checksum);
+        errdefer alloc.free(id);
+        const key = try keyForArtifactIdAlloc(alloc, self.prefix, id);
+        defer alloc.free(key);
+        var result = self.client.putObject(self.bucket, key, contents, .{
+            .if_none_match = true,
+            .content_type = "application/octet-stream",
+            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+        }) catch |err| switch (err) {
+            error.PreconditionFailed => {
+                const existing = try self.getBoundedAllocWithCancellation(alloc, id, contents.len, cancellation);
+                defer alloc.free(existing);
+                if (!std.mem.eql(u8, existing, contents)) return error.ArtifactIntegrityMismatch;
+                return .{ .artifact_id = id, .checksum = checksum, .byte_len = contents.len };
+            },
+            else => return err,
+        };
+        defer result.deinit(self.client.allocator);
+        return .{ .artifact_id = id, .checksum = checksum, .byte_len = contents.len };
     }
 
     pub fn getAlloc(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8) ![]u8 {
@@ -368,8 +423,9 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
+        const selector_allocator = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(alloc);
+        const selected_generation = try self.generation(selector_allocator, artifact_id, cancellation);
+        defer if (selected_generation) |value| selector_allocator.free(value);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         var result = self.client.getObject(self.bucket, key, .{
@@ -389,8 +445,9 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
+        const selector_allocator = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(alloc);
+        const selected_generation = try self.generation(selector_allocator, artifact_id, cancellation);
+        defer if (selected_generation) |value| selector_allocator.free(value);
         const key = try keyForArtifactIdAlloc(alloc, self.prefix, artifact_id);
         defer alloc.free(key);
         var client = self.client;
@@ -426,8 +483,9 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
+        const selector_allocator = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(alloc);
+        const selected_generation = try self.generation(selector_allocator, artifact_id, cancellation);
+        defer if (selected_generation) |value| selector_allocator.free(value);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         var result = self.client.getObject(self.bucket, key, .{
@@ -467,8 +525,9 @@ pub const ObjectStore = struct {
         remaining: ?*u64,
     ) ![]u8 {
         try cancellation.check();
-        const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
+        const selector_allocator = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(alloc);
+        const selected_generation = try self.generation(selector_allocator, artifact_id, cancellation);
+        defer if (selected_generation) |value| selector_allocator.free(value);
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
         const end = std.math.add(u64, offset, std.math.cast(u64, len) orelse return error.InvalidRange) catch return error.InvalidRange;
@@ -511,8 +570,9 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
     ) !artifact_store.ArtifactMetadata {
         try cancellation.check();
-        const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
+        const selector_allocator = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(alloc);
+        const selected_generation = try self.generation(selector_allocator, artifact_id, cancellation);
+        defer if (selected_generation) |value| selector_allocator.free(value);
         const checksum_value = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const checksum = try alloc.dupe(u8, checksum_value);
         errdefer alloc.free(checksum);
@@ -546,15 +606,16 @@ pub const ObjectStore = struct {
 
     fn verifyContentWithBudget(
         self: *ObjectStore,
-        _: std.mem.Allocator,
+        alloc: std.mem.Allocator,
         artifact_id: []const u8,
         expected_byte_len: u64,
         expected_checksum: []const u8,
         cancellation: CancellationToken,
         remaining: ?*u64,
     ) !void {
-        const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |selected| std.heap.page_allocator.free(selected);
+        const selector_allocator = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(alloc);
+        const selected_generation = try self.generation(selector_allocator, artifact_id, cancellation);
+        defer if (selected_generation) |selected| selector_allocator.free(selected);
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
@@ -641,7 +702,7 @@ pub const ObjectStore = struct {
     pub fn deleteWithCancellation(self: *ObjectStore, artifact_id: []const u8, token: CancellationToken) !void {
         try token.check();
         if (self.read_only) return error.ArtifactStoreReadOnly;
-        if (self.local_inventory) |*fs| if (try artifact_store.uploadScopeFromArtifactId(artifact_id)) |scope| try @import("retained_closure.zig").invalidate(fs, scope, .none);
+        if (self.local_inventory) |*fs| if (try artifact_store.uploadScopeFromArtifactId(artifact_id)) |scope| try @import("retained_closure.zig").invalidate(fs, scope, token);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         if (try self.usesObjectVersions(token)) {
@@ -884,6 +945,28 @@ pub const ObjectStore = struct {
     fn objectStore(raw: *anyopaque) *ObjectStore {
         return @ptrCast(@alignCast(raw));
     }
+    // Hosted stores retain object-backed immutable writes and reads. Native
+    // filesystem retention and versioned-generation capabilities are absent;
+    // deletion requires a separately implemented hosted collection protocol.
+    const hosted_vtable: artifact_store.ArtifactStore.VTable = .{
+        .deinit = erasedDeinit,
+        .put = erasedPut,
+        .put_with_cancellation = erasedPutWithCancellation,
+        .put_scoped = erasedPutScoped,
+        .put_scoped_many = if (@import("builtin").os.tag == .freestanding) erasedPutScopedMany else null,
+        .delete = hostedDeleteUnsupported,
+        .get_alloc = erasedGetAlloc,
+        .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
+        .get_bounded_alloc_with_cancellation = erasedGetBoundedAllocWithCancellation,
+        .get_range_alloc = erasedGetRangeAlloc,
+        .get_range_alloc_with_cancellation = erasedGetRangeAllocWithCancellation,
+        .stat = erasedStat,
+        .stat_with_cancellation = erasedStatWithCancellation,
+    };
+    fn hostedDeleteUnsupported(_: *anyopaque, _: []const u8) !void {
+        return error.HostedMaintenanceUnsupported;
+    }
+
     const vtable: artifact_store.ArtifactStore.VTable = .{
         .object_store = objectStore,
         .retention_witness = retentionWitness,
@@ -895,6 +978,7 @@ pub const ObjectStore = struct {
         .put = erasedPut,
         .put_with_cancellation = erasedPutWithCancellation,
         .put_scoped = erasedPutScoped,
+        .put_scoped_many = if (@import("builtin").os.tag == .freestanding) erasedPutScopedMany else null,
         .visit_scoped_uploads = erasedVisitScopedUploads,
         .reclaim_retired_scoped_inventory = erasedReclaimRetiredScopedInventory,
         .get_alloc = erasedGetAlloc,
@@ -924,6 +1008,45 @@ pub const ObjectStore = struct {
     fn erasedPutWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.putWithCancellation(alloc, contents, cancellation);
+    }
+
+    fn erasedPutScopedMany(raw: *anyopaque, alloc: std.mem.Allocator, scope: artifact_store.UploadScope, contents: []const []const u8, cancellation: CancellationToken) ![]artifact_store.ArtifactMetadata {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.read_only) return error.ArtifactStoreReadOnly;
+        try cancellation.check();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const metadata = try alloc.alloc(artifact_store.ArtifactMetadata, contents.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (metadata[0..initialized]) |*item| item.deinit(alloc);
+            alloc.free(metadata);
+        }
+        var requests: [8]objectstore.PutObjectRequest = undefined;
+        var count: usize = 0;
+        for (contents, metadata) |bytes, *item| {
+            try cancellation.check();
+            item.* = meta: {
+                const checksum = try sha256StringWithCancellationAlloc(alloc, bytes, cancellation);
+                errdefer alloc.free(checksum);
+                break :meta .{ .checksum = checksum, .artifact_id = try alloc.dupe(u8, &try scope.artifactId(checksum)), .byte_len = bytes.len };
+            };
+            initialized += 1;
+            const key = try keyForArtifactIdAlloc(arena.allocator(), self.prefix, item.artifact_id);
+            const duplicate = for (requests[0..count]) |request| {
+                if (std.mem.eql(u8, request.key, key)) break true;
+            } else false;
+            if (duplicate) continue;
+            requests[count] = .{ .key = key, .body = bytes, .options = .{ .if_none_match = true, .content_type = "application/octet-stream", .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn) } };
+            count += 1;
+        }
+        const uploaded = try self.client.putObjects(self.bucket, requests[0..count]);
+        defer {
+            for (uploaded) |*item| item.deinit(self.client.allocator);
+            self.client.allocator.free(uploaded);
+        }
+        try cancellation.check();
+        return metadata;
     }
 
     fn erasedPutScoped(ptr: *anyopaque, alloc: std.mem.Allocator, scope: artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
@@ -1173,6 +1296,37 @@ test "objectstore-backed artifact readers preserve bucket provisioning authority
     defer reader.deinit();
     try std.testing.expectError(error.ArtifactStoreReadOnly, reader.put(alloc, "denied"));
     try std.testing.expectError(error.ArtifactStoreReadOnly, reader.delete("sha256:abcd"));
+}
+
+test "objectstore-backed configured adapters need object access without bucket metadata probes" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("objects-only");
+    const Probe = struct {
+        fn denied(_: *anyopaque, _: []const u8, _: objectstore.BucketOptions) anyerror!bool {
+            return error.AccessDenied;
+        }
+    };
+    var vtable = client.vtable.*;
+    vtable.bucket_exists = Probe.denied;
+    client.vtable = &vtable;
+    try std.testing.expectError(error.AccessDenied, ObjectStore.initWithClientOptions(a, client, "objects-only", "tenant", .{}));
+    // A provisioning request must still run its explicit existence check.
+    try std.testing.expectError(error.AccessDenied, ObjectStore.initWithClientOptions(a, client, "missing", "tenant", .{ .ensure_bucket = true, .skip_bucket_probe = true }));
+    var writer = try ObjectStore.initWithClientOptions(a, client, "objects-only", "tenant", .{ .skip_bucket_probe = true });
+    defer writer.deinit();
+    var write_store = writer.artifactStore();
+    var ref = try write_store.put("object-scoped access");
+    defer ref.deinit(a);
+    var reader = try ObjectStore.initWithClientOptions(a, client, "objects-only", "tenant", .{ .skip_bucket_probe = true, .read_only = true });
+    defer reader.deinit();
+    var read_store = reader.artifactStore();
+    const bytes = try read_store.getVerifiedAllocWithCancellation(ref.artifact_id, @intCast(ref.byte_len), ref.checksum, .none);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("object-scoped access", bytes);
+    try std.testing.expectError(error.ArtifactStoreReadOnly, read_store.put("denied"));
 }
 
 test "objectstore-backed artifacts reject malformed content addresses before I/O" {
@@ -1551,4 +1705,116 @@ test "external lake global frontier unversioned S3-compatible GC uses names thro
     try store.delete(&id);
     try std.testing.expectEqual(@as(usize, 1), state.lists);
     try std.testing.expectEqual(@as(usize, 1), state.deletes);
+}
+
+test "external lake execution GCS ambiguous creates authenticate existing content after retry" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const httpx = @import("httpx");
+    const payload = "payload";
+    const checksum = try sha256StringWithCancellationAlloc(a, payload, .none);
+    defer a.free(checksum);
+    const id = try makeArtifactIdAlloc(a, checksum);
+    defer a.free(id);
+    const key = try keyForArtifactIdAlloc(a, "", id);
+    defer a.free(key);
+    // This fixture uses an unscoped digest key, whose slash is URL encoded.
+    const encoded = try httpx.uri.encode(a, key);
+    defer a.free(encoded);
+    const metadata_path = try std.fmt.allocPrint(a, "/storage/v1/b/bucket/o/{s}", .{encoded});
+    defer a.free(metadata_path);
+    const metadata = try std.fmt.allocPrint(a, "{{\"name\":\"{s}\",\"generation\":\"42\",\"size\":\"7\"}}", .{key});
+    defer a.free(metadata);
+    for ([_]bool{ false, true }) |idle_timeout| {
+        for ([_]bool{ false, true }) |corrupt| {
+            const Check = struct {
+                fn create(info: httpx.testing_mod.RequestInfo) !void {
+                    try std.testing.expectEqualStrings("payload", info.body);
+                    try std.testing.expect(std.mem.indexOf(u8, info.query, "ifGenerationMatch=0") != null);
+                }
+                fn read(info: httpx.testing_mod.RequestInfo) !void {
+                    try std.testing.expect(std.mem.indexOf(u8, info.query, "generation=42") != null);
+                    try std.testing.expectEqualStrings("bytes=0-6", info.header("Range").?);
+                }
+            };
+            var server = try httpx.testing_mod.TestServer.start(a, io, &.{
+                // The server accepted the bytes but the success reply was lost.
+                .{ .method = .POST, .path = "/upload/storage/v1/b/bucket/o", .max_uses = 1, .assert_request = Check.create, .respond = .{ .delay_ns = if (idle_timeout) 150 * std.time.ns_per_ms else 0, .disconnect_before_response = true } },
+                .{ .method = .POST, .path = "/upload/storage/v1/b/bucket/o", .max_uses = 1, .assert_request = Check.create, .respond = .{ .status = 412 } },
+                .{ .path = metadata_path, .max_uses = 1, .respond = .{ .body = metadata } },
+                .{ .path = metadata_path, .assert_request = Check.read, .respond = .{ .status = 206, .headers = &.{ .{ .name = "Content-Range", .value = "bytes 0-6/7" }, .{ .name = "x-goog-generation", .value = "42" } }, .body = if (corrupt) "corrupt" else payload } },
+            });
+            defer server.deinit();
+            const Task = struct {
+                fn serve(ts: *httpx.testing_mod.TestServer) std.Io.Cancelable!void {
+                    for (0..4) |_| ts.handleOne() catch return;
+                }
+            };
+            var group: std.Io.Group = .init;
+            try group.concurrent(io, Task.serve, .{&server});
+            defer group.cancel(io);
+            var transport_memory: @import("antfly_local_sources").sql_memory_budget = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+            const transport_allocator = transport_memory.allocator();
+            var private_memory: @import("antfly_local_sources").sql_memory_budget = .{ .backing = a, .limit = 1024 * 1024 };
+            const private_allocator = private_memory.allocator();
+            var json = try objectstore.Gcs.JsonApiClient.init(transport_allocator, .{
+                .endpoint = try std.fmt.allocPrint(transport_allocator, "{s}/storage/v1", .{server.baseUrl()}),
+                .upload_endpoint = try std.fmt.allocPrint(transport_allocator, "{s}/upload/storage/v1", .{server.baseUrl()}),
+                .io = io,
+                .request_timeout_ms = if (idle_timeout) null else 3000,
+                .http_client_config = .{ .keep_alive = false, .timeouts = .{ .read_ms = 100 }, .retry_policy = .{ .initial_delay_ms = 1 } },
+            });
+            var client = json.client();
+            defer client.deinit();
+            var backend = try ObjectStore.initWithClientOptions(transport_allocator, client, "bucket", "", .{ .skip_bucket_probe = true });
+            defer backend.deinit();
+            var store = backend.artifactStore();
+            store.allocator = private_allocator;
+            if (corrupt) {
+                try std.testing.expectError(error.ArtifactIntegrityMismatch, store.put(payload));
+            } else {
+                var value = try store.put(payload);
+                defer value.deinit(private_allocator);
+                try std.testing.expectEqualStrings(id, value.artifact_id);
+                try std.testing.expectEqualStrings(checksum, value.checksum);
+                try std.testing.expectEqualStrings("42", value.provider_version.?);
+            }
+            try group.await(io);
+            try std.testing.expectEqualSlices(usize, &.{ 1, 1, 1, 1 }, server.route_hits);
+            try std.testing.expect(private_memory.peak > 0 and transport_memory.peak > 0);
+            // The request-local allocator remains healthy, but the actual
+            // shared HTTP/TLS owner must refuse unadmitted transient growth.
+            transport_memory.limit = transport_memory.live;
+            try std.testing.expectError(error.OutOfMemory, store.put("another payload"));
+            try std.testing.expect(transport_memory.isLocallyExhausted());
+            try std.testing.expect(store.allocator.ptr == private_allocator.ptr);
+        }
+    }
+}
+
+test "external lake execution generation selectors obey caller quota and reclaim scratch" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    const scope = try artifact_store.UploadScope.forPublication(@splat(57), 1, std.testing.io);
+    var writer: @import("cloud_generations.zig").Writer = .{ .a = a, .reader = .{ .client = memory.client(), .bucket = "absent", .prefix = "maps" }, .scope = scope };
+    defer writer.deinit();
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("selector", &digest, .{});
+    const id = try scope.artifactId(&std.fmt.bytesToHex(digest, .lower));
+    try writer.capture(&id, 1, "generation", .none);
+    var store = try ObjectStore.initWithClientOptions(a, memory.client(), "absent", "maps", .{ .skip_bucket_probe = true });
+    defer store.deinit();
+    store.cloud_writer = &writer;
+    var quota: @import("antfly_local_sources").sql_memory_budget = .{ .backing = a, .limit = 0 };
+    try std.testing.expectError(error.OutOfMemory, store.getRangeAllocWithCancellation(quota.allocator(), &id, 0, 1, .none));
+    quota.limit = 4096;
+    var arena = std.heap.ArenaAllocator.init(quota.allocator());
+    defer arena.deinit();
+    const scratch = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(arena.allocator());
+    const selected = (try store.generation(scratch, &id, .none)).?;
+    try std.testing.expectEqualStrings("generation", selected);
+    scratch.free(selected);
+    try std.testing.expect(quota.peak > 0);
+    try std.testing.expectEqual(@as(usize, 0), quota.live);
 }

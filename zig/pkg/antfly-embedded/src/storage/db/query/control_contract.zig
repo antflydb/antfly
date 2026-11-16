@@ -125,6 +125,8 @@ pub const DenseSearchProfile = struct {
     hbc_leaves_explored: u64 = 0,
     hbc_approx_vectors_scored: u64 = 0,
     hbc_exact_vectors_scored: u64 = 0,
+    hbc_exact_projection_vectors_scored: u64 = 0,
+    hbc_exact_vectors_pruned_by_bound: u64 = 0,
     hbc_leaf_payload_stale: u64 = 0,
     hbc_leaf_payload_missing: u64 = 0,
     hbc_native_leaf_scan_hits: u64 = 0,
@@ -227,6 +229,53 @@ pub fn isDefaultMatchAll(query: types.Query) bool {
     };
 }
 
+/// Whether execution fuses multiple retrieval lanes after normalization.
+pub fn searchRequestRequiresComposedSearch(req: types.SearchRequest) bool {
+    if (req.full_text_queries.len > 0 or req.dense_queries.len > 0 or req.sparse_queries.len > 0) return true;
+
+    var base_result_sets: u32 = 0;
+    if (req.full_text != null) base_result_sets += 1;
+    if (req.dense != null) base_result_sets += 1;
+    if (req.sparse != null) base_result_sets += 1;
+    switch (req.query) {
+        .dense_knn => base_result_sets += 1,
+        .sparse_knn => base_result_sets += 1,
+        else => {},
+    }
+    return base_result_sets > 1;
+}
+
+/// Canonical single-vector execution shape, shared by admission and execution.
+/// A match-all text sentinel contributes no retrieval lane in this shape.
+pub fn directSingleVectorRequest(req: types.SearchRequest) ?types.SearchRequest {
+    if (req.merge_config != null or req.reranker != null or req.pruner != null) return null;
+    if (req.full_text_queries.len != 0) return null;
+    if (req.full_text) |text| switch (text) {
+        .match_all => {},
+        else => return null,
+    };
+    if (!isDefaultMatchAll(req.query)) return null;
+    if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.expand_strategy != null) return null;
+    if (req.dense != null or req.sparse != null) return null;
+    if (req.dense_queries.len == 1 and req.sparse_queries.len == 0) {
+        var next = req;
+        next.index_name = req.dense_queries[0].index_name;
+        next.full_text = null;
+        next.dense = req.dense_queries[0].query;
+        next.dense_queries = &.{};
+        return next;
+    }
+    if (req.sparse_queries.len == 1 and req.dense_queries.len == 0) {
+        var next = req;
+        next.index_name = req.sparse_queries[0].index_name;
+        next.full_text = null;
+        next.sparse = req.sparse_queries[0].query;
+        next.sparse_queries = &.{};
+        return next;
+    }
+    return null;
+}
+
 pub fn requestBindsRootTextIndex(req: types.SearchRequest) bool {
     return req.full_text != null or
         req.filter_query_json.len > 0 or
@@ -253,32 +302,19 @@ pub fn requestHasPostprocessPageTransforms(req: types.SearchRequest) bool {
         req.reranker != null;
 }
 
-pub fn componentPaging(req: types.SearchRequest) ComponentPaging {
-    var limit = if (req.reranker) |reranker|
-        reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset
-    else
-        req.limit +| req.offset;
-    const needs_component_window = requestHasPostprocessPageTransforms(req);
-
-    if (!needs_component_window) {
-        return .{
-            .offset = req.offset,
-            .limit = req.limit,
-        };
-    }
-
-    if (req.merge_config) |merge_config| {
-        if (merge_config.window_size > limit) limit = merge_config.window_size;
-    }
-    if (req.reranker) |reranker| {
-        const reranker_window = reranker.candidate_count orelse (reranker.top_n orelse req.limit) +| req.offset;
-        if (reranker_window > limit) limit = reranker_window;
-    }
-
+pub fn pagingPlanInput(req: types.SearchRequest) @import("paging_plan.zig").Input {
     return .{
-        .offset = 0,
-        .limit = limit,
+        .offset = req.offset,
+        .limit = req.limit,
+        .merge_window = if (req.merge_config) |config| config.window_size else null,
+        .reranking = if (req.reranker) |config| .{ .candidate_count = config.candidate_count, .top_n = config.top_n } else null,
+        .has_pruner = req.pruner != null,
     };
+}
+
+pub fn componentPaging(req: types.SearchRequest) ComponentPaging {
+    const result = @import("paging_plan.zig").componentPaging(pagingPlanInput(req));
+    return .{ .offset = result.offset, .limit = result.limit };
 }
 
 pub fn pagingCandidateWindow(paging: ComponentPaging) u32 {

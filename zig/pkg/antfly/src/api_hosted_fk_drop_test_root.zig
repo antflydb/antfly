@@ -18,6 +18,9 @@ const fixture = @import("api/hosted_fk_drop_integration_test.zig");
 const graph_fixture = @import("api/hosted_graph_truncate_integration_test.zig");
 
 pub const antfly_sources = @import("source_owner_control.zig");
+// This fixture owns its lake coordinator; the shared control catalog must
+// remain free of physical implementation imports.
+pub const lake_execution_backend = @import("api/lake_execution_build_impl.zig");
 pub const consumer_tests_only = true;
 pub const linked_owner_fixture = @import("api/linked_owner_test_fixture.zig");
 pub const storage_backend_erased = @import("antfly_local_sources").storage_backend_erased;

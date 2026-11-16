@@ -109,11 +109,21 @@ pub fn storageSuffixAlloc(alloc: Allocator, id: []const u8) ![]u8 {
 }
 
 pub const ScopedUploadVisitor = struct {
+    pub const Maintenance = enum { inspect, remove };
+    /// Admit provider-owned migration work and physical cleanup before I/O.
+    /// remove consumes both one work unit and one deletion unit. Payload
+    /// deletion remains admitted by visit, including on remote providers.
+    maintenance: ?*const fn (*anyopaque, Maintenance) anyerror!void = null,
     /// Backend-owned durable continuation. Callers persist it only after all
     /// delivered entries have been processed. Lexical providers may ignore it.
     continuation: ?[]const u8 = null,
     /// Remove deterministic local staging files while visiting fenced records.
     cleanup_staging: bool = false,
+    /// Reclaim an empty local attempt and its advisory journal after the
+    /// complete fenced attempt has been visited. Remote providers ignore this.
+    reclaim_retired_inventory: bool = false,
+    /// Report a non-empty attempt whose remaining files still need discovery.
+    retain_scope: ?*const fn (*anyopaque, UploadScope) anyerror!void = null,
     checkpoint: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     after_suffix: ?[]const u8 = null,
     fencing_floor: u64 = 0,
@@ -242,6 +252,36 @@ pub const ExecutionIo = struct {
         self.pending = null;
     }
 };
+/// Stack-owned publication scheduling. Borrow an inherited capability unchanged;
+/// otherwise acquire CPU admission without waiting before installing one. The
+/// scheduler's CPU budget already excludes its I/O reserve. Busy, disabled and
+/// undersized schedulers retain required-inline progress, including nested owners.
+pub const PublicationIo = struct {
+    const Execution = @import("antfly_local_sources").sql_parallel_scheduler.Execution;
+    slot: ?*?*const IoPhase = null,
+    execution: Execution = undefined,
+    phase: ExecutionIo = undefined,
+    pub fn install(self: *PublicationIo, slot: *?*const IoPhase, io: std.Io, scheduler: *@import("antfly_local_sources").sql_parallel_scheduler.Scheduler, checkpoint: @FieldType(Execution, "checkpoint")) void {
+        self.* = .{};
+        const bytes = 8 * 1024 * 1024;
+        if (slot.* != null or scheduler.max_workers == 0 or scheduler.max_io_workers == 0 or scheduler.cpuWorkspaceBudget(bytes) < bytes) return;
+        self.execution = .{ .scheduler = scheduler, .bytes = bytes, .checkpoint = checkpoint };
+        if (!self.execution.tryEnter()) return;
+        self.phase = .{ .execution = &self.execution, .io = io };
+        self.slot = slot;
+        slot.* = self.phase.capability();
+    }
+    pub fn deinit(self: *PublicationIo) void {
+        if (self.slot) |slot| {
+            // Upload helpers join every child before returning, including errors.
+            std.debug.assert(self.phase.pending == null);
+            slot.* = null;
+            self.execution.pause();
+            self.slot = null;
+        }
+    }
+};
+
 pub const IoGuard = struct {
     phase: ?*const IoPhase = null,
     pub fn abort(self: *IoGuard) void {
@@ -261,6 +301,12 @@ pub const IoGuard = struct {
     }
 };
 pub const ArtifactStore = struct {
+    /// Opt-in facts v4 body packs. Other profiles continue writing v3 facts.
+    pack_document_bodies: bool = false,
+    inline_point_bodies: bool = false,
+    canonical_point_bodies: bool = false,
+    point_read_blocks: bool = false,
+    inline_fact_leaves: bool = false,
     /// The host guarantees that replacement owners resolve the same immutable namespace.
     shared_across_owners: bool = false,
     namespace_identity: ?[32]u8 = null,
@@ -280,6 +326,10 @@ pub const ArtifactStore = struct {
     }
 
     pub const VTable = struct {
+        /// Optional hints must not turn an unused representation's missing
+        /// bytes into mandatory derived-state recovery. Adapters opt in; all
+        /// unrecognized authorization/provider wrappers remain intact.
+        optional_read_view: ?*const fn (*anyopaque) ArtifactStore = null,
         object_store: ?*const fn (*anyopaque) *@import("object_store.zig").ObjectStore = null,
         retention_witness: ?*const fn (*anyopaque, UploadScope, CancellationToken) anyerror!?RetentionWitness = null,
         retained_closure: ?*const fn (*anyopaque, []const u8, CancellationToken) anyerror!bool = null,
@@ -305,13 +355,32 @@ pub const ArtifactStore = struct {
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
         delete_with_cancellation: ?*const fn (*anyopaque, []const u8, CancellationToken) anyerror!void = null,
         put_scoped: ?*const fn (*anyopaque, Allocator, UploadScope, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
+        put_scoped_many: ?*const fn (*anyopaque, Allocator, UploadScope, []const []const u8, CancellationToken) anyerror![]ArtifactMetadata = null,
         visit_scoped_uploads: ?*const fn (*anyopaque, [32]u8, ScopedUploadVisitor, CancellationToken) anyerror!void = null,
         reclaim_retired_scoped_inventory: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
         cleanup_retired_scoped_temporaries: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
     };
 
+    /// Borrowed hint-only view. The backend owner must outlive it. Preserve
+    /// caller scope, allocator and I/O admission; only opted-in recovery
+    /// decorators change. Required reads keep their original recovery policy.
+    pub fn optionalReadView(self: ArtifactStore) ArtifactStore {
+        const callback = self.vtable.optional_read_view orelse return self;
+        const target = callback(self.ptr);
+        var result = self;
+        result.ptr = target.ptr;
+        result.vtable = target.vtable;
+        return result;
+    }
     pub fn providerStore(self: ArtifactStore) ?*@import("object_store.zig").ObjectStore {
         return if (self.vtable.object_store) |call| call(self.ptr) else null;
+    }
+    /// Credential-scoped residency is distinct from durable publication domains.
+    pub fn cacheScope(self: ArtifactStore, fallback: [32]u8) [32]u8 {
+        if (self.providerStore()) |provider| {
+            if (!std.mem.allEqual(u8, &provider.cloud_cache_scope, 0)) return provider.cloud_cache_scope;
+        }
+        return fallback;
     }
     pub fn retentionWitness(self: *ArtifactStore, scope: UploadScope, cancellation: CancellationToken) !?RetentionWitness {
         try scope.validate();
@@ -367,6 +436,53 @@ pub const ArtifactStore = struct {
 
     pub fn put(self: *ArtifactStore, contents: []const u8) !ArtifactMetadata {
         return try self.putWithCancellation(contents, .none);
+    }
+
+    pub fn putScopedMany(self: *ArtifactStore, scope: UploadScope, contents: []const []const u8, cancellation: CancellationToken) ![]ArtifactMetadata {
+        if (contents.len == 0 or contents.len > 8) return error.InvalidObjectBatch;
+        try scope.validate();
+        if (self.upload_scope) |authority| {
+            if (!std.mem.eql(u8, &scope.domain, &authority.domain) or scope.fencingToken() != authority.fencingToken()) return error.InvalidArtifactUploadScope;
+        }
+        try cancellation.check();
+        const batch = self.vtable.put_scoped_many orelse return self.putScopedSerial(scope, contents, cancellation);
+        var phase = try self.beginIo(contents.len);
+        defer phase.abort();
+        const metadata = batch(self.ptr, self.allocator, scope, contents, cancellation) catch |err| switch (err) {
+            // A prior immutable upload may already exist. Authenticate it via
+            // the ordinary single-object path, including partial batch wins.
+            error.PreconditionFailed => {
+                try phase.finish();
+                return self.putScopedSerial(scope, contents, cancellation);
+            },
+            else => return phase.failed(err),
+        };
+        errdefer {
+            for (metadata) |*item| item.deinit(self.allocator);
+            self.allocator.free(metadata);
+        }
+        try phase.finish();
+        if (metadata.len != contents.len) return error.InvalidObjectBatch;
+        for (metadata, contents) |item, bytes| {
+            const id = try scope.artifactId(item.checksum);
+            if (item.byte_len != bytes.len or !std.mem.eql(u8, &id, item.artifact_id)) return error.ArtifactIntegrityMismatch;
+        }
+        try cancellation.check();
+        return metadata;
+    }
+
+    fn putScopedSerial(self: *ArtifactStore, scope: UploadScope, contents: []const []const u8, cancellation: CancellationToken) ![]ArtifactMetadata {
+        const metadata = try self.allocator.alloc(ArtifactMetadata, contents.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (metadata[0..initialized]) |*item| item.deinit(self.allocator);
+            self.allocator.free(metadata);
+        }
+        for (contents, metadata) |bytes, *item| {
+            item.* = try self.putScoped(scope, bytes, cancellation);
+            initialized += 1;
+        }
+        return metadata;
     }
 
     pub fn putScoped(self: *ArtifactStore, scope: UploadScope, contents: []const u8, cancellation: CancellationToken) !ArtifactMetadata {
@@ -459,7 +575,18 @@ pub const ArtifactStore = struct {
                 }
             };
             var failures: [max_upload_batch]?anyerror = @splat(null);
-            if (io) |executor| {
+            if (backend.upload_scope != null and backend.vtable.put_scoped_many != null) {
+                var offset = begin;
+                while (offset < end) {
+                    var stop = offset + 1;
+                    var bytes = contents[offset].len;
+                    while (stop < end and stop - offset < 8 and contents[stop].len <= 1024 * 1024 -| bytes) : (stop += 1) bytes += contents[stop].len;
+                    const batch = backend.putScopedMany(backend.upload_scope.?, contents[offset..stop], cancellation) catch |err| return phase.failed(err);
+                    defer self.allocator.free(batch);
+                    for (batch, completed[offset..stop]) |metadata, *slot| slot.* = metadata;
+                    offset = stop;
+                }
+            } else if (io) |executor| {
                 var group: std.Io.Group = .init;
                 for (begin..end) |index| group.async(executor, Worker.run, .{ &backend, contents[index], cancellation, &completed[index], &failures[index] });
                 group.await(executor) catch |err| {
@@ -956,4 +1083,66 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "external lake execution publication IO preserves inline progress and releases admission" {
+    const Scheduler = @import("antfly_local_sources").sql_parallel_scheduler.Scheduler;
+    for ([_]usize{ 0, 4, 8, 12, 16, 64 }) |mib| {
+        var scheduler: Scheduler = .{ .max_workers = 1, .max_io_workers = 2, .max_bytes = mib * 1024 * 1024 };
+        var slot: ?*const IoPhase = null;
+        var owner: PublicationIo = .{};
+        owner.install(&slot, std.testing.io, &scheduler, null);
+        try std.testing.expectEqual(mib >= 16, slot != null);
+        if (slot) |phase| {
+            // An upload wave yields CPU admission, then restores it on failure.
+            try phase.begin(phase.ptr, 2);
+            try std.testing.expectEqual(@as(usize, 2), scheduler.io_workers);
+            var guard: IoGuard = .{ .phase = phase };
+            try std.testing.expectEqual(error.AccessDenied, guard.failed(error.AccessDenied));
+            try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+            try std.testing.expectEqual(@as(usize, 1), scheduler.workers);
+            var nested: PublicationIo = .{};
+            nested.install(&slot, std.testing.io, &scheduler, null);
+            nested.deinit();
+            try std.testing.expect(slot == phase);
+        }
+        owner.deinit();
+        try std.testing.expect(slot == null);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    }
+    var scheduler: Scheduler = .{ .max_workers = 1, .max_io_workers = 1 };
+    var occupying: @import("antfly_local_sources").sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 1 };
+    try std.testing.expect(occupying.tryEnter());
+    var slot: ?*const IoPhase = null;
+    var busy: PublicationIo = .{};
+    busy.install(&slot, std.testing.io, &scheduler, null);
+    busy.deinit();
+    try std.testing.expect(slot == null);
+    occupying.pause();
+    const Check = struct {
+        canceled: bool = false,
+        fn call(raw: *anyopaque) !void {
+            if (@as(*@This(), @ptrCast(@alignCast(raw))).canceled) return error.Cancelled;
+        }
+    };
+    var check: Check = .{};
+    var owner: PublicationIo = .{};
+    owner.install(&slot, std.testing.io, &scheduler, .{ .ptr = &check, .check = Check.call });
+    try slot.?.begin(slot.?.ptr, 1);
+    check.canceled = true;
+    try std.testing.expectError(error.Cancelled, slot.?.finish(slot.?.ptr));
+    owner.deinit();
+    try std.testing.expect(slot == null);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    scheduler.max_io_workers = 0;
+    owner.install(&slot, std.testing.io, &scheduler, null);
+    owner.deinit();
+    try std.testing.expect(slot == null);
+    scheduler.max_io_workers = 1;
+    scheduler.max_workers = 0;
+    owner.install(&slot, std.testing.io, &scheduler, null);
+    owner.deinit();
+    try std.testing.expect(slot == null);
 }

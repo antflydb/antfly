@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/stretchr/testify/require"
 	"os"
 	"path/filepath"
 	"sort"
@@ -98,7 +99,7 @@ func TestSharedSyncSkipsUnchangedRecordsAndRetainsIndexingTime(t *testing.T) {
 	backend.mu.Lock()
 	var before []byte
 	for _, row := range backend.records {
-		if grep, ok := row["grep"].(map[string]any); ok {
+		if grep, ok := row["source"].(map[string]any); ok {
 			grep["indexed_at"] = float64(123)
 		}
 		before, _ = json.Marshal(row)
@@ -305,4 +306,86 @@ func TestSharedSyncRejectsUnsupportedOrMalformedMergeWithoutFallback(t *testing.
 			}
 		})
 	}
+}
+
+type budgetedSyncClient struct {
+	SyncClient
+	rejectedID string
+	writes     int
+}
+
+func (c *budgetedSyncClient) ValidateMerge(_ context.Context, _ string, body []byte) error {
+	var request ScopedMergeRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		return err
+	}
+	if _, found := request.ScopedMerge.Records[c.rejectedID]; found {
+		return fmt.Errorf("local record budget exceeded")
+	}
+	return nil
+}
+func (c *budgetedSyncClient) Merge(ctx context.Context, table string, body []byte) ([]byte, error) {
+	c.writes++
+	return c.SyncClient.Merge(ctx, table, body)
+}
+func TestPreflightRejectionAllowsSiblingWritesButCannotAuthorizeDeletion(t *testing.T) {
+	runner, fixture, backend := runnerFixture(t)
+	first := fixture.inventory.Objects[0]
+	second := first
+	second.ID += "-sibling"
+	second.Path = "sibling.txt"
+	firstDoc, err := Normalize(testSourceID, first, []byte("first"), *runner.Profile.Sources[0].Permissions, time.Now())
+	require.NoError(t, err)
+	secondDoc, err := Normalize(testSourceID, second, []byte("second"), *runner.Profile.Sources[0].Permissions, time.Now())
+	require.NoError(t, err)
+	firstKey, err := RecordKey(testSourceID, first.ID)
+	require.NoError(t, err)
+	secondKey, err := RecordKey(testSourceID, second.ID)
+	require.NoError(t, err)
+	client := &budgetedSyncClient{SyncClient: runner.Publisher, rejectedID: firstKey}
+	writer, err := NewSyncWriter(client, "sources", testSourceID, []string{first.ID, second.ID}, true)
+	require.NoError(t, err)
+	_, err = writer.Upsert(t.Context(), map[string]Document{firstKey: firstDoc})
+	require.ErrorContains(t, err, "local record budget")
+	require.Zero(t, client.writes)
+	_, err = writer.Upsert(t.Context(), map[string]Document{secondKey: secondDoc})
+	require.NoError(t, err)
+	require.Equal(t, 1, client.writes)
+	_, err = writer.Finish(t.Context())
+	require.Error(t, err, "the rejected record cannot authorize deletion")
+	require.Equal(t, 1, client.writes)
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	require.Contains(t, backend.records, secondKey)
+	require.NotContains(t, backend.records, firstKey)
+}
+
+func TestSyncWriterRestoresOnlyMatchingPublicationProofs(t *testing.T) {
+	runner, connector, backend := runnerFixture(t)
+	item := connector.inventory.Objects[0]
+	doc, err := Normalize(testSourceID, item, connector.data[item.ID], Permissions{}, time.Now())
+	require.NoError(t, err)
+	id, err := RecordKey(testSourceID, item.ID)
+	require.NoError(t, err)
+	first, err := NewSyncWriter(runner.Publisher, "sources", testSourceID, []string{item.ID}, true)
+	require.NoError(t, err)
+	first.TrackPublicationProofs()
+	_, err = first.Upsert(t.Context(), map[string]Document{id: doc})
+	require.NoError(t, err)
+	proofs := first.PublicationProofs()
+	require.Len(t, proofs, 1)
+	next, err := NewSyncWriter(runner.Publisher, "sources", testSourceID, []string{item.ID}, true)
+	require.NoError(t, err)
+	restored, err := next.RestorePublicationProofs(t.Context(), proofs)
+	require.NoError(t, err)
+	require.True(t, restored)
+	backend.mu.Lock()
+	backend.records[id]["permissions"] = map[string]any{"public": true}
+	backend.mu.Unlock()
+	changed, err := NewSyncWriter(runner.Publisher, "sources", testSourceID, []string{item.ID}, true)
+	require.NoError(t, err)
+	restored, err = changed.RestorePublicationProofs(t.Context(), proofs)
+	require.NoError(t, err)
+	require.False(t, restored)
+	require.Empty(t, changed.verified)
 }

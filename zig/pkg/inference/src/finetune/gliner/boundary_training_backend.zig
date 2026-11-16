@@ -278,10 +278,13 @@ pub const Owner = struct {
             backend.store.lazy_weights.deinit(self.backing);
             self.backing.destroy(backend);
         };
-        if (self.cuda_backend) |backend| {
+        // Initialization cannot create this owner when CUDA is disabled.
+        // Keep its destructor out of CPU-only artifacts as well: a runtime
+        // null check still makes Zig emit the complete CUDA cleanup graph.
+        if (comptime build_options.enable_cuda) if (self.cuda_backend) |backend| {
             backend.deinit();
             self.backing.destroy(backend);
-        }
+        };
         std.debug.assert(self.metadata.live == 0);
         self.backing.destroy(self);
     }

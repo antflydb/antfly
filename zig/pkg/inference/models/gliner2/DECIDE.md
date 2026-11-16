@@ -1,8 +1,10 @@
 # GLiNER2.5 Decide artifact contract
 
+For the separate PII and GLiGuard extraction profiles, see [SPECIALTY.md](SPECIALTY.md).
+
 Antfly's decision runtime targets the published legacy span checkpoint
 `fastino/GLiNER2.5-Decide`, Hugging Face revision
-`7ee5da4c2415e32259bcdc0b1a7367c32ce8d6f6`.
+`5a7adf72a23b4d311abae6ce050d7f0012bb3416`.
 
 The reviewed `model.safetensors` is 1,945,828,140 bytes with SHA-256
 `40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997`.

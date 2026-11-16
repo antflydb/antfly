@@ -1,16 +1,16 @@
-import { Badge, Collapsible, CollapsibleContent, CollapsibleTrigger } from "@antfly/design-system";
 import {
-  AlertCircle,
-  BookOpen,
-  Check,
-  ChevronDown,
-  ChevronRight,
-  HelpCircle,
-  Loader2,
-  Search,
-  Sparkles,
-  Target,
-} from "lucide-react";
+  Badge,
+  HighlightedCodeBlock,
+  Spinner,
+  TraceCollapsible,
+  TraceCollapsibleContent,
+  TraceCollapsibleTrigger,
+  TraceDescription,
+  TraceIcon,
+  TraceLine,
+  TraceTitle,
+} from "@antfly/design-system";
+import { AlertCircle, BookOpen, Check, HelpCircle, Search, Sparkles, Target } from "lucide-react";
 import type React from "react";
 import { useState } from "react";
 import { cn } from "@/lib/utils";
@@ -41,7 +41,6 @@ interface PipelineStepProps {
 
 export const PipelineStep: React.FC<PipelineStepProps> = ({
   step,
-  isLast,
   onFollowupClick,
   formatAnswer,
 }) => {
@@ -56,7 +55,7 @@ export const PipelineStep: React.FC<PipelineStepProps> = ({
       case "complete":
         return <Check className="af-status-icon-success w-3.5 h-3.5" />;
       case "running":
-        return <Loader2 className="af-status-icon-info w-3.5 h-3.5 animate-spin" />;
+        return <Spinner className="af-status-icon-info w-3.5 h-3.5" />;
       case "error":
         return <AlertCircle className="af-status-icon-error w-3.5 h-3.5" />;
       case "pending":
@@ -66,16 +65,17 @@ export const PipelineStep: React.FC<PipelineStepProps> = ({
     }
   };
 
-  const statusColor = () => {
+  const traceStatus = () => {
     switch (step.status) {
-      case "complete":
-        return "af-status-border-success";
       case "running":
-        return "af-status-border-info af-status-surface-info";
+        return "running" as const;
       case "error":
-        return "af-status-border-error";
+        return "error" as const;
+      case "pending":
+      case "skipped":
+        return "pending" as const;
       default:
-        return "border-border/50";
+        return undefined;
     }
   };
 
@@ -83,42 +83,21 @@ export const PipelineStep: React.FC<PipelineStepProps> = ({
   const isOpen = expanded || step.status === "running";
 
   return (
-    <div className="relative">
-      {/* Vertical connector line */}
-      {!isLast && <div className="absolute left-[19px] top-10 bottom-0 w-px bg-border" />}
-
-      <Collapsible open={isOpen} onOpenChange={setExpanded}>
-        <CollapsibleTrigger asChild>
-          <button
-            type="button"
-            className={cn(
-              "w-full flex items-center gap-3 p-3 rounded-none border transition-colors text-left",
-              statusColor(),
-              step.status !== "pending" && "hover:bg-muted/50 cursor-pointer"
-            )}
-            disabled={step.status === "pending"}
-          >
-            <div className="flex items-center justify-center w-[22px] shrink-0">{statusIcon()}</div>
-            <Icon className="w-4 h-4 text-muted-foreground shrink-0" />
-            <span className="text-sm font-medium flex-1">{step.label}</span>
-            {duration && (
-              <span className="text-xs text-muted-foreground tabular-nums">{duration}</span>
-            )}
-            {step.status !== "pending" &&
-              (isOpen ? (
-                <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />
-              ) : (
-                <ChevronRight className="w-3.5 h-3.5 text-muted-foreground" />
-              ))}
-          </button>
-        </CollapsibleTrigger>
-        <CollapsibleContent>
-          <div className="ml-[31px] mt-2 mb-3 pl-3 border-l-2 border-border/50">
-            {renderStepContent(step, onFollowupClick, formatAnswer)}
-          </div>
-        </CollapsibleContent>
-      </Collapsible>
-    </div>
+    <TraceCollapsible open={isOpen} onOpenChange={setExpanded}>
+      <TraceCollapsibleTrigger disabled={step.status === "pending"}>
+        <TraceLine status={traceStatus()}>
+          <TraceIcon>{statusIcon()}</TraceIcon>
+          <TraceIcon>
+            <Icon className="w-4 h-4" />
+          </TraceIcon>
+          <TraceTitle>{step.label}</TraceTitle>
+          {duration && <TraceDescription>{duration}</TraceDescription>}
+        </TraceLine>
+      </TraceCollapsibleTrigger>
+      <TraceCollapsibleContent>
+        {renderStepContent(step, onFollowupClick, formatAnswer)}
+      </TraceCollapsibleContent>
+    </TraceCollapsible>
   );
 };
 
@@ -153,7 +132,7 @@ function renderStepContent(
             </div>
           )}
           {c.reasoning && (
-            <div className="p-2 bg-muted/50 rounded-none text-muted-foreground">{c.reasoning}</div>
+            <div className="p-2 bg-muted/50 rounded-md text-muted-foreground">{c.reasoning}</div>
           )}
         </div>
       );
@@ -167,7 +146,7 @@ function renderStepContent(
           {data.filterApplied && (
             <div>
               <span className="text-muted-foreground">Filter:</span>{" "}
-              <code className="bg-muted px-1 rounded-none">{data.filterApplied}</code>
+              <code className="bg-muted px-1 rounded-sm">{data.filterApplied}</code>
             </div>
           )}
           <div className="flex items-center gap-2">
@@ -176,15 +155,21 @@ function renderStepContent(
           {data.hits.length > 0 && (
             <div className="space-y-1 max-h-48 overflow-y-auto">
               {data.hits.map((hit, i) => (
-                <div key={hit._id || i} className="p-2 rounded-none border bg-background text-xs">
+                <div key={hit._id || i} className="p-2 rounded-md border bg-background text-xs">
                   <div className="flex items-center justify-between">
                     <span className="font-medium truncate">{hit._id}</span>
                     <Badge className="text-[10px]">{hit._score?.toFixed(3)}</Badge>
                   </div>
                   {hit._source && (
-                    <pre className="text-muted-foreground overflow-x-auto whitespace-pre-wrap mt-1 line-clamp-3">
-                      {JSON.stringify(hit._source, null, 2).slice(0, 300)}
-                    </pre>
+                    <HighlightedCodeBlock
+                      code={JSON.stringify(hit._source, null, 2).slice(0, 300)}
+                      language="json"
+                      size="sm"
+                      wrap
+                      copyable={false}
+                      className="mt-1"
+                      contentClassName="max-h-20"
+                    />
                   )}
                 </div>
               ))}
@@ -303,7 +288,7 @@ function renderStepContent(
               key={q}
               type="button"
               onClick={() => onFollowupClick?.(q)}
-              className="w-full text-left text-sm p-2 rounded-none hover:bg-muted/50 transition-colors text-muted-foreground hover:text-foreground"
+              className="w-full text-left text-sm p-2 rounded-md hover:bg-muted/50 transition-colors text-muted-foreground hover:text-foreground"
             >
               {q}
             </button>

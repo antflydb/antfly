@@ -37,15 +37,20 @@ class GraphQueryParams:
         max_depth (int | Unset):
         min_weight (float | Unset):
         max_weight (float | Unset):
-        max_results (int | Unset):
-        deduplicate_nodes (bool | Unset):
-        include_paths (bool | Unset):
+        max_results (int | Unset): Global result-entry limit shared by all starts; root-specific path entries each
+            consume one slot.
+        deduplicate_nodes (bool | Unset): Deduplicate nodes per root when include_paths is true, otherwise across all
+            starts.
+        include_paths (bool | Unset): Preserve independent paths per start; the first path node identifies the root.
+            max_depth is measured from each root.
         weight_mode (PathWeightMode | Unset): Path weighting algorithm for pathfinding:
             - min_hops: Minimize number of edges
             - min_weight: Minimize sum of finite non-negative edge weights
             - max_weight: Maximize product of finite edge weights in [0,1]
         k (int | Unset):
-        node_filter (NodeFilter | Unset): Filter nodes during graph traversal using existing query primitives
+        node_filter (NodeFilter | Unset): Admission predicate applied to every start, target and intermediate node
+            before returning or expanding it, for all graph operations. Denied nodes cannot occur in result paths or expose
+            descendants through traversal.
         algorithm (str | Unset):
         algorithm_params (GraphQueryParamsAlgorithmParams | Unset):
     """

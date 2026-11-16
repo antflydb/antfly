@@ -170,6 +170,7 @@ pub const Inspection = struct {
     configuration: Configuration,
     reader: media.mp4.Reader = undefined,
     packet_input: ?PacketInput = null,
+    borrowed_hevc_config: ?[]u8 = null,
     webm_reader: media.webm.Reader = undefined,
     webm_index: ?video.webm_pictures.Index = null,
     webm: bool = false,
@@ -197,9 +198,9 @@ pub const Inspection = struct {
             self.source.limits = source.limits;
         } else if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
         self.validated_bytes = if (borrowed) |reader| try packetBytes(reader) else bytes;
-        self.webm = configuration.webm != null or (borrowed == null and isWebm(bytes));
+        self.webm = configuration.webm != null or (borrowed == null and usesWebmLane(a, bytes));
         if (self.webm) {
-            self.webm_reader = if (configuration.webm) |input| input.reader.* else try media.webm.Reader.init(a, &self.source, .{});
+            self.webm_reader = if (configuration.webm) |input| input.reader.* else try openWebmLane(a, &self.source, bytes);
             self.owns_webm_reader = configuration.webm == null;
             self.webm_reader.input = &self.source;
             self.webm_index = if (configuration.webm) |input| input.index.* else try video.webm_pictures.index(a, &self.webm_reader, webmDecodeOptions(self.source.control, &self.pool));
@@ -211,6 +212,7 @@ pub const Inspection = struct {
             if (borrowed) |reader| {
                 self.reader = reader.*;
                 self.reader.input = &self.source;
+                self.borrowed_hevc_config = try normalizeHevc(a, &self.reader);
             } else {
                 self.packet_input = try PacketInput.init(a, &self.source, bytes);
                 self.reader = self.packet_input.?.reader;
@@ -233,6 +235,7 @@ pub const Inspection = struct {
         if (self.owns_webm_index) self.webm_index.?.deinit();
         if (self.owns_webm_reader) self.webm_reader.deinit();
         if (self.packet_input) |*input| input.deinit();
+        if (self.borrowed_hevc_config) |bytes| a.free(bytes);
         std.debug.assert(self.bounded.live == 0);
         std.debug.assert(std.meta.eql(self.pool.snapshot(), media.admission.Resources{}));
         self.backing.destroy(self);
@@ -784,12 +787,22 @@ fn policyLayout(track: media.mp4.Track, display: video.display.Layout, width: u3
     if (matrix == .gbr_identity and (tone != .none or (primaries != 1 and primaries != 2))) return error.UnsupportedVideoColor;
     if (tone != .none) {
         // Require explicit consistent primaries; never guess an HDR gamut.
-        if (track.codec != .avc or !((matrix == .bt2020_ncl and primaries == 9) or (matrix == .bt709 and primaries == 1))) return error.UnsupportedVideoColor;
+        if ((track.codec != .avc and track.codec != .hevc) or !((matrix == .bt2020_ncl and primaries == 9) or (matrix == .bt709 and primaries == 1))) return error.UnsupportedVideoColor;
     } else if (matrix == .bt2020_ncl or (primaries != 2 and primaries != 1 and primaries != 5 and primaries != 6)) return error.UnsupportedVideoColor;
     const g = projector.embeddingGemma2VideoGeometry(display.width, display.height);
     // Apply SAR through target aspect; a single separable resample avoids an
     // intermediate stretched raster and its additional RGB8 rounding.
-    return .{ .width = g.width, .height = g.height, .matrix = matrix, .rotation = display.rotation, .tone_mapping = tone, .torchvision = true, .rgb_rounding = if (matrix == .gbr_identity) .gbr_reference else if (width % 16 == 0) .q13_components else .q16_luma };
+    return .{ .width = g.width, .height = g.height, .presentation_width = display.width, .presentation_height = display.height, .matrix = matrix, .rotation = display.rotation, .tone_mapping = tone, .torchvision = true, .rgb_rounding = if (matrix == .gbr_identity) .gbr_reference else if (width % 16 == 0) .q13_components else .q16_luma };
+}
+
+/// The bitstream's color and aspect apply where the container says nothing. A
+/// container pasp wins over the stream's SAR, as in other players, and policySignal
+/// refuses color that conflicts.
+fn hevcPolicy(a: std.mem.Allocator, track: media.mp4.Track, width: u32, height: u32) !video.preparation.Options {
+    const signal = (try video.hevc_config.parse(a, track.codec_config)) orelse return policy(track, width, height);
+    var effective = track;
+    if (!track.pixel_aspect_declared) effective.pixel_aspect = .{ .horizontal = signal.sar.horizontal, .vertical = signal.sar.vertical };
+    return policySignal(effective, width, height, .{ .primaries = signal.primaries, .transfer = signal.transfer, .matrix = signal.matrix });
 }
 
 fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader) !?*video.h264_dynamic.Session {
@@ -811,11 +824,30 @@ fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader) !?*video.h2
 fn isWebm(bytes: []const u8) bool {
     return bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "\x1a\x45\xdf\xa3");
 }
+/// AV1 in MP4 shares WebM's reconstruction, display policy and Apple route.
+fn usesWebmLane(a: std.mem.Allocator, bytes: []const u8) bool {
+    return isWebm(bytes) or video.mp4_coded.usesWebmLane(a, bytes);
+}
+fn openWebmLane(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8) !media.webm.Reader {
+    return if (isWebm(bytes)) media.webm.Reader.init(a, source, .{}) else video.mp4_coded.openWebm(a, source);
+}
+fn normalizeHevc(a: std.mem.Allocator, reader: *media.mp4.Reader) !?[]u8 {
+    return video.hevc_config.normalizeReader(a, reader) catch |err| switch (err) {
+        // This parser and both output routes share the 4:2:0 Main/Main10
+        // envelope. Preserve the codec-unavailable identity for unsupported
+        // HEVC profiles, including CPU-only hosts and CUDA fallback.
+        error.UnsupportedVideoProfile => return error.HevcDecoderUnavailable,
+        else => return err,
+    };
+}
 // Own normalized TS storage alongside the packet reader. Returning this owner
 // is safe: the snapshot's Source address is stable until deinit.
 pub const PacketInput = struct {
     reader: media.mp4.Reader,
     snapshot: ?*media.stream.Snapshot = null,
+    /// Stays valid for copies of `reader`, which borrow it through their track.
+    inband_config: ?[]u8 = null,
+    allocator: ?std.mem.Allocator = null,
     pub fn init(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8) !PacketInput {
         if (media.transport_stream.isTransportStream(bytes)) {
             const normalized = try video.transport_avc.Reader.init(a, source.identity, bytes, .{}, .{
@@ -824,9 +856,13 @@ pub const PacketInput = struct {
             });
             return .{ .reader = normalized.reader, .snapshot = normalized.snapshot };
         }
-        return .{ .reader = try media.mp4.Reader.init(a, source, .{}) };
+        var input = PacketInput{ .reader = try media.mp4.Reader.init(a, source, video.mp4_coded.limits), .allocator = a };
+        errdefer input.deinit();
+        input.inband_config = try normalizeHevc(a, &input.reader);
+        return input;
     }
     pub fn deinit(self: *PacketInput) void {
+        if (self.inband_config) |config| self.allocator.?.free(config);
         self.reader.deinit();
         if (self.snapshot) |snapshot| snapshot.deinit();
     }
@@ -892,8 +928,76 @@ pub fn inspectPixelsWithSampling(bytes: []const u8, control: Control, sampling: 
     defer std.debug.assert(bounded.live == 0);
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
     defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
-    const plan = inspectPlan(bounded.allocator(), bytes, control, sampling, &pool, false) catch |err| return if ((err == error.OutOfMemory and bounded.denied) or err == error.SharedAdmissionExceeded) error.MemoryBudgetExceeded else err;
+    const plan = inspectPlan(bounded.allocator(), bytes, control, sampling, &pool, false) catch |err| {
+        // Executor-contract validation happens before backend acquisition. It
+        // must count supported CUDA MP4 pixels without requiring the portable
+        // AVC/MJPEG decoder to understand HEVC or AV1. Execution still chooses
+        // and validates its own backend; timestamp-window APIs stay portable.
+        if (err == error.UnsupportedVideoCodec and sampling == .reference) {
+            const adapter = control.imageWorkControl();
+            const clip = try @import("../ops/cuda/video.zig").inspectEmbedding(bounded.allocator(), bytes, .{ .context = adapter.context, .check_fn = adapter.check_fn });
+            if (clip.codec == .hevc or clip.codec == .av1) return @as(u64, clip.width) * clip.height * clip.frames;
+        }
+        return if ((err == error.OutOfMemory and bounded.denied) or err == error.SharedAdmissionExceeded) error.MemoryBudgetExceeded else err;
+    };
+    if (sampling == .reference) {
+        // Readers choose the first track supported by their route. A portable
+        // AVC/MJPEG track can follow a larger HEVC/AV1 track selected by CUDA.
+        // Charge the maximum across both viable routes before backend selection.
+        const adapter = control.imageWorkControl();
+        const clip = @import("../ops/cuda/video.zig").inspectEmbedding(bounded.allocator(), bytes, .{ .context = adapter.context, .check_fn = adapter.check_fn }) catch |err| {
+            try control.check();
+            if (err == error.OutOfMemory) return if (bounded.denied) error.MemoryBudgetExceeded else err;
+            // CUDA has a narrower envelope than portable decoding (including
+            // WebM/TS, MJPEG, and higher-depth AVC). Execution validates its route.
+            return plan.pixels;
+        };
+        return @max(plan.pixels, @as(u64, clip.width) * clip.height * clip.frames);
+    }
     return plan.pixels;
+}
+
+test "embeddinggemma2 video contract pixel inspection admits CUDA MP4 codecs without portable decoding" {
+    inline for (.{ "hevc-hvc1.mp4", "hevc-hev1.mp4", "hevc-hev1-inband.mp4", "av1.mp4" }) |name| {
+        try std.testing.expectEqual(@as(u64, 4 * 192 * 192), try inspectPixels(@embedFile("../testdata/video/codecs/" ++ name), .{}));
+    }
+}
+
+test "HEVC output planning and preparation share the bitstream's aspect" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../testdata/video/codecs/hevc-sar-nopasp.mp4") }, .identity = "sar" };
+    var reader = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
+    defer reader.deinit();
+    try std.testing.expectEqual(reader.track.pixel_aspect.horizontal, reader.track.pixel_aspect.vertical);
+    const stream = try hevcPolicy(a, reader.track, reader.track.width, reader.track.height);
+    const container = try policy(reader.track, reader.track.width, reader.track.height);
+    try std.testing.expect(stream.width != container.width);
+    var preparation = stream;
+    preparation.rgb_rounding = .q13_reconstructed;
+    const expected = (try video.preparation.geometry(reader.track.width, reader.track.height, preparation)).values() * @sizeOf(f32);
+    const planned = try selectionOutputBytes(a, &.{0}, &reader, null, null, null);
+    try std.testing.expectEqual(expected, planned.bytes);
+}
+
+test "An explicit square pasp wins over a stream's SAR" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../testdata/video/codecs/hevc-sar-pasp-square.mp4") }, .identity = "square" };
+    var reader = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
+    defer reader.deinit();
+    try std.testing.expect(reader.track.pixel_aspect_declared);
+    try std.testing.expectEqual((try policy(reader.track, 64, 64)).presentation_width, (try hevcPolicy(a, reader.track, 64, 64)).presentation_width);
+    try std.testing.expectEqual(@as(u32, 64), (try hevcPolicy(a, reader.track, 64, 64)).presentation_width);
+}
+
+test "embeddinggemma2 video contract pixels follow the first decodable track on both routes" {
+    const bytes = @embedFile("../testdata/video/codecs/hevc-avc-tracks.mp4");
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    const portable = try inspectPlan(std.testing.allocator, bytes, .{}, .reference, &pool, false);
+    const cuda = try @import("../ops/cuda/video.zig").inspectEmbedding(std.testing.allocator, bytes, .{});
+    try std.testing.expectEqual(@as(u64, 4 * 192 * 192), portable.pixels);
+    try std.testing.expectEqual(@as(u64, 4 * 192 * 192), @as(u64, cuda.width) * cuda.height * cuda.frames);
+    try std.testing.expectEqual(@as(u64, 4 * 192 * 192), try inspectPixels(bytes, .{}));
+    try std.testing.expectError(error.Timeout, inspectPixels(bytes, .{ .deadline_ns = 0 }));
 }
 
 /// Geometry-derived share of a prepaid execution reservation. Counts maximum
@@ -925,6 +1029,9 @@ pub const Plan = struct {
     // Preserve the unfiltered envelope when a precomputed plan is admitted
     // again under a different cache owner. A past hit is not a future pin.
     source_apple_surface_bytes: ?usize = null,
+    /// The surface envelope is a decoder pool that cache hits don't shrink, rather
+    /// than one surface per selected picture.
+    apple_surfaces_fixed: bool = false,
     patch_output_bytes: usize = 0,
     commands: u64 = 0,
     pub fn hostBytes(self: Plan) !usize {
@@ -985,7 +1092,7 @@ fn selectionOutputBytes(a: std.mem.Allocator, selected: []const usize, reader: ?
             const height: u32 = @intCast(if (cfg) |c| c.height else track.height);
             source_width = width;
             source_height = height;
-            preparation = if (cfg) |c| try policySignal(track, width, height, c.color) else try policy(track, width, height);
+            preparation = if (cfg) |c| try policySignal(track, width, height, c.color) else if (track.codec == .hevc) try hevcPolicy(a, track, width, height) else try policy(track, width, height);
             // Portable decode can reconstruct full chroma even when container
             // colour signalling alone does not specify its rounding policy.
             if (preparation.tone_mapping == .none) preparation.rgb_rounding = .q13_reconstructed;
@@ -1055,6 +1162,8 @@ pub fn inspectReaderPlanWithSelection(a: std.mem.Allocator, borrowed: *const med
     source.limits = borrowed.input.limits;
     var reader = borrowed.*;
     reader.input = &source;
+    const normalized = try normalizeHevc(a, &reader);
+    defer if (normalized) |config_bytes| a.free(config_bytes);
     return inspectPacketPlan(a, &reader, control, sampling, metal, selection);
 }
 pub fn inspectConfiguredPlan(a: std.mem.Allocator, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration, metal: bool) !Plan {
@@ -1118,7 +1227,7 @@ pub fn pinCachedPlan(original: Plan, bytes: []const u8, reader: ?*const media.mp
     // Retain all 24 decoder/reference slots, reducing only selected-output
     // surfaces. The original maximum geometry/depth still bounds every miss.
     result.source_apple_surface_bytes = original.source_apple_surface_bytes orelse original.apple_surface_bytes;
-    result.apple_surface_bytes = if (decode_count == 0) 0 else try std.math.mul(usize, result.source_apple_surface_bytes.? / (original.pictures + 24), @as(usize, @intCast(decode_count)) + 24);
+    result.apple_surface_bytes = if (decode_count == 0) 0 else if (original.apple_surfaces_fixed) result.source_apple_surface_bytes.? else try std.math.mul(usize, result.source_apple_surface_bytes.? / (original.pictures + 24), @as(usize, @intCast(decode_count)) + 24);
     return result;
 }
 /// Only AVC currently consumes these pins. Never discount a decoder path
@@ -1154,8 +1263,8 @@ pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sa
     if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-preflight", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
-    if (isWebm(bytes)) {
-        var reader = try media.webm.Reader.init(a, &source, .{});
+    if (usesWebmLane(a, bytes)) {
+        var reader = try openWebmLane(a, &source, bytes);
         defer reader.deinit();
         var index = try video.webm_pictures.index(a, &reader, webmDecodeOptions(source.control, pool));
         defer index.deinit();
@@ -1167,7 +1276,9 @@ pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sa
 }
 fn inspectPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, control: Control, sampling: Sampling, metal: bool, selection: ?*const ReaderSelection) !Plan {
     // AVC combines VUI and container declarations in parameterSession below.
-    if (reader.track.codec != .avc) _ = try policy(reader.track, reader.track.width, reader.track.height);
+    if (reader.track.codec == .hevc) {
+        _ = try hevcPolicy(a, reader.track, reader.track.width, reader.track.height);
+    } else if (reader.track.codec != .avc) _ = try policy(reader.track, reader.track.width, reader.track.height);
     const selected = try selectReader(a, reader, sampling, reader.input.control, selection);
     defer a.free(selected);
     const configurations = try parameterSession(a, reader);
@@ -1182,6 +1293,14 @@ fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, co
         plan.apple_surface_bytes = std.math.cast(usize, try video.apple.surfaceAdmissionBytes(reader.track.width, reader.track.height, selected.len)) orelse return error.ResourceLimitExceeded;
         if (plan.apple_surface_bytes > 512 * 1024 * 1024) plan.apple_surface_bytes = 0;
     }
+    if (metal and reader.track.codec == .hevc and video.apple_hevc.hasParameterSets(reader.track.codec_config)) {
+        if (video.apple_hevc.surfaceBytes(reader.track)) |bytes| {
+            if (bytes <= video.apple_hevc.max_surface_bytes) {
+                plan.apple_surface_bytes = std.math.cast(usize, bytes) orelse return error.ResourceLimitExceeded;
+                plan.apple_surfaces_fixed = true;
+            }
+        } else |_| {}
+    }
     for (selected) |index| {
         try control.check();
         if (plan.pictures >= plan.picture_indexes.len) return error.ResourceLimitExceeded;
@@ -1189,11 +1308,70 @@ fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, co
         const cfg = if (configurations) |session| try session.configAt(index) else static_config;
         const width = if (cfg) |value| value.width else reader.track.width;
         const height = if (cfg) |value| value.height else reader.track.height;
-        try plan.picture(@intCast(width), @intCast(height), if (cfg) |value| try policySignal(reader.track, @intCast(width), @intCast(height), value.color) else try policy(reader.track, @intCast(width), @intCast(height)));
+        try plan.picture(@intCast(width), @intCast(height), if (cfg) |value| try policySignal(reader.track, @intCast(width), @intCast(height), value.color) else if (reader.track.codec == .hevc) try hevcPolicy(a, reader.track, @intCast(width), @intCast(height)) else try policy(reader.track, @intCast(width), @intCast(height)));
     }
     return plan;
 }
 
+/// Presentation time of each selected picture, in microseconds from the first
+/// picture. Slots match the slots delivered to a FrameObserver for this sampling.
+pub fn selectedConfiguredPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: Control, configuration: Configuration) ![]i64 {
+    const scope = configuration.inspection_scope orelse return selectedPresentationUs(a, bytes, control, configuration.sampling, configuration.pool);
+    try control.check();
+    _ = try scope.inspect(bytes, null, control, configuration, false);
+    const entry = scope.find(bytes, null, configuration).?;
+    const selected = entry.selected.?;
+    const output = try a.alloc(i64, selected.len);
+    errdefer a.free(output);
+    var first: i64 = std.math.maxInt(i64);
+    if (entry.webm) {
+        for (entry.webm_index.?.pictures) |picture| {
+            try control.check();
+            first = @min(first, picture.pts);
+        }
+        for (selected, output) |id, *value| value.* = @divFloor(entry.webm_index.?.pictures[id].pts - first, 1000);
+    } else {
+        for (entry.reader.packets) |packet| {
+            try control.check();
+            first = @min(first, packet.pts);
+        }
+        for (selected, output) |id, *value| {
+            const ticks = @as(i128, entry.reader.packets[id].pts) - first;
+            value.* = std.math.cast(i64, @divFloor(ticks * std.time.us_per_s, entry.reader.track.timescale)) orelse return error.TimestampOverflow;
+        }
+    }
+    return output;
+}
+
+pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) ![]i64 {
+    const adapter = control.imageWorkControl();
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-timestamps", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
+    if (usesWebmLane(a, bytes)) {
+        var reader = try openWebmLane(a, &source, bytes);
+        defer reader.deinit();
+        var index = try video.webm_pictures.index(a, &reader, webmDecodeOptions(source.control, pool));
+        defer index.deinit();
+        const selected = try selectWebm(a, index, sampling, source.control, null);
+        defer a.free(selected);
+        var first: i64 = std.math.maxInt(i64);
+        for (index.pictures) |picture| first = @min(first, picture.pts);
+        const output = try a.alloc(i64, selected.len);
+        for (selected, output) |id, *value| value.* = @divFloor(index.pictures[id].pts - first, 1000);
+        return output;
+    }
+    var input = try PacketInput.init(a, &source, bytes);
+    defer input.deinit();
+    const selected = try selectWithSampling(a, &input.reader, sampling);
+    defer a.free(selected);
+    var first: i64 = std.math.maxInt(i64);
+    for (input.reader.packets) |packet| first = @min(first, packet.pts);
+    const output = try a.alloc(i64, selected.len);
+    for (selected, output) |id, *value| {
+        const ticks: i128 = input.reader.packets[id].pts - first;
+        value.* = @intCast(@divFloor(ticks * std.time.us_per_s, input.reader.track.timescale));
+    }
+    return output;
+}
 fn selectWebm(a: std.mem.Allocator, index: video.webm_pictures.Index, sampling: Sampling, control: media.source.Control, timeline: ?*const video.sampling.Timeline) ![]usize {
     if (sampling == .reference) return index.select();
     if (timeline) |cached| return switch (sampling) {
@@ -1383,7 +1561,7 @@ pub const Prefetch = struct {
             source.identity = input.reader.input.identity;
             source.limits = input.reader.input.limits;
         }
-        const webm = if (inspection) |owner| owner.webm else self.webm_input != null or (self.packet_reader == null and isWebm(bytes));
+        const webm = if (inspection) |owner| owner.webm else self.webm_input != null or (self.packet_reader == null and usesWebmLane(a, bytes));
         var webm_reader: media.webm.Reader = undefined;
         var reader: media.mp4.Reader = undefined;
         var packet_input: ?PacketInput = null;
@@ -1400,7 +1578,7 @@ pub const Prefetch = struct {
                 reader.input = &source;
             }
         } else if (webm) {
-            webm_reader = if (self.webm_input) |input| input.reader.* else try media.webm.Reader.init(a, &source, .{});
+            webm_reader = if (self.webm_input) |input| input.reader.* else try openWebmLane(a, &source, bytes);
             webm_reader.input = &source;
         } else if (self.packet_reader) |borrowed| {
             source.storage = borrowed.input.storage;
@@ -1413,6 +1591,8 @@ pub const Prefetch = struct {
             reader = packet_input.?.reader;
         }
         defer if (inspection == null and webm and self.webm_input == null) webm_reader.deinit() else if (packet_input) |*input| input.deinit();
+        const normalized_hevc = if (webm) null else try normalizeHevc(a, &reader);
+        defer if (normalized_hevc) |bytes_owned| a.free(bytes_owned);
         var webm_index: ?video.webm_pictures.Index = if (inspection) |owner| owner.webm_index else if (self.webm_input) |input| input.index.* else if (webm) try video.webm_pictures.index(a, &webm_reader, webmDecodeOptions(source.control, pool)) else null;
         if (webm_index) |*index| index.reader = &webm_reader;
         defer if (inspection == null and self.webm_input == null) {
@@ -1883,7 +2063,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         source.identity = input.reader.input.identity;
         source.limits = input.reader.input.limits;
     }
-    const webm = if (inspection) |owner| owner.webm else webm_input != null or (borrowed == null and isWebm(bytes));
+    const webm = if (inspection) |owner| owner.webm else webm_input != null or (borrowed == null and usesWebmLane(a, bytes));
     var webm_reader: media.webm.Reader = undefined;
     var reader: media.mp4.Reader = undefined;
     var packet_input: ?PacketInput = null;
@@ -1900,7 +2080,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
             reader.input = &source;
         }
     } else if (webm) {
-        webm_reader = if (webm_input) |input| input.reader.* else try media.webm.Reader.init(a, &source, .{});
+        webm_reader = if (webm_input) |input| input.reader.* else try openWebmLane(a, &source, bytes);
         webm_reader.input = &source;
     } else if (borrowed) |input| {
         source.storage = input.input.storage;
@@ -1913,6 +2093,8 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         reader = packet_input.?.reader;
     }
     defer if (inspection == null and webm and webm_input == null) webm_reader.deinit() else if (packet_input) |*input| input.deinit();
+    const normalized_hevc = if (webm) null else try normalizeHevc(a, &reader);
+    defer if (normalized_hevc) |bytes_owned| a.free(bytes_owned);
     var webm_index: ?video.webm_pictures.Index = if (inspection) |owner| owner.webm_index else if (webm_input) |input| input.index.* else if (webm) try video.webm_pictures.index(a, &webm_reader, webmDecodeOptions(source.control, pool)) else null;
     if (webm_index) |*index| index.reader = &webm_reader;
     defer if (inspection == null and webm_input == null) {
@@ -2124,6 +2306,18 @@ fn decodeAppleH264(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
     capture.decoder.record(if (batch.hardware) .apple_hardware else .apple_software);
     return true;
 }
+fn decodeAppleHevc(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []const usize, capture: *Capture) !bool {
+    if (!appleAllowed(capture.decoder)) return false;
+    const receipt = video.apple_hevc.decodeTo(a, reader, selected, .{
+        .pool = capture.pool,
+        .device_surfaces = capture.metal != null or capture.observer != null,
+    }, .{ .context = capture, .accept = Capture.publishAppleHevc }) catch |err| {
+        try appleUnavailable(capture, err);
+        return false;
+    };
+    capture.decoder.record(if (receipt.hardware) .apple_hardware else .apple_software);
+    return true;
+}
 fn decodeAppleWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput) !video.apple_webm.Receipt {
     if (input) |bound| if (bound.apple_continuation) |owner| {
         if (try owner.decode(reader, indexed, selected, capture)) |value| return value;
@@ -2163,6 +2357,11 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, requested: [
     var slots: [32]usize = undefined;
     const original_slots = capture.decode_slots;
     defer capture.decode_slots = original_slots;
+    if (reader.track.codec == .hevc) {
+        if (capture.prefetch) |producer| try producer.waitForDecoder();
+        if (try decodeAppleHevc(a, reader, selected, capture)) return;
+        return error.HevcDecoderUnavailable;
+    }
     if (reader.track.codec == .mjpeg) {
         if (capture.prefetch) |producer| try producer.waitForDecoder();
         if (capture.decoder.policy == .apple) return error.UnsupportedVideoProfile;
@@ -2914,6 +3113,21 @@ const Capture = struct {
             if (self.resident == null) @memcpy(self.output[slot * 140 * 512 ..][0..n], self.output[first * 140 * 512 ..][0..n]);
             self.frame_tokens[slot] = self.frame_tokens[first];
         };
+    }
+    fn publishAppleHevc(raw: *anyopaque, id: usize, surface: *const video.apple.Surface) !void {
+        const self: *Capture = @ptrCast(@alignCast(raw));
+        self.apple_published += 1;
+        const slot = std.mem.indexOfScalar(usize, self.selected, id) orelse return error.InvalidPacketIndex;
+        if (self.copyDuplicate(slot)) return;
+        var options = try hevcPolicy(self.a, self.track, surface.width, surface.height);
+        options.admission_pool = self.pool;
+        if (try self.observe(slot, .{ .surface = surface }, options)) return;
+        if (self.metal) |metal| {
+            const prepared = try metal.submit(self.a, surface, options, self.control);
+            return self.projectGpu(slot, prepared, options);
+        }
+        const patches = try video.preparation.reference(self.a, surface, options, self.control);
+        try self.projectOwned(slot, patches, options, self.a);
     }
     fn publishDecoded(raw: *anyopaque, slot: usize, frame: *const video.h264.Frame) !void {
         const self: *Capture = @ptrCast(@alignCast(raw));
@@ -4500,6 +4714,16 @@ test "embeddinggemma2 video cache admission removes only pinned unique preparati
     try std.testing.expect(try partial.deviceBytes() < try original.deviceBytes());
     for (original.picture_indexes[0..original.pictures]) |id| cache.storeCpu(.{ .clip = hash, .picture = @intCast(id) }, &values, 1);
     const cached = try inspectConfiguredPlan(a, bytes, null, .{}, configuration, true);
+    var fixed_miss_cache = FrameCache{ .allocator = a, .session = session };
+    defer fixed_miss_cache.deinit();
+    var fixed_miss_pins = CachePins{ .cache = &fixed_miss_cache };
+    defer fixed_miss_pins.deinit();
+    var fixed_plan = original;
+    fixed_plan.apple_surface_bytes = 25 * 4096;
+    fixed_plan.apple_surfaces_fixed = true;
+    try std.testing.expectEqual(@as(usize, 0), (try pinCachedPlan(fixed_plan, bytes, null, .{}, configuration)).apple_surface_bytes);
+    const fixed_miss = try pinCachedPlan(fixed_plan, bytes, null, .{}, .{ .sampling = sampling, .cache_pins = &fixed_miss_pins });
+    try std.testing.expectEqual(fixed_plan.apple_surface_bytes, fixed_miss.apple_surface_bytes);
     var decoder_plan = original;
     decoder_plan.apple_surface_bytes = (original.pictures + 24) * 4096;
     const pinned_decoder = try pinCachedPlan(decoder_plan, bytes, null, .{}, configuration);
@@ -5503,4 +5727,80 @@ test "model aware media frame observer shares original decoder surfaces before m
         try std.testing.expectEqual(@as(usize, 1), observer.calls);
         try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
     }
+}
+
+test "HEVC borrowed readers and inspection scopes share active SPS geometry" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/codecs/hevc-multi-sps.mp4");
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "borrowed-multi-sps" };
+    var reader = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
+    defer reader.deinit();
+    const initial = reader.track.codec_config;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    const expected = try inspectPlan(a, bytes, .{}, .reference, &pool, true);
+    const borrowed = try inspectReaderPlan(a, &reader, .{}, .reference, &pool, true);
+    try std.testing.expectEqual(expected.sequence_tokens, borrowed.sequence_tokens);
+    try std.testing.expectEqual(expected.patch_output_bytes, borrowed.patch_output_bytes);
+    var scope = InspectionScope{ .allocator = a };
+    defer scope.deinit();
+    const scoped = try scope.inspect(bytes, &reader, .{}, .{}, true);
+    try std.testing.expectEqual(expected.patch_output_bytes, scoped.patch_output_bytes);
+    try std.testing.expect(scope.entries[0].?.reader.track.hevc_policy_validated);
+    try std.testing.expectEqual(@as(u32, 2), (try video.hevc_config.parse(a, scope.entries[0].?.reader.track.codec_config)).?.sar.horizontal);
+    // Borrowed metadata and ownership belong to the caller, never to the scope.
+    try std.testing.expectEqual(initial.ptr, reader.track.codec_config.ptr);
+    try std.testing.expect(!reader.track.hevc_policy_validated);
+}
+
+test "video inspection shares timestamps and decode metadata and honors cancellation" {
+    const a = std.testing.allocator;
+    inline for (.{ "hevc-multi-sps.mp4", "av1.mp4", "h264.mp4" }) |name| {
+        const bytes = @embedFile("../testdata/video/codecs/" ++ name);
+        var scope = InspectionScope{ .allocator = a };
+        defer scope.deinit();
+        const configuration = Configuration{ .inspection_scope = &scope, .sampling = .{ .timestamps = .{} } };
+        const expected = try selectedPresentationUs(a, bytes, .{}, configuration.sampling, null);
+        defer a.free(expected);
+        const actual = try selectedConfiguredPresentationUs(a, bytes, .{}, configuration);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(i64, expected, actual);
+        const entry = scope.find(bytes, null, configuration).?;
+        const reads = entry.source.reads;
+        const retained = scope.retainedBytes();
+        const again = try selectedConfiguredPresentationUs(a, bytes, .{}, configuration);
+        defer a.free(again);
+        try std.testing.expectEqualSlices(i64, actual, again);
+        try std.testing.expectEqual(@as(usize, 1), scope.count);
+        try std.testing.expectEqual(reads, entry.source.reads);
+        try std.testing.expectEqual(retained, scope.retainedBytes());
+        if (!std.mem.startsWith(u8, name, "hevc") or @import("builtin").os.tag == .macos) {
+            const Count = struct {
+                frames: usize = 0,
+                fn accept(raw: *anyopaque, _: usize, _: video.preparation.BorrowedFrame, _: video.preparation.Options, _: media.source.Control) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.frames += 1;
+                }
+            };
+            var count: Count = .{};
+            var observed = configuration;
+            observed.observer = .{ .context = &count, .accept = Count.accept };
+            try observeConfigured(a, bytes, null, .{}, observed);
+            try std.testing.expectEqual(actual.len, count.frames);
+            try std.testing.expectEqual(@as(usize, 1), scope.count);
+            try std.testing.expectEqual(reads, entry.source.reads);
+        }
+        try std.testing.expectError(error.Timeout, selectedConfiguredPresentationUs(a, bytes, .{ .deadline_ns = 0 }, configuration));
+    }
+    var cancelled = InspectionScope{ .allocator = a };
+    defer cancelled.deinit();
+    try std.testing.expectError(error.Timeout, selectedConfiguredPresentationUs(a, @embedFile("../testdata/video/codecs/hevc-multi-sps.mp4"), .{ .deadline_ns = 0 }, .{ .inspection_scope = &cancelled }));
+    try std.testing.expectEqual(@as(usize, 0), cancelled.count);
+    var bounded = InspectionScope{ .allocator = a, .limit = 1 };
+    defer bounded.deinit();
+    const result = selectedConfiguredPresentationUs(a, @embedFile("../testdata/video/codecs/hevc-multi-sps.mp4"), .{}, .{ .inspection_scope = &bounded });
+    if (result) |unexpected| {
+        a.free(unexpected);
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expect(err == error.ResourceLimitExceeded or err == error.OutOfMemory or err == error.SharedAdmissionExceeded);
+    try std.testing.expectEqual(@as(usize, 0), bounded.count);
 }

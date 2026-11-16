@@ -32,7 +32,11 @@ pub const Artifact = struct {
 pub fn add(b: *std.Build, options: std.Build.TestOptions) Artifact {
     var object_options = options;
     object_options.use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(options.root_module.resolved_target.?.result);
-    object_options.max_rss = @import("runtime_memory.zig").testCompileMaxRss(options.name, b.graph.host.result, options.root_module.resolved_target.?.result, options.root_module.optimize, options.max_rss);
+    // Only default closures match the measured stripped profile. A caller's
+    // compile filter can expand the selected surface (not merely narrow it).
+    const stripped_default_selection = (options.root_module.strip orelse false) and
+        @import("../../../build_support/antfly/test_support.zig").selectTestFilters(b, &.{}).len == 0;
+    object_options.max_rss = @import("runtime_memory.zig").linkedTestCompileMaxRss(options.name, b.graph.host.result, options.root_module.resolved_target.?.result, options.root_module.optimize, stripped_default_selection, options.max_rss);
     object_options.emit_object = true;
     object_options.test_runner = options.test_runner orelse .{
         .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
@@ -47,6 +51,13 @@ pub fn add(b: *std.Build, options: std.Build.TestOptions) Artifact {
     var clones = std.AutoHashMap(*std.Build.Module, *std.Build.Module).init(b.allocator);
     object_options.root_module = splitNativeSources(b, options.root_module, module, options.name, &clones);
     const object = b.addTest(object_options);
+    if (options.root_module.resolved_target.?.result.os.tag == .macos) {
+        // The system final link supplies these runtimes. Bundling them here
+        // forces an intermediate Mach-O -r link, which can leave runtime data
+        // initializers (including stderr's writer vtable) invalid in optimized objects.
+        object.bundle_compiler_rt = false;
+        object.bundle_ubsan_rt = false;
+    }
     module.addObject(object);
     const executable = b.addExecutable(.{ .name = options.name, .root_module = module, .use_llvm = object_options.use_llvm });
     return .{ .object = object, .executable = executable };
@@ -137,6 +148,12 @@ fn splitNativeSources(
     native_module.optimize = original.optimize orelse final.optimize;
     for (original.link_objects.items) |link| switch (link) {
         .c_source_file, .c_source_files, .assembly_file => native_module.link_objects.append(b.allocator, link) catch @panic("OOM"),
+        .other_step, .static_path => {
+            if (final.resolved_target.?.result.os.tag == .macos)
+                final.link_objects.append(b.allocator, link) catch @panic("OOM")
+            else
+                copy.link_objects.append(b.allocator, link) catch @panic("OOM");
+        },
         else => copy.link_objects.append(b.allocator, link) catch @panic("OOM"),
     };
     if (native_module.link_objects.items.len != 0) {

@@ -21,9 +21,11 @@ from __future__ import annotations
 import argparse
 import glob
 import hashlib
+from http.client import HTTPException
 import json
 import mimetypes
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError
@@ -38,6 +40,44 @@ UPLOAD_BASE = "https://uploads.github.com"
 
 class GitHubError(RuntimeError):
     pass
+
+
+def read_response(request: Request) -> bytes:
+    """Retry interrupted reads, never replay a possibly committed mutation."""
+    method = request.get_method()
+    attempts = 3 if method == "GET" else 1
+    for attempt in range(attempts):
+        delay = 2**attempt
+        try:
+            with urlopen(request, timeout=60) as response:
+                return response.read()
+        except HTTPError as exc:
+            retryable = exc.code in {408, 429, 500, 502, 503, 504}
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            if retry_after is not None:
+                try:
+                    delay = max(delay, float(retry_after))
+                except ValueError:
+                    pass
+            if retryable and attempt + 1 < attempts and delay <= 30:
+                exc.close()
+                time.sleep(delay)
+                continue
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except (HTTPException, OSError):
+                detail = exc.reason
+            raise GitHubError(
+                f"{method} {request.full_url} failed with {exc.code}: {detail}"
+            ) from exc
+        except (HTTPException, OSError) as exc:
+            if attempt + 1 < attempts:
+                time.sleep(delay)
+                continue
+            raise GitHubError(
+                f"{method} {request.full_url} transport failed after {attempts} attempt(s): {exc}"
+            ) from exc
+    raise AssertionError("request attempts exhausted")
 
 
 def request_json(
@@ -59,12 +99,7 @@ def request_json(
         data = json.dumps(body).encode("utf-8")
         merged_headers["Content-Type"] = "application/json"
     req = Request(url, data=data, headers=merged_headers, method=method)
-    try:
-        with urlopen(req) as resp:
-            payload = resp.read()
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise GitHubError(f"{method} {url} failed with {exc.code}: {detail}") from exc
+    payload = read_response(req)
     if not payload:
         return None
     return json.loads(payload)
@@ -84,12 +119,7 @@ def request_bytes(
         },
         method=method,
     )
-    try:
-        with urlopen(req) as resp:
-            return json.loads(resp.read())
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise GitHubError(f"{method} {url} failed with {exc.code}: {detail}") from exc
+    return json.loads(read_response(req))
 
 
 def download_bytes(url: str, token: str) -> bytes:
@@ -101,12 +131,7 @@ def download_bytes(url: str, token: str) -> bytes:
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    try:
-        with urlopen(req) as resp:
-            return resp.read()
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise GitHubError(f"GET {url} failed with {exc.code}: {detail}") from exc
+    return read_response(req)
 
 
 def github_api(
@@ -449,9 +474,19 @@ def main() -> int:
             args.immutable_assets,
             args.repair_assets,
         )
-        refreshed = get_release_by_tag(args.repo, args.tag, token)
-        if refreshed is not None:
-            release = with_complete_assets(args.repo, refreshed, token)
+    # Payload names are unique, so uploads do not require a refreshed inventory
+    # before processing the next name. Refresh once by the identity we own;
+    # draft tag lookups can return 404 and force repository-wide release scans.
+    refreshed = github_api("GET", args.repo, f"/releases/{release['id']}", token)
+    if not isinstance(refreshed, dict) or (
+        refreshed.get("id") != release["id"] or refreshed.get("tag_name") != args.tag
+    ):
+        raise GitHubError("GitHub release identity changed during asset upload")
+    refreshed = with_complete_assets(args.repo, refreshed, token)
+    if args.exact_assets:
+        actual_names = {asset.get("name") for asset in refreshed["assets"]}
+        if actual_names != {asset.name for asset in assets}:
+            raise GitHubError("GitHub release asset inventory differs after upload")
     return 0
 
 

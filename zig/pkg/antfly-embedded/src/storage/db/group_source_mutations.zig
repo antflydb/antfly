@@ -174,7 +174,7 @@ pub const Overlay = struct {
     pub fn sourceSettled(self: *Overlay, document: []const u8) !bool {
         const authority = (try @import("artifact_publication.zig").authority(self)) orelse return self.legacy_completion;
         const obligations = @import("artifact_producer_obligations.zig");
-        const progress = (try obligations.load(self)) orelse return false;
+        const progress = (try obligations.loadMetadata(self)) orelse return false;
         try progress.requireAuthority(authority);
         if (!progress.baseline_complete) return false;
         return @import("artifact_completion_progress.zig").groupReady(self.allocator, self, self.completion_root, document);

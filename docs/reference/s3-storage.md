@@ -134,9 +134,12 @@ GCS connections also support per-lane buckets, prefixes, credentials, custom
 JSON API endpoints, and `bucket_provisioning`, just like S3 connections.
 
 Primary-storage credentials grant database write authority. Keep them separate
-from `remote_content.s3`, which grants read access to customer-provided objects
-for template helpers. Several named remote-content credentials may select
-different buckets without gaining access to Antfly's durable state.
+from source-reading credentials. S3 template reads use `remote_content.s3`.
+Native `gs://` artifact reads use a named GCS external-I/O connection with an
+explicit `content.fetch` capability and a source-only bucket/prefix scope.
+See [private GCS source artifacts](../guides/artifact-indexes.mdx#private-gcs-source-artifacts)
+for generation-pinned URLs and Workload Identity configuration. Neither source
+reader needs access to Antfly's durable state.
 
 ## Bucket provisioning
 

@@ -1,0 +1,8 @@
+**
+!LICENSE
+!examples/
+!examples/hackernews/
+!examples/hackernews/serve.py
+!examples/hackernews/managed_api.py
+!examples/hackernews/web/
+!examples/hackernews/web/**

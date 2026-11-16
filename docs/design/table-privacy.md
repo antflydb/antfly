@@ -1,0 +1,1238 @@
+# Table privacy implementation
+
+Implements the table-scoped **Privacy** design in
+[issue #1401](https://github.com/antflydb/antfly/issues/1401). The user-facing
+contract and examples are in [Table privacy](../reference/table-privacy.md).
+The branch starts at `f2b3baaee1cb508005451843c17fa07f2e069d4b`.
+Main is merged through `93d85e2b476069cc5976e92cb1a7b3abd4a8f406`; privacy uses metadata protocol version 82.
+
+## Policy and user experience
+
+The six `/db/v1/tables/{table}/privacy` operations are declared in
+`specs/openapi/antfly/privacy.yaml`, implemented in `api/privacy.zig`, and
+included in the Go, Python, Rust and TypeScript generated SDKs. TypeScript also
+exposes `client.privacy` with ETag handling, typed errors, cancellation and
+bounded JSON responses.
+
+The Privacy tab provides selected fields, category groups and custom category
+definitions, sensitivity and per-category thresholds, replacement style,
+artifact-compatible producer configuration, explicit sample keys, UTF-8 span
+highlights, external-processing disclosure, and false-positive threshold tuning.
+Protective saves require a fresh preview and an availability acknowledgment.
+Policy adoption is independent of scan-status availability. Policy and scan
+polling run separately, with one outstanding request per poller, cancellation
+on scope changes, and automatic recovery of scan errors. An accepted save
+adopts its reply without an additional policy GET.
+The editor pins the ETag of its loaded policy. Status polling never advances
+that save precondition; explicit reload adopts a concurrent policy and clears
+the previous preview/availability acknowledgment. Coverage and findings
+distinguish unknown, pending, failed and successfully
+inspected documents; the interface says “No findings detected.”
+
+Policies use the artifact API's extractor/generated-extractor/generator
+configuration model. Custom revisions are mandatory. Credentials remain
+references or environment defaults; literal secrets are rejected. The default
+native PII checkpoint is pinned at
+`1cb4166094dc58fa8d836429f060d6c95f62b495`. Preview, backfill and new writes
+use the same validated producer contract.
+
+PUT installs policy, managed producer graph and protected consumers in one
+metadata definition CAS. Exact ETag/If-Match protects replacement. Canonical
+policy identity includes fields, resolved categories/thresholds, mode,
+replacement and producer identity. Batch/retry tuning is stored separately
+from producer identity and does not invalidate accepted inspections. Scan
+progress is excluded from owner configuration comparisons so advancing a job
+cannot restart producer workers.
+
+`redact_before_storage` returns typed 422
+`privacy_synchronous_ingestion_required`. No asynchronous path claims to erase
+original values before persistence. Protected document tables reject unsupported
+relational/graph consumers, external authored vectors, and unsupported source
+chains during admission. Index/enrichment mutation cannot bypass the managed
+graph while protection is active.
+
+## Inspection and publication
+
+`privacy/contract.zig`, `inspection.zig`, `document.zig` and `materialize.zig`
+validate half-open UTF-8 source spans, optional confidence, category identity,
+complete source fingerprints and per-field receipts. Invalid or missing evidence
+is a failure, never an empty successful scan. Redaction replaces the union of
+accepted overlapping spans. Durable findings omit matched values.
+
+Compatible short inputs batch across documents and fields. The default native
+long-document route uses overlapping source windows, exact composed tokenizer
+admission of at most 512 prepared tokens, at most 64 windows per document,
+source-offset rebasing and deduplication. Compatible windows use physical
+Metal/CUDA batches up to eight; CPU remains serial. Detector windows never
+become search chunks.
+
+Protected roots and descendant producer identities include the immutable policy
+version. A stable input-free guard fences policy replacement. Default and named
+text/vector consumers are rewritten together; chunking and embedding consume
+the sanitized projection. Ordered chunk completion admits privacy document
+roots through their accepted manifests, including inherited source guards.
+A current owner-accepted chunk-vector stream closure releases its replay request;
+document and physical projection obligations retain independent completion
+witnesses. Private inspection receipts are stripped before
+ordinary downstream producers and public document hydration.
+
+A provider response cannot authorize serving. Replicated owners require accepted
+ordered publication provenance, including current primary/derived input guards
+and output revision witnesses. Privacy backfill admits the native artifact
+catalog and activates its epoch through the routed Raft owner before scheduling
+producer work. Standalone owners commit storage-owned local witnesses atomically
+with artifact bytes; those witnesses bind source, policy and output and are
+never accepted on a replicated owner. After ordered publication owns vector
+sources, retiring an ANN consumer reclaims index metadata while retaining the
+source artifacts. Existing retirement jobs recover under the same ownership
+rule, so restoring original consumers after a switch to monitoring can rebuild
+without unordered source deletion. Document deletion also retires local
+witnesses for every previous policy generation. Retry admission writes an
+owner-local sequence floor atomically with its durable work record; coverage
+ignores a terminal failure from an older attempt, even if its worker finishes
+after the retry was queued. New terminal failures retain their attempt identity.
+
+Point reads, scans, filtering, hydration, stored search callbacks, text planning
+statistics and AI source loading enforce current projection evidence. Search
+additionally fences producer completion and physical index checkpoints at one
+apply-shared cut before candidates and statistics are observed. Pending, stale
+and failed content cannot influence protected results. Readiness is deliberately
+conservative across the table's managed consumers: search may be unavailable
+until the affected generation is complete.
+
+Receivers independently capture fresh metadata policy fences, including requests
+from older coordinators. Internal lookup/query/scan/statistics protocols carry
+policy assertions and require matching receiver acknowledgments before exposing
+results. Missing or mismatched acknowledgment fails retryably. Document SQL
+uses retained owner snapshots and projects current sanitized artifacts before
+predicates and column projection; remote cursor creation carries the same
+policy assertion and acknowledgment. SQL mutations and delayed serializable
+snapshots on protected tables fail with an unsupported response. This avoids
+using a sanitized preimage to overwrite an original document. Ordinary batch
+writes preserve originals and enqueue the new source revision. Opaque retained
+query paths and relational storage remain unsupported. Public request flags cannot
+authorize original access. Privacy operations and original artifact inspection
+require table administration permission when access control is enabled.
+
+The rollout requires the new metadata decoder and data-store privacy protocol;
+older data stores cannot register into a privacy-enabled fleet. Distributed
+admission also requires a dedicated internal-service signing identity.
+
+## Jobs and coverage
+
+Backfill discovery streams original identifiers and queues ordinary generated
+asset references directly. It does not retain complete source pages or map
+source documents before admission. Each page has a 1,000-row maximum and an
+8 MiB budget for owned identifiers, producer names and reference storage; one
+oversized identifier may advance alone. A page ending exactly at its ceiling
+may require an empty follow-up page to establish EOF. Source capture, mapping
+and detector admission remain owned by ordinary replay, with the same durable
+retry floors and publication requirements.
+
+Automatic and explicit scans retain durable identities, bounded cursors,
+per-shard progress, failures and transport backoff in metadata. The metadata
+leader's supervisor owns distributed scans; standalone uses its local catalog
+authority. Every progress acknowledgment rechecks leadership term and the exact
+prior table definition. Each scheduling quantum retains the exact oldest
+runnable scan and table, allowing bounded retries to progress alongside a
+full-table backfill. Scan retention preserves every active job and retires only
+terminal or superseded jobs; a full set of 16 active jobs applies HTTP 409
+backpressure without changing scan identity or sequence.
+
+Backfill queues ordinary producer work without rewriting primary documents or
+renewing TTLs. `processing` verifies current receipts and consumer publication
+before success. Verification uses bounded resumable census pages. Public coverage is collected
+independently in durable bounded pages by the same fair leader-owned scheduler;
+GET status never opens data shards. The latest complete result remains visible
+with observation-interval timestamps while another census runs. Unavailable
+pages retain their cursor and reduce their page size, and policy replacement
+resets coverage. These asynchronous observations never authorize protected reads. Source-bound
+terminal failure markers are separate from clean receipts; source changes
+invalidate them, and explicit scans can retry after provider recovery.
+An ordered primary deletion closes generated-output requirements only when the
+document's complete artifact directory is empty. Completion remains bound to
+the materialization snapshot, so orphaned outputs keep work pending and a
+resurrected document invalidates the old deletion witness.
+Retired producer generation heads and clocks are metadata beside that output
+directory and do not block deletion completion. Standalone audits each new
+catalog generation after producer replay becomes idle, handing late consumer
+receipt gaps to the existing paged recovery jobs.
+Primary deletion retires both asset and embedding rerun targets along with
+outputs, including targets whose provider never created an artifact. Managed
+dense generators may repeat their own output name on the consumer config;
+ordered publication rejects a consumer name that selects another output.
+An accepted base-vector result for an older primary input is a cache miss for
+a freshly captured source. The current-input recheck still rejects stale
+tokens; delayed old publications cannot overwrite the replacement output.
+
+Coverage reports total/current/pending/known-failed documents, documents with
+findings, category/field counts and protected-ready/blocked counts. Census rows carry
+status only, without original values. Parse scratch is released per row and
+failure details are bounded. An incomplete or unavailable census yields null
+counts. Findings pagination binds policy and filters and handles resumes within
+a document; missing/deleted documents contribute no current findings.
+Findings offer equivalent GET query and POST JSON-body forms. TypeScript SDK/UI clients use
+POST so a continuation can carry any admitted document identifier without the
+HTTP request-line limit. Versioned binary cursors avoid JSON-escape growth;
+issuance and decoding share a bound derived from the document-write budget.
+The findings POST body allowance covers that cursor plus document/field filters,
+while other endpoint limits remain unchanged. Legacy JSON cursors remain readable.
+Large internal lookup and manifest keys use a private document-read POST with
+base64 key bytes, preserving binary namespaces without URL or JSON escaping
+amplification. Short keys retain legacy GET compatibility. Body and response
+budgets derive from the admitted document size and apply only to the relevant
+endpoints; native and linked-kernel registrars use the same body limits. Lookup
+controls, service-identity checks, policy acknowledgments, deadlines and read
+consistency follow the same handler as the GET form.
+Coverage status rows admit a maximum document ID plus its bounded status
+envelope and are parsed once into per-row scratch. Failure counts include every
+observed failure; examples retain at most 100 entries and 1 MiB of encoded JSON
+across pages, so unusually large IDs cannot inflate the durable failure list.
+Findings retain the ordinary 8 MiB page budget with one oversized-entry
+allowance; the TypeScript SDK accounts separately for that entry, escaped key,
+producer revision and continuation instead of imposing its generic response cap.
+
+Ordered producer commands account for document identities separately from the
+64 MiB artifact-value budget. Baseline, validation, completion and readiness
+cursors share the admitted-key limit. Unit-worker directory probes, persisted
+unit jobs and chunk scan/retirement cursors use that same limit; producer and
+child names retain their separate smaller budget. Scan progress stores either
+the shard resumes or a legacy global cursor, avoiding duplicate large keys;
+an empty shard list correctly falls back to the legacy cursor. Public scan
+status omits range bounds and every cursor, keeping polling responses small
+while native continuations remain durable. Keys over 4 KiB, and literal keys
+with the reserved reference prefix, are stored as immutable, SHA-256-verified
+generations in metadata job state. The catalog contains only small references;
+workers hydrate only the selected scan or census cursor. Existing raw-key
+catalogs migrate on their next write. A standalone definition CAS sends an
+exact digest of the previous indexes instead of duplicating the legacy payload.
+
+Checkpoint uploads use 256 KiB chunks and a per-table 256 MiB staging quota.
+Completed uploads are reused across catalog CAS retries, so contention cannot
+repeatedly upload the same range key or consume staging quota for each attempt.
+The metadata writer verifies all chunks before marking a generation ready, then
+atomically attaches references with the table update and releases staging quota.
+Unattached generations expire after one hour. The leader collects unreferenced
+generations, including those left by deleted tables or failed uploads, in
+transactions deleting at most eight chunks. Every deletion rechecks current
+catalog references in the same writer transaction; generation identities are
+never reused. Snapshot recovery includes chunks, manifests and deletion progress.
+Protocol version 80 is required on metadata and data nodes. Data coordinators
+forward policy and scan mutations to the metadata owner, preserving preconditions,
+request controls and ambiguous outcomes without replaying scan admission.
+Forwarded mutations retain accepted or ambiguous outcomes across transport
+reply failures, owned body/ETag copies, data-node handoff and processing
+disclosure updates. A shared observation boundary converts post-acceptance
+failures into `MetadataMutationOutcomeUnknown`; definite rejection retains its
+error identity. Request delivery telemetry distinguishes unsent failures from
+response-less failures that may follow admission. These guards add no RPCs,
+response copies or replay loops.
+The compiled metadata registrar exposes exactly the two authenticated privacy
+control routes. They opt into the public 64 MiB request allowance through a
+separate route ceiling in the HTTP parser; ordinary metadata routes retain their
+32 MiB fallback limit. Buffered-body accounting covers one full opted-in request.
+Ordinary pages keep their small work quantum; one oversized identity can advance
+a page without starving forever.
+Large control commands borrow bounded shared staging capacity while small
+controls retain reserved headroom. Upload chunks remain 1 MiB. Progress records
+preserve APP1 encoding through 128 chunks and use APP2 above that boundary.
+Pending baseline commands coalesce per owner until apply; a changing observed
+Raft watermark cannot fill the queue with repeated large upper bounds. Full-text
+rebuild cursors use the same admitted identity limit. Standalone catalog updates
+use compact UTF-8 text with a binary-safe fallback on the process-local transport;
+canonical command encoding remains unchanged. Unavailable census pages retain
+null counts and reduce the work quantum without advancing their cursor. The
+census yields at a complete row boundary after its soft work quantum and commits
+that validated prefix with a continuation. Routing/setup and one oversized row
+have a separate bounded hard deadline; caller deadlines still take precedence.
+Completed rows preceding a hard timeout also form a resumable prefix, while an
+incomplete row is discarded and retried. Storage compares long binary key
+prefixes in vector-sized chunks. Snappy match extension uses the same exact
+vectorized prefix comparison, full-width copy tags use bulk repetition, and
+overlap expansion uses bulk copies (with a single-byte repeat fast path).
+Differential tests retain byte-identical compressed output. Ordering and encoded
+formats remain unchanged, avoiding scalar byte loops during large-key SST
+reads/compaction.
+Ordered Raft receipt preflight, document commit, artifact publication, catalog
+installation and upload staging use nonblocking apply admission. Storage reports
+the existing stable `WriterLocked` identity; the server adapter normalizes it to
+Raft deferral, whose retry identity also survives the outer compiled owner ABI.
+Contention defers the committed entry so its owner releases the Raft progress
+lock before retrying; the receipt is rechecked under the mutation fence. This
+prevents an apply reader waiting for quorum progress from cycling with a Raft
+owner waiting for exclusive apply admission.
+Producer-readiness scans retain disposable snapshots outside apply. Their short
+counter/revision transactions share primary mutation admission, preventing lost
+read-modify-write updates between background settlement and new enrollment.
+The v2 derived-summary namespace rebuilds older potentially undercounted caches
+from durable obligations and publication witnesses. Legacy summaries retire in
+bounded pages, with one oversized identity allowed to advance each page.
+Enrollment and serving-status checks read a compact descriptor and point
+counters. A separate root-scoped revision counter avoids rewriting large scan
+checkpoints per document; only background checkpoint progress persists cursor
+bytes. The enrollment descriptor has an independent small size/shape bound.
+Durable producer obligations similarly separate a fixed 122-byte count/revision
+record from the potentially large baseline cursor. Legacy APO2 records migrate
+atomically on the first write; APO3 checkpoints require the new metadata and
+older readers reject the new format rather than trusting stale counts.
+Internal publication batches also use compact UTF-8 identities with a binary
+fallback; the canonical command writer/digest and legacy JSON decoder remain
+compatible. Publication decoding budgets identities separately from values.
+Raft checkpoint byte targets amortize against the prior retained-log image,
+avoiding a full-log rewrite for every large control entry. The configured
+replay-record limit and durable Ready append/watermark ordering remain intact;
+recovery restores the prior image-size estimate from its checkpoint.
+The raw apply store syncs each commit to the WAL and batches SST publication at
+8 MiB with a bounded 64 MiB deferred queue and 32 MiB flush windows. Shared
+background maintenance keeps compaction off the Raft progress worker when
+capacity is available; bounded foreground assistance remains for pressure.
+Compaction domains separate mutable metadata from append-only command history.
+Read-only inspection replays durable WAL state before writer shutdown, and
+reopen retains exact replay/conflict detection.
+
+Background work selection uses one ordered due entry per privacy-enabled table.
+Standalone maintains a replaceable in-memory tree rebuilt by catalog replay;
+Raft maintains forward/reverse scheduling hints in the existing derived catalog
+indexes, atomically with table CAS writes. Snapshot restore and index migration
+rebuild those hints from durable scan/coverage state. Selection reads one due
+entry and its table, then checks local leadership and rechecks the term before
+persisting progress. No page enumerates the entire administrative catalog.
+Progress-only table CAS updates use an explicit runtime-field allowlist
+(`coverage`, `scans`, `scan_id`, `scan_sequence`). Every other table, index,
+and policy field must remain identical. The authoritative row, schema digest,
+and due index commit atomically without a semantic catalog notification or
+revision change. Unconditional reconciliation upserts retain the durable
+privacy resource and reject stale policy bindings, so a cached semantic catalog
+cannot rewind job progress. Remote data APIs fetch current physical table records
+through a linearizable private catalog point read; progress never depends on a
+cached administrative/routing snapshot. Definition-CAS ingress also checks this
+current row through a shared validator. Runtime-only admission uses that point
+read and the allowlist, bypassing catalog-wide ownership validation and extra
+reconciliation rounds. Authored changes retain ordinary admission. Policy installation is acknowledged by its immutable
+resource version even if worker progress has already advanced. Standalone advances its durability revision while retaining
+routing and join-planning generations, including allocation-free rollback of
+the existing due node. Policy changes retain ordinary catalog publication.
+If a worker advances the row between policy admission and Raft apply, the
+rejected authored CAS records its command digest and exact term/index in the
+existing bounded per-table rejection slot. Successful or rejected runtime
+progress cannot overwrite that receipt. The policy endpoint can then retry a
+known rejection; a superseded or missing receipt remains an unknown outcome.
+This preserves the full-record CAS boundary without creating an unbounded
+per-command history or adding a wire command.
+Bounded-range verification pages shrink after an unavailable two-second read
+and persist the learned size, cursor and accumulated evidence together. Full-table
+jobs share the durable coverage census, accepting only a completed pass started
+strictly after the job entered verification. Active jobs do not multiply the
+shard-wide census workload; protected completion still requires serving readiness.
+Readiness probes have a two-second execution budget. Routing, transport and
+readiness failures persist bounded backoff without marking inspection failed;
+the table advances its due entry so other tables can run. Publication still
+rechecks metadata authority and term before that progress can commit.
+An idle producer watermark and completed discovery cursor cannot discharge
+missing consumer publication receipts. The coverage audit re-arms the same
+durable source-discovery job using a control-revision CAS; its existing bounded
+pages restore proof without replacing the physical generation. Pending replay,
+paused jobs, known terminal producer debt, concurrent handoffs, and active
+candidate construction retain their existing owner boundaries. Aggregate
+failure receipts also suppress rediscovery when legacy per-source receipts are
+absent, preventing terminal failures from becoming repeated inference work.
+
+Policy PUT acknowledges a logical resource version, independently of mutable
+job JSON. A bounded CAS retry recomposes against current progress while
+preserving the caller's exact policy ETag precondition. Executable policy
+normalization sorts selected fields, resolves category groups/thresholds and
+canonicalizes producer configuration before deriving managed enrichments.
+Validation bounds the resolved union of group and explicit categories to 128,
+so authored and canonical executable policies obey the same admission limit.
+Finding deduplication uses a hash index preserving first-seen order and maximum
+confidence across repeated field/window evidence, with expected linear cost.
+
+Findings enumeration streams identifiers and stops at 50 IDs or 8 MiB of
+encoded ID rows, allowing one oversized ID. Independent line scratch is released
+before manifest/source reads; enumeration never materializes an entire large-ID
+page before applying its budget. Manifest reads propagate request deadlines and
+cancellation through routing, compiled owners, read-index admission and the
+private HTTP POST, whose remaining budget is enforced again at the receiver.
+A per-document arena holds the manifest, authoritative source and validation scratch; only accepted findings
+survive into the response arena. Inspection and output each have an 8 MiB page
+budget, with one complete document admitted before inspection yields. The
+continuation includes the next unexamined document or finding ordinal, bound
+to the policy and filters, including pages with zero accepted findings.
+The storage scanner borrows plain document bytes for the duration of each
+callback, including ID-only and hash-only scans. Privacy projection scratch
+uses an independently backed row arena reused between callbacks; retained
+response allocations cannot pin whole-document temporary copies.
+Scratch backing uses the platform allocator's arena-unwrapping helper, retaining
+allocation accounting and failure injection beneath request arenas.
+
+Managed inspection shares one validated policy/normalizer across its field
+cohort. Physical batches retain only normalized, source-bound field evidence;
+provider envelopes and arbitrary extra response fields are released per batch.
+Composition uses the same inspector for serial and batched execution. The host
+memory plan covers logical output retention plus the largest physical field
+batch, including configuration and field-control overhead. Admission parses
+one document at a time in reclaimable scratch rather than retaining a DOM for
+every document within its resolution budget. A scratch allocator unwraps arenas
+while preserving every nested invocation quota; temporary frees
+therefore release actual backing memory even when results are interleaved.
+
+Detector evidence, normalized field text and final document projections have
+separate bounds. Normalized text may retain the source-sized selected values;
+composition also preserves unselected fields. The host's logical-result bound
+is three source byte lengths plus twice the producer evidence allowance and a
+512-byte envelope. Admission charges the actual source sum across the cohort
+and independently accounts for normalized receipts retained alongside final
+results; one large source never multiplies every sibling's reservation. Checked
+arithmetic fails closed on overflow. The underlying producer's result limits
+continue to bound raw detector output on every call.
+
+Dependency priming consults the same incarnation-, source- and definition-bound
+retry tickets as ordinary document replay. Its healthy path does one indexed
+lookup without reading primary bytes. It publishes successful siblings and
+allows durably parked provider failures to yield; control, publication and
+worker failures still stop the quantum. Ordinary replay reloads delayed roots
+after priming, so their consumers wait without re-invoking a rate-limited root.
+Provider Retry-After clocks survive restart and new document admissions.
+
+External-processing disclosure uses the same pure endpoint resolver and linked
+callback availability as execution. Explicit endpoints override callbacks;
+otherwise callbacks override the configured inference endpoint. Generated
+extractors use generator routing. Policy/status reads perform no capability
+fetch, credential resolution or model invocation to report this flag.
+Forwarded metadata acknowledgments are localized to the issuing data API's
+route, preserving ETags, mutation outcome and unknown response fields (including
+exact numeric literals). An already-correct flag or a scan-only response is
+returned without replacing its body.
+
+Checkpoint reclamation shares eight chunks (at most 2 MiB), 32 CAS operations,
+and a 25 ms soft time budget across each quantum. A completed small blob can
+lose its header in the same quantum. Partial blobs rotate behind later rows.
+Backlogged work polls after 100 ms; idle work polls after one second, subject to
+the maintenance supervisor's scheduling frequency. Writer-side reference and
+term checks still fence every deletion.
+
+New checkpoint generations retain a per-table payload charge until final header
+erasure, including attached and retired generations; each generation charges at
+least 4 KiB. The retained limit is 8 GiB, alongside the existing 256 MiB staged
+upload limit. Denied reservations change neither counter nor manifest. Capacity
+pressure yields the entire table for five seconds using its last committed
+cursors, allowing cleanup and other tables to progress. It never skips a source
+page or turns capacity pressure into a terminal inspection failure.
+
+Metadata protocol 81 gates new accounting writes. Legacy headers remain
+readable and drain normally; their serialized bytes omit the new false flag so
+historical CAS hashes continue to replay exactly. New accounting counters and
+partial reclamation progress survive snapshots and restart.
+
+## Restore and prepared execution boundaries
+
+Table backup manifests authenticate configuration and the protected producer
+graph. Their privacy scan and coverage checkpoints are source-owner state:
+large bounds and cursors can refer to blobs in the source table's metadata job
+store. Restore preserves policy/resource identity and execution controls, clears
+scan history and coverage, and starts a new full scan with a monotonically
+advanced scan sequence. Cohort staging, direct table creation and legacy
+replacement restore apply this transformation only to the destination definition;
+source artifact/provenance validation continues to use the authenticated source
+manifest. Metadata snapshots and hot-standby recovery remain resumable.
+Native restore retains logical artifact bodies and matching producer skip state,
+but excludes local publication witnesses. Replay therefore checks the witness
+before reusing any private root or descendant asset. A missing or stale witness
+requires normal producer execution and atomic output/witness publication; it
+cannot be reconstructed by trusting an imported artifact's own receipt.
+
+Index artifact-source admission skips enrichment/resolver declarations and the
+shared allowlist of opaque control metadata. Trusted restored catalogs can carry
+that metadata; public table creation still rejects it. A monitor policy does not
+turn an ordinary full-text index into an artifact consumer.
+
+Protected read snapshots now prepare the validated policy version, resolved
+categories and producer revision once. Projection, publication checks, status
+inspection and status encoding reuse that immutable binding. Every document
+still validates its source fingerprint, receipt, artifact and publication in the
+same read cut. Single-document and multi-document execution share the prepared
+privacy implementation, and internal evidence validation consumes a typed marker
+rather than serializing/reparsing full descriptions for every field. Memory
+planning reserves the largest physical field batch even for one document and
+releases evicted planning candidates instead of retaining the whole input history.
+
+Source preparation validates complete JSON with the shared streaming validator,
+including duplicate keys in unselected nested values, and decodes only selected
+literal field names. Planning and execution account for container structure as
+well as encoded bytes: compact, wide maps and arrays must not exhaust a budget
+sized only from their small wire representation. The source structural allowance
+uses the largest document in a cohort, while retained selected strings and results
+remain charged across the cohort. Composition preserves exact numeric lexemes.
+
+Protected search hydration releases source/receipt validation scratch after each
+hit. When a supported positive field selection is available, only its sanitized
+output survives that row. Delayed embedded SQL readers own a stable prepared
+privacy binding for their query read lease; releasing a result page does not
+reparse or copy the policy. Each row still checks its source, artifact and
+publication against the pinned transaction. Preview rejects unsupported
+`redact_before_storage` before provider resolution or sample lookup, including
+empty samples, using the same typed error as policy installation.
+
+Wide JSON also requires scalable text-segment navigation. Readers sort their
+owned field directory once during admission, reject adjacent duplicate names,
+and use binary lookup for sections, statistics, capability checks and deferred
+bindings. Mapped and native range readers share this behavior; historical wire
+ordering, payloads and checksum validation are unchanged. This avoids quadratic
+field scans during compaction that could stall writes/publication for documents
+with 10,000 indexed fields. Hand-built readers retain the legacy lookup fallback
+until their metadata has been explicitly admitted as sorted.
+
+## Compact authoritative read bindings
+
+Read fences use `/internal/v1/catalog/privacy-policy-binding`, a fixed-size
+metadata response containing the authority identity, semantic catalog revision
+and current protected policy version. The request crosses the same metadata
+linearizable-read barrier and deadline boundary as routing. Unsupported,
+malformed, expired and wrong-incarnation responses fail closed; remote discovery
+never falls back to transferring a full table definition for this capability.
+The client imposes a separate 4 KiB response ceiling. Privacy mutation admission
+requires metadata protocol 82 so the capability is part of the fleet contract.
+
+Metadata derives bindings once per immutable catalog projection, skipping job
+history without constructing its JSON tree. A malformed policy blocks that
+table's fence rather than poisoning healthy tables' routing. Warm captures retain
+the published projection and return its scalar binding without allocating.
+Standalone uses its catalog mutex as the read barrier and caches scalar bindings
+by table ID within the semantic epoch; runtime progress does not invalidate them.
+Policy publication, deletion/recreation, restore and durability failure remain
+part of the existing catalog authority boundary. Schema, producer definitions,
+range descriptors and retained scan failures are absent from the read response.
+
+Policy and scan writes prepare caller-owned acceptance responses before their
+CAS. A successful CAS therefore returns the accepted state without subsequent
+response allocation or a redundant acknowledgment read. Structural reconcile
+scheduling is a best-effort hint; the durable policy and scan queue drive
+convergence. Transport ambiguity continues to require observation before replay.
+The TypeScript HTTP error exposes the server's typed mutation outcome and numeric
+retry delay for JSON and non-JSON errors without replaying writes.
+
+Metadata classifies projection reads, rejection receipts and semantic comparisons
+inside one post-apply observation boundary. Definite rejection remains a conflict;
+all failed or inconclusive observations return the unknown-outcome contract.
+This adds no reads, retries or response copies to the successful path.
+Allowed cross-origin browser clients can send `If-Match` with the default CORS
+policy and inspect `ETag`, `Retry-After` and the mutation-outcome header. Explicit
+operator header lists remain replacements for those defaults.
+
+
+## Validation
+
+### Forwarded reply ownership and editor recovery (2026-11-05)
+
+- Merge `ec422fdf54` incorporates main through
+  `93d85e2b476069cc5976e92cb1a7b3abd4a8f406`. The generated Go SDK conflict
+  was resolved from the combined schema. The CPU build-policy regression now
+  preserves main's independently measured CUDA Debug reservation.
+- Fix `acd154aa19` retains mutation ambiguity across response-less delivery
+  failures, transport reply ownership, the data-node allocator handoff and
+  processing-disclosure adjustment. Explicit unsent/rejected outcomes retain
+  their original error identity. No response copies, RPCs or replay loops are
+  added to successful mutations. Fault tests cover both owned buffers, every
+  allocation in policy disclosure, accepted and ambiguous replies, and the
+  unsent/maybe-sent/unknown transport matrix for policies and scans.
+- Regression `4e64350f50` also passes through the actual metadata discovery and
+  status-source handoff: eighteen deliveries cover success and both caller
+  buffer failures for accepted and ambiguous policy/scan replies, without replay.
+- Policy adoption and its ETag no longer depend on scan-status availability.
+  Independent serial pollers recover progress without overwriting edits;
+  scope changes cancel requests and explicit Refresh retries immediately.
+  An accepted save adopts its response without another policy GET.
+- Full generation, the rebuilt dashboard/type checking, Biome, Zig formatting,
+  license headers and the Apache boundary checks pass. The Go SDK suite passes;
+  TypeScript SDK passes 601 tests with one opt-in skip. Targeted UI tests pass
+  11 cases, including recovery, ETag retention, slow polling and cancellation.
+- Native ARM64 Linux CPU qualification passes all 132 build steps, 75
+  API/metadata tests, 172 storage/privacy tests, two ABI checks, two data-node
+  checks and two CORS checks. All 20 build-policy tests pass on Mac and Linux.
+  The API compile reports rounded 15G MaxRSS within its 20 GiB reservation.
+  One hundred warm bindings still allocate zero bytes against the
+  14,768,412-byte catalog. Logs use the `.privacy-forwarding-editor-` prefix.
+- Selected HTTP lifecycle, retry, curation and conditional-save cases pass in
+  standalone (eight, 301.25 s) and Raft (seven, 384.58 s). The subsequent real
+  discovery-handoff target passes all 57 build steps and both native cases.
+- Qualified Linux server SHA-256:
+  `0fbce51282acd5ea590c2825bd69f837019a12bad90c6fc460c7810d48edcf3a`.
+  Evidence and reproduction commands are retained locally under
+  `.benchmark-results/privacy/forwarding-editor-main-93d85/`.
+- Required cache cleanup completes on both hosts while preserving active or
+  recent builds. About 10 GiB of this worktree's idle compiler output was also
+  reclaimed after checking that no build used it; downloaded dependencies and
+  qualified local binaries remain intact. The temporary Glowworm worktree and
+  branch were removed after saving the evidence locally.
+- This qualification uses CPU execution; Metal/CUDA throughput is not remeasured
+  because inference and batching are unchanged by these fixes.
+
+### Post-apply observations and browser conditional saves (2026-11-05)
+
+- Fix `8a674eebe7` places all fallible post-apply table observations behind one
+  outcome boundary. Projection, receipt and semantic comparison failures now
+  report an unknown mutation outcome after admission; definite rejection still
+  reports a generation conflict. Successful mutations add no reads or retries.
+  Fault tests cover twelve stage/error combinations and malformed policy JSON.
+- Default CORS permits `If-Match` and exposes `ETag`, `Retry-After` and
+  `X-Antfly-Raft-Mutation-Outcome`. Explicit operator header lists remain
+  authoritative. Native tests cover both defaults and explicit overrides; the
+  HTTP regression creates, conditionally replaces and rereads a policy from an
+  allowed origin and rejects a disallowed origin.
+- Main through `6c0b004e95ad947587cbc4bbb60f4812fb714b28` is incorporated.
+  Full generation, Zig/Python formatting, license and Apache boundary checks
+  pass. The Mac build passes all 135 steps: 71 API/metadata tests, 172
+  storage/privacy tests, two ABI checks, two transport checks and two CORS
+  tests. Compact binding capture still allocates zero bytes for 100 warm reads
+  against a 14,768,412-byte catalog.
+- Selected Mac HTTP lifecycle, CAS, retry and curation cases pass in standalone
+  (eight including CORS, 275.43 s) and Raft (seven, 338.30 s). The binary SHA-256
+  is `01df1990ca9aec8815e433596fa665d4215d8171e01516e2496318b0532fb1d6`.
+  Logs use the `.privacy-outcome-cors-` prefix.
+- Glowworm's native ARM64 Linux CPU build passes all 132 steps with the same
+  native test counts. Selected HTTP cases pass in standalone (eight, 296.89 s)
+  and Raft (seven, 390.67 s), including the browser CORS case in standalone.
+- Native ARM64 Linux qualification exposed an undersized API compile claim.
+  Fix `78c36799ee` reserves 20 GiB for the measured Zig 0.17.0 CPU Debug
+  profile, providing at least 25% margin above its 15,947,554,816-byte peak.
+  All 19 build-policy tests pass on both Mac and Linux, including profile
+  exclusions and aggregate scheduling limits. The corrected Linux rebuild
+  passes all 132 steps without a memory-bound error; its API archive reports
+  a rounded 15G MaxRSS. See `zig/COMPILATION.md`.
+- `make gc` completes on both hosts, preserving active and protected caches.
+  The Mac run leaves 90.0 GiB free; Glowworm removes 233.9 GiB of idle output
+  and leaves 2979.3 GiB free.
+  Linux evidence is retained locally under
+  `.benchmark-results/privacy/outcome-cors-main-6c0/linux/`; the temporary
+  Glowworm qualification worktree and branch have been removed.
+- Inference and batching code is unchanged; this qualification does not
+  remeasure Metal or CUDA throughput.
+
+### Committed acceptance and compact read bindings (2026-11-05)
+
+- Fix `adc07ca4f1` keeps successful policy/scan CAS responses caller-owned before
+  admission, removes the redundant acknowledgment read, and treats structural
+  reconcile scheduling as a best-effort hint. Fault tests exercise unavailable
+  rereads, failed hints, every response allocation failure, and rejected CAS.
+- Main was fetched and checked at
+  `6c0b004e95ad947587cbc4bbb60f4812fb714b28`; it was already incorporated.
+  Metadata protocol 82 requires the compact binding capability.
+- The retained-job regression uses a 14,768,412-byte catalog. One hundred warm
+  binding captures allocate zero bytes, compared with the review probe's
+  49,244,924-byte peak for the former full-resource path. The private HTTP client
+  limits the entire binding reply to 4 KiB. Native tests cover semantic refresh,
+  standalone progress/restore, malformed neighbors, endpoint discovery,
+  unsupported peers, deadline expiry and authority-incarnation mismatches.
+- All 135 native build steps succeed: 70 API/metadata tests, 172 storage/privacy
+  tests, two ABI checks, two data-node transport tests and the standalone binding
+  regression pass. Log: `.privacy-binding-build.log`.
+- The complete TypeScript SDK suite passes 601 tests with one opt-in skip;
+  type checking passes. Error cases cover 409/503, JSON/non-JSON responses,
+  numeric retry delays and unknown mutation outcomes without automatic replay.
+  Zig formatting, license headers and the Apache boundary checks pass.
+- Raft HTTP passes all applicable cases: 40 passed, one opt-in model case
+  skipped and four standalone restore cases excluded in 932.01 s.
+  Log: `.privacy-binding-http-raft.log`.
+- Full standalone HTTP run: 43 passed, one opt-in model case skipped and one
+  curation setup failure in 656.57 s. The failing unprotected-destination case
+  received `ResolverCurationConflict` while creating its initial proposal,
+  before any privacy policy mutation. Both curation variants passed an isolated
+  unchanged-binary rerun (2 passed in 7.98 s). The intermittent proposal conflict
+  remains recorded; this qualification does not claim a clean full-suite run.
+  Logs: `.privacy-binding-http-standalone.log`,
+  `.privacy-binding-http-curation-recheck.log`.
+- The pinned default-model gate passes in 25.32 s with Metal required and
+  selected, covering long-document preview, original offsets, backfill,
+  protected reads, findings and readiness. An initial run passed preview but
+  timed out after 120 s waiting for background protection and logged a cancelled
+  enrichment request. The unchanged-binary rerun passed; the initial timeout is
+  retained rather than treated as a clean first run. Logs:
+  `.privacy-binding-metal.log`, `.privacy-binding-metal-recheck.log`; backend
+  evidence: `.benchmark-results/privacy/binding-fixes/metal-server-first.log`
+  and `metal-server-recheck.log`. Inference/batching code is unchanged; CUDA
+  throughput was not remeasured in this qualification.
+- Required cache cleanup completed, preserving active/recent output and leaving
+  197.6 GiB free (`.privacy-binding-gc.log`).
+- Qualified server SHA-256:
+  `27073455df3d0d1c5b1550393ff17253aab7b8fdfb92107279c6eae550f01325`.
+
+### Mutation outcome forwarding (2026-11-05)
+
+- Merge `8b041aff4c` incorporates main through
+  `6c0b004e95ad947587cbc4bbb60f4812fb714b28`. The Go SDK conflict was resolved
+  by regenerating the client and SQL policy bindings from the combined spec.
+- Metadata HTTP forwarding decodes `X-Antfly-Raft-Mutation-Outcome: unknown-v1`
+  independently of status, including both 409 and 503. Data-node forwarding
+  preserves that typed outcome and `Retry-After` when moving the response out
+  of the discovery arena. Status, body, ETag and JSON metadata are retained.
+- Both allocator handoffs share a response clone that value-copies scalar
+  metadata and duplicates only the body and optional ETag. Failure while
+  allocating either buffer releases only the new allocation and leaves the
+  source intact. This adds no RPCs, retries, body parsing or serialization.
+- Regression cases cover policy and scan mutations with success, 409 and 503
+  replies at the HTTP client and the actual remote status-source boundary.
+  They assert exactly one mutation request per invocation, including ambiguous
+  outcomes. Clone tests exercise every allocation failure with and without ETags.
+- The merged Go SDK tests pass. TypeScript SDK validation passes 593 tests
+  with one opt-in skip and passes type checking. Zig formatting, license headers
+  and the Apache boundary check pass.
+- Fix `6010041670` passes all 121 native build steps, 66 API/metadata tests,
+  172 storage/privacy tests, both ABI checks and the focused data-node regression
+  (six response cases through discovery and the status source). Projected
+  hydration retains the 4,712,210/4,715,173-byte peaks for one/twenty documents.
+- Eighteen HTTP cases pass in each deployment mode (267.83 s standalone,
+  300.07 s Raft), covering lifecycle, CAS, protected serving, startup availability,
+  curation transitions, credentials, secret references, category limits and
+  unsupported storage. The other 27 HTTP cases were outside this targeted run;
+  previous full-suite qualification remains below. Logs:
+  `.privacy-forwarding-http-standalone.log`, `.privacy-forwarding-http-raft.log`.
+- The pinned default-model long-document gate passes in 27.18 s with Metal
+  required and selected, covering preview, original offsets, backfill, sanitized
+  reads, findings and protected readiness. Log: `.privacy-forwarding-metal.log`;
+  server evidence: `.benchmark-results/privacy/forwarding-main-6c0/metal-server.log`.
+  Inference/batching implementation is unchanged by this fix; CUDA performance
+  was not remeasured in this qualification.
+- Required cache cleanup completed, preserving active/recent build output and
+  leaving 136.8 GiB free (`.privacy-forwarding-gc.log`).
+- Qualified server SHA-256:
+  `94e5db3eacac3554bc7261ffe53bf881f1dfa4cc6675bd384df8f5205122321f`.
+  Native build log: `.privacy-forwarding-build.log`. SDK logs:
+  `.privacy-forwarding-go.log`, `.privacy-forwarding-ts-tests.log`,
+  `.privacy-forwarding-ts-types.log`.
+
+### Retryable owner availability (2026-11-05)
+
+- Merge `1a27bdb5da` incorporates main through
+  `fa45514327ae2cf3ce5ea7af461cb07130b3c089`. Fix `c389f256e9` classifies
+  group startup, storage/read-index, leader and transport/topology availability
+  as retryable HTTP 503, sharing table reads' transport classification. These
+  errors include `Retry-After: 1`; forwarded metadata responses retain it.
+- Validation, CAS preconditions, cancellation, deadlines and unknown mutation
+  outcomes retain distinct responses. Native tests force 22 availability errors
+  and verify non-availability cases. The forwarding test proves that a 503 is
+  not replayed and ambiguous scan admission remains an unknown mutation outcome.
+- The cold-start regression creates 15 empty tables and previews each directly,
+  without preliminary writes, deletes or reads. Standalone's first attempts all
+  return 200. In Raft, 11 first attempts return 503 with the typed body/header;
+  every preview subsequently succeeds through bounded client-side polling.
+  No valid preview returns 422, installs a policy or claims a complete scan.
+  The secret-reference empty-sample test also no longer warms its data owner.
+- Build: 106/106 steps, 64 API/metadata tests, 171 native privacy/storage tests
+  and both ABI checks pass. Eighteen HTTP cases pass in each deployment mode
+  (269.68 s standalone, 307.54 s Raft), covering all four lifecycle variants,
+  cold startup, curation transitions, credential rejection, secret references,
+  category limits and unsupported storage. The remaining 27 HTTP cases were
+  outside this targeted run; earlier full-suite qualification is below.
+- The TypeScript SDK additions merged from main pass 593 tests (one opt-in skip)
+  and type checking. Formatting, license headers and the Apache boundary pass.
+  Projected hydration retains the 4,712,210/4,715,173-byte peaks for one/twenty
+  documents. Successful reads gain no RPCs, retries or added error-path work.
+- Qualified server SHA-256:
+  `36109fb1375beafd6a7da83ba5dab12605717ef2efd37e6a42acdc522ec7820b`.
+  Logs: `.privacy-startup-build.log`, `.privacy-startup-http-standalone.log`,
+  `.privacy-startup-http-raft.log`, `.privacy-startup-sdk-tests.log`,
+  `.privacy-startup-sdk-types.log`. Required cache cleanup removed 96.0 GiB,
+  leaving 145.0 GiB free while preserving active builds.
+
+### Live catalog controls and credential admission (2026-11-05)
+
+- Merge `f0256a88ee` incorporates main through
+  `a60aa92028ee5a9a336ba5c4ac95f506b9f83e7e`. The combined Go SDK was
+  regenerated, including checked SQL hooks. The merged extractor retains
+  native/Metal/CUDA long-window batching and adapts to main's optional backend
+  used by classification microbatches.
+- Fixes `e881502272` and `d22e81ac58` separate rollback consumer declarations
+  from live opaque resolver/curation state. Policy replacement merges only
+  current control entries, removes legacy control snapshots, and never treats
+  evidence as index or producer declarations. Deleted controls cannot reappear.
+- Credential admission shares public provider inspection's field/URL classifier.
+  It rejects nested/header literals, userinfo, encoded credential query keys,
+  fragments, and malformed references before preview or installation. Exact
+  native secret references, omitted credentials/environment defaults, safe
+  endpoints, and user-authored schema/label definitions remain supported.
+- The extended HTTP regression exposed mutable privacy progress inside resolver
+  fingerprints. Resolver admission and query proofs now exclude exactly the
+  runtime fields already exempted by privacy's progress-only CAS path. Authored
+  policy, resource versions, generations and consumer declarations remain
+  fences. Fresh proposals work after tuning, semantic replacement, monitor,
+  protection re-enablement and restart in both deployment modes.
+- Final server SHA-256:
+  `224668cabdd3787d57cfe4c8adcac955b22705250d6daac55d39862f79546cdb`.
+  Build: 106/106 steps; 63 API/metadata tests, 171 native privacy/storage tests
+  and both ABI checks pass without leaks. Go SDK tests, formatting, license
+  headers and the Apache product boundary pass.
+- Focused HTTP qualification: 10/10 standalone (37.41 s), 10/10 Raft (29.19 s).
+  The required Metal long-document gate also passes on the final binary
+  (27.05 s), with two selected fields, UTF-8 offsets and a long document.
+- Full standalone HTTP qualification: 43 passed, one opt-in native model
+  skip (666.77 s). Full Raft HTTP qualification: 39 passed, one model skip,
+  four standalone-only restore cases deselected (889.84 s). Those four restore
+  cases pass in the standalone run; the model gate runs separately with
+  required Metal.
+- Native projected hydration retains the earlier allocation bound: one
+  128 KiB document peaks at 4,712,210 bytes and twenty at 4,715,173 bytes.
+  Catalog installation parses live state once and excludes opaque control
+  payloads from the rollback snapshot; credential checks run at admission.
+
+### Merged code and wide-field compaction (2026-11-04)
+
+- Privacy fixes are committed in `80ef8959ae`; merge `a61de5b7a7` incorporates
+  main through `81941d33651c582a91341ffcd3bde7e065688352` without conflicts.
+- Full HTTP qualification initially exposed a second wide-object problem:
+  repeated linear segment-directory scans and quadratic duplicate admission
+  delayed ordinary writes and protected publication. The sorted in-memory
+  directory fix (`e167fda62d`) preserves wire ordering, checksums and historical
+  compatibility.
+- Integrated build: 106/106 steps, 62 API/metadata tests, 169 native
+  privacy/storage checks and both ABI checks pass without leaks. All 135
+  segment checks pass, including mapped/native ranges, CRC behavior, merges,
+  and a reversed 2,048-field directory with duplicate rejection.
+- Broader native query target: 66/66 steps, 449 tests passed, two opt-in dense
+  replay/cache benchmarks skipped, and no leaks. The manually driven graph
+  replication fixture now disables autonomous maintenance (`d6b8fe99fb`), so
+  background ownership cannot race its one-shot ordered page applications.
+- All four new HTTP cases pass in both standalone (39.72 s) and Raft (37.67 s).
+  The wide-object preview/backfill/update case takes 9.99/12.36 seconds,
+  respectively, instead of the earlier stalled/timed-out runs.
+- Complete standalone HTTP suite: 33 passed, one optional model case skipped
+  (656.85 s). Complete Raft HTTP suite: 29 passed, one optional model skip,
+  four standalone-only backup fixtures deselected (916.84 s). The pinned-model
+  case passes separately with required Metal on the same binary.
+- All five original HTTP/memory reproducers pass on the merged binary
+  (55.69 s). Sampled RSS depends on background cache warming; the deterministic
+  one/twenty-hit allocator regression remains the working-set bound.
+- Scoped retry, change-journal and enrichment replay checks pass all 11 cases
+  across 58 build steps. The pinned PII model's two-field long-document HTTP
+  gate passes with Metal required (33.88 s). CUDA kernels and model weights
+  are unchanged; CUDA qualification was not repeated.
+- Formatting, license headers and the Apache boundary check pass (2,407 source
+  files). `make gc` completes, preserves active/recent output and removes no
+  eligible build output; 144.3 GiB remains free.
+- Qualified server binary SHA-256:
+  `a46abdbf57fd3b99dc8fba96db5d15d7b8daf68a304252c2f9102d6163bdfb59`.
+
+### Wide JSON and protected reader lifetimes (2026-11-04)
+
+- Initial qualification used main at
+  `616117cc78ba29dcd6c0212abd78ac076201ee3f`. Main advanced during testing;
+  merge `a61de5b7a7` incorporates `81941d33651c582a91341ffcd3bde7e065688352`
+  without conflicts. The following measurements use the preserved pre-merge
+  binary; final merged-code qualification is recorded separately.
+- Integrated build: 106/106 steps, 62 API/metadata tests, 168 native
+  privacy/storage checks and both ABI checks pass without leaks. New cases
+  exercise wide maps/arrays and deep containers in one/16-document cohorts,
+  capability preflight, exact integers, escaped/literal selected field names,
+  Unicode, nested duplicate rejection, and allocation ownership.
+- Real-store protected hydration peaks at 4,712,210 allocated bytes for one
+  128 KiB document and 4,715,173 bytes for twenty, selecting one small field.
+  The deterministic regression also enforces an 8 MiB ceiling. The SQL reader
+  retains one 128 KiB-description policy binding across 32 row/page cycles;
+  the remaining row budget cannot accommodate another policy copy.
+- Scoped retry, change-journal and enrichment replay checks pass all 11 cases
+  across 58 build steps.
+- The pinned PII model's two-field long-document HTTP case passes with Metal
+  required (24.49 s), covering preview, backfill, findings and serving. Model
+  weights and CUDA kernels are unchanged; CUDA qualification was not repeated.
+- All three original HTTP reproducers pass (42.65 s): the 10,000-property
+  preview, protective backfill, and unsupported preview with a real document.
+- Repeating the reviewed 20-hit/1 MiB-padding workload reduces sampled
+  incremental RSS from 224.8 MiB to 85.4 MiB; the final monitor control uses
+  81.0 MiB. The response remains approximately 1.3 KiB. Protected query latency
+  is essentially unchanged (1.034 s reviewed, 1.036 s final); this measures
+  Debug serving memory, not model inference or production throughput.
+- Formatting, license headers and the Apache boundary check pass (2,407 files).
+- Qualified server binary SHA-256:
+  `a7cbdc91aa3588868686923ba61ab4486e3406efb7c76d0c5e5c6aa1f09c6048`.
+
+### Restore, invocation memory and prepared reads (2026-11-04)
+
+- Fixes are committed in `d7565d6e9d`, after merging main through
+  `616117cc78ba29dcd6c0212abd78ac076201ee3f`. Both adjacent test additions
+  were retained at the merge conflict sites.
+- Final integrated build: 106/106 steps, 62 API/metadata tests, 164 native
+  privacy/storage checks and two active ABI checks pass without leaks.
+- Six focused HTTP regressions pass (116.09 s): portable and native restore
+  in monitor/protective modes with externalized 5,000-byte scan bounds, plus
+  128 KiB category descriptions in single/two-document preview and backfill.
+  Restored policies, versions, generations and execution controls are preserved;
+  new scans complete, coverage becomes current and protected reads succeed.
+- A real-store regression verifies that valid local publication skips provider
+  execution, while retained producer state with a missing witness regenerates
+  and atomically republishes. The prepared serving/status regression completes
+  under a 32 KiB row budget despite a 128 KiB policy description.
+- Scoped retry worksets, change journals and enrichment replay cursors pass all
+  11 checks; the focused build completes 58/58 steps.
+- The pinned PII model's single-document, two-field long-input HTTP test passes
+  with Metal explicitly required (26.60 s), covering preview, backfill, serving,
+  findings and protected readiness. CUDA kernels/model weights are unchanged;
+  this run does not repeat CUDA qualification.
+- Complete standalone HTTP suite: 29 passed, one optional model skip (618.71 s).
+  Raft HTTP suite: 25 passed, one optional model skip, four standalone backup
+  fixture cases deselected (826.96 s). The skipped pinned-model case passed
+  separately with required Metal on the same binary.
+- The original synthetic 100-document protected-read benchmark passes on the
+  final Debug binary (four samples per policy). With a 16 KiB category
+  description, median latency falls from 115.6 ms in review to 19.8 ms; the
+  no-description control falls from 29.6 ms to 17.1 ms. This measures the HTTP
+  read path, not model inference, recall or production throughput.
+- Formatting, license headers and the Apache boundary check pass (2,407 source
+  files). `make gc` completes and preserves active/recent builds; no eligible
+  build output remained for removal, with 86.3 GiB free at completion.
+- Qualified server binary SHA-256:
+  `f0cc3fe29f76661468e95212803d4fc95d5bdcf8482e2ee7f294fa77f3707025`.
+
+### Earlier discovery, preview and identifier fixes (2026-11-04)
+
+- The initial main fetch was already incorporated through `4bb2b815aa`.
+  Main advanced during qualification; merged
+  `8c1eddf12be59f4f14672d5f63c9d2fbadb232d9`, including resumable full-text
+  replay. The benchmark conflict retains main's multi-document calls and the
+  branch's existing diagnostics; all 18 benchmark helper tests pass.
+- Discovery now retains references instead of full source pages and cleaned
+  document copies. The real-store memory regression exercises discovery over
+  twelve 1 MiB documents; separate cases cover byte limits, row limits and
+  progress for an oversized identifier.
+- Preview computes one policy version for response construction and reuses it
+  across findings. The HTTP fixture includes 2,000 findings and a 16 KiB category
+  description, checking every finding's version against the response.
+- The review's claim that saved execution controls were discarded was incorrect:
+  the existing policy-bound override intentionally keeps controls outside the
+  immutable producer. The new HTTP regression tunes from one to five attempts,
+  preserves identity/generation/scan, restarts, and requires the fifth response
+  to recover during an explicit rescan. No producer-identity change is needed.
+- Pre-merge integrated build: 106/106 steps, 58 API/metadata tests, 151 native
+  storage/privacy tests and two ABI checks passed. Formatting and license
+  checks passed.
+- The synthetic 2,000-finding preview with a 16 KiB category description took
+  0.091 seconds on the qualified build, compared with 0.712 seconds in the review
+  reproduction. The 341,433-byte response shape is unchanged. This measures
+  synthetic HTTP/response processing, not model inference or customer throughput.
+- Pre-merge regression server SHA-256:
+  `7342d8158de254d7ae123b8c9f4d98ad7af55b2e498475c5997295ff869337ec`.
+- Model-weight, Metal and CUDA execution are unchanged; this qualification
+  does not repeat those backend runs.
+- The initial standalone suite hit the existing 60-second replacement wait:
+  receipts were current and the named text/vector indexes were ready, while
+  the implicit text index still reported source publication/backfill pending.
+  On the unchanged binary, the isolated case passed (60.28 seconds including
+  setup), as did the preceding one-shard monitor/protective sequence (114.94
+  seconds). No timeout was widened or publication check bypassed.
+- The complete pre-merge Raft HTTP suite passed 21 cases with one optional
+  model-weight skip (749.57 seconds), including the 1,000-row rescan whose two
+  5 MB identifiers force byte-bound continuation.
+- The complete unchanged-binary standalone rerun passed 21 cases with one
+  optional model-weight skip (475.36 seconds); the replacement lifecycle passed
+  in 55.85 seconds. The initial timeout remains recorded above.
+- Merged-main build before the empty-ID follow-up: 106/106 steps, 58 API/metadata tests, 151 native
+  storage/privacy tests and two ABI checks passed. The execution-control fixture
+  now uses four documents to verify serial physical batches as well as recovery
+  on the fifth configured attempt after tuning and restart.
+- On the merged binary, the same 2,000-finding preview took 0.078 seconds with
+  either an empty or 16 KiB category description; the per-finding policy-size
+  cost is removed. Server SHA-256 before the empty-ID follow-up:
+  `09dfd1572ee6f52579d2ba841fe5995250e6fa9d92ba9d9d4ba3ba6dfd7483ac`.
+- That merged binary passed the complete standalone suite (21 passed, one
+  optional model-weight skip, 468.94 seconds) and Raft suite (21 passed, one
+  optional model-weight skip, 758.70 seconds).
+- A final boundary check found that empty document IDs were admitted but an
+  empty continuation key was indistinguishable from the initial open bound.
+  Discovery, coverage and range verification now explicitly preserve exclusive
+  continuation through local scans, shard routing and trusted internal/owner
+  transports. A boolean marker keeps large identifiers on the wire only once;
+  public scan requests cannot enable this private option. Native and HTTP
+  regressions cover empty, NUL and non-ASCII IDs with one-row discovery pages.
+- The new HTTP boundary regression also exposed inconsistent artifact validators:
+  the primary store admitted empty IDs while artifact manifests, publication and
+  completion rejected them. Document identities now follow the store's key
+  contract; producer and unit names remain nonempty, and byte, ordering,
+  authority and checksum checks remain enforced. Retry state records a present
+  empty cursor explicitly; existing nonempty/absent cursor framing is preserved,
+  and readers accept both header forms. Focused tests cover empty retry tickets,
+  replay cursors, scope keys and unit-job round trips.
+- The first Raft boundary run detected an additional remote shard encoder that
+  reconstructed only three request fields and dropped the continuation marker.
+  It now serializes the typed request, matching the local/owner path.
+- Catalog-install waiting preserves the original checkpoint instead of returning
+  an unadmitted exclusive cursor. The internal HTTP route/client preserve the
+  pending-publication error identity, and the coordinator yields without
+  consuming its failure budget. Scheduler and transport regressions cover this
+  retry path.
+- HTTP completion then exposed two more pre-existing empty-ID omissions: producer
+  readiness rejected a valid zero-length document suffix, and journal/index
+  replay dropped empty document keys. Readiness now validates the encoded prefix
+  and producer digest independently of document length. Journal/replay retain
+  empty IDs; existing tombstone slot metadata distinguishes a real empty delete
+  from a canceled nonempty artifact delete without another map or allocation.
+  The stream-readiness fencing regression now uses an empty ID, and dedicated
+  native cases cover journal references/deletes and all index replay kinds.
+- The completed production build passed all 106 steps, with 61 API/metadata,
+  158 native privacy/storage and two owner/ABI tests. Adding the existing vector
+  tombstone cancellation/revival regression to the permanent privacy target
+  then passed all 57 target steps, 61 API/metadata, 159 native and two owner/ABI
+  tests. The separate compatibility run passed all 11 selected retry-workset,
+  replay-cursor and journal tests, including healthy progress across restart,
+  allocation failures and maximum durable metadata budgets.
+- The final empty-ID HTTP cases pass for monitor and protective modes in both
+  standalone (38.48 seconds) and two-shard Raft (46.35 seconds). Each discovers
+  exactly three empty/NUL/non-ASCII IDs and reaches current coverage.
+- Final production server SHA-256:
+  `62a8ba8c821d23fa9f8f107b49e276d658b82ccf3363eb798fa0978a22b6f6cb`.
+- Final complete HTTP suites on that binary: standalone **23 passed**, one
+  optional model-weight skip (488.93 seconds); Raft **23 passed**, one optional
+  model-weight skip (739.60 seconds). The final runs include serial cohort/retry
+  tuning across restart, dense 2,000-finding previews, byte-bound discovery with
+  5 MB identifiers, empty-ID completion and monitor/protective lifecycle cases.
+- Final synthetic preview recheck: 2,000 findings took 0.083 seconds with an
+  empty category description and 0.065 seconds with a 16 KiB description,
+  compared with 0.712 seconds in the original large-policy reproduction. Both
+  responses remain 341,433 bytes. These individual synthetic samples establish
+  removal of the policy-size multiplier, not a production throughput guarantee.
+- Final Zig/Python formatting, Python lint, diff and license checks pass;
+  the Apache boundary covers 2,407 source files. Required cache cleanup completed
+  successfully, preserving active builds and leaving 100.8 GB free at completion.
+- Review fixes are committed through `704547d306`; main remains merged through
+  `8c1eddf12b`. Model-weight/backend qualification was not repeated because
+  inference execution and model math are unchanged.
+
+### Previous retry, projection and disclosure fixes (2026-11-04)
+
+- Merged main through `4bb2b815aa7d359d979d28cb9a4f4fa6205e70fc`. The merge
+  keeps compact producer enrollment separate from mutable readiness cursors,
+  adopts the bounded transaction-local empty-input proof, and regenerates the
+  Go client with its license and SQL transport policy hooks.
+- The real-store priming regression covers a one-hour provider retry, restart,
+  healthy-consumer progress after a write 30 seconds later, preservation of the
+  provider deadline, and completion when the failed root becomes due. All
+  three retry workset regressions pass on the integrated source, alongside
+  218 ordered-artifact tests and 10 owner/ABI checks (67/67 build steps).
+- The HTTP regression now covers 2 MiB selected and unrelated fields in serial
+  and native batched previews, protective backfill and reads, and rejection of
+  oversized raw provider output. The selected-text fixture explicitly configures
+  a 4 MiB constrained-input budget; production input defaults remain unchanged.
+  Pure tests cover overflow-safe budgets,
+  source-sum admission for mixed-size cohorts, explicit/default endpoints,
+  independent callback availability, and generated-extractor disclosure.
+- Integrated server/focused build: 106/106 steps, 58 API/metadata tests,
+  150 native storage/privacy tests and two ABI checks passed. The forwarded
+  acknowledgment regression verifies route correction without losing exact
+  numeric literals, future producer fields, ETags or unchanged-body reuse.
+- Full Go SDK tests, Zig/Python formatting and license checks passed. `make gc`
+  completed while protecting active builds. This review does not repeat
+  model-weight, Metal or CUDA qualification.
+- Qualified server SHA-256:
+  `7a7372f3f65702e3e3d948c3478d031538c30afa710ae69daa4c8db21ece10d9`.
+- Complete standalone HTTP suite: 20 passed, one optional model-weight test
+  skipped (393.29 seconds), including the expanded source-budget regression.
+- Complete Raft HTTP suite on the same binary: 20 passed, one optional
+  model-weight test skipped (771.49 seconds). Both suites include one/two
+  shards, policy replacement, restart, membership changes, large identifiers,
+  private scan boundaries, source-sized projections and raw-output limits.
+
+### Previous detector memory and checkpoint retention fixes (2026-11-04)
+
+- Merged main at `7bc16af5383a8be6e9f95877f4bd443487d06fc4`, retaining privacy
+  dependency batching and failure markers alongside durable scoped retries and
+  shared source preparation. Regenerated the combined Go API client; Go SDK
+  tests and all 13 host allocator tests pass.
+- The focused regressions cover the maximum 50-document/64-field memory plan,
+  preservation of both inner and outer invocation quotas, atomic retained-byte
+  admission, snapshot restoration, multi-manifest GC budgets and fairness, and
+  capacity backoff without cursor advancement.
+- Integrated server/focused build: 106/106 steps, 53 API/metadata tests,
+  147 native storage/privacy tests and two ABI checks pass. The two durable
+  scoped-retry regressions pass after the merge. The ordered-artifact target
+  passes 218 native tests and 10 owner/ABI checks, including the merged
+  execution-identity and protocol-floor cases. Formatting and license checks
+  pass. Qualified server SHA-256:
+  `63d02912ec3dde876ef3b2503c2b70509a0b5d15a6775e543a9087cb9bd1a9dc`.
+- Standalone and Raft upgrade probes start protocol-80 binary SHA-256
+  `c4faece05bee12a4f234fabed47df2f900043fe460bddc3243ca133aaf7a0c80`,
+  persist an out-of-line legacy checkpoint, switch to the integrated server,
+  finish that scan, update the policy with its exact ETag, then persist an
+  accounted checkpoint and restart again. Both pass (13.49/10.36 seconds).
+- Complete integrated HTTP suites each pass 20 cases with one optional
+  model-weight skip: standalone 405.12 seconds and Raft 708.42 seconds.
+  They run concurrently; these are qualification durations, not isolated
+  throughput benchmarks. The oversized-preview regression
+  waits for full publication of its 9 MiB identifier before testing sample
+  admission, so a concurrent Raft read-fence timeout does not replace the
+  intended 422 assertion.
+- A synthetic HTTP memory probe uses 32 KiB of provider padding per field.
+  The maximum 50-document/64-field cohort completes in 400 native batches of
+  eight, discards padding, and returns 1,191,657 bytes. On the integrated
+  server it takes 3.75 seconds; sampled warm-process RSS grows by 32,912 KiB.
+  This measures host orchestration with a synthetic detector, not model/GPU
+  throughput. Model weights, Metal and CUDA are not requalified in this fix.
+
+### Previous preview and listener fixes (2026-11-04)
+
+- Main remains incorporated through `ab58a77e243983386345e86969f5f8ddee8811e7`.
+  Final server SHA-256:
+  `c4faece05bee12a4f234fabed47df2f900043fe460bddc3243ca133aaf7a0c80`.
+- Data, standalone and metadata listeners admit the existing explicit document-read
+  and findings body budgets. Ordinary routes retain their existing limits and
+  aggregate transport admission still bounds buffered bodies.
+- Preview includes escaped identifiers in its 8 MiB input budget, streams
+  automatic samples, and counts serialized output before allocating its response.
+  Responses above 8 MiB return `privacy_sample_too_large` rather than exceeding
+  SDK limits. Native inference batching remains unchanged.
+- Checkpoint GC borrows validated catalog slices and reuses the pinned table row
+  within a page instead of repeatedly copying schemas and catalogs. The regression
+  exercises 32 projections of an 8 MiB schema with borrowed catalog ownership.
+  A real-store GC page with 32 headers and an 8 MiB table description also
+  stays below 32 MiB of measured allocations.
+- Final focused gate: 49 API/metadata tests, 145 storage/runtime tests and two ABI
+  checks pass. Server build recheck passes all 71 steps; HTTP parser/server tests
+  execute directly with 173/173 passing. Formatting and license checks pass.
+- Full privacy lifecycles each pass 19 cases with one optional model-weight skip:
+  standalone 403.55 seconds and Raft 741.54 seconds. These include preview
+  response expansion from repeated IDs and run concurrently, so their durations
+  are qualification times rather than isolated throughput benchmarks.
+- The two new HTTP boundaries pass in standalone (31.88 s) and Raft (26.75 s),
+  including absent 50 MiB key reads, explicit/automatic oversized preview rejection,
+  and successful automatic sampling at a row limit and at end of stream.
+
+### Previous checkpoint and findings fixes (2026-11-04)
+
+- Main is incorporated through `ab58a77e243983386345e86969f5f8ddee8811e7`.
+  The qualified final binary is SHA-256
+  `a1cb6458db1f4e211591f928a62fc8060cb82a2e2c3b9cbbeba7701e40bf078d`.
+- Server/focused gate: 109/109 build steps and 45 API/metadata checks passed,
+  plus 145 storage/runtime tests and two active ABI checks. HTTP server and
+  parser regressions passed 173/173, including explicit route opt-in and the
+  unchanged ordinary-body limit.
+- The 33 MiB empty-table boundary lifecycle passes in standalone and Raft,
+  including restart, completion, polling bodies below 4 KiB and another policy
+  update. Calls took 18.54/21.87 seconds respectively, including restart.
+- Upgrade qualification starts the preserved pre-fix binary, persists a raw
+  boundary, switches binaries and verifies completion and another policy update.
+  Standalone covers 33 MiB (77.08-second call); Raft covers 17 MiB
+  (19.93-second call), within the old metadata listener's 32 MiB admission cap.
+- Full lifecycle cohorts on the final binary each passed 16 cases with one
+  optional model skip: standalone 366.27 seconds and Raft 694.88 seconds.
+  Boundary cases are recorded separately above. The final lifecycle suites ran
+  concurrently; these durations are qualification times, not isolated throughput
+  benchmarks. Raft's 5,000,000-byte ID case took 105.64 seconds.
+- TypeScript SDK: 543 passed with one unrelated skip; typecheck and Go SDK tests
+  pass. API/SDK generation, formatting and license checks pass. Inference/model
+  execution is unchanged; these fixes do not add a new GPU qualification run.
+
+### Earlier boundary and performance fixes (2026-11-04)
+
+- Merged main at `ab58a77e24` and regenerated the API, SDKs and dashboard types.
+- Focused contracts pass 145 native tests without leaks, 37 API tests and two
+  active runtime error-registry checks. The full active registry passes 11 tests;
+  the WAL replica suite passes 28 tests.
+- Raw Raft apply-store suite: 34 tests pass without leaks, including shared
+  background runtime wiring, live read-only WAL visibility, replay conflicts,
+  snapshots, overlap recovery and compaction-domain boundaries.
+- Regressions cover large binary internal reads, large coverage rows and cursor
+  round trips, bounded failure examples, producer/readiness checkpoint migration,
+  stale completion fences, concurrent writer admission, compact publication wire
+  encoding, amortized Raft checkpoints, and byte-identical Snappy encoding.
+- TypeScript SDK: 543 passed, one unrelated skip; TypeScript type checking and
+  generated Go SDK tests pass. Generation, formatting and license checks pass.
+- A local Debug microbenchmark encoding a repeated 5 MiB input improved from
+  21 ms to 3 ms with identical compressed bytes. This measures the encoder only.
+- Standalone HTTP: 16 passed, one optional model-weight test skipped (354.20 s).
+- Raft 5 MB identifier boundary regression: passed (128.89 s total, 109.91 s
+  call), with all 101 roots current, a completed resumed scan, signed lookup,
+  manifest and manifest-list body reads, and rejection of unsigned originals.
+  Remaining Raft HTTP cases: 15 passed, one optional model-weight test skipped
+  (521.71 s); together the two Raft runs cover all 17 cases with 16 passes and
+  one skip on the same binary. Cases include one/two shards, policy replacement,
+  restart, resumed coverage, membership changes and large/escaped identifiers.
+- Qualified server binary SHA-256:
+  `a25e75266da97d87c62e3659eadf2d2f5e820806b050c1a5613a04a2c42416c8`.
+  This review does not repeat model-weight, Metal or CUDA qualification.
+
+### Previous review validation (2026-11-03)
+
+- Merged main at `e6144685f8` and regenerated the public API and all SDKs.
+- Focused privacy build: 121/121 steps and 25/25 API/metadata tests passed;
+  the native storage/privacy group passed 65 tests without leaks. Regressions
+  cover cache retention, current-row admission, stale authored-CAS rejection
+  receipts, durable progress reconciliation, bounded publication recovery,
+  snapshot scheduling rebuilds, and modern/legacy cursor round trips.
+- Final standalone HTTP suite: 13 passed, 1 optional model-weight test skipped
+  in 279 seconds. Final Raft HTTP suite: 13 passed, 1 optional model-weight test
+  skipped in 406 seconds. Both run the same final binary and include one/two
+  shards, monitor/protective policy saves and replacements, restart, resumed
+  coverage, 3 KiB/36 KiB escaped document identifiers, and rejection of
+  unsupported storage before preview, installation or rescan.
+- Generated Go SDK tests, TypeScript privacy SDK tests (3), dashboard UTF-8
+  preview tests (3), full generation, formatting and license checks passed.
+  This review did not repeat native model-weight, Metal or CUDA qualification.
+- Final binary SHA-256:
+  `10e133029c1269edee2e9c951a8350a00344e2ddfee833566b09a3045bec3852`.
+
+### Prior validation
+
+- ReleaseFast deduplication microbenchmark (three repetitions): 65,536 distinct
+  valid findings improved from a median 965 ms to 10.3 ms; 16,384 improved from
+  58.4 ms to 2.75 ms. This measures normalization, not model inference.
+- Focused API target: `zig build antfly-privacy-test` — 21 API/metadata tests and 62 storage/runtime tests passed,
+  including scan bounds, adaptive verification, evidence ownership, byte-budgeted findings,
+  scheduling index allocation failures/snapshot restore, and transport policy fences.
+- Storage contract target: 15 checks passed, including real DB ID-scan memory,
+  borrowed projection/cancellation, allocation ownership and publication contracts.
+  The ID-scan regression reads twelve 1 MiB originals while retained request
+  allocations remain below 256 KiB.
+- Scheduler regression drives complete passes through durable progress updates
+  for both backfill and verification, including shard-leader, routing and timeout
+  failures, and verifies another table can become the next runnable entry.
+- Pure catalog/inspection suite: 26 passed. Privacy TypeScript SDK: 3 passed;
+  dashboard privacy tests: 6 passed. Generated Go SDK tests passed. Full
+  API/SDK/dashboard generation, formatting and license checks passed.
+- Standalone HTTP: 9 passed, 1 optional model-weight test skipped (260 seconds).
+  Raft HTTP: 9 passed, 1 optional model-weight test skipped (486 seconds).
+  Both include resolved-category admission and policy replacement. The large
+  membership cases took 24/23 seconds in standalone and 157/92 seconds in Raft
+  for monitor/protective modes respectively.
+- An initial standalone one-shard policy-replacement check timed out waiting
+  for serving readiness. It passed in an isolated run, in the preceding-monitor
+  sequence, and in the complete rerun with unchanged code and binary. The cause
+  was subsequently traced to missing default text-index publication receipts after
+  completed initial discovery. The bounded recovery fix described above and its
+  deterministic regression now cover that state; the HTTP test retains scan,
+  vector-index and server diagnostics.
+- Large Raft membership tests enforce a 90-second no-progress watchdog and a
+  ten-minute hard convergence cap, accounting for bounded publication backpressure.
+
+### Earlier broader validation
+
+The following results were recorded during implementation before this main merge.
+
+- Compiled metadata owner regression verifies indexed due selection and point reads
+  across the storage archive. Table-read regression checks both static vtable
+  variants across capability selection; the full table-read target passed 125 checks.
+- Runtime error transport: 43 tests passed, including privacy retry/corruption
+  identities; SQL diagnostics: 7 passed. Remote scan transport: 2 passed.
+- Standalone publication witnesses: 4;
+  current-status/serving suites: 10 each.
+- Python SDK: 779 passed; Go SDK tests passed; Rust SDK check passed.
+- TypeScript SDK: 535 passed, one unrelated skip. Dashboard: 280 passed;
+  UTF-8 preview highlighting: 3 passed. Full API/SDK/dashboard generation passed.
+- Standalone and Raft HTTP lifecycle suites each pass six cases covering
+  preview, CAS, backfill, current findings, protected query/hydration, sanitized
+  SQL predicates, source edits, invalid-evidence failure, repeated retry,
+  policy replacement, restart, deletion, null sources and empty tables. Raft
+  covers one and two shards; monitor and protective cases include a managed
+  vector index. Protective cases verify sanitized embedder inputs, return to
+  monitor, null-to-text source updates and restart. Real default-producer HTTP qualification passed on
+  required Metal with two selected fields and a long document.
+- Fresh native/Metal/CUDA comparison uses three synthetic documents, UTF-8
+  offsets and seven inspection windows. Labels, text and coordinates match
+  exactly. Maximum score differences from native were `4.18e-7` on Metal and
+  `5.37e-7` on CUDA; the final-window email is detected.
+
+These synthetic checks establish the exercised runtime and publication
+contract, not customer-text recall or calibrated confidence. Representative
+application text and languages still require evaluation before deployment;
+threshold tuning and privacy redaction reduce exposure of detected information
+without promising anonymization or compliance.
+
+The repeatable backend gate is
+[`qualify_privacy_windows.py`](../../scripts/gliner_specialty/qualify_privacy_windows.py).
+It requires the requested backend and records discrete-span and confidence
+comparisons against a native reference, with task-owned server cleanup.

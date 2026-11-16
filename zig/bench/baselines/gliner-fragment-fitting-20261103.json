@@ -1,0 +1,69 @@
+{
+  "date": "2026-11-03",
+  "scope": "Window-dependent fragment-cap fitting and invariant-schema rejection; Debug host geometry and ownership validation. No new throughput measurements or GPU-execution qualification.",
+  "source": {
+    "base_commit": "e04da50001c8eb465b85bcb76945f68ffc2bd9d8",
+    "files_sha256": {
+      "zig/pkg/inference/src/extractors/gliner_boundary_executor.zig": "7c7388e7949bf411dec5df5da686fb7012549f107004fef8bee98fae133ee46a",
+      "zig/pkg/inference/src/extractors/gliner_boundary_long_executor.zig": "db3e9e1824b459d65b0e68567478f9b67fdb2ea16fcb263d89d6ce4e90a030aa"
+    }
+  },
+  "behavior": {
+    "capacity_refusals": [
+      "BoundarySequenceLimitExceeded",
+      "BoundaryFragmentLimitExceeded"
+    ],
+    "schema_validation": "On a failed initial partition, validate the empty invariant prompt before building source fitting costs; invalid schema fragments return their processor error.",
+    "no_partition_fits": "Preserve the original processor refusal instead of an incidental candidate-geometry error.",
+    "fast_path": "A fitting requested ceiling still prepares its window samples once.",
+    "budgets": "Existing fragment, token, preparation-memory and physical-work limits remain enforced."
+  },
+  "regression": {
+    "source_word": "A 65,536-byte URL beginning with https://, filled with repeated configuration plus trailing x characters.",
+    "text_layout": "a b c d <URL> e f g",
+    "schema": {
+      "entities": [
+        "x"
+      ]
+    },
+    "default_fragment_limit_bytes": 65536,
+    "requested_window_words": 6,
+    "overlap_words": 0,
+    "previous_outcome": "BoundaryFragmentLimitExceeded because a synthetic terminal period extends the URL beyond the byte cap.",
+    "fixed_outcome": {
+      "window_count": 3,
+      "prompt_tokens": 5083,
+      "equals_explicit_window_words_4_usage": true
+    },
+    "tokenizer_sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+    "geometry_only": true
+  },
+  "validation": {
+    "optimize": "Debug",
+    "selected": 62,
+    "passed": 62,
+    "skipped": 0,
+    "log_sha256": "c932f9386e63c55fbc0635672091331381fa82e0e18f7d01ed84f4ce2ee193e9",
+    "filters": [
+      "boundary qualification",
+      "pipelines.gliner_boundary_processor.test.",
+      "pipelines.gliner_boundary_long_document.test."
+    ],
+    "coverage": [
+      "Pinned-base tokenizer with the default 65,536-byte fragment cap.",
+      "Small deterministic fragment fixture with fitted and explicit-width usage equality.",
+      "Cached fitted samples are reused without extra tokenizer calls.",
+      "Original oversized source words still return BoundaryFragmentLimitExceeded.",
+      "Invalid schema fragments abort before source fitting-cost indexing, within two schema attempts.",
+      "Every allocation failure during fragment fitting and cache publication releases owned state.",
+      "Existing nonmonotonic fitting, bounded tokenization, work accounting, cancellation, repacking and long-document ownership tests."
+    ],
+    "prior_gpu_qualification": "See gliner-token-fitting-20261103.json at base commit e04da50001; GPU execution was not rerun for this host-only fitting change."
+  },
+  "reproduce": {
+    "environment": {
+      "ANTFLY_GLINER25_BASE_MODEL_DIR": "Path to the pinned fastino/gliner2.5-base-v1 artifact."
+    },
+    "command_from_zig": "ZIG_GLOBAL_CACHE_DIR=\"$PWD/../.zig-cache/global\" zig build inference-test -Doptimize=debug -j1 --cache-dir ../.zig-cache -Dtest-filter=\"boundary qualification\" -Dtest-filter=pipelines.gliner_boundary_processor.test. -Dtest-filter=pipelines.gliner_boundary_long_document.test."
+  }
+}

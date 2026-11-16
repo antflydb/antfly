@@ -28,6 +28,16 @@ pub fn chunkText(
     chunk_size: u32,
     chunk_overlap: u32,
 ) ![]Chunk {
+    return chunkTextMinimumContent(alloc, text, chunk_size, chunk_overlap, 0);
+}
+
+fn chunkTextMinimumContent(
+    alloc: Allocator,
+    text: []const u8,
+    chunk_size: u32,
+    chunk_overlap: u32,
+    min_chars: u32,
+) ![]Chunk {
     if (chunk_size == 0) return &.{};
     if (chunk_overlap >= chunk_size) return error.InvalidChunkOverlap;
 
@@ -51,16 +61,18 @@ pub fn chunkText(
         const backward_end = utf8_text.snapToBoundary(source_text, raw_end, .backward);
         const end = if (backward_end > start) backward_end else utf8_text.snapToBoundary(source_text, raw_end, .forward);
         if (end <= start) break;
-        // Reserve the destination before allocating its owned payload. A
-        // failed list growth must not strand the text outside cleanup's slice.
-        try chunks.ensureUnusedCapacity(alloc, 1);
-        chunks.appendAssumeCapacity(.{
-            .chunk_id = chunk_id,
-            .text = try alloc.dupe(u8, source_text[start..end]),
-            .start_offset = mapOffset(&sanitized, start, .start),
-            .end_offset = mapOffset(&sanitized, end, .end),
-        });
-        chunk_id += 1;
+        if (@import("inference_chunker").types.hasMinimumTextContent(source_text[start..end], min_chars)) {
+            // Reserve the destination before allocating its owned payload. A
+            // failed list growth must not strand the text outside cleanup's slice.
+            try chunks.ensureUnusedCapacity(alloc, 1);
+            chunks.appendAssumeCapacity(.{
+                .chunk_id = chunk_id,
+                .text = try alloc.dupe(u8, source_text[start..end]),
+                .start_offset = mapOffset(&sanitized, start, .start),
+                .end_offset = mapOffset(&sanitized, end, .end),
+            });
+            chunk_id += 1;
+        }
         if (end == source_text.len) break;
         const previous_start = start;
         const raw_next = previous_start + step;
@@ -70,6 +82,11 @@ pub fn chunkText(
     }
 
     return try chunks.toOwnedSlice(alloc);
+}
+
+pub fn chunkTextWithConfigJsonControlled(alloc: Allocator, text: []const u8, config_json: []const u8, context: ?@import("antfly_inference_execution_context").RequestContext) ![]Chunk {
+    if (context) |control| try control.check();
+    return chunkTextWithConfigJson(alloc, text, config_json);
 }
 
 pub fn chunkTextWithConfigJson(
@@ -89,18 +106,20 @@ pub fn chunkTextWithConfigJson(
     const source_text = sanitized.text;
 
     const chunks = try switch (cfg.provider) {
-        .mock => chunkText(
+        .mock => chunkTextMinimumContent(
             alloc,
             source_text,
             cfg.defaultedTargetTokens(),
             cfg.defaultedOverlapTokens(),
+            cfg.text.min_chars,
         ),
         .antfly => if (cfg.model.len == 0)
-            chunkText(
+            chunkTextMinimumContent(
                 alloc,
                 source_text,
                 cfg.defaultedTargetTokens(),
                 cfg.defaultedOverlapTokens(),
+                cfg.text.min_chars,
             )
         else
             error.UnsupportedPlatform,
@@ -114,8 +133,61 @@ pub fn chunkTextWithConfigJsonAndProvider(
     alloc: Allocator,
     text: []const u8,
     config_json: []const u8,
-    _: anytype,
+    supplied: ?@import("../../../chunking/provider.zig").Provider,
 ) ![]Chunk {
+    const provider_mod = @import("../../../chunking/provider.zig");
+    const shared = @import("inference_chunker");
+    if (supplied) |provider| {
+        var cfg = try chunking_types.parseConfigFromSlice(alloc, config_json);
+        defer cfg.deinit(alloc);
+        const linked = provider.chunk_input_with_context_callback != null or provider.chunk_input_callback != null;
+        // Minimal owners may borrow an explicitly supplied text executor.
+        // Remote sockets and model/media execution remain unavailable here.
+        if (cfg.provider == .antfly and !cfg.isModelAware() and linked and std.mem.trim(u8, cfg.api_url, " \t\r\n").len == 0) {
+            const ptr = provider.ptr orelse return error.InvalidChunkProvider;
+            const dispatch = provider.boundary_dispatch orelse return error.InvalidChunkProvider;
+            const io = provider.execution.io orelse if (@import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi)
+                return error.BackendRuntimeIoUnavailable
+            else
+                std.Io.Threaded.global_single_threaded.io();
+            const context = provider.execution.requestContext(io);
+            try context.check();
+            var sanitized = try utf8_text.sanitizeAlloc(alloc, text, "configured enrichment chunker");
+            defer sanitized.deinit(alloc);
+            const name = if (cfg.model.len != 0) cfg.model else "fixed";
+            const input = shared.Input{ .text = sanitized.text };
+            const remote = dispatch_call: {
+                const accounting = provider.dispatch_accounting;
+                const started = if (accounting) |hook| try hook.begin(hook.ptr) else 0;
+                defer if (accounting) |hook| hook.finish(hook.ptr, started);
+                break :dispatch_call if (provider.chunk_input_with_context_callback) |raw| blk: {
+                    const callback: provider_mod.ChunkInputWithContextFn = @ptrCast(@alignCast(raw));
+                    break :blk try provider_mod.CallbackBoundary.call("chunk_input_with_context", dispatch, callback, .{ ptr, alloc, name, input, cfg, context });
+                } else blk: {
+                    const callback: provider_mod.ChunkInputFn = @ptrCast(@alignCast(provider.chunk_input_callback.?));
+                    break :blk try provider_mod.CallbackBoundary.call("chunk_input", dispatch, callback, .{ ptr, alloc, name, input, cfg });
+                };
+            };
+            defer shared.types.freeChunks(alloc, remote);
+            try context.check();
+            const chunks = try alloc.alloc(Chunk, remote.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (chunks[0..initialized]) |*chunk| chunk.deinit(alloc);
+                alloc.free(chunks);
+            }
+            for (remote, chunks) |source, *chunk| {
+                if (!std.mem.eql(u8, source.mime_type, "text/plain")) return error.UnsupportedChunkMediaType;
+                const content = source.text orelse return error.InvalidChunkerResponse;
+                const offsets = chunk_mod.completeTextOffsetPair(source.start_char, source.end_char, sanitized.text.len);
+                chunk.* = .{ .chunk_id = source.id, .text = try alloc.dupe(u8, content), .start_offset = offsets.start, .end_offset = offsets.end };
+                initialized += 1;
+                if (source.metadata) |metadata| chunk.metadata = try metadata.clone(alloc);
+            }
+            remapChunkOffsets(&sanitized, chunks);
+            return chunks;
+        }
+    }
     return try chunkTextWithConfigJson(alloc, text, config_json);
 }
 

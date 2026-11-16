@@ -55,7 +55,7 @@ def test_native_changes_restart_replays_exact_request_without_losing_newer_rows(
 
     monkeypatch.setattr(native_ingest, "urlopen", lost)
     with pytest.raises(OSError):
-        native_ingest.publish(state, "http://antfly/db/v1", "hn")
+        native_ingest.publish(state, "https://antfly/db/v1", "hn")
     before = json.loads(sent[0])
     assert before["expected_checkpoint"] is None
     state.db.close()
@@ -67,11 +67,11 @@ def test_native_changes_restart_replays_exact_request_without_losing_newer_rows(
         return Accepted(1 if len(sent) == 2 else 2)
 
     monkeypatch.setattr(native_ingest, "urlopen", success)
-    assert native_ingest.publish(state, "http://antfly/db/v1", "hn")["wal_lsn"] == 1
+    assert native_ingest.publish(state, "https://antfly/db/v1", "hn")["wal_lsn"] == 1
     assert sent[1] == sent[0]
     assert list(state.db.entries("change:"))
     state.put({"id": 2, "type": "comment", "deleted": True, "time": 1})
-    assert native_ingest.publish(state, "http://antfly/db/v1", "hn")["wal_lsn"] == 2
+    assert native_ingest.publish(state, "https://antfly/db/v1", "hn")["wal_lsn"] == 2
     next_batch = json.loads(sent[2])
     assert next_batch["expected_checkpoint"] == before["checkpoint"]
     assert next_batch["epoch"] == before["epoch"]
@@ -92,10 +92,10 @@ def test_native_changes_keeps_pending_transaction_when_endpoint_changes(
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("timeout")),
     )
     with pytest.raises(OSError):
-        native_ingest.publish(state, "http://antfly/db/v1", "hn")
+        native_ingest.publish(state, "https://antfly/db/v1", "hn")
     pending = state.get("native_changes_request")
     with pytest.raises(RuntimeError, match="different native table"):
-        native_ingest.publish(state, "http://other/db/v1", "hn")
+        native_ingest.publish(state, "https://other/db/v1", "hn")
     assert state.get("native_changes_request") == pending
     state.db.close()
 
@@ -113,16 +113,16 @@ def test_native_cohorts_route_edits_and_deletes_by_retained_creation_time(
         return Accepted(len(sent))
 
     monkeypatch.setattr(native_ingest, "urlopen", success)
-    native_ingest.publish(state, "http://antfly/db/v1", "history", created_before=20)
+    native_ingest.publish(state, "https://antfly/db/v1", "history", created_before=20)
     assert [change["row"]["hn_id"] for change in sent[0]["changes"]] == [1]
     assert not list(state.db.entries("change:"))
     state.put({"id": 1, "deleted": True})
     state.put({"id": 2, "points": 10})
-    native_ingest.publish(state, "http://antfly/db/v1", "history", created_before=20)
+    native_ingest.publish(state, "https://antfly/db/v1", "history", created_before=20)
     assert sent[1]["changes"] == [{"op": "delete", "row": {"hn_id": 1}}]
     with pytest.raises(RuntimeError, match="boundaries cannot change"):
         native_ingest.publish(
-            state, "http://antfly/db/v1", "history", created_before=21
+            state, "https://antfly/db/v1", "history", created_before=21
         )
     state.db.close()
 
@@ -140,13 +140,48 @@ def test_native_cohort_consumes_only_foreign_markers_without_a_false_checkpoint(
         ),
     )
     assert (
-        native_ingest.publish(state, "http://antfly/db/v1", "current", created_after=20)
+        native_ingest.publish(
+            state, "https://antfly/db/v1", "current", created_after=20
+        )
         is None
     )
     assert not list(state.db.entries("change:"))
     assert not state.get("native_changes_checkpoint", "")
     state.put({"id": 2, "deleted": True})
     with pytest.raises(RuntimeError, match="original creation time"):
-        native_ingest.publish(state, "http://antfly/db/v1", "current", created_after=20)
+        native_ingest.publish(
+            state, "https://antfly/db/v1", "current", created_after=20
+        )
     assert list(state.db.entries("change:"))
     state.db.close()
+
+
+def test_unknown_native_acceptance_preserves_exact_request_and_checkpoint(monkeypatch):
+    from types import SimpleNamespace
+
+    intent = {
+        "endpoint": "https://antfly/db/v1/tables/hn/lake/changes",
+        "body": {"batch_id": "stable", "checkpoint": "10", "expected_checkpoint": "9"},
+        "pending": [["change:1", "marker"]],
+    }
+    values = {
+        "native_changes_request": json.dumps(intent),
+        "native_changes_checkpoint": "9",
+    }
+    state = SimpleNamespace(get=values.get, set=values.__setitem__)
+    sent = []
+
+    def unknown(request, **kwargs):
+        sent.append(request.data)
+        response = Accepted(1)
+        response.data = json.dumps({"state": "unknown", "searchable": False})
+        return response
+
+    monkeypatch.setattr(native_ingest, "authorization_headers", lambda: {})
+    monkeypatch.setattr(native_ingest, "urlopen", unknown)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="unconfirmed"):
+            native_ingest.publish(state, "https://antfly/db/v1", "hn")
+        assert json.loads(values["native_changes_request"]) == intent
+        assert values["native_changes_checkpoint"] == "9"
+    assert sent[0] == sent[1]

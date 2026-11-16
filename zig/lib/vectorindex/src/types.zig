@@ -55,6 +55,17 @@ pub const NativeResidualLocationPlane = struct {
             .residual_checksum = self.residual_checksums[index],
         };
     }
+
+    pub fn slice(self: @This(), start: usize, end: usize) @This() {
+        return .{
+            .reader_generations = self.reader_generations[start..end],
+            .reader_shard_ids = self.reader_shard_ids[start..end],
+            .revisions = self.revisions[start..end],
+            .residual_offsets = self.residual_offsets[start..end],
+            .residual_lengths = self.residual_lengths[start..end],
+            .residual_checksums = self.residual_checksums[start..end],
+        };
+    }
 };
 const Allocator = std.mem.Allocator;
 const vec = @import("antfly_vector").vector;
@@ -90,6 +101,8 @@ pub const HBCConfig = struct {
     dims: u32,
     metric: vec.DistanceMetric = .l2_squared,
     split_algo: vec.ClustAlgorithm = .kmeans,
+    /// Opt-in CPU L2 e-means for ordinary binary leaf splits only.
+    experimental_emeans_leaf_splits: bool = false,
     branching_factor: u32 = 16,
     leaf_size: u32 = 100,
     search_width: u32 = 32,
@@ -102,7 +115,19 @@ pub const HBCConfig = struct {
     rerank_policy: RerankPolicy = .always,
     quantizer_seed: u64 = 42,
     use_random_ortho_trans: bool = false,
+    /// RaBitQ bits per dimension. Above 1, every quantized set also carries
+    /// extended RaBitQ codes (`antfly_vector.rabitq_ex`) and leaf scoring
+    /// refines 1-bit estimates with them (`quantization_refine`). Extended
+    /// codes assume `use_random_ortho_trans`.
+    quantization_bits: u8 = 1,
+    quantization_refine: QuantizationRefine = .near_cutoff,
+    /// `near_cutoff` rescores a candidate when its 1-bit estimate minus this
+    /// many 1-bit error bounds could still enter the heap. The 1-bit bound
+    /// is roughly 1.3 standard deviations, so small values miss neighbors.
+    quantization_refine_margin: f32 = 2,
     bulk_build_algo: BulkBuildAlgo = .hilbert_seeded,
+    /// Optional reservoir size for Lloyd and e-means bulk leaf training. Zero uses all rows.
+    bulk_build_training_sample_size: usize = 0,
     prefer_key_local_leaf_splits: bool = false,
     key_local_leaf_split_penalty: f32 = 1.10,
     max_cached_nodes: usize = 100_000,
@@ -125,6 +150,16 @@ pub const HBCConfig = struct {
     flat_centroid_probe_count: usize = 0,
 };
 
+/// How leaf scoring uses extended codes when `quantization_bits > 1`.
+pub const QuantizationRefine = enum {
+    /// Score with 1-bit codes, then rescore with extended codes only the
+    /// candidates whose 1-bit lower bound could still enter the candidate
+    /// heap. Fixes admission at a fraction of the cost of scoring all.
+    near_cutoff,
+    /// Score every member with extended codes.
+    all,
+};
+
 pub const StorageBackend = enum {
     lsm,
 };
@@ -134,6 +169,8 @@ pub const BulkBuildAlgo = enum {
     hilbert_seeded,
     doc_key_seeded,
     kmeans,
+    /// Experimental CPU L2 leaf clustering; parent levels still use Lloyd.
+    emeans,
 };
 
 pub const Node = struct {
@@ -179,15 +216,20 @@ pub const Node = struct {
     }
 
     pub fn clone(self: Node, alloc: Allocator) !Node {
+        const centroid = try alloc.dupe(f32, self.centroid);
+        errdefer alloc.free(centroid);
+        const children = try alloc.dupe(u64, self.children);
+        errdefer alloc.free(children);
+        const members = try alloc.dupe(u64, self.members);
         return .{
             .id = self.id,
             .is_leaf = self.is_leaf,
             .level = self.level,
             .parent = self.parent,
-            .centroid = try alloc.dupe(f32, self.centroid),
+            .centroid = centroid,
             .covering_radius = self.covering_radius,
-            .children = try alloc.dupe(u64, self.children),
-            .members = try alloc.dupe(u64, self.members),
+            .children = children,
+            .members = members,
             .posting_state = self.posting_state,
             .backing = &.{},
         };
@@ -307,3 +349,20 @@ pub const SplitRebuildWork = struct {
         return self.right_only_members + self.mixed_right_members;
     }
 };
+
+test "node clone frees partial ownership after allocation failure" {
+    const Check = struct {
+        fn run(a: Allocator) !void {
+            var centroid = [_]f32{ 1, 2 };
+            var children = [_]u64{ 3, 4 };
+            var members = [_]u64{ 5, 6 };
+            const node: Node = .{ .id = 1, .is_leaf = false, .level = 1, .parent = 0, .centroid = &centroid, .children = &children, .members = &members };
+            var copy = try node.clone(a);
+            defer copy.deinit(a);
+            try std.testing.expectEqualSlices(f32, &centroid, copy.centroid);
+            try std.testing.expectEqualSlices(u64, &children, copy.children);
+            try std.testing.expectEqualSlices(u64, &members, copy.members);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}

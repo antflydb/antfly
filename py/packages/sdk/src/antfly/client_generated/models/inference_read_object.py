@@ -13,6 +13,7 @@ from ..models.inference_read_result_status import InferenceReadResultStatus
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.inference_audio_read_metadata import InferenceAudioReadMetadata
     from ..models.inference_read_result_fields_type_0 import InferenceReadResultFieldsType0
     from ..models.inference_read_result_inherited_parts_item import InferenceReadResultInheritedPartsItem
     from ..models.inference_read_result_raster_to_source_type_0 import InferenceReadResultRasterToSourceType0
@@ -31,6 +32,7 @@ class InferenceReadObject:
         text (str): Extracted text from the image Example: Invoice Total: $123.45.
         object_ (InferenceReadObjectObject):
         index (int): Original input image index.
+        audio (InferenceAudioReadMetadata | None | Unset):
         source_id (str | Unset): Original document source ID.
         number (int | Unset): One-based original page or slide number.
         kind (InferenceReadResultKind | Unset):
@@ -58,6 +60,7 @@ class InferenceReadObject:
     text: str
     object_: InferenceReadObjectObject
     index: int
+    audio: InferenceAudioReadMetadata | None | Unset = UNSET
     source_id: str | Unset = UNSET
     number: int | Unset = UNSET
     kind: InferenceReadResultKind | Unset = UNSET
@@ -76,6 +79,7 @@ class InferenceReadObject:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.inference_audio_read_metadata import InferenceAudioReadMetadata
         from ..models.inference_read_result_fields_type_0 import InferenceReadResultFieldsType0
         from ..models.inference_read_result_raster_to_source_type_0 import InferenceReadResultRasterToSourceType0
 
@@ -84,6 +88,14 @@ class InferenceReadObject:
         object_ = self.object_.value
 
         index = self.index
+
+        audio: dict[str, Any] | None | Unset
+        if isinstance(self.audio, Unset):
+            audio = UNSET
+        elif isinstance(self.audio, InferenceAudioReadMetadata):
+            audio = self.audio.to_dict()
+        else:
+            audio = self.audio
 
         source_id = self.source_id
 
@@ -161,6 +173,8 @@ class InferenceReadObject:
                 "index": index,
             }
         )
+        if audio is not UNSET:
+            field_dict["audio"] = audio
         if source_id is not UNSET:
             field_dict["source_id"] = source_id
         if number is not UNSET:
@@ -196,6 +210,7 @@ class InferenceReadObject:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_audio_read_metadata import InferenceAudioReadMetadata
         from ..models.inference_read_result_fields_type_0 import InferenceReadResultFieldsType0
         from ..models.inference_read_result_inherited_parts_item import InferenceReadResultInheritedPartsItem
         from ..models.inference_read_result_raster_to_source_type_0 import InferenceReadResultRasterToSourceType0
@@ -209,6 +224,23 @@ class InferenceReadObject:
         object_ = InferenceReadObjectObject(d.pop("object"))
 
         index = d.pop("index")
+
+        def _parse_audio(data: object) -> InferenceAudioReadMetadata | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                audio_type_1 = InferenceAudioReadMetadata.from_dict(data)
+
+                return audio_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(InferenceAudioReadMetadata | None | Unset, data)
+
+        audio = _parse_audio(d.pop("audio", UNSET))
 
         source_id = d.pop("source_id", UNSET)
 
@@ -315,6 +347,7 @@ class InferenceReadObject:
             text=text,
             object_=object_,
             index=index,
+            audio=audio,
             source_id=source_id,
             number=number,
             kind=kind,

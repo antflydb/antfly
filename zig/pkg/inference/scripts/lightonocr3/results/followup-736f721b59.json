@@ -1,0 +1,13 @@
+{
+  "implementation_commit": "736f721b59",
+  "qualification_runtime_base": "ccec577d5e",
+  "archive_sha256": "149ae21a9a99940101b055626f374ad94876bd72e857cddc9b779e1e4a11997e",
+  "archive_bytes": 21923689,
+  "regular_files": 80,
+  "uri": "gs://antfly-image-artifacts-zig-build-artifacts/benchmarks/lightonocr3/followup-1308/736f721b59/149ae21a9a99940101b055626f374ad94876bd72e857cddc9b779e1e4a11997e/qualification.tar.gz",
+  "generation": "1793066243969265",
+  "md5_base64": "LN6TEUHbjV9tTeQ7oYl01Q==",
+  "scope": "Both LightOn models; F32 decode and two optional prefill modes; 64 requests/concurrency, two rounds, three synthetic fixtures. Functional graph and full-output qualification; no vLLM throughput parity claim.",
+  "source_note": "Frozen build163 precedes a required license-header-only formatting correction and the subsequent main merge. The bundle retains exact frozen source, binary identity, commands, safe environment settings and reference reports.",
+  "verification": "Uploaded object size and MD5 match the local archive. Each payload member has a SHA-256 in evidence-manifest.json; the outer archive SHA-256 also covers that manifest."
+}

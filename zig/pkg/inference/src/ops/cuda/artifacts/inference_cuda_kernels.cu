@@ -1470,6 +1470,66 @@ extern "C" __global__ void termite_linear_triple_bias_f32_tile4_r2(
     }
 }
 
+// Keep the original 256-thread reduction tree, but publish its final five
+// levels with warp shuffles instead of block-wide barriers.
+__device__ __forceinline__ float termite_rms_sum_tree_256_f32(float value, float* partial) {
+    const unsigned tid = threadIdx.x;
+    partial[tid] = value;
+    __syncthreads();
+    if (tid < 32u) {
+        const float a = partial[tid] + partial[tid + 128u];
+        const float b = partial[tid + 64u] + partial[tid + 192u];
+        const float c = partial[tid + 32u] + partial[tid + 160u];
+        const float d = partial[tid + 96u] + partial[tid + 224u];
+        float sum = (a + b) + (c + d);
+        for (unsigned offset = 16u; offset != 0u; offset >>= 1u) {
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        }
+        if (tid == 0u) partial[0] = sum;
+    }
+    __syncthreads();
+    return partial[0];
+}
+
+// E4B's short, single-row norms cannot hide dependent global loads behind
+// other rows. Retain the strided inputs/weights/residuals in registers across
+// the reduction. Each lane accumulates in exactly the original order.
+// Op 0: weighted RMS; 1: weighted RMS + residual; 2: scale after residual.
+template <unsigned Op>
+__device__ __forceinline__ void termite_rms_register_2560_f32(
+    float* dst, const float* input, const float* weight,
+    const float* residual, const float* scalar, float eps
+) {
+    const unsigned tid = threadIdx.x;
+    const unsigned base = blockIdx.x * 2560u;
+    __shared__ float partial[256];
+    float values[10], weights[10], residuals[10];
+#pragma unroll
+    for (unsigned j = 0u; j < 10u; ++j) {
+        const unsigned i = tid + j * 256u;
+        values[j] = input[base + i];
+        weights[j] = weight[i];
+        if (Op != 0u) residuals[j] = residual[base + i];
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (unsigned j = 0u; j < 10u; ++j) sum += values[j] * values[j];
+    const float sumsq = termite_rms_sum_tree_256_f32(sum, partial);
+    // Match the historical runtime-divisor rounding, even though this shape
+    // is specialized: a constant reciprocal multiply is not equivalent.
+    float mean;
+    asm volatile("div.rn.f32 %0, %1, %2;" : "=f"(mean) : "f"(sumsq), "f"(2560.0f));
+    const float scale = rsqrtf(mean + eps);
+    const float output_scale = Op == 2u ? scalar[0] : 1.0f;
+#pragma unroll
+    for (unsigned j = 0u; j < 10u; ++j) {
+        float value = values[j] * scale * weights[j];
+        if (Op != 0u) value += residuals[j];
+        if (Op == 2u) value *= output_scale;
+        dst[base + tid + j * 256u] = value;
+    }
+}
+
 extern "C" __global__ void termite_rms_norm_f32(
     float* dst,
     const float* input,
@@ -1480,6 +1540,10 @@ extern "C" __global__ void termite_rms_norm_f32(
 ) {
     unsigned int row = blockIdx.x;
     if (row >= rows) return;
+    if (dim == 2560u && blockDim.x == 256u) {
+        termite_rms_register_2560_f32<0u>(dst, input, weight, nullptr, nullptr, eps);
+        return;
+    }
     unsigned int tid = threadIdx.x;
     const unsigned int base = row * dim;
     __shared__ float partial[256];
@@ -1545,6 +1609,10 @@ extern "C" __global__ void termite_rms_norm_add_f32(
 ) {
     unsigned int row = blockIdx.x;
     if (row >= rows) return;
+    if (dim == 2560u && blockDim.x == 256u) {
+        termite_rms_register_2560_f32<1u>(dst, input, weight, residual, nullptr, eps);
+        return;
+    }
     unsigned int tid = threadIdx.x;
     const unsigned int base = row * dim;
     __shared__ float partial[256];
@@ -1647,6 +1715,10 @@ extern "C" __global__ void termite_rms_norm_add_output_scale_f32(
 ) {
     unsigned int row = blockIdx.x;
     if (row >= rows) return;
+    if (dim == 2560u && blockDim.x == 256u) {
+        termite_rms_register_2560_f32<2u>(dst, input, weight, residual, scalar, eps);
+        return;
+    }
     unsigned int tid = threadIdx.x;
     const unsigned int base = row * dim;
     __shared__ float partial[256];
@@ -2388,7 +2460,8 @@ extern "C" __global__ void termite_gliner_gru_combine_f32(
     const float* gi,
     const float* gh,
     unsigned int rows,
-    unsigned int dim
+    unsigned int dim,
+    unsigned int add_residual
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int count = rows * dim;
@@ -2401,7 +2474,7 @@ extern "C" __global__ void termite_gliner_gru_combine_f32(
     float n = tanhf(gi[gate_base + dim * 2u] + r * gh[gate_base + dim * 2u]);
     float h0 = label_embeddings[idx];
     float h1 = (1.0f - z) * n + z * h0;
-    dst[idx] = h1 + h0;
+    dst[idx] = add_residual ? h1 + h0 : h1;
 }
 
 extern "C" __global__ void termite_concat_lastdim_f32(
@@ -21321,6 +21394,7 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b
     }
 }
 
+
 extern "C" __global__ void termite_linear_q6_k_q8_1_f32_tile8_e4b(
     float* dst,
     const unsigned char* input_q8_1,
@@ -23772,6 +23846,10 @@ extern "C" __global__ void termite_deberta_attention_fused_f32(
         __syncthreads();
     }
     const float max_score = reductions[0];
+    // Every warp must consume the maximum before thread 0 reuses this
+    // shared location for its denominator partial. Ragged/long rows can
+    // otherwise observe the partial sum as their maximum.
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += kThreads) {
@@ -23795,6 +23873,88 @@ extern "C" __global__ void termite_deberta_attention_fused_f32(
         dst[(b * seq_len + qi) * hidden + head_off + tid] = denom > 0.0f ? acc / denom : 0.0f;
     }
 }
+
+// FP32 streaming DeBERTa attention: eight independent query warps per block.
+// Keep Q and online-softmax accumulators in registers. No reduced-precision
+// conversion or shared score tile is needed. The exact Decide CUDA profile
+// selects this route; other profiles retain their existing attention dispatch.
+extern "C" __global__ void termite_deberta_attention_stream_f32(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* q_r,
+    const float* k_r,
+    const long long* mask,
+    unsigned int batch,
+    unsigned int seq_len,
+    unsigned int num_heads,
+    unsigned int head_dim
+) {
+    constexpr unsigned int kWarpsPerBlock = 8u;
+    constexpr unsigned int kHeadDim = 64u;
+    if (seq_len == 0u || seq_len > 512u || head_dim != kHeadDim || blockDim.x != 256u) return;
+
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5u;
+    const unsigned int block = blockIdx.x;
+    const unsigned int query_group = block % ((seq_len + kWarpsPerBlock - 1u) / kWarpsPerBlock);
+    const unsigned int bh = block / ((seq_len + kWarpsPerBlock - 1u) / kWarpsPerBlock);
+    const unsigned int head = bh % num_heads;
+    const unsigned int b = bh / num_heads;
+    const unsigned int qi = query_group * kWarpsPerBlock + warp;
+    if (b >= batch || qi >= seq_len) return;
+
+    const unsigned int hidden = num_heads * head_dim;
+    const unsigned int head_off = head * head_dim;
+    const unsigned int q_base = (b * seq_len + qi) * hidden + head_off;
+    const float scale = rsqrtf((float)head_dim * 3.0f);
+    const float q0 = q[q_base + lane];
+    const float q1 = q[q_base + lane + 32u];
+
+    float running_max = -3.402823466e+38f;
+    float running_sum = 0.0f;
+    float value0 = 0.0f;
+    float value1 = 0.0f;
+    for (unsigned int ki = 0u; ki < seq_len; ++ki) {
+        if (mask[b * seq_len + ki] == 0ll) continue;
+        const unsigned int k_base = (b * seq_len + ki) * hidden + head_off;
+        const unsigned int rel_idx = qi + seq_len - 1u - ki;
+        const unsigned int rel_base = rel_idx * hidden + head_off;
+        const float k0 = k[k_base + lane];
+        const float k1 = k[k_base + lane + 32u];
+        const float kr0 = k_r[rel_base + lane];
+        const float kr1 = k_r[rel_base + lane + 32u];
+        const float qr0 = q_r[rel_base + lane];
+        const float qr1 = q_r[rel_base + lane + 32u];
+        // Preserve the fused FP32 kernel's per-lane accumulation order.
+        float score = 0.0f;
+        score += q0 * k0;
+        score += q0 * kr0;
+        score += qr0 * k0;
+        score += q1 * k1;
+        score += q1 * kr1;
+        score += qr1 * k1;
+        score += __shfl_down_sync(0xffffffffu, score, 16);
+        score += __shfl_down_sync(0xffffffffu, score, 8);
+        score += __shfl_down_sync(0xffffffffu, score, 4);
+        score += __shfl_down_sync(0xffffffffu, score, 2);
+        score += __shfl_down_sync(0xffffffffu, score, 1);
+        score = __shfl_sync(0xffffffffu, score, 0) * scale;
+
+        const float next_max = fmaxf(running_max, score);
+        const float alpha = expf(running_max - next_max);
+        const float beta = expf(score - next_max);
+        value0 = value0 * alpha + beta * v[k_base + lane];
+        value1 = value1 * alpha + beta * v[k_base + lane + 32u];
+        running_sum = running_sum * alpha + beta;
+        running_max = next_max;
+    }
+    const float inv_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+    dst[q_base + lane] = value0 * inv_sum;
+    dst[q_base + lane + 32u] = value1 * inv_sum;
+}
+
 
 // FP16-storage DeBERTa-v3 encoder prefill attention.  Unlike the F32 fused
 // fallback above, each warp owns a query and performs an online softmax while
@@ -27583,3 +27743,13 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attent
 #include "../../../graph/templates/cuda_gqa_repeat_split_f16.cuh"
 // Append inference-only kernels so existing kernel numbering stays stable.
 #include "../kernels/embedding_gemma2_optimized.cuh"
+
+// Keep additional Gemma4 entry points after the existing bundle to preserve kernel numbering.
+#include "../kernels/rms_q8_1_2560.cuh"
+#include "../kernels/gemma4_e4b_prefetch.cuh"
+
+#include "../kernels/gemma4_q4_prefill.cuh"
+
+#include "../kernels/gemma4_vision_norm_rope.cuh"
+
+#include "../kernels/gemma4_vision_attention.cuh"

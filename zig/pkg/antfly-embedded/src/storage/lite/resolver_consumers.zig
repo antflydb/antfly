@@ -62,8 +62,8 @@ pub fn enqueue(a: A, txn: anytype, source_prefix: []const u8, work: Work) !void 
         } else |err| if (err != error.NotFound) return err;
     }
     try txn.put(key, try std.json.Stringify.valueAlloc(a, desired, .{}));
-    try txn.put("\x00\x00__metadata__:minimum_reader_version", "23");
-    if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "23");
+    try txn.put("\x00\x00__metadata__:minimum_reader_version", "29");
+    if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "29");
 }
 pub fn invalidateTarget(a: A, txn: anytype, table: []const u8, template: ?[]const u8) !void {
     const target = if (template) |value| try namespacePrefix(a, table, value) else try targetPrefix(a, table);
@@ -229,8 +229,8 @@ pub fn synchronize(a: A, txn: anytype, source_prefix: []const u8, before: ?[]con
     if (txn.get(marker)) |_| {
         // Existing handles may predate bootstrap's in-memory reader floor.
         // Every subsequent catalog write keeps the durable floor monotonic.
-        try txn.put("\x00\x00__metadata__:minimum_reader_version", "23");
-        if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "23");
+        try txn.put("\x00\x00__metadata__:minimum_reader_version", "29");
+        if (source_prefix.len > 0) try txn.put(try std.mem.concat(a, u8, &.{ source_prefix, "\x00\x00__metadata__:minimum_reader_version" }), "29");
     } else |err| if (err != error.NotFound) return err;
     const old = if (before) |raw| try definitions(a, raw) else &.{};
     const next = if (after) |raw| try definitions(a, raw) else &.{};
@@ -293,6 +293,13 @@ pub fn bootstrap(a: A, txn: anytype) !void {
                 for ([_][]const u8{ prefix, namespace_prefix, routes_prefix, profiles_prefix }) |scope| {
                     var cursor = try txn.openCursor();
                     defer cursor.close();
+                    // Discarded projections need only their keys. In particular,
+                    // static profile definitions can own large external values.
+                    cursor.setKeysOnly();
+                    const upper = try a.dupe(u8, scope);
+                    std.debug.assert(upper[upper.len - 1] == '/');
+                    upper[upper.len - 1] += 1;
+                    cursor.setUpperBound(upper);
                     var row = try seekEntry(&cursor, scope);
                     while (row) |entry| {
                         if (!std.mem.startsWith(u8, entry.key, scope)) break;
@@ -319,7 +326,7 @@ pub fn bootstrap(a: A, txn: anytype) !void {
                 try enqueue(a, txn, source, .{ .table = binding.table, .key_template = binding.key_template, .namespace_curation_table_id = binding.namespace_curation_table_id, .namespace_curation_generation = binding.namespace_curation_generation, .namespace_curation_missing = binding.namespace_curation_missing });
                 binding_row = try nextEntry(&cursor);
             }
-            try txn.put("\x00\x00__metadata__:minimum_reader_version", "23");
+            try txn.put("\x00\x00__metadata__:minimum_reader_version", "29");
             try txn.put(marker, "1");
             break :blk "1";
         },

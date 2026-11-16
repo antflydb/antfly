@@ -37,6 +37,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data runtime commit requirements",
         "data runtime ordered artifact upload handoff",
         "data runtime hosted FK retirement",
         "pure topology control bypasses only ordinary dense repair writer preflight",
@@ -131,7 +132,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
         "remote metadata source restore staging authority binds every owner read",
+        "remote table descriptors prefer ordered peers before legacy fallback",
         "remote metadata mutation failover preserves ambiguous and deterministic outcomes",
+        "privacy remote mutation forwarding retains response metadata through the status source",
+        "privacy remote read bindings pin metadata identity and never fall back to full catalogs",
         "remote metadata mutation discovery preserves forwarding budget for the configured leader",
         "remote metadata mutation discovery preserves endpoint coverage and delivery time",
         "remote metadata source retains mutation authority across cache invalidation",
@@ -145,7 +149,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "remote metadata source shares backend runtime io across a bounded executor pool",
         "remote routing cache entries retain immutable snapshots outside the cache lock",
         "remote routing never publishes a cache entry after its deadline",
-        "remote routing normalizes every timeout class at the source boundary",
+        "remote routing preserves cancellation while normalizing timeout classes",
         "remote await route plan cloning preserves its absolute deadline",
         "remote metadata catalog source provides compact routing",
         "remote metadata routing negotiation upgrades the N-1 adapter",
@@ -191,6 +195,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft protocol barrier is fail closed for legacy batch parsers",
         "raft protocol barrier rejects unsupported future versions",
         "raft proposal materializes a default batch timestamp exactly once",
+        "raft proposal preserves isolated catalog admission through document revision negotiation",
+        "raft proposal preserves guarded graph cleanup through document revision negotiation",
+        "raft cleanup protocol preflight rejects mixed decoders and rechecks upgraded peers",
         "online merge admission distinguishes unsupported peers and fences leader authority",
         "distributed online merge admission declines both owners and direct source proposals",
         "data raft raw topology rejection advances delegate with exact typed outcome",
@@ -199,6 +206,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft batch protocol cache reuses only short lived negative evidence",
         "raft batch protocol activation is reusable only in its accepted leader term",
         "raft batch protocol activation cleanup preserves in flight references",
+        "time series document revision protocol dominates older envelope features",
+        // Zig 0.17 response files treat apostrophes as quote delimiters even
+        // inside double-quoted arguments. Keep the test name intact and select
+        // it with its unique quote-free prefix on both compiler and run paths.
+        "time series optional revision upgrade preserves a mixed group",
         "data raft forwarding admission waits within the borrowed deadline and cancellation",
         "data raft apply completion notifications fence reuse deadlines and bounded ownership",
         "data raft retry clock and sleep borrow VoprIo",
@@ -272,6 +284,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_data_runtime_tests = @import("linked_tests.zig").runPair(b, lib_data_runtime_tests, implementation_tests);
     const lib_data_runtime_test_step = b.step("antfly-data-runtime-test", "Run focused data runtime tests");
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
+    const privacy_forwarding_tests = @import("linked_tests.zig").add(b, .{
+        .name = "data-privacy-forwarding-tests",
+        .root_module = data_runtime_test_mod,
+        .filters = &.{ "privacy remote mutation forwarding retains response metadata through the status source", "privacy remote read bindings pin metadata identity and never fall back to full catalogs" },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-data-privacy-forwarding-test", "Verify privacy response metadata through remote discovery and the status-source handoff")
+        .dependOn(&privacy_forwarding_tests.run(b).step);
     const private_initial_owner_predicate_tests = b.addTest(.{
         .name = "data-private-initial-owner-predicate-tests",
         .root_module = options.data_implementation_module,
@@ -282,6 +302,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, private_initial_owner_predicate_tests).step);
 
     const lib_data_storage_default_filters = [_][]const u8{
+        "privacy data raft apply batches WAL-durable commands without one SST per entry",
+        "privacy data raft apply compaction families are contiguous and separate hot metadata from history",
         "membership reducer",
         "FK retirement worker",
         "data raft online topology arbitration persists exact rejection and scopes release across reopen",

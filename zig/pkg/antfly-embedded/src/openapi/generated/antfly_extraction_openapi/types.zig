@@ -4,6 +4,48 @@
 const std = @import("std");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 
+/// Recognition options, checked against every selected backend and fallback before inference. Whisper supports all options and pause-aware windowing of long recordings. Gemma supports transcription up to 30 seconds and rejects language, timestamps and diarization requests. No backend is substituted to satisfy an option.
+pub const AudioReadOptions = struct {
+    /// Force recognition in this language (e.g. en). Omitted means detect language where supported; this is not a translation or cleanup request. Gemma does not support language control or detection metadata.
+    language: ?[]const u8 = null,
+    /// Request phrase timestamps in milliseconds relative to the original source recording. Defaults to false. Does not imply word alignment.
+    timestamps: ?bool = null,
+    /// Request speaker labels and temporal segments. Defaults to false. Whisper requires the local speaker embedding model; unavailable models cause an explicit error. Implies timestamp decoding.
+    diarization: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "language", "language", true },
+        .{ "timestamps", "timestamps", true },
+        .{ "diarization", "diarization", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
+            try jw.write(value);
+        }
+        if (self.diarization) |value| {
+            try jw.objectField("diarization");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const DocumentSource = struct {
     /// Image-only perspective correction. Four clockwise corners in original image-edge pixels, ordered top-left, top-right, bottom-right, bottom-left. OCR evidence remains in original source coordinates.
     quadrilateral: ?[]const []const f64 = null,
@@ -12,7 +54,7 @@ pub const DocumentSource = struct {
     /// Inline data URI or location allowed by the deployment content security policy.
     url: []const u8,
     media_type: []const u8,
-    /// Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide.
+    /// Optional one-based page/slide selection, returned in original source order. Omission selects every visible page/slide. Audio/video recordings are one source unit and do not accept page selection.
     pages: ?[]const i64 = null,
     /// Include slide speaker notes as separate evidence, never silently as visible slide text.
     include_notes: ?bool = null,
@@ -309,6 +351,14 @@ pub const ExtractionConfig = struct {
     schema_version: ?std.json.Value = null,
     url: ?[]const u8 = null,
     api_url: ?[]const u8 = null,
+    /// Google Cloud project for the vertex provider.
+    project_id: ?[]const u8 = null,
+    /// Vertex AI location.
+    location: ?[]const u8 = null,
+    /// AWS region for the bedrock provider.
+    region: ?[]const u8 = null,
+    /// Path to Google service account credentials for the vertex provider.
+    credentials_path: ?[]const u8 = null,
     /// Cloudflare Workers AI account identifier.
     account_id: ?[]const u8 = null,
     /// Optional Cloudflare AI Gateway identifier.
@@ -325,6 +375,10 @@ pub const ExtractionConfig = struct {
         .{ "schema_version", "schema_version", true },
         .{ "url", "url", true },
         .{ "api_url", "api_url", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "region", "region", true },
+        .{ "credentials_path", "credentials_path", true },
         .{ "account_id", "account_id", true },
         .{ "gateway_id", "gateway_id", true },
         .{ "api_key", "api_key", true },
@@ -359,6 +413,22 @@ pub const ExtractionConfig = struct {
         }
         if (self.api_url) |value| {
             try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
             try jw.write(value);
         }
         if (self.account_id) |value| {
@@ -852,6 +922,7 @@ pub const ExtractionInputRequest = union(enum) {
             if (try parseStructuralVariant(GeneratedExtractionRequest, allocator, source, options)) |parsed| return .{ .generated_extraction_request = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
+            "audio_options",
             "model",
             "schema_version",
             "read_artifact",
@@ -1695,6 +1766,10 @@ pub const ExtractionProvider = enum {
     pioneer,
     cloudflare,
     openai,
+    gemini,
+    vertex,
+    anthropic,
+    bedrock,
     mock,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1703,6 +1778,10 @@ pub const ExtractionProvider = enum {
             .pioneer => "pioneer",
             .cloudflare => "cloudflare",
             .openai => "openai",
+            .gemini => "gemini",
+            .vertex => "vertex",
+            .anthropic => "anthropic",
+            .bedrock => "bedrock",
             .mock => "mock",
         };
         try jw.write(s);
@@ -1718,6 +1797,10 @@ pub const ExtractionProvider = enum {
             .{ "pioneer", .pioneer },
             .{ "cloudflare", .cloudflare },
             .{ "openai", .openai },
+            .{ "gemini", .gemini },
+            .{ "vertex", .vertex },
+            .{ "anthropic", .anthropic },
+            .{ "bedrock", .bedrock },
             .{ "mock", .mock },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -2014,11 +2097,12 @@ pub const ExtractionRelationSchema = struct {
 
 /// Atomic extraction request. Supply exactly one of inputs, documents or read_artifact. Every input is validated before inference; failures return no partial data.
 pub const ExtractionRequest = struct {
+    audio_options: ?AudioReadOptions = null,
     model: []const u8,
     schema_version: ?std.json.Value = null,
     /// Opaque handle returned by read with retain_artifact. Mutually exclusive with inputs and documents. Reuses the immutable complete reading without downloading or running OCR again. Handles expire and are local to the serving process.
     read_artifact: ?[]const u8 = null,
-    /// Complete PDF/PPTX/image sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping.
+    /// Complete PDF/PPTX/image/audio sources. Mutually exclusive with inputs. Reading and extraction share document adapters and preserve independent source grouping.
     documents: ?[]const DocumentSource = null,
     inputs: ?[]const ExtractionInput = null,
     schema: ExtractionSchema,
@@ -2026,6 +2110,7 @@ pub const ExtractionRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "audio_options", "audio_options", true },
         .{ "model", "model", false },
         .{ "schema_version", "schema_version", true },
         .{ "read_artifact", "read_artifact", true },
@@ -2045,6 +2130,10 @@ pub const ExtractionRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.audio_options) |value| {
+            try jw.objectField("audio_options");
+            try jw.write(value);
+        }
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.schema_version) |value| {

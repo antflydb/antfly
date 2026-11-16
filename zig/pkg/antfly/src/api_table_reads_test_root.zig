@@ -21,6 +21,12 @@ const http_client = @import("api/http_client.zig");
 const storage_db = @import("antfly_source_root").antfly_sources.selected_db;
 
 test {
+    _ = @import("antfly_local_sources").api_index_metadata.aliases;
+    _ = @import("antfly_local_sources").metadata_lake_index_catalog;
+    _ = @import("api/index_aliases.zig");
+    _ = @import("api/index_alias_cache.zig");
+    _ = @import("system_catalog/graph_bindings.zig");
+    _ = @import("metadata/service.zig");
     _ = @import("api/retained_read_owner.zig");
     _ = @import("api/retained_read_rpc.zig");
     _ = @import("api/retained_read_client.zig");

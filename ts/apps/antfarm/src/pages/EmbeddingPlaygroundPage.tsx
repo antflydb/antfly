@@ -10,9 +10,10 @@ import {
   DashboardPageHeader,
   DashboardPageTitle,
   DashboardToolbar,
+  Field,
+  FieldLabel,
   FormActions,
   Input,
-  Label,
   Select,
   SelectContent,
   SelectItem,
@@ -101,7 +102,7 @@ function EmbeddingSparkline({
     <svg
       width={width}
       height={height}
-      className="shrink-0 rounded-none"
+      className="shrink-0 rounded-md"
       aria-label="Embedding vector preview"
     >
       <rect width={width} height={height} className="fill-muted/50" rx={2} />
@@ -300,7 +301,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
     <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
-          <DashboardPageTitle className="font-aeonik">Embedding Playground</DashboardPageTitle>
+          <DashboardPageTitle>Embedding Playground</DashboardPageTitle>
           <DashboardPageDescription>
             Explore vector similarity between a query and documents using embedding models
           </DashboardPageDescription>
@@ -330,8 +331,8 @@ const EmbeddingPlaygroundPage: React.FC = () => {
         <CardContent className="space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {/* Model Selection */}
-            <div className="space-y-2">
-              <Label htmlFor="model">Embedder Model</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="model">Embedder Model</FieldLabel>
               <Select
                 value={selectedModel}
                 onValueChange={setSelectedModel}
@@ -356,18 +357,18 @@ const EmbeddingPlaygroundPage: React.FC = () => {
                   ))}
                 </SelectContent>
               </Select>
-            </div>
+            </Field>
 
             {/* Query */}
-            <div className="space-y-2">
-              <Label htmlFor="query">Query</Label>
+            <Field className="gap-2">
+              <FieldLabel htmlFor="query">Query</FieldLabel>
               <Input
                 id="query"
                 placeholder="Enter a query to compare against documents..."
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
               />
-            </div>
+            </Field>
           </div>
           <FormActions>
             <AIWorkflowSubmitButton
@@ -394,7 +395,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
       </Card>
       {/* Error Display */}
       {error && (
-        <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
@@ -448,9 +449,11 @@ const EmbeddingPlaygroundPage: React.FC = () => {
           <CardContent className="flex-1 space-y-3 max-h-[600px] overflow-y-auto">
             {documents.map((doc, index) => (
               // biome-ignore lint/suspicious/noArrayIndexKey: document inputs identified by position
-              <div key={index} className="space-y-1">
+              <Field key={index} className="gap-1">
                 <div className="flex items-center justify-between">
-                  <Label className="text-xs text-muted-foreground">Document {index + 1}</Label>
+                  <FieldLabel className="text-xs text-muted-foreground">
+                    Document {index + 1}
+                  </FieldLabel>
                   <Button
                     variant="ghost"
                     size="sm"
@@ -467,7 +470,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
                   value={doc}
                   onChange={(e) => updateDocument(index, e.target.value)}
                 />
-              </div>
+              </Field>
             ))}
           </CardContent>
         </Card>
@@ -482,7 +485,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
               <div className="max-h-[600px] overflow-y-auto space-y-3">
                 {/* Query embedding preview */}
                 {queryEmbedding && showSparklines && (
-                  <div className="p-3 bg-muted/30 rounded-none border border-dashed space-y-2">
+                  <div className="p-3 bg-muted/30 rounded-lg border border-dashed space-y-2">
                     <div className="flex items-center gap-2">
                       <span className="text-xs font-medium text-muted-foreground">
                         Query vector
@@ -493,7 +496,7 @@ const EmbeddingPlaygroundPage: React.FC = () => {
                 )}
 
                 {results.map((doc, rank) => (
-                  <div key={doc.index} className="p-3 bg-muted/30 rounded-none border space-y-2">
+                  <div key={doc.index} className="p-3 bg-muted/30 rounded-lg border space-y-2">
                     <div className="flex items-center gap-2">
                       <span className="flex items-center justify-center w-6 h-6 rounded-full bg-primary/10 text-primary text-xs font-bold shrink-0">
                         {rank + 1}

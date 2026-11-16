@@ -25,6 +25,68 @@ spec.loader.exec_module(poc)
 
 
 class LakeMetricEvidenceTests(unittest.TestCase):
+    def test_publication_counters_distinguish_unavailable_reset_and_resumed_work(self):
+        before = {
+            "antfly_objectstore_put_calls_total": 7,
+            "antfly_objectstore_put_input_bytes_total": 100,
+            "antfly_objectstore_put_max_nanoseconds": 900,
+        }
+        after = dict(
+            before,
+            antfly_objectstore_put_calls_total=10,
+            antfly_objectstore_put_input_bytes_total=250,
+        )
+        profile = poc.publication_profile(before, after, 1.2345, True)
+        self.assertTrue(profile["counters_available"])
+        self.assertTrue(profile["fresh_registration"])
+        self.assertEqual(
+            profile["object_operations"],
+            {
+                "antfly_objectstore_put_calls_total": 3,
+                "antfly_objectstore_put_input_bytes_total": 150,
+            },
+        )
+        resumed = poc.publication_profile(before, after, 1, False)
+        self.assertFalse(resumed["fresh_registration"])
+        for missing, reset in (({}, {}), (after, before)):
+            invalid = poc.publication_profile(missing, reset, 1, False)
+            self.assertFalse(invalid["counters_available"])
+            self.assertIsNone(invalid["object_operations"])
+
+    def test_process_cpu_time_keeps_days_hours_and_fractional_seconds(self):
+        self.assertEqual(poc.process_cpu_seconds("  1:02.34\n"), 62.34)
+        self.assertEqual(poc.process_cpu_seconds("2:03:04.50"), 7384.5)
+        self.assertEqual(poc.process_cpu_seconds("1-02:03:04.50"), 93784.5)
+        for invalid in ("", "nan:00", "1:-1", "1:2:3:4"):
+            with self.assertRaises(ValueError):
+                poc.process_cpu_seconds(invalid)
+
+    def test_object_operations_and_request_outliers_survive_without_arbitrary_labels(
+        self,
+    ):
+        text = (
+            "antfly_objectstore_bucket_probe_calls_total 12\n"
+            "antfly_objectstore_get_retries_total 3\n"
+            "antfly_lake_query_slowest_lake_publication_nanoseconds 3900000000\n"
+            'antfly_objectstore_get_calls_total{bucket="private"} 99\n'
+        )
+        metrics = poc.parse_lake_metrics(text)
+        delta = poc.lake_metric_deltas(
+            {"antfly_objectstore_bucket_probe_calls_total": 10}, metrics
+        )
+        self.assertEqual(delta["antfly_objectstore_bucket_probe_calls_total"], 2)
+        self.assertEqual(delta["antfly_objectstore_get_retries_total"], 3)
+        self.assertEqual(
+            metrics["antfly_lake_query_slowest_lake_publication_nanoseconds"],
+            3900000000,
+        )
+        self.assertNotIn(
+            'antfly_objectstore_get_calls_total{bucket="private"}', metrics
+        )
+        self.assertNotIn(
+            "antfly_lake_query_slowest_lake_publication_nanoseconds", delta
+        )
+
     def test_slowest_profile_survives_a_multi_request_burst_as_absolute_gauges(self):
         timings = dict(
             total=3325,

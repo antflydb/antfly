@@ -1163,6 +1163,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         max_position_embeddings: usize,
         norm_eps_bits: u32,
         layers_hash: u64,
+        packed_qkv_cache_bytes: ?usize,
+        attention_scratch_bytes: ?usize,
     };
 
     const DeepSeekV4CacheKey = struct {
@@ -2559,6 +2561,62 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.lightonocr3_packed_core_reported_rows |= lightOnReportedRowBit(rows);
             std.debug.print("lightonocr3_packed_core: rows={d} scratch_bytes={d}\n", .{ rows, scratch_count * 4 });
         }
+        return try self.ctFromOwnedMetalTensor(output);
+    }
+
+    /// GLiDE packed Gated-DeltaNet core over rows concatenated without
+    /// padding: every row starts from a zero history, convolution taps stop at
+    /// row boundaries, and all rows share one dispatch per stage. `meta` holds
+    /// each token's row position followed by every row's (start, length).
+    /// Returns null when the device lacks the kernels or a binding is misaligned.
+    pub fn glidePackedCore(cb: *const ops.ComputeBackend, request: anytype) !?CT {
+        if (cb.kind() != .metal or request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4 or request.eps != 1e-6) return null;
+        if (request.tokens == 0 or request.rows == 0 or request.key_heads == 0 or request.value_heads % request.key_heads != 0 or
+            request.meta.len != request.tokens + request.rows * 2) return error.InvalidTensorShape;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const raw = self.provider_impl.raw_decode_runtime orelse return null;
+        if (metal_runtime_mod.termite_metal_decode_runtime_glide_core_available(raw) == 0) return null;
+        const runtime: *anyopaque = @ptrCast(raw);
+        const tokens = request.tokens;
+        const channels = (request.key_heads * 2 + request.value_heads) * 128;
+        const width = request.value_heads * 128;
+        var weights: [4]MetalTensor = undefined;
+        var weight_count: usize = 0;
+        defer for (weights[0..weight_count]) |*tensor| tensor.deinit();
+        for ([_]CT{ request.conv_weight, request.a_log, request.dt_bias, request.norm_weight }) |input| {
+            weights[weight_count] = try self.qwen35SideWeight(cb, input);
+            weight_count += 1;
+        }
+        var mixed = try self.ownedDeviceMetalTensorFromCt(request.mixed);
+        defer mixed.deinit();
+        var z = try self.ownedDeviceMetalTensorFromCt(request.z);
+        defer z.deinit();
+        var beta = try self.ownedDeviceMetalTensorFromCt(request.beta);
+        defer beta.deinit();
+        var a = try self.ownedDeviceMetalTensorFromCt(request.a);
+        defer a.deinit();
+        var conv = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, tokens * channels * 4, .private, &.{ @intCast(tokens), @intCast(channels) });
+        defer conv.deinit();
+        var gates = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, tokens * request.value_heads * 2 * 4, .private, &.{ @intCast(tokens), @intCast(request.value_heads * 2) });
+        defer gates.deinit();
+        var core = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, tokens * width * 4, .private, &.{ @intCast(tokens), @intCast(width) });
+        defer core.deinit();
+        var output = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, tokens * width * 4, .private, &.{ @intCast(tokens), @intCast(width) });
+        errdefer output.deinit();
+        const tensors = [_]*const MetalTensor{ &mixed, &weights[0], &beta, &a, &weights[1], &weights[2], &z, &weights[3], &conv, &gates, &core, &output };
+        var handles: [12]?*anyopaque = undefined;
+        var offsets: [12]usize = undefined;
+        for (tensors, &handles, &offsets) |tensor, *handle, *offset| {
+            if (!tensor.isDevice() or tensor.dtype != .f32) return error.UnsupportedTensorType;
+            handle.* = tensor.deviceHandle();
+            offset.* = tensor.deviceByteOffset();
+        }
+        const rc = metal_runtime_mod.termite_metal_decode_runtime_glide_core_packed(raw, &handles, &offsets, request.meta.ptr, tokens, request.rows, request.key_heads, request.value_heads);
+        if (rc == -3 or rc == -5) {
+            output.deinit();
+            return null;
+        }
+        if (rc != 0) return error.GlideMetalCoreFailed;
         return try self.ctFromOwnedMetalTensor(output);
     }
 
@@ -14640,9 +14698,40 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
 
+        // A Q8 relative table cannot feed layerNorm directly. Decode it on
+        // device instead of falling back through a full host download and
+        // upload whenever the requested bucket layout changes. The temporary
+        // has ordinary owned storage; only the normalized gathered table is
+        // retained by the existing bounded relative-embedding cache.
+        var decoded_weight: ?CT = null;
+        defer if (decoded_weight) |weight| freeOp(ctx, weight);
+        const weight_buf = toBuf(request.weight);
+        if (weight_buf.quantized_storage orelse weight_buf.runtime_quantized_storage) |storage| {
+            if (!std.meta.eql(storage.tensor_type, gguf_tensor_types.TensorType{ .known = .Q8_0 }) or
+                storage.packed_expert != null or storage.shape.len != 2 or
+                storage.shape[0] <= 0) return null;
+            const columns = std.math.cast(usize, storage.shape[1]) orelse return null;
+            if (columns != request.hidden_size) return null;
+            const rows: usize = @intCast(storage.shape[0]);
+            const slot = (try self.ensureQuantizedStorageLinearSlot(request.weight, request.hidden_size, rows)) orelse return null;
+            var dense = (try metal_runtime.decoderRuntimeCopyQuantLinearSlotToF32(
+                self.provider_impl,
+                slot,
+                0,
+                rows,
+                request.hidden_size,
+                rows,
+                1.0,
+            )) orelse return null;
+            decoded_weight = self.ctFromOwnedMetalTensor(dense) catch |err| {
+                dense.deinit();
+                return err;
+            };
+        }
+
         const normed = layerNormOp(
             ctx,
-            request.weight,
+            decoded_weight orelse request.weight,
             request.layer_norm_weight,
             request.layer_norm_bias,
             request.hidden_size,
@@ -15044,6 +15133,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             else => return err,
         };
         defer v.deinit();
+        if (request.f16_row_flash) if (request.row_spans) |spans| {
+            if (try metal_runtime.decoderRuntimeGlideRowAttentionF32Device(self.provider_impl, q, k, v, spans, request)) |output|
+                return try self.ctFromOwnedMetalTensor(output);
+        };
         const output = (try metal_runtime.decoderRuntimeSegmentAttentionF32Device(self.provider_impl, q, k, v, request)) orelse return null;
         return try self.ctFromOwnedMetalTensor(output);
     }
@@ -16870,6 +16963,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             gh_mt,
             request.num_labels,
             request.hidden_size,
+            request.add_residual,
             &out_shape,
         )) |tensor| {
             return self.ctFromOwnedMetalTensor(tensor);
@@ -33497,6 +33591,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .max_position_embeddings = request.max_position_embeddings,
             .norm_eps_bits = @bitCast(request.norm_eps),
             .layers_hash = debertaEncoderFramePlanLayerHash(request.layers),
+            .packed_qkv_cache_bytes = request.packed_qkv_cache_bytes,
+            .attention_scratch_bytes = request.attention_scratch_bytes,
         };
     }
 
@@ -33535,6 +33631,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (request.batch == 0 or request.seq_len == 0 or request.hidden_size == 0 or request.intermediate_size == 0) return false;
         if (request.num_attention_heads == 0 or request.hidden_size % request.num_attention_heads != 0) return false;
         if (request.position_buckets == 0 or request.max_position_embeddings == 0) return false;
+
+        if (request.packed_qkv_cache_bytes) |packed_bytes| {
+            const attention_bytes = request.attention_scratch_bytes orelse return false;
+            try metal_runtime.configureDebertaCacheLimits(self.provider_impl.raw_decode_runtime, packed_bytes, attention_bytes);
+        } else if (request.attention_scratch_bytes != null) return false;
 
         const plan_key = debertaEncoderFramePlanKey(request);
         if (self.hasReusableDebertaEncoderFramePlan(plan_key)) {
@@ -35826,6 +35927,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .prefer_bf16_fallback = request.prefer_bf16_fallback,
             .prefer_f16_mps_fallback = request.prefer_f16_mps_fallback,
             .prefer_f32_mps_fallback = request.prefer_f32_mps_fallback,
+            .require_preferred_dense_precision = request.require_preferred_dense_precision,
+            .glide_f16_tensor_ops = request.glide_f16_tensor_ops,
             .dense_f32_slot_storage = f32_storage,
             .dense_bf16_bytes = dense_bf16_bytes,
             .dense_f16_bytes = dense_f16_bytes,
@@ -35853,12 +35956,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer input.deinit();
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
         defer linear_input.deinit();
+        var glide_residual: ?MetalTensor = if (request.glide_residual) |residual| try self.ownedDeviceMetalTensorFromCt(residual) else null;
+        defer if (glide_residual) |*residual| residual.deinit();
         var tensor = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
             .slot = request.slot,
             .input = linear_input,
             .in_dim = request.in_dim,
             .out_dim = request.out_dim,
             .use_transformed_lm_head = request.use_transformed_lm_head,
+            .glide_geglu_exact = request.glide_geglu_exact,
+            .glide_down_slot = request.glide_down_slot,
+            .glide_residual = glide_residual,
         })) orelse return null;
         errdefer tensor.deinit();
         return self.ctFromOwnedMetalTensor(tensor);
@@ -44931,6 +45039,229 @@ fn addLegacyGlinerMpsTestWeight(store: *WeightStore, name: []const u8, values: [
     });
 }
 
+const DebertaPreplanCancellationProbe = struct {
+    threadlocal var original_get_weight: ?*const fn (*anyopaque, []const u8) anyerror!CT = null;
+    threadlocal var cancelled: bool = false;
+    threadlocal var armed: bool = false;
+
+    fn reset(callback: *const fn (*anyopaque, []const u8) anyerror!CT) void {
+        original_get_weight = callback;
+        cancelled = false;
+        armed = true;
+    }
+
+    fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
+        const result = try original_get_weight.?(ctx, name);
+        // This is the final layer-one lookup. Layer zero is therefore fully
+        // prepared, while layer one has not uploaded anything. The explicit
+        // post-lookup preplan checkpoint must observe cancellation before its
+        // upload batch begins.
+        if (armed and std.mem.eql(u8, name, "encoder.layer.1.output.LayerNorm.bias")) {
+            cancelled = true;
+            armed = false;
+        }
+        return result;
+    }
+
+    fn check(_: ?*anyopaque) anyerror!void {
+        if (cancelled) return error.Cancelled;
+    }
+};
+
+test "metal_compute: DeBERTa specialty cold preplan cancellation accounts partial F32 slots and retries" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const deberta_arch = @import("../architectures/deberta.zig");
+    const deberta_model = @import("../models/deberta.zig");
+    const a = std.testing.allocator;
+    const initial = metal_tensor_mod.memoryStatsSnapshot();
+    {
+        var store = testMetalWeightStoreInit(a);
+        defer store.lazy_weights.deinit(a);
+        store.prefetch = gpu_hosted_store_mod.PrefetchQueue.init(a, &store, gpu_hosted_store_mod.simplePrefetchProcess);
+        defer store.prefetch.deinit();
+        defer deinitSharedNativeProvider(&store);
+        var hidden_weight: [16]f32 = @splat(0);
+        var intermediate_weight: [32]f32 = @splat(0);
+        var hidden_bias: [4]f32 = @splat(0);
+        var intermediate_bias: [8]f32 = @splat(0);
+        inline for (.{ "0", "1" }) |layer| {
+            inline for (.{ "query_proj", "key_proj", "value_proj" }) |projection| {
+                try addLegacyGlinerMpsTestWeight(&store, "encoder.layer." ++ layer ++ ".attention.self." ++ projection ++ ".weight", &hidden_weight, &.{ 4, 4 });
+                try addLegacyGlinerMpsTestWeight(&store, "encoder.layer." ++ layer ++ ".attention.self." ++ projection ++ ".bias", &hidden_bias, &.{4});
+            }
+            try addLegacyGlinerMpsTestWeight(&store, "encoder.layer." ++ layer ++ ".attention.output.dense.weight", &hidden_weight, &.{ 4, 4 });
+            try addLegacyGlinerMpsTestWeight(&store, "encoder.layer." ++ layer ++ ".attention.output.dense.bias", &hidden_bias, &.{4});
+            try addLegacyGlinerMpsTestWeight(&store, "encoder.layer." ++ layer ++ ".intermediate.dense.weight", &intermediate_weight, &.{ 8, 4 });
+            try addLegacyGlinerMpsTestWeight(&store, "encoder.layer." ++ layer ++ ".intermediate.dense.bias", &intermediate_bias, &.{8});
+            try addLegacyGlinerMpsTestWeight(&store, "encoder.layer." ++ layer ++ ".output.dense.weight", &intermediate_weight, &.{ 4, 8 });
+            try addLegacyGlinerMpsTestWeight(&store, "encoder.layer." ++ layer ++ ".output.dense.bias", &hidden_bias, &.{4});
+            inline for (.{ "attention.output.LayerNorm", "output.LayerNorm" }) |normalization| {
+                try addLegacyGlinerMpsTestWeight(&store, "encoder.layer." ++ layer ++ "." ++ normalization ++ ".weight", &hidden_bias, &.{4});
+                try addLegacyGlinerMpsTestWeight(&store, "encoder.layer." ++ layer ++ "." ++ normalization ++ ".bias", &hidden_bias, &.{4});
+            }
+        }
+
+        var compute = try MetalCompute.init(a, &store, null);
+        defer compute.deinit();
+        var cb = compute.computeBackend();
+        var vtable = cb.vtable.*;
+        DebertaPreplanCancellationProbe.reset(vtable.getWeight);
+        vtable.getWeight = DebertaPreplanCancellationProbe.getWeight;
+        cb.vtable = &vtable;
+        cb.execution_control = .{ .check_fn = DebertaPreplanCancellationProbe.check };
+        const config = deberta_model.Config{
+            .hidden_size = 4,
+            .num_hidden_layers = 2,
+            .num_attention_heads = 1,
+            .intermediate_size = 8,
+            .max_position_embeddings = 8,
+            .position_buckets = 4,
+            .metal_require_f32_weight_mirrors = true,
+        };
+        try std.testing.expectError(error.Cancelled, deberta_arch.preplanMetalDebertaEncoderFrame(&cb, a, config, 1, 3, false));
+        const partial = cb.debugTimingSnapshot().provider;
+        try std.testing.expectEqual(@as(u64, 6), partial.metal_runtime_dense_linear_f32_slots);
+        try std.testing.expectEqual(@as(u64, 0), partial.metal_runtime_dense_linear_bf16_slots);
+        try std.testing.expectEqual(@as(u64, 0), partial.metal_runtime_dense_linear_f16_slots);
+        try std.testing.expectEqual(@as(u64, (4 * 4 * 4 + 2 * 4 * 8) * @sizeOf(f32)), partial.metal_runtime_dense_linear_f32_weight_bytes);
+        try std.testing.expectEqual(@as(u64, 4 * 4 * @sizeOf(f32)), partial.metal_runtime_norm_bytes);
+        try std.testing.expectEqual(@as(u64, 6), partial.decoder_runtime_prepare_linear_calls);
+
+        // A fresh request control retries on the same model runtime. The six
+        // complete layer-zero slots are reused; only layer one is uploaded.
+        DebertaPreplanCancellationProbe.cancelled = false;
+        DebertaPreplanCancellationProbe.armed = false;
+        cb.execution_control = null;
+        try std.testing.expect(try deberta_arch.preplanMetalDebertaEncoderFrame(&cb, a, config, 1, 3, false));
+        const complete = cb.debugTimingSnapshot().provider;
+        try std.testing.expectEqual(@as(u64, 12), complete.metal_runtime_dense_linear_f32_slots);
+        try std.testing.expectEqual(@as(u64, 0), complete.metal_runtime_dense_linear_bf16_slots);
+        try std.testing.expectEqual(@as(u64, 0), complete.metal_runtime_dense_linear_f16_slots);
+        try std.testing.expectEqual(@as(u64, 2 * (4 * 4 * 4 + 2 * 4 * 8) * @sizeOf(f32)), complete.metal_runtime_dense_linear_f32_weight_bytes);
+        try std.testing.expectEqual(@as(u64, 2 * 4 * 4 * @sizeOf(f32)), complete.metal_runtime_norm_bytes);
+        try std.testing.expectEqual(@as(u64, 12), complete.decoder_runtime_prepare_linear_calls);
+    }
+    const released = metal_tensor_mod.memoryStatsSnapshot();
+    try std.testing.expectEqual(initial.device_owned_live_bytes, released.device_owned_live_bytes);
+    try std.testing.expectEqual(initial.host_mirror_live_bytes, released.host_mirror_live_bytes);
+}
+
+fn addNativeGlinerGruTestWeight(store: *NativeWeightStore, name: []const u8, values: []const f32, shape: []const i64) !void {
+    const key = try store.allocator.dupe(u8, name);
+    errdefer store.allocator.free(key);
+    var tensor = try tensor_mod.Tensor.initFloat32(store.allocator, key, shape, values);
+    errdefer tensor.deinit();
+    try store.resident_weights.put(store.allocator, key, .{ .tensor = tensor });
+}
+
+test "metal_compute: GLiNER v1 position-zero GRU and projector stay resident and match native" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    const H: usize = 2;
+    const labels_count: usize = 2;
+    var pos: [20 * H]f32 = @splat(0);
+    var w_ih: [3 * H * H]f32 = @splat(0);
+    var w_hh: [3 * H * H]f32 = @splat(0);
+    // z ~= 0 makes h1 small even when h0 is large. Adding h0 and subtracting
+    // it again would round both h1 components to zero at this magnitude.
+    var b_ih = [_]f32{ 0, 0, -40, -40, 0.25541282, 0.54930615 };
+    var b_hh: [3 * H]f32 = @splat(0);
+    var projector0: [4 * H * 2 * H]f32 = @splat(0);
+    var projector0_bias: [4 * H]f32 = @splat(0);
+    var projector2: [H * 4 * H]f32 = @splat(0);
+    var projector2_bias: [H]f32 = @splat(0);
+    projector0[0 * 2 * H + 0] = 1;
+    projector0[1 * 2 * H + 1] = 1;
+    projector2[0 * 4 * H + 0] = 1;
+    projector2[1 * 4 * H + 1] = 1;
+    const labels = [_]f32{ 1.0e8, -1.0e8, -1.0e8, 1.0e8 };
+
+    const Weight = struct {
+        name: []const u8,
+        values: []f32,
+        shape: []const i64,
+    };
+    const weights = [_]Weight{
+        .{ .name = "count_embed.pos_embedding.weight", .values = &pos, .shape = &.{ 20, H } },
+        .{ .name = "count_embed.gru.weight_ih_l0", .values = &w_ih, .shape = &.{ 3 * H, H } },
+        .{ .name = "count_embed.gru.weight_hh_l0", .values = &w_hh, .shape = &.{ 3 * H, H } },
+        .{ .name = "count_embed.gru.bias_ih_l0", .values = &b_ih, .shape = &.{3 * H} },
+        .{ .name = "count_embed.gru.bias_hh_l0", .values = &b_hh, .shape = &.{3 * H} },
+        .{ .name = "count_embed.projector.0.weight", .values = &projector0, .shape = &.{ 4 * H, 2 * H } },
+        .{ .name = "count_embed.projector.0.bias", .values = &projector0_bias, .shape = &.{4 * H} },
+        .{ .name = "count_embed.projector.2.weight", .values = &projector2, .shape = &.{ H, 4 * H } },
+        .{ .name = "count_embed.projector.2.bias", .values = &projector2_bias, .shape = &.{H} },
+    };
+
+    var native_store = NativeWeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer native_store.deinitOwned();
+    for (weights) |weight| try addNativeGlinerGruTestWeight(&native_store, weight.name, weight.values, weight.shape);
+    var native_compute = native_compute_mod.NativeCompute.init(a, &native_store, null);
+    defer native_compute.deinit();
+    var native_cb = native_compute.computeBackend();
+    const native_labels = try native_cb.fromFloat32Shape(&labels, &.{ labels_count, H });
+    defer native_cb.free(native_labels);
+    const native_projected = try @import("../architectures/gliner_head.zig").countLstmV1AtStep(&native_cb, a, native_labels, labels_count, H, 0);
+    defer native_cb.free(native_projected);
+    const native_values = try native_cb.toFloat32(native_projected, a);
+    defer a.free(native_values);
+
+    var metal_store = testMetalWeightStoreInit(a);
+    metal_store.prefer_f32_dense_tensors = true;
+    defer {
+        deinitSharedNativeProvider(&metal_store);
+        metal_store.lazy_weights.deinit(a);
+    }
+    for (weights) |weight| try addLegacyGlinerMpsTestWeight(&metal_store, weight.name, weight.values, weight.shape);
+    var metal_compute = try MetalCompute.init(a, &metal_store, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+    const metal_labels = try auditDeviceTensor(&metal_compute, &metal_cb, &labels, &.{ labels_count, H });
+    defer metal_cb.free(metal_labels);
+
+    var audit: metal_tensor_mod.TransferAudit = .{};
+    try metal_tensor_mod.beginTransferAudit(&audit);
+    var audit_active = true;
+    defer if (audit_active) metal_tensor_mod.endTransferAudit();
+    const raw = (try metal_cb.glinerLabelGru(metal_labels, labels_count, H, false)) orelse return error.ExpectedMetalGlinerGru;
+    defer metal_cb.free(raw);
+    const residual = (try metal_cb.glinerLabelGruCombined(metal_labels, labels_count, H)) orelse return error.ExpectedMetalGlinerGru;
+    defer metal_cb.free(residual);
+    const metal_projected = try @import("../architectures/gliner_head.zig").countLstmV1AtStep(&metal_cb, a, metal_labels, labels_count, H, 0);
+    defer metal_cb.free(metal_projected);
+    metal_tensor_mod.endTransferAudit();
+    audit_active = false;
+
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, raw));
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, residual));
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, metal_projected));
+    try std.testing.expectEqual(@as(u64, 0), audit.download_bytes);
+    try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+    try std.testing.expectEqual(@as(u64, 0), audit.host_accesses);
+
+    const raw_values = try metal_cb.toFloat32(raw, a);
+    defer a.free(raw_values);
+    const residual_values = try metal_cb.toFloat32(residual, a);
+    defer a.free(residual_values);
+    const metal_values = try metal_cb.toFloat32(metal_projected, a);
+    defer a.free(metal_values);
+    for (0..labels_count) |row| {
+        for (0..H) |column| {
+            const index = row * H + column;
+            const n = std.math.tanh(b_ih[2 * H + column]);
+            const z = 1.0 / (1.0 + @exp(-b_ih[H + column]));
+            const expected_raw = (1.0 - z) * n + z * labels[index];
+            try std.testing.expectApproxEqAbs(expected_raw, raw_values[index], 2e-5);
+            try std.testing.expectApproxEqAbs(expected_raw + labels[index], residual_values[index], 1e-2);
+            try std.testing.expect(@abs((residual_values[index] - labels[index]) - raw_values[index]) > 0.1);
+            try std.testing.expectApproxEqAbs(native_values[index], metal_values[index], 2e-5);
+        }
+    }
+}
+
 test "embeddinggemma2 Metal admitted projection cache survives requests cancellation and unload" {
     try exerciseEmbeddingGemma2ProjectionCache("language_model.layers.0.self_attn.q_proj.weight", "vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight");
 }
@@ -50063,4 +50394,39 @@ test "LightOnOCR3 row reporting covers sixty-four cohorts without shift overflow
     try std.testing.expectEqual(@as(u64, 0), lightOnReportedRowBit(0));
     try std.testing.expectEqual(@as(u64, 0), lightOnReportedRowBit(65));
     try std.testing.expectEqual(@as(u64, 0), lightOnReportedRowBit(std.math.maxInt(usize)));
+}
+
+test "metal GLiNER GRU residual modes preserve cancellation-sensitive state on device" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const labels = [_]f32{ 16777216, -16777216, 2, -3, 0, 5 };
+    var gates: [18]f32 = @splat(0);
+    for (0..2) |row| for (0..3) |col| {
+        gates[row * 9 + 3 + col] = -100;
+        gates[row * 9 + 6 + col] = 0.25541282;
+    };
+    var label_mt = try compute.deviceTensorFromF32Slice(&labels, &.{ 2, 3 });
+    defer label_mt.deinit();
+    var gi = try compute.deviceTensorFromF32Slice(&gates, &.{ 2, 9 });
+    defer gi.deinit();
+    const zero_gates: [18]f32 = @splat(0);
+    var gh = try compute.deviceTensorFromF32Slice(&zero_gates, &.{ 2, 9 });
+    defer gh.deinit();
+    for ([_]bool{ false, true }) |add_residual| {
+        var out = (try metal_runtime_mod.decoderRuntimeGlinerGruCombineF32Device(compute.provider_impl, label_mt, gi, gh, 2, 3, add_residual, &.{ 2, 3 })) orelse return error.UnsupportedOperation;
+        defer out.deinit();
+        const cb = compute.computeBackend();
+        const out_ct = try compute.ctFromOwnedMetalTensor(try out.retainedCopy());
+        defer cb.free(out_ct);
+        const got = try cb.toFloat32(out_ct, a);
+        defer a.free(got);
+        for (got, labels) |value, label| try std.testing.expectApproxEqAbs(@as(f32, 0.25) + (if (add_residual) label else 0), value, 0.000001);
+    }
 }

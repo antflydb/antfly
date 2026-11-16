@@ -96,6 +96,8 @@ pub const CatalogCursor = struct {
 /// Replacement/import is reserved for bootstrap; normal DDL sends touched rows.
 pub const StandaloneCatalogUpdate = struct {
     pub const TableReplacement = struct {
+        /// A compact exact-CAS proof avoids duplicating large legacy indexes.
+        expected_indexes_digest: ?[32]u8 = null,
         expected: metadata.TableRecord,
         replacement: metadata.TableRecord,
     };
@@ -250,6 +252,7 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
         .apply_system_catalog,
         .apply_restore_staging,
         .create_restore_job_with_staging,
+        .apply_sql_completion_reference,
         .apply_fk_generation_publication,
         .apply_fk_initial_create,
         .upsert_table,
@@ -264,14 +267,24 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
 }
 
 const store_report_update = @import("../store_report_update.zig");
+/// Expected alias-validation rejections retain their identity across the
+/// independently compiled owner boundary without transporting Zig errors.
+pub const TableIndexMutationValidation = @import("index_mutation_validation.zig").Result;
+
 pub const CatalogProjectionRequest = union(enum) {
+    job_state_get: []const u8,
+    job_state_scan: ?[]const u8,
+    job_owner_count: []const u8,
     read_store: struct { store_id: u64, reports: bool },
     read_store_group_facts: u64,
     read_store_report_targets: struct { store_id: u64, group_ids: []const u64, full: bool, include_runtime: bool },
+    catalog_graph_authority: @import("../../system_catalog/server_call.zig").GraphAuthority,
     catalog_read: system_catalog.Read,
     catalog_export: void,
     catalog_export_standalone_portable: void,
     catalog_list_tables: system_catalog.TableList,
+    privacy_due_table: i64,
+    table_by_name: []const u8,
     catalog_meta: void,
     catalog_admission: system_catalog.Mutation,
     catalog_prepare: SystemCatalogCommand,
@@ -286,6 +299,8 @@ pub const CatalogProjectionRequest = union(enum) {
     topology_activation: void,
     report_cursor: u64,
     read_control_stores: []const u64,
+    owner_readiness: @import("../api.zig").OwnerReadinessRequest,
+    owner_readiness_transitions: @import("../api.zig").OwnerReadinessRequest,
     report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
     report_baseline_fragment_admission: @import("../store_report_baseline.zig").Request,
     catalog_snapshot: void,
@@ -295,8 +310,13 @@ pub const CatalogProjectionRequest = union(enum) {
     sql_policy_publication_status: u64,
     sql_policy_publication_work: u64,
     sql_policy_begin_command: @import("antfly_local_sources").system_catalog_policies.BeginRequest,
+    has_index_aliases: void,
+    validate_table_index_mutation: struct { before: metadata.TableRecord, after: metadata.TableRecord },
     require_policy_index_mutation_allowed: u64,
     require_policy_topology_mutation_allowed: u64,
+    sql_completion_reference: [16]u8,
+    sql_completion_reference_preflight: []const u8,
+    fk_publication_completion: @import("../fk_generation_publication.zig").CompletionRequest,
     fk_generation_publication_status: u64,
     fk_generation_publication_work: u64,
     fk_generation_publication_decision: @import("../fk_generation_publication.zig").DecisionRequest,
@@ -309,4 +329,5 @@ pub const CatalogProjectionRequest = union(enum) {
     fk_initial_retirement_page: @import("../fk_initial_retirement_wire.zig").PageRequest,
     store_root_control: @import("../fk_initial_retirement_wire.zig").Control,
     fk_initial_parent_decision: @import("../fk_generation_publication.zig").DecisionRequest,
+    has_index_alias_lifecycle_state: void,
 };

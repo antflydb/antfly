@@ -24,7 +24,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import yaml
 from jsonschema import Draft4Validator, ValidationError
 
 # The generators are standalone scripts with sibling imports. Support both
@@ -33,6 +32,7 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parent), *sys.path]
     import join_openapi
     import join_public_openapi
     import yaml_to_json
+    from openapi_inputs import load_yaml
 
 
 class OpenApiBuildPathsTest(unittest.TestCase):
@@ -223,12 +223,10 @@ class OpenApiBuildPathsTest(unittest.TestCase):
 
     def test_openrouter_generator_schema_matches_single_model_runtime(self):
         root = Path(__file__).resolve().parent.parent
-        source = yaml.safe_load(
-            (root / "specs/openapi/shared/generating.yaml").read_text()
-        )["components"]["schemas"]
-        public = yaml.safe_load((root / "openapi.yaml").read_text())["components"][
+        source = load_yaml(root / "specs/openapi/shared/generating.yaml")["components"][
             "schemas"
         ]
+        public = load_yaml(root / "openapi.yaml")["components"]["schemas"]
         for schemas in (source, public):
             with self.subTest(source=schemas is source):
                 schema = schemas["OpenRouterGeneratorConfig"]
@@ -269,9 +267,7 @@ class OpenApiBuildPathsTest(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         for path in ("specs/openapi/antfly/embeddings.yaml", "openapi.yaml"):
             with self.subTest(path=path):
-                schemas = yaml.safe_load((root / path).read_text())["components"][
-                    "schemas"
-                ]
+                schemas = load_yaml(root / path)["components"]["schemas"]
                 validator = Draft4Validator(
                     {
                         "$ref": "#/components/schemas/IndexEmbedderConfig",

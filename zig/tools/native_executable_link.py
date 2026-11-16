@@ -19,6 +19,9 @@
 import argparse
 import json
 import subprocess
+from pathlib import Path
+
+from macho_merged_globals import prepare_entry_object
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--arch", required=True)
@@ -46,7 +49,7 @@ subprocess.run(
         "-adhoc_codesign",
         "-o",
         args.output,
-        args.object,
+        str(prepare_entry_object(Path(args.object), Path(args.output))),
         *inputs,
         "-lSystem",
     ],

@@ -4,10 +4,10 @@ import type * as React from "react";
 import { cn } from "@/lib/utils";
 
 const cardVariants = cva(
-  // square, flat (no shadow). The card owns the vertical rhythm (gap + py);
+  // rounded panel, flat (no shadow). The card owns the vertical rhythm (gap + py);
   // header/content/footer own horizontal padding only — no internal dividers,
   // whitespace is the structure.
-  "text-card-foreground flex flex-col gap-4 rounded-none py-6",
+  "text-card-foreground flex flex-col gap-4 rounded-lg py-6",
   {
     variants: {
       variant: {

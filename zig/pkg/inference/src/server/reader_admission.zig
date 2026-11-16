@@ -33,6 +33,7 @@ pub fn CohortMemory(comptime Hooks: type) type {
         packed_mixed: bool = false,
         prefill_query_chunk_rows: usize = 0,
         decoder_backend_peak: usize = 0,
+        decoder_workspace: @import("reader_workspace.zig").Decoder = .{},
 
         pub fn product(values: []const usize) !usize {
             var bytes: usize = 1;
@@ -59,14 +60,23 @@ pub fn CohortMemory(comptime Hooks: type) type {
             // escaping outputs retain their original admission below. The
             // scratch estimate is independent of KV dtype; its KV result is
             // deliberately discarded, rather than replacing the page estimate.
+            // The generic estimate includes persistent CUDA histories. Remove
+            // them from shareable workspace; the per-page persistent lease below
+            // charges that same history once, independently of the GPU gate.
+            const recurrent_bytes = try runtime.tier.memory.gptRecurrentBackendStateBytes(self.backend, cfg);
+            if (decoder.backend_scratch_bytes < recurrent_bytes) return error.ResourceLimitExceeded;
+            var transient_decoder = decoder;
+            transient_decoder.backend_scratch_bytes -= recurrent_bytes;
             const working_scratch = if (self.prefill_query_chunk_rows != 0)
-                (try runtime.tier.memory.estimateGptGeneration(self.backend, .f16, cfg, prompt_tokens, output_tokens, working_rows)).scratch_bytes
+                (try runtime.tier.memory.estimateGptGeneration(self.backend, .f16, cfg, prompt_tokens, output_tokens, working_rows)).scratch_bytes - recurrent_bytes
             else
-                decoder.backend_scratch_bytes;
-            var retained_decoder = decoder;
+                transient_decoder.backend_scratch_bytes;
+            var retained_decoder = transient_decoder;
             if (self.share_decoder_scratch) {
                 // A single GPU gate owns prefill and decode. Their frame
-                // resources drain before the locked forward/result copy returns.
+                // resources retire after their last queued consumer. CUDA may
+                // release the gate during a retained readback: all subsequent
+                // scratch reuse remains ordered on that same model stream.
                 // Keep a full prompt hidden tensor and logits additive in case
                 // a final-row view or sampling output outlives that gate.
                 const logits = try product(&.{ cfg.vocab_size, @sizeOf(f32) });
@@ -76,7 +86,7 @@ pub fn CohortMemory(comptime Hooks: type) type {
                 // GPU gate returns. Full projected inputs remain charged below,
                 // together with KV, recurrent history and both working sets.
                 const retained = if (self.packed_mixed) logits else std.math.add(usize, logits, hidden) catch return error.ResourceLimitExceeded;
-                retained_decoder.backend_scratch_bytes = @min(decoder.backend_scratch_bytes, retained);
+                retained_decoder.backend_scratch_bytes = @min(transient_decoder.backend_scratch_bytes, retained);
                 if (!cfg.qwen35_device_only_state)
                     retained_decoder.host_scratch_bytes = std.math.add(usize, retained_decoder.host_scratch_bytes, logits) catch return error.ResourceLimitExceeded;
                 // Bound both an active and submitted set, plus the complete
@@ -84,7 +94,9 @@ pub fn CohortMemory(comptime Hooks: type) type {
                 // this monotonic lease bounded across a long mixed-page epoch.
                 // Batched prefill returns only independent host logit rows;
                 // all combined device intermediates drain before it returns.
-                // Reserve two complete maximum-sized group working sets.
+                // Static cohorts retain two complete maximum-sized working
+                // sets. CUDA epochs use the per-item plan below, growing for
+                // admitted pages while preserving both queued working sets.
                 var two_sets = try product(&.{ working_scratch, 2, self.max_prefill_batch_items });
                 if (self.packed_mixed) {
                     if (working_rows == 0) return error.ResourceLimitExceeded;
@@ -95,6 +107,10 @@ pub fn CohortMemory(comptime Hooks: type) type {
                     two_sets = std.math.divCeil(usize, try product(&.{ two_sets, rows }), working_rows) catch return error.ResourceLimitExceeded;
                 }
                 const batch_head = try product(&.{ self.decoder_rows, logits });
+                const per_item = std.math.divCeil(usize, two_sets, self.max_prefill_batch_items) catch return error.ResourceLimitExceeded;
+                self.decoder_workspace.per_item = @max(self.decoder_workspace.per_item, per_item);
+                self.decoder_workspace.head = @max(self.decoder_workspace.head, batch_head);
+                self.decoder_workspace.max_items = self.max_prefill_batch_items;
                 const target = std.math.add(usize, two_sets, batch_head) catch return error.ResourceLimitExceeded;
                 const envelope = std.math.ceilPowerOfTwo(usize, @max(target, 1)) catch return error.ResourceLimitExceeded;
                 self.decoder_backend_peak = @max(self.decoder_backend_peak, envelope);
@@ -129,8 +145,10 @@ pub fn CohortMemory(comptime Hooks: type) type {
                     persistent.host_scratch_bytes = std.math.add(usize, persistent.host_scratch_bytes, host_state) catch return error.ResourceLimitExceeded;
                 persistent.backend_scratch_bytes = std.math.add(usize, persistent.backend_scratch_bytes, gpu_state) catch return error.ResourceLimitExceeded;
             };
-            // Projected embeddings can await prefill while another page owns
-            // the runtime; token plans and output buffers also outlive vision.
+            // Independently owned device projected embeddings can await prefill
+            // while another page owns the runtime. Their full per-page bytes
+            // remain charged until retirement; no batched parent is borrowed.
+            // Token plans and output buffers also outlive vision.
             const tokens = std.math.add(usize, prompt_tokens, output_tokens) catch return error.ResourceLimitExceeded;
             persistent = try persistent.merge(.{
                 .host_scratch_bytes = try product(&.{ tokens, 128 }),

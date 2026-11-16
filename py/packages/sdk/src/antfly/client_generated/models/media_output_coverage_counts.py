@@ -24,11 +24,13 @@ class MediaOutputCoverageCounts:
             embedding (MediaOutputCoverageValues | Unset):
             transcribe (MediaOutputCoverageValues | Unset):
             classify (MediaOutputCoverageValues | Unset):
+            diarize (MediaOutputCoverageValues | Unset):
     """
 
     embedding: MediaOutputCoverageValues | Unset = UNSET
     transcribe: MediaOutputCoverageValues | Unset = UNSET
     classify: MediaOutputCoverageValues | Unset = UNSET
+    diarize: MediaOutputCoverageValues | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,6 +46,10 @@ class MediaOutputCoverageCounts:
         if not isinstance(self.classify, Unset):
             classify = self.classify.to_dict()
 
+        diarize: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.diarize, Unset):
+            diarize = self.diarize.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -53,6 +59,8 @@ class MediaOutputCoverageCounts:
             field_dict["transcribe"] = transcribe
         if classify is not UNSET:
             field_dict["classify"] = classify
+        if diarize is not UNSET:
+            field_dict["diarize"] = diarize
 
         return field_dict
 
@@ -82,10 +90,18 @@ class MediaOutputCoverageCounts:
         else:
             classify = MediaOutputCoverageValues.from_dict(_classify)
 
+        _diarize = d.pop("diarize", UNSET)
+        diarize: MediaOutputCoverageValues | Unset
+        if isinstance(_diarize, Unset):
+            diarize = UNSET
+        else:
+            diarize = MediaOutputCoverageValues.from_dict(_diarize)
+
         media_output_coverage_counts = cls(
             embedding=embedding,
             transcribe=transcribe,
             classify=classify,
+            diarize=diarize,
         )
 
         media_output_coverage_counts.additional_properties = d

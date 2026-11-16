@@ -56,7 +56,9 @@ env:
 
 concurrency:
   group: zig-${{ inputs.pr_number || github.ref }}
-  cancel-in-progress: true
+  # Finish an active main qualification; GitHub coalesces pending runs in this
+  # same group. PR heads and merge-queue revisions still supersede old work.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' || inputs.pr_number != '' }}
 
 jobs:
   admission:
@@ -70,11 +72,38 @@ jobs:
       suite: ${{ inputs.full_validation && 'full' || 'zig' }}
 
   grep-qualification:
-    name: native grep qualification
-    needs: admission
-    if: ${{ !cancelled() && needs.admission.result == 'success' && inputs.validation_scope != 'inference-e2e' && (inputs.pr_number == '' || github.run_attempt == 1) }}
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      inputs.validation_scope != 'inference-e2e' &&
+      (inputs.pr_number == '' || github.run_attempt == 1) &&
+      ( inputs.full_validation ||
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (inputs.pr_number == '' && github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') ||
+      github.event.schedule == '0 8 * * *' ||
+      (!inputs.full_validation &&
+      (inputs.pr_number != '' || github.event.schedule == '0 3 * * 0') &&
+      (needs.changes.outputs.zig_tests == 'true' ||
+      needs.changes.outputs.model_check == 'true' ||
+      needs.changes.outputs.trace_validate == 'true')) ) }}
+    name: zig-${{ matrix.suite }} / grep
+    needs: [admission, changes]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      matrix:
+        # Select one profile so full validation does not build/test grep twice.
+        include: >-
+          ${{ fromJSON(
+          (inputs.full_validation ||
+          github.event_name == 'merge_group' ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (inputs.pr_number == '' && github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') ||
+          github.event.schedule == '0 8 * * *') &&
+          '[{"suite":"full","cases":5000}]' ||
+          '[{"suite":"base","cases":500}]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,11 +111,22 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/load-toolchain-policy
         id: toolchain
+      # Bootstrap must also work when the admitted candidate predates the
+      # installer. Keep privileged setup pinned to the executing workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: scripts/ci/install_ubuntu_packages.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Install compression oracles
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh bzip2 xz-utils time
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
-      - name: Install compression oracles
-        run: sudo apt-get update && sudo apt-get install -y bzip2 xz-utils time
       - name: Verify native Linux and pinned oracle
         shell: bash
         run: |
@@ -96,11 +136,14 @@ jobs:
           echo 'e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849  '"$RUNNER_TEMP/ripgrep-15.2.0-x86_64-unknown-linux-musl/rg" | sha256sum --check
           echo "$RUNNER_TEMP/ripgrep-15.2.0-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
       - name: Native tests and generated differential campaign
+        env:
+          DIFFERENTIAL_CASES: ${{ matrix.cases }}
         run: |
           zig build --build-file zig/build.zig -Dgrep-only=true -Doptimize=ReleaseFast -Dstrip=true grep grep-test
           mkdir -p zig/zig-out/grep-qualification
-          python3 zig/pkg/antfly-grep/tests/differential.py zig/zig-out/bin/antfly-grep "$(command -v rg)" --seed 116417 --cases 5000 --output zig/zig-out/grep-qualification/differential.json
+          python3 zig/pkg/antfly-grep/tests/differential.py zig/zig-out/bin/antfly-grep "$(command -v rg)" --seed 116417 --cases "$DIFFERENTIAL_CASES" --output zig/zig-out/grep-qualification/differential.json
       - name: Benchmark native CPU and cache configurations
+        if: matrix.suite == 'full'
         shell: bash
         run: |
           python3 zig/pkg/antfly-grep/bench/compare.py zig/zig-out/bin/antfly-grep --extended --codecs --mib 8 --rounds 7 --quiet --output zig/zig-out/grep-qualification/warm.json
@@ -112,11 +155,13 @@ jobs:
       - name: Verify standalone release contents
         run: |
           python3 -m unittest discover -s scripts/packaging -p test_grep_packaging.py
+          python3 -m unittest discover -s scripts/release -p test_grep_release.py
           python3 scripts/packaging/package_grep_release.py --binary zig/zig-out/bin/antfly-grep --output zig/zig-out/grep-qualification/antfly-grep-linux-x86_64.tar.gz
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: native-grep-qualification
+          retention-days: 14
+          name: zig-${{ matrix.suite }}-grep
           path: zig/zig-out/grep-qualification/
 
   changes:
@@ -139,7 +184,20 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
+
+      - name: Fetch validation diff base
+        env:
+          BASE_SHA: ${{ inputs.base_sha || github.event.merge_group.base_sha || github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ -f scripts/ci/fetch_validation_base.py ]]; then
+            python3 scripts/ci/fetch_validation_base.py "$BASE_SHA"
+          else
+            # Older approved PR heads predate this helper. Keep their complete
+            # coverage until they merge main rather than failing or skipping.
+            echo "VALIDATION_FORCE_ALL=true" >> "$GITHUB_ENV"
+          fi
 
       - name: Verify Zig release pins and checksums
         run: python3 scripts/ci/verify_zig_toolchain.py
@@ -196,7 +254,7 @@ jobs:
           HELPER
           chmod +x "$helper"
 
-          if [[ "${{ inputs.full_validation }}" == "true" ]]; then
+          if [[ "${VALIDATION_FORCE_ALL:-false}" == "true" || "${{ inputs.full_validation }}" == "true" ]]; then
             {
               echo "zig_tests=true"
               echo "e2e=true"
@@ -312,10 +370,17 @@ jobs:
             scripts/ci/test_zig_e2e_shard.py scripts/ci/merge_e2e_durations.py scripts/ci/summarize_e2e_timings.py scripts/ci/antfly_e2e_durations.json \
             scripts/ci/toolchain-policy.json \
             ':(glob)go/pkg/embedded/**' \
+            ':(glob)go/pkg/sources/**' \
+            ':(glob)examples/grepstein/**' \
+            scripts/ci/check_source_native.py \
             ':(glob)rs/crates/embedded*/**' \
             rs/Cargo.toml rs/Cargo.lock \
             ':(glob)py/packages/embedded/**' \
             ':(glob)ts/packages/embedded*/**' \
+            ':(glob)ts/packages/better-auth/**' \
+            ':(glob)ts/packages/sdk/**' \
+            ':(glob)ts/examples/express-auth/**' \
+            .github/workflows/better-auth-compatibility.yml \
             ts/package.json ts/pnpm-lock.yaml ts/pnpm-workspace.yaml \
             scripts/ci/test-embedded-sdk-native.sh \
             scripts/ci/test_embedded_sdk_native.py \
@@ -421,8 +486,19 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
 
+      # Bootstrap must also work when the admitted candidate predates the
+      # installer. Keep privileged setup pinned to the executing workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: scripts/ci/install_ubuntu_packages.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -485,24 +561,6 @@ jobs:
           test "$(uname -s)" = "Linux"
           test "$(uname -m)" = "aarch64"
 
-      - name: Install Zig
-        env:
-          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
-          ZIG_AARCH64_LINUX_SHA256: ${{ steps.toolchain.outputs.zig_aarch64_linux_sha256 }}
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ca-certificates curl xz-utils python3 make
-          curl -fsSL \
-            "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
-            -o "$RUNNER_TEMP/zig.tar.xz"
-          echo "$ZIG_AARCH64_LINUX_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --strict
-          mkdir -p "$RUNNER_TEMP/zig"
-          tar -xJf "$RUNNER_TEMP/zig.tar.xz" \
-            -C "$RUNNER_TEMP/zig" \
-            --strip-components=1
-          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
-
       # The admitted branch can predate this action. Bootstrap tooling from
       # the same immutable revision as the executing approval workflow.
       - name: Check out executing dependency policy
@@ -515,7 +573,25 @@ jobs:
             .github/actions/prepare-zig-dependencies
             scripts/ci/prepare_zig_dependencies.py
             scripts/ci/zig-dependencies.json
+            scripts/ci/install_ubuntu_packages.sh
           sparse-checkout-cone-mode: false
+
+      - name: Install Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_AARCH64_LINUX_SHA256: ${{ steps.toolchain.outputs.zig_aarch64_linux_sha256 }}
+        run: |
+          set -euo pipefail
+          bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh ca-certificates curl xz-utils python3 make
+          curl -fsSL \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
+            -o "$RUNNER_TEMP/zig.tar.xz"
+          echo "$ZIG_AARCH64_LINUX_SHA256  $RUNNER_TEMP/zig.tar.xz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" \
+            -C "$RUNNER_TEMP/zig" \
+            --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Prepare verified Zig source dependencies
         uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
@@ -578,7 +654,7 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
           submodules: true
 
       - name: Sample ARC runner disk use
@@ -586,29 +662,6 @@ jobs:
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-
-      - name: Set up Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
-
-      - name: Restore ARC Zig cache dirs
-        run: |
-          # Compiler outputs belong on the PVC; runner temp counts toward
-          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
-          # caches below before starting the next phase.
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
-          global_cache="/mnt/cache/antfly/zig/zig-global"
-          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache"
 
       # The admitted branch can predate this action. Bootstrap tooling from
       # the same immutable revision as the executing approval workflow.
@@ -622,7 +675,42 @@ jobs:
             .github/actions/prepare-zig-dependencies
             scripts/ci/prepare_zig_dependencies.py
             scripts/ci/zig-dependencies.json
+            scripts/ci/install_ubuntu_packages.sh
           sparse-checkout-cone-mode: false
+
+      - name: Install build tools
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
+
+      - name: Restore ARC Zig cache dirs
+        run: |
+          # Compiler outputs belong on the PVC; runner temp counts toward
+          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
+          # caches below before starting the next phase.
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
 
       - name: Prepare verified Zig source dependencies
         uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
@@ -677,14 +765,16 @@ jobs:
       - name: Compile consolidated storage and graph benchmark contracts
         if: needs.changes.outputs.zig_tests == 'true'
         working-directory: zig
-        run: zig build antfly-storage-bench antfly-graph-bench -Doptimize=debug
+        run: >-
+          python3 tools/run_bounded_zig_build.py -- build --build-file ./build.zig
+          antfly-storage-bench antfly-graph-bench -Doptimize=debug -Dcpu=baseline
 
       # Keep inexpensive tooling checks beside the normal unit gate. The
       # isolated compilation/cache matrix runs in zig-full / build-cache.
       - name: Test build tooling
         working-directory: zig
         run: >-
-          python3 -m unittest
+          python3 -m unittest -v
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
           tools/test_benchmark_lake_archive.py
@@ -707,14 +797,24 @@ jobs:
           tools/test_sync_generated.py
           pkg/inference/build/test_prepare_wasm64_zig_lib.py
 
+      - name: Test linked read-session provider finalization and archive limits
+        run: |
+          zig build --build-file zig/build_read_session_graph_test.zig -Dtarget=x86_64-linux-musl --summary all
+          python3 -m unittest discover -s scripts/packaging -p test_native_archives.py
+
       - name: Test benchmark orchestration and fixture setup
         run: |
+          python3 -m unittest discover -s scripts/ci -p test_artifact_exchange.py
+          python3 -m unittest discover -s scripts/release -p test_r2_scope_restore.py
           python3 -m unittest discover -s scripts/ci -p test_eval_extract.py
           python3 -m unittest discover -s scripts/ci -p test_lite_embedding_bundle.py
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s zig/pkg/inference/scripts -p test_qualification_memory.py
           python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
+          python3 -m unittest discover -s scripts/gliner_specialty -p 'test_*.py'
+          python3 -m unittest discover -s zig/pkg/inference/scripts/gliner25/specialty -p 'test_*.py'
 
       - name: Test Laya data and qualification contracts
         run: |
@@ -833,7 +933,7 @@ jobs:
 
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: "temurin"
           java-version: "21"
@@ -887,7 +987,7 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
           submodules: true
 
       - name: Sample ARC runner disk use
@@ -895,30 +995,6 @@ jobs:
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-
-      - name: Set up Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
-
-      - name: Restore ARC Zig cache dirs
-        id: cache
-        run: |
-          # Compiler outputs belong on the PVC; runner temp counts toward
-          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
-          # caches below before starting the next phase.
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
-          global_cache="/mnt/cache/antfly/zig/zig-global"
-          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache"
 
       # The admitted branch can predate this action. Bootstrap tooling from
       # the same immutable revision as the executing approval workflow.
@@ -932,7 +1008,43 @@ jobs:
             .github/actions/prepare-zig-dependencies
             scripts/ci/prepare_zig_dependencies.py
             scripts/ci/zig-dependencies.json
+            scripts/ci/install_ubuntu_packages.sh
           sparse-checkout-cone-mode: false
+
+      - name: Install build tools
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
+
+      - name: Restore ARC Zig cache dirs
+        id: cache
+        run: |
+          # Compiler outputs belong on the PVC; runner temp counts toward
+          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
+          # caches below before starting the next phase.
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
 
       - name: Prepare verified Zig source dependencies
         uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
@@ -951,15 +1063,27 @@ jobs:
           # The @antfly/web package contract suite runs from its built ESM
           # artifact in the TypeScript SDK gate.
           node pkg/antfly-embedded/wasm_client_test.mjs
-          python3 tools/run_bounded_zig_build.py build wasm-test inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
+          # Separate the complete embedded image and inference image phases:
+          # their LLVM peaks must not overlap within the runner's fixed budget.
+          python3 tools/run_bounded_zig_build.py --report reports/wasm-embedded-build.json build wasm-test -Dmetal=false -j1 -freference-trace=30 --summary all
+          python3 tools/run_bounded_zig_build.py --report reports/wasm-inference-build.json build inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
           EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm node --test pkg/inference/web/test-extraction-runtime.mjs pkg/inference/web/test-laya-runtime.mjs pkg/inference/web/test-decide-runtime.mjs pkg/inference/web/test-backends-runtime.mjs
-          zig build inference-wasm -Dwebgpu=true -Dmetal=false -j1 -freference-trace=30 --summary all
-          zig build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
+          python3 tools/run_bounded_zig_build.py --report reports/wasm-webgpu-build.json build inference-wasm -Dwebgpu=true -Dmetal=false -j1 -freference-trace=30 --summary all
+          python3 tools/run_bounded_zig_build.py --report reports/wasm-inference64-build.json build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
           cd pkg/inference
-          zig build wasm -Dwasm=true -j1 --summary all
+          python3 ../../tools/run_bounded_zig_build.py --report ../../reports/wasm-abi32-build.json build wasm -Dwasm=true -j1 --summary all
           node web/test-wasm-abi.mjs wasm32
-          zig build wasm -Dwasm=true -Dwasm-memory-model=wasm64 -j1 --summary all
+          python3 ../../tools/run_bounded_zig_build.py --report ../../reports/wasm-abi64-build.json build wasm -Dwasm=true -Dwasm-memory-model=wasm64 -j1 --summary all
           node web/test-wasm-abi.mjs wasm64
+
+      - name: Upload WASM compiler memory profiles
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wasm-compiler-memory-${{ github.run_attempt }}
+          path: zig/reports/wasm-*-build.json
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Release completed qualification artifacts
         if: always() && steps.cache.outcome == 'success'
@@ -997,7 +1121,7 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
           submodules: true
 
       - name: Sample ARC runner disk use
@@ -1005,30 +1129,6 @@ jobs:
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-
-      - name: Set up Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
-
-      - name: Restore ARC Zig cache dirs
-        id: cache
-        run: |
-          # Compiler outputs belong on the PVC; runner temp counts toward
-          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
-          # caches below before starting the next phase.
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
-          global_cache="/mnt/cache/antfly/zig/zig-global"
-          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache"
 
       # The admitted branch can predate this action. Bootstrap tooling from
       # the same immutable revision as the executing approval workflow.
@@ -1042,7 +1142,39 @@ jobs:
             .github/actions/prepare-zig-dependencies
             scripts/ci/prepare_zig_dependencies.py
             scripts/ci/zig-dependencies.json
+            scripts/ci/install_ubuntu_packages.sh
           sparse-checkout-cone-mode: false
+
+      - name: Install build tools
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils gdb file libopenblas0-pthread
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      # These are the same large native CAPI test objects as the full gate.
+      # Keep the compiler allocator and measured admission profile identical.
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
+
+      - name: Restore ARC Zig cache dirs
+        id: cache
+        run: |
+          # Compiler outputs belong on the PVC; runner temp counts toward
+          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
+          # caches below before starting the next phase.
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          global_cache="/mnt/cache/antfly/zig/zig-global"
+          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
+          mkdir -p "$local_cache" "$global_cache"
 
       - name: Prepare verified Zig source dependencies
         uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
@@ -1113,6 +1245,7 @@ jobs:
         if: always() && needs.changes.outputs.zig_tests == 'true' && steps.lite_extraction_report.outputs.exists == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          retention-days: 14
           name: lite-extraction-evaluation
           path: ${{ runner.temp }}/lite-extraction-eval.json
           if-no-files-found: error
@@ -1163,14 +1296,29 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+            scripts/ci/install_ubuntu_packages.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils gdb file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Install Nix
-        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
       - name: Install glibc-linked Zig
@@ -1195,20 +1343,6 @@ jobs:
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
-
-      # The admitted branch can predate this action. Bootstrap tooling from
-      # the same immutable revision as the executing approval workflow.
-      - name: Check out executing dependency policy
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: .ci-dependency-policy
-          persist-credentials: false
-          sparse-checkout: |
-            .github/actions/prepare-zig-dependencies
-            scripts/ci/prepare_zig_dependencies.py
-            scripts/ci/zig-dependencies.json
-          sparse-checkout-cone-mode: false
 
       - name: Prepare verified Zig source dependencies
         uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
@@ -1251,12 +1385,20 @@ jobs:
           tools/test_local_test_partitions.py
           tools/test_sync_generated.py
 
+      - name: Test linked read-session provider finalization and archive limits
+        run: |
+          zig build --build-file zig/build_read_session_graph_test.zig -Dtarget=x86_64-linux-musl --summary all
+          python3 -m unittest discover -s scripts/packaging -p test_native_archives.py
+
       - name: Test benchmark orchestration and fixture setup
         run: |
+          python3 -m unittest discover -s scripts/ci -p test_artifact_exchange.py
+          python3 -m unittest discover -s scripts/release -p test_r2_scope_restore.py
           python3 -m unittest discover -s scripts/ci -p test_eval_extract.py
           python3 -m unittest discover -s scripts/ci -p test_lite_embedding_bundle.py
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s zig/pkg/inference/scripts -p test_qualification_memory.py
           python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
@@ -1345,6 +1487,7 @@ jobs:
         if: always() && !cancelled() && steps.lite_extraction_report.outputs.exists == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          retention-days: 14
           name: lite-extraction-evaluation
           path: ${{ runner.temp }}/lite-extraction-eval.json
           if-no-files-found: error
@@ -1392,7 +1535,7 @@ jobs:
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
       - name: Set up Java for TLA+
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: "temurin"
           java-version: "21"
@@ -1577,16 +1720,13 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Install build tools
-        run: |
-          helper=scripts/ci/install_ubuntu_packages.sh
-          if [ ! -f "$helper" ]; then helper=.ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh; fi
-          bash "$helper" build-essential pkg-config ca-certificates git curl xz-utils file
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils file
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Install Nix
-        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
       - name: Install glibc-linked Zig
@@ -1636,6 +1776,7 @@ jobs:
         if: ${{ always() && matrix.shard == 'storage-ownership' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          retention-days: 14
           name: storage-compilation
           path: zig/storage-compilation.json
           if-no-files-found: ignore
@@ -1769,8 +1910,23 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+            scripts/ci/install_ubuntu_packages.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -1789,20 +1945,6 @@ jobs:
             echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global"
             echo "TMPDIR=$cache_root/tmp"
           } >> "$GITHUB_ENV"
-
-      # The admitted branch can predate this action. Bootstrap tooling from
-      # the same immutable revision as the executing approval workflow.
-      - name: Check out executing dependency policy
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: .ci-dependency-policy
-          persist-credentials: false
-          sparse-checkout: |
-            .github/actions/prepare-zig-dependencies
-            scripts/ci/prepare_zig_dependencies.py
-            scripts/ci/zig-dependencies.json
-          sparse-checkout-cone-mode: false
 
       - name: Prepare verified Zig source dependencies
         uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
@@ -1859,14 +2001,23 @@ jobs:
       ${{ always() && !cancelled() && needs.admission.result == 'success' &&
       (inputs.pr_number == '' || github.run_attempt == 1) &&
       (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
-    name: embedded-sdk-native / ${{ matrix.sdk }}
+    name: embedded-sdk-native / ${{ matrix.sdk }}${{ matrix.python_shard && format(' / {0}', matrix.python_shard) || '' }}
     needs: [admission, e2e-base-build, e2e-full-build]
     runs-on: arc-antfly-standard-runtime
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        sdk: [go, rust, python, typescript]
+        include:
+          - sdk: go
+          - sdk: rust
+          - sdk: typescript
+          - sdk: python
+            python_shard: core
+          - sdk: python
+            python_shard: cypher-0
+          - sdk: python
+            python_shard: cypher-1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1875,8 +2026,19 @@ jobs:
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
+      # Bootstrap must also work when the admitted candidate predates the
+      # installer. Keep privileged setup pinned to the executing workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: scripts/ci/install_ubuntu_packages.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install native test tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config
       - name: Download native SDK library installation
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -1899,12 +2061,12 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.rust_version }}
       - name: Set up Python
         if: matrix.sdk == 'python'
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - name: Set up uv
         if: matrix.sdk == 'python'
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Set up Node
         if: matrix.sdk == 'typescript'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -1912,13 +2074,74 @@ jobs:
           node-version-file: ts/package.json
       - name: Set up pnpm
         if: matrix.sdk == 'typescript'
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: ts/package.json
       - name: Test embedded SDK against the installed C ABI
         env:
+          ANTFLY_SDK_PYTHON_SHARD: ${{ matrix.python_shard }}
           ANTFLY_INFERENCE_MODELS_DIR: ${{ runner.temp }}/embedded-sdk-native-models
+          ANTFLY_SDK_NATIVE_REPORT_DIR: ${{ runner.temp }}/embedded-sdk-native-reports
         run: scripts/ci/test-embedded-sdk-native.sh "${RUNNER_TEMP}/native-sdk" "${{ matrix.sdk }}"
+
+      - name: Retain Python native test results and timings
+        if: always() && matrix.sdk == 'python'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: embedded-sdk-python-${{ matrix.python_shard }}-results-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/embedded-sdk-native-reports
+          if-no-files-found: ignore
+          retention-days: 14
+
+  source-sdk-native:
+    if: >-
+      ${{ always() && !cancelled() && needs.admission.result == 'success' &&
+      (inputs.pr_number == '' || github.run_attempt == 1) &&
+      (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
+    name: source-sdk-native
+    needs: [admission, e2e-base-build, e2e-full-build]
+    runs-on: arc-antfly-standard-runtime
+    timeout-minutes: 20
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Download candidate E2E executable
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: antfly-e2e-${{ needs.e2e-base-build.result == 'success' && 'base' || 'full' }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/source-sdk-artifact
+      - name: Install candidate E2E executable
+        run: tar -xzf "${RUNNER_TEMP}/source-sdk-artifact/"*.tar.gz -C zig
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.toolchain.outputs.go_version }}
+          cache: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ steps.toolchain.outputs.python_build }}
+      - name: Verify source SDK ingestion and durable recipe restart
+        run: python scripts/ci/check_source_native.py --no-build --binary zig/zig-out/bin/antfly
+
+  better-auth:
+    if: >-
+      ${{ always() && !cancelled() && needs.admission.result == 'success' &&
+      (inputs.pr_number == '' || github.run_attempt == 1) &&
+      (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
+    needs: [admission, e2e-base-build, e2e-full-build]
+    uses: ./.github/workflows/better-auth-compatibility.yml
+    with:
+      head_sha: ${{ inputs.head_sha || github.sha }}
+      artifact_suite: ${{ needs.e2e-base-build.result == 'success' && 'base' || 'full' }}
+      versions: ${{ github.event_name == 'schedule' && '["supported","latest","beta"]' || '["supported"]' }}
 
   pgwire-driver-conformance:
     if: >-
@@ -1939,8 +2162,19 @@ jobs:
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
+      # Bootstrap must also work when the admitted candidate predates the
+      # installer. Keep privileged setup pinned to the executing workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: scripts/ci/install_ubuntu_packages.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install driver build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config
       - name: Download candidate E2E executable
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -1962,12 +2196,23 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.rust_version }}
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - name: Set up uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-      - name: Test standard PostgreSQL drivers against candidate runtime
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Set up pnpm for Kysely conformance
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: ts/package.json
+      - name: Build Kysely integration
+        working-directory: ts
+        run: |
+          pnpm install --frozen-lockfile --filter @antfly/sdk...
+          pnpm --filter @antfly/sdk build
+          pnpm --filter @antfly/sdk typecheck
+          pnpm --filter @antfly/sdk exec vitest run test/kysely
+      - name: Test standard PostgreSQL drivers and Kysely against candidate runtime
         run: >-
           uv run --no-project --with requests --with pytest
           --with 'psycopg[binary]==3.3.6' --with asyncpg==0.31.0
@@ -1982,10 +2227,12 @@ jobs:
 
   e2e-base-plan:
     if: >-
-      ${{ !cancelled() && success() && !inputs.full_validation && needs.admission.result == 'success' &&
-      inputs.pr_number != '' && github.run_attempt == 1 && needs.changes.outputs.e2e == 'true' }}
-    name: e2e-base / plan
-    needs: [admission, changes]
+      ${{ always() && !cancelled() && needs.admission.result == 'success' &&
+      inputs.validation_scope != 'inference-e2e' &&
+      (inputs.pr_number == '' || github.run_attempt == 1) &&
+      (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
+    name: e2e / plan
+    needs: [admission, changes, e2e-base-build, e2e-full-build]
     runs-on: arc-antfly-standard-runtime
     timeout-minutes: 10
     steps:
@@ -1993,7 +2240,7 @@ jobs:
         with:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
       - name: Restore common E2E duration history
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -2004,15 +2251,24 @@ jobs:
         working-directory: zig
         env:
           PYTHONPATH: ../scripts/ci
+          FULL_E2E: ${{ inputs.full_validation || inputs.pr_number == '' }}
+          ANTFLY_E2E_FULL_LAKE: ${{ (inputs.full_validation || inputs.pr_number == '') && '1' || '0' }}
           ANTFLY_E2E_DURATION_FILE: ${{ runner.temp }}/e2e-plan/durations.json
         run: |
           mkdir -p "${RUNNER_TEMP}/e2e-plan"
           if [[ ! -f "$ANTFLY_E2E_DURATION_FILE" ]]; then
             cp ../scripts/ci/antfly_e2e_durations.json "$ANTFLY_E2E_DURATION_FILE"
           fi
-          uv run --project e2e/antfly pytest --collect-only -q -p zig_e2e_shard \
+          extras=()
+          selection=()
+          if [[ "$FULL_E2E" == "true" ]]; then
+            extras+=(--extra lake --extra iceberg)
+          else
+            selection+=(-m "$(python3 ../scripts/ci/zig_e2e_shard.py base-marker)")
+          fi
+          uv run --project e2e/antfly "${extras[@]}" pytest --collect-only -q -p zig_e2e_shard \
             --antfly-ci-plan-output "${RUNNER_TEMP}/e2e-plan/plan.json" \
-            -m "$(python3 ../scripts/ci/zig_e2e_shard.py base-marker)" e2e/antfly
+            "${selection[@]}" e2e/antfly
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
@@ -2074,8 +2330,19 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
 
+      # Bootstrap must also work when the admitted candidate predates the
+      # installer. Keep privileged setup pinned to the executing workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: scripts/ci/install_ubuntu_packages.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils gdb postgresql-client
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -2112,7 +2379,7 @@ jobs:
           ln -s "$cache_root/home-antfly-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -2235,8 +2502,19 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
 
+      # Bootstrap must also work when the admitted candidate predates the
+      # installer. Keep privileged setup pinned to the executing workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: scripts/ci/install_ubuntu_packages.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -2271,7 +2549,7 @@ jobs:
           ln -s "$cache_root/home-antfly-low-fd" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -2296,6 +2574,28 @@ jobs:
         run: |
           ulimit -n 256
           taskset -c ${{ steps.e2e_cpus.outputs.list }} zig build http-low-fd-ratchet-test
+
+      - name: Qualify mapped vector descriptors at supported open-file limits
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }}
+          scripts/ci/zig-vector-block-fd-test.sh
+
+      - name: Qualify public vector ingestion and recovery under descriptor pressure
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }}
+          uv run --project zig/e2e/antfly python
+          zig/e2e/antfly/bench_descriptor_pressure.py zig/zig-out/bin/antfly
+          --documents 1024 --steady-seconds 2 --limits 256 1024
+          --output "${RUNNER_TEMP}/descriptor-pressure-reports"
+
+      - name: Retain descriptor pressure measurements
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: antfly-descriptor-pressure-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/descriptor-pressure-reports
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Run low-FD Autograph regression
         env:
@@ -2345,7 +2645,7 @@ jobs:
       inputs.pr_number != '' &&
       needs.changes.outputs.e2e == 'true') }}
     name: e2e-base
-    needs: [admission, changes, e2e-base-build, e2e-base-plan, e2e-base-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]
+    needs: [admission, changes, e2e-base-build, e2e-base-plan, e2e-base-tests, e2e-base-low-fd, embedded-sdk-native, source-sdk-native, pgwire-driver-conformance, better-auth]
     runs-on: arc-antfly-standard-runtime
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -2359,7 +2659,9 @@ jobs:
           PLAN_RESULT: ${{ needs.e2e-base-plan.result }}
           LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}
           NATIVE_SDK_RESULT: ${{ needs.embedded-sdk-native.result }}
+          SOURCE_SDK_RESULT: ${{ needs.source-sdk-native.result }}
           PGWIRE_DRIVER_RESULT: ${{ needs.pgwire-driver-conformance.result }}
+          BETTER_AUTH_RESULT: ${{ needs.better-auth.result }}
         run: |
           set -euo pipefail
           test "$BUILD_RESULT" = "success"
@@ -2367,7 +2669,9 @@ jobs:
           test "$PLAN_RESULT" = "success"
           test "$LOW_FD_RESULT" = "success"
           test "$NATIVE_SDK_RESULT" = "success"
+          test "$SOURCE_SDK_RESULT" = "success"
           test "$PGWIRE_DRIVER_RESULT" = "success"
+          test "$BETTER_AUTH_RESULT" = "success"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -2437,8 +2741,23 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+            scripts/ci/install_ubuntu_packages.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils gdb
 
       - name: Set up Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -2457,20 +2776,6 @@ jobs:
             echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global"
             echo "TMPDIR=$cache_root/tmp"
           } >> "$GITHUB_ENV"
-
-      # The admitted branch can predate this action. Bootstrap tooling from
-      # the same immutable revision as the executing approval workflow.
-      - name: Check out executing dependency policy
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: .ci-dependency-policy
-          persist-credentials: false
-          sparse-checkout: |
-            .github/actions/prepare-zig-dependencies
-            scripts/ci/prepare_zig_dependencies.py
-            scripts/ci/zig-dependencies.json
-          sparse-checkout-cone-mode: false
 
       - name: Prepare verified Zig source dependencies
         uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
@@ -2523,6 +2828,7 @@ jobs:
     if: >-
       ${{ !cancelled() &&
       needs.admission.result == 'success' &&
+      (inputs.validation_scope == 'inference-e2e' || needs.e2e-base-plan.result == 'success') &&
       (inputs.pr_number == '' ||
       github.run_attempt == 1) &&
       (always() &&
@@ -2536,20 +2842,21 @@ jobs:
       github.event_name == 'workflow_dispatch') ||
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full / ${{ matrix.suite }}
-    needs: [admission, changes, e2e-base-build, e2e-full-build]
+    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-base-plan]
     runs-on: ${{ !startsWith(matrix.suite, 'inference-') && 'arc-antfly-heavy-runtime' || 'arc-antfly-heavy' }}
     timeout-minutes: 150
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
-        suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference-generation","inference-speech","inference-embedding"]' || '["inference-generation","inference-speech","inference-embedding","antfly"]') }}
+        suite: ${{ fromJSON((inputs.pr_number == '' && github.event_name == 'workflow_dispatch') && inputs.validation_scope == 'inference-e2e' && '["inference-generation","inference-speech","inference-embedding"]' || '["inference-generation","inference-speech","inference-embedding","antfly-ordinary-0","antfly-ordinary-1","antfly-ordinary-2","antfly-recovery-0","antfly-recovery-1","antfly-recovery-2"]') }}
     env:
       # Full Antfly E2E has the same multi-process groups as the base shards.
       # Keep one process-owning worker per runner while lightweight tests may
       # continue on the other pytest workers.
       ANTFLY_E2E_PROCESS_SLOTS: "2"
       ANTFLY_E2E_PROCESS_WORKERS: "1"
+      ANTFLY_E2E_SUITE: ${{ matrix.suite }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2563,8 +2870,19 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
 
+      # Bootstrap must also work when the admitted candidate predates the
+      # installer. Keep privileged setup pinned to the executing workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: scripts/ci/install_ubuntu_packages.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb libopenblas0-pthread
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils gdb libopenblas0-pthread postgresql-client
 
       - name: Prepare ARC test cache dirs
         run: |
@@ -2572,7 +2890,7 @@ jobs:
           # footprint fits on job-local disk; crash-test databases also use
           # runner-local disk (not tmpfs), just like the required base lanes.
           test_tmp="${RUNNER_TEMP}/antfly-e2e/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
-          if [[ "${{ matrix.suite }}" == "antfly" ]]; then
+          if [[ "$ANTFLY_E2E_SUITE" == antfly-* ]]; then
             home_cache_root="${RUNNER_TEMP}/antfly/zig"
           else
             home_cache_root="/mnt/cache/antfly/zig"
@@ -2584,6 +2902,12 @@ jobs:
             echo "TMPDIR=$test_tmp"
             echo "UV_CACHE_DIR=$uv_cache"
             echo "HF_HOME=$hf_home"
+            suite="${{ matrix.suite }}"
+            if [[ "$suite" == inference-* ]]; then
+              # Managed pulls lock and atomically publish verified model bundles.
+              # All lanes reuse these immutable artifacts; runtime caches stay local.
+              echo "ANTFLY_INFERENCE_MODELS_DIR=$home_cache_root/inference-models-full-v1"
+            fi
             echo "ANTFLY_E2E_DURATION_FILE=$duration_file"
           } >> "$GITHUB_ENV"
           mkdir -p "$test_tmp" "$uv_cache" "$hf_home" "$(dirname "$duration_file")"
@@ -2593,7 +2917,7 @@ jobs:
           ln -s "$home_cache_root/home-antfly-full-${{ matrix.suite }}" ~/.antfly
 
       - name: Install uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Compute CPU bound for E2E
         id: e2e_cpus
@@ -2603,14 +2927,14 @@ jobs:
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
 
       - name: Set up Rust WASI target
-        if: matrix.suite == 'antfly'
+        if: startsWith(matrix.suite, 'antfly-')
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: ${{ steps.toolchain.outputs.rust_version }}
           targets: wasm32-wasip2
 
       - name: Build record-tools extension test fixture
-        if: matrix.suite == 'antfly'
+        if: startsWith(matrix.suite, 'antfly-')
         run: cargo build --manifest-path zig/e2e/fixtures/extensions/records/Cargo.toml --release --target wasm32-wasip2
 
       - name: Download E2E executable
@@ -2625,14 +2949,14 @@ jobs:
       # Independent ingestion writers use the checkout's embedded SDK and the
       # C ABI artifact produced by the same build as the server under test.
       - name: Download ingestion native library
-        if: matrix.suite == 'antfly'
+        if: startsWith(matrix.suite, 'antfly-')
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/libantfly-e2e-full
 
       - name: Install ingestion native library
-        if: matrix.suite == 'antfly'
+        if: startsWith(matrix.suite, 'antfly-')
         run: |
           mkdir -p zig/zig-out
           tar -xzf "${RUNNER_TEMP}/libantfly-e2e-full/libantfly-e2e-${{ inputs.full_validation && 'base' || 'full' }}.tar.gz" -C zig/zig-out
@@ -2648,7 +2972,7 @@ jobs:
           fi
 
       - name: Install Wasmtime C API
-        if: matrix.suite == 'antfly'
+        if: startsWith(matrix.suite, 'antfly-')
         env:
           WASMTIME_VERSION: v45.0.2
         run: |
@@ -2668,6 +2992,16 @@ jobs:
           test -n "$lib"
           echo "ANTFLY_WASMTIME_LIB=$lib" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$root/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Restore verified inference model bundles
+        if: startsWith(matrix.suite, 'inference-')
+        id: inference_models_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.ANTFLY_INFERENCE_MODELS_DIR }}
+          # ARC scratch PVCs are ephemeral: a stable path alone does not retain
+          # weights across jobs. Restore bundles, never loaded model state.
+          key: inference-model-bundles-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.suite }}-${{ hashFiles('zig/e2e/inference/models.py', 'scripts/ci/inference_e2e_shards.py', '.github/workflows/zig-tests.yml') }}
 
       - name: Run Antfly inference full E2E
         if: startsWith(matrix.suite, 'inference-')
@@ -2692,7 +3026,10 @@ jobs:
           # steady request deadline on CPU-only release runners. Only tests
           # explicitly covering first-use paths opt into this hard bound.
           ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "1800"
-          ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
+          # Byte admission evicts under pressure. Do not force reloads just
+          # because a compound endpoint needs a small second model. The explicit
+          # eviction regression starts its own one-model server.
+          ANTFLY_INFERENCE_MAX_LOADED_MODELS: "0"
           # Keep the model process inside its existing 14GiB admission budget.
           # Shards remain serial and use the existing heavy runner envelope.
           ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB: "14000"
@@ -2713,9 +3050,13 @@ jobs:
         if: matrix.suite == 'inference-generation'
         working-directory: zig
         env:
+          # Exercise the same shipped CPU backend as the inference shard.
+          ANTFLY_INFERENCE_BLAS: openblas
+          OPENBLAS_NUM_THREADS: "2"
+          ANTFLY_E2E_PHASE_TIMINGS: "1"
+          ANTFLY_INFERENCE_SERVER_LOG_DIR: ${{ runner.temp }}/inference-server-logs
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_STANDALONE_TESTS: "1"
-          ANTFLY_INFERENCE_STANDALONE_MODELS_DIR: ~/.antfly/inference/models
           ANTFLY_INFERENCE_STANDALONE_MODEL_NAME: ggml-org/gemma-4-e2b-it-gguf
           # Match the cold-start contract used by the full inference suite.
           # Standalone exercises the same CPU-only model initialization path.
@@ -2724,20 +3065,62 @@ jobs:
           ANTFLY_INFERENCE_STANDALONE_HOST_BUDGET_MB: "12000"
           ANTFLY_INFERENCE_STANDALONE_COMBINED_BUDGET_MB: "12000"
         run: |
-          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q \
+          # Reuse the immutable models downloaded by the generation shard.
+          export ANTFLY_INFERENCE_STANDALONE_MODELS_DIR="$ANTFLY_INFERENCE_MODELS_DIR"
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q -s --durations=10 \
             e2e/antfly/test_standalone.py::test_standalone_inference_process_envelope_composition
 
+      - name: Download shared full E2E plan
+        if: startsWith(matrix.suite, 'antfly-')
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: antfly-e2e-plan-${{ github.run_id }}
+          path: ${{ runner.temp }}/e2e-plan
+      - name: Initialize full lane timing history
+        if: startsWith(matrix.suite, 'antfly-')
+        run: |
+          mkdir -p "${RUNNER_TEMP}/e2e-reports"
+          cp "${RUNNER_TEMP}/e2e-plan/durations.json" "${RUNNER_TEMP}/e2e-reports/durations.json"
+          echo "ANTFLY_E2E_DURATION_FILE=${RUNNER_TEMP}/e2e-reports/durations.json" >> "$GITHUB_ENV"
+
       - name: Run Antfly full E2E
-        if: matrix.suite == 'antfly'
+        if: startsWith(matrix.suite, 'antfly-')
         working-directory: zig
         env:
           ANTFLY_E2E_FULL_LAKE: "1"
+          PYTHONPATH: ../scripts/ci
+          ANTFLY_E2E_REPORT_DIR: ${{ runner.temp }}/e2e-reports
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE: "1"
           ANTFLY_E2E_NATIVE_STACKS: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
-          taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly
+          suite="${{ matrix.suite }}"
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh \
+            -p zig_e2e_shard --antfly-ci-shard "${suite#antfly-}" \
+            --antfly-ci-plan "${RUNNER_TEMP}/e2e-plan/plan.json" e2e/antfly
+
+      - name: Save verified inference model bundles
+        # Approved PR code runs in a dispatched main workflow. It may consume
+        # trusted cache entries, but must never publish into main's cache scope.
+        if: >-
+          success() && startsWith(matrix.suite, 'inference-') &&
+          inputs.pr_number == '' && github.ref == 'refs/heads/main' &&
+          (inputs.head_sha == '' || inputs.head_sha == github.sha) &&
+          steps.inference_models_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.ANTFLY_INFERENCE_MODELS_DIR }}
+          key: ${{ steps.inference_models_cache.outputs.cache-primary-key }}
+
+      - name: Retain full API timings and per-test results
+        if: always() && startsWith(matrix.suite, 'antfly-')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: antfly-e2e-full-timings-${{ matrix.suite }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-reports
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Retain full inference server logs
         if: always() && startsWith(matrix.suite, 'inference-')
@@ -2749,7 +3132,7 @@ jobs:
           retention-days: 7
 
       - name: Retain failed full E2E server logs and cluster diagnostics
-        if: failure() && matrix.suite == 'antfly'
+        if: failure() && startsWith(matrix.suite, 'antfly-')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: antfly-e2e-full-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
@@ -2788,23 +3171,48 @@ jobs:
       github.event_name == 'workflow_dispatch') ||
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full
-    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-full-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]
+    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-base-plan, e2e-full-tests, e2e-base-low-fd, embedded-sdk-native, source-sdk-native, pgwire-driver-conformance, better-auth]
     runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify full E2E suites
         env:
           BUILD_RESULT: ${{ inputs.full_validation && needs.e2e-base-build.result || needs.e2e-full-build.result }}
           TEST_RESULT: ${{ needs.e2e-full-tests.result }}
+          PLAN_RESULT: ${{ needs.e2e-base-plan.result }}
           LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}
           NATIVE_SDK_RESULT: ${{ needs.embedded-sdk-native.result }}
+          SOURCE_SDK_RESULT: ${{ needs.source-sdk-native.result }}
           PGWIRE_DRIVER_RESULT: ${{ needs.pgwire-driver-conformance.result }}
+          BETTER_AUTH_RESULT: ${{ needs.better-auth.result }}
           REQUIRE_LOW_FD: ${{ inputs.full_validation && inputs.pr_number != '' }}
         run: |
           set -euo pipefail
           test "$BUILD_RESULT" = "success"
           test "$TEST_RESULT" = "success"
+          test "$PLAN_RESULT" = "success"
           test "$NATIVE_SDK_RESULT" = "success"
+          test "$SOURCE_SDK_RESULT" = "success"
           test "$PGWIRE_DRIVER_RESULT" = "success"
+          test "$BETTER_AUTH_RESULT" = "success"
           if [[ "$REQUIRE_LOW_FD" == "true" ]]; then
             test "$LOW_FD_RESULT" = "success"
           fi
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: antfly-e2e-plan-${{ github.run_id }}
+          path: ${{ runner.temp }}/e2e-plan
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: antfly-e2e-full-timings-*
+          path: ${{ runner.temp }}/e2e-observations
+      - name: Merge healthy lane measurements
+        run: >-
+          python3 scripts/ci/merge_e2e_durations.py
+          --baseline "${RUNNER_TEMP}/e2e-plan/durations.json"
+          --observations "${RUNNER_TEMP}/e2e-observations"
+          --output "${RUNNER_TEMP}/e2e-plan/durations.json"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/e2e-plan/durations.json
+          key: antfly-e2e-durations-v2-${{ github.run_id }}-${{ github.run_attempt }}

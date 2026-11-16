@@ -32,6 +32,37 @@ const time = @import("time.zig");
 
 const spin_limit = 64;
 
+/// Broadcast-only condition for predicate loops sharing one mutex. Both wait
+/// and broadcast require that mutex to be held. Every wake returns to the
+/// caller's predicate: a re-entering competitor cannot consume a different
+/// waiter's pending notification after a spurious wake.
+pub const BroadcastCondition = struct {
+    epoch: std.atomic.Value(u32) = .init(0),
+    waiters: u32 = 0,
+
+    pub const init: BroadcastCondition = .{};
+
+    pub fn waitUncancelable(self: *BroadcastCondition, io: std.Io, mutex: *std.Io.Mutex) void {
+        const observed = self.epoch.load(.acquire);
+        std.debug.assert(self.waiters < std.math.maxInt(u32));
+        self.waiters += 1;
+        mutex.unlock(io);
+        defer {
+            mutex.lockUncancelable(io);
+            self.waiters -= 1;
+        }
+        // The atomic value check also covers a broadcast between releasing
+        // the mutex and entering the kernel wait. Spurious wakes are valid.
+        io.futexWaitUncancelable(u32, &self.epoch.raw, observed);
+    }
+
+    pub fn broadcast(self: *BroadcastCondition, io: std.Io) void {
+        if (self.waiters == 0) return;
+        _ = self.epoch.fetchAdd(1, .release);
+        io.futexWake(u32, &self.epoch.raw, self.waiters);
+    }
+};
+
 /// Acquire `mutex` (any type exposing `tryLock`), spinning briefly and then
 /// releasing the CPU between attempts via `time.yieldBriefly`. On
 /// freestanding targets there is no scheduler to yield to, so this degrades

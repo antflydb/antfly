@@ -40,6 +40,8 @@ pub const Datum = struct {
     patterns: ?*PatternSet = null,
     value: Json = .null,
     sql_null: bool = true,
+    /// A missing JSON source member is distinct from a present JSON/SQL NULL.
+    missing: bool = false,
 
     pub fn fromJson(value: Json) Datum {
         return .{ .value = value, .sql_null = value == .null };
@@ -207,7 +209,36 @@ pub const BindLimits = struct {
 };
 const decisions = @import("../functions/decisions.zig");
 pub const DecisionDemand = struct { instruction: u32, function: decisions.Function, args: []const Json };
+/// Load raw data, a canonical value-identity token, or a missing-presence bool.
+/// Derived modes return the function result rather than the underlying datum.
+pub const ColumnRead = enum { value, identity, missing };
+pub const ColumnLoader = struct {
+    context: *anyopaque,
+    read: *const fn (*anyopaque, Allocator, u32, ColumnRead) anyerror!Datum,
+};
+/// Validated borrowed JSON may cross a pure JSON column/CASE output without
+/// building a DOM. Ordinary operators continue to consume typed Datum values.
+pub const NormalizedOutput = @import("raw_json_budget.zig").Normalized;
+pub const Output = union(enum) { datum: Datum, raw: struct { value: NormalizedOutput, column: u32 } };
+pub const OutputColumnLoader = struct {
+    context: *anyopaque,
+    read: *const fn (*anyopaque, Allocator, u32) anyerror!?[]const u8,
+    normalized: ?*const fn (*anyopaque, u32) anyerror!?NormalizedOutput = null,
+};
+/// One invocation and its nested lazy readers; parallel workers own separate budgets.
+pub const EvaluationBudget = struct {
+    work: @import("numeric_value.zig").Context,
+    input_bytes: usize = 0,
+    output_bytes: usize = 0,
+};
 pub const EvalLimits = struct {
+    output_column_loader: ?OutputColumnLoader = null,
+    /// Optional pinned source access. The VM requests only executed branches;
+    /// identity/existence reads can use authenticated metadata without payloads.
+    column_loader: ?ColumnLoader = null,
+    /// Lazy readers and the VM share one invocation budget when derived reads
+    /// require exact arithmetic or normalization outside the evaluator frame.
+    shared_budget: ?*EvaluationBudget = null,
     steps: usize = 65_536,
     pattern_steps: usize = 8 * 1024 * 1024,
     input_bytes: usize = @import("resource_limits.zig").default_memory_bytes,
@@ -224,7 +255,7 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path, value_identity, is_missing, date_bin };
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -253,6 +284,93 @@ pub const Instruction = struct {
     },
     const Branch = struct { condition: u32, value: u32 };
 };
+
+/// Allocation-free admission for serialized typed DAGs, before speculative
+/// caches inspect operands. Binder and remote consumers share function arities.
+/// Runtime value checks still own errors in demanded expressions (bad casts,
+/// division by zero, array shapes), preserving SQL short-circuit semantics.
+pub fn validateTypedInstructions(instructions: []const Instruction, root: u32, output: Type) !void {
+    if (instructions.len == 0 or root >= instructions.len or !std.meta.eql(instructions[root].type, output)) return error.InvalidSqlProgram;
+    for (instructions, 0..) |instruction, index| {
+        validateParameterType(instruction.type) catch return error.InvalidSqlProgram;
+        switch (instruction.operation) {
+            .literal => |value| {
+                if (value == .null) continue;
+                const kind = instruction.type.kind orelse return error.InvalidSqlProgram;
+                const valid = switch (value) {
+                    .null => unreachable,
+                    .bool => kind == .boolean or kind == .json,
+                    .integer, .float, .number_string => kind == .integer or kind == .number or kind == .json,
+                    .string => kind == .string or kind == .uuid or kind == .datetime or kind == .json or (kind == .number and instruction.type.element_type == .numeric),
+                    .array, .object => kind == .json,
+                };
+                if (!valid) return error.InvalidSqlProgram;
+            },
+            .column, .parameter => if (instruction.type.kind == null) return error.InvalidSqlProgram,
+            .unary => |op| {
+                if (op.operand >= index) return error.InvalidSqlProgram;
+                switch (op.op) {
+                    .not, .is_true, .is_not_true, .is_false, .is_not_false, .is_unknown, .is_not_unknown => try requireInstructionKind(instructions[op.operand].type, .boolean),
+                    .positive, .negative => {
+                        const kind = instructions[op.operand].type.kind;
+                        if (kind != null and kind != .integer and kind != .number) return error.InvalidSqlProgram;
+                    },
+                    else => {},
+                }
+            },
+            .binary => |op| {
+                if (op.left >= index or op.right >= index) return error.InvalidSqlProgram;
+                if (op.op == .@"and" or op.op == .@"or") {
+                    try requireInstructionKind(instructions[op.left].type, .boolean);
+                    try requireInstructionKind(instructions[op.right].type, .boolean);
+                    try requireInstructionKind(instruction.type, .boolean);
+                }
+            },
+            .cast => |op| {
+                if (op.operand >= index or instruction.type.kind != op.type) return error.InvalidSqlProgram;
+                validateParameterType(.{ .kind = op.type, .element_type = op.element_type, .numeric_modifier = op.numeric_modifier }) catch return error.InvalidSqlProgram;
+            },
+            .case_when => |op| {
+                if (op.otherwise) |ordinal| if (ordinal >= index) return error.InvalidSqlProgram;
+                for (op.branches) |branch| {
+                    if (branch.condition >= index or branch.value >= index) return error.InvalidSqlProgram;
+                    try requireInstructionKind(instructions[branch.condition].type, .boolean);
+                }
+            },
+            .in_list => |op| {
+                if (op.operand >= index) return error.InvalidSqlProgram;
+                for (op.values) |ordinal| if (ordinal >= index) return error.InvalidSqlProgram;
+                try requireInstructionKind(instruction.type, .boolean);
+            },
+            .call => |op| {
+                validateFunctionArity(op.function, op.args.len) catch return error.InvalidSqlProgram;
+                for (op.args) |ordinal| if (ordinal >= index) return error.InvalidSqlProgram;
+                // These kernels borrow typed array pointers/element descriptors;
+                // prove the static shape before any optional cache can inspect it.
+                switch (op.function) {
+                    .array_cat => {
+                        try requireInstructionKind(instructions[op.args[0]].type, .array);
+                        try requireInstructionKind(instructions[op.args[1]].type, .array);
+                        if (instruction.type.kind != .array) return error.InvalidSqlProgram;
+                    },
+                    .array_append, .array_prepend => {
+                        try requireInstructionKind(instructions[op.args[@intFromBool(op.function == .array_prepend)]].type, .array);
+                        if (instruction.type.kind != .array) return error.InvalidSqlProgram;
+                    },
+                    .@"$array", .string_to_array => if (instruction.type.kind != .array) return error.InvalidSqlProgram,
+                    .array_position => if (op.args.len == 3) try requireInstructionKind(instructions[op.args[2]].type, .integer),
+                    .is_missing => if (instruction.type.kind != .boolean) return error.InvalidSqlProgram,
+                    .value_identity => if (instruction.type.kind != .string) return error.InvalidSqlProgram,
+                    else => {},
+                }
+            },
+        }
+    }
+}
+fn requireInstructionKind(descriptor: Type, expected: ast.ColumnType) !void {
+    // An untyped NULL is safe in strict and non-strict SQL kernels alike.
+    if (descriptor.kind != null and descriptor.kind != expected) return error.InvalidSqlProgram;
+}
 
 const TextTranslation = std.AutoHashMapUnmanaged(u21, []const u8);
 
@@ -315,6 +433,340 @@ pub const Program = struct {
             }
         }
         self.concat_nodes = nodes;
+    }
+
+    /// Only integer affine instruction trees may consume synthetic marginal
+    /// bins. Every intermediate remains affine, so the original evaluator at
+    /// the emitted extrema preserves checked arithmetic failures as well.
+    pub fn affineColumn(self: Program) ?u32 {
+        if (self.output_type.kind != .integer) return null;
+        const form = self.affineInstruction(self.root, 0, .distinct) orelse return null;
+        return if (form.field) |field| @intCast(field) else null;
+    }
+    /// Prove affinity in one candidate input. All other inputs are symbolic
+    /// invariants whose per-bag constancy must be certified by the producer.
+    pub fn affineRelativeTo(self: Program, column: u32) bool {
+        if (self.output_type.kind != .integer) return false;
+        const form = self.affineInstruction(self.root, 0, .{ .single = column }) orelse return false;
+        return form.field == column;
+    }
+    /// Treat all integer inputs as affine functions of one producer marginal.
+    /// The producer must prove that shared lineage before using representatives.
+    pub fn affineTogether(self: Program) bool {
+        if (self.output_type.kind != .integer) return false;
+        return self.affineInstruction(self.root, 0, .shared) != null;
+    }
+    /// Syntactic candidate only. The producer supplies bounded, typed lineage
+    /// before this can authorize representative rows.
+    pub fn numericLinearCandidate(self: Program) bool {
+        if (self.output_type.kind != .integer and self.output_type.kind != .number) return false;
+        for (self.instructions) |instruction| {
+            if (instruction.input_function or (instruction.type.kind != .integer and instruction.type.kind != .number)) return false;
+            switch (instruction.operation) {
+                .column, .literal, .parameter => {},
+                .cast => |c| if (c.type != .number or (c.element_type != null and c.element_type != .float64)) return false,
+                .unary => |u| if (u.op != .positive and u.op != .negative) return false,
+                .binary => |b| if (b.op != .add and b.op != .subtract and b.op != .multiply and b.op != .divide) return false,
+                else => return false,
+            }
+        }
+        return true;
+    }
+    pub fn statisticCandidate(self: Program) bool {
+        for (self.instructions) |instruction| {
+            if (instruction.input_function or instruction.type.kind != .integer) return false;
+            switch (instruction.operation) {
+                .column, .literal, .parameter => {},
+                .cast => |c| if (c.type != .integer) return false,
+                .unary => |u| if (u.op != .positive and u.op != .negative) return false,
+                .binary => |b| if (b.op != .add and b.op != .subtract and b.op != .multiply) return false,
+                else => return false,
+            }
+        }
+        return true;
+    }
+    pub fn statisticProof(self: Program, a: Allocator, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, integers: []const ?i64) !?@import("cypher").statistic.Form {
+        const n = for (fields) |field| {
+            if (field.polynomial) |f| break f.dimensions;
+        } else return null;
+        return self.statisticInstruction(a, self.root, 0, columns, fields, integers, n);
+    }
+    fn statisticInstruction(self: Program, a: Allocator, index: u32, depth: usize, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, integers: []const ?i64, n: usize) anyerror!?@import("cypher").statistic.Form {
+        const F = @import("cypher").statistic.Form;
+        if (depth > 128 or index >= self.instructions.len) return null;
+        const instruction = self.instructions[index];
+        if (instruction.input_function or instruction.type.kind != .integer) return null;
+        const result: ?F = switch (instruction.operation) {
+            .column => |column| blk: {
+                if (column >= columns.len) break :blk null;
+                for (fields) |field| if (std.mem.eql(u8, field.name, columns[column].name)) break :blk field.polynomial;
+                break :blk null;
+            },
+            .literal => |value| if (value == .integer) try F.literal(a, value.integer, n) else null,
+            .parameter => |slot| if (slot < integers.len) (if (integers[slot]) |value| try F.literal(a, value, n) else null) else null,
+            .unary => |u| blk: {
+                const operand = (try self.statisticInstruction(a, u.operand, depth + 1, columns, fields, integers, n)) orelse break :blk null;
+                break :blk switch (u.op) {
+                    .positive => operand,
+                    .negative => try operand.negative(a),
+                    else => null,
+                };
+            },
+            .binary => |b| blk: {
+                const op: @import("cypher").statistic.Op = switch (b.op) {
+                    .add => .add,
+                    .subtract => .subtract,
+                    .multiply => .multiply,
+                    else => break :blk null,
+                };
+                const l = (try self.statisticInstruction(a, b.left, depth + 1, columns, fields, integers, n)) orelse break :blk null;
+                const r = (try self.statisticInstruction(a, b.right, depth + 1, columns, fields, integers, n)) orelse break :blk null;
+                break :blk try F.combine(l, r, a, op);
+            },
+            .cast => |c| if (c.type == .integer) try self.statisticInstruction(a, c.operand, depth + 1, columns, fields, integers, n) else null,
+            else => null,
+        };
+        const proof = result orelse return null;
+        if (instruction.type.element_type) |kind| if (@import("builtin_cast.zig").integral(kind)) {
+            _ = @import("builtin_cast.zig").checkedInteger(proof.range.low, kind) catch return null;
+            _ = @import("builtin_cast.zig").checkedInteger(proof.range.high, kind) catch return null;
+        };
+        return proof;
+    }
+    pub fn numericProof(self: Program, a: Allocator, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, scalars: []const ?@import("cypher").linear_numeric.Lattice) !?@import("cypher").linear_numeric.Form {
+        return self.numericInstruction(a, self.root, 0, columns, fields, scalars);
+    }
+    fn numericInstruction(self: Program, a: Allocator, index: u32, depth: usize, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, scalars: []const ?@import("cypher").linear_numeric.Lattice) anyerror!?@import("cypher").linear_numeric.Form {
+        const N = @import("cypher").linear_numeric;
+        if (depth > 128 or index >= self.instructions.len) return null;
+        const instruction = self.instructions[index];
+        if (instruction.input_function or (instruction.type.kind != .integer and instruction.type.kind != .number) or instruction.type.element_type == .float32) return null;
+        return switch (instruction.operation) {
+            .column => |column| blk: {
+                if (column >= columns.len) break :blk null;
+                for (fields) |field| if (std.mem.eql(u8, field.name, columns[column].name)) break :blk field.numeric;
+                break :blk null;
+            },
+            .literal => |value| switch (value) {
+                .integer => |n| N.Form.literal(.integer(n)),
+                .float => |n| N.Form.literal(N.Lattice.number(n) orelse return null),
+                .number_string => |text| N.Form.literal(N.Lattice.decimal(text) orelse return null),
+                else => null,
+            },
+            .parameter => |slot| if (slot < scalars.len) (if (scalars[slot]) |value| N.Form.literal(value) else null) else null,
+            .unary => |u| blk: {
+                const operand = (try self.numericInstruction(a, u.operand, depth + 1, columns, fields, scalars)) orelse return null;
+                break :blk switch (u.op) {
+                    .positive => operand,
+                    .negative => try operand.negative(a),
+                    else => null,
+                };
+            },
+            .binary => |b| blk: {
+                const left = (try self.numericInstruction(a, b.left, depth + 1, columns, fields, scalars)) orelse return null;
+                const right = (try self.numericInstruction(a, b.right, depth + 1, columns, fields, scalars)) orelse return null;
+                const op: N.Op = switch (b.op) {
+                    .add => .add,
+                    .subtract => .subtract,
+                    .multiply => .multiply,
+                    .divide => .divide,
+                    else => return null,
+                };
+                const result = (try N.Form.combine(left, right, a, op)) orelse return null;
+                // NUMERIC division selects a display scale from each row's
+                // magnitude. Even an exact quotient can change the aggregate's
+                // retained scale when representatives omit an interior value.
+                // Binary64 division has no such observable decimal metadata.
+                if (op == .divide and instruction.type.element_type == .numeric and (!left.constant() or result.range.shift < -16)) return null;
+                break :blk result;
+            },
+            .cast => |c| blk: {
+                if (c.type != .number or (c.element_type != null and c.element_type != .float64)) return null;
+                var result = (try self.numericInstruction(a, c.operand, depth + 1, columns, fields, scalars)) orelse return null;
+                if (!result.range.exactFloat()) return null;
+                result.range.floating = true;
+                break :blk result;
+            },
+            else => null,
+        };
+    }
+    /// A request-local totality proof for linear consumers. Unknown parameter
+    /// or column bounds decline compression rather than speculating about an
+    /// error. Every intermediate instruction must fit the integer domain.
+    pub fn linearBounds(self: Program, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, integers: []const ?i64) ?@import("cypher").linear_bounds.Interval {
+        const proof = self.linearInstruction(self.root, 0, columns, fields, integers) orelse return null;
+        return proof.interval;
+    }
+    fn linearInstruction(self: Program, index: u32, depth: usize, columns: []const Column, fields: []const @import("cypher").linear_bounds.Field, integers: []const ?i64) ?@import("cypher").integer_affine.Form {
+        if (depth > 128 or index >= self.instructions.len) return null;
+        const Form = @import("cypher").integer_affine.Form;
+        const instruction = self.instructions[index];
+        if (instruction.input_function or instruction.type.kind != .integer) return null;
+        return switch (instruction.operation) {
+            .column => |column| blk: {
+                if (column >= columns.len) break :blk null;
+                for (fields) |field| if (std.mem.eql(u8, field.name, columns[column].name)) break :blk Form.column(column).bounded(field.bounds orelse return null);
+                break :blk null;
+            },
+            .literal => |value| if (value == .integer) Form.literal(value.integer) else null,
+            .parameter => |slot| if (slot < integers.len) (if (integers[slot]) |value| Form.literal(value) else null) else null,
+            .unary => |unary| blk: {
+                const operand = self.linearInstruction(unary.operand, depth + 1, columns, fields, integers) orelse return null;
+                break :blk switch (unary.op) {
+                    .positive => operand,
+                    .negative => operand.negative(),
+                    else => null,
+                };
+            },
+            .binary => |binary| blk: {
+                const left = self.linearInstruction(binary.left, depth + 1, columns, fields, integers) orelse return null;
+                const right = self.linearInstruction(binary.right, depth + 1, columns, fields, integers) orelse return null;
+                const result = switch (binary.op) {
+                    .add => Form.combineMarginals(left, right, .add),
+                    .subtract => Form.combineMarginals(left, right, .subtract),
+                    .multiply => Form.combineMarginals(left, right, .multiply),
+                    else => null,
+                } orelse return null;
+                if (result.interval == null) break :blk null;
+                break :blk result;
+            },
+            else => null,
+        };
+    }
+    const AffineInputs = union(enum) { distinct, single: u32, shared };
+    fn affineInstruction(self: Program, index: u32, depth: usize, inputs: AffineInputs) ?@import("cypher").integer_affine.Form {
+        if (depth > 128 or index >= self.instructions.len) return null;
+        const form = @import("cypher").integer_affine.Form;
+        const instruction = self.instructions[index];
+        if (instruction.input_function or instruction.type.kind != .integer) return null;
+        return switch (instruction.operation) {
+            .column => |column| switch (inputs) {
+                .distinct => form.column(column),
+                .single => |varying| if (column == varying) form.column(column) else form.invariant(),
+                .shared => form.column(0),
+            },
+            // Typed parameters are invocation invariants. This certificate is
+            // structural; ordinary evaluation of integer bins retains their
+            // actual coefficients, nulls and checked intermediate failures.
+            .parameter => form.invariant(),
+            .literal => |value| if (value == .integer) form.literal(value.integer) else null,
+            .unary => |u| blk: {
+                const operand = self.affineInstruction(u.operand, depth + 1, inputs) orelse return null;
+                break :blk switch (u.op) {
+                    .positive => operand,
+                    .negative => operand.negative(),
+                    else => null,
+                };
+            },
+            .binary => |b| blk: {
+                const left = self.affineInstruction(b.left, depth + 1, inputs) orelse return null;
+                const right = self.affineInstruction(b.right, depth + 1, inputs) orelse return null;
+                break :blk switch (b.op) {
+                    .add => form.combine(left, right, .add),
+                    .subtract => form.combine(left, right, .subtract),
+                    .multiply => form.combine(left, right, .multiply),
+                    else => null,
+                };
+            },
+            else => null,
+        };
+    }
+    /// Re-evaluating this program for the same input row has the same value
+    /// and no observable effects within one statement. CASE/Boolean laziness
+    /// stays in the ordinary evaluator; compression only changes multiplicity.
+    /// Decision calls and consumable pattern cursors require ordinary rows.
+    /// current_setting reads the invocation's pinned immutable settings view.
+    pub fn repeatable(self: Program) bool {
+        for (self.instructions) |instruction| switch (instruction.operation) {
+            .literal, .column, .parameter, .unary, .binary, .cast, .case_when, .in_list => {},
+            .call => |call| switch (call.function) {
+                .ai_decide, .ai_choice, .ai_score, .ai_probability, .@"$pattern_quantified" => return false,
+                .abs,
+                .lower,
+                .upper,
+                .length,
+                .octet_length,
+                .concat,
+                .coalesce,
+                .nullif,
+                .greatest,
+                .least,
+                .ceil,
+                .floor,
+                .round,
+                .sqrt,
+                .power,
+                .mod,
+                .substring,
+                .trim,
+                .ltrim,
+                .rtrim,
+                .replace,
+                .starts_with,
+                .date_part,
+                .date_bin,
+                .date_trunc,
+                .to_timestamp,
+                .current_setting,
+                .@"$single",
+                .trunc,
+                .sign,
+                .to_jsonb,
+                .jsonb_build_object,
+                .jsonb_extract_path_text,
+                .concat_ws,
+                .bit_length,
+                .strpos,
+                .jsonb_typeof,
+                .lpad,
+                .rpad,
+                .repeat,
+                .reverse,
+                .left,
+                .right,
+                .split_part,
+                .translate,
+                .overlay,
+                .ascii,
+                .chr,
+                .@"$array",
+                .@"$array_quantified",
+                .cardinality,
+                .array_ndims,
+                .array_length,
+                .array_lower,
+                .array_upper,
+                .@"$array_pattern_quantified",
+                .@"$contains",
+                .@"$overlaps",
+                .array_to_string,
+                .jsonb_exists,
+                .string_to_array,
+                .@"$like_escape",
+                .jsonb_set,
+                .array_position,
+                .array_positions,
+                .array_remove,
+                .array_replace,
+                .array_append,
+                .array_prepend,
+                .array_cat,
+                .jsonb_exists_any,
+                .jsonb_exists_all,
+                .regexp_like,
+                .regexp_count,
+                .regexp_instr,
+                .regexp_substr,
+                .regexp_replace,
+                .jsonb_array_length,
+                .initcap,
+                .jsonb_extract_path,
+                .value_identity,
+                .is_missing,
+                => {},
+            },
+        };
+        return true;
     }
 
     fn literalInstruction(self: *const Program, index: u32, earlier: []const bool) bool {
@@ -452,6 +904,35 @@ pub const Program = struct {
         }
     }
 
+    /// Prepare execution caches for validated typed IR. Instructions and their
+    /// literal payloads are borrowed and must outlive this execution program.
+    /// No binder, settings, or statement-owned invocation pointers are copied.
+    pub fn fromTypedInstructions(alloc: Allocator, instructions: []const Instruction, root: u32, output: Type, limits: BindLimits) !Program {
+        if (root >= instructions.len or !std.meta.eql(instructions[root].type, output)) return error.InvalidSqlBackendResponse;
+        try validateTypedInstructions(instructions, root, output);
+        const arena = try alloc.create(std.heap.ArenaAllocator);
+        errdefer alloc.destroy(arena);
+        arena.* = .init(alloc);
+        errdefer arena.deinit();
+        var program: Program = .{ .arena = arena, .instructions = instructions, .root = root, .output_type = output, .parameter_types = &.{}, .parameter_descriptors = &.{}, .required_columns = &.{} };
+        errdefer program.releaseConstants();
+        // Serialized fragments carry instructions, not binder-owned metadata.
+        // Rebuild dependencies before publishing to sparse/vector consumers.
+        var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen.deinit(arena.allocator());
+        var required: std.ArrayList(u32) = .empty;
+        for (instructions) |instruction| if (instruction.operation == .column) {
+            const column = instruction.operation.column;
+            const entry = try seen.getOrPut(arena.allocator(), column);
+            if (!entry.found_existing) try required.append(arena.allocator(), column);
+        };
+        program.required_columns = try required.toOwnedSlice(arena.allocator());
+        try program.prepareConstantArrays(arena.allocator(), limits);
+        try program.prepareConcatNodes(arena.allocator());
+        program.decimal_plan = try @import("decimal_program.zig").compile(arena.allocator(), instructions, root);
+        return program;
+    }
+
     pub fn deinit(self: *Program) void {
         self.releaseConstants();
         const backing = self.arena.child_allocator;
@@ -473,6 +954,34 @@ pub const Program = struct {
         const result = try context.runDatum(self.root, 0);
         _ = try context.validateJson(result.value, 0);
         return result;
+    }
+
+    /// Same read-mode semantics used by ordinary scalar function evaluation.
+    /// The allocator owns derived results; limits may share the caller's work.
+    pub fn readColumnValue(self: *const Program, alloc: Allocator, value: Datum, descriptor: Type, demand: ColumnRead, limits: EvalLimits) !Datum {
+        var evaluator: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits };
+        return evaluator.readColumnValue(value, descriptor, demand);
+    }
+
+    pub fn directOutputColumn(self: *const Program) ?u32 {
+        return switch (self.instructions[self.root].operation) {
+            .column => |ordinal| ordinal,
+            else => null,
+        };
+    }
+
+    pub fn evaluateOutput(self: *const Program, alloc: Allocator, cells: []const Datum, parameters: []const Json, limits: EvalLimits) !Output {
+        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = cells, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = limits };
+        const result = try context.runOutput(self.root, 0);
+        if (result == .datum) _ = try context.validateJson(result.datum.value, 0);
+        return result;
+    }
+
+    /// Convert a result with the same typed JSON rules used by SQL's to_jsonb.
+    pub fn resultJson(self: *const Program, alloc: Allocator, value: Datum, limits: EvalLimits) !Json {
+        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits };
+        if (value.array) |array| return @import("array_wire.zig").toJsonLeaky(alloc, array.*, .{ .values = .{ .bytes = limits.output_bytes }, .wire_bytes = limits.output_bytes });
+        return context.sqlJson(value, self.output_type);
     }
 
     fn preparedValues(self: *const Program) ?[]const Datum {
@@ -2024,16 +2533,17 @@ test "SQL scalar regex functions preserve PostgreSQL values OIDs NULLs and error
     }
 }
 
-fn arity(function: Function, count: usize) !void {
+pub fn validateFunctionArity(function: Function, count: usize) !void {
     if (regexFunction(function)) |regex| {
         if (!regex_functions.validArity(regex, count)) return error.SqlUndefinedFunction;
         return;
     }
     const valid = switch (function) {
+        .value_identity, .is_missing => count == 1,
         .regexp_like, .regexp_count, .regexp_instr, .regexp_substr, .regexp_replace => unreachable,
         .array_position => count == 2 or count == 3,
         .array_positions, .array_remove, .array_append, .array_prepend, .array_cat => count == 2,
-        .array_replace => count == 3,
+        .array_replace, .date_bin => count == 3,
         .@"$like_escape" => count == 4,
         .@"$contains", .@"$overlaps", .jsonb_exists, .jsonb_exists_any, .jsonb_exists_all => count == 2,
         .array_to_string => count == 2 or count == 3,
@@ -2241,7 +2751,11 @@ const Binder = struct {
                     break :blk .{ .kind = .integer, .nullable = false };
                 }
                 const function = try functionId(call.name);
-                try arity(function, call.args.len);
+                try validateFunctionArity(function, call.args.len);
+                if (function == .value_identity or function == .is_missing) {
+                    _ = try self.infer(call.args[0], depth + 1);
+                    break :blk .{ .kind = if (function == .value_identity) .string else .boolean, .element_type = if (function == .value_identity) .text else .boolean, .nullable = function == .value_identity };
+                }
                 if (function == .jsonb_extract_path or function == .jsonb_extract_path_text) {
                     for (call.args, 0..) |arg, i| {
                         const actual = try self.infer(arg, depth + 1);
@@ -2496,7 +3010,7 @@ const Binder = struct {
                     .length, .octet_length, .bit_length, .strpos, .ascii => .int32,
                     .starts_with => .boolean,
                     .to_jsonb, .jsonb_build_object => .jsonb,
-                    .date_trunc, .to_timestamp => null,
+                    .date_bin, .date_trunc, .to_timestamp => null,
                     .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .@"$single" => merged.element_type,
                     else => .text,
                 }, .kind = switch (function) {
@@ -2504,7 +3018,7 @@ const Binder = struct {
                     .length, .octet_length, .bit_length, .strpos, .ascii => .integer,
                     .starts_with, .@"$pattern_quantified" => .boolean,
                     .sqrt, .power, .date_part => .number,
-                    .date_trunc, .to_timestamp => .datetime,
+                    .date_bin, .date_trunc, .to_timestamp => .datetime,
                     .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .@"$single" => merged.kind,
                     else => .string,
                 }, .numeric_modifier = switch (function) {
@@ -2788,10 +3302,10 @@ const Binder = struct {
                         .overlay => if (i < 2) .string else .integer,
                         .chr => .integer,
                         .lpad, .rpad => if (i == 1) .integer else .string,
-                        .date_part, .date_trunc => if (i == 0) .string else .datetime,
+                        .date_bin, .date_part, .date_trunc => if (i == 0) .string else .datetime,
                         .to_timestamp => .number,
                         .concat => null,
-                        .to_jsonb, .jsonb_build_object => null,
+                        .to_jsonb, .jsonb_build_object, .value_identity, .is_missing => null,
                         .jsonb_extract_path_text, .jsonb_extract_path => if (i == 0) .json else .string,
                         else => kind.kind,
                     };
@@ -3104,7 +3618,14 @@ const Evaluator = struct {
     /// One invocation owns all VM, JSON, array and exact-arithmetic work.
     /// Nested codecs may impose tighter local limits, never a fresh request
     /// budget or cancellation identity. Failure remains sticky across them.
+    fn inputBytes(self: *Evaluator) *usize {
+        return if (self.limits.shared_budget) |owner| &owner.input_bytes else &self.input_bytes;
+    }
+    fn outputBytes(self: *Evaluator) *usize {
+        return if (self.limits.shared_budget) |owner| &owner.output_bytes else &self.bytes;
+    }
     fn workOwner(self: *Evaluator) *@import("numeric_value.zig").Context {
+        if (self.limits.shared_budget) |owner| return &owner.work;
         if (self.work_owner == null) self.work_owner = .{
             .alloc = self.alloc,
             .remaining = self.limits.steps,
@@ -3135,9 +3656,9 @@ const Evaluator = struct {
     fn compareJson(self: *Evaluator, left: Json, right: Json) !std.math.Order {
         if (left == .string and right == .string) {
             try self.workOwner().charge(0);
-            const remaining = self.limits.input_bytes -| self.input_bytes;
+            const remaining = self.limits.input_bytes -| self.inputBytes().*;
             var work: json_order.Budget = .{ .remaining = remaining };
-            defer self.input_bytes += remaining - work.remaining;
+            defer self.inputBytes().* += remaining - work.remaining;
             return compareWithBudget(left, right, &work);
         }
         var work = self.workBudget();
@@ -3167,14 +3688,58 @@ const Evaluator = struct {
 
     fn charge(self: *Evaluator, bytes: usize) !void {
         try self.workOwner().charge(0);
-        if (bytes > self.limits.output_bytes -| self.bytes) return self.workOwner().limit();
-        self.bytes += bytes;
+        if (bytes > self.limits.output_bytes -| self.outputBytes().*) return self.workOwner().limit();
+        self.outputBytes().* += bytes;
     }
 
     fn run(self: *Evaluator, index: u32, depth: usize) anyerror!Json {
         const result = try self.runDatum(index, depth);
         if (result.array != null or result.numeric != null) return error.SqlTypeMismatch;
         return result.value;
+    }
+
+    fn selectedCase(self: *Evaluator, case: anytype, depth: usize) !?u32 {
+        for (case.branches) |branch| {
+            const condition = try self.runDatum(branch.condition, depth + 1);
+            if (!condition.sql_null) {
+                if (condition.value != .bool) return error.SqlTypeMismatch;
+                if (condition.value.bool) return branch.value;
+            }
+        }
+        return case.otherwise;
+    }
+
+    fn runOutput(self: *Evaluator, index: u32, depth: usize) anyerror!Output {
+        const instruction = self.program.instructions[index];
+        // Typed coercions and modifiers must always use the regular VM.
+        if (instruction.type.kind == .json) switch (instruction.operation) {
+            .column => |ordinal| if (self.limits.output_column_loader) |loader| {
+                if (depth >= self.limits.depth) return self.workOwner().limit();
+                const limits: @import("raw_json_budget.zig").Limits = .{
+                    .wire_bytes = self.limits.output_bytes,
+                    .depth = self.limits.depth,
+                    .checkpoint = self.limits.checkpoint,
+                    .checkpoint_context = self.limits.checkpoint_context,
+                };
+                if (loader.normalized) |prepared| if (try prepared(loader.context, ordinal)) |value| {
+                    try self.workOwner().charge(1);
+                    try value.charge(limits, self.workOwner());
+                    return .{ .raw = .{ .value = value, .column = ordinal } };
+                };
+                if (try loader.read(loader.context, self.alloc, ordinal)) |raw| {
+                    try self.workOwner().charge(1);
+                    const normalized = try @import("raw_json_budget.zig").normalizePrepared(self.alloc, raw, limits, self.workOwner());
+                    return .{ .raw = .{ .value = normalized, .column = ordinal } };
+                }
+            },
+            .case_when => |case| {
+                if (depth >= self.limits.depth) return self.workOwner().limit();
+                try self.workOwner().charge(1);
+                return if (try self.selectedCase(case, depth)) |selected| self.runOutput(selected, depth + 1) else .{ .datum = .{} };
+            },
+            else => {},
+        };
+        return .{ .datum = try self.runDatum(index, depth) };
     }
 
     fn runDatum(self: *Evaluator, index: u32, depth: usize) anyerror!Datum {
@@ -3199,7 +3764,9 @@ const Evaluator = struct {
                 if (instruction.type.kind == .json) break :blk Datum.json(value);
                 break :blk Datum.json(try self.convert(value, instruction.type.kind.?));
             },
-            .column => |ordinal| if (ordinal < self.cells.len) self.cells[ordinal] else return error.InvalidSqlBackendResponse,
+            .column => |ordinal| if (self.limits.column_loader) |loader|
+                try loader.read(loader.context, self.alloc, ordinal, .value)
+            else if (ordinal < self.cells.len) self.cells[ordinal] else return error.InvalidSqlBackendResponse,
             .cast => |cast| blk: {
                 if (cast.type == .array) if (self.program.constant_arrays.get(index)) |prepared| {
                     try self.charge(try prepared.retainedBytes());
@@ -3219,7 +3786,7 @@ const Evaluator = struct {
                 if (datum.sql_null) break :blk .{};
                 if (cast.type == .array) {
                     if (datum.array == null and datum.value == .string) {
-                        const decoded = try @import("array_text.zig").decodeLeaky(self.alloc, cast.element_type orelse return error.InvalidSqlProgram, datum.value.string, .{ .values = .{ .bytes = self.limits.output_bytes -| self.bytes, .work = self.remainingSteps() }, .context = self.workOwner() });
+                        const decoded = try @import("array_text.zig").decodeLeaky(self.alloc, cast.element_type orelse return error.InvalidSqlProgram, datum.value.string, .{ .values = .{ .bytes = self.limits.output_bytes -| self.outputBytes().*, .work = self.remainingSteps() }, .context = self.workOwner() });
                         try self.charge(decoded.allocated_bytes + @sizeOf(arrays.Value));
                         const value = try self.alloc.create(arrays.Value);
                         value.* = decoded.value;
@@ -3301,7 +3868,7 @@ const Evaluator = struct {
                 if (left.sql_null or right.sql_null) break :blk .{};
                 if (left.array != null or right.array != null) return error.SqlTypeMismatch;
                 var work = self.workBudget();
-                const joined = try @import("json_concat.zig").concat(self.alloc, left.value, right.value, self.limits.output_bytes -| self.bytes, &work);
+                const joined = try @import("json_concat.zig").concat(self.alloc, left.value, right.value, self.limits.output_bytes -| self.outputBytes().*, &work);
                 try self.charge(joined.allocated_bytes);
                 break :blk Datum.json(joined.value);
             } else if (binary.op == .eq or binary.op == .neq or binary.op == .lt or binary.op == .lte or binary.op == .gt or binary.op == .gte or binary.op == .is_distinct or binary.op == .is_not_distinct) blk: {
@@ -3321,14 +3888,7 @@ const Evaluator = struct {
                 break :blk Datum.json(comparison(binary.op, try self.compareValues(left, right)));
             } else Datum.fromJson(try self.runLegacy(index, depth)),
             .case_when => |case| blk: {
-                for (case.branches) |branch| {
-                    const condition = try self.runDatum(branch.condition, depth + 1);
-                    if (!condition.sql_null) {
-                        if (condition.value != .bool) return error.SqlTypeMismatch;
-                        if (condition.value.bool) break :blk try self.runDatum(branch.value, depth + 1);
-                    }
-                }
-                break :blk if (case.otherwise) |other| try self.runDatum(other, depth + 1) else .{};
+                break :blk if (try self.selectedCase(case, depth)) |selected| try self.runDatum(selected, depth + 1) else .{};
             },
             .in_list => |list| blk: {
                 const operand = try self.runDatum(list.operand, depth + 1);
@@ -3365,6 +3925,14 @@ const Evaluator = struct {
                     } });
                 }
                 switch (call.function) {
+                    .value_identity, .is_missing => {
+                        const operand = self.program.instructions[call.args[0]].operation;
+                        if (self.limits.column_loader) |loader| if (operand == .column) {
+                            break :blk try loader.read(loader.context, self.alloc, operand.column, if (call.function == .value_identity) .identity else .missing);
+                        };
+                        const value = try self.runDatum(call.args[0], depth + 1);
+                        break :blk try self.readColumnValue(value, self.program.instructions[call.args[0]].type, if (call.function == .is_missing) .missing else .identity);
+                    },
                     .array_append, .array_prepend, .array_cat => {
                         if (try self.fusedConcat(index, depth)) |value| break :blk value;
                         const left = try self.runDatum(call.args[0], depth + 1);
@@ -3376,7 +3944,7 @@ const Evaluator = struct {
                             if (right.array.?.cardinality() == 0) break :blk left;
                         }
                         var work = self.workBudget();
-                        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
+                        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.outputBytes().* };
                         const prepend = call.function == .array_prepend;
                         const input = if (prepend) right else left;
                         const empty: arrays.Value = .{ .element_type = instruction.type.element_type.?, .dimensions = &.{}, .elements = &.{} };
@@ -3403,7 +3971,7 @@ const Evaluator = struct {
                             const answer = if (call.args.len == 2 and self.program.constant_memberships.contains(call.args[0])) try self.program.constant_memberships.get(call.args[0]).?.firstPosition(needle, &work) else try array.position(needle, start, &work);
                             break :blk if (answer) |value| Datum.json(.{ .integer = value }) else .{};
                         }
-                        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
+                        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.outputBytes().* };
                         const output = if (call.function == .array_positions) try array.positions(self.alloc, needle, limits, &work) else try array.transform(self.alloc, needle, if (call.function == .array_remove) null else third, limits, &work);
                         try self.charge(try output.admissionBytes());
                         const owned = try self.alloc.create(arrays.Value);
@@ -3430,7 +3998,7 @@ const Evaluator = struct {
                         if (input.sql_null) break :blk .{};
                         if (input.value != .string or (!delimiter.sql_null and delimiter.value != .string) or (!null_text.sql_null and null_text.value != .string)) return error.SqlTypeMismatch;
                         var work = self.workBudget();
-                        const output = try @import("text_array.zig").split(self.alloc, input.value.string, if (delimiter.sql_null) null else delimiter.value.string, if (null_text.sql_null) null else null_text.value.string, self.limits.output_bytes -| self.bytes, &work);
+                        const output = try @import("text_array.zig").split(self.alloc, input.value.string, if (delimiter.sql_null) null else delimiter.value.string, if (null_text.sql_null) null else null_text.value.string, self.limits.output_bytes -| self.outputBytes().*, &work);
                         try self.charge(output.bytes);
                         break :blk Datum.typedArray(output.value);
                     },
@@ -3441,7 +4009,7 @@ const Evaluator = struct {
                         if (input.sql_null or delimiter.sql_null) break :blk .{};
                         if (delimiter.value != .string or (!null_text.sql_null and null_text.value != .string)) return error.SqlTypeMismatch;
                         var work = self.workBudget();
-                        const text = try @import("text_array.zig").join(self.alloc, input.array orelse return error.SqlTypeMismatch, delimiter.value.string, if (null_text.sql_null) null else null_text.value.string, self.limits.output_bytes -| self.bytes, &work);
+                        const text = try @import("text_array.zig").join(self.alloc, input.array orelse return error.SqlTypeMismatch, delimiter.value.string, if (null_text.sql_null) null else null_text.value.string, self.limits.output_bytes -| self.outputBytes().*, &work);
                         try self.charge(text.len);
                         break :blk Datum.json(.{ .string = text });
                     },
@@ -3463,7 +4031,7 @@ const Evaluator = struct {
                             // Temporary index bytes are bounded by remaining output
                             // headroom and released before returning the boolean;
                             // they are not retained result bytes to charge again.
-                            break :contains try arrays.dynamicMembership(self.alloc, array.*, other.*, call.function == .@"$overlaps", .{ .bytes = self.limits.output_bytes -| self.bytes }, &work);
+                            break :contains try arrays.dynamicMembership(self.alloc, array.*, other.*, call.function == .@"$overlaps", .{ .bytes = self.limits.output_bytes -| self.outputBytes().* }, &work);
                         } else try @import("json_containment.zig").contains(left.value, right.value, &work, 0);
                         break :blk Datum.json(.{ .bool = accepted });
                     },
@@ -3555,7 +4123,7 @@ const Evaluator = struct {
                         if (target.sql_null or path.sql_null or replacement.sql_null or create.sql_null) break :blk .{};
                         if (target.array != null or replacement.array != null or create.array != null or create.value != .bool) return error.SqlTypeMismatch;
                         var work = self.workBudget();
-                        const changed = try @import("json_path_update.zig").set(self.alloc, target.value, path.array orelse return error.SqlTypeMismatch, replacement.value, create.value.bool, self.limits.output_bytes -| self.bytes, &work);
+                        const changed = try @import("json_path_update.zig").set(self.alloc, target.value, path.array orelse return error.SqlTypeMismatch, replacement.value, create.value.bool, self.limits.output_bytes -| self.outputBytes().*, &work);
                         try self.charge(changed.allocated_bytes);
                         break :blk Datum.json(changed.value);
                     },
@@ -3670,7 +4238,7 @@ const Evaluator = struct {
                         if (value.value == .null) break :blk .{};
                         if (value.value == .string) break :blk value;
                         var work = self.workBudget();
-                        const text = try @import("jsonb_text.zig").format(self.alloc, value.value, self.limits.output_bytes -| self.bytes, &work);
+                        const text = try @import("jsonb_text.zig").format(self.alloc, value.value, self.limits.output_bytes -| self.outputBytes().*, &work);
                         errdefer self.alloc.free(text);
                         try self.charge(text.len);
                         break :blk Datum.json(.{ .string = text });
@@ -3760,7 +4328,9 @@ const Evaluator = struct {
         const instruction = self.program.instructions[index];
         return switch (instruction.operation) {
             .literal => |value| value,
-            .column => |ordinal| if (ordinal < self.cells.len) self.cells[ordinal].value else error.InvalidSqlBackendResponse,
+            .column => |ordinal| if (self.limits.column_loader) |loader|
+                (try loader.read(loader.context, self.alloc, ordinal, .value)).value
+            else if (ordinal < self.cells.len) self.cells[ordinal].value else error.InvalidSqlBackendResponse,
             .parameter => |slot| if (slot < self.parameters.len) try self.convert(self.parameters[slot], instruction.type.kind.?) else error.InvalidSqlParameters,
             .cast => |cast| try self.convert(try self.run(cast.operand, depth + 1), cast.type),
             .unary => |unary| blk: {
@@ -3898,9 +4468,9 @@ const Evaluator = struct {
             } else error.SqlTypeMismatch,
             .datetime => blk: {
                 if (value != .string) return error.SqlTypeMismatch;
-                const ns = datetime.parseDateTimeToNs(value.string) orelse return error.InvalidSqlDateTime;
+                const ns = datetime.parseDateTimeToSignedNs(value.string) orelse return error.InvalidSqlDateTime;
                 try self.charge(30);
-                break :blk .{ .string = try datetime.formatDateTimeNsAlloc(self.alloc, ns) };
+                break :blk .{ .string = try datetime.formatDateTimeSignedNsAlloc(self.alloc, ns) };
             },
             .json => if (value == .string) blk: {
                 try self.charge(value.string.len);
@@ -4179,7 +4749,7 @@ const Evaluator = struct {
         if (nonempty <= 1 and !has_scalar and identity != null and identity.?.element_type == kind) return Datum.typedArray(identity.?);
         const results = @import("array_compact.zig").ResultBuilder;
         const axes = shape.axes[0..shape.rank];
-        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
+        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.outputBytes().* };
         var output = try results.initPlanned(self.alloc, kind, axes, shape.count, present, text_bytes, limits);
         var work = self.workBudget();
         for (leaves) |leaf| switch (leaf) {
@@ -4259,8 +4829,8 @@ const Evaluator = struct {
         return .{
             .alloc = self.alloc,
             .remaining = self.remainingSteps(),
-            .max_output_bytes = self.limits.output_bytes -| self.bytes,
-            .max_groups = (self.limits.output_bytes -| self.bytes) / 2,
+            .max_output_bytes = self.limits.output_bytes -| self.outputBytes().*,
+            .max_groups = (self.limits.output_bytes -| self.outputBytes().*) / 2,
             .parent = self.workOwner(),
         };
     }
@@ -4268,6 +4838,22 @@ const Evaluator = struct {
     /// SQL floating values enter JSONB through their declared output format,
     /// then exact decimal parsing. JSON numbers have neither a float width
     /// nor NaN/infinity payloads; PostgreSQL represents specials as strings.
+    fn readColumnValue(self: *Evaluator, value: Datum, descriptor: Type, demand: ColumnRead) !Datum {
+        return switch (demand) {
+            .value => value,
+            .missing => Datum.json(.{ .bool = value.missing }),
+            .identity => identity: {
+                if (value.missing) break :identity .{};
+                const logical = if (value.sql_null) Json.null else if (value.array) |array|
+                    try @import("array_wire.zig").toJsonLeaky(self.alloc, array.*, .{ .values = .{ .bytes = self.limits.output_bytes }, .wire_bytes = self.limits.output_bytes })
+                else
+                    try self.sqlJson(value, descriptor);
+                const token = try @import("../common/value_identity.zig").identity(logical);
+                break :identity Datum.json(.{ .string = try self.alloc.dupe(u8, &token) });
+            },
+        };
+    }
+
     fn sqlJson(self: *Evaluator, datum: Datum, descriptor: Type) !Json {
         if (datum.sql_null) return .null;
         if (datum.numeric != null) return self.numericJson(datum);
@@ -4441,8 +5027,8 @@ const Evaluator = struct {
             // Linear input decoding has a byte quota independent of the
             // instruction/arithmetic work quota and includes cancellation.
             try self.workOwner().charge(0);
-            if (length > self.limits.input_bytes -| self.input_bytes) return self.workOwner().limit();
-            self.input_bytes += length;
+            if (length > self.limits.input_bytes -| self.inputBytes().*) return self.workOwner().limit();
+            self.inputBytes().* += length;
         }
         if (source == .jsonb and target != .jsonb and target != .text) {
             if (value == .null or value == .array or value == .object or value == .string) return error.SqlTypeMismatch;
@@ -4646,7 +5232,7 @@ const Evaluator = struct {
             var budget: regex_functions.Budget = .{ .remaining = self.limits.pattern_steps -| self.pattern_steps, .checkpoint = self.limits.regex_checkpoint, .ptr = self.limits.regex_context, .checkpoint_interval = 256 };
             const initial = budget.remaining;
             defer self.pattern_steps += initial - budget.remaining;
-            const value = regex_functions.evaluate(self.alloc, session, regex, values[0..args.len], self.limits.output_bytes -| self.bytes, &budget) catch |err|
+            const value = regex_functions.evaluate(self.alloc, session, regex, values[0..args.len], self.limits.output_bytes -| self.outputBytes().*, &budget) catch |err|
                 return if (self.limits.regex_execution) |owner| owner.mapError(err) else err;
             if (value == .string) try self.charge(value.string.len);
             return value;
@@ -4663,14 +5249,23 @@ const Evaluator = struct {
                 try self.charge(size);
                 return .{ .string = try self.alloc.dupe(u8, buffer[0..size]) };
             },
+            .date_bin => {
+                if (first != .string or values[1] != .string or values[2] != .string) return error.SqlTypeMismatch;
+                const every = datetime.durationNs(first.string) orelse return error.InvalidSqlParameters;
+                const ns = datetime.parseDateTimeToSignedNs(values[1].string) orelse return error.InvalidSqlDateTime;
+                const origin = datetime.parseDateTimeToSignedNs(values[2].string) orelse return error.InvalidSqlDateTime;
+                const start = datetime.binSigned(ns, every, origin) orelse return error.InvalidSqlDateTime;
+                try self.charge(30);
+                return .{ .string = try datetime.formatDateTimeSignedNsAlloc(self.alloc, start) };
+            },
             .date_part, .date_trunc => {
                 if (first != .string or values[1] != .string) return error.SqlTypeMismatch;
                 const field = datetime.unit(first.string) orelse return error.InvalidSqlParameters;
-                const ns = datetime.parseDateTimeToNs(values[1].string) orelse return error.InvalidSqlDateTime;
-                if (function == .date_part) return .{ .float = datetime.part(ns, field) };
-                const truncated = datetime.truncate(ns, field) orelse return error.InvalidSqlDateTime;
+                const ns = datetime.parseDateTimeToSignedNs(values[1].string) orelse return error.InvalidSqlDateTime;
+                if (function == .date_part) return .{ .float = datetime.partSigned(ns, field) };
+                const truncated = datetime.truncateSigned(ns, field) orelse return error.InvalidSqlDateTime;
                 try self.charge(30);
-                return .{ .string = try datetime.formatDateTimeNsAlloc(self.alloc, truncated) };
+                return .{ .string = try datetime.formatDateTimeSignedNsAlloc(self.alloc, truncated) };
             },
             .to_timestamp => {
                 const seconds = try asFloat(first);
@@ -5668,6 +6263,7 @@ test "SQL scalar bound programs preserve lazy truth exact integers and function 
         .{ .sql = "'[1,2,3]'::json -> -1", .expected = "3" },
         .{ .sql = "'2024-02-29'::datetime", .expected = "\"2024-02-29T00:00:00.000000000Z\"" },
         .{ .sql = "date_part('year', '2024-02-29'::datetime)", .expected = "2024" },
+        .{ .sql = "date_bin('5m', '2026-11-06T12:07:30+01:00'::datetime, '1970-01-01T00:02:00Z'::datetime)", .expected = "\"2026-11-06T11:07:00.000000000Z\"" },
         .{ .sql = "date_trunc('month', '2024-02-29T13:14:15+01:00'::datetime)", .expected = "\"2024-02-01T00:00:00.000000000Z\"" },
         .{ .sql = "to_timestamp(0)", .expected = "\"1970-01-01T00:00:00.000000000Z\"" },
     };
@@ -5992,6 +6588,21 @@ test "SQL strpos rejects invalid UTF8 and bounds adversarial substring work" {
     try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(alloc, &.{}, &.{ .{ .string = &invalid }, .{ .string = "x" } }, .{}));
     try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(alloc, &.{}, &.{ .{ .string = "x" }, .{ .string = &invalid } }, .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(alloc, &.{}, &.{ .{ .string = "aaaaaaaaaaaaab" }, .{ .string = "aaaaab" } }, .{ .pattern_steps = 24 }));
+}
+
+test "SQL scalar repeatability includes lazy pure programs and excludes external calls" {
+    for ([_][]const u8{
+        "CASE WHEN score>0 AND score IN (1,2,3) THEN abs(score) ELSE 1/(score-score) END",
+        "coalesce(nullif(score,0),7)",
+        "length(lower(concat('x',CAST(score AS TEXT))))",
+        "ai_score('refund','Severity','[\"low\",\"high\"]','local')",
+    }, [_]bool{ true, true, true, false }) |text, expected| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, text, .{});
+        defer compiled.deinit();
+        var program = try bind(std.testing.allocator, compiled.expression, &.{.{ .name = "score", .type = .integer }}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(expected, program.repeatable());
+    }
 }
 
 test "SQL computed array scalar producers retain compact results under tight output budgets" {
@@ -6967,4 +7578,111 @@ test "SQL quantified JSONB compatibility inputs are logical while text casts sti
     defer arena.deinit();
     try std.testing.expect((try program.evaluate(arena.allocator(), &.{ .json(.{ .string = "\"alpha\"" }), .typedArray(&source) }, &.{}, .{})).value.bool);
     try std.testing.expectError(error.SqlInvalidTextRepresentation, program.evaluate(arena.allocator(), &.{ .json(.{ .string = "alpha" }), .typedArray(&source) }, &.{}, .{}));
+}
+
+test "SQL bounded linear certificates retain segment axes and exact numeric domains" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const N = @import("cypher").linear_numeric;
+    const columns = [_]Column{ .{ .name = "a", .type = .integer }, .{ .name = "b", .type = .integer } };
+    const fields = [_]@import("cypher").linear_bounds.Field{
+        .{ .name = "a", .bounds = .{ .low = 0, .high = 1024 }, .numeric = try N.Form.column(arena.allocator(), .{ .low = 0, .high = 1024 }, 2, 0) },
+        .{ .name = "b", .bounds = .{ .low = 0, .high = 1024 }, .numeric = try N.Form.column(arena.allocator(), .{ .low = 0, .high = 1024 }, 2, 1) },
+    };
+    const Case = struct { sql: []const u8, admitted: bool, total: bool = false };
+    for ([_]Case{
+        .{ .sql = "a+b", .admitted = true, .total = true },
+        .{ .sql = "a-b", .admitted = true },
+        .{ .sql = "2.0*a", .admitted = true },
+        .{ .sql = "(a+b)/2.0", .admitted = false },
+        .{ .sql = "CAST(a+b AS float8)/2.0", .admitted = true, .total = true },
+        .{ .sql = "CAST(a AS float8)*2", .admitted = true },
+        .{ .sql = "0.1*a", .admitted = false },
+        .{ .sql = "a/3.0", .admitted = false },
+        .{ .sql = "a/2", .admitted = false },
+        .{ .sql = "a/0.0", .admitted = false },
+        .{ .sql = "a/1152921504606846976.0", .admitted = false },
+        .{ .sql = "(a+9223372036854775807)-b", .admitted = false },
+        .{ .sql = "a*b", .admitted = false },
+    }) |entry| {
+        var compiled = try @import("compiler.zig").compileScalar(a, entry.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &columns, &.{}, .{});
+        defer program.deinit();
+        const proof = try program.numericProof(arena.allocator(), &columns, &fields, &.{});
+        try std.testing.expectEqual(entry.admitted, proof != null);
+        if (entry.admitted) try std.testing.expect(program.numericLinearCandidate());
+        if (proof) |form| try std.testing.expectEqual(entry.total, form.total());
+    }
+}
+
+test "SQL polynomial certificates retain every narrow integer intermediate" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const columns = [_]Column{.{ .name = "n", .type = .integer, .element_type = .int32 }};
+    const fields = [_]@import("cypher").linear_bounds.Field{.{ .name = "n", .bounds = .{ .low = 0, .high = 50000 }, .polynomial = try @import("cypher").statistic.Form.column(arena.allocator(), 1, 0, 50000) }};
+    for ([_][]const u8{ "n*n", "(n+2147483647)-2147483647" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &columns, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expect(try program.statisticProof(arena.allocator(), &columns, &fields, &.{}) == null);
+        try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(arena.allocator(), &.{Datum.json(.{ .integer = 50000 })}, &.{}, .{}));
+    }
+}
+
+test "SQL integer statistic casts retain value and checked width" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const columns = [_]Column{.{ .name = "n", .type = .integer, .element_type = .int32 }};
+    const fields = [_]@import("cypher").linear_bounds.Field{.{ .name = "n", .bounds = .{ .low = 0, .high = 50000 }, .polynomial = try @import("cypher").statistic.Form.column(arena.allocator(), 1, 0, 50000) }};
+    var compiled = try @import("compiler.zig").compileScalar(a, "CAST(n AS bigint)*CAST(n AS bigint)", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &columns, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expect(program.statisticCandidate());
+    try std.testing.expect(try program.statisticProof(arena.allocator(), &columns, &fields, &.{}) != null);
+    try std.testing.expectEqual(@as(i64, 2500000000), (try program.evaluate(arena.allocator(), &.{Datum.json(.{ .integer = 50000 })}, &.{}, .{})).value.integer);
+}
+
+test "SQL serialized scalar fragments reconstruct unique column dependencies for sparse readers" {
+    const instructions: []const Instruction = &.{
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .column = 5 } },
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .column = 5 } },
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .binary = .{ .op = .@"or", .left = 0, .right = 1 } } },
+    };
+    var program = try Program.fromTypedInstructions(std.testing.allocator, instructions, 2, .{ .kind = .boolean }, .{});
+    defer program.deinit();
+    try std.testing.expectEqualSlices(u32, &.{5}, program.required_columns);
+}
+
+test "SQL derived column reads share invocation work and byte admission with the VM" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const sa = region.allocator();
+    var context: @import("numeric_value.zig").Context = .{ .alloc = sa };
+    const number = try @import("numeric_value.zig").parse(&context, "123456789.01");
+    const instructions: []const Instruction = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } }};
+    var program = try Program.fromTypedInstructions(a, instructions, 0, .{ .kind = .boolean }, .{});
+    defer program.deinit();
+    var budget: EvaluationBudget = .{ .work = .{ .alloc = sa, .remaining = 65536 } };
+    const limits: EvalLimits = .{ .output_bytes = 16, .shared_budget = &budget };
+    const value = Datum.typedNumeric(&number.value);
+    const descriptor: Type = .{ .kind = .number, .element_type = .numeric };
+    try std.testing.expect((try program.readColumnValue(sa, value, descriptor, .identity, limits)).value == .string);
+    try std.testing.expect(budget.output_bytes > 0);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.readColumnValue(sa, value, descriptor, .identity, limits));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(sa, &.{}, &.{}, limits));
+}
+
+test "time series date_bin is repeatable within a statement" {
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "date_bin('5m', '2026-11-06T12:07:30Z'::datetime, '1970-01-01T00:02:00Z'::datetime)", .{});
+    defer compiled.deinit();
+    var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expect(program.repeatable());
 }

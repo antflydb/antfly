@@ -22,10 +22,14 @@ pub const Provider = struct {
     mutex: std.atomic.Mutex = .unlocked,
     versions: std.StringHashMapUnmanaged([]u8) = .empty,
     serial: u64 = 0,
+    stable_pagination: bool = false,
+    marker_pagination: bool = false,
+    null_versions: bool = false,
     now_ms: u64 = 100,
     until_ms: u64 = 1_000_000,
     stats: usize = 0,
     gets: usize = 0,
+    clock_reads: std.atomic.Value(usize) = .init(0),
     get_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     put_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     retention_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
@@ -65,7 +69,7 @@ pub const Provider = struct {
         var uploaded = try c.putObject(bucket, name, bytes, options);
         uploaded.deinit(c.allocator);
         self.serial += 1;
-        const generation = try std.fmt.allocPrint(a, "{d}", .{self.serial});
+        const generation = if (self.null_versions) try a.dupe(u8, "null") else try std.fmt.allocPrint(a, "{d}", .{self.serial});
         errdefer a.free(generation);
         const version_name = try std.fmt.allocPrint(a, "{s}@{s}", .{ name, generation });
         defer a.free(version_name);
@@ -153,11 +157,18 @@ pub const Provider = struct {
             for (entries.items) |*entry| entry.deinit(a);
             entries.deinit(a);
         }
-        const offset = if (options.continuation_token) |token| try std.fmt.parseUnsigned(usize, token, 10) else 0;
+        const offset = if (!self.stable_pagination) if (options.continuation_token) |token| try std.fmt.parseUnsigned(usize, token, 10) else 0 else 0;
         var eligible: usize = 0;
         var more = false;
+        var last: []const u8 = "";
+        const lower = if (self.marker_pagination) blk: {
+            if (options.continuation_token != null or (options.version_id_marker != null and options.key_marker == null)) return error.InvalidVersionPagination;
+            break :blk if (options.key_marker) |key| try std.fmt.allocPrint(a, "{s}@{s}", .{ key, options.version_id_marker orelse "" }) else null;
+        } else if (options.continuation_token) |token| try a.dupe(u8, token) else null;
+        defer if (lower) |value| a.free(value);
         for (page.entries) |entry| {
             const split = std.mem.lastIndexOfScalar(u8, entry.key, '@') orelse continue;
+            if (self.stable_pagination) if (lower) |token| if (std.mem.order(u8, entry.key, token) != .gt) continue;
             defer eligible += 1;
             if (eligible < offset) continue;
             if (entries.items.len == options.max_keys) {
@@ -169,10 +180,15 @@ pub const Provider = struct {
             const version = try a.dupe(u8, entry.key[split + 1 ..]);
             errdefer a.free(version);
             try entries.append(a, .{ .key = name, .version_id = version, .is_delete_marker = false });
+            last = entry.key;
         }
-        const token = if (more) try std.fmt.allocPrint(a, "{d}", .{offset + entries.items.len}) else null;
+        const token = if (more and !self.marker_pagination) if (self.stable_pagination) try a.dupe(u8, last) else try std.fmt.allocPrint(a, "{d}", .{offset + entries.items.len}) else null;
         errdefer if (token) |value| a.free(value);
-        return .{ .entries = try entries.toOwnedSlice(a), .is_truncated = more, .next_continuation_token = token };
+        const next_key = if (more and self.marker_pagination) try a.dupe(u8, entries.items[entries.items.len - 1].key) else null;
+        errdefer if (next_key) |value| a.free(value);
+        const next_version = if (more and self.marker_pagination) try a.dupe(u8, entries.items[entries.items.len - 1].version_id) else null;
+        errdefer if (next_version) |value| a.free(value);
+        return .{ .entries = try entries.toOwnedSlice(a), .is_truncated = more, .next_continuation_token = token, .next_key_marker = next_key, .next_version_id_marker = next_version };
     }
     fn retention(raw: *anyopaque, _: A, _: []const u8, _: []const u8, _: []const u8, _: ?os.CancellationToken) !?os.VersionRetention {
         const self = owner(raw);
@@ -180,6 +196,7 @@ pub const Provider = struct {
         return if (self.now_ms < self.until_ms) .{ .observed_ms = self.now_ms, .until_ms = self.until_ms } else null;
     }
     fn time(raw: *anyopaque, _: A, _: []const u8, _: ?os.CancellationToken) !?u64 {
+        _ = owner(raw).clock_reads.fetchAdd(1, .monotonic);
         return owner(raw).now_ms;
     }
     const vtable: os.Client.VTable = .{ .deinit = noop, .bucket_exists = exists, .make_bucket = make, .put_object = put, .get_object = get, .stat_object = stat, .stat_object_with_options = statOptions, .get_object_attributes = attributes, .delete_object = delete, .list_objects = list, .list_object_versions = listVersions, .version_retention = retention, .provider_time = time };

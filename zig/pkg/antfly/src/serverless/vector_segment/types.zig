@@ -20,6 +20,8 @@ const vector_types = @import("antfly_vector").vector;
 pub const Entry = struct {
     doc_id: []u8,
     vector: []f32,
+    source_lsn: u64 = 0,
+    source_ordinal: u32 = 0,
 
     pub fn deinit(self: *Entry, alloc: Allocator) void {
         alloc.free(self.doc_id);

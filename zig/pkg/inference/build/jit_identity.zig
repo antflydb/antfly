@@ -64,6 +64,11 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         },
         .cuda => &.{
             "src/ops/cuda/kernels.zig",
+            "src/ops/cuda/kernels/rms_q8_1_2560.cuh",
+            "src/ops/cuda/kernels/gemma4_e4b_prefetch.cuh",
+            "src/ops/cuda/kernels/gemma4_q4_prefill.cuh",
+            "src/ops/cuda/kernels/gemma4_vision_norm_rope.cuh",
+            "src/ops/cuda/kernels/gemma4_vision_attention.cuh",
             "src/graph/kernel_jit.zig",
             "src/graph/quant_kernel_compiler.zig",
             "src/graph/quant_kernel_cuda_renderer.zig",
@@ -75,13 +80,20 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
     run.addArg(b.fmt("{d}", .{qualification.len}));
     for (qualification) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     if (backend == .cuda) {
-        run.addArgs(&.{ "dispatch", "4" });
-        for ([_][]const u8{
+        const dispatch = [_][]const u8{
             "src/ops/cuda/cuda_compute.zig",
+            "src/ops/cuda/kernels/rms_q8_1_2560.cuh",
+            "src/ops/cuda/kernels/gemma4_e4b_prefetch.cuh",
+            "src/ops/cuda/kernels/gemma4_q4_prefill.cuh",
+            "src/ops/cuda/kernels/gemma4_vision_norm_rope.cuh",
+            "src/ops/cuda/kernels/gemma4_vision_attention.cuh",
             "src/graph/quant_kernel_compiler.zig",
             "src/graph/quant_matmul.zig",
             "src/gguf/tensor_types.zig",
-        }) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
+        };
+        run.addArg("dispatch");
+        run.addArg(b.fmt("{d}", .{dispatch.len}));
+        for (dispatch) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     }
     run.addArg("--output");
     return b.createModule(.{ .root_source_file = run.addOutputFileArg2(b.fmt("{s}_identity.zig", .{@tagName(backend)}), .{ .make_absolute = true }) });

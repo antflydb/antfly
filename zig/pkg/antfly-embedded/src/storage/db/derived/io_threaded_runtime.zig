@@ -66,6 +66,9 @@ const Worker = struct {
     last_replay_tail_records: u64 = 0,
     recoverable_retry_backoff: catch_up_policy.RecoverableRetryBackoff = .{},
     retry_not_before_ns: u64 = 0,
+    dependency_wait_epoch: ?u64 = null,
+    dispatch_notification_epoch: u64 = 0,
+    notification_epoch: u64 = 0,
     last_error_name: ?[]const u8 = null,
 };
 
@@ -92,9 +95,9 @@ fn forcePersistAppliedSequence(worker: *const Worker) bool {
     return catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).force_persist_applied_sequence;
 }
 
-fn canAdvanceToTarget(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64, target_sequence: u64) !bool {
+fn canAdvanceToTarget(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64, target_sequence: u64, replayed_through_sequence: u64) !bool {
     if (runtime.can_advance_to_target_fn) |callback| {
-        return try callback(runtime.ctx, worker.kind, from_sequence, target_sequence);
+        return try callback(runtime.ctx, worker.kind, from_sequence, target_sequence, replayed_through_sequence);
     }
     return true;
 }
@@ -173,6 +176,13 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn snapshotStats(_: *@This()) types.DerivedWorkerStats {
         return .{};
+    }
+
+    pub fn requestSequence(self: *@This(), sequence: u64) void {
+        self.notifySequence(sequence);
+    }
+    pub fn requestIndexes(self: *@This(), sequence: u64, names: []const []const u8) void {
+        self.notifyIndexes(sequence, names);
     }
 
     pub fn notifySequence(self: *@This(), sequence: u64) void {
@@ -586,6 +596,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         };
         for (self.workers.items) |worker| {
             if (worker.last_error_name != null) stats.failed_workers += 1;
+            if (worker.dependency_wait_epoch != null) stats.workers_waiting_for_replay_input += 1;
             const lag = worker.target_sequence -| worker.applied_sequence;
             if (lag > 0) stats.workers_with_replay_debt += 1;
             stats.max_replay_lag_sequences = @max(stats.max_replay_lag_sequences, lag);
@@ -600,33 +611,36 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return stats;
     }
 
-    pub fn notifySequence(self: *DerivedRuntime, sequence: u64) void {
-        const io = self.ioContext();
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-
-        self.last_notified_sequence = @max(self.last_notified_sequence, sequence);
-        var changed = false;
-        for (self.workers.items) |worker| {
-            const next = @max(worker.target_sequence, sequence);
-            changed = changed or next != worker.target_sequence;
-            worker.target_sequence = next;
-        }
-        if (changed) self.signalWorkers(io);
+    /// Visibility requests only advance targets; they do not certify that a
+    /// previously missing source has changed. Commit and repair notifications
+    /// explicitly invalidate dependency waits, including same-sequence repairs.
+    pub fn requestSequence(self: *DerivedRuntime, sequence: u64) void {
+        self.updateTargets(sequence, null, false);
     }
-
-    pub fn notifyIndexes(self: *DerivedRuntime, sequence: u64, index_names: []const []const u8) void {
-        if (index_names.len == 0) return;
+    pub fn requestIndexes(self: *DerivedRuntime, sequence: u64, names: []const []const u8) void {
+        if (names.len == 0) return;
+        self.updateTargets(sequence, names, false);
+    }
+    pub fn notifySequence(self: *DerivedRuntime, sequence: u64) void {
+        self.updateTargets(sequence, null, true);
+    }
+    pub fn notifyIndexes(self: *DerivedRuntime, sequence: u64, names: []const []const u8) void {
+        if (names.len == 0) return;
+        self.updateTargets(sequence, names, true);
+    }
+    fn updateTargets(self: *DerivedRuntime, sequence: u64, names: ?[]const []const u8, input_changed: bool) void {
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-
+        if (names == null) self.last_notified_sequence = @max(self.last_notified_sequence, sequence);
         var changed = false;
         for (self.workers.items) |worker| {
-            if (!indexNameInList(worker.name, index_names)) continue;
-            const next = @max(worker.target_sequence, sequence);
-            changed = changed or next != worker.target_sequence;
-            worker.target_sequence = next;
+            if (names) |selected| if (!indexNameInList(worker.name, selected)) continue;
+            if (input_changed or sequence > worker.target_sequence) {
+                worker.notification_epoch +%= 1;
+                changed = true;
+            }
+            worker.target_sequence = @max(worker.target_sequence, sequence);
         }
         if (changed) self.signalWorkers(io);
     }
@@ -640,8 +654,9 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         var changed = false;
         for (self.workers.items) |worker| {
             if (worker.kind.kind == excluded_kind) continue;
+            worker.notification_epoch +%= 1;
+            changed = true;
             const next = @max(worker.target_sequence, sequence);
-            changed = changed or next != worker.target_sequence;
             worker.target_sequence = next;
         }
         if (changed) self.signalWorkers(io);
@@ -656,8 +671,9 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         self.force_catch_up_sequence = @max(self.force_catch_up_sequence, sequence);
         var changed = false;
         for (self.workers.items) |worker| {
+            worker.notification_epoch +%= 1;
+            changed = true;
             const next = @max(worker.target_sequence, sequence);
-            changed = changed or next != worker.target_sequence;
             worker.target_sequence = next;
         }
         if (changed) self.signalWorkers(io);
@@ -716,6 +732,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         defer self.mutex.unlock(io);
         self.force_catch_up_sequence = @max(self.force_catch_up_sequence, sequence);
         for (self.workers.items) |worker| {
+            if (sequence > worker.target_sequence) worker.notification_epoch +%= 1;
             worker.target_sequence = @max(worker.target_sequence, sequence);
         }
         self.signalWorkers(io);
@@ -834,6 +851,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         for (self.workers.items) |worker| {
             if (!indexNameInList(worker.name, index_names)) continue;
             const next = @max(worker.target_sequence, sequence);
+            if (next != worker.target_sequence) worker.notification_epoch +%= 1;
             changed = changed or next != worker.target_sequence;
             worker.target_sequence = next;
         }
@@ -1012,6 +1030,15 @@ fn workerMain(worker: *Worker) void {
     // registration and survives yields; no physical thread is pinned at idle.
     for (0..1) |_| {
         runtime.mutex.lockUncancelable(io);
+        if (worker.dependency_wait_epoch) |epoch| {
+            if (epoch == worker.notification_epoch and !runtime.shutdown and !worker.stop and !worker.paused) {
+                worker.next_delay_ms = null;
+                runtime.mutex.unlock(io);
+                return;
+            }
+            worker.dependency_wait_epoch = null;
+        }
+        worker.dispatch_notification_epoch = worker.notification_epoch;
         const retry_remaining = if (worker.retry_not_before_ns == 0) 0 else worker.retry_not_before_ns -| platform_time.monotonicNs();
         if (!runtime.shutdown and !worker.stop and !worker.paused and runtime.last_error_name == null and worker.last_error_name == null and retry_remaining > 0) {
             // Foreground notifications may wake a delayed registration. Preserve
@@ -1204,7 +1231,7 @@ fn workerMain(worker: *Worker) void {
         }
 
         const target_advance_allowed = if (stats.shouldTryTargetAdvance(from_sequence, target_sequence))
-            canAdvanceToTarget(runtime, worker, from_sequence, target_sequence) catch |err| {
+            canAdvanceToTarget(runtime, worker, from_sequence, target_sequence, stats.targetAdvanceFromSequence(from_sequence, target_sequence)) catch |err| {
                 close_success = false;
                 runtime.recordError(io, worker, "target_advance", err);
                 return;
@@ -1531,6 +1558,22 @@ fn scheduleRecoverableCatchUpRetry(worker: *Worker, err: anyerror) void {
         &worker.recoverable_retry_backoff,
         err,
     );
+    if (err == error.ReplayDocumentNotVisible) {
+        // The unadvanced durable checkpoint is the repair debt. Retry after a
+        // source/producer commit (including explicit same-sequence repair), or
+        // once on reopen. Capture the pre-read epoch to avoid losing a commit
+        // that races the failed replay read. Keep the retry deadline as well:
+        // unrelated commits must not repeatedly decode this blocked window.
+        // No event means no timer, even after the deadline has elapsed.
+        const runtime = worker.runtime;
+        const io = runtime.ioContext();
+        runtime.mutex.lockUncancelable(io);
+        defer runtime.mutex.unlock(io);
+        worker.dependency_wait_epoch = worker.dispatch_notification_epoch;
+        worker.retry_not_before_ns = platform_time.monotonicNs() +| delay_ns;
+        worker.next_delay_ms = if (worker.notification_epoch == worker.dispatch_notification_epoch) null else delayMilliseconds(delay_ns);
+        return;
+    }
     if (worker.recoverable_retry_backoff.shouldLog()) std.log.warn(
         "derived worker retrying recoverable failure worker={s} error={s} failures={} retry_ms={}",
         .{ worker.name, @errorName(err), worker.recoverable_retry_backoff.failures, delay_ns / std.time.ns_per_ms },
@@ -1643,6 +1686,7 @@ fn stopAndJoinWorker(runtime: *DerivedRuntime, worker: *Worker, io: Io) void {
 const TestThreadedRuntimeCapture = struct {
     require_capture_worker: ?*Worker = null,
     fail_next_begin: bool = false,
+    missing_replay_input: bool = false,
     empty_coverage_checks: @import("antfly_platform").atomic.Value(u64) = .init(0),
     runtime: ?*DerivedRuntime = null,
     apply_calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
@@ -1659,6 +1703,7 @@ const TestThreadedRuntimeCapture = struct {
     fail_next_forced_persist: std.atomic.Value(bool) = .init(false),
     fail_next_dense_apply_not_found: std.atomic.Value(bool) = .init(false),
     fail_next_apply_resource_budget: std.atomic.Value(bool) = .init(false),
+    apply_admission_error: anyerror = error.ResourceBudgetExceeded,
     fail_next_apply_would_block: std.atomic.Value(bool) = .init(false),
     would_block_failures: std.atomic.Value(u64) = .init(0),
     fail_next_publish: std.atomic.Value(bool) = .init(false),
@@ -1685,13 +1730,14 @@ fn testThreadedRuntimeApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, 
         try std.testing.expect(worker.replay_cursor != null);
     }
     _ = capture.apply_calls.fetchAdd(1, .monotonic);
+    if (capture.missing_replay_input) return error.ReplayDocumentNotVisible;
     if (capture.fail_next_apply_would_block.swap(false, .monotonic)) {
         _ = capture.would_block_failures.fetchAdd(1, .monotonic);
         return error.WouldBlock;
     }
     if (capture.fail_next_apply_resource_budget.swap(false, .monotonic)) {
         _ = capture.resource_budget_failures.fetchAdd(1, .monotonic);
-        return error.ResourceBudgetExceeded;
+        return capture.apply_admission_error;
     }
     if (index_ref.kind == .dense_vector and capture.fail_next_dense_apply_not_found.swap(false, .monotonic)) {
         _ = capture.apply_not_found_failures.fetchAdd(1, .monotonic);
@@ -1850,7 +1896,7 @@ test "io threaded deferred source capture advances empty targets only through co
         .target_hints = &.{.full_text},
     });
     const Coverage = struct {
-        fn allow(ctx: *anyopaque, _: index_manager_mod.ManagedIndexRef, from: u64, target: u64) !bool {
+        fn allow(ctx: *anyopaque, _: index_manager_mod.ManagedIndexRef, from: u64, target: u64, _: u64) !bool {
             const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
             try std.testing.expectEqual(@as(u64, 0), from);
             try std.testing.expectEqual(@as(u64, 1), target);
@@ -2422,6 +2468,16 @@ test "io threaded dense publish NotFound retries with a fresh session" {
 }
 
 test "io threaded full-text resource pressure retries without poisoning runtime" {
+    try testFullTextAdmissionRetry(error.ResourceBudgetExceeded);
+}
+
+test "issue1015 issue1431 full-text capacity pressure retries and persists progress" {
+    for ([_]anyerror{ error.CapacityUnavailable, error.CapacityObservationStale }) |err| {
+        try testFullTextAdmissionRetry(err);
+    }
+}
+
+fn testFullTextAdmissionRetry(admission_error: anyerror) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2439,7 +2495,7 @@ test "io threaded full-text resource pressure retries without poisoning runtime"
         .target_hints = &.{.full_text},
     });
 
-    var capture = TestThreadedRuntimeCapture{};
+    var capture = TestThreadedRuntimeCapture{ .apply_admission_error = admission_error };
     capture.fail_next_apply_resource_budget.store(true, .monotonic);
     var runtime = try DerivedRuntime.init(
         alloc,
@@ -3008,4 +3064,122 @@ test "issue1015 idle cleanup persists a new watermark once" {
     try std.testing.expectEqual(@as(u64, 1), runtime.last_truncated_sequence);
     std.debug.print("LITE_IDLE_CLEANUP durable_sequence=1 dispatches=4 persist_calls={d} truncate_calls={d}\n", .{ probe.persist_calls, probe.truncate_calls });
     try std.testing.expectEqual(@as(usize, 1), probe.persist_calls);
+}
+
+test "db pending producer replay parks missing input and wakes on same sequence repair" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/parked-replay", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, alloc, .{ .sequence = 1, .changed_doc_keys = &.{"doc:a"}, .target_hints = &.{.full_text} });
+    var capture = TestThreadedRuntimeCapture{};
+    capture.apply_admission_error = error.ReplayDocumentNotVisible;
+    capture.fail_next_apply_resource_budget.store(true, .monotonic);
+    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, null);
+    defer runtime.deinit();
+    try runtime.addWorker("text", .{ .name = "text", .kind = .full_text }, 0);
+    runtime.notifySequence(1);
+    const io = runtime.ioContext();
+    const deadline = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+    while (true) {
+        runtime.mutex.lockUncancelable(io);
+        const parked = runtime.workers.items[0].dependency_wait_epoch != null;
+        runtime.mutex.unlock(io);
+        if (parked) break;
+        if (platform_time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try io.sleep(Io.Duration.fromMilliseconds(1), .awake);
+    }
+    for (0..100) |_| {
+        runtime.requestSequence(1);
+        runtime.requestIndexes(1, &.{"text"});
+        try std.testing.expectError(error.EnrichmentWaitTimeout, runtime.waitForIndexesWithVisibilityWait(1, &.{"text"}, .{ .deadline_ns = platform_time.monotonicNs() }));
+    }
+    try io.sleep(Io.Duration.fromMilliseconds(100), .awake);
+    try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(?u64, 0), runtime.appliedSequence("text"));
+    try std.testing.expectEqual(@as(u64, 0), capture.truncated_sequence.load(.monotonic));
+    runtime.notifyIndexes(1, &.{"text"});
+    try runtime.waitForIndexesWithVisibilityWait(1, &.{"text"}, .{ .deadline_ns = deadline });
+    try std.testing.expectEqual(@as(?u64, 1), runtime.appliedSequence("text"));
+
+    // A commit racing the failed read retains a scheduled retry and backoff.
+    var probe_name = "probe".*;
+    var probe: Worker = .{ .runtime = &runtime, .name = &probe_name, .kind = .{ .name = &probe_name, .kind = .full_text }, .applied_sequence = 0, .persisted_sequence = 0, .target_sequence = 1, .notification_epoch = 1 };
+    scheduleRecoverableCatchUpRetry(&probe, error.ReplayDocumentNotVisible);
+    try std.testing.expect(probe.next_delay_ms != null and probe.next_delay_ms.? > 0);
+    try std.testing.expect(probe.retry_not_before_ns > 0);
+}
+
+test "db pending producer replay bounds retries under unrelated commits without idle polling" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/busy-missing-input", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, alloc, .{ .sequence = 1, .changed_doc_keys = &.{"missing"}, .target_hints = &.{.full_text} });
+    var capture = TestThreadedRuntimeCapture{ .missing_replay_input = true };
+    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, null);
+    defer runtime.deinit();
+    // Dispatch manually so deadline boundaries are deterministic. The worker
+    // remains in the real notification/retention sets, without a timer thread.
+    const worker = owned: {
+        const value = try alloc.create(Worker);
+        errdefer alloc.destroy(value);
+        const name = try alloc.dupe(u8, "text");
+        errdefer alloc.free(name);
+        value.* = .{ .runtime = &runtime, .name = name, .kind = .{ .name = name, .kind = .full_text }, .applied_sequence = 0, .persisted_sequence = 0, .target_sequence = 1 };
+        try runtime.workers.append(alloc, value);
+        break :owned value;
+    };
+    runtime.notifySequence(1);
+    workerMain(worker);
+    try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
+    try std.testing.expect(worker.retry_not_before_ns > 0);
+    try std.testing.expectEqual(@as(?u64, null), worker.next_delay_ms);
+
+    // Model a not-yet-expired deadline without depending on host speed. Real
+    // unrelated journal commits must not bypass it or advance the checkpoint.
+    const deadline = platform_time.monotonicNs() + 60 * std.time.ns_per_s;
+    worker.retry_not_before_ns = deadline;
+    for (2..34) |sequence| {
+        try appendTestThreadedRuntimeRecord(&journal, alloc, .{ .sequence = sequence, .changed_doc_keys = &.{"unrelated"}, .target_hints = &.{.full_text} });
+        switch (sequence % 4) {
+            0 => runtime.notifySequence(sequence),
+            1 => runtime.notifyIndexes(sequence, &.{"text"}),
+            2 => runtime.notifyExceptKind(sequence, .dense_vector),
+            else => runtime.forceSequence(sequence),
+        }
+        workerMain(worker);
+        try std.testing.expectEqual(deadline, worker.retry_not_before_ns);
+        try std.testing.expect(worker.next_delay_ms != null and worker.next_delay_ms.? > 0);
+        try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), worker.applied_sequence);
+    }
+    // An expired deadline with pending notifications permits one retry.
+    worker.retry_not_before_ns = 0;
+    workerMain(worker);
+    try std.testing.expectEqual(@as(u64, 2), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 2), worker.recoverable_retry_backoff.failures);
+    try std.testing.expect(worker.retry_not_before_ns > 0);
+    try std.testing.expectEqual(@as(?u64, null), worker.next_delay_ms);
+    try std.testing.expectEqual(@as(u64, 0), capture.truncated_sequence.load(.monotonic));
+
+    // The clock alone cannot make the worker poll an unchanged dependency.
+    worker.retry_not_before_ns = 0;
+    for (0..32) |_| workerMain(worker);
+    try std.testing.expectEqual(@as(u64, 2), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(?u64, null), worker.next_delay_ms);
+    capture.missing_replay_input = false;
+    runtime.notifyIndexes(33, &.{"text"});
+    workerMain(worker);
+    try std.testing.expectEqual(@as(u64, 3), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 33), worker.applied_sequence);
+    try std.testing.expectEqual(@as(u64, 33), capture.persisted_sequence.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 0), worker.recoverable_retry_backoff.failures);
+    try std.testing.expect(worker.dependency_wait_epoch == null);
 }

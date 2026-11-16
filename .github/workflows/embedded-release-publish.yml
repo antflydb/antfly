@@ -45,7 +45,7 @@ jobs:
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
 
@@ -94,7 +94,6 @@ jobs:
             --repository "$GITHUB_REPOSITORY" --default-branch main \
             --request dist/release-request/release-request.json \
             "${tag_args[@]}" --github-output "$GITHUB_OUTPUT"
-          echo "publish=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: ${{ github.event_name == 'workflow_dispatch' && steps.identity.outputs.publish == 'true' }}
@@ -131,13 +130,6 @@ jobs:
             --version "${{ steps.identity.outputs.version }}" \
             --commit "${{ steps.identity.outputs.commit }}" \
             --npm-tag "${{ steps.identity.outputs.npm_tag }}"
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: ${{ github.event_name == 'workflow_dispatch' && steps.identity.outputs.publish == 'true' }}
-        with:
-          name: verified-antfly-embedded-snapshot
-          path: dist/lite-snapshot/
-          if-no-files-found: error
 
   dispatch-publication:
     name: Dispatch validated embedded publication
@@ -178,7 +170,7 @@ jobs:
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -206,6 +198,7 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          retention-days: 90
           name: verified-antfly-embedded-cargo-snapshot
           path: dist/cargo-snapshot/
           if-no-files-found: error
@@ -224,7 +217,7 @@ jobs:
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -233,7 +226,7 @@ jobs:
           path: dist/cargo-snapshot
       - name: Obtain short-lived crates.io credentials
         id: auth
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
       - name: Publish sealed sys crate before safe bindings
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
@@ -252,6 +245,7 @@ jobs:
       name: pypi
       url: https://pypi.org/p/antfly-embedded
     permissions:
+      actions: read
       contents: read
       id-token: write
     steps:
@@ -259,13 +253,15 @@ jobs:
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: verified-antfly-embedded-snapshot
+          name: antfly-embedded-package-snapshot
           path: dist/lite-snapshot
+          run-id: ${{ needs.prepare.outputs.build_run_id }}
+          github-token: ${{ github.token }}
       - name: Select exact Python wheels
         id: pypi
         run: |
@@ -280,7 +276,7 @@ jobs:
             --out-dir dist/pypi
       - name: Publish wheels
         if: ${{ steps.pypi.outputs.has_packages == 'true' }}
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         with:
           packages-dir: dist/pypi
       - name: Verify exact PyPI release
@@ -301,6 +297,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm
     permissions:
+      actions: read
       contents: read
       id-token: write
     steps:
@@ -308,13 +305,15 @@ jobs:
       - name: Load pinned npm toolchain
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: verified-antfly-embedded-snapshot
+          name: antfly-embedded-package-snapshot
           path: dist/lite-snapshot
+          run-id: ${{ needs.prepare.outputs.build_run_id }}
+          github-token: ${{ github.token }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: ts/package.json

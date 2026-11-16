@@ -301,8 +301,15 @@ pub fn preparePublication(db: *DB, scope: ledger.Scope, cancellation: Cancellati
         if ((try db.onlineSourceStatus(scope)).phase == .released) return error.OnlineSourceScopeChanged;
         return publication.certificate;
     }
-    if (progress.snapshot_phase == .published) return error.OnlineSourcePinMissing;
-    try verifyInventory(alloc, io, root, handle, progress.admitted_applied_index, cancellation);
+    // Publication is replicated, but source.afb2 and its inode receipt are
+    // replica-local. A follower may retain the exact admitted seal without
+    // having serialized it before the publisher dies. Rebuild only from that
+    // verified immutable seal; verifyCut below also requires the replicated
+    // publication certificate. Never capture the owner's later live rows.
+    verifyInventory(alloc, io, root, handle, progress.admitted_applied_index, cancellation) catch |err| {
+        if (err == error.FileNotFound and progress.snapshot_phase == .published) return error.OnlineSourcePinMissing;
+        return err;
+    };
     const primary_path = try std.fmt.allocPrint(alloc, "{s}/primary-lsm", .{root});
     defer alloc.free(primary_path);
     var backend = try @import("../lsm_backend.zig").Backend.open(alloc, primary_path, .{ .backend = .{ .read_only = true }, .read_runtime = @import("../lsm_backend/storage_io.zig").ReadRuntime.init(io) });
@@ -974,6 +981,13 @@ test "relational index system source pin prepared crash blocks markers then reop
         try std.testing.expect(certificate.eql(try db.prepareOnlineSourcePublication(scope, .none)));
         try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 4 });
         try std.testing.expectEqual(.published, (try db.onlineSourceStatus(scope)).snapshot_phase);
+        // Model a surviving replica whose admission seal is durable, but whose
+        // local export was never produced before the publication was applied.
+        try std.Io.Dir.cwd().deleteFile(std.testing.io, receipt_path);
+        try std.Io.Dir.cwd().deleteFile(std.testing.io, artifact);
+        try std.testing.expect(certificate.eql(try db.prepareOnlineSourcePublication(scope, .none)));
+        // Existing receipt corruption still fails closed below. Recovery used
+        // the frozen cut, despite the distinct later live primary above.
         _ = try backup.writeFileDurable(std.testing.io, artifact, "corrupt");
         try std.testing.expectError(error.BackupSealSourceChanged, publicationCertificateIfPresent(&db, scope, .none));
         try std.testing.expectError(error.BackupSealSourceChanged, db.prepareOnlineSourcePublication(scope, .none));

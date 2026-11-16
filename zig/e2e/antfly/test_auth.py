@@ -581,11 +581,18 @@ def test_standalone_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthA
                     "title": "gold doc",
                     "body": "visible body",
                     "tier": "gold",
+                    "tenant_id": "a",
+                },
+                "doc:other": {
+                    "title": "other tenant",
+                    "tier": "gold",
+                    "tenant_id": "b",
                 },
                 "doc:silver": {
                     "title": "silver doc",
                     "body": "hidden body",
                     "tier": "silver",
+                    "tenant_id": "a",
                 },
             },
             "sync_level": "full_index",
@@ -604,6 +611,7 @@ def test_standalone_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthA
             ],
         },
     )
+    auth_api.put("/auth/v1/users/reader/row-filters/*", {"term": {"tenant_id": "a"}})
     auth_api.put("/auth/v1/users/reader/row-filters/docs", {"term": {"tier": "gold"}})
 
     auth_api.s.headers["Authorization"] = _basic_auth("reader", "reader")
@@ -631,6 +639,66 @@ def test_standalone_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthA
     assert [entry["_id"] for entry in scan_result] == ["doc:gold"]
     assert scan_result[0]["tier"] == "gold"
     assert scan_result[0]["title"] == "gold doc"
+
+    query = auth_api.post(
+        "/tables/docs/query",
+        {"full_text_search": {"match_all": {}}, "limit": 10},
+    )["responses"][0]
+    assert [hit["_id"] for hit in query["hits"]["hits"]] == ["doc:gold"]
+    hidden = auth_api.request_raw("GET", "/tables/docs/documents/doc:other")
+    assert hidden.status_code == 404, hidden.text
+
+    # Admission limits apply to each policy, including when the combined
+    # executable predicate exceeds a single policy's node/depth allowance.
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    auth_api.put(
+        "/auth/v1/users/reader/row-filters/docs",
+        {"terms": {"tier": ["gold"] * 9000}},
+    )
+    deep = {"term": {"tenant_id": "a"}}
+    for _ in range(30):
+        deep = {"conjuncts": [deep]}
+    for global_policy in ({"terms": {"tenant_id": ["a"] * 9000}}, deep):
+        auth_api.s.headers["Authorization"] = _basic_auth(
+            "admin", AUTH_BOOTSTRAP_PASSWORD
+        )
+        auth_api.put("/auth/v1/users/reader/row-filters/*", global_policy)
+        auth_api.s.headers["Authorization"] = _basic_auth("reader", "reader")
+        response = auth_api.post(
+            "/tables/docs/query",
+            {"full_text_search": {"match_all": {}}, "limit": 10},
+        )["responses"][0]
+        assert [hit["_id"] for hit in response["hits"]["hits"]] == ["doc:gold"]
+
+    # The explicit aggregate cap is an authorization denial on every read
+    # surface, including handlers that resolve policies before dispatch.
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    for scope, field, value in (
+        ("*", "tenant_id", "a"),
+        ("docs", "tier", "gold"),
+        ("*?database=default&namespace=public&all_tables=true", "tenant_id", "a"),
+    ):
+        auth_api.put(
+            f"/auth/v1/users/reader/row-filters/{scope}",
+            {"terms": {field: [value] * 12000}},
+        )
+    auth_api.s.headers["Authorization"] = _basic_auth("reader", "reader")
+    denied = auth_api.request_raw(
+        "POST",
+        "/tables/docs/query",
+        json={"full_text_search": {"match_all": {}}, "limit": 10},
+        timeout=30,
+    )
+    assert denied.status_code == 403, denied.text
+    denied = auth_api.request_raw("GET", "/tables/docs/documents/doc:gold", timeout=30)
+    assert denied.status_code == 403, denied.text
+    denied = auth_api.request_raw(
+        "POST",
+        "/tables/docs/documents",
+        json={"from": "doc:", "to": "doc;", "inclusive_from": True},
+        timeout=30,
+    )
+    assert denied.status_code == 403, denied.text
 
 
 def test_stateful_auth_uses_configured_admin_password(stateful_auth_api: AuthApi):
@@ -786,7 +854,11 @@ def test_system_catalog_scoped_permissions_and_row_filters(request, fixture_name
         api.post(
             path + "/batch",
             {
-                "inserts": {"gold": {"tier": "gold"}, "silver": {"tier": "silver"}},
+                "inserts": {
+                    "gold": {"tier": "gold", "tenant_id": "a"},
+                    "silver": {"tier": "silver", "tenant_id": "a"},
+                    "other": {"tier": "gold", "tenant_id": "b"},
+                },
                 "sync_level": "full_index",
             },
         )
@@ -807,13 +879,23 @@ def test_system_catalog_scoped_permissions_and_row_filters(request, fixture_name
             ],
         },
     )
+    # This policy must not leak into the unrelated tenant namespace when its
+    # tables are bound to opaque storage IDs.
+    api.put(
+        "/auth/v1/users/reader/row-filters/*?database=default&namespace=public&all_tables=true",
+        {"term": {"visibility": "public"}},
+    )
+    api.put(
+        "/auth/v1/users/reader/row-filters/*?database=tenant&namespace=allowed&all_tables=true",
+        {"term": {"tenant_id": "a"}},
+    )
     api.put(
         "/auth/v1/users/reader/row-filters/events?database=tenant&namespace=allowed",
         {"term": {"tier": "gold"}},
     )
     api.s.headers["Authorization"] = _basic_auth("reader", "reader")
     for path in ("/databases/tenant/namespaces/allowed/tables/events",):
-        assert api.get(path + "/documents/gold") == {"tier": "gold"}
+        assert api.get(path + "/documents/gold") == {"tier": "gold", "tenant_id": "a"}
         hidden = api.s.get(api.url + path + "/documents/silver", timeout=30)
         assert hidden.status_code == 404, hidden.text
         result = api.post(
@@ -1339,11 +1421,30 @@ def test_memory_evaluation_pages_and_indexed_candidates_with_admin_key(storage_e
             }
             for task in tasks
         ]
-        call(
-            "POST",
-            space + "/evaluations/run/verdicts",
-            {"expected_revision": revision(), "verdicts": verdicts, "model": judge},
-        )
+        # External-evaluation maintenance can advance the space while the
+        # caller assembles a verdict. Refresh a rejected space CAS while keeping
+        # the task's pinned case revisions and fingerprints.
+        for attempt in range(4):
+            try:
+                call(
+                    "POST",
+                    space + "/evaluations/run/verdicts",
+                    {
+                        "expected_revision": revision(),
+                        "verdicts": verdicts,
+                        "model": judge,
+                    },
+                )
+                break
+            except requests.HTTPError as error:
+                response = error.response
+                if (
+                    response is None
+                    or response.status_code != 409
+                    or response.json().get("code") != "MemoryRevisionConflict"
+                    or attempt == 3
+                ):
+                    raise
         assert call("GET", space + "/evaluations/run")["identity"]["accuracy"] == 1
         assert len(call("GET", space + "/evaluations/run/results")["items"]) == 3
         claims = [
@@ -1366,9 +1467,15 @@ def test_memory_evaluation_pages_and_indexed_candidates_with_admin_key(storage_e
             },
         )
         deadline = time.monotonic() + 60
+        maintenance_requested = False
         while True:
             try:
-                call("POST", space + "/maintenance", {})
+                # Exercise explicit maintenance once, then observe the resident
+                # worker. Repeated mutations create new receipts and replay
+                # targets while the indexes we are waiting for are rebuilding.
+                if not maintenance_requested:
+                    call("POST", space + "/maintenance", {})
+                    maintenance_requested = True
                 page = call(
                     "POST",
                     space + "/memories/claim-0/supersession-candidates",
@@ -1409,3 +1516,105 @@ def test_memory_evaluation_pages_and_indexed_candidates_with_admin_key(storage_e
             time.sleep(0.1)
     finally:
         server.stop()
+
+
+@pytest.mark.e2e_resource("antfly_process")
+@pytest.mark.parametrize("fixture_name", ["auth_api", "stateful_auth_api"])
+def test_privacy_scoped_routes_and_permissions(request, fixture_name):
+    """Every privacy operation selects and authorizes the explicit table scope."""
+    api = request.getfixturevalue(fixture_name)
+    admin = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    api.s.headers["Authorization"] = admin
+    api.post("/databases/privacy_tenant", {})
+    api.post("/databases/privacy_tenant/namespaces/serving", {})
+    scoped = "/databases/privacy_tenant/namespaces/serving/tables/notes"
+    literal = "/tables/notes"
+    policy = {"mode": "monitor", "fields": ["absent"]}
+    for path in (literal, scoped):
+        api.post(path, {"num_shards": 1})
+        api.post(
+            path + "/batch",
+            {"inserts": {"doc": {"value": path}}, "sync_level": "full_index"},
+        )
+    api.post(
+        "/auth/v1/users/privacy_curator",
+        {
+            "password": "curator",
+            "initial_policies": [
+                {
+                    "table_target": {
+                        "database": "privacy_tenant",
+                        "namespace": "serving",
+                        "table": "notes",
+                    },
+                    "resource_type": "table",
+                    "type": "admin",
+                }
+            ],
+        },
+    )
+    api.post(
+        "/auth/v1/users/privacy_reader",
+        {
+            "password": "reader",
+            "initial_policies": [
+                {
+                    "table_target": {
+                        "database": "privacy_tenant",
+                        "namespace": "serving",
+                        "table": "notes",
+                    },
+                    "resource_type": "table",
+                    "type": "read",
+                }
+            ],
+        },
+    )
+    path = scoped + "/privacy"
+    api.s.headers["Authorization"] = _basic_auth("privacy_curator", "curator")
+    assert not api.get(path)["configured"]
+    preview_body = {"policy": policy, "sample": {"keys": ["doc"]}}
+    preview = api.post(path + "/preview", preview_body)
+    assert preview["documents"][0]["fields"][0]["findings"] == []
+    saved = api.put(path, policy)
+    scan = api.post(path + "/scans", {"limit": 1})
+    assert api.get(path + "/scans/" + scan["scan_id"])["scan_id"] == scan["scan_id"]
+    assert api.get(path + "/findings")["findings"] == []
+    assert api.post(path + "/findings", {"limit": 1})["findings"] == []
+    operations = [
+        ("GET", "", None),
+        ("PUT", "", policy),
+        ("POST", "/preview", preview_body),
+        ("POST", "/scans", {}),
+        ("GET", "/scans/" + scan["scan_id"], None),
+        ("GET", "/findings", None),
+        ("POST", "/findings", {"limit": 1}),
+    ]
+    # A table read grant cannot inspect policies/findings; the scoped admin
+    # grant cannot administer an identically named default.public table.
+    for auth, base in (
+        (_basic_auth("privacy_reader", "reader"), path),
+        (_basic_auth("privacy_curator", "curator"), literal + "/privacy"),
+    ):
+        api.s.headers["Authorization"] = auth
+        for method, suffix, body in operations:
+            response = api.s.request(
+                method, api.url + base + suffix, json=body, timeout=30
+            )
+            assert response.status_code == 403, (method, base + suffix, response.text)
+    api.s.headers["Authorization"] = admin
+    assert not api.get(literal + "/privacy")["configured"]
+    assert api.get(path)["policy_version"] == saved["policy_version"]
+    # The public lifecycle remains terminal across A -> B -> A, even if the
+    # background worker completed the job before either replacement.
+    for replacement in ({**policy, "replacement": "mask"}, policy):
+        before = api.get(path)
+        response = api.s.put(
+            api.url + path,
+            json=replacement,
+            headers={"If-Match": before["etag"]},
+            timeout=30,
+        )
+        assert response.status_code == 202, response.text
+        assert api.get(path + "/scans/" + saved["scan_id"])["phase"] == "superseded"
+    assert api.get(path)["policy_version"] == saved["policy_version"]

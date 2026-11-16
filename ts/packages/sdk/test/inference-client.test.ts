@@ -51,7 +51,7 @@ describe("InferenceClient", () => {
     expect(typeof client.classify).toBe("function");
     expect(typeof client.extractEntities).toBe("function");
     expect(typeof client.rewrite).toBe("function");
-    expect(typeof client.transcribe).toBe("function");
+    expect(typeof client.readAudio).toBe("function");
     expect(typeof client.listModels).toBe("function");
     expect(typeof client.getRawClient).toBe("function");
   });
@@ -406,7 +406,7 @@ describe("InferenceClient with mock fetch", () => {
       expect(await lastFetchJSONBody()).toMatchObject({ model: "gemma", stream: true });
       const [, init] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
       expect(init?.signal).toBe(controller.signal);
-      expect((init?.headers as Record<string, string>).Accept).toBe("text/event-stream");
+      expect(new Headers(init?.headers).get("Accept")).toBe("text/event-stream");
     });
 
     it("fails closed when a server does not attest a managed generation policy", async () => {
@@ -574,6 +574,33 @@ describe("InferenceClient with mock fetch", () => {
       expect(cancel).toHaveBeenCalledOnce();
     });
 
+    it("unwraps the gateway's nested {error:{code,message}} envelope (source-reference failures)", async () => {
+      // zig/pkg/antfly/src/api/httpx_handler.zig's gatewayFailure nests
+      // {message, type, code} under `error`, unlike the flat
+      // {error, message, retryable} shape generation errors use.
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message: "InferenceSourceMismatch",
+              type: "invalid_request_error",
+              code: "InferenceSourceMismatch",
+            },
+          }),
+          { status: 409, headers: { "Content-Type": "application/json" } }
+        )
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      let caught: unknown;
+      try {
+        await client.generate(request);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(InferenceAPIError);
+      expect(caught).toMatchObject({ status: 409, code: "InferenceSourceMismatch" });
+    });
+
     it.each([
       "data: [DONE]",
       "data: [DONE]\n",
@@ -732,6 +759,74 @@ describe("InferenceClient with mock fetch", () => {
         }
       };
       await expect(consume()).rejects.toThrow("ended before [DONE]");
+    });
+  });
+
+  describe("generation stream budget failures", () => {
+    it("preserves classification without rounding unsigned diagnostic counts", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          'event: error\ndata: {"error":"MODEL_RESOURCE_LIMIT","retryable":false,"required_bytes":18446744073709551615,"limit_bytes":100}\n\n',
+          { headers: { "Content-Type": "text/event-stream" } }
+        )
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(
+        client.generateStream({ model: "gemma", messages: [] }).next()
+      ).rejects.toMatchObject({
+        code: "MODEL_RESOURCE_LIMIT",
+        retryable: false,
+        requiredBytes: undefined,
+        limitBytes: 100,
+      });
+    });
+    it("preserves structured permanent budget details and cancels the stream", async () => {
+      const payload = {
+        error: "MODEL_RESOURCE_LIMIT",
+        message: "working set exceeds host budget",
+        retryable: false,
+        budget: "host",
+        required_bytes: 110,
+        limit_bytes: 100,
+      };
+      const cancel = vi.fn();
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode(`event: error\ndata: ${JSON.stringify(payload)}\n\n`)
+              );
+            },
+            cancel,
+          }),
+          { headers: { "Content-Type": "text/event-stream" } }
+        )
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(
+        client.generateStream({ model: "gemma", messages: [] }).next()
+      ).rejects.toMatchObject({
+        status: 200,
+        code: "MODEL_RESOURCE_LIMIT",
+        retryable: false,
+        budget: "host",
+        requiredBytes: 110,
+        limitBytes: 100,
+      });
+      expect(cancel).toHaveBeenCalled();
+    });
+
+    it("accepts legacy text errors without assigning retryability", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response("event: error\ndata: legacy failure\n\n", {
+          headers: { "Content-Type": "text/event-stream" },
+        })
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(client.generateStream({ model: "gemma", messages: [] }).next()).rejects.toThrow(
+        "Generation stream failed: legacy failure"
+      );
     });
   });
 
@@ -981,6 +1076,66 @@ describe("InferenceClient with mock fetch", () => {
   });
 
   describe("embedDense (negotiated dense-vector helper)", () => {
+    it.each([
+      { failedIndexes: [0] },
+      { failedIndexes: [1] },
+      { failedIndexes: [2] },
+      { failedIndexes: [0, 1, 2] },
+    ])("rejects per-item failures at indexes $failedIndexes instead of shifting vectors", async ({
+      failedIndexes,
+    }) => {
+      const data = [0, 1, 2]
+        .filter((index) => !failedIndexes.includes(index))
+        .map((index) => ({ object: "embedding", index, embedding: [index, 0.5] }));
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            object: "list",
+            model: "model",
+            data,
+            errors: failedIndexes.map((index) => ({
+              index,
+              code: "INVALID_INPUT",
+              message: "Invalid input",
+              stage: "parse",
+              retryable: false,
+              status: 400,
+            })),
+            summary: { total: 3, succeeded: data.length, failed: failedIndexes.length },
+          }),
+          { headers: { "Content-Type": "application/json" } }
+        )
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(
+        client.embedDense("model", ["first", "second", "third"], { error_policy: "per_item" })
+      ).rejects.toThrow("use embed() to inspect indexed results and errors");
+    });
+
+    it("accepts per-item responses when every input succeeds", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            object: "list",
+            model: "model",
+            data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2] }],
+            errors: [],
+            summary: { total: 1, succeeded: 1, failed: 0 },
+          }),
+          { headers: { "Content-Type": "application/json" } }
+        )
+      );
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(
+        client.embedDense("model", ["text"], { error_policy: "per_item" })
+      ).resolves.toEqual([[0.1, 0.2]]);
+      expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1]?.body as string)).toMatchObject({
+        error_policy: "per_item",
+      });
+    });
+
     it("extracts dense vectors from the current OpenAI-compatible JSON response", async () => {
       vi.mocked(fetch).mockResolvedValueOnce(
         new Response(
@@ -1037,8 +1192,8 @@ describe("InferenceClient with mock fetch", () => {
       expect(url).toBe("http://localhost:8080/ai/v1/embed");
       expect(options?.method).toBe("POST");
       expect(options?.headers).toBeDefined();
-      const headers = options?.headers as Record<string, string>;
-      expect(headers.Accept).toBe(NUMERIC_RESPONSE_ACCEPT);
+      const headers = new Headers(options?.headers);
+      expect(headers.get("Accept")).toBe(NUMERIC_RESPONSE_ACCEPT);
     });
 
     it.each([
@@ -1495,11 +1650,13 @@ describe("InferenceClient with mock fetch", () => {
     });
   });
 
-  describe("transcribe", () => {
+  describe("readAudio", () => {
     it("should transcribe audio", async () => {
       const mockResponse = {
         model: "openai/whisper-tiny",
-        text: "Hello, how are you today?",
+        object: "list",
+        data: [{ object: "read", index: 0, text: "Hello, how are you today?" }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       };
 
       vi.mocked(fetch).mockResolvedValueOnce({
@@ -1511,13 +1668,13 @@ describe("InferenceClient with mock fetch", () => {
       } as Response);
 
       const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
-      const result = await client.transcribe("base64audiodata", {
+      const result = await client.readAudio("base64audiodata", {
         model: "openai/whisper-tiny",
-        language: "en",
+        audio_options: { language: "en" },
       });
 
       expect(result.model).toBe("openai/whisper-tiny");
-      expect(result.text).toBe("Hello, how are you today?");
+      expect(result.data[0]?.text).toBe("Hello, how are you today?");
       expect(fetch).toHaveBeenCalled();
     });
 
@@ -1528,18 +1685,14 @@ describe("InferenceClient with mock fetch", () => {
         })
       );
       const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
-      await client.transcribe("audio", {
+      await client.readAudio("audio", {
         model: "transcribers/speech",
-        language: "de",
-        timestamps: false,
-        diarization: false,
+        audio_options: { language: "de", timestamps: false, diarization: false },
       });
       expect(await lastFetchJSONBody()).toEqual({
         model: "transcribers/speech",
         audio: "audio",
-        language: "de",
-        timestamps: false,
-        diarization: false,
+        audio_options: { language: "de", timestamps: false, diarization: false },
       });
     });
 
@@ -1554,7 +1707,7 @@ describe("InferenceClient with mock fetch", () => {
 
       const client = new InferenceClient({ baseUrl: "http://localhost:8080/api" });
       await expect(
-        client.transcribe("bad-data", { model: "openai/whisper-tiny" })
+        client.readAudio("bad-data", { model: "openai/whisper-tiny" })
       ).rejects.toMatchObject({
         status: 400,
         code: "Invalid audio",
@@ -1622,4 +1775,37 @@ describe("InferenceClient with mock fetch", () => {
       }
     });
   });
+});
+
+it("isolates concurrent per-call headers and keeps numeric response negotiation", async () => {
+  const captured: Headers[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      captured.push(request.headers);
+      return Response.json({ object: "list", model: "m", data: [{ index: 0, embedding: [1, 2] }] });
+    })
+  );
+  const inference = new InferenceClient({
+    baseUrl: "http://embed.test",
+    headers: { Authorization: "Bearer configured", "X-Keep": "default" },
+  });
+  try {
+    await Promise.all([
+      inference.embed("m", ["a"], { headers: { authorization: "Bearer a", "X-Keep": undefined } }),
+      inference.embed("m", ["b"], { headers: { AUTHORIZATION: "Bearer b" } }),
+      inference.embedDense("m", ["c"], { headers: { Accept: "application/xml" } }),
+    ]);
+    expect(captured.map((h) => h.get("Authorization"))).toEqual([
+      "Bearer a",
+      "Bearer b",
+      "Bearer configured",
+    ]);
+    expect(captured[0].get("X-Keep")).toBe("default");
+    expect(captured[2].get("Accept")).toBe(NUMERIC_RESPONSE_ACCEPT);
+    expect(captured[0].get("Accept")).toBe("application/json");
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

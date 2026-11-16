@@ -22,14 +22,36 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 /// Persisted prefix for the canonical, injective unit-fingerprint encoding.
 /// Keeping the version in the value makes payload markers self-describing and
 /// lets readers distinguish them from the unversioned legacy digest.
-pub const current_prefix = "duf2:";
-pub const current_state_version: u8 = 2;
-const current_domain = "antfly-document-unit-fingerprint-v2";
+pub const current_prefix = "duf6:";
+pub const current_state_version: u8 = 6;
+const current_domain = "antfly-document-unit-fingerprint-v6";
+
+/// Versions whose persisted units can still be authenticated. Only v6 is
+/// emitted by current writers or accepted as completed-state reuse evidence.
+pub const PersistedVersion = enum { v5, v6 };
+
+pub fn persistedVersion(fingerprint: []const u8) ?PersistedVersion {
+    inline for (.{ PersistedVersion.v5, PersistedVersion.v6 }) |version| {
+        const prefix = if (version == .v6) current_prefix else "duf5:";
+        if (fingerprint.len == prefix.len + Sha256.digest_length * 2 and std.mem.startsWith(u8, fingerprint, prefix) and isLowerHex(fingerprint[prefix.len..])) return version;
+    }
+    return null;
+}
+
+/// Read-side verification preserves the original hashed field set. A v5
+/// digest cannot authenticate newly introduced rendering-policy metadata.
+pub fn matchesPersistedFingerprint(alloc: Allocator, unit: document_extraction.Unit, fingerprint: []const u8) !bool {
+    const version = persistedVersion(fingerprint) orelse return false;
+    if (version == .v5 and unit.ocr_render_policy != null) return false;
+    const computed = try fingerprintForVersionAlloc(alloc, unit, version);
+    defer alloc.free(computed);
+    return std.mem.eql(u8, fingerprint, computed);
+}
 
 // Adding extraction metadata is a persisted-format change: update the encoder,
 // assign a new stable tag, and bump the fingerprint version deliberately.
 comptime {
-    if (@typeInfo(document_extraction.Unit).@"struct".field_names.len != 33) {
+    if (@typeInfo(document_extraction.Unit).@"struct".field_names.len != 37) {
         @compileError("document_extraction.Unit changed; update and version document_unit_fingerprint");
     }
 }
@@ -68,6 +90,10 @@ const Field = enum(u8) {
     char_start = 31,
     char_end = 32,
     transcript_spans = 33,
+    native_text_quality = 34,
+    native_text_diagnostics = 35,
+    text_blocks = 36,
+    ocr_render_policy = 37,
 };
 
 /// Computes the current document-unit fingerprint without constructing an
@@ -76,8 +102,12 @@ const Field = enum(u8) {
 /// a fixed byte order. The result is therefore unambiguous and portable while
 /// retaining one allocation for the returned persisted value.
 pub fn fingerprintAlloc(alloc: Allocator, unit: document_extraction.Unit) ![]u8 {
+    return fingerprintForVersionAlloc(alloc, unit, .v6);
+}
+
+fn fingerprintForVersionAlloc(alloc: Allocator, unit: document_extraction.Unit, version: PersistedVersion) ![]u8 {
     var hasher = Sha256.init(.{});
-    hashLengthPrefixed(&hasher, current_domain);
+    hashLengthPrefixed(&hasher, if (version == .v6) current_domain else "antfly-document-unit-fingerprint-v5");
     hashTaggedBytes(&hasher, .unit_id, unit.unit_id);
     hashTaggedBytes(&hasher, .unit_type, unit.unit_type);
     hashTaggedBytes(&hasher, .text, unit.text);
@@ -86,9 +116,20 @@ pub fn fingerprintAlloc(alloc: Allocator, unit: document_extraction.Unit) ![]u8 
     hashTaggedOptionalBytes(&hasher, .extraction_status, unit.extraction_status);
     hashTaggedOptionalBytes(&hasher, .source_sha256, unit.source_sha256);
     hashTaggedOptionalU64(&hasher, .byte_length, unit.byte_length);
+    hashTaggedNativeTextQuality(&hasher, unit.native_text_quality);
+    hashTaggedNativeTextDiagnostics(&hasher, unit.native_text_diagnostics);
     hashTaggedBool(&hasher, .ocr_used, unit.ocr_used);
     hashTaggedBool(&hasher, .ocr_attempted, unit.ocr_attempted);
     hashTaggedOptionalU16(&hasher, .ocr_render_dpi, unit.ocr_render_dpi);
+    if (version == .v6) {
+        hashTaggedBool(&hasher, .ocr_render_policy, unit.ocr_render_policy != null);
+        if (unit.ocr_render_policy) |policy| {
+            hashTaggedOptionalU16(&hasher, .ocr_render_policy, policy.version);
+            hashTaggedBytes(&hasher, .ocr_render_policy, @tagName(policy.sampling));
+            hashTaggedOptionalBytes(&hasher, .ocr_render_policy, if (policy.resolved_profile) |profile| @tagName(profile) else null);
+            hashTaggedBytes(&hasher, .ocr_render_policy, @tagName(policy.resolution));
+        }
+    }
     hashTaggedOptionalU16(&hasher, .ocr_effective_render_dpi, unit.ocr_effective_render_dpi);
     hashTaggedOptionalU32(&hasher, .ocr_rendered_width, unit.ocr_rendered_width);
     hashTaggedOptionalU32(&hasher, .ocr_rendered_height, unit.ocr_rendered_height);
@@ -108,17 +149,16 @@ pub fn fingerprintAlloc(alloc: Allocator, unit: document_extraction.Unit) ![]u8 
     hashTaggedOptionalBbox(&hasher, .page_bbox, unit.page_bbox);
     hashTaggedOptionalI32(&hasher, .page_rotation, unit.page_rotation);
     hashTaggedTextRegions(&hasher, unit.text_regions);
-    // Transcript timing joined the format after v2 shipped. The tag is
-    // written only when spans exist, so every unit without them (all
-    // non-audio units, and audio units transcribed before timing was kept)
-    // keeps the digest it already has and is not re-materialized.
+    hashTaggedTextBlocks(&hasher, unit.text_blocks);
+    // Transcript timing retains its established tag and remains omitted when
+    // absent, while the versioned domain separates this encoding from older units.
     if (unit.transcript_spans.len > 0) hashTaggedTranscriptSpans(&hasher, unit.transcript_spans);
     hashTaggedOptionalU32(&hasher, .char_start, unit.char_start);
     hashTaggedOptionalU32(&hasher, .char_end, unit.char_end);
 
     var digest: [Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
-    return try prefixedLowerHexAlloc(alloc, current_prefix, &digest);
+    return try prefixedLowerHexAlloc(alloc, if (version == .v6) current_prefix else "duf5:", &digest);
 }
 
 /// Reproduces the unversioned fingerprint emitted before `duf2`. It is
@@ -241,6 +281,7 @@ pub fn storedPayloadLegacyFingerprintAlloc(alloc: Allocator, stored: []const u8)
         .ocr_used = try requiredBool(provenance, "ocr_used"),
         .ocr_attempted = try requiredBool(object, "ocr_attempted"),
         .ocr_render_dpi = try optionalInteger(u16, object, "ocr_render_dpi"),
+        .ocr_render_policy = if (object.get("ocr_render_policy")) |value| if (value == .null) null else std.json.parseFromValueLeaky(document_extraction.RenderPolicy, scratch, value, .{}) catch return error.InvalidDocumentExtractionState else null,
         .ocr_effective_render_dpi = try optionalInteger(u16, object, "ocr_effective_render_dpi"),
         .ocr_rendered_width = try optionalInteger(u32, object, "ocr_rendered_width"),
         .ocr_rendered_height = try optionalInteger(u32, object, "ocr_rendered_height"),
@@ -470,7 +511,80 @@ fn hashTaggedTextRegions(hasher: *Sha256, regions: []const document_extraction.T
             hasher.update(&encoded);
         }
         for (region.bbox) |coordinate| hashU64(hasher, @bitCast(coordinate));
+        hashOptionalF64(hasher, region.font_size);
+        hashOptionalBool(hasher, region.bold);
+        hashOptionalBool(hasher, region.italic);
     }
+}
+
+fn hashTaggedNativeTextQuality(hasher: *Sha256, quality: ?document_extraction.TextQuality) void {
+    hashField(hasher, .native_text_quality);
+    hashPresence(hasher, quality != null);
+    if (quality) |value| {
+        hasher.update(&.{
+            @intFromBool(value.too_short),
+            @intFromBool(value.garbled),
+            @intFromBool(value.font_corrupted),
+            @intFromBool(value.replacement_corrupted),
+        });
+        hashU64(hasher, @bitCast(value.single_char_word_ratio));
+        hashU64(hasher, @bitCast(value.corrupted_line_ratio));
+        hashU64(hasher, @bitCast(value.replacement_char_ratio));
+        hashU64(hasher, @intCast(value.trimmed_len));
+        hashU64(hasher, @intCast(value.non_whitespace_chars));
+    }
+}
+
+fn hashTaggedNativeTextDiagnostics(hasher: *Sha256, diagnostics: ?document_extraction.NativeTextDiagnostics) void {
+    hashField(hasher, .native_text_diagnostics);
+    hashPresence(hasher, diagnostics != null);
+    if (diagnostics) |value| {
+        hasher.update(&.{
+            @intCast(@backingInt(value.policy)),
+            @intFromBool(value.extraction_complete),
+            @intCast(@backingInt(value.semantic_coverage)),
+        });
+        hashU64(hasher, @intCast(value.actual_text_replacements));
+        hashU64(hasher, @intCast(value.outside_page_runs));
+        hashU64(hasher, @intCast(value.invisible_runs));
+        hashU64(hasher, @intCast(value.unaligned_runs));
+        hashU64(hasher, @intCast(value.unsupported_ordering_runs));
+        hashU64(hasher, @intCast(value.source_run_count));
+        hashU64(hasher, @intCast(value.emitted_run_count));
+        hashU64(hasher, @intCast(value.outside_page_spans));
+        hashU64(hasher, @intCast(value.invisible_spans));
+        hashU64(hasher, @intCast(value.unpositioned_spans));
+        hasher.update(&.{
+            @intFromBool(value.actual_text_incomplete),
+            @intFromBool(value.outline_fallback),
+            @intFromBool(value.has_nontext_visual),
+            @intFromBool(value.has_unrendered_annotations),
+        });
+    }
+}
+
+fn hashTaggedTextBlocks(hasher: *Sha256, blocks: []const document_extraction.TextBlock) void {
+    hashField(hasher, .text_blocks);
+    hashU64(hasher, @intCast(blocks.len));
+    for (blocks) |block| {
+        hashU64(hasher, block.span[0]);
+        hashU64(hasher, block.span[1]);
+        for (block.bbox) |coordinate| hashU64(hasher, @bitCast(coordinate));
+        hashU64(hasher, block.reading_order);
+        hashOptionalF64(hasher, block.font_size);
+        hashOptionalBool(hasher, block.bold);
+        hashOptionalBool(hasher, block.italic);
+    }
+}
+
+fn hashOptionalF64(hasher: *Sha256, value: ?f64) void {
+    hashPresence(hasher, value != null);
+    if (value) |float| hashU64(hasher, @bitCast(float));
+}
+
+fn hashOptionalBool(hasher: *Sha256, value: ?bool) void {
+    hashPresence(hasher, value != null);
+    if (value) |boolean| hasher.update(&.{@intFromBool(boolean)});
 }
 
 fn hashTaggedTranscriptSpans(hasher: *Sha256, spans: []const document_extraction.TranscriptSpan) void {
@@ -563,6 +677,7 @@ test "document unit fingerprint distinguishes absent and empty optional fields" 
 
 test "document unit fingerprint state version rejects legacy encodings" {
     try std.testing.expect(!stateVersionIsCurrent(.{ .integer = 1 }));
+    try std.testing.expect(!stateVersionIsCurrent(.{ .integer = current_state_version - 1 }));
     try std.testing.expect(stateVersionIsCurrent(.{ .integer = current_state_version }));
     try std.testing.expect(!stateVersionIsCurrent(.{ .string = "2" }));
 }
@@ -594,4 +709,67 @@ test "document unit fingerprint folds transcript spans in only when present" {
     const moved_fingerprint = try fingerprintAlloc(alloc, timed);
     defer alloc.free(moved_fingerprint);
     try std.testing.expect(!std.mem.eql(u8, timed_fingerprint, moved_fingerprint));
+}
+
+test "document unit fingerprint includes native quality diagnostics region style and blocks" {
+    const alloc = std.testing.allocator;
+    const base = document_extraction.Unit{
+        .unit_id = @constCast("page:000001"),
+        .unit_type = @constCast("page"),
+        .text = @constCast("Heading"),
+        .method = @constCast("pdf_text"),
+    };
+    const baseline = try fingerprintAlloc(alloc, base);
+    defer alloc.free(baseline);
+
+    var enriched = base;
+    enriched.native_text_quality = .{ .trimmed_len = 7, .non_whitespace_chars = 7 };
+    enriched.native_text_diagnostics = .{ .policy = .page, .source_run_count = 1, .emitted_run_count = 1 };
+    const metadata = try fingerprintAlloc(alloc, enriched);
+    defer alloc.free(metadata);
+    try std.testing.expect(!std.mem.eql(u8, baseline, metadata));
+
+    inline for (.{ "outside_page_spans", "invisible_spans", "unpositioned_spans" }) |field| {
+        var changed = enriched;
+        @field(changed.native_text_diagnostics.?, field) = 1;
+        const fingerprint = try fingerprintAlloc(alloc, changed);
+        defer alloc.free(fingerprint);
+        try std.testing.expect(!std.mem.eql(u8, metadata, fingerprint));
+    }
+
+    var partial_structure = enriched;
+    partial_structure.native_text_diagnostics.?.actual_text_incomplete = true;
+    const partial_fingerprint = try fingerprintAlloc(alloc, partial_structure);
+    defer alloc.free(partial_fingerprint);
+    try std.testing.expect(!std.mem.eql(u8, metadata, partial_fingerprint));
+
+    var regions = [_]document_extraction.TextRegion{.{ .span = .{ 0, 7 }, .bbox = .{ 1, 2, 3, 4 }, .font_size = 12, .bold = true }};
+    var blocks = [_]document_extraction.TextBlock{.{ .span = .{ 0, 7 }, .bbox = .{ 1, 2, 3, 4 }, .reading_order = 0, .font_size = 12, .bold = true }};
+    enriched.text_regions = &regions;
+    enriched.text_blocks = &blocks;
+    const structured = try fingerprintAlloc(alloc, enriched);
+    defer alloc.free(structured);
+    try std.testing.expect(!std.mem.eql(u8, metadata, structured));
+
+    enriched.native_text_diagnostics.?.policy = .visible;
+    const visible = try fingerprintAlloc(alloc, enriched);
+    defer alloc.free(visible);
+    try std.testing.expect(!std.mem.eql(u8, structured, visible));
+}
+
+test "OCR sampling provenance participates in unit fingerprints" {
+    const a = std.testing.allocator;
+    const base = document_extraction.Unit{ .unit_id = @constCast("page:1"), .unit_type = @constCast("page"), .text = @constCast("text"), .method = @constCast("ocr_text"), .ocr_render_policy = .{} };
+    const baseline = try fingerprintAlloc(a, base);
+    defer a.free(baseline);
+    inline for (.{ "version", "sampling", "resolved_profile", "resolution" }) |field| {
+        var changed = base;
+        if (comptime std.mem.eql(u8, field, "version")) changed.ocr_render_policy.?.version += 1;
+        if (comptime std.mem.eql(u8, field, "sampling")) changed.ocr_render_policy.?.sampling = .pdf;
+        if (comptime std.mem.eql(u8, field, "resolved_profile")) changed.ocr_render_policy.?.resolved_profile = .exact;
+        if (comptime std.mem.eql(u8, field, "resolution")) changed.ocr_render_policy.?.resolution = .model_input;
+        const hash = try fingerprintAlloc(a, changed);
+        defer a.free(hash);
+        try std.testing.expect(!std.mem.eql(u8, baseline, hash));
+    }
 }

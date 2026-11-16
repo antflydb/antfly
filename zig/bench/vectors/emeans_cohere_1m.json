@@ -1,0 +1,181 @@
+{
+  "date": "2026-11-10",
+  "base_commit": "70db7c929ba4e96e24510cbf81c4893c65b61e06",
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "dataset": "VectorDBBench Cohere Medium 1M",
+  "fixture_url_prefix": "https://assets.zilliz.com/benchmark/cohere_medium_1m/",
+  "configuration": {
+    "vectors": 1000000,
+    "dims": 768,
+    "queries": 100,
+    "runs_per_optimizer": 1,
+    "metric": "l2_squared",
+    "unit_normalized": true,
+    "leaf_size": 4096,
+    "branching_factor": 16,
+    "backend": "cpu",
+    "optimize": "ReleaseFast",
+    "commit_budget_bytes": 67108864,
+    "centroid_directory": "flat_rabitq"
+  },
+  "parquet_preparation": {
+    "vectors": 1000000,
+    "dims": 768,
+    "queries": 100,
+    "parquet_scan_normalize_write_ns": 17420751875
+  },
+  "scope": [
+    "Local Parquet decode, normalization and float32 vector-file write are measured once and included in each phase sum.",
+    "Both optimizers train on the entire corpus in one bulk build, with exact vectors served from the prepared file.",
+    "Native posting publication, reopen, row count and tree-link verification succeeded for both runs.",
+    "Verification and query sweeps follow the build timer. Remote I/O, exact-vector LSM construction, and lake manifest publication are outside the measurement.",
+    "Single serial runs on a shared workstation with other active workloads and memory pressure.",
+    "Cache eviction removed the completed e-means output and the in-flight Lloyd scratch directories. Lloyd continued with its original in-memory corpus after its empty scratch directories were recreated. Both completed timing and verification logs were retained."
+  ],
+  "results": [
+    {
+      "algorithm": "emeans",
+      "count": 1000000,
+      "leaf_size": 4096,
+      "fixture_load_ns": 1403609292,
+      "construction_ns": 573945148292,
+      "leaf_cluster_ns": 468492237000,
+      "posting_publish_ns": 1883432208,
+      "segments": 1,
+      "build_and_reopen_ns": 575851412208,
+      "parquet_to_reopened_sidecar_phase_sum_ns": 594675773375,
+      "other_construction_ns": 105452911292,
+      "published_posting_bytes": 143727467,
+      "query_sweep": [
+        {
+          "probes": 16,
+          "recall_at_100": 0.8115,
+          "mean_query_ms": 13.82334292,
+          "scored": 4830126,
+          "leaves_explored": 1600
+        },
+        {
+          "probes": 32,
+          "recall_at_100": 0.9028,
+          "mean_query_ms": 6.57936208,
+          "scored": 9683495,
+          "leaves_explored": 3200
+        },
+        {
+          "probes": 64,
+          "recall_at_100": 0.9577,
+          "mean_query_ms": 7.4880025,
+          "scored": 19205587,
+          "leaves_explored": 6400
+        },
+        {
+          "probes": 128,
+          "recall_at_100": 0.9785,
+          "mean_query_ms": 9.14839208,
+          "scored": 38066508,
+          "leaves_explored": 12800
+        },
+        {
+          "probes": 256,
+          "recall_at_100": 0.9861,
+          "mean_query_ms": 13.45819041,
+          "scored": 75424072,
+          "leaves_explored": 25600
+        },
+        {
+          "probes": 512,
+          "recall_at_100": 0.9866,
+          "mean_query_ms": 16.93282583,
+          "scored": 100000000,
+          "leaves_explored": 34200
+        },
+        {
+          "probes": 1024,
+          "recall_at_100": 0.9866,
+          "mean_query_ms": 16.72491333,
+          "scored": 100000000,
+          "leaves_explored": 34200
+        },
+        {
+          "probes": 2048,
+          "recall_at_100": 0.9866,
+          "mean_query_ms": 16.68291583,
+          "scored": 100000000,
+          "leaves_explored": 34200
+        }
+      ]
+    },
+    {
+      "algorithm": "kmeans",
+      "count": 1000000,
+      "leaf_size": 4096,
+      "fixture_load_ns": 1224488250,
+      "construction_ns": 811170732666,
+      "leaf_cluster_ns": 711770719000,
+      "posting_publish_ns": 1626064584,
+      "segments": 1,
+      "build_and_reopen_ns": 812820179833,
+      "parquet_to_reopened_sidecar_phase_sum_ns": 831465419958,
+      "other_construction_ns": 99400013666,
+      "published_posting_bytes": 143897063,
+      "query_sweep": [
+        {
+          "probes": 16,
+          "recall_at_100": 0.8215,
+          "mean_query_ms": 6.48019875,
+          "scored": 4630715,
+          "leaves_explored": 1600
+        },
+        {
+          "probes": 32,
+          "recall_at_100": 0.9016,
+          "mean_query_ms": 7.0059325,
+          "scored": 9207178,
+          "leaves_explored": 3200
+        },
+        {
+          "probes": 64,
+          "recall_at_100": 0.9559,
+          "mean_query_ms": 7.45210208,
+          "scored": 18418327,
+          "leaves_explored": 6400
+        },
+        {
+          "probes": 128,
+          "recall_at_100": 0.9772,
+          "mean_query_ms": 9.61126292,
+          "scored": 36831606,
+          "leaves_explored": 12800
+        },
+        {
+          "probes": 256,
+          "recall_at_100": 0.9874,
+          "mean_query_ms": 15.15978958,
+          "scored": 72673454,
+          "leaves_explored": 25600
+        },
+        {
+          "probes": 512,
+          "recall_at_100": 0.988,
+          "mean_query_ms": 18.53858541,
+          "scored": 100000000,
+          "leaves_explored": 35800
+        },
+        {
+          "probes": 1024,
+          "recall_at_100": 0.988,
+          "mean_query_ms": 20.235995,
+          "scored": 100000000,
+          "leaves_explored": 35800
+        },
+        {
+          "probes": 2048,
+          "recall_at_100": 0.988,
+          "mean_query_ms": 18.986025,
+          "scored": 100000000,
+          "leaves_explored": 35800
+        }
+      ]
+    }
+  ]
+}

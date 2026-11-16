@@ -29,16 +29,22 @@ pub fn validateStructuredFilterValueAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
 ) !void {
-    _ = alloc;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
     var remaining_nodes: usize = max_tree_nodes;
-    try validateNode(value, 0, &remaining_nodes);
+    try validateNode(arena.allocator(), value, 0, &remaining_nodes);
 }
 
-fn validateNode(value: std.json.Value, depth: u8, remaining_nodes: *usize) anyerror!void {
+fn validateNode(alloc: std.mem.Allocator, value: std.json.Value, depth: u8, remaining_nodes: *usize) anyerror!void {
     if (depth >= max_tree_depth or remaining_nodes.* == 0) return error.InvalidArgument;
     _ = try pattern_filter_contract.requireSingleRoot(value);
     remaining_nodes.* -= 1;
 
+    if (value.object.get("value")) |predicate| {
+        const spec = std.json.parseFromValueLeaky(@import("../../../search/value_query.zig").Spec, alloc, predicate, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidArgument;
+        if (spec.field.len == 0 or !std.math.isFinite(spec.boost) or spec.boost <= 0) return error.InvalidArgument;
+        return;
+    }
     if (value.object.get("match_all") != null or value.object.get("match_none") != null) return;
     if (value.object.get("ref")) |reference| {
         if (reference != .string or reference.string.len == 0) return error.InvalidArgument;
@@ -46,7 +52,7 @@ fn validateNode(value: std.json.Value, depth: u8, remaining_nodes: *usize) anyer
     }
     if (value.object.get("doc_id")) |doc_id| return validateDocIds(doc_id);
     inline for ([_][]const u8{ "conjuncts", "disjuncts" }) |key| {
-        if (value.object.get(key)) |children| return validateChildren(children, depth + 1, remaining_nodes);
+        if (value.object.get(key)) |children| return validateChildren(alloc, children, depth + 1, remaining_nodes);
     }
     if (value.object.get("bool")) |bool_query| {
         if (bool_query != .object) return error.InvalidArgument;
@@ -55,7 +61,7 @@ fn validateNode(value: std.json.Value, depth: u8, remaining_nodes: *usize) anyer
         var has_required = false;
         inline for ([_][]const u8{ "filter", "must", "should", "must_not" }) |key| {
             if (bool_query.object.get(key)) |children| {
-                try validateChildren(children, depth + 1, remaining_nodes);
+                try validateChildren(alloc, children, depth + 1, remaining_nodes);
                 if (comptime std.mem.eql(u8, key, "should")) should_len = children.array.items.len;
                 if (comptime std.mem.eql(u8, key, "filter") or std.mem.eql(u8, key, "must")) has_required = true;
             }
@@ -83,11 +89,11 @@ fn validateNode(value: std.json.Value, depth: u8, remaining_nodes: *usize) anyer
     return error.UnsupportedQueryRequest;
 }
 
-fn validateChildren(value: std.json.Value, depth: u8, remaining_nodes: *usize) anyerror!void {
+fn validateChildren(alloc: std.mem.Allocator, value: std.json.Value, depth: u8, remaining_nodes: *usize) anyerror!void {
     if (value != .array or value.array.items.len == 0 or value.array.items.len > remaining_nodes.*) {
         return error.InvalidArgument;
     }
-    for (value.array.items) |child| try validateNode(child, depth, remaining_nodes);
+    for (value.array.items) |child| try validateNode(alloc, child, depth, remaining_nodes);
 }
 
 fn validateDocIds(value: std.json.Value) !void {

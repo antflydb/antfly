@@ -1,0 +1,432 @@
+# Table privacy
+
+Privacy inspects selected string fields for configured entity categories. A
+policy can report findings (`monitor`) or redact the documents consumed by
+search and AI (`redact_for_search_and_ai`). Originals remain stored. The
+`redact_before_storage` mode returns HTTP 422
+(`privacy_synchronous_ingestion_required`) on preview and policy installation,
+before sampling or provider execution, until synchronous ingestion is available.
+Policies, previews, and rescans
+require document storage without an external base source; unsupported storage
+returns `PrivacyRelationalStorageUnsupported` before inspection or mutation.
+
+Start in a table's **Privacy** tab: choose fields and categories, preview a
+bounded sample, inspect highlighted spans, and adjust sensitivity or individual
+category thresholds. A protective save requires a fresh preview and an impact
+acknowledgment. Samples contain original values and require table administrator
+access. A preview is not a table-wide detection-quality assessment.
+
+## API
+
+All paths below are relative to `/db/v1`. Privacy operations require table
+administration permission when access control is enabled.
+
+```http
+POST /tables/customers/privacy/preview
+Content-Type: application/json
+
+{
+  "policy": {
+    "mode": "redact_for_search_and_ai",
+    "fields": ["body"],
+    "category_groups": ["contact_details", "personal_identifiers"],
+    "sensitivity": "balanced"
+  },
+  "sample": {"keys": ["customer-1", "customer-2"]}
+}
+```
+
+Preview accepts up to 50 documents and does not install a policy. Save the
+policy object with `PUT /tables/customers/privacy`. The response is `202` with
+an ETag, immutable `policy_version`, and an automatically scheduled `scan_id`.
+Read the policy, resolved producer, and current coverage with `GET` on that
+path. Replacing an existing policy requires its exact ETag in `If-Match`;
+missing and stale preconditions return `428` and `412` respectively.
+
+Poll `GET /tables/customers/privacy/scans/{scan_id}`. Jobs progress through
+`queued`, `running`, and `processing`; processing verifies current receipts and
+consumer publication before `succeeded`. Failed jobs expose bounded document
+IDs and error codes. A semantic policy replacement supersedes earlier jobs.
+Supersession is committed atomically with replacement and remains terminal if a
+later policy reuses the same semantic version. Execution-only tuning preserves
+jobs and their progress.
+
+```http
+GET /tables/customers/privacy/findings?field=body&category=email&limit=100
+```
+
+Findings include document, field, category, half-open UTF-8 byte coordinates,
+policy version, source fingerprint, producer revision, and confidence when the
+producer supplies it. They omit matched values. Pagination cursors bind the
+policy and filters; restart pagination after changing either. Treat cursors as
+opaque strings and pass them unchanged, including for large or escaped document
+identifiers. Use `POST /tables/customers/privacy/findings` with the same fields
+in a JSON body for large cursors or filters that exceed URL limits. The TypeScript SDK
+and Privacy tab use this body form. Explicit
+`policy_version` requests for a superseded policy return `410`.
+
+Failure examples are limited to 100 entries and 1 MiB of serialized JSON.
+Coverage and scan failure counts include documents omitted from those examples.
+
+Start a bounded retry or rescan with `POST /tables/customers/privacy/scans`,
+optionally supplying `from_key`, `to_key`, and a page `limit` from 1 to 1000.
+Source updates also schedule inspection through the ordinary producer pipeline.
+
+## Repairing an activation parked before an upgrade
+
+Upgrading the server or correcting a provider does not erase terminal producer
+failures. This includes activations affected by the v0.3.0 text/document
+transport mismatch: their repair ledger can contain `InferenceTransportUnavailable`
+and dependent `ArtifactDependencyFailed` entries even though the provider is
+now healthy. Protected reads continue to fail closed until current receipts and
+consumer publication are complete.
+
+After upgrading and verifying the configured extractor endpoint, inspect the
+policy and its bounded artifact repair ledger:
+
+```http
+GET /tables/customers/privacy
+
+POST /tables/customers/repair/issues
+Content-Type: application/json
+
+{"target":"artifact","limit":50}
+```
+
+Create a fresh privacy scan to explicitly retry inspection and its dependent
+consumers under the **same installed policy**:
+
+```http
+POST /tables/customers/privacy/scans
+Content-Type: application/json
+
+{"limit":100}
+```
+
+The coordinator advances bounded pages; `limit` is a per-page bound, not a cap
+on the total repaired documents. Supply `from_key` and `to_key` when only a
+particular key range needs repair. Poll the returned new `scan_id` until
+`succeeded`; an older failed scan remains historical failure evidence. Verify
+that coverage reports no pending or protected-blocked documents and that
+retrieval returns the redacted projection. If the new scan fails, inspect its
+error codes and repair ledger before retrying again. Do not disable privacy,
+replace the policy, or delete its artifacts to bypass the serving barrier.
+
+## Producers and execution
+
+The default is the pinned
+[Fastino GLiNER2 PII model](https://huggingface.co/fastino/gliner2-privacy-filter-PII-multi)
+at revision `1cb4166094dc58fa8d836429f060d6c95f62b495`. It uses Antfly's
+existing artifact extraction infrastructure, including native admission and
+cancellation. Long documents use bounded overlapping windows with exact
+512-token admission; spans are rebased into the source. Compatible inspections
+are batched across documents and fields, and compatible windows use Metal/CUDA
+batches of up to eight. Native CPU execution remains serial.
+
+Override `producer` using the artifact API's configuration shape:
+
+```json
+{
+  "type": "extractor",
+  "revision": "immutable-deployment-revision",
+  "config": {
+    "provider": "antfly",
+    "model": "my-pinned-extractor",
+    "schema_version": 2
+  }
+}
+```
+
+Generated extractors and generators are supported too. Generators use
+`type: "generator"` and an artifact producer config containing `generator`
+and `output_schema`. Evidence must contain valid source spans; invalid evidence
+fails inspection. Custom producer revisions are mandatory. Credentials must be
+empty or exact `${secret:key.name}` references. Omitting a credential uses the
+provider’s environment defaults. Literal credentials in nested provider options,
+headers, endpoint userinfo, query parameters, or fragments are rejected before
+preview or installation. Schema and entity-label definitions remain user data. Remote producers receive original selected text;
+the preview and policy response disclose external processing. That disclosure
+uses execution's route selection, including `inference.api_url`, explicit
+producer endpoints, and task-specific linked callback availability. Generated
+extractors follow their generator's route.
+
+Managed document projections have a source-sized host budget, separate from
+producer response limits. Large selected values and unrelated document fields
+therefore do not consume the detector's evidence allowance. Preview still has
+its own 8 MiB sample and response limits; provider output remains independently
+bounded. Selected text must also fit the configured producer input budget;
+for constrained generators this is `producer.config.batch.max_input_bytes`.
+
+The union of expanded category groups and explicit custom categories is limited
+to 128 categories. Overrides of an existing group category count once. This
+limit is checked before preview or policy installation.
+
+`execution.batch_items` (1–8) and `execution.max_attempts` (1–5) tune batching
+and invalid-evidence retries. Changing them preserves semantic policy identity
+and accepted inspection results. Transport backoff remains owned by the
+artifact runtime. Dependency priming honors the same durable, source-bound retry
+clock as ordinary replay, including after restart. A deferred inspection does
+not prevent independent documents' downstream work from progressing. Changing
+fields, categories, thresholds, replacement, mode,
+or producer identity creates a new policy version and schedules backfill.
+
+## Protected serving
+
+Protective policies atomically rewrite default and named full-text/vector
+consumers to use the sanitized projection. Chunking and embeddings consume
+sanitized document text. Original authored vectors, unsupported graph or
+relational consumers, and unsupported extraction chains are rejected during
+admission. Ordinary index/enrichment mutations cannot replace policy-owned
+objects while protection is active.
+
+Point reads and hydration verify current source, policy, and storage-owned
+publication evidence. Search also fences producer completion and physical
+index checkpoints before candidates, statistics, filtering, and aggregation.
+Queries can temporarily return unavailable while a protected generation is
+pending or failed; readiness is conservative across the table's managed
+consumers. Original values do not become searchable while backfill runs.
+Original artifact inspection requires separate administrator access.
+
+SQL reads of document tables apply predicates, joins, projections and aggregates
+to the sanitized document snapshot. SQL mutations and delayed serializable
+snapshots on protected tables return an unsupported response. Use the ordinary
+document batch API for writes; it preserves originals and schedules inspection
+for the new source revision. Pending inspection makes SQL reads retryably
+unavailable rather than exposing an older source or original values.
+
+Coverage reports current, pending, known failed, documents with findings,
+category and field counts, and protected readiness. Unavailable or incomplete census
+results have null counts instead of an optimistic zero. Detection is
+probabilistic: qualify categories and thresholds against representative text
+before relying on the policy for your application.
+
+
+Coverage counts are collected by a durable background census in bounded pages.
+`GET /tables/{table}/privacy` reads its latest completed result without scanning
+the data shards. `started_at_millis` and `completed_at_millis` describe the
+observation interval; these informational counts refresh asynchronously and are
+not an atomic cross-shard snapshot or permission to serve a document. While
+`refreshing` is true, the previous completed counts remain visible. Before the
+first complete pass, coverage is unavailable. Source and policy receipts still
+fence every protected read independently of these counts.
+
+Scan history retains at most 16 jobs. Completed, failed, and superseded jobs can
+be retired; active jobs are preserved. When all 16 are active, another scan
+request returns HTTP 409 (`privacy_scan_limit_exceeded`) without losing work.
+
+Backfill discovery queues document references without retaining source bodies.
+The requested scan limit is a row ceiling; discovery also limits retained
+identifiers and reference metadata to an 8 MiB page. One oversized identifier
+can advance alone. Replay captures current sources and admits detector work
+after discovery; discovery does not rewrite originals or renew TTLs.
+
+Policy saves acknowledge the installed resource version. Background scan and
+coverage updates do not change its ETag or delay acknowledgement. Equivalent
+field/category ordering and producer object-key ordering keep the executable
+producer unchanged; execution tuning still updates runtime controls separately.
+The policy-bound runtime override survives restart and governs subsequent
+inspection attempts without invalidating accepted receipts.
+
+Policy replacement preserves the live resolver and curation control state,
+including proposals created after protection was enabled. Switching to monitor
+restores the logical consumer declarations while retaining current control
+state. Re-enabling protection does not resurrect deleted resolver metadata or
+interpret curation evidence as index or producer configuration. Scan and coverage
+progress do not invalidate resolver admission or query proofs; authored policy
+and consumer changes still fence them.
+
+Findings enumerate document IDs and inspect one source and manifest at a time.
+Pages stop between documents after an 8 MiB inspection budget, or within a
+document when the finding count or output-byte budget is reached. A document
+is validated completely before any of its findings are returned, so a single
+large document can exceed the inspection budget. Follow `next_cursor` even
+when a page contains no findings; missing or stale receipts count as pending.
+
+Full-table scan jobs share the background coverage census. Completion requires a
+fresh pass started after that job entered verification, plus protected serving
+readiness where applicable. Range scans verify their own bounds in adaptive pages.
+
+Preview accepts at most 50 documents. Samples, including JSON-escaped document
+identifiers, have an 8 MiB budget; preview responses also have an 8 MiB budget.
+Exceeding either returns HTTP 422 (`privacy_sample_too_large`); request fewer or
+smaller documents. Automatic sampling streams rows and stops before retaining
+an oversized sample. A rejected preview does not install a policy.
+
+A newly created Raft table can become visible before its data owner is ready.
+Privacy operations return HTTP 503 with `retryable: true` and `Retry-After: 1`
+while an owner, required index, or group leader is temporarily unavailable.
+Retry a preview after that delay. Invalid policies remain HTTP 422, policy CAS
+failures remain HTTP 412/428, and an unknown mutation outcome remains HTTP 409:
+inspect policy/scan state before retrying that mutation. Availability handling
+does not automatically replay policy writes or scan creation.
+
+A successful policy or scan admission returns its prepared `202` response.
+Reconcile scheduling is a best-effort acceleration of durable work; a failed
+hint cannot turn an accepted policy into a retryable rejection. A lost or
+unusable transport response still requires reconciling policy/scan state.
+
+
+An upstream `X-Antfly-Raft-Mutation-Outcome: unknown-v1` marker is preserved
+through metadata and data-node forwarding, alongside the status, response body,
+ETag and `Retry-After`. Treat this marker as an ambiguous write outcome on either
+409 or 503: inspect policy/scan state before deciding whether to submit again.
+The TypeScript SDK exposes these headers on `AntflyHTTPError` as
+`mutationOutcome` (`"unknown"` when marked) and `retryAfterSeconds` (a
+nonnegative numeric delay when supplied). The delay alone never authorizes
+replaying a mutation; the SDK does not retry policy or scan writes.
+
+For browser clients on an allowed cross-origin site, default CORS permits
+`If-Match` and exposes `ETag`, `Retry-After` and
+`X-Antfly-Raft-Mutation-Outcome`. Explicit `cors.allowed_headers` and
+`cors.exposed_headers` lists replace those defaults; include these headers when
+customizing the lists so conditional saves and outcome inspection remain usable.
+
+
+Private range checkpoints have per-table budgets of 256 MiB for staged uploads
+and 8 GiB for retained payloads, including retired generations awaiting cleanup.
+Capacity exhaustion returns HTTP 422 (`privacy_checkpoint_capacity_exceeded`);
+allow cleanup to finish and use fewer or smaller concurrent range scans before
+retrying. Metadata protocol 82 is required for new privacy mutations. Older
+checkpoint headers remain readable and are reclaimed during upgrade.
+
+
+Table backups retain the policy, its execution controls, managed producers and
+protected index configuration. Restore creates a fresh full-table scan and
+coverage census for the destination. Source-table scan history, cursors and
+coverage counts are not imported; follow the restored resource's new `scan_id`.
+Its policy version and ETag remain unchanged. Protected reads still require
+current source receipts and authoritative publication, independently of census
+progress. Private artifacts without destination publication are regenerated, so
+the configured producer may need to run again. Metadata recovery and hot-standby replication retain their own
+resumable job state; this reset applies to table backup restore.
+
+Privacy operations also support explicit database and namespace scope:
+`/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy`
+and the same `/preview`, `/findings`, `/scans`, and `/scans/{scanId}` suffixes.
+All require administration permission on that scoped table. A plain table name
+always selects `default.public`; dots and escaped slashes never infer scope.
+
+The TypeScript privacy client accepts either a literal name or an explicit target
+for each operation. The target uses the shared `CatalogTableTarget` contract,
+with database `default` and namespace `public` when omitted. For example:
+
+```typescript
+const target = { database: "tenant", namespace: "serving", table: "notes" };
+const current = await client.privacy.get(target);
+await client.privacy.put(target, policy, { ifMatch: current.etag });
+```
+
+Generated Go, Python, and Rust clients expose the corresponding
+`getNamespaceTablePrivacy`, `putNamespaceTablePrivacy`,
+`previewNamespaceTablePrivacy`, `startNamespaceTablePrivacyScan`,
+`getNamespaceTablePrivacyScan`, `listNamespaceTablePrivacyFindings`, and
+`queryNamespaceTablePrivacyFindings` operations (using each language's naming
+convention).
+
+
+### Index migration while protection is active
+
+With `redact_for_search_and_ai`, create a new physical embedding or full-text
+index through the normal create-index API. Antfly attaches it to the current
+protected artifact graph in the same catalog commit. Existing index generations
+and privacy inspection receipts remain usable. Wait for the new index to become
+complete, then move the serving index alias with `expected_index` set to the old
+physical index. After cutover, delete the unreferenced old physical index through
+the normal delete-index API. Its private chunk/embedding producers retire in the
+same catalog mutation, so later writes no longer invoke its model. Shared
+producers and the protected serving guard remain owned by their surviving
+consumers. Raw external vectors and unsupported graph consumers are rejected.
+Repeating an identical creation request preserves the physical generation.
+
+Semantic policy changes (including producer revision or replacement style)
+replace dependent consumer generations and backfill them under the new policy.
+Identical policy PUTs and execution-only tuning preserve existing generations.
+An alias that still references a changed consumer blocks the policy replacement
+with HTTP 409 `IndexReferencedByAlias`. Remove every alias referencing a changed consumer before changing the policy;
+rebind only after the protected index is complete. To remove an alias, GET
+`/tables/{tableName}/index-aliases/{aliasName}` and DELETE the same path with
+`If-Match` set to that response's exact `ETag`. Missing validators return 428,
+stale validators return 412, and a repeated deletion returns 404. This CAS also
+protects against deleting a concurrently recreated alias or one restored from a backup. Physical indexes and
+retained PUT idempotency receipts remain intact. Protection remains
+active throughout the transition. Alias mutations require metadata protocol 91
+and store artifact-source protocol 4 so older owners cannot misread the new
+validator state. Legacy alias catalogs continue to admit protocol-3 stores
+during rolling upgrades until lifecycle validator state is committed.
+
+Missing producer input does not become a successful replay merely because a retry
+limit elapsed. Its journal window remains pending until input arrives, a durable
+source deletion or generation proves it retired, or explicit repair resolves the
+missing state. Workers park instead of polling the same failed window; source or
+producer commits and explicit repair notifications wake them, including repairs
+at the same replay sequence. Ordinary query visibility waits do not wake an
+unchanged missing-input window. Continuing writes also respect a bounded retry
+backoff; they cannot cause a blocked window to replay at the write rate. A retry
+requires both a notification and an elapsed deadline, so idle workers do not
+poll. Reopening retries retained debt. This applies to
+full-text consumers as well as vector consumers.
+
+### Inspect stored vectors as an administrator
+
+For a dense index protected by `redact_for_search_and_ai` and backed by text
+chunk embedding producers, an explicit
+artifact inspection can use the index name:
+
+```http
+GET /db/v1/tables/docs/documents/doc-id/artifacts/semantic-index?detail=raw
+```
+
+This uses the existing table administrator permission for raw artifact
+inspection. Tenant search and document projections retain their artifact
+restrictions. Existing asset names take precedence over an index with the
+same name. Index inspections are explicit lookups and are not added to asset
+manifest enumeration. Unprotected indexes and document-level, sparse, media,
+or elided-vector recipes are outside this inspection format.
+
+The response has `route_type: "dense_index_inspection"`, `manifest_version: 1`,
+and an empty top-level `artifact_id` because an index can consume many physical
+artifacts. Its raw `manifest_json` is a JSON string with format
+`antfly.dense-index-inspection.v1`. It contains the index name, physical
+coverage generation and recipe fingerprint; the active privacy policy version;
+the currently sanitized `document_json` and its SHA-256 fingerprint; and a
+`current` publication flag. Each vector carries its real artifact ID, producer
+name, provider/model identity, producer fingerprint, exact source text and
+SHA-256 fingerprint, the persisted artifact fingerprint and opaque provider cache identity, and
+persisted float values. Fingerprints are lowercase
+SHA-256 hex over the exact represented bytes.
+
+Source, selected chunk heads, recipe, publication guards, and stored vectors
+are captured while apply is held shared, with the source and vectors read from
+one storage snapshot. Standalone inspection uses the same source-guarded coverage generations and
+clean projection checkpoints as protected serving; ordered owners additionally
+verify per-output causal provenance. The payload identifies this authority and
+reports the index/checkpoint config hashes, checkpoint status, applied sequence
+and replay target sequence. It does not substitute asset privacy witnesses for
+vector authority. `current: false` and an `incomplete_reason` do not certify vector
+equivalence. Pending root publication never yields certified vectors.
+The operation never calls an embedding provider to reconstruct missing values.
+It seeks only the selected producers for this document and bounds inspection
+to 16 producers, 128 vectors, 65,536 float values and 1 MiB of source payloads.
+Identities are limited to 4 KiB and each producer configuration to 1 MiB.
+Publication preflight and traversal share a 512-visit, 2 MiB budget, including
+policy/configuration bytes, readiness nodes, index checks and empty unit heads.
+The five-second deadline starts at capture entry and is checked throughout.
+Ordered global readiness verifies one durable catalog authority and each
+producer counter once, without rebuilding per-producer dependency closures.
+Standalone vector readiness reads its index-generation coverage once and does
+not compute source scopes. Full-text scope traversal is linear in the dependency
+graph and charges the same budget during edge discovery, traversal and hashing;
+its existing v2 receipt identity is preserved. Fixed payload or traversal limits
+return HTTP 413 with code `inspection_limit_exceeded`, `retryable: false`, and
+the configured limits; deadline or publication contention remains retryable.
+No response is truncated. Capture excludes primary and replay publication using
+the existing snapshot admission gates, then releases those gates before JSON
+encoding. `checkpoint_generation` and `checkpoint_config_hash` can be checked
+against the independent live index status fields
+`projection_checkpoint_generation` and `projection_checkpoint_config_fingerprint`
+(the latter is hexadecimal).
+
+An independent oracle should compare these values against a separate invocation
+of the intended model on independently retrieved sanitized text. Check source
+revision, policy and index identity as well as the numeric values, and retain
+tenant permission checks separately.

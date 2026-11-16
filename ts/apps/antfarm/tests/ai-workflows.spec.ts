@@ -623,7 +623,7 @@ test.describe("AI workflow routes", () => {
         },
       });
     });
-    await page.route("**/ai/v1/transcribe", async (route) => {
+    await page.route("**/ai/v1/read", async (route) => {
       const body = route.request().postDataJSON();
       transcribedAudio.push(body.audio);
       await route.fulfill({
@@ -656,6 +656,51 @@ test.describe("AI workflow routes", () => {
     await expect(page.getByText("first segment")).toBeVisible();
     await expect(page.getByText("second segment")).toBeVisible();
     expect(transcribedAudio).toEqual(["Y2h1bmstMQ==", "Y2h1bmstMg=="]);
+  });
+
+  test("Gemma-only audio readers are selectable and submit supported read options", async ({
+    page,
+  }) => {
+    const catalog = structuredClone(connections);
+    const models = catalog.connections[0].inference.models;
+    models.transcribers = [];
+    models.generators = [{ name: "gemma-audio", inputs: ["text", "audio"] }];
+    await page.route("**/db/v1/connections**", (route) => route.fulfill({ json: catalog }));
+    await page.route("**/ai/v1/models", (route) =>
+      route.fulfill({
+        json: {
+          generators: {
+            "gemma-audio": { inputs: ["text", "audio"], audio_read: { forced_language: false } },
+          },
+          transcribers: {},
+        },
+      })
+    );
+    const requests: Record<string, unknown>[] = [];
+    await page.route("**/ai/v1/read", async (route) => {
+      requests.push(route.request().postDataJSON());
+      await route.fulfill({
+        json: {
+          object: "list",
+          model: "gemma-audio",
+          data: [{ object: "read", index: 0, status: "complete", text: "Gemma audio transcript" }],
+        },
+      });
+    });
+    await page.goto("/inference/playground/transcribe");
+    await expect(page.getByLabel("Audio Reader Model")).toContainText("gemma-audio");
+    await expect(page.getByLabel("Language")).toBeDisabled();
+    await page.getByRole("button", { name: "File", exact: true }).click();
+    await page.locator('input[type="file"][accept="audio/*"]').setInputFiles({
+      name: "audio.wav",
+      mimeType: "audio/wav",
+      buffer: Buffer.from("RIFFmock-wav"),
+    });
+    await page.getByRole("button", { name: "Transcribe", exact: true }).click();
+    await expect(page.getByText("Gemma audio transcript")).toBeVisible();
+    expect(requests).toHaveLength(1);
+    expect(requests[0].model).toBe("gemma-audio");
+    expect(requests[0].audio_options).toEqual({});
   });
 
   test("retryable model-busy responses retry and an in-flight inference can be stopped", async ({

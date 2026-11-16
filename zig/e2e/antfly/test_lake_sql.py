@@ -2300,32 +2300,37 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                 ], filtered
             return results
 
-        def native_roots():
+        def collect_native_roots():
             roots, manifests, pages = [], {}, {}
             for path in (server.root / "artifacts").rglob("*"):
                 if not path.is_file():
                     continue
                 payload = path.read_bytes()
+                if not payload.startswith(b"AFOBJ001"):
+                    continue
+                byte_len, metadata_len = struct.unpack_from("<QI", payload, 8)
+                payload = payload[84 + metadata_len :]
+                assert len(payload) == byte_len
                 begin = payload.find(b"AFGPT003")
                 if begin >= 0:
                     encoded = payload[begin:]
                     pages[hashlib.sha256(encoded).digest()] = encoded
-                for prefix in (b'{"version":', b'{"file":'):
-                    begin = payload.find(prefix)
-                    if begin < 0:
-                        continue
-                    encoded = payload[begin:]
-                    try:
-                        document = json.loads(encoded)
-                    except (ValueError, UnicodeDecodeError):
-                        continue
-                    if "file" in document and "segments" in document:
-                        manifests[hashlib.sha256(encoded).hexdigest()] = (
-                            document,
-                            len(encoded),
-                        )
-                    elif "file_groups" in document or "file_states" in document:
-                        roots.append(document)
+                # FileGroup adds optional fields without fixing JSON member
+                # order (sort_bounds now precedes file). Decode the actual
+                # object payload instead of recognizing a first-field prefix.
+                if not payload.startswith(b"{"):
+                    continue
+                try:
+                    document = json.loads(payload)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if "file" in document and "segments" in document:
+                    manifests[hashlib.sha256(payload).hexdigest()] = (
+                        document,
+                        len(payload),
+                    )
+                elif "file_groups" in document or "file_states" in document:
+                    roots.append(document)
 
             def records(ref, domain):
                 page = pages[bytes(ref["digest"])]
@@ -2399,6 +2404,13 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                     segment for group in groups for segment in group["segments"]
                 ]
             return roots
+
+        def native_roots():
+            server.pause()
+            try:
+                return collect_native_roots()
+            finally:
+                server.resume()
 
         wait_ready()
         initial = verify([1])
@@ -2811,6 +2823,9 @@ def test_native_remote_large_hydration_and_residual_filter(tmp_path):
 
 def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path):
     """Bounded index seeks and ordinal maps share exact bitmap semantics."""
+    from helpers import PhaseTimings
+
+    timings = PhaseTimings("indexed-metadata-scale")
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
@@ -2857,7 +2872,9 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             + hashlib.sha256(payload).hexdigest().encode()
             + payload
         )
+    timings.mark("independent-source-fixture")
     server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    timings.mark("server-startup")
     failed = True
     try:
 
@@ -2988,6 +3005,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         # This fixture builds several ordered indexes over more than 100,000
         # rows. Allow bounded Debug publication setup before checking indexed
         # query semantics; this is not a publication-latency benchmark.
+        timings.mark("table-admission")
         deadline = time.monotonic() + 600
         while True:
             resource = call("GET", "/tables/indexed_predicates/indexes/body_text")
@@ -2995,6 +3013,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                 break
             assert time.monotonic() < deadline, str(resource) + server.debug_logs()
             time.sleep(0.1)
+        timings.mark("native-index-publication")
 
         def query(predicate, **options):
             return call(
@@ -3334,6 +3353,9 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             },
         )
         assert rejected_residual["hits"]["hits"] == [], rejected_residual
+        assert query({"match_all": {}}, count=True, fields=[], limit=0)["hits"][
+            "total"
+        ] == {"value": count, "relation": "exact"}
         for descending, expected in (
             (False, list(range(7, 10))),
             (True, list(range(count - 8, count - 11, -1))),
@@ -3348,9 +3370,14 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             assert [
                 h["_source"]["amount"] for h in ordered["hits"]["hits"]
             ] == expected, ordered
-            assert ordered["hits"]["total"] == {"value": count, "relation": "exact"}, (
-                ordered
-            )
+            # A bounded page need not scan every matching posting solely to
+            # count it. Its total is an honest lower bound; count-only queries
+            # below independently retain exact cardinality coverage.
+            total = ordered["hits"]["total"]
+            assert total["relation"] in ("exact", "gte"), ordered
+            assert 10 <= total["value"] <= count, ordered
+            if total["relation"] == "exact":
+                assert total["value"] == count, ordered
             profile = ordered["profile"]["sort"]
             assert profile["candidate_source"] == "ordered_lake_index", profile
             assert profile["candidate_count"] <= 11, profile
@@ -3446,14 +3473,31 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             assert [h["_source"]["amount"] for h in skewed["hits"]["hits"]] == list(
                 range(count - 1000, count - 997)
             ), skewed
-            assert skewed["hits"]["total"] == {"value": 1000, "relation": "exact"}, (
-                skewed
+            total = skewed["hits"]["total"]
+            assert total["relation"] in ("exact", "gte"), skewed
+            assert 3 <= total["value"] <= 1000, skewed
+            if total["relation"] == "exact":
+                assert total["value"] == 1000, skewed
+            counted = call(
+                "POST",
+                "/tables/indexed_predicates/query",
+                {
+                    "full_text_search": {"term": "late", "field": "body"},
+                    "count": True,
+                    "fields": [],
+                    "limit": 0,
+                },
+            )
+            assert counted["hits"]["total"] == {"value": 1000, "relation": "exact"}, (
+                counted
             )
             assert (
                 skewed["profile"]["sort"]["candidate_source"]
-                == "ordered_lake_index_then_text_postings"
+                == "ordered_lake_index_then_text_windows"
             ), skewed
-            assert skewed["profile"]["sort"]["ordered_scanned_count"] <= 1024, skewed
+            assert 0 < skewed["profile"]["sort"]["ordered_scanned_count"] <= 1024, (
+                skewed
+            )
         tied = query(
             {"match_all": {}}, order_by=[{"field": "sort_rank"}], limit=1, profile=True
         )
@@ -3580,6 +3624,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         ):
             dated = query(predicate, count=True, fields=[], limit=0)
             assert dated["hits"]["total"] == {"value": 2, "relation": "exact"}, dated
+        timings.mark("indexed-query-assertions")
         failed = False
     finally:
         server.stop(test_failed=failed)
@@ -3871,10 +3916,12 @@ def test_remote_ordered_scan_budget_counts_rows_without_text_ordinals(tmp_path):
             2,
         ], result
         profile = result["profile"]["sort"]
-        assert profile["candidate_source"] == "ordered_lake_index_then_text_postings", (
+        assert profile["candidate_source"] == "ordered_lake_index_then_text_windows", (
             result
         )
-        assert profile["ordered_scanned_count"] <= 1024, result
+        # The abandoned ordered attempt reports physical probes, including rows
+        # without text ordinals, before the bounded text-window fallback.
+        assert 0 < profile["ordered_scanned_count"] <= 1024, result
         failed = False
     finally:
         server.stop(test_failed=failed)
@@ -4975,6 +5022,19 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
         ]
         assert len(expected) == row_count
 
+        def same_hits(actual, expected):
+            # Different admission windows may group float32 reductions
+            # differently. Keep identities, order, hydration and metadata exact
+            # while comparing scores within native floating-point precision.
+            assert len(actual) == len(expected)
+            for hit, oracle in zip(actual, expected, strict=True):
+                assert hit["_score"] == pytest.approx(
+                    oracle["_score"], rel=1e-6, abs=1e-12
+                )
+                assert {k: v for k, v in hit.items() if k != "_score"} == {
+                    k: v for k, v in oracle.items() if k != "_score"
+                }
+
         def check():
             result = call(
                 "POST", "/tables/paged_text/query", dict(request, limit=19, offset=61)
@@ -5253,14 +5313,11 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                 query = dict(request, **shape, limit=7)
                 reference = full_admission(query)
                 actual = call("POST", "/tables/paged_text/query", query)
-                assert actual["hits"]["hits"] == reference["hits"]["hits"], (
-                    actual,
-                    reference,
-                )
+                same_hits(actual["hits"]["hits"], reference["hits"]["hits"])
                 profiled = call(
                     "POST", "/tables/paged_text/query", dict(query, profile=True)
                 )
-                assert profiled["hits"]["hits"] == actual["hits"]["hits"]
+                same_hits(profiled["hits"]["hits"], actual["hits"]["hits"])
                 if (
                     "reranker" not in shape
                     and "pruner" not in shape
@@ -5310,20 +5367,20 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                         remote_snapshot=actual["remote_snapshot"],
                     )
                     following = call("POST", "/tables/paged_text/query", forward)
-                    assert (
-                        following["hits"]["hits"]
-                        == full_admission(forward)["hits"]["hits"]
+                    same_hits(
+                        following["hits"]["hits"],
+                        full_admission(forward)["hits"]["hits"],
                     )
                     backward = dict(
                         query,
                         search_before=following["hits"]["hits"][0]["_sort"],
                         remote_snapshot=following["remote_snapshot"],
                     )
-                    assert (
+                    same_hits(
                         call("POST", "/tables/paged_text/query", backward)["hits"][
                             "hits"
-                        ]
-                        == actual["hits"]["hits"]
+                        ],
+                        actual["hits"]["hits"],
                     )
 
         check()
@@ -6849,18 +6906,24 @@ def test_prefix_compressed_repeated_predicates_without_statistics_survive_restar
                 # Both ranges are valid together; every row fails only after
                 # its column has been traversed by the first predicate.
                 (
-                    "SELECT COUNT(*) FROM prefix_predicates "
-                    "WHERE label >= 'a' AND label < 'ab'",
+                    (
+                        "SELECT COUNT(*) FROM prefix_predicates "
+                        "WHERE label >= 'a' AND label < 'ab'"
+                    ),
                     [["0"]],
                 ),
                 (
-                    "SELECT COUNT(*) FROM prefix_predicates "
-                    "WHERE label >= 'a' AND label < 'b'",
+                    (
+                        "SELECT COUNT(*) FROM prefix_predicates "
+                        "WHERE label >= 'a' AND label < 'b'"
+                    ),
                     [[str(count)]],
                 ),
                 (
-                    "SELECT label FROM prefix_predicates "
-                    "WHERE label >= 'a' AND label < 'b' LIMIT 3",
+                    (
+                        "SELECT label FROM prefix_predicates "
+                        "WHERE label >= 'a' AND label < 'b' LIMIT 3"
+                    ),
                     [["abcdefg"]] * 3,
                 ),
             ):

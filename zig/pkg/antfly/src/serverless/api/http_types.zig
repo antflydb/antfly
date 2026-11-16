@@ -32,8 +32,7 @@ pub const RequestGuard = struct {
     }
     fn isCancelled(ptr: *const anyopaque) bool {
         const self: *const @This() = @ptrCast(@alignCast(ptr));
-        self.context.ensureActive() catch return true;
-        return false;
+        return self.context.isCancellationRequested();
     }
 };
 

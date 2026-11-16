@@ -44,7 +44,18 @@ const entry_flag_projection_plane: u32 = 1 << 1;
 const entry_flag_residual_locations: u32 = 1 << 2;
 const entry_flag_omitted_l2_centroid_dots: u32 = 1 << 3;
 const entry_flag_subgroups: u32 = 1 << 4;
-const known_entry_flags: u32 = entry_flag_member_ids | entry_flag_projection_plane | entry_flag_residual_locations | entry_flag_omitted_l2_centroid_dots | entry_flag_subgroups;
+/// Extended (multi-bit) RaBitQ columns follow the centroid dots: u64 codes
+/// (`exWordsPerRow` per row) then two f32 factors per row. The bit count is
+/// the u32 at entry header offset 24. Builds that predate the flag reject
+/// such entries instead of misreading them.
+const entry_flag_ex_codes: u32 = 1 << 5;
+const known_entry_flags: u32 = entry_flag_member_ids | entry_flag_projection_plane | entry_flag_residual_locations | entry_flag_omitted_l2_centroid_dots | entry_flag_subgroups | entry_flag_ex_codes;
+
+/// Bytes of a set's extended columns (zero without them).
+fn exColumnBytes(set: *const proto.RaBitQuantizedVectorSet) usize {
+    if (!set.hasEx()) return 0;
+    return set.ex_codes.len * @sizeOf(u64) + set.ex_factors.len * @sizeOf(f32);
+}
 
 /// One bounded leaf's permuted build columns. Authoritative float32 vectors
 /// and residuals are not copied or moved by this serving-layout operation.
@@ -95,6 +106,11 @@ fn reorderSet(alloc: Allocator, source: *const proto.RaBitQuantizedVectorSet, ro
         result.centroid_distances[dst] = source.centroid_distances[src];
         result.quantized_dot_products[dst] = source.quantized_dot_products[src];
         if (source.centroid_dot_products.len != 0) result.centroid_dot_products[dst] = source.centroid_dot_products[src];
+        if (source.hasEx()) {
+            const ew = proto.RaBitQuantizedVectorSet.exWordsPerRow(source.centroid.len, source.ex_bits);
+            @memcpy(result.ex_codes[dst * ew ..][0..ew], source.ex_codes[src * ew ..][0..ew]);
+            result.ex_factors[dst * 2 ..][0..2].* = source.ex_factors[src * 2 ..][0..2].*;
+        }
     }
     return result;
 }
@@ -353,6 +369,7 @@ pub const Writer = struct {
             if (posting_id <= previous) return error.UnsortedQuantizedDirectory;
         }
 
+        if (set.ex_bits != 0 and !set.hasEx()) return error.InvalidQuantizedDirectoryEntry;
         var serving_bytes = leafScanBytes(
             count,
             width,
@@ -360,8 +377,8 @@ pub const Writer = struct {
             member_id_bytes.len != 0,
             projections.len != 0,
         );
-        serving_bytes.unfiltered +|= subgroup_bytes.len;
-        serving_bytes.filtered +|= subgroup_bytes.len;
+        serving_bytes.unfiltered +|= subgroup_bytes.len + exColumnBytes(set);
+        serving_bytes.filtered +|= subgroup_bytes.len + exColumnBytes(set);
         if (member_id_bytes.len != 0) {
             const vectors: u64 = @intCast(count);
             self.admission_stats.merge(.{
@@ -389,6 +406,10 @@ pub const Writer = struct {
         var flags: u32 = 0;
         if (subgroup_bytes.len != 0) flags |= entry_flag_subgroups;
         if (omitted_l2_centroid_dots) flags |= entry_flag_omitted_l2_centroid_dots;
+        if (set.hasEx()) {
+            flags |= entry_flag_ex_codes;
+            writeU32(self.out.items, entry_offset + 24, set.ex_bits);
+        }
         if (member_id_bytes.len != 0) {
             flags |= entry_flag_member_ids;
             try self.out.appendSlice(self.alloc, member_id_bytes);
@@ -408,6 +429,11 @@ pub const Writer = struct {
             try appendZeros(self.alloc, &self.out, scalar_bytes)
         else
             try self.out.appendSlice(self.alloc, std.mem.sliceAsBytes(set.centroid_dot_products));
+        if (set.hasEx()) {
+            try alignOutput(self.alloc, &self.out, @alignOf(u64));
+            try self.out.appendSlice(self.alloc, std.mem.sliceAsBytes(set.ex_codes));
+            try self.out.appendSlice(self.alloc, std.mem.sliceAsBytes(set.ex_factors));
+        }
         if (projections.len != 0) {
             // Keep each column contiguous: a leaf scan streams the f16 matrix,
             // while boundary math reads the much smaller metadata columns.
@@ -620,6 +646,7 @@ pub const StreamingWriter = struct {
             if (posting_id <= previous) return error.UnsortedQuantizedDirectory;
         }
 
+        if (set.ex_bits != 0 and !set.hasEx()) return error.InvalidQuantizedDirectoryEntry;
         var serving_bytes = leafScanBytes(
             count,
             width,
@@ -627,8 +654,8 @@ pub const StreamingWriter = struct {
             member_id_bytes.len != 0,
             projections.len != 0,
         );
-        serving_bytes.unfiltered +|= subgroup_bytes.len;
-        serving_bytes.filtered +|= subgroup_bytes.len;
+        serving_bytes.unfiltered +|= subgroup_bytes.len + exColumnBytes(set);
+        serving_bytes.filtered +|= subgroup_bytes.len + exColumnBytes(set);
         if (member_id_bytes.len != 0) {
             const vectors: u64 = @intCast(count);
             self.admission_stats.merge(.{
@@ -649,6 +676,10 @@ pub const StreamingWriter = struct {
         var flags: u32 = 0;
         if (subgroup_bytes.len != 0) flags |= entry_flag_subgroups;
         if (omitted_l2_centroid_dots) flags |= entry_flag_omitted_l2_centroid_dots;
+        if (set.hasEx()) {
+            flags |= entry_flag_ex_codes;
+            writeU32(&header, 24, set.ex_bits);
+        }
         if (member_id_bytes.len != 0) flags |= entry_flag_member_ids;
         if (projections.len != 0) {
             flags |= entry_flag_projection_plane;
@@ -667,6 +698,11 @@ pub const StreamingWriter = struct {
             try self.appendEntryZeros(sink, scalar_bytes)
         else
             try self.appendEntryBytes(sink, std.mem.sliceAsBytes(set.centroid_dot_products));
+        if (set.hasEx()) {
+            try self.alignEntry(sink, @alignOf(u64));
+            try self.appendEntryBytes(sink, std.mem.sliceAsBytes(set.ex_codes));
+            try self.appendEntryBytes(sink, std.mem.sliceAsBytes(set.ex_factors));
+        }
         if (projections.len != 0) {
             try self.alignEntry(sink, @alignOf(f16));
             try self.projection_ranges.append(self.alloc, .{
@@ -812,6 +848,10 @@ pub const View = struct {
     count: usize,
     width: usize,
     subgroup_plan: ?subgroups.View = null,
+    /// Extended RaBitQ columns (`entry_flag_ex_codes`); empty when absent.
+    ex_bits: u32 = 0,
+    ex_codes: []const u64 = &.{},
+    ex_factors: []const f32 = &.{},
 
     pub const CanonicalRead = struct {
         value: proto.RaBitQuantizedVectorSet,
@@ -834,7 +874,7 @@ pub const View = struct {
 
     pub fn canonicalScratchBytes(self: View) u64 {
         return if (self.subgroup_plan != null)
-            @as(u64, @intCast(self.centroid.len * 4 + self.codes.len * 8 + self.count * 16))
+            @as(u64, @intCast(self.centroid.len * 4 + self.codes.len * 8 + self.count * 16 + self.ex_codes.len * 8 + self.ex_factors.len * 4))
         else
             0;
     }
@@ -853,6 +893,9 @@ pub const View = struct {
             .quantized_dot_products = @constCast(self.quantized_dot_products),
             .centroid_dot_products = if (self.omitted_l2_centroid_dots) &.{} else @constCast(self.centroid_dot_products),
             .centroid_norm = self.centroid_norm,
+            .ex_bits = self.ex_bits,
+            .ex_codes = @constCast(self.ex_codes),
+            .ex_factors = @constCast(self.ex_factors),
         };
     }
 };
@@ -1022,6 +1065,25 @@ pub const Reader = struct {
         const dots_raw: []align(@alignOf(f32)) const u8 = @alignCast(self.data[distances_end..dots_end]);
         const centroid_dots_raw: []align(@alignOf(f32)) const u8 = @alignCast(self.data[dots_end..centroid_dots_end]);
         cursor = centroid_dots_end;
+        var ex_bits: u32 = 0;
+        var ex_codes: []const u64 = &.{};
+        var ex_factors: []const f32 = &.{};
+        if (flags & entry_flag_ex_codes != 0) {
+            ex_bits = readU32(self.data, start + 24);
+            if (ex_bits == 0 or ex_bits > 8) return error.InvalidQuantizedDirectory;
+            const ew = proto.RaBitQuantizedVectorSet.exWordsPerRow(self.dims, ex_bits);
+            const ex_code_bytes = std.math.mul(usize, count * ew, @sizeOf(u64)) catch return error.InvalidQuantizedDirectory;
+            const ex_factor_bytes = std.math.mul(usize, count * 2, @sizeOf(f32)) catch return error.InvalidQuantizedDirectory;
+            cursor = std.mem.alignForward(usize, cursor, @alignOf(u64));
+            const ex_codes_end = std.math.add(usize, cursor, ex_code_bytes) catch return error.InvalidQuantizedDirectory;
+            const ex_factors_end = std.math.add(usize, ex_codes_end, ex_factor_bytes) catch return error.InvalidQuantizedDirectory;
+            if (ex_factors_end > end) return error.InvalidQuantizedDirectory;
+            const ex_codes_raw: []align(@alignOf(u64)) const u8 = @alignCast(self.data[cursor..ex_codes_end]);
+            const ex_factors_raw: []align(@alignOf(f32)) const u8 = @alignCast(self.data[ex_codes_end..ex_factors_end]);
+            ex_codes = std.mem.bytesAsSlice(u64, ex_codes_raw);
+            ex_factors = std.mem.bytesAsSlice(f32, ex_factors_raw);
+            cursor = ex_factors_end;
+        } else if (readU32(self.data, start + 24) != 0) return error.InvalidQuantizedDirectory;
         const projections: ?hbc_runtime.NativeProjectionPlane = if (flags & entry_flag_projection_plane != 0) blk: {
             if (member_ids.len != count) return error.InvalidQuantizedDirectory;
             cursor = std.mem.alignForward(usize, cursor, @alignOf(f16));
@@ -1124,6 +1186,9 @@ pub const Reader = struct {
             .count = count,
             .width = width,
             .subgroup_plan = subgroup_plan,
+            .ex_bits = ex_bits,
+            .ex_codes = ex_codes,
+            .ex_factors = ex_factors,
         };
     }
 };
@@ -1777,4 +1842,65 @@ test "L2 append after directory materialization publishes a valid larger checkpo
     const reader = try Reader.init(encoded);
     const view = (try reader.get(7)).?;
     try std.testing.expectEqual(@as(usize, 3), view.centroid_distances.len);
+}
+
+test "quantized directory carries extended RaBitQ columns through both writers" {
+    const alloc = std.testing.allocator;
+    const dims = 16;
+    const n = 6;
+    var prng = std.Random.DefaultPrng.init(3);
+    const rand = prng.random();
+    const vectors = try alloc.alloc(f32, n * dims);
+    defer alloc.free(vectors);
+    for (vectors) |*v| v.* = rand.floatNorm(f32);
+    var q = try @import("antfly_vector").quantizer.RaBitQuantizer.init(alloc, dims, 42, .cosine);
+    defer q.deinit();
+    q.ex_bits = 4;
+    var set = try q.quantize(&@as([dims]f32, @splat(0.1)), vectors, n);
+    defer set.deinit(alloc);
+    try std.testing.expect(set.hasEx());
+    var member_ids: [n]u64 = undefined;
+    for (&member_ids, 0..) |*id, i| id.* = 100 + i;
+
+    var buffered = try Writer.init(alloc, dims, 2);
+    defer buffered.deinit();
+    try buffered.appendWithMemberBytes(7, &set, std.mem.sliceAsBytes(&member_ids));
+    const expected = try buffered.build();
+    defer alloc.free(expected);
+
+    var sink: TestingSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var streaming = try StreamingWriter.init(alloc, &sink, dims, 2);
+    defer streaming.deinit();
+    try streaming.appendWithLeafPlanes(&sink, 7, &set, std.mem.sliceAsBytes(&member_ids), &.{});
+    _ = try streaming.finish(&sink);
+    try std.testing.expectEqualSlices(u8, expected, sink.out.items);
+
+    const reader = try Reader.init(expected);
+    const view = (try reader.get(7)).?;
+    try std.testing.expectEqual(@as(u32, 4), view.ex_bits);
+    const borrowed = view.asProto();
+    try std.testing.expect(borrowed.hasEx());
+    try std.testing.expectEqualSlices(u64, set.ex_codes, borrowed.ex_codes);
+    try std.testing.expectEqualSlices(f32, set.ex_factors, borrowed.ex_factors);
+    // Scan admission charges the extra columns.
+    try std.testing.expect(reader.scanBytes(7, false).? >= exColumnBytes(&set));
+
+    // Reordering for a serving layout moves extended rows with their codes.
+    const rows = [_]u32{ 5, 4, 3, 2, 1, 0 };
+    var reordered = try reorderSet(alloc, &set, &rows, false);
+    defer reordered.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, set.exCode(5), reordered.exCode(0));
+    var back = try reorderSet(alloc, &reordered, &rows, true);
+    defer back.deinit(alloc);
+    try std.testing.expectEqualSlices(u64, set.ex_codes, back.ex_codes);
+
+    // A set claiming extended codes without complete columns is rejected.
+    var broken = try set.clone(alloc);
+    defer broken.deinit(alloc);
+    broken.ex_factors = broken.ex_factors[0 .. broken.ex_factors.len - 2];
+    var w2 = try Writer.init(alloc, dims, 2);
+    defer w2.deinit();
+    try std.testing.expectError(error.InvalidQuantizedDirectoryEntry, w2.append(9, &broken));
+    broken.ex_factors.len += 2;
 }

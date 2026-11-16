@@ -56,7 +56,7 @@ pub fn leafCharge(usage: c.Usage, bytes: usize, calls: u64) Charge {
 pub fn restore(run: *c.Run, usage: c.Usage, receipts: []const c.costs.Receipt, include_calls: bool) !void {
     var measured: runs.Measurement = .{};
     for (receipts) |receipt| measured = try measured.plus(receipt.measured);
-    if (measured.prompt_tokens < usage.prompt_tokens or measured.completion_tokens < usage.completion_tokens or measured.rendered_pixels < usage.rendered_pixels or usage.total_tokens != usage.prompt_tokens +| usage.completion_tokens) return error.InvalidDocumentCheckpoint;
+    if (measured.prompt_tokens < usage.prompt_tokens or measured.completion_tokens < usage.completion_tokens or measured.rendered_pixels < usage.rendered_pixels or measured.unmeasured_tokens < usage.unmeasured_tokens or usage.total_tokens != usage.prompt_tokens +| usage.completion_tokens +| usage.unmeasured_tokens) return error.InvalidDocumentCheckpoint;
     var value = usage;
     if (!include_calls) value.model_calls = 0; // caller already admitted its logical call
     try run.restoreCosts(value, receipts);

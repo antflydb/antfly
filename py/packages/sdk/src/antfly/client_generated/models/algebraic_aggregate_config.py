@@ -18,6 +18,9 @@ class AlgebraicAggregateConfig:
         name (str):
         op (AlgebraicAggregateConfigOp):
         group_by (list[str] | Unset):
+        time (str | Unset): Schema datetime column used for temporal grouping. Requires bucket.
+        bucket (str | Unset): UTC calendar unit (minute, hour, day, week, month, quarter, year) or positive fixed
+            elapsed duration such as 5m. Requires time. Fixed buckets align to the Unix epoch.
         measure (str | Unset): Required except for count. Omitted count means COUNT(*); a supplied column means
             COUNT(column), excluding SQL NULL values.
     """
@@ -25,6 +28,8 @@ class AlgebraicAggregateConfig:
     name: str
     op: AlgebraicAggregateConfigOp
     group_by: list[str] | Unset = UNSET
+    time: str | Unset = UNSET
+    bucket: str | Unset = UNSET
     measure: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -35,6 +40,10 @@ class AlgebraicAggregateConfig:
         group_by: list[str] | Unset = UNSET
         if not isinstance(self.group_by, Unset):
             group_by = self.group_by
+
+        time = self.time
+
+        bucket = self.bucket
 
         measure = self.measure
 
@@ -48,6 +57,10 @@ class AlgebraicAggregateConfig:
         )
         if group_by is not UNSET:
             field_dict["group_by"] = group_by
+        if time is not UNSET:
+            field_dict["time"] = time
+        if bucket is not UNSET:
+            field_dict["bucket"] = bucket
         if measure is not UNSET:
             field_dict["measure"] = measure
 
@@ -62,12 +75,18 @@ class AlgebraicAggregateConfig:
 
         group_by = cast(list[str], d.pop("group_by", UNSET))
 
+        time = d.pop("time", UNSET)
+
+        bucket = d.pop("bucket", UNSET)
+
         measure = d.pop("measure", UNSET)
 
         algebraic_aggregate_config = cls(
             name=name,
             op=op,
             group_by=group_by,
+            time=time,
+            bucket=bucket,
             measure=measure,
         )
 

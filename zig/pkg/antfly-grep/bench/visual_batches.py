@@ -46,19 +46,39 @@ def main():
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--image-bytes", type=int, default=0)
     parser.add_argument(
+        "--shapes",
+        type=int,
+        default=1,
+        help="alternating exact projection shapes (1..parents)",
+    )
+    parser.add_argument(
         "--stream",
         action="store_true",
         help="disable ranking to measure first streaming output",
     )
+    parser.add_argument(
+        "--source-projection",
+        action="store_true",
+        help="enable conditional source identities on the fixture server",
+    )
     parser.add_argument("--delay-ms", type=float, default=20)
+    parser.add_argument(
+        "--question-miss",
+        action="store_true",
+        help="also measure a changed question with warm validation facts and cold scores",
+    )
     parser.add_argument("--slow-first-ms", type=float, default=0)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    phases = (
+        ("cold", "warm", "question_miss") if args.question_miss else ("cold", "warm")
+    )
     if (
         args.rounds < 1
         or not 1 <= args.units <= 16
         or not 1 <= args.parents <= 64
+        or not 1 <= args.shapes <= args.parents
         or not 1 <= args.page_size <= 1000
         or not 0 <= args.image_bytes <= 500000
         or args.delay_ms < 0
@@ -129,7 +149,11 @@ def main():
                                     + struct.pack(">I", zlib.crc32(b"tEXt" + payload))
                                 )
                                 image = image[:-12] + chunk + image[-12:]
-                            field = f"preview{i}"
+                            field = (
+                                f"preview{i}"
+                                if args.shapes == 1
+                                else f"shape{parent % args.shapes}_preview{i}"
+                            )
                             entry["_source"]["payloads"][field] = (
                                 "data:image/png;base64,"
                                 + base64.b64encode(image).decode()
@@ -145,9 +169,14 @@ def main():
                     Path(config).write_text(json.dumps(settings))
                     case.server.delay = args.delay_ms / 1000
                     case.server.slow_first_ms = args.slow_first_ms
-                    for phase in ("cold", "warm"):
+                    case.server.source_projection_mode = (
+                        "enabled" if args.source_projection else None
+                    )
+                    for phase in phases:
                         case.server.requests.clear()
                         case.server.index_requests.clear()
+                        case.server.projected_asset_bytes = 0
+                        case.server.index_response_bytes = 0
                         start = time.monotonic_ns()
                         process_report = case.root / "child-usage.json"
                         command = [
@@ -160,6 +189,10 @@ def main():
                             "--decision-concurrency=8",
                             "--decision-batch-wait-ms=20",
                         ]
+                        if phase == "question_miss":
+                            command[command.index("--ask") + 1] = (
+                                "find visual errors and retries"
+                            )
                         if args.stream:
                             command.append("--no-rank")
                         result = subprocess.run(
@@ -213,6 +246,8 @@ def main():
                                 "harness_elapsed_ns": harness_elapsed,
                                 "provider_requests": len(requests),
                                 "index_requests": len(case.server.index_requests),
+                                "index_response_bytes": case.server.index_response_bytes,
+                                "projected_asset_bytes": case.server.projected_asset_bytes,
                                 "logical_provider_json_bytes": sum(
                                     len(
                                         json.dumps(
@@ -233,7 +268,7 @@ def main():
         fixture.CliTests.tearDownClass()
     medians = []
     for variant in binaries:
-        for phase in ("cold", "warm"):
+        for phase in phases:
             selected = [
                 r for r in samples if r["variant"] == variant and r["phase"] == phase
             ]
@@ -251,6 +286,8 @@ def main():
                             "peak_rss_bytes",
                             "provider_requests",
                             "index_requests",
+                            "index_response_bytes",
+                            "projected_asset_bytes",
                             "logical_provider_json_bytes",
                             "evaluated_units",
                         )
@@ -264,6 +301,7 @@ def main():
         "machine": platform.machine(),
         "units": args.units,
         "parents": args.parents,
+        "shapes": args.shapes,
         "page_size": args.page_size,
         "requested_image_bytes": args.image_bytes,
         "ranked": not args.stream,
@@ -271,6 +309,8 @@ def main():
         "per_request_delay_ms": args.delay_ms,
         "slow_first_ms": args.slow_first_ms,
         "batch_size": args.batch_size,
+        "conditional_source_projection": args.source_projection,
+        "question_miss": args.question_miss,
         "binaries": {
             name: {
                 "path": str(path),

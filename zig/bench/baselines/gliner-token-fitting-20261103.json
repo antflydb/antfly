@@ -1,0 +1,396 @@
+{
+  "date": "2026-11-03",
+  "scope": "Exact nonmonotonic uniform-window fitting, bounded tokenizer work, and supplemental Debug qualification; warm in-process CUDA request comparison, not optimized HTTP-service throughput.",
+  "source": {
+    "base_commit": "2dc7086a039953f6d8457ab763adbb534b4fa99c",
+    "runtime_and_initial_regression_patch_sha256": "b83cb165bda34f43e326686a4a6b11ce234941f992b91198e040cd4d1893042e",
+    "main_suite_files_sha256": {
+      "zig/lib/extracting/src/text_windows.zig": "55f6dcab0433f1097656c8ad29e5acfc95bf8c1cbc892ce87ab5d809699e0e5c",
+      "zig/pkg/inference/src/extractors/gliner_boundary_executor.zig": "9880677342b37d66be349d4883435074517d9c94bb07bce79d76a6bd6dea7f2a",
+      "zig/pkg/inference/src/extractors/gliner_boundary_long_executor.zig": "18147d79e23097695970e14a0d9b58a13d6357c43a21e7739dbc87d86d4f62c0",
+      "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig": "4859b1f0ab806b0b98c4d01b291e7cf74f3894d19f101d9c5d196d1e18f23910"
+    },
+    "final_files_sha256": {
+      "zig/lib/extracting/src/text_windows.zig": "55f6dcab0433f1097656c8ad29e5acfc95bf8c1cbc892ce87ab5d809699e0e5c",
+      "zig/pkg/inference/src/extractors/gliner_boundary_executor.zig": "493d1e8e866995ea5bc9a883d8a05a6846957f932bf83b88431686bb1888e526",
+      "zig/pkg/inference/src/extractors/gliner_boundary_long_executor.zig": "8d3768cd0cd989243659cb2fa3c6167d5c66c85d123a77239723f7b779f2c995",
+      "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig": "4859b1f0ab806b0b98c4d01b291e7cf74f3894d19f101d9c5d196d1e18f23910"
+    },
+    "coverage_note": "After the main suites, only test code changed: a platform-calibrated native OOM fixture was replaced with targeted backing-allocation injection, and an opt-in complete-request CUDA benchmark was added. Production runtime source is unchanged from the main suites. Final source hashes match glowworm."
+  },
+  "model": {
+    "files": {
+      "config.json": {
+        "fixture": "models/base/config.json",
+        "sha256": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1",
+        "size_bytes": 3150
+      },
+      "encoder_config/config.json": {
+        "fixture": "models/base/encoder_config.json",
+        "sha256": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4",
+        "size_bytes": 857
+      },
+      "model.safetensors": {
+        "sha256": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+        "size_bytes": 774366564
+      },
+      "tokenizer.json": {
+        "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "size_bytes": 8341713
+      },
+      "tokenizer_config.json": {
+        "fixture": "models/base/tokenizer_config.json",
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+        "size_bytes": 645
+      }
+    },
+    "model_id": "fastino/gliner2.5-base-v1",
+    "revision": "72ac19b486cd4557424c8d61114e7530c243e9b0"
+  },
+  "algorithm": {
+    "fast_path": "Prepare the requested ceiling once and retain its tokenized windows when it fits.",
+    "fallback": "Index exact independently encoded source-word costs, terminal variants and source geometry once. Test candidate uniform widths in descending order with prefix sums; retain the largest fitting width. Prepare only the selected final partition.",
+    "maximum_candidate_width": 4096,
+    "maximum_windows_per_candidate": 1024,
+    "cancellation": "Check during source indexing, word encoding, and candidate search.",
+    "regressions": [
+      "24-word heterogeneous-cost request: ceiling 12 now succeeds while preserving the valid width-10 partition.",
+      "Same request with ceiling 4096 performs fewer than 256 tokenizer calls.",
+      "Exhaustive tokenized-partition comparisons cover both splitters, Unicode, URLs, email, punctuation and trailing whitespace.",
+      "All allocation failures in fitting release retained and temporary state."
+    ]
+  },
+  "validation": {
+    "local": {
+      "main_run": {
+        "selected": 75,
+        "passed": 71,
+        "skipped": 2,
+        "failed": 2,
+        "failure_reason": "MetalDeviceUnavailable inside sandbox; both tests passed when rerun with GPU access.",
+        "log_sha256": "5c0314b4c01387905b41364ded1e06c82f5a57515f9e26308810ec4074de2127"
+      },
+      "metal_retry": {
+        "selected": 2,
+        "passed": 2,
+        "skipped": 0,
+        "log_sha256": "072c82d23dbe1fd3b11ecd9876f2ea4a2beed9deaaa1d00244bf1271ebe4bcd9"
+      },
+      "native_oom_replacement": {
+        "selected": 1,
+        "passed": 1,
+        "skipped": 0,
+        "log_sha256": "c4bdd448100609e054e4d6aeabeec5ad0666d292adeb35db2cc8d9deb58ebb74"
+      },
+      "extracting": {
+        "passed": 37,
+        "log_sha256": "d1c1b8b84c254af28ab7d92afe73eaceca139b41bee8e805522634b2700ad22e",
+        "note": "Six loopback HTTP fixtures initially failed sandbox bind restrictions; the full 37-test executable passed outside the sandbox."
+      },
+      "skip_reason": "Small-model directory was unset for two pinned-small checks.",
+      "preparation_benchmark": {
+        "scope": "Preparation only, same Debug implementation with request-local reuse disabled/enabled; final preparation-store teardown included. Not an old-head comparison.",
+        "samples": [
+          {
+            "reuse": false,
+            "three_pass_request_ns": 215881000
+          },
+          {
+            "reuse": true,
+            "three_pass_request_ns": 77411000
+          },
+          {
+            "reuse": true,
+            "three_pass_request_ns": 77597000
+          },
+          {
+            "reuse": false,
+            "three_pass_request_ns": 212663000
+          }
+        ],
+        "speedup": 2.7646573080099093
+      }
+    },
+    "glowworm": {
+      "gpu": "NVIDIA GB10",
+      "optimize": "Debug",
+      "main_run": {
+        "selected": 74,
+        "passed": 71,
+        "skipped": 2,
+        "failed": 1,
+        "failure_reason": "The old native OOM fixture used a whole-request 6 MiB cap and failed during relation decoding on Linux. Its deterministic replacement passed.",
+        "log_sha256": "80a9a82a3f5c3f5b4daf55496af618df057c5e2a7f661feadd98df005d578b33"
+      },
+      "native_oom_replacement": {
+        "passed": 1,
+        "log_sha256": "b3cd8f0eac019c20de052f120b28b0d104f13f6e751df895722f2880350ee9f3",
+        "note": "The first opt-in benchmark attempt in this log required the GPU hard-cancellation watchdog; the final corrected benchmark passed separately."
+      },
+      "complete_request_benchmark": {
+        "selected": 1,
+        "passed": 1,
+        "skipped": 0,
+        "log_sha256": "195d7c2d28120cc9c9b617a3a2f084e07d1f1b3fd832dbca98aea2662bade6a5"
+      },
+      "extracting_passed": 37,
+      "skip_reason": "Small-model directory was unset for two pinned-small checks.",
+      "preparation_benchmark": {
+        "scope": "Preparation only, same Debug implementation with request-local reuse disabled/enabled; final preparation-store teardown included. Not an old-head comparison.",
+        "samples": [
+          {
+            "reuse": false,
+            "three_pass_request_ns": 136718894
+          },
+          {
+            "reuse": true,
+            "three_pass_request_ns": 49413443
+          },
+          {
+            "reuse": true,
+            "three_pass_request_ns": 49226099
+          },
+          {
+            "reuse": false,
+            "three_pass_request_ns": 135911107
+          }
+        ],
+        "speedup": 2.7639017322282378
+      }
+    },
+    "learned_boundaries": {
+      "metal_and_cuda": {
+        "body_words": 4096,
+        "prompt_tokens_at_word_boundary": 4105,
+        "near_token_boundary": 16381,
+        "token_capacity": 16384,
+        "window_count": 1,
+        "default_work_budget": true
+      },
+      "parity": "Native/Metal/CUDA pinned window composition passed; CUDA covers physical batch retry charges and quota refusal."
+    }
+  },
+  "warm_cuda_request_comparison": {
+    "backend": "cuda",
+    "execution_policy": "reference_v1",
+    "optimize": "Debug",
+    "host": "glowworm (shared host)",
+    "comparison": "Request-local preparation reuse disabled/enabled in the same implementation; not a prior-commit comparison.",
+    "warmup_requests": 2,
+    "ordering": "Eight ABBA rounds, 16 timed requests per mode.",
+    "includes": [
+      "workspace geometry",
+      "qualification geometry",
+      "exact token fitting",
+      "learned inference",
+      "global decoding",
+      "response serialization",
+      "final preparation-store teardown"
+    ],
+    "excludes": [
+      "model loading",
+      "tokenizer loading",
+      "input JSON/schema parsing",
+      "HTTP transport and server admission queues",
+      "returned-response disposal"
+    ],
+    "input": {
+      "sentence": "The library indexes records and answers search queries. ",
+      "repeats": 64,
+      "schema": {
+        "entities": [
+          "concept"
+        ]
+      },
+      "long_document": {
+        "mode": "window",
+        "window_words": 128,
+        "overlap_words": 16
+      }
+    },
+    "equal_responses": true,
+    "samples": [
+      {
+        "reuse": false,
+        "request_ns": 146194945,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 105268774,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 104406969,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 147095132,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 146701006,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 104989943,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 104630776,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 146786846,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 146427744,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 104377017,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 104323610,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 146665966,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 146332688,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 104403962,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 104294571,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 146666591,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 145908306,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 104744440,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 105069654,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 146535199,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 147037308,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 104521369,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 105398789,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 145953841,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 147276316,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 105153574,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 104823304,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 146530784,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 146290944,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 105204854,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": true,
+        "request_ns": 104381497,
+        "response_bytes": 6554
+      },
+      {
+        "reuse": false,
+        "request_ns": 147566986,
+        "response_bytes": 6554
+      }
+    ],
+    "metrics": [
+      {
+        "reuse": false,
+        "requests": 16,
+        "total_ns": 2345970602,
+        "p50_ns": 146600582.5,
+        "p95_nearest_rank_ns": 147566986
+      },
+      {
+        "reuse": true,
+        "requests": 16,
+        "total_ns": 1675993103,
+        "p50_ns": 104687608.0,
+        "p95_nearest_rank_ns": 105398789
+      }
+    ],
+    "throughput_ratio_reuse_over_disabled": 1.3997495561292892
+  },
+  "remaining_qualification": [
+    "Repository-wide aggregate CI requires maintainer approval.",
+    "Optimized HTTP-service throughput, concurrency and long-context accuracy are not established by these Debug checks."
+  ]
+}

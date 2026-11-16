@@ -18,6 +18,7 @@
 const std = @import("std");
 const pdf = @import("antfly_pdf");
 const image = @import("antfly_image");
+const audio = @import("../pipelines/audio.zig");
 const c = @import("contract.zig");
 const ooxml = @import("antfly_documents").ooxml;
 const slide_parts = @import("antfly_documents").slides;
@@ -35,6 +36,95 @@ fn selectedPage(selection: ?[]const usize, number: usize) bool {
     }.order) != null;
 }
 pub const Slide = struct { path: []const u8, view: ?ooxml.View = null, hidden: bool = false, notes: ?ooxml.View = null, inherited: []const c.InheritedPart = &.{}, theme: @import("antfly_documents").drawingml_theme.Theme = .{}, theme_supported: bool = true };
+/// Audio/video containers are read through their audio track, never as pages.
+pub fn isAudioMediaType(mime: []const u8) bool {
+    const essence = @import("antfly_readers").mediaTypeEssence(mime) catch return false;
+    return audio.detectFormatFromMime(essence) != null;
+}
+/// All audio transports normalize to an ordinary document source. A supplied
+/// MIME declaration is validated independently of model/backend selection.
+pub fn audioInput(a: A, value: []const u8) !Input {
+    const uri = @import("antfly_scraping").data_uri;
+    const url = try @import("antfly_readers").audioSourceUrl(a, value);
+    var mime: []const u8 = "";
+    if (try uri.parse(url)) |parsed| {
+        const declared = parsed.effectiveMediaTypeEssence();
+        if (!std.ascii.eqlIgnoreCase(declared, "application/octet-stream")) {
+            if (!isAudioMediaType(declared)) return error.UnsupportedInferenceMimeType;
+            mime = parsed.media_type;
+        }
+        _ = try parsed.decodedSize();
+    }
+    return .{ .id = "audio-0", .url = url, .media_type = mime };
+}
+
+/// MIME may describe a container or a codec. Ogg is a container for both
+/// Vorbis and Opus, while audio/opus and audio/vorbis are codec-specific.
+fn audioMediaTypeMatches(mime: []const u8, detected: audio.EncodedFormat) !bool {
+    const data_uri = @import("antfly_scraping").data_uri;
+    const declared = try data_uri.parseMediaType(mime);
+    const expected = audio.detectFormatFromMime(mime) orelse return false;
+    const ogg_container = std.ascii.eqlIgnoreCase(declared.essence, "audio/ogg") or std.ascii.eqlIgnoreCase(declared.essence, "application/ogg");
+    if (ogg_container and detected == .opus) {
+        if (try declared.parameter("codecs") != null) {
+            const opus = try data_uri.parseMediaType("audio/ogg;codecs=opus");
+            var alias = declared;
+            alias.essence = opus.essence;
+            return opus.isCompatibleDeclaration(alias);
+        }
+        return true;
+    }
+    return expected == detected;
+}
+
+pub fn audioMime(bytes: []const u8) ![]const u8 {
+    return audio.mimeForBytes(bytes) catch return error.UnsupportedDocumentFormat;
+}
+// Semantic replacements are logical regions, independent of how many source
+// glyphs painted them. Borrow text until ordering/limits are resolved, then
+// allocate each emitted region once. The Reader retains original glyphs.
+fn nativePdfRegionsAlloc(a: A, analysis: pdf.reader.PageTextAnalysis, limit: usize, control: c.Control) ![]c.Region {
+    var regions = std.ArrayList(c.Region).empty;
+    defer regions.deinit(a);
+    for (analysis.runs, 0..) |run, index| {
+        if (index % 256 == 0) try control.check();
+        if (run.semantic_span_index != std.math.maxInt(usize)) continue;
+        const span = run.output_span orelse continue;
+        if (span.start >= span.end or span.end > analysis.text.len) continue;
+        if (regions.items.len >= limit) return error.DocumentRegionLimitExceeded;
+        const box = run.bounds();
+        try regions.append(a, .{ .id = span.start, .text = analysis.text[span.start..span.end], .bbox = if (box) |b| .{ b.min_x, b.min_y, b.max_x, b.max_y } else null, .origin = .native });
+    }
+    for (analysis.semantic_spans, 0..) |span, index| {
+        if (index % 256 == 0) try control.check();
+        const output = span.output_span orelse continue;
+        if (output.start >= output.end or output.end > analysis.text.len) continue;
+        if (regions.items.len >= limit) return error.DocumentRegionLimitExceeded;
+        const box = span.output_bounds;
+        try regions.append(a, .{ .id = output.start, .text = analysis.text[output.start..output.end], .bbox = if (box) |b| .{ b.min_x, b.min_y, b.max_x, b.max_y } else null, .origin = .native });
+    }
+    try control.check();
+    // IDs temporarily carry emitted byte offsets for reading order.
+    std.mem.sort(c.Region, regions.items, {}, struct {
+        fn less(_: void, left: c.Region, right: c.Region) bool {
+            return left.id < right.id;
+        }
+    }.less);
+    const owned = try regions.toOwnedSlice(a);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |region| a.free(region.text);
+        a.free(owned);
+    }
+    for (owned, 0..) |*region, index| {
+        if (index % 256 == 0) try control.check();
+        region.text = try a.dupe(u8, region.text);
+        initialized += 1;
+        region.id = index;
+    }
+    return owned;
+}
+
 pub const Source = struct {
     input: Input,
     fingerprint: [64]u8,
@@ -43,13 +133,13 @@ pub const Source = struct {
     // Source-owned immutable fork metadata is reused across bounded page calls.
     render_template: ?pdf.reader.RenderForkTemplate = null,
     max_regions: usize = (c.Limits{}).max_regions,
-    parsed: union(enum) { pdf: pdf.reader.Reader, image: void, slides: struct { archive: ooxml.Archive, slides: []const Slide, size: ?drawingml.Size, inheritance: slide_parts.Cache } },
+    parsed: union(enum) { pdf: pdf.reader.Reader, image: void, audio: void, slides: struct { archive: ooxml.Archive, slides: []const Slide, size: ?drawingml.Size, inheritance: slide_parts.Cache } },
     pub fn init(a: A, input: Input, bytes: []const u8, limits: c.Limits, control: c.Control) !Source {
         try control.check();
         if (input.id.len == 0 or input.id.len > 256 or bytes.len > limits.max_source_bytes) return error.InvalidDocumentSource;
         const essence = @import("antfly_readers").mediaTypeEssence(input.media_type) catch return error.InvalidDocumentSource;
         var normalized = input;
-        normalized.media_type = if (std.ascii.eqlIgnoreCase(essence, "application/pdf")) "application/pdf" else if (std.ascii.eqlIgnoreCase(essence, "application/vnd.openxmlformats-officedocument.presentationml.presentation")) "application/vnd.openxmlformats-officedocument.presentationml.presentation" else if (image.inferenceFormatForMimeEssence(essence)) |format| image.inferenceMimeEssenceForFormat(format).? else return error.UnsupportedDocumentFormat;
+        normalized.media_type = if (std.ascii.eqlIgnoreCase(essence, "application/pdf")) "application/pdf" else if (std.ascii.eqlIgnoreCase(essence, "application/vnd.openxmlformats-officedocument.presentationml.presentation")) "application/vnd.openxmlformats-officedocument.presentationml.presentation" else if (isAudioMediaType(essence)) essence else if (image.inferenceFormatForMimeEssence(essence)) |format| image.inferenceMimeEssenceForFormat(format).? else return error.UnsupportedDocumentFormat;
         if (input.quadrilateral != null and !std.mem.startsWith(u8, normalized.media_type, "image/")) return error.InvalidDocumentQuadrilateral;
         const selection: ?[]const usize = if (input.pages) |pages| blk: {
             if (pages.len == 0) return error.InvalidDocumentSelection;
@@ -141,6 +231,16 @@ pub const Source = struct {
             }
             if (slides.items.len == 0) return error.InvalidDocumentSource;
             result = .{ .input = normalized, .bytes = bytes, .fingerprint = fingerprint, .parsed = .{ .slides = .{ .archive = archive, .slides = try slides.toOwnedSlice(a), .size = slide_size, .inheritance = inheritance } } };
+        } else if (isAudioMediaType(normalized.media_type)) {
+            if (input.pages != null or input.include_notes or input.include_hidden) return error.InvalidDocumentSelection;
+            const detected = audio.detectFormat(bytes) orelse return error.DocumentMediaTypeMismatch;
+            if (!try audioMediaTypeMatches(input.media_type, detected)) return error.DocumentMediaTypeMismatch;
+            if (!audio.canDecodeFormat(detected)) return error.UnsupportedDocumentFormat;
+            // Pins and published run identities use the container's canonical
+            // MIME, including when a durable attachment resumes without its
+            // original transport declaration (for example audio/x-wav).
+            normalized.media_type = try audioMime(bytes);
+            result = .{ .input = normalized, .bytes = bytes, .fingerprint = fingerprint, .parsed = .audio };
         } else if (std.mem.startsWith(u8, normalized.media_type, "image/")) {
             const expected = image.inferenceFormatForMimeEssence(normalized.media_type) orelse return error.UnsupportedDocumentFormat;
             if (image.detectFormat(bytes) != expected) return error.DocumentMediaTypeMismatch;
@@ -167,7 +267,7 @@ pub const Source = struct {
         return switch (self.parsed) {
             .pdf => |*p| try p.pageCount(),
             .slides => |s| s.slides.len,
-            .image => 1,
+            .image, .audio => 1,
         };
     }
     pub fn selected(self: Source, number: usize) bool {
@@ -191,12 +291,10 @@ pub const Source = struct {
                 page.kind = .page;
                 page.coordinate_space = .pdf_points;
                 page.native_text = try a.dupe(u8, analysis.text);
-                const regions = try a.alloc(c.Region, analysis.runs.len);
-                for (regions, analysis.runs, 0..) |*region, run, i| {
-                    const box = run.bounds();
-                    region.* = .{ .id = i, .text = try a.dupe(u8, run.text), .bbox = if (box) |b| .{ b.min_x, b.min_y, b.max_x, b.max_y } else null, .origin = .native };
-                }
-                page.regions = regions;
+                page.regions = try nativePdfRegionsAlloc(a, analysis, limit, control);
+                if (analysis.diagnostics.unaligned_runs > 0 or analysis.diagnostics.unpositioned_spans > 0)
+                    try @import("representation.zig").finding(a, &page, "native_text_alignment_unavailable", true);
+                if (analysis.diagnostics.actual_text_incomplete) try @import("representation.zig").finding(a, &page, "native_actual_text_unavailable", true);
                 if (analysis.has_unrendered_annotations) try @import("representation.zig").finding(a, &page, "pdf_annotation_rendering_unavailable", true);
                 if (analysis.outline_fallback) try @import("representation.zig").finding(a, &page, "native_font_fallback", true);
                 if (analysis.has_nontext_visual) try @import("representation.zig").finding(a, &page, "visual_content_requires_inspection", true);
@@ -223,6 +321,10 @@ pub const Source = struct {
                 // Notes retain their own checked view, separately from visible OCR.
                 if (slide.notes) |notes| page.notes = try notes.text(a);
             },
+            .audio => {
+                page.kind = .audio;
+                page.coordinate_space = .none;
+            },
             .image => {},
         }
         try @import("representation.zig").validatePage(page, limit);
@@ -232,6 +334,7 @@ pub const Source = struct {
         errdefer run.abandonPixels();
         try run.control.check();
         switch (self.parsed) {
+            .audio => return error.DocumentCapabilityMismatch,
             .pdf => |*p| {
                 const request = pdf.PageRenderRequest{ .page_number = number, .max_pixels = run.limits.max_pixels, .max_dimension = @min(run.limits.max_dimension, 4096), .max_output_bytes = run.limits.max_source_bytes };
                 const plan = try pdf.prepareParsedPageRenderPlan(p, request);
@@ -730,4 +833,114 @@ test "document failed rendering abandons pixel grant liveness without refunding 
     try std.testing.expectEqual(@as(u64, 2), record.used.pixels);
     try std.testing.expectEqual(@as(usize, 0), record.pending.len);
     try std.testing.expectEqual(@as(u64, 2), record.uncertain.pixels);
+}
+
+test "document audio source keeps recording identity without fabricated page geometry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try audio.wav.encodeMono(a, &.{ 0, 0 }, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 });
+    const input: Input = .{ .id = "recording", .url = "fixture", .media_type = "audio/wav" };
+    var source = try Source.init(a, input, bytes, .{}, .{});
+    defer source.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try source.pageCount());
+    const unit = try source.analyze(a, 1, .{});
+    try std.testing.expectEqualStrings("recording", unit.source_id);
+    try std.testing.expectEqual(.audio, unit.kind);
+    try std.testing.expectEqual(.none, unit.coordinate_space);
+    try std.testing.expect(unit.regions.len == 0 and unit.raster_to_source == null);
+    var selected = input;
+    selected.pages = &.{1};
+    try std.testing.expectError(error.InvalidDocumentSelection, Source.init(a, selected, bytes, .{}, .{}));
+    try std.testing.expectError(error.DocumentMediaTypeMismatch, Source.init(a, input, @import("antfly_documents").fixtures.get("one-pixel.png"), .{}, .{}));
+    var run = c.Run{ .limits = .{} };
+    defer run.deinit();
+    try std.testing.expectError(error.DocumentCapabilityMismatch, source.render(a, 1, &run));
+}
+
+test "document Ogg container MIME accepts Opus and preserves explicit codec declarations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Source admission sniffs the container header; decoder integrity checks
+    // remain at the bounded audio decoder. No PCM is allocated by admission.
+    const bytes = "OggS" ++ "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++ "OpusHead";
+    for ([_][]const u8{ "audio/ogg", "application/ogg", "audio/ogg;codecs=opus", "audio/ogg; codecs=\"opus\"", "audio/opus" }) |mime| {
+        var source = try Source.init(a, .{ .id = "recording", .url = "fixture", .media_type = mime }, bytes, .{}, .{});
+        defer source.deinit();
+        try std.testing.expect(source.parsed == .audio);
+        try std.testing.expectEqualStrings("audio/opus", source.input.media_type);
+    }
+    for ([_][]const u8{ "audio/vorbis", "audio/wav", "audio/ogg;codecs=vorbis" }) |mime| {
+        try std.testing.expectError(error.DocumentMediaTypeMismatch, Source.init(a, .{ .id = "recording", .url = "fixture", .media_type = mime }, bytes, .{}, .{}));
+    }
+    const declared = try audioInput(a, "data:audio/ogg;codecs=vorbis;base64,T2dnUwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE9wdXNIZWFk");
+    try std.testing.expectEqualStrings("audio/ogg;codecs=vorbis", declared.media_type);
+}
+
+test "document audio MIME case and inline generic types preserve canonical source identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try audio.wav.encodeMono(a, &.{ 0, 0 }, .{ .audio_format = 1, .sample_rate = 16000, .bits_per_sample = 16 });
+    var lower = try Source.init(a, .{ .id = "clip", .url = "fixture", .media_type = "audio/wav" }, bytes, .{}, .{});
+    defer lower.deinit();
+    for ([_][]const u8{ "Audio/Wav", "AUDIO/WAV", "Audio/Wav; charset=binary" }) |mime| {
+        try std.testing.expect(isAudioMediaType(mime));
+        var source = try Source.init(a, .{ .id = "clip", .url = "fixture", .media_type = mime }, bytes, .{}, .{});
+        defer source.deinit();
+        try std.testing.expect(source.parsed == .audio);
+        try std.testing.expectEqualStrings("audio/wav", source.input.media_type);
+        try std.testing.expectEqual(lower.fingerprint, source.fingerprint);
+    }
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    for ([_][]const u8{ "Audio/Wav", "Application/Octet-Stream" }) |mime| {
+        const uri = try std.fmt.allocPrint(a, "data:{s};base64,{s}", .{ mime, encoded });
+        var input = try audioInput(a, uri);
+        if (input.media_type.len == 0) input.media_type = try audioMime(bytes);
+        var source = try Source.init(a, input, bytes, .{}, .{});
+        defer source.deinit();
+        try std.testing.expectEqualStrings("audio/wav", source.input.media_type);
+        try std.testing.expectEqual(lower.fingerprint, source.fingerprint);
+    }
+    try std.testing.expectError(error.UnsupportedInferenceMimeType, audioInput(a, "data:Image/Png;base64,AA=="));
+}
+
+test "document PDF semantic regions retain replacement ordering geometry and limits" {
+    const Check = struct {
+        fn run(a: A) !void {
+            const analysis = pdf.reader.PageTextAnalysis{
+                .text = @constCast("Before Label After Unknown"),
+                .runs = @constCast(&[_]pdf.reader.TextRun{
+                    .{ .text = "before source", .x = 10, .y = 20, .font_size = 10, .advance_width = 20, .ascent = 8, .descent = 2, .output_span = .{ .start = 0, .end = 6 } },
+                    .{ .text = "first glyph", .x = 30, .y = 20, .font_size = 10, .semantic_span_index = 0, .output_span = .{ .start = 7, .end = 12 } },
+                    .{ .text = "second glyph", .x = 40, .y = 20, .font_size = 10, .semantic_span_index = 0, .output_span = .{ .start = 7, .end = 12 } },
+                    .{ .text = "after source", .x = 60, .y = 20, .font_size = 10, .advance_width = 20, .ascent = 8, .descent = 2, .output_span = .{ .start = 13, .end = 18 } },
+                }),
+                .semantic_spans = @constCast(&[_]pdf.reader.SemanticTextSpan{
+                    .{ .text = "Label", .run_start = 1, .run_end = 3, .output_span = .{ .start = 7, .end = 12 }, .output_bounds = .{ .min_x = 30, .min_y = 18, .max_x = 60, .max_y = 28 } },
+                    .{ .text = "Unknown", .run_start = 4, .run_end = 4, .output_span = .{ .start = 19, .end = 26 } },
+                }),
+            };
+            const regions = try nativePdfRegionsAlloc(a, analysis, 4, .{});
+            defer {
+                for (regions) |region| a.free(region.text);
+                a.free(regions);
+            }
+            try std.testing.expectEqual(@as(usize, 4), regions.len);
+            for (regions, [_][]const u8{ "Before", "Label", "After", "Unknown" }, 0..) |region, expected, index| {
+                try std.testing.expectEqualStrings(expected, region.text);
+                try std.testing.expectEqual(index, region.id);
+            }
+            try std.testing.expectEqual(@as(?[4]f64, .{ 30, 18, 60, 28 }), regions[1].bbox);
+            try std.testing.expect(regions[3].bbox == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try std.testing.expectError(error.DocumentRegionLimitExceeded, nativePdfRegionsAlloc(std.testing.allocator, .{
+        .text = @constCast("Label"),
+        .runs = &.{},
+        .semantic_spans = @constCast(&[_]pdf.reader.SemanticTextSpan{.{ .text = "Label", .run_start = 0, .run_end = 0, .output_span = .{ .start = 0, .end = 5 } }}),
+    }, 0, .{}));
 }

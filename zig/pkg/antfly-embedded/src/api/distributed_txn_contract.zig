@@ -57,9 +57,14 @@ pub const TxnStatusRequest = struct {
 };
 
 pub const TableCommitRequest = struct {
+    commit_requires: ?db_types.CommitRequires = null,
+    /// Coordinator planning context, retained until cascade expansion finishes.
+    /// A participant's explicit prerequisite always overrides this default.
+    default_commit_requires: ?db_types.CommitRequires = null,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
+    normalized_graph_rows: bool = false,
     range_guards: []const @import("range_read_guards.zig").OwnerRangeProof = &.{},
     schema_version: ?u32 = null,
     table_name: []const u8,
@@ -71,6 +76,8 @@ pub const TableCommitRequest = struct {
     writes: []const db_types.TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const db_types.DocumentTransform = &.{},
+    graph_writes: []const db_types.GraphEdgeWrite = &.{},
+    graph_deletes: []const db_types.GraphEdgeDelete = &.{},
     predicates: []const db_types.TransactionVersionPredicate = &.{},
     integrity: []const db_types.TransactionIntegrityOperation = &.{},
     integrity_commands: []const @import("../storage/db/relational_integrity_contract.zig").Command = &.{},

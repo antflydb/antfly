@@ -190,3 +190,11 @@ test "query embedding cache keys isolate security domains" {
 test "model aware media retained text pins its producing revision through managed execution" {
     try managed_embedder.testRetainedTextGenerationLease();
 }
+
+test "managed embedder grouped HTTP transports preserve order attachments and cardinality" {
+    try local.testGroupedEmbeddingHttpTransports();
+}
+
+test "managed embedder grouped singleton preserves unimodal HTTP compatibility" {
+    try local.testGroupedEmbeddingSingleton();
+}

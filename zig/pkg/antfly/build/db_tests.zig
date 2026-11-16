@@ -16,6 +16,7 @@
 const std = @import("std");
 const addRuntimeTestFilters = @import("../../../build_support/antfly/test_support.zig").addRuntimeTestFilters;
 const compileFiltersWithAnchors = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors;
+const addFilteredTestRunArtifactWithRuntimeFilters = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters;
 const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifact;
 const addCuratedTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact;
 const selectTestFilters = @import("../../../build_support/antfly/test_support.zig").selectTestFilters;
@@ -31,6 +32,26 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const native_query_maintenance_filters = [_][]const u8{
+        "db native checkpoint warming",
+        "db native checkpoint discovery",
+        "db idle dense query captures",
+        "external lake native warming",
+        "source vector payloads debt policy bounds background deferral",
+        "source vector payloads background verification defers small copies",
+        "source pin cleanup supervisor preserves bounded backoff",
+        "sparse background compaction retires fully deleted inputs",
+        "text merge scheduler completion cannot retire a superseding task",
+    };
+    const native_query_maintenance_tests = b.addTest(.{
+        .name = "native-query-maintenance-tests",
+        .root_module = antfly_test_mod,
+        .filters = &native_query_maintenance_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-storage-native-query-maintenance-test", "Run idle native query capture and warming regressions")
+        .dependOn(&addCuratedTestRunArtifact(b, native_query_maintenance_tests, &native_query_maintenance_filters).step);
     const row_preparation_filters = [_][]const u8{
         "prepared relational",
         "relational durable preparation",
@@ -63,6 +84,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addCuratedTestRunArtifact(b, producer_receipt_tests, &producer_receipt_filters).step);
     const relationship_identity_filters = [_][]const u8{
         "db graph endpoint cleanup pages",
+        "db graph endpoint cleanup transaction graph effects",
+        "db graph endpoint cleanup graph-only prepares reserve source ranges across reopen",
+        "db external lake rejects native mutations before and after cold reopen",
         "derived worker pause",
         "graph endpoint cleanup byte admission",
         "bulk append index",
@@ -85,7 +109,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "graph maintenance prune retires private ttl state",
         "graph split prune preserves a retained owner",
         "graph document clear",
-        "portable graph retirements are primary and require reader version four",
+        "portable backup graph retirements are primary and require reader version four",
         "graph relationship bulk ingestion preserves direct append and retirement",
         "docstore relational bulk appends retain direct ingest and atomic dirty tokens",
         "docstore backend adapters expose txn cursor and batch operations",
@@ -102,7 +126,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "graph pattern path conversion releases partial relationship allocations",
         "graph replay truncated relationship fields release all allocations",
         "db algebraic path conversion preserves provenance under allocation failures",
-        "portable relationships preserve parallel identities and arbitrary endpoints",
+        "portable backup relationships preserve parallel identities and arbitrary endpoints",
         "relationship predicate roots reject every nonobject JSON type",
         "db graph stale generation cleanup retires the exact fact identity",
         "db graph fact documents project arbitrary endpoints and retain parallel facts",
@@ -148,7 +172,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, retirement_tests).step);
     const ordered_artifact_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "ordered artifact inventory", "storage.db.derived.apply_state", "artifact footprint", "artifact publication upload", "artifact publication compact transport", "db derived coverage snapshot", "db dense target reads atomic outcome and source coverage snapshot", "db dense target reads atomic artifact and source coverage snapshot", "online admission facts are unbound", "native source admission", "api module compiles", "metadata module compiles", "db lookup includes chunk artifacts", "db search includes chunk artifacts", "db scan includes chunk artifacts", "db lookup does not load chunks", "db lookup loads chunks" },
+        .filters = &.{ "document extraction metadata fingerprint", "document extraction v5 fingerprint", "document extraction checksum", "document extraction rejects a malformed digest", "document extraction verified fingerprints", "document extraction fingerprint binds", "shared PDF enrollment skips completed metadata", "ordered artifact inventory", "storage.db.derived.apply_state", "artifact footprint", "artifact publication upload", "artifact publication compact transport", "db derived coverage snapshot", "db dense target reads atomic outcome and source coverage snapshot", "db dense target reads atomic artifact and source coverage snapshot", "online admission facts are unbound", "native source admission", "api module compiles", "metadata module compiles", "db lookup includes chunk artifacts", "db search includes chunk artifacts", "db scan includes chunk artifacts", "db lookup does not load chunks", "db lookup loads chunks" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-ordered-artifact-test", "Run ordered artifact inventory, wire, and durable owner regressions")
@@ -165,11 +189,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
-    const db_enrichment_filters: []const []const u8 = &.{
+    const db_enrichment_filters: []const []const u8 = selectTestFilters(b, &.{
         "#1210",
+        "relational prepared writes validate orphan vector receipts",
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
         "db public extraction budget rejection publishes a failure manifest",
         "db document extraction manifest inspection and reprocess API",
+        "db artifact manifest list",
         "db generic artifact repair queue",
         "db successful asset publication clears terminal debt",
         "db artifact repair kind",
@@ -199,7 +225,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db retryable chunked producer does not block independent dense publication",
         "storage.db.db.test.db retryable asset producer batches do not block independent dense publication",
         "storage.db.db.test.db asset consumes another asset artifact and re-derives on upstream change",
+        "db mixed extraction batches retain document checkpoint ownership in either order",
         "storage.db.db.test.db asset consuming asset validates upstream references at admission",
+        "generic scalar chunks reject stale upstream and fence publication",
         "asset preparation is lazy and byte bounded across retryable provider batches",
         "asset planning groups interleaved providers",
         "asset producer neighbor context samples local graph adjacency into the input and skip state",
@@ -208,6 +236,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.neighbor_context.test.neighbor context config enforces bounds and closed fields",
         "storage.db.enrichment.neighbor_context.test.neighbor block renders deterministically and honors the limit",
         "shared PDF",
+        "normalized local admission refusal is exempt but normalized provider transient failure is not",
+        "a dense or media embedder refusing admission after adapter normalization never spends the document retry budget",
+        "a real embedding provider transient failure still spends the document retry budget",
         "storage.db.db.test.db io_threaded executor processes indexed writes",
         "storage.db.db.test.db reopen replays pending derived embeddings",
         "storage.db.db.test.db replay respects per-index applied watermarks",
@@ -225,6 +256,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "request-owned retries do not inherit unrelated pipeline debt",
         "idle generated coverage gap becomes durable paged recovery debt",
         "durable enrichment retry progress preserves unrelated request debt across restart",
+        "durable enrichment server retry deadline survives restart without early execution",
+        "durable enrichment scoped retry",
+        "scoped retry workset",
+        "db scoped retry workset",
+        "model aware media URL fields",
+        "provider retry guidance preserves server minimum beyond bounded worker backoff",
+        "OCR retryability counts failures beyond the diagnostic sample",
         "ordinary startup target preserves restored retry debt",
         "enrichment terminal failure envelope remains conservative across sparse durable debt",
         "enrichment terminal failure envelope uses exact durable lookup for sparse gaps",
@@ -233,6 +271,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "enrichment runtime status",
         "enrichment runtime restore",
         "worker retry preserves only an explicitly authorized request identity",
+        "admission refusals retry past worker_retry_max_attempts without parking",
+        "admission refusal on the final allowed attempt still yields",
+        "shouldYieldRequestErrorFor applies the same admission exemption as the active identity check",
+        "worker loop retry recheck applies the same admission exemption as the inline check",
+        "the admission-wait budget is bounded so a permanently refused request eventually parks",
         "permanent remote HTTP failure cannot authorize request retry identity",
         "enrichment visibility wait wakes immediately on applied state",
         "enrichment visibility wait has a hard liveness timeout",
@@ -249,7 +292,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "PDF scratch growth distinguishes",
         "PDF partial scratch grants yield contention",
         "PDF composite lease admits two future overlap windows atomically",
+        "document preparation",
         "prepared document source cache isolates credentials and reuses bytes",
+        "prepared document source cache accounts retained bytes through eviction",
         "prepared document cache single-flights concurrent PDF variants and drains leases",
         "document unit spool admits replay memory before opening a read transaction",
         "document publication spool reads ordered segments with one transaction",
@@ -263,12 +308,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "retained document collection allocations compose with the hard working-set cap",
         "document replay payloads are admitted before persistent allocation",
         "document extraction accepts validated reader no-text results without hiding invalid output",
+        "native text routes independently of OCR output thresholds and counts Unicode characters",
+        "document extraction OCR selection keeps independent native quality",
         "document extraction generated OCR rejects empty punctuation and prompt echoes on empty pages",
         "document extraction generated OCR preserves short scan text and quality warnings transactionally",
         "document extraction generated OCR bypasses unsupported native batch",
         "document extraction generated OCR rejects malformed envelopes before apply",
         "document extraction generated OCR applies unit updates transactionally",
         "document extraction generated OCR retries only uniformly admission denied batches",
+        "document extraction missing model and truncated OCR are actionable terminal unit failures",
         "asset batch fallback isolates malformed envelope and preserves typed mixed results",
         "asset batch fallback keeps the logical request retry budget",
         "document-wide OCR resource failure preserves units and marks pending pages",
@@ -281,6 +329,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "generated media staging follows pending work",
         "generated text provider config is validated while parsing extraction config",
         "PDF text regions use reconstructed output spans",
+        "native text diagnostics distinguish extraction completion and semantic coverage",
+        "native text neutral provenance owns nested JSON through allocation failure",
+        "document extraction parses independent native text policy and quality",
+        "document extraction client clone owns native metadata arrays",
+        "ordered artifact inventory typed unit payload",
         "public enrichment validation rejects invalid execution and producer config",
         "transcriber shorthand expands to a document extraction producer",
         "enrichment runtime document extraction manifest uses v2 range and merge shape",
@@ -292,6 +345,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "document unit fingerprint distinguishes absent and empty optional fields",
         "document unit fingerprint state version rejects legacy encodings",
         "document unit fingerprint folds transcript spans in only when present",
+        "document unit fingerprint includes native quality diagnostics region style and blocks",
         "transcript spans locate provider segments inside the joined transcript",
         "transcript timing stamps chunks with the phrases they overlap",
         "diarized phrases carry their speaker into spans and chunks",
@@ -302,6 +356,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "recordings in video containers take the transcription route",
         "transcript spans split a timed phrase at sentence ends using its words",
         "db canonical hierarchy traversal rejects typed retrieval controls",
+        "leann synchronous document provenance pins revisions and tolerates inference float variation",
+        "db paper evaluation",
+        "db document extraction pins provider generation across batches rows and final preparation",
+        "db templated dense artifact reuse follows the resolved model revision",
+        "db templated dense backfill batches rendered text and preserves media",
+        "db templated dense retry preserves document debt and independent text progress",
+        "db templated dense routes preserve backfill and reembedding semantics",
+        "db templated dense batches respect provider item ceilings",
+        "dense text batch boundary preserves limits order cancellation and allocation cleanup",
+        "dense text planning retains metadata-only custom provider compatibility",
+        "commit requirements dense text rejects revision-bearing legacy execution before dispatch",
+        "commit requirements dense grouped parts require and consume the captured lease",
+        "commit requirements dense text batches reject a deployment after inference",
+        "dense text metadata checks cancellation before and after its snapshot",
+        "dense capability snapshots prefer controlled leases over legacy discovery",
+        "dense text planning rejects expired requests before discovery",
+        "dense text planning forwards request control to capability discovery",
+        "dense lane publication failure stops later work and retains pipeline provenance",
+        "enrichment preserves snapshot failures instead of skipping source content",
+        "extractSourceText with template and invalid JSON returns null",
+        "db transient remote source failures resume after restart without repair",
         "db document unit payload preserves pdf page provenance",
         "db document extraction asset materializes unit artifacts from data url",
         "db document extraction chunks units through source artifact enrichment",
@@ -331,6 +406,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db asset producer enrichments batch compatible generated assets",
         "storage.db.db.test.db asset producer enrichments execute fake providers and skip unchanged state",
         "storage.db.db.test.db async replay truncation retains journal behind generated enrichment",
+        "storage.db.db.test.db chunked dense fault injection waits for checkpoint writer",
+        "storage.db.db.test.db chunked dense target rebuild waits for checkpoint writer",
         "storage.db.db.test.db chunked dense enrichment replays cached artifacts after dense reset without re-embedding",
         "storage.db.db.test.db chunked dense enrichment retries temporary model capacity without terminal coverage",
         "storage.db.db.test.db chunked dense enrichment skips unchanged chunks and deletes stale chunk artifacts",
@@ -339,6 +416,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db deferred generated coverage remains pending until the enrichment worker decides an outcome",
         "storage.db.db.test.db deleteEnrichment rejects asset referenced by chunk enrichment",
         "storage.db.db.test.db dense enrichment republishes unchanged source hash from cached artifact after index reset",
+        "storage.db.db.test.db dense enrichment skips unchanged multimodal parts",
         "storage.db.db.test.db dense enrichment skips unchanged source hash",
         "storage.db.db.test.db encodeThinReplayRecordPayload marks generated enrichment replay for async writes",
         "storage.db.db.test.db enrichment artifact consumer resolution includes graph and default full text indexes",
@@ -348,6 +426,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db enrichment repair never clears a newer failure revision",
         "storage.db.db.test.db enrichment restart supervisor recovers transient start failures",
         "storage.db.db.test.db enrichment status changes notify query visibility hook",
+        "storage.db.db.test.db enrichment status changes notify only after atomic publication",
+        "storage.db.db.test.db enrichment status changes notify after discarding corrupt optional cursors",
         "storage.db.db.test.db enrichment status does not wait for lifecycle mutation",
         "storage.db.db.test.db enrichments precomputed watermark advances across replay entries without enrichment debt",
         "storage.db.db.test.db enrichments precomputes generated enrichments into the committed batch",
@@ -385,6 +465,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db runtime-only status overlay preserves a resident enrichment worker",
         "storage.db.db.test.db shared enrichment failure parks repair debt for every consumer",
         "storage.db.db.test.db shared enrichment repair regenerates one physical artifact once",
+        "storage.db.db.test.db generated enrichment recovery skips empty fields and advances coverage across reopen",
         "storage.db.db.test.db sparse enrichment skips unchanged source hash",
         "storage.db.db.test.db terminal enrichment markers do not resurrect across rollback recreation",
         "storage.db.db.test.db terminal enrichment sequence index survives coalescing and retires with repair debt",
@@ -415,6 +496,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "parallel dense inference preserves order",
         "forced dense generations recompute cached vectors",
         "storage.db.enrichment.enrichment_runtime.test.enrichment extractSourceText with template error directive fails instead of returning text",
+        "storage.db.enrichment.enrichment_runtime.test.enrichment extractSourceText empty fields and templates share no output while preserving whitespace",
         "storage.db.enrichment.enrichment_runtime.test.enrichment foreground catch up reconciles retry state after checkpoint apply",
         "storage.db.enrichment.enrichment_runtime.test.enrichment generated preparation window bounds time to first publication",
         "storage.db.enrichment.enrichment_runtime.test.enrichment remote render config preserves runtime execution context",
@@ -432,6 +514,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.enrichment_state.test.enrichment apply state works with memory backend store",
         "storage.db.enrichment.enrichment_state.test.enrichment projection checkpoint persists status and identity fields",
         "storage.db.enrichment.enrichment_state.test.enrichment projection checkpoint rejects malformed structured state",
+        "storage.db.enrichment.enrichment_state.test.enrichment status publication keeps progress advanced before write admission",
         "storage.db.enrichment.enrichment_state.test.enrichment replay cursor rejects corruption",
         "storage.db.enrichment.enrichment_state.test.enrichment replay cursor round trips and clears independently",
         "storage.db.enrichment.enrichment_state.test.enrichment state lsm point loads do not clone mutable snapshot",
@@ -485,6 +568,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "request-owned retries do not inherit unrelated pipeline debt",
         "idle generated coverage gap becomes durable paged recovery debt",
         "durable enrichment retry progress preserves unrelated request debt across restart",
+        "durable enrichment server retry deadline survives restart without early execution",
+        "durable enrichment scoped retry",
+        "scoped retry workset",
+        "db scoped retry workset",
+        "model aware media URL fields",
+        "provider retry guidance preserves server minimum beyond bounded worker backoff",
+        "OCR retryability counts failures beyond the diagnostic sample",
         "ordinary startup target preserves restored retry debt",
         "enrichment terminal failure envelope remains conservative across sparse durable debt",
         "enrichment terminal failure envelope uses exact durable lookup for sparse gaps",
@@ -493,6 +583,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "enrichment runtime status",
         "enrichment runtime restore",
         "worker retry preserves only an explicitly authorized request identity",
+        "admission refusals retry past worker_retry_max_attempts without parking",
+        "admission refusal on the final allowed attempt still yields",
+        "shouldYieldRequestErrorFor applies the same admission exemption as the active identity check",
+        "worker loop retry recheck applies the same admission exemption as the inline check",
+        "the admission-wait budget is bounded so a permanently refused request eventually parks",
         "permanent remote HTTP failure cannot authorize request retry identity",
         "enrichment visibility wait wakes immediately on applied state",
         "enrichment visibility wait has a hard liveness timeout",
@@ -518,6 +613,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "PDF render deadline installs an active monotonic cancellation probe",
         "generated text provider config is validated while parsing extraction config",
         "PDF text regions use reconstructed output spans",
+        "native text diagnostics distinguish extraction completion and semantic coverage",
+        "native text neutral provenance owns nested JSON through allocation failure",
+        "document extraction parses independent native text policy and quality",
+        "document extraction client clone owns native metadata arrays",
+        "ordered artifact inventory typed unit payload",
         "public enrichment validation rejects invalid execution and producer config",
         "transcriber shorthand expands to a document extraction producer",
         "enrichment runtime document extraction manifest uses v2 range and merge shape",
@@ -529,6 +629,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "document unit fingerprint distinguishes absent and empty optional fields",
         "document unit fingerprint state version rejects legacy encodings",
         "document unit fingerprint folds transcript spans in only when present",
+        "document unit fingerprint includes native quality diagnostics region style and blocks",
         "transcript spans locate provider segments inside the joined transcript",
         "transcript timing stamps chunks with the phrases they overlap",
         "diarized phrases carry their speaker into spans and chunks",
@@ -539,6 +640,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "recordings in video containers take the transcription route",
         "transcript spans split a timed phrase at sentence ends using its words",
         "db canonical hierarchy traversal rejects typed retrieval controls",
+        "leann synchronous document provenance pins revisions and tolerates inference float variation",
+        "db paper evaluation",
+        "db document extraction pins provider generation across batches rows and final preparation",
+        "db templated dense artifact reuse follows the resolved model revision",
+        "db templated dense backfill batches rendered text and preserves media",
+        "db templated dense retry preserves document debt and independent text progress",
+        "db templated dense routes preserve backfill and reembedding semantics",
+        "db templated dense batches respect provider item ceilings",
+        "dense text batch boundary preserves limits order cancellation and allocation cleanup",
+        "dense text planning retains metadata-only custom provider compatibility",
+        "commit requirements dense text rejects revision-bearing legacy execution before dispatch",
+        "commit requirements dense grouped parts require and consume the captured lease",
+        "commit requirements dense text batches reject a deployment after inference",
+        "dense text metadata checks cancellation before and after its snapshot",
+        "dense capability snapshots prefer controlled leases over legacy discovery",
+        "dense text planning rejects expired requests before discovery",
+        "dense text planning forwards request control to capability discovery",
+        "dense lane publication failure stops later work and retains pipeline provenance",
+        "enrichment preserves snapshot failures instead of skipping source content",
+        "extractSourceText with template and invalid JSON returns null",
+        "db transient remote source failures resume after restart without repair",
         "db document unit payload preserves pdf page provenance",
         "db document extraction asset materializes unit artifacts from data url",
         "db document extraction chunks units through source artifact enrichment",
@@ -567,7 +689,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db dense index consuming a chunk-then-embed source via plural sources config converges its target counter",
         "runUntilIdle no-progress guard fails fast with a named stuck-index diagnostic",
         "target advance stuck tracking records first-seen time and clears on success",
-    };
+    });
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, db_enrichment_filters),
@@ -757,9 +879,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_db_text_query_step = b.step("antfly-storage-db-text-query-test", "Run focused full-text query guardrail tests");
     lib_db_text_query_step.dependOn(&run_lib_db_text_query_tests.step);
 
+    const native_artifact_stream_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "native asset members hydrate source authority and revision identity", "native unit ancestry uses its configured producer name", "native member logical filters use parent values and shared verification budgets", "missing modality producers and transcription failures remain incomplete" },
+    });
+    b.step("antfly-native-artifact-stream-test", "Test native asset provenance and configurable unit ancestry").dependOn(&b.addRunArtifact(native_artifact_stream_tests).step);
     const lib_db_result_shape_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{
+            "externalizeSearchResultArtifactIds",
+            "native asset members hydrate source authority and revision identity",
+            "native unit ancestry uses its configured producer name",
+            "native member logical filters use parent values and shared verification budgets",
+            "missing modality producers and transcription failures remain incomplete",
             "dedupeSearchHitsById uses ordinals when hit page is complete",
             "exact-id dedupe preserves distinct chunks sharing a parent ordinal",
             "applyStoredSearchPatternFilters reports lower-bound total for filtered page window",
@@ -809,6 +941,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_lib_db_result_shape_tests = addFilteredTestRunArtifact(b, lib_db_result_shape_tests);
     lib_db_query_step.dependOn(&run_lib_db_result_shape_tests.step);
+    const alias_provenance_run = addFilteredTestRunArtifactWithRuntimeFilters(b, lib_db_result_shape_tests, &.{"externalizeSearchResultArtifactIds"});
+    b.step("antfly-index-alias-provenance-test", "Verify repeated member identity conversion and allocation cleanup")
+        .dependOn(&alias_provenance_run.step);
 
     const lib_db_reopen_tests = b.addTest(.{
         .root_module = antfly_test_mod,

@@ -1,0 +1,96 @@
+{
+  "name": "antfly-mail-app",
+  "main": "mail-worker-entry.mjs",
+  "compatibility_date": "2026-10-23",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": true,
+  "rules": [
+    {
+      "type": "CompiledWasm",
+      "globs": [
+        "**/*.wasm"
+      ],
+      "fallthrough": true
+    }
+  ],
+  "version_metadata": {
+    "binding": "WORKER_VERSION"
+  },
+  "vars": {
+    "AUTH_ORIGIN": "https://mail.example.com",
+    "MAIL_DOMAIN": "example.com",
+    "AUTH_STORAGE_ID": "example-mail-auth-v1"
+  },
+  "send_email": [
+    {
+      "name": "EMAIL"
+    }
+  ],
+  "limits": {
+    "cpu_ms": 30000
+  },
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  },
+  "observability": {
+    "enabled": false
+  },
+  "r2_buckets": [
+    {
+      "binding": "DATABASE",
+      "bucket_name": "antfly-mail-database"
+    },
+    {
+      "binding": "MAIL_OBJECTS",
+      "bucket_name": "antfly-mail-objects"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MAILBOXES",
+        "class_name": "Mailbox"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "Mailbox"
+      ]
+    }
+  ],
+  "services": [
+    {
+      "binding": "AUTH_SERVICE",
+      "service": "antfly-mail-auth"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "MAIL_QUEUE",
+        "queue": "antfly-mail"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "antfly-mail",
+        "max_concurrency": 2,
+        "max_batch_size": 1,
+        "dead_letter_queue": "antfly-mail-dead"
+      }
+    ]
+  },
+  "assets": {
+    "directory": "./mail-public",
+    "binding": "MAIL_ASSETS",
+    "run_worker_first": true,
+    "not_found_handling": "single-page-application"
+  }
+}

@@ -111,7 +111,7 @@ pub const Worker = struct {
     pub fn sourceStep(self: *Worker, a: A, ports: Ports, definition: Definition) !void {
         const activated = try query(bool, a, ports, definition.route.value, contract.Query{ .action = .activation, .artifact = definition.artifact, .definition = definition.definition });
         if (!activated) {
-            try ports.submit_fn(ports.ptr, .{ .action = .activate, .artifact = definition.artifact, .definition = definition.definition, .namespace = definition.namespace, .backfill = .{ .route = definition.route } });
+            try ports.submit_fn(ports.ptr, .{ .action = .activate_catalog, .artifact = definition.artifact, .definition = definition.definition, .namespace = definition.namespace, .backfill = .{ .route = definition.route } });
             return;
         }
         if (definition.retirement) {
@@ -246,17 +246,24 @@ test "group worker resumes durable activation and yields when queues are empty" 
     const a = arena.allocator();
     const Fixture = struct {
         phase: baseline.Phase = .scan,
+        activated: bool = false,
         commands: usize = 0,
         fn query(ptr: *anyopaque, alloc: A, _: []const u8, raw: []const u8) ![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
-            if (std.mem.eql(u8, value.object.get("action").?.string, "activation")) return alloc.dupe(u8, "true");
+            if (std.mem.eql(u8, value.object.get("action").?.string, "activation")) return alloc.dupe(u8, if (self.activated) "true" else "false");
             if (std.mem.eql(u8, value.object.get("action").?.string, "backfill_page")) return std.json.Stringify.valueAlloc(alloc, @import("group_source_page.zig").Page{ .generation = 1, .phase = .scan, .cursor = "durable-cursor", .next = "", .done = true, .candidates = &.{} }, .{});
             if (std.mem.eql(u8, value.object.get("action").?.string, "backfill")) return std.json.Stringify.valueAlloc(alloc, baseline.Progress{ .generation = 1, .phase = self.phase, .cursor = "durable-cursor" }, .{});
             return std.json.Stringify.valueAlloc(alloc, reads.PointerPage{ .rows = &.{}, .cursor = "", .done = true }, .{});
         }
         fn submit(ptr: *anyopaque, command: contract.Command) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.activated) {
+                try std.testing.expectEqual(contract.Action.activate_catalog, command.action);
+                self.activated = true;
+                self.commands += 1;
+                return;
+            }
             try std.testing.expectEqual(contract.Action.backfill, command.action);
             try std.testing.expectEqualStrings("durable-cursor", command.backfill.?.cursor);
             self.commands += 1;
@@ -276,8 +283,9 @@ test "group worker resumes durable activation and yields when queues are empty" 
     defer worker.deinit();
     try worker.sourceStep(a, ports, definition);
     try worker.sourceStep(a, ports, definition);
+    try worker.sourceStep(a, ports, definition);
     try worker.groupStep(a, ports, definition, 100);
-    try std.testing.expectEqual(@as(usize, 1), fixture.commands);
+    try std.testing.expectEqual(@as(usize, 2), fixture.commands);
 }
 
 test "group worker consumes a new lease before yielding a slow namespace round" {

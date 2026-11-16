@@ -22,7 +22,9 @@ class PatternStep:
 
     Attributes:
         alias (str | Unset):
-        node_filter (NodeFilter | Unset): Filter nodes during graph traversal using existing query primitives
+        node_filter (NodeFilter | Unset): Admission predicate applied to every start, target and intermediate node
+            before returning or expanding it, for all graph operations. Denied nodes cannot occur in result paths or expose
+            descendants through traversal.
         edge (PatternEdgeStep | Unset): Deprecated linear graph_searches pattern edge.
     """
 

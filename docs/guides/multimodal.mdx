@@ -1,33 +1,35 @@
 ---
 title: Multimodal Embeddings
-description: Index and search images, audio, and documents with executable Antfly workflows
+description: Index and search images, audio, and video with native multimodal embeddings, precomputed descriptions, or your own vectors
 prerequisites:
   - Antfly installed and running
-  - Antfly Inference with the ClipClap model for native image or audio embeddings
+  - Antfly Inference with EmbeddingGemma 2 for native image, audio, or video embeddings
 difficulty: intermediate
 estimatedTime: "20 min"
-tags: [multimodal, images, pdf, embeddings]
-sidebar: concepts
-order: 6
+tags: [multimodal, images, audio, video, embeddings]
+sidebar: ingest
+order: 2
 ---
 
 <Questions>
 - How do I index images in Antfly?
-- How do I search by image or audio?
+- How do I search by image, audio, or video?
 - When should I preprocess media into text?
-- How do I index PDFs durably?
+- How do I index PDFs and scanned documents?
 - Which embedding providers can maintain an index?
 </Questions>
 
-Antfly indexes images, audio, and documents in one of three shapes, and the choice decides what runs at write time, what is stored durably, and which providers can maintain the index. ClipClap, the native model, puts text, images, and audio in one vector space, so a plain-language query can return a picture and a picture can return its neighbors.
+Antfly indexes images, audio, and video in one of three shapes, and the choice decides what runs at write time, what is stored durably, and which providers can maintain the index. EmbeddingGemma 2, the default embedder, puts text, images, audio, and video in one vector space, so a plain-language query can return a picture or a sound, and a picture can return its neighbors.
 
 ## Choose the Ingestion Shape
 
 Antfly supports three explicit multimodal workflows:
 
 1. **Native multimodal embeddings** use the `antfly` index provider with a
-   locally installed model such as `antflydb/clipclap`. A template turns a URL
+   locally installed model such as EmbeddingGemma 2. A template turns a URL
    into a media part with `remoteMedia`, and the model embeds that part directly.
+   Recordings and video go through a chunk enrichment that cuts the source into
+   windows and embeds each one.
 2. **Application-managed descriptions** run OCR, captioning, or transcription
    before the write. Store the resulting text in a document field and use any
    managed text embedder supported for index creation. For recordings, the
@@ -43,16 +45,24 @@ call on every write and makes retries, cost, and durable intermediate output
 observable. It also prevents an index configuration from parsing successfully
 and failing only after ingestion starts.
 
-## Native Image and Audio Embeddings
+## Native Image, Audio, and Video Embeddings
 
-ClipClap embeds text, images, and audio into one vector space. Install it once:
+[EmbeddingGemma 2](/docs/guides/models/embeddinggemma2) embeds text, images,
+audio, and video into one vector space. Install it once:
 
 ```bash
-antfly inference pull antflydb/clipclap:gguf:Q4_K
+antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
 ```
 
 The running service discovers the newly installed model on its next model-list
 or inference request; no restart is needed.
+
+Vectors have 768 dimensions by default. The model is Matryoshka-trained, so
+`/ai/v1/embed` can also return 512, 256, or 128 dimensions through its
+`dimensions` field when storage matters more than the last bit of recall. The
+model also takes a task type: Antfly embeds index writes as
+`RETRIEVAL_DOCUMENT` and search inputs as `RETRIEVAL_QUERY`, so an index needs
+no setting for either role.
 
 Antfly learns which inputs a model accepts from its capabilities, which Antfly
 inference publishes for every model it serves, so the index needs no extra
@@ -68,9 +78,11 @@ declare them on the embedder:
 }
 ```
 
-`inputs` replaces the discovered input types. Only the `antfly` (`image`,
-`audio`) and `bedrock` (`image`) providers accept media inputs; other providers
-reject them instead of silently dropping media.
+`inputs` replaces the discovered input types and takes `text`, `image`, and
+`audio`. Only the `antfly` (`image`, `audio`) and `bedrock` (`image`) providers
+accept media inputs; other providers reject them instead of silently dropping
+media. Video reaches EmbeddingGemma 2 through `/ai/v1/embed` and chunk
+enrichment, covered in [Embed Video](#embed-video) below.
 
 ### Define the Source Field
 
@@ -108,15 +120,18 @@ antfly index create --table product_catalog \
   --template '{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}' \
   --embedder '{
     "provider": "antfly",
-    "model": "antflydb/clipclap"
+    "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
   }' \
   --distance-metric cosine
 ```
 
 `partial` treats documents without an image as intentional skips while still
 requiring every source document to reach a durable outcome. Antfly probes the
-model during index creation and records its dimension, so omit `dimension`
-unless you want creation to verify an expected value.
+model during index creation and records its dimension (768 for EmbeddingGemma
+2), so omit `dimension` unless you want creation to verify an expected value.
+To guard against a silent model change, copy the `model_identity` hash from an
+`/ai/v1/embed` response into the embedder config; see
+[Pin the model in an index](/docs/guides/models/embeddinggemma2#pin-the-model-in-an-index).
 
 For remote URLs, configure `remote_content` with the narrowest required host or
 object-store allowlist. An omitted allowlist leaves template fetches
@@ -135,8 +150,8 @@ antfly index wait --table product_catalog \
 
 ### Search with Text
 
-Because ClipClap shares a vector space across modalities, ordinary text can
-retrieve matching images:
+Because EmbeddingGemma 2 shares a vector space across modalities, ordinary text
+can retrieve matching images:
 
 ```bash
 antfly query --table product_catalog \
@@ -166,6 +181,61 @@ curl -X POST http://127.0.0.1:8080/db/v1/query \
 
 For an inline data URI, use `{{media url=this}}` instead. Avoid logging or
 persisting large data URIs in query histories.
+
+### Search Audio with Text
+
+Audio goes through the same template and the same model. An index over a
+`clip_url` field holds sound clips in the vector space the text queries use:
+
+```bash
+antfly index create --table sound_library \
+  --index sound_search \
+  --type embeddings \
+  --coverage-policy partial \
+  --template '{{#if clip_url}}{{remoteMedia url=clip_url}}{{/if}}' \
+  --embedder '{
+    "provider": "antfly",
+    "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
+  }' \
+  --distance-metric cosine
+```
+
+A description of the sound finds it:
+
+```bash
+antfly query --table sound_library \
+  --semantic-search "rain on a tin roof" \
+  --indexes sound_search \
+  --fields "title,clip_url" \
+  --limit 10
+```
+
+An audio clip can be the query too: send its URL with
+`"embedding_template": "{{remoteMedia url=this}}"`, as in the image example
+above, and an index that mixes photos and recordings returns both. For spoken
+content where the words matter more than the sound, transcribe it instead; see
+[Index Recorded Calls and Podcasts](/docs/guides/transcription).
+
+### Embed Video
+
+EmbeddingGemma 2 embeds MP4, MOV, and WebM video as a `media` part, sampled at
+1 FPS up to 32 frames. A request to `/ai/v1/embed` returns one vector for the
+clip, in the same space as the text, image, and audio vectors:
+
+```json
+{
+  "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1",
+  "input": [
+    {"content": [{"type": "media", "mime_type": "video/mp4", "data": "<base64 MP4>"}]}
+  ]
+}
+```
+
+To index long recordings, declare a chunk enrichment with EmbeddingGemma 2 as
+its boundary model. Antfly cuts the source into windows, embeds each window,
+and can transcribe the same windows in the same pass. [Resumable Media
+Enrichment](/docs/guides/media-pass) has the configuration. CUDA video
+decoding needs Linux NVDEC and an H.264 MP4 of at most 60 seconds.
 
 ### Rerank with Images
 
@@ -253,37 +323,13 @@ model revisions in one index.
 Managed index creation accepts `antfly`, `ollama`, `openai`, `openrouter`,
 `cohere`, `gemini`, `vertex`, and `bedrock`.
 
-## Durable PDF Ingestion
+## Documents and Scans
 
-Template helpers are request-time transformations; they do not persist PDF
-pages or make OCR output independently reprocessable. Use a
-`document_extraction` asset producer for durable document ingestion:
-
-```json
-{
-  "name": "document_units_v1",
-  "kind": "asset",
-  "field": "url",
-  "content_type": "application/json",
-  "producer_json": "{\"type\":\"document_extraction\",\"config\":{}}"
-}
-```
-
-The built-in parser targets unencrypted, born-digital PDFs. Pages with no native
-text use the local `antflydb/Florence-2-base` reader by default. Install it with:
-
-```bash
-antfly inference pull antflydb/Florence-2-base
-```
-
-If the model is absent, the page records a failed OCR outcome instead of
-silently disappearing. Install the model and explicitly reprocess the artifact
-to retry. Set `ocr_fallback` to `false` or `ocr.enabled` to `false` to disable
-OCR. For formats outside the built-in parser, use the
-[docsaf example](https://github.com/antflydb/antfly/tree/main/examples/docsaf).
-
-`remotePDF` remains a compatibility helper for template-time extraction, but it
-is deprecated. Prefer durable extraction for production workflows.
+To index PDFs, Office documents, scanned pages, and photos of documents as
+text, use a `document_extraction` enrichment, which extracts native text and
+reads the rest with OCR. [Index PDFs and Scanned Documents](/docs/guides/index-documents)
+walks through it. `remotePDF` remains a deprecated template helper; prefer
+durable extraction.
 
 ## Operational Guidance
 
@@ -293,9 +339,11 @@ is deprecated. Prefer durable extraction for production workflows.
   source document must produce a vector.
 - Store durable captions, transcripts, or extracted pages when they are costly
   to reproduce.
-- Use `cosine` for ClipClap and other models trained for cosine similarity. The
-  database default remains `l2_squared`, so select the model's metric explicitly
-  when it differs.
+- Use `cosine` for EmbeddingGemma 2 and other models trained for cosine
+  similarity. The database default remains `l2_squared`, so select the model's
+  metric explicitly when it differs.
+- Keep one model, dimension, and task profile per index. Rebuild the index when
+  any of them changes; vectors from different settings are not comparable.
 - Monitor index status and wait for the required coverage before serving a new
   index to users.
 
@@ -308,10 +356,12 @@ so a coding agent can execute this guide for you:
 npx skills add antflydb/antfly-skills
 ```
 
-Then prompt it with the outcome, for example "Add a ClipClap image index over the photo_url field of my products table and search it by description", and use this page to judge the result.
+Then prompt it with the outcome, for example "Add an EmbeddingGemma 2 image index over the photo_url field of my products table and search it by description", and use this page to judge the result.
 
 ## Next Steps
 
 - [Wikipedia walkthrough](/docs/guides/wikipedia-search#image-search): the same image index built over the Wikipedia thumbnails
-- [Artifact-Backed Indexes](/docs/guides/artifact-indexes): searching extracted PDF pages and chunks alongside whole documents
-- [Antfly Inference](/docs/guides/inference): pulling ClipClap and the other local models
+- [Index PDFs and Scanned Documents](/docs/guides/index-documents): extracting and OCRing documents into searchable text
+- [EmbeddingGemma 2](/docs/guides/models/embeddinggemma2): input formats, dimensions, task types, and limits
+- [Resumable Media Enrichment](/docs/guides/media-pass): windowed embeddings and transcripts for audio and video
+- [Antfly Inference](/docs/guides/inference): pulling EmbeddingGemma 2 and the other local models

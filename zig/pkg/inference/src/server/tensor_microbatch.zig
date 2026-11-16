@@ -221,7 +221,18 @@ pub fn eligible(session: session_mod.Session, inputs: []const Tensor) bool {
     return true;
 }
 
-pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task: micro.Task, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: *std.atomic.Mutex, inputs: []const Tensor, control: ?Control, deadline: ?std.Io.Clock.Timestamp, wait_us: u64) ![]Tensor {
+fn collectionWaitUs(override: ?u64, backend_default: u64) u64 {
+    return override orelse @max(@as(u64, 200), backend_default);
+}
+
+test "tensor microbatch explicit collection override preserves zero and bounded caller policy" {
+    try std.testing.expectEqual(@as(u64, 5000), collectionWaitUs(null, 5000));
+    try std.testing.expectEqual(@as(u64, 200), collectionWaitUs(null, 0));
+    try std.testing.expectEqual(@as(u64, 0), collectionWaitUs(0, 5000));
+    try std.testing.expectEqual(@as(u64, 20), collectionWaitUs(20, 5000));
+}
+
+pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task: micro.Task, session: session_mod.Session, permit: ?*session_mod.RunPermit, gate: *std.atomic.Mutex, inputs: []const Tensor, control: ?Control, deadline: ?std.Io.Clock.Timestamp, wait_us: ?u64) ![]Tensor {
     if (control) |active| try active.check();
     if (!eligible(session, inputs)) return direct(allocator, .{ .session = session, .permit = permit, .gate = gate, .inputs = inputs, .control = control, .rows = 1 });
     const alloc = std.heap.smp_allocator;
@@ -252,12 +263,20 @@ pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task
         try std.json.Stringify.value(.{ .name = tensor.name, .dtype = tensor.dtype, .shape = if (broadcast) tensor.shape else tensor.shape[1..], .value = if (broadcast) tensor.data else &.{} }, .{}, &signature.writer);
     }
     const ticket = Ticket{ .session = session, .permit = permit, .gate = gate, .inputs = inputs, .control = control, .rows = @intCast(inputs[0].shape[0]) };
+    const policy = session.forwardBatchPolicy(inputs);
+    const max_items = @min(@as(usize, 8), policy.max_items);
+    const max_rows = @min(@as(usize, 64), policy.max_rows);
+    if (max_items == 0 or max_rows == 0) return error.InvalidMicrobatchLimits;
     // Requests already larger than the coalescing window keep their existing
     // native batch. Do not turn a valid caller batch into a broker size error.
-    if (ticket.rows > 64 or bytes > 64 * 1024 * 1024) return direct(allocator, ticket);
+    if (ticket.rows > max_rows or bytes > 64 * 1024 * 1024) return direct(allocator, ticket);
     if (permit) |borrowed| {
         if (!try borrowed.yieldExecution()) return direct(allocator, ticket);
     }
+    // Queue metadata retains its actual allocation, not a growth quantum of
+    // idle request-local capacity that could block the physical batch's peak.
+    if (@import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(allocator)) |workspace|
+        try workspace.trim();
     const Probe = struct {
         fn canceled(raw: *const anyopaque) bool {
             const active: *const Control = @ptrCast(@alignCast(raw));
@@ -271,7 +290,7 @@ pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task
         .task = task,
         .schema = signature.written(),
         .resource_class = if (session.backend().usesGpuHostedSession()) .gpu else .cpu,
-    }, .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_tokens = 64, .max_bytes = 64 * 1024 * 1024, .max_wait_us = wait_us }, &.{.{ .bytes = bytes, .tokens = ticket.rows }}, &.{.{}}, deadline, if (control) |*active| .{ .ptr = active, .is_cancelled_fn = Probe.canceled } else .{}, &.{ticket}, broker, execute);
+    }, .{ .mode = .native, .preferred_items = max_items, .max_items = max_items, .max_tokens = max_rows, .max_bytes = 64 * 1024 * 1024, .max_wait_us = collectionWaitUs(wait_us, policy.collection_wait_us) }, &.{.{ .bytes = bytes, .tokens = ticket.rows }}, &.{.{}}, deadline, if (control) |*active| .{ .ptr = active, .is_cancelled_fn = Probe.canceled } else .{}, &.{ticket}, broker, execute);
     defer {
         for (results) |result| switch (result.result) {
             .value => |value| destroy(alloc, value),
@@ -296,8 +315,41 @@ pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task
 fn direct(allocator: std.mem.Allocator, ticket: Ticket) ![]Tensor {
     if (ticket.control) |control| try control.lock(ticket.gate) else platform.sync.lockYielding(ticket.gate);
     defer ticket.gate.unlock();
-    if (ticket.permit) |permit| return permit.runWithControl(ticket.inputs, allocator, ticket.control);
-    return ticket.session.runWithControl(ticket.inputs, allocator, ticket.control);
+    return runSerial(allocator, ticket.session, ticket.permit, ticket.inputs, ticket.control);
+}
+
+/// Called only after choosing physical serial execution. Queued/fused work
+/// uses its own allocator and lease, never a request-local borrowed estimate.
+pub fn runSerial(allocator: std.mem.Allocator, session: session_mod.Session, permit: ?*session_mod.RunPermit, inputs: []const Tensor, control: ?Control) ![]Tensor {
+    if (permit) |owned| return owned.runWithControl(inputs, allocator, control);
+    if (@import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(allocator)) |workspace| {
+        if (session.backend() == .native and try workspace.canBorrowRun(session, try session.planRun(inputs, null))) {
+            // An encoder and decoder can be distinct native sessions. Bind the
+            // actual callee for this scope, without retaining a temporary sink.
+            const previous = workspace.session;
+            const previous_context = workspace.admission_context;
+            try workspace.bindSession(session.withAdmissionControl(control));
+            defer {
+                workspace.session = previous;
+                workspace.admission_context = previous_context;
+            }
+            var scope = try workspace.admitRun(try session.planRun(inputs, null));
+            defer scope.deinit();
+            return scope.permit.runWithControl(inputs, allocator, control);
+        }
+        if (session.run_admission != null) {
+            // KV/accelerator output leases are distinct from request scratch.
+            // Execute under that owner, transferring only the small container.
+            const work = platform.allocator.concurrentFallback();
+            const outputs = try session.runWithControl(inputs, work, control);
+            errdefer destroy(work, outputs);
+            const result = try allocator.dupe(Tensor, outputs);
+            workspace.trim() catch {};
+            work.free(outputs);
+            return result;
+        }
+    }
+    return session.runWithControl(inputs, allocator, control);
 }
 
 fn execute(_: *anyopaque, items: []const micro.ExecuteItem) void {

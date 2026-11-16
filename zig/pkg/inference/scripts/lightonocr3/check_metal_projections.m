@@ -1653,7 +1653,7 @@ static int ocr_gqa_check(termite_metal_decode_runtime *r, size_t n, size_t heads
             const bool split = termite_metal_decode_gqa_split_eligible(
                 r, r, 3, 1, n, 16, heads, kv_heads, 256, kv_heads * dim * 2, kv_heads * dim, page, 0, 0, NULL,
                 &scratch, &launch, &strict);
-            const bool expected_split = mode == 1 && n >= 192 && n <= 2048;
+            const bool expected_split = mode == 1 && n >= 192 && n <= 16384;
             if (split != expected_split || strict)
                 return 3;
             id<MTLComputeCommandEncoder> enc = termite_metal_tracked_compute_command_encoder_for(
@@ -1668,12 +1668,20 @@ static int ocr_gqa_check(termite_metal_decode_runtime *r, size_t n, size_t heads
                                                                    width * 4, -1))
                     return 4;
             } else {
-                [enc setComputePipelineState:r->attention_paged_1x_pipeline];
                 [enc setBuffer:y offset:16 atIndex:5];
                 [enc setBytes:&p length:sizeof(p) atIndex:6];
-                [enc setThreadgroupMemoryLength:(2 * n + 256) * 4 atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(1, heads, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                const size_t scratch_bytes = (2 * n + 256) * sizeof(float);
+                if (n <= 4096 && scratch_bytes <= r->device.maxThreadgroupMemoryLength) {
+                    [enc setComputePipelineState:r->attention_paged_1x_pipeline];
+                    [enc setThreadgroupMemoryLength:scratch_bytes atIndex:0];
+                    [enc dispatchThreadgroups:MTLSizeMake(1, heads, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                } else {
+                    [enc setComputePipelineState:r->attention_paged_pipeline];
+                    [enc setBytes:&p.kv_position_offset length:sizeof(p.kv_position_offset) atIndex:7];
+                    [enc dispatchThreads:MTLSizeMake(heads, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(r->attention_paged_pipeline, heads), 1, 1)];
+                }
             }
             [enc endEncoding];
             if (termite_metal_decode_runtime_submit_frame(r) || termite_metal_decode_runtime_wait_frame(r))
@@ -2311,9 +2319,13 @@ static int batch_gate_up_check(termite_metal_decode_runtime *r, size_t rows, siz
                             return 72;
                     } else
                         setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_LOCAL_KERNELS", "1", 1);
-                    if (termite_metal_decode_runtime_apply_bf16_gate_up_device(
-                            r, 0, 1, (__bridge void *)x, 16, rows, in, out, (__bridge void *)y, 16))
+                    const int gate_up_rc = termite_metal_decode_runtime_apply_bf16_gate_up_device(
+                        r, 0, 1, (__bridge void *)x, 16, rows, in, out, (__bridge void *)y, 16);
+                    if (gate_up_rc != 0) {
+                        fprintf(stderr, "batch_gate_up_dispatch rows=%zu in=%zu out=%zu mode=%zu rc=%d\n",
+                                rows, in, out, mode, gate_up_rc);
                         return 10;
+                    }
                     if (mode == 1 && termite_metal_decode_runtime_end_planned_compute_scope(r))
                         return 73;
                     if (mode == 2)
@@ -2922,10 +2934,11 @@ static int wide_mpp_check(termite_metal_decode_runtime *r,size_t rows,size_t in,
 // double-precision CPU softmax. Query production occurs on the GPU in the same
 // planned frame. Pages have distinct logical lengths and permuted block tables.
 static int ocr_attention_batch_check(termite_metal_decode_runtime *r,
-                                     size_t rows, size_t heads,
+                                     size_t rows, size_t heads, size_t first_tokens,
                                      bool benchmark) {
-  const size_t dim = 256, kv_heads = heads / 4, physical = 768, page = 128,
-               width = heads * dim;
+  const size_t dim = 256, kv_heads = heads / 4, page = 128, width = heads * dim;
+  const size_t block_count = (first_tokens + (rows - 1) * 13 + page - 1) / page;
+  const size_t physical = block_count * page;
   id<MTLBuffer> source =
       [r->device newBufferWithLength:rows * width * 4
                              options:MTLResourceStorageModeShared];
@@ -2960,7 +2973,9 @@ static int ocr_attention_batch_check(termite_metal_decode_runtime *r,
   r->attention_span_v_buffers[0] = v;
   r->attention_span_slot_key_row_bytes[0] = kv_heads * dim * 2;
   r->attention_span_slot_v_row_stride[0] = kv_heads * dim;
-  uint32_t blocks[6] = {640, 384, 128, 512, 256, 0};
+  uint32_t blocks[block_count];
+  for (size_t i = 0; i < block_count; i++)
+    blocks[i] = (uint32_t)((block_count - 1 - i) * page);
   double elapsed[2] = {0};
   const size_t trials = benchmark ? 16 : 1;
   for (size_t trial = 0; trial < trials; trial++)
@@ -2991,9 +3006,9 @@ static int ocr_attention_batch_check(termite_metal_decode_runtime *r,
       if (mode && termite_metal_decode_runtime_lighton_attention_batch_begin(r))
         return 3;
       for (size_t row = 0; row < rows; row++) {
-        const size_t tokens = 432 + row * 13;
+        const size_t tokens = first_tokens + row * 13;
         if (termite_metal_decode_runtime_encode_paged_attention_slot_ex(
-                r, r, r->active_frame_cb, 0, 3, q, row * width * 4, blocks, 6, NULL, 0,
+                r, r, r->active_frame_cb, 0, 3, q, row * width * 4, blocks, block_count, NULL, 0,
                 page, 1, tokens, heads, kv_heads, dim, kv_heads * dim * 2,
                 kv_heads * dim * 2, tokens - 1, 0, 0, 0, NULL, 0, result[mode],
                 16 + row * width * 4))
@@ -3028,7 +3043,7 @@ static int ocr_attention_batch_check(termite_metal_decode_runtime *r,
     }
   double worst = 0, cpu_worst = 0;
   for (size_t row = 0; row < rows; row++) {
-    const size_t tokens = 432 + row * 13;
+    const size_t tokens = first_tokens + row * 13;
     for (size_t j = 0; j < width; j++) {
       float a = ((float *)result[0].contents)[4 + row * width + j],
             b = ((float *)result[1].contents)[4 + row * width + j];
@@ -4535,8 +4550,16 @@ int main(int argc, const char **argv) {
         }
         if (argc == 2 && (strcmp(argv[1], "--check-batch-attention") == 0 || strcmp(argv[1], "--benchmark-batch-attention") == 0)) {
             for(size_t heads=8;heads<=16;heads+=8)for(size_t rows=2;rows<=16;rows*=2){
-                int rc=ocr_attention_batch_check(r,rows,heads,strstr(argv[1],"benchmark")!=NULL);
+                int rc=ocr_attention_batch_check(r,rows,heads,432,strstr(argv[1],"benchmark")!=NULL);
                 if(rc){fprintf(stderr,"ATTENTION_BATCH_FAIL rc=%d\n",rc);return 125;}
+            }
+            if (strstr(argv[1], "benchmark") == NULL) {
+                const size_t long_contexts[] = {4090, 16345};
+                for (size_t heads = 8; heads <= 16; heads += 8)
+                    for (size_t i = 0; i < 2; i++) {
+                        int rc = ocr_attention_batch_check(r, 4, heads, long_contexts[i], false);
+                        if (rc) { fprintf(stderr, "ATTENTION_BATCH_LONG_FAIL rc=%d\n", rc); return 125; }
+                    }
             }
             if (r->lighton_attention_batch_scratch[0] == nil && r->lighton_attention_batch_scratch[1] == nil) return 126;
             if (termite_metal_decode_runtime_begin_frame(r) || termite_metal_decode_runtime_lighton_attention_batch_begin(r)) return 127;
@@ -4636,15 +4659,21 @@ int main(int argc, const char **argv) {
         const size_t prefill_seqs[]={127,128,432,554,662};
         for(size_t i=0;i<5;i++)for(size_t vh=16;vh<=32;vh+=16)if(prefill_columns_check(r,prefill_seqs[i],vh))return 123;
         if(ocr_residency_check(r))return 121;
-        if (!r->f16_encoder_mpp_pipeline) return 116;
         if (termite_metal_f16_encoder_mpp_shape(127,128,512) || termite_metal_f16_encoder_mpp_shape(524289,128,512) || termite_metal_f16_encoder_mpp_shape(128,129,512)) return 117;
         const bool f16_benchmark = argc == 2 && strcmp(argv[1],"--benchmark-f16-encoder") == 0;
-        for (size_t width=128;width<=1024;width*=2) {
-            if(f16_encoder_check(r,129,width,width,16,false) || f16_encoder_check(r,129,width,width*3,16,false) || f16_encoder_check(r,129,width,width*4,16,false) || f16_encoder_check(r,129,width*4,width,16,false)) return 118;
+        // Florence's F16 encoder rollout remains M4 Max-only.
+        if ([r->device.name isEqualToString:@"Apple M4 Max"]) {
+            if (!r->f16_encoder_mpp_pipeline) return 116;
+            for (size_t width=128;width<=1024;width*=2) {
+                if(f16_encoder_check(r,129,width,width,16,false) || f16_encoder_check(r,129,width,width*3,16,false) || f16_encoder_check(r,129,width,width*4,16,false) || f16_encoder_check(r,129,width*4,width,16,false)) return 118;
+            }
+            if(f16_encoder_check(r,578,768,768,16,false) || f16_encoder_check(r,578,3072,768,16,false) || f16_encoder_check(r,129,1024,768,16,false) || f16_encoder_check(r,127,128,512,16,false) || f16_encoder_check(r,129,128,512,4,false)) return 119;
+            if(f16_encoder_check(r,25088,128,512,16,f16_benchmark) || f16_encoder_check(r,578,768,3072,16,f16_benchmark) || f16_encoder_check(r,2304,512,2048,16,f16_benchmark)) return 120;
+            if(f16_benchmark)return 0;
+        } else {
+            fprintf(stderr, "SKIP: Florence F16 encoder MPP is not qualified on %s\n", r->device.name.UTF8String);
+            if (f16_benchmark) return 77;
         }
-        if(f16_encoder_check(r,578,768,768,16,false) || f16_encoder_check(r,578,3072,768,16,false) || f16_encoder_check(r,129,1024,768,16,false) || f16_encoder_check(r,127,128,512,16,false) || f16_encoder_check(r,129,128,512,4,false)) return 119;
-        if(f16_encoder_check(r,25088,128,512,16,f16_benchmark) || f16_encoder_check(r,578,768,3072,16,f16_benchmark) || f16_encoder_check(r,2304,512,2048,16,f16_benchmark)) return 120;
-        if(f16_benchmark)return 0;
         if (!r->lightonocr3_four_row_segment_pipeline || !r->lightonocr3_mpp_four_row_pipeline) return 114;
         id<MTLComputePipelineState> saved_four_segment = r->lightonocr3_four_row_segment_pipeline;
         id<MTLComputePipelineState> saved_four_mpp = r->lightonocr3_mpp_four_row_pipeline;
@@ -4678,8 +4707,8 @@ int main(int argc, const char **argv) {
         }
         if (!r->lightonocr3_gqa_split_stage_pipeline || !r->lightonocr3_gqa_split_reduce_pipeline) return 102;
         const bool ocr_gqa_benchmark=argc==2 && strcmp(argv[1],"--benchmark-ocr-gqa")==0;
-        const size_t ocr_contexts[]={128,192,432,554,662,1024,2048,2056};
-        for(size_t i=0;i<8;i++)for(size_t shape=0;shape<2;shape++)
+        const size_t ocr_contexts[]={128,191,192,432,554,662,1024,2048,2049,4096,4097,8191,16384,16385};
+        for(size_t i=0;i<sizeof(ocr_contexts)/sizeof(ocr_contexts[0]);i++)for(size_t shape=0;shape<2;shape++)
             if(ocr_gqa_check(r,ocr_contexts[i],shape?16:8,shape?4:2,i%2?8:1,ocr_gqa_benchmark && (ocr_contexts[i]==432 || ocr_contexts[i]==662)))return 103;
         if (ocr_gqa_benchmark) return 0;
         if (argc == 2 && strcmp(argv[1], "--benchmark-down-split") == 0) {

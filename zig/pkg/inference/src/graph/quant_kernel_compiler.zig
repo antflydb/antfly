@@ -158,6 +158,8 @@ pub const Schedule = struct {
 pub const CatalogEntry = struct {
     signature: quant_kernel_op.SpecializationSignature,
     runtime: quant_kernel_op.RuntimeConstraints,
+    /// Target of the attached evidence. CUDA's catalog separately checks the
+    /// portable artifact's execution compatibility against the current device.
     target: Target,
     schedule: Schedule,
     kernel_id: []const u8,
@@ -1470,6 +1472,15 @@ pub const GeneratedArtifact = struct {
     cuda_flash_prefill_kernel: ?cuda_renderer.FlashPrefillKernelKind = null,
     cuda_splitk_online_decode_kernel: ?cuda_renderer.SplitkOnlineDecodeKernelKind = null,
     op: GeneratedOp,
+
+    pub fn cudaExecutionContract(self: GeneratedArtifact) ?cuda_renderer.CudaExecutionContract {
+        if (self.backend != .cuda) return null;
+        if (self.cuda_kernel) |kind| return cuda_renderer.kernelExecutionContract(kind);
+        if (self.cuda_attention_kernel) |kind| return cuda_renderer.attentionExecutionContract(kind);
+        if (self.cuda_splitk_online_decode_kernel) |kind| return cuda_renderer.splitkOnlineDecodeExecutionContract(kind);
+        if (self.cuda_flash_prefill_kernel) |kind| return cuda_renderer.flashPrefillExecutionContract(kind);
+        return null;
+    }
 
     pub fn opKind(self: GeneratedArtifact) OpKind {
         return std.meta.activeTag(self.op);

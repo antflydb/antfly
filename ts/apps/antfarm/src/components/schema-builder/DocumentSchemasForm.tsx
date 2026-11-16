@@ -13,10 +13,11 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
+  Spinner,
   Switch,
 } from "@antfly/design-system";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { MagnifyingGlassIcon, ReloadIcon } from "@radix-ui/react-icons";
+import { MagnifyingGlassIcon } from "@radix-ui/react-icons";
 import type React from "react";
 import { useCallback, useEffect, useState } from "react";
 import { FormProvider, useFieldArray, useForm } from "react-hook-form";
@@ -499,7 +500,7 @@ const DocumentSchemasForm: React.FC<DocumentSchemasFormProps> = ({
                 disabled={isDetecting}
                 onClick={handleDetect}
               >
-                {isDetecting && <ReloadIcon className="h-4 w-4 mr-1 animate-spin" />}
+                {isDetecting && <Spinner className="h-4 w-4 mr-1" />}
                 <MagnifyingGlassIcon className="h-4 w-4 mr-1" />
                 Detect from Data
               </Button>

@@ -62,7 +62,11 @@ proposal, verdict and entity curation operations. It does not include arbitrary
 table writes, configuration, ontology changes, source-wide forgetting or
 embedding publication. Admin includes curator; write alone does not.
 
-HTTP and `/memory/v1/mcp` share this authorization. Operations retain their
+Pinning a team-visible memory into the session brief also requires curator,
+because it changes every principal's injected context; owners pin their private
+memories with write.
+
+HTTP, `/memory/v1/mcp` and `/memory/v1/mcp/agent` share this authorization. Operations retain their
 required grant and recheck the live credential at publication and receipt replay.
 Revocation applies to admitted work as well as new requests. Private records
 remain in their owner's audience. Lite's database owner retains full rights.
@@ -137,7 +141,7 @@ set, requires a matching `iss`. The claims are:
 
 ### Row Filters
 
-Row filters are query JSON stored per table, with `*` as a fallback for every
+Row filters are query JSON stored per table, with `*` applying to every
 table. They are attached to users, roles, and groups through
 `/auth/v1/users/{user}/row-filters/{table}` and
 `/auth/v1/subjects/{subject}/row-filters/{table}`, or carried in a trusted
@@ -153,13 +157,27 @@ Filters are validated before they are stored.
 
 At read time, Antfly:
 
-1. Selects the table-specific filter if one exists, and otherwise the `*`
-   filter. The two are not combined.
-2. Combines filters from the same table with `AND`: the user's own filter, the
+1. Combines every matching global (`*`), namespace, and table filter with `AND`.
+   A `null` filter adds no restriction; it never removes broader filters.
+2. Combines filters from every principal with `AND`: the user's own filter, the
    filters of every role and group the user inherits, and an API key's own
    filter.
 3. Resolves `$auth` references against the authenticated identity.
 4. Combines the result with the caller's query with `AND`.
+
+Each stored policy is limited to 16,384 policy nodes and at most 64 levels
+of nesting. Antfly validates matching policies independently, so its generated
+conjunction does not consume a policy's nesting allowance. The effective
+conjunction is limited to 32,768 JSON values, including the generated wrapper,
+before and after identity expansion. Matching policies are parsed one at a time;
+composition stops at the first denied or over-budget component without building
+or parsing the remaining conjunction. Temporary composition memory scales with
+the bounded accepted prefix and a reusable single-component workspace, rather
+than all matching policies. This bound also keeps the resulting plan within the
+storage compiler's existing execution budget. Exceeding the aggregate
+limit denies authorization (`403`); it does not make the client's query invalid.
+All matching policies share a separate 16,384-value identity-expansion budget.
+Missing, incompatible, or over-budget identity values deny the entire predicate.
 
 Queries, document scans, lookups, and retrieval-agent queries apply these
 filters. In a join, the right table's filter is applied as well.

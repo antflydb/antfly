@@ -16,14 +16,14 @@ can stop after the local search; it needs no model download or Cloud account.
 Semantic search, image search, reranking, and RAG are optional follow-ons.
 
 **Prefer to start hosted?** Follow [Get started with Antfly Cloud Lite](/docs/cloud/getting-started).
-It uses the same documents and HTTP requests. Lite is the default Cloud offering;
-availability is controlled per organization during rollout.
+That guide covers account setup, scoped keys, and database import/export. Lite
+is the default Cloud offering; availability is controlled per organization
+during rollout.
 
 ## Install Antfly
 
-Use [Antfly v0.3.0-rc.3](https://github.com/antflydb/antfly/releases/tag/v0.3.0-rc.3)
-for this walkthrough, matching the runtime documented for Cloud snapshot
-compatibility. Download the archive for your OS and architecture, verify its
+Use [Antfly v0.3.0](https://github.com/antflydb/antfly/releases/tag/v0.3.0)
+for the local keyword-search and snapshot steps in this walkthrough. Download the archive for your OS and architecture, verify its
 published checksum, and extract the archive. Keep its supporting files beside
 the `antfly` binary and add that directory to your `PATH`.
 
@@ -31,10 +31,11 @@ the `antfly` binary and add that directory to your `PATH`.
 antfly --version
 ```
 
-Check that this reports `0.3.0-rc.3`. This is a prerelease; a Homebrew or latest
-installation may select a different version. Check file compatibility before
-opening the same database with another runtime. See [Downloads](/docs/downloads)
-for the other installation options.
+Check that this reports `0.3.0`. A Homebrew or latest installation may select
+a different version. Cloud uses its own runtime: its import preflight must
+accept the snapshot before you create the managed copy. Check file compatibility
+before opening the database with another local runtime, too. See
+[Downloads](/docs/downloads) for the other installation options.
 
 ## Start a local Lite database
 
@@ -126,7 +127,7 @@ so you can compare it with the Cloud copy. Try changing `Korea` to another word
 or phrase from the dataset, then rerun the request.
 
 This is full-text search: it matches indexed words, without embeddings or an
-inference service. The [SDKs](/docs/sdks) use the same HTTP API.
+inference service. The [SDKs](/docs/reference/sdks) use the same HTTP API.
 
 ## Move this database to Cloud
 
@@ -161,8 +162,8 @@ antfly_request query.json tables/default/query
 
 Expect the same article IDs, titles, and URLs. Do not repeat the table creation
 or dataset load: the snapshot already contains all 10,000 articles and their
-full-text index. Your HTTP requests stay the same;
-the endpoint and authentication change. An application using an embedded Lite
+full-text index. Your HTTP requests stay the same; the endpoint and authentication
+change. An application using an embedded Lite
 binding needs an HTTP client or adapter to connect to Cloud.
 
 <Callout type="info">
@@ -214,4 +215,4 @@ file does not delete the managed database or stop its billing.
   and richer searches over the same dataset.
 - [Antfly Lite](/docs/guides/lite): embedded applications, file formats, and portability.
 - [Cloud Lite](/docs/cloud/getting-started): hosted creation, scoped keys, import, and export.
-- [SDKs](/docs/sdks): connect your application through the same HTTP API.
+- [SDKs](/docs/reference/sdks): connect your application through the same HTTP API.

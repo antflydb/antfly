@@ -28,6 +28,7 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: chunking_types.Config)
         .overlap_tokens = cfg.defaultedOverlapTokens(),
         .max_chunks = cfg.max_chunks, // 0 = unlimited
         .separator = cfg.defaultedSeparator(),
+        .min_chars = cfg.text.min_chars,
     });
     defer inference_chunker.types.freeChunks(alloc, shared_chunks);
 

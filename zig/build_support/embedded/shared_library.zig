@@ -19,20 +19,72 @@ const std = @import("std");
 /// Executor owners and provider archives must share the internal Zig callback ABI.
 pub const llvmBackend = @import("source_owner.zig").llvmBackend;
 
-pub fn inferenceCompileMaxRss(os: std.Target.Os.Tag, shared: bool, measured_darwin: bool) u64 {
+pub fn inferenceCompileMaxRss(os: std.Target.Os.Tag, shared: bool, measured_darwin: bool, measured_cross: bool) u64 {
     const gib = 1024 * 1024 * 1024;
-    if (os == .macos and shared) return (if (measured_darwin) @as(u64, 12) else 20) * gib;
+    // Linux -> macOS SDK 26.1: 11G rounded MaxRSS, plus a GiB and 10%.
+    if (os == .macos and shared and measured_cross) return 14 * gib;
+    // Native SDK 26.6.2 / Zig 0.17 cold fast build: 24,912,183,296 bytes.
+    // Keep more than 10% margin on unqualified native Darwin SDKs.
+    if (os == .macos and shared) return (if (measured_darwin) @as(u64, 12) else 26) * gib;
     return (if (os == .macos and measured_darwin) @as(u64, 8) else 12) * gib;
 }
 
 test "qualified inference core keeps peak margin and fits beside API compilation" {
     const gib = 1024 * 1024 * 1024;
-    const claim = inferenceCompileMaxRss(.macos, true, true);
+    const claim = inferenceCompileMaxRss(.macos, true, true, false);
     // Fresh merged-main MaxRSS 9G upper bound, plus at least 25%.
     try std.testing.expect(claim >= 9 * gib + 9 * gib / 4);
     try std.testing.expect(claim + 14 * gib <= 28 * gib);
-    try std.testing.expect(inferenceCompileMaxRss(.macos, true, false) + 14 * gib > 28 * gib);
-    try std.testing.expectEqual(12 * gib, inferenceCompileMaxRss(.linux, true, false));
+    try std.testing.expect(inferenceCompileMaxRss(.macos, true, false, false) + 14 * gib > 28 * gib);
+    try std.testing.expectEqual(12 * gib, inferenceCompileMaxRss(.linux, true, false, false));
+}
+
+pub fn storageCompileMaxRss(os: std.Target.Os.Tag, measured_sdk27: bool, measured_darwin: bool, measured_cross: bool) u64 {
+    const gib = 1024 * 1024 * 1024;
+    // Linux -> macOS SDK 26.1: 13G rounded MaxRSS, plus a GiB and 10%.
+    return @as(u64, if (os == .macos and measured_cross) 16 else if (measured_sdk27) 14 else if (os == .macos and !measured_darwin) 24 else 16) * gib;
+}
+
+/// Physical storage has a separate compiler owner from the runtime adapter.
+/// Apply native measurements only to their qualified host/target/profile.
+pub fn nativeStorageCompileMaxRss(host: std.Target, target: std.Target, optimize: std.lang.Optimize, fallback: u64) u64 {
+    if (std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        host.os.tag == .linux and host.cpu.arch == .x86_64 and
+        target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
+        optimize == .debug)
+    {
+        // Main run 42491033320: 17,237,008,384 bytes. 18 GiB provides
+        // >=10% headroom while admitting a 2 GiB compile in a 20 GiB lane.
+        return @max(fallback, 18 * 1024 * 1024 * 1024);
+    }
+    return fallback;
+}
+
+test "native Debug storage covers its peak and retains small compiler overlap" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const gib: u64 = 1024 * 1024 * 1024;
+    const peak: u64 = 17_237_008_384;
+    const claim = nativeStorageCompileMaxRss(linux, linux, .debug, 16 * gib);
+    try std.testing.expect(claim >= peak + peak / 10);
+    try std.testing.expect(claim + 2 * gib <= 20 * gib);
+    try std.testing.expectEqual(16 * gib, nativeStorageCompileMaxRss(linux, linux, .fast, 16 * gib));
+    try std.testing.expectEqual(24 * gib, nativeStorageCompileMaxRss(linux, linux, .debug, 24 * gib));
+}
+
+test "cross Darwin provider claims retain peak margins and admit storage with inference" {
+    const gib = 1024 * 1024 * 1024;
+    const storage = storageCompileMaxRss(.macos, false, false, true);
+    const inference = inferenceCompileMaxRss(.macos, true, false, true);
+    try std.testing.expect(storage >= 14 * gib + 14 * gib / 10);
+    try std.testing.expect(inference >= 12 * gib + 12 * gib / 10);
+    try std.testing.expect(storage + inference <= 32 * gib);
+    try std.testing.expectEqual(24 * gib, storageCompileMaxRss(.macos, false, false, false));
+    const native_peak: u64 = 24_912_183_296;
+    const native_inference = inferenceCompileMaxRss(.macos, true, false, false);
+    try std.testing.expect(native_inference >= native_peak + native_peak / 10);
+    try std.testing.expect(native_inference <= 28 * gib);
+    try std.testing.expectEqual(12 * gib, inferenceCompileMaxRss(.linux, true, false, true));
+    try std.testing.expectEqual(16 * gib, storageCompileMaxRss(.linux, false, false, true));
 }
 
 /// Provider archives borrow std.Io executors from the C API and Lite CLI. Internal Zig
@@ -121,6 +173,7 @@ pub fn addWithStorageOwner(b: *std.Build, module: *std.Build.Module, providers: 
         const output = run.addOutputFileArg("libantfly.dylib");
         // Retain atom sizes and archive owners alongside the cached binary.
         // Release archives contain only the library, not this diagnostic map.
+        if (module.strip == true) run.addArg("--strip");
         run.addArg("--map");
         _ = run.addOutputFileArg("libantfly.map");
         var bundled: BundledInputs = .{ .modules = .init(b.allocator) };
@@ -378,6 +431,7 @@ pub fn nativeExecutableLink(b: *std.Build, object: *std.Build.Step.Compile, name
     const target = object.root_module.resolved_target.?.result;
     const link = b.addSystemCommand(&.{"python3"});
     link.addFileArg(b.path("tools/native_executable_link.py"));
+    link.addFileInput(b.path("tools/macho_merged_globals.py"));
     const deployment = target.os.version_range.semver.min;
     link.addArgs(&.{ "--arch", if (target.cpu.arch == .aarch64) "arm64" else "x86_64", "--deployment", b.fmt("{d}.{d}.{d}", .{ deployment.major, deployment.minor, deployment.patch }), "--sdk" });
     link.addDirectoryArg(b.named_lazy_paths.get("antfly_macos_sdk_root").?);

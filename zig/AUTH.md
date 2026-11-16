@@ -29,9 +29,17 @@ Cloud proxies may authenticate a request with `X-Antfly-Trusted-Principal`.
 Supplying that header always requires a configured verifier and a valid signed
 principal, even when `auth_enabled` is false. A missing verifier or invalid
 signature returns HTTP 401 rather than falling back to anonymous access. This
-also applies to separately mounted inference routes. An auth-disabled standalone
-server still permits anonymous requests when no trusted-principal header is
-present; it must not be exposed as an authenticated service.
+also applies to separately mounted inference routes. Standalone loads
+`antfly.trusted_principal.secret` and `antfly.trusted_principal.issuer` from its
+secret store, including projected sources and the corresponding environment
+variables. A configured verifier protects public requests even when local
+password authentication is disabled. It does not bootstrap a local admin user;
+local password bootstrap still requires `enable_auth`. Keep the signing secret
+distinct from any internal-service credential.
+
+A standalone server with neither local authentication nor a configured verifier
+permits anonymous requests when no trusted-principal header is present; it must
+not be exposed as an authenticated service.
 
 MCP authorizes each request and tool call using that request's identity, table
 permissions, and row filters. A session ID does not retain an earlier admin

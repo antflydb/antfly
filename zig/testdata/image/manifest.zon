@@ -1984,6 +1984,18 @@
             .notes = "Truncated 24-bit BMP fixture expected to fail decode cleanly.",
         },
         .{
+            .path = "webp/lossless/pillow-normal-prefix-129x97.webp",
+            .format = "webp",
+            .result = "success",
+            .width = 129,
+            .height = 97,
+            .pixel_format = "rgba8",
+            .frames = 1,
+            .pixel_hashes = .{"ff857f3cbd64adf7f28d578aa69eafa78303c2cdc4c56843c58612b6a13319ea"},
+            .tags = .{ "vp8l", "lossless", "normal_prefix", "repeat", "generated" },
+            .notes = "Pillow 12.3.0 lossless encoding of RGB(x,y)=((3x+y)%256,(x+5y)%256,(7x+11y)%256). Encoded-symbol limits must count repeat codes before expansion.",
+        },
+        .{
             .path = "webp/lossless/literal-rgba-2x3.webp",
             .format = "webp",
             .result = "success",

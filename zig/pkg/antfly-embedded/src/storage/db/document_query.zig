@@ -41,7 +41,9 @@ pub const BorrowedSpanProjection = struct {
     fields: []const []const u8,
     include_all_fields: bool,
     pub fn matches(self: @This(), opts: types.LookupOptions) bool {
-        return self.fields.ptr == opts.fields.ptr and self.fields.len == opts.fields.len and self.include_all_fields == opts.include_all_fields;
+        if (!std.mem.eql(u8, self.plan.projection_json, opts.cypher_projection_json)) return false;
+        for (self.plan.presence, 0..) |name, i| if (i >= opts.cypher_presence_fields.len or !std.mem.eql(u8, name, opts.cypher_presence_fields[i])) return false;
+        return self.fields.ptr == opts.fields.ptr and self.fields.len == opts.fields.len and self.include_all_fields == opts.include_all_fields and self.plan.presence.len == opts.cypher_presence_fields.len;
     }
 };
 
@@ -52,6 +54,9 @@ pub const SpanProjectionPlan = struct {
     excluded: []const []const u8,
     include_all: bool,
     passthrough: bool,
+    presence: []const []const u8 = &.{},
+    projection_json: []const u8 = "",
+    property_projection: []const @import("cypher").read_fields.Projection = &.{},
 
     pub fn init(alloc: Allocator, opts: types.LookupOptions) !?@This() {
         if (!spanProjectionSupported(opts.fields)) return null;
@@ -88,6 +93,8 @@ pub const SpanProjectionPlan = struct {
         for (paths.items) |*path| {
             if (path.parts.len > 2) path.selector = if (paths.items.len == 1) selector else try @import("query/json_projection_plan.zig").compile(a, &.{path.*});
         }
+        const presence = try a.alloc([]const u8, opts.cypher_presence_fields.len);
+        for (opts.cypher_presence_fields, presence) |name, *owned| owned.* = try a.dupe(u8, name);
         return .{
             .arena = arena,
             .selector = selector,
@@ -95,6 +102,9 @@ pub const SpanProjectionPlan = struct {
             .excluded = excluded.items,
             .include_all = include_all or (!has_positive and has_negative),
             .passthrough = opts.fields.len == 0 and opts.include_all_fields,
+            .presence = presence,
+            .projection_json = try a.dupe(u8, opts.cypher_projection_json),
+            .property_projection = try @import("query/cypher_projection.zig").decode(a, opts.cypher_projection_json),
         };
     }
     pub fn deinit(self: *@This()) void {
@@ -115,10 +125,31 @@ pub fn lookupJsonWithSources(alloc: Allocator, output: Allocator, raw: []const u
     return lookupJsonWithSourcesPolicy(alloc, output, raw, plan, sources, false);
 }
 pub fn lookupJsonWithSourcesPolicy(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource, exact: bool) !types.LookupResult {
-    return lookupJsonDestination(alloc, output, raw, plan, sources, exact, null);
+    return lookupJsonDestination(alloc, output, raw, plan, sources, exact, null, false, &.{});
 }
 pub fn writeLookupFields(alloc: Allocator, writer: *std.Io.Writer, raw: []const u8, plan: *const SpanProjectionPlan) !void {
-    _ = try lookupJsonDestination(alloc, alloc, raw, plan, &.{}, false, writer);
+    _ = try lookupJsonDestination(alloc, alloc, raw, plan, &.{}, false, writer, false, &.{});
+}
+pub const Omission = struct {
+    parts: []const []const u8,
+    // Number of leading path components proven to be stored object ancestors.
+    objects: usize,
+};
+pub fn lookupJsonWithOmissions(scratch: Allocator, output: Allocator, raw: []const u8, fields: []const []const u8, omissions: []const Omission) !types.LookupResult {
+    var plan = (try SpanProjectionPlan.init(scratch, .{ .fields = fields, .include_all_fields = false })).?;
+    defer plan.deinit();
+    return lookupJsonWithPlanOmissions(scratch, output, raw, &plan, omissions);
+}
+pub fn lookupJsonWithPlanOmissions(scratch: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, omissions: []const Omission) !types.LookupResult {
+    if (omissions.len != 0 and (plan.passthrough or plan.include_all)) return error.InvalidProjectedDocumentJson;
+    for (omissions) |omission| if (omission.parts.len == 0 or omission.objects >= omission.parts.len) return error.InvalidProjectedDocumentJson;
+    return lookupJsonDestination(scratch, output, raw, plan, &.{}, false, null, false, omissions);
+}
+/// Strictly validate and stream a complete projected object. No encoded
+/// intermediate or value-sized DOM survives the call; number normalization,
+/// duplicate-key rejection and projection semantics match ordinary lookup.
+pub fn writeLookupObject(alloc: Allocator, writer: *std.Io.Writer, raw: []const u8, plan: *const SpanProjectionPlan) !void {
+    _ = try lookupJsonDestination(alloc, alloc, raw, plan, &.{}, false, writer, true, &.{});
 }
 /// Stream an admitted stored/projected object without retaining a second body.
 /// Keep the legacy number-normalization boundary when a literal _id forced a
@@ -166,9 +197,34 @@ fn writePassthroughFields(alloc: Allocator, writer: *std.Io.Writer, raw: []const
     if (try scanner.next() != .end_of_document) return error.SyntaxError;
     return true;
 }
-fn lookupJsonDestination(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource, exact: bool, writer: ?*std.Io.Writer) !types.LookupResult {
+fn lookupJsonDestination(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource, exact: bool, writer: ?*std.Io.Writer, complete_object: bool, omissions: []const Omission) !types.LookupResult {
+    if (plan.presence.len != 0 or plan.property_projection.len != 0) {
+        const fields = try alloc.alloc([]const u8, plan.paths.len);
+        defer alloc.free(fields);
+        for (plan.paths, fields) |path, *name| {
+            if (path.parts.len != 1) return error.InvalidArgument;
+            name.* = path.parts[0];
+        }
+        var projection_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer projection_arena.deinit();
+        const projected = try @import("query/cypher_projection.zig").record(projection_arena.allocator(), raw, fields, plan.presence, plan.property_projection);
+        if (writer) |sink| {
+            if (complete_object) try std.json.Stringify.value(projected, .{}, sink) else {
+                var iterator = projected.object.iterator();
+                while (iterator.next()) |entry| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, "_id")) continue;
+                    try sink.writeByte(',');
+                    try std.json.Stringify.value(entry.key_ptr.*, .{}, sink);
+                    try sink.writeByte(':');
+                    try std.json.Stringify.value(entry.value_ptr.*, .{}, sink);
+                }
+            }
+            return .{ .json = @constCast("") };
+        }
+        return .{ .json = try std.json.Stringify.valueAlloc(output, projected, .{}) };
+    }
     if (writer == null and plan.passthrough and sources.len == 0) return .{ .json = try output.dupe(u8, raw) };
-    if (writer != null and plan.passthrough and sources.len == 0 and try writePassthroughFields(alloc, writer.?, raw)) return .{ .json = @constCast("") };
+    if (!complete_object and writer != null and plan.passthrough and sources.len == 0 and try writePassthroughFields(alloc, writer.?, raw)) return .{ .json = @constCast("") };
     var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
     defer arena.deinit();
     const a = arena.allocator();
@@ -187,13 +243,63 @@ fn lookupJsonDestination(alloc: Allocator, output: Allocator, raw: []const u8, p
     var projected: Projection.Object = .empty;
     if (plan.include_all or plan.passthrough) {
         try Projection.includePreparedRootExcept(&projection_owner, &projected, &view, plan.excluded);
-    } else for (plan.paths) |path| try Projection.includeRoot(&projection_owner, &projected, &view, path);
+    } else for (plan.paths) |path| {
+        const omitted: ?Omission = for (omissions) |omission| {
+            if (omission.parts.len != path.parts.len) continue;
+            for (omission.parts, path.parts) |left, right| {
+                if (!std.mem.eql(u8, left, right)) break;
+            } else break omission;
+        } else null;
+        if (omitted) |omission| {
+            var root: Projection = .{ .object = projected };
+            try root.ensureObjectPath(a, omission.parts[0..omission.objects]);
+            projected = root.object;
+        } else try Projection.includeRoot(&projection_owner, &projected, &view, path);
+    }
     if (writer) |sink| {
-        try (Projection{ .object = projected }).writeFieldsTo(a, sink);
+        if (complete_object) try (Projection{ .object = projected }).writeTo(a, sink) else try (Projection{ .object = projected }).writeFieldsTo(a, sink);
         return .{ .json = @constCast("") };
     }
     return .{ .json = try (Projection{ .object = projected }).serializeWithPolicy(a, output, exact) };
 }
+
+/// Immutable request-owned selector. Public exclusions participate in the same
+/// projection as caller masks, so indexed arrays are never compacted twice.
+pub const PublicPlan = struct {
+    arena: std.heap.ArenaAllocator,
+    opts: types.LookupOptions,
+    span: ?SpanProjectionPlan,
+    pub fn init(backing: Allocator, opts: types.LookupOptions) !PublicPlan {
+        var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(backing));
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var fields: std.ArrayList([]const u8) = .empty;
+        try fields.appendSlice(a, opts.fields);
+        if (opts.fields.len == 0 and opts.include_all_fields) try fields.append(a, "*");
+        if (fields.items.len != 0) for (@import("../hierarchy_navigation.zig").public_internal_fields) |name| {
+            try fields.append(a, try std.fmt.allocPrint(a, "-{s}", .{name}));
+        };
+        var normalized = opts;
+        normalized.fields = fields.items;
+        return .{ .arena = arena, .opts = normalized, .span = try SpanProjectionPlan.init(a, normalized) };
+    }
+    pub fn deinit(self: *PublicPlan) void {
+        if (self.span) |*span| span.deinit();
+        self.arena.deinit();
+    }
+    pub fn apply(self: *const PublicPlan, scratch: Allocator, output: Allocator, raw: []const u8) !types.LookupResult {
+        if (self.span) |*span| return lookupJsonWithSourcesPolicy(scratch, output, raw, span, &.{}, self.opts.output_exact);
+        var parsed = try std.json.parseFromSlice(std.json.Value, scratch, raw, .{});
+        defer parsed.deinit();
+        var projected = try projectLookupView(scratch, parsed.value, self.opts);
+        defer deinitProjectionView(scratch, &projected);
+        // Projection views borrow values: remove map entries without freeing them.
+        if (projected == .object) for (@import("../hierarchy_navigation.zig").public_internal_fields) |name| {
+            _ = projected.object.swapRemove(name);
+        };
+        return .{ .json = try serializeWithOutput(scratch, output, projected) };
+    }
+};
 
 pub fn lookupJsonWithOutput(alloc: Allocator, output: Allocator, raw: []const u8, opts: types.LookupOptions) !types.LookupResult {
     if (opts.fields.len == 0 and opts.include_all_fields) return .{ .json = try output.dupe(u8, raw) };
@@ -1053,4 +1159,22 @@ test "public graph metric borrowed wire raw scan fields preserve lexemes and res
         try writeRawScanFields(a, &writer.writer, raw);
         try std.testing.expectEqualStrings(want, writer.written());
     }
+}
+
+test "api query contract public selector strips private roots with one array projection" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            for ([_][]const []const u8{ &.{"*"}, &.{"-padding"}, &.{"arr.1.n"}, &.{"nested.*"} }) |fields| {
+                var plan = try PublicPlan.init(a, .{ .fields = fields, .include_all_fields = false });
+                defer plan.deinit();
+                var result = try plan.apply(a, a, "{\"arr\":[{\"n\":1},{\"n\":2}],\"nested\":{\"_type\":\"user\"},\"padding\":0,\"_resolution_work\":{\"secret\":1},\"_hierarchy_unit_revision_token\":\"private\",\"_artifact_unit_fingerprint\":\"private\"}");
+                defer result.deinit(a);
+                try std.testing.expect(std.mem.indexOf(u8, result.json, "private") == null);
+                try std.testing.expect(std.mem.indexOf(u8, result.json, "secret") == null);
+                if (std.mem.eql(u8, fields[0], "arr.1.n")) try std.testing.expectEqualStrings("{\"arr\":[{\"n\":2}]}", result.json);
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

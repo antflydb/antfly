@@ -23,7 +23,7 @@ const groups = @import("group_sources.zig");
 const identity = @import("group_source_identity.zig");
 pub const max_page_items = 128;
 pub const max_partition_bytes = 4 * 1024 * 1024;
-pub const Action = enum { invalidate, claim, heartbeat, publish, finish, acknowledge, backfill, retire, activate };
+pub const Action = enum { invalidate, claim, heartbeat, publish, finish, acknowledge, backfill, retire, activate, activate_catalog };
 pub const Invalidate = struct { owner: state.Owner, event: index.Invalidation };
 pub const Claim = struct { group: state.Group, pending: state.Pending, owner: groups.Digest, now_ms: u64, ttl_ms: u32 };
 pub const Held = struct { group: state.Group, partition: index.Partition, lease: state.Lease, now_ms: u64, ttl_ms: u32 = 30000 };
@@ -58,6 +58,11 @@ pub const Command = struct {
     finish: ?Finish = null,
     acknowledge: ?Acknowledge = null,
     backfill: ?Backfill = null,
+    /// `activate` retains its historical replay contract. New producers use
+    /// `activate_catalog`, admitted only after the protocol-26 member barrier.
+    pub fn isActivation(self: Command) bool {
+        return self.action == .activate or self.action == .activate_catalog;
+    }
     pub fn validate(self: Command) !void {
         try self.definition.validate();
         if (self.artifact.len == 0 or self.artifact.len > 256) return error.InvalidGroupedSourceCommand;
@@ -104,10 +109,10 @@ pub const Command = struct {
                 const value = self.acknowledge orelse return error.InvalidGroupedSourceCommand;
                 if (value.document.len == 0 or value.document.len > 4096 or value.key_base64.len == 0 or value.key_base64.len > 32768 or value.observed_base64.len == 0 or value.observed_base64.len > index.max_record_bytes + 36) return error.InvalidGroupedSourceCommand;
             },
-            .backfill, .retire, .activate => {
+            .backfill, .retire, .activate, .activate_catalog => {
                 const value = self.backfill orelse return error.InvalidGroupedSourceCommand;
                 if (value.cursor.len > 32768 or value.route.value.len > 4096) return error.InvalidGroupedSourceCommand;
-                if (self.action != .activate) {
+                if (!self.isActivation()) {
                     const page = value.page orelse return error.InvalidGroupedSourceCommand;
                     try page.validate();
                 }
@@ -131,7 +136,7 @@ pub const Command = struct {
             .publish => self.publish.?.held.group.anchor(a),
             .finish => self.finish.?.held.group.anchor(a),
             .acknowledge => a.dupe(u8, self.acknowledge.?.document),
-            .backfill, .retire, .activate => a.dupe(u8, self.backfill.?.route.value),
+            .backfill, .retire, .activate, .activate_catalog => a.dupe(u8, self.backfill.?.route.value),
         };
     }
 };
@@ -187,6 +192,7 @@ pub fn validateRequest(req: anytype) !void {
     try command.validate();
     const empty: @TypeOf(req) = .{};
     inline for (@typeInfo(@TypeOf(req)).@"struct".field_names, @typeInfo(@TypeOf(req)).@"struct".field_types) |name, T| {
+        if (comptime std.mem.eql(u8, name, "document_version_scheme")) continue;
         if (comptime !std.mem.eql(u8, name, "group_source") and !std.mem.eql(u8, name, "sync_level")) {
             if (comptime @typeInfo(T) == .pointer and @typeInfo(T).pointer.size == .slice) {
                 if (@field(req, name).len != 0) return error.InvalidGroupedSourceCommand;

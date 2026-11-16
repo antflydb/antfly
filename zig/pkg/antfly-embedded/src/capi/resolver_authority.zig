@@ -747,7 +747,7 @@ fn projection(root: *h.Handle, a: A, cfg: h.db_mod.ResolverConfig) !?Projection 
 /// Build one current namespace outside writer leases and publish all local
 /// consumers atomically. Missing/recreated destinations retract old projections
 /// immediately, independent of physical cleanup of the retired authority.
-const query_pins_owner_marker = prefix ++ "query-pins-owner-enrolled-v3";
+const query_pins_owner_marker = prefix ++ "query-pins-owner-enrolled-v9";
 fn queryPinsWorkPossible(database: *h.db_mod.DB, a: A) !bool {
     if (!database.core.index_manager.hasResolverDefinitions()) return false;
     _ = database.core.store.get(a, query_pins_owner_marker) catch |err| return if (err == error.NotFound) true else err;
@@ -1303,6 +1303,59 @@ pub fn hasProjectionDebt(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     return false;
 }
 
+test "capi resolver curation namespace outcomes stay bounded through JSON round trips" {
+    const api = @import("db.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try api.TestDirectory.init("resolver-absorbed-response-budget");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    defer h.closeHandle(root);
+    const template = "concept/{{_key}}";
+    const selected = try a.alloc(Consumer, 256);
+    for (selected) |*source| source.* = .{ .db = &root.db, .source = "default", .cfg = .{
+        .name = "r",
+        .table = "entities",
+        .source_artifact = "kg",
+        .resolution_artifact = "resolved",
+        .key_template = template,
+        .promote = false,
+        .retired = true,
+    } };
+    const cascade = try a.alloc(c.AbsorbedResult, 1000);
+    for (cascade, 0..) |*item, i| item.* = .{ .key = try std.fmt.allocPrint(a, "concept/{d}", .{i}), .disposition = .suppress };
+    var heads: ResultHeads = .empty;
+    try heads.put(a, template, .{ .key_template = template, .revision = 1 });
+    const buffer = try a.alloc(u8, 8 * 1024 * 1024);
+    var sizes: [2]usize = undefined;
+    for ([_]usize{ 1, selected.len }, &sizes) |count, *size| {
+        var bounded = std.heap.FixedBufferAllocator.init(buffer);
+        const budget = bounded.allocator();
+        const rows = try results(budget, 0, selected[0..count], undefined, "concept/root", false, true, heads);
+        // Include the complete wire response and the decode/re-encode used
+        // by wait processing. Per-consumer cascades exceed this budget.
+        const bytes = try json(budget, .{
+            .entity_table = "entities",
+            .key = "concept/root",
+            .atomicity = "namespace",
+            .complete = true,
+            .namespaces = &.{.{ .key_template = template, .revision = 1, .changed = true, .absorbed = cascade }},
+            .results = rows,
+        });
+        size.* = bytes.len;
+        try std.testing.expect(bytes.len < 256 * 1024);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, budget, bytes, .{});
+        try std.testing.expectEqual(cascade.len, parsed.object.get("namespaces").?.array.items[0].object.get("absorbed").?.array.items.len);
+        try std.testing.expectEqual(count, parsed.object.get("results").?.array.items.len);
+        for (parsed.object.get("results").?.array.items) |row| try std.testing.expect(!row.object.contains("absorbed"));
+        try std.testing.expectEqualStrings(bytes, try json(budget, parsed));
+    }
+    // Adding consumers adds scalar progress rows, never another cascade.
+    try std.testing.expect(sizes[1] - sizes[0] < selected.len * 512);
+    std.debug.print("EMBEDDED OUTCOMES consumers=1/256 absorbed=1000 response_bytes={d}/{d} round_trip_budget=8MiB\n", .{ sizes[0], sizes[1] });
+}
+
 test "capi resolver curation prepared adoption fences a source config edit" {
     const api = @import("db.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1331,6 +1384,14 @@ test "capi resolver curation prepared adoption fences a source config edit" {
 }
 
 test "capi resolver curation indexed static profiles exclude seventeen thousand unrelated aliases after projection and reopen" {
+    try exerciseIndexedStaticProfiles(17, 1000, false);
+}
+
+test "capi resolver curation indexed static profiles adopt legacy enrollment before warm mutations and reopen" {
+    try exerciseIndexedStaticProfiles(2, 2, true);
+}
+
+fn exerciseIndexedStaticProfiles(profile_count: usize, aliases_per_profile: usize, legacy_adoption: bool) !void {
     const api = @import("db.zig");
     const a0 = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a0);
@@ -1339,36 +1400,50 @@ test "capi resolver curation indexed static profiles exclude seventeen thousand 
     var tmp = try api.TestDirectory.init("resolver-indexed-static-profiles");
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
-    var root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    // Exercise real projection publication and reopen without power-loss syncs.
+    var root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true, .no_sync = true }, true, null, null);
     var handle = try api.publishHandle(root);
     defer api.antfly_db_close(handle);
     try tables.create(root, "entities", "{}", false);
-    for (0..17) |i| {
-        const static = try a.alloc(@import("antfly_resolver").KeyAlias, 1000);
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    // Establish a real authority with the first profile. Later enrollments
+    // exercise warm transactional profile/adjacency publication, rather than
+    // rebuilding all 17,000 aliases merely to prepare the lookup assertions.
+    for (0..profile_count) |i| {
+        const static = try a.alloc(@import("antfly_resolver").KeyAlias, aliases_per_profile);
         for (static, 0..) |*alias, j| alias.* = .{ .key = try std.fmt.allocPrint(a, "concept/noise-{d}-{d}", .{ i, j }), .target = try std.fmt.allocPrint(a, "concept/target-{d}-{d}", .{ i, j }) };
         if (i == 0) static[0] = .{ .key = "concept/seed", .target = "concept/bridge" };
         if (i == 1) static[0] = .{ .key = "concept/bridge", .target = "concept/end" };
         _ = try root.db.upsertResolverWithResultOptions(.{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .source_artifact = try std.fmt.allocPrint(a, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(a, "out-{d}", .{i}), .key_template = "concept/{{_key}}", .aliases = static, .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
+        if (!legacy_adoption and i == 0) {
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/new"), .fromSlice("{\"into\":\"concept/new-target\"}"), &out));
+            api.antfly_buffer_free(&out);
+        }
     }
-    var out: h.capi.Buffer = .{};
-    defer api.antfly_buffer_free(&out);
-    // Cold adoption folds legacy policy once. Warm operations use adjacency.
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/new"), .fromSlice("{\"into\":\"concept/new-target\"}"), &out));
-    api.antfly_buffer_free(&out);
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    // Keep a distinct legacy fixture: pre-bootstrap enrollment is untrusted
+    // until adoption has rebuilt it, after which warm operations use adjacency.
+    if (legacy_adoption) {
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/new"), .fromSlice("{\"into\":\"concept/new-target\"}"), &out));
+        api.antfly_buffer_free(&out);
+    }
+    // Warm enrollment already commits the alias projection transactionally.
+    // The large case isolates its lookup/reopen bounds; drain unrelated empty
+    // producer retirement only in the separate legacy lifecycle fixture.
+    if (legacy_adoption) try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
     native.static_profiles.test_edge_visits.store(0, .monotonic);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"into\":\"concept/final\",\"replace\":true}"), &out));
     api.antfly_buffer_free(&out);
     try std.testing.expect(native.static_profiles.test_edge_visits.load(.monotonic) <= 8);
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    if (legacy_adoption) try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
     api.antfly_db_close(handle);
-    root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, false, null, null);
+    root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true, .no_sync = true }, false, null, null);
     handle = try api.publishHandle(root);
     native.static_profiles.test_edge_visits.store(0, .monotonic);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_unmerge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"pin_distinct\":true}"), &out));
     api.antfly_buffer_free(&out);
     try std.testing.expect(native.static_profiles.test_edge_visits.load(.monotonic) <= 8);
-    try std.testing.expectEqualStrings("23", try root.db.core.store.get(a, catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings(try catalog.readerVersionBytes(catalog.resolver_pin_index_reader_version), try root.db.core.store.get(a, catalog.minimum_reader_key));
 }
 
 test "capi resolver curation static directory fences consumers enrolled after discovery" {
@@ -1889,6 +1964,6 @@ test "capi resolver curation owner materializes graph fenced root pins and reope
         defer prepared.release();
         const page = try authority.queryExecutionPrepared(prepared, &.{"entity/root"}, &.{}, true);
         try std.testing.expectEqual(@as(usize, 1), page.namespace.state.distinct.len);
-        try std.testing.expectEqualStrings("23", try root.db.core.store.get(a, catalog.minimum_reader_key));
+        try std.testing.expectEqualStrings(try catalog.readerVersionBytes(catalog.resolver_pin_index_reader_version), try root.db.core.store.get(a, catalog.minimum_reader_key));
     }
 }

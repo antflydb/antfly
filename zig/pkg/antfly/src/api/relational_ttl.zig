@@ -33,8 +33,7 @@ const CommitCancellation = struct {
     request: operation.RequestContext,
     fn canceled(ptr: *const anyopaque) bool {
         const self: *const CommitCancellation = @ptrCast(@alignCast(ptr));
-        self.request.ensureActive() catch return true;
-        return false;
+        return self.request.isCancellationRequested();
     }
 };
 

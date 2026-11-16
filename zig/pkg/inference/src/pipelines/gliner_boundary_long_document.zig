@@ -119,10 +119,35 @@ pub const Plan = struct {
     inference_fingerprint: ?[32]u8,
     fingerprint: [32]u8,
     descriptor: Descriptor,
+    word_splitter: processor.WordSplitter = .whitespace,
 
     pub fn deinit(self: *Plan) void {
         self.owner.deinit();
         self.* = undefined;
+    }
+    /// Rebind only this plan value's semantic identity. Geometry and ownership
+    /// are unchanged, allowing a borrowed view of immutable prepared windows.
+    pub fn rebindInferenceProfile(self: *Plan, profile: [32]u8) void {
+        self.inference_fingerprint = profile;
+        self.fingerprint = self.computeFingerprint();
+    }
+    fn computeFingerprint(self: Plan) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-gliner25-window-plan/v1\x00");
+        hash.update(&self.schema_fingerprint);
+        if (self.inference_fingerprint) |profile| hash.update(&profile);
+        hashNumber(&hash, self.text.len);
+        hash.update(self.text);
+        hashNumber(&hash, @backingInt(self.word_splitter));
+        hashNumber(&hash, @backingInt(self.descriptor.mode));
+        hashNumber(&hash, @backingInt(self.descriptor.other_record_identity));
+        for (self.windows) |window| {
+            hashNumber(&hash, window.bytes.start);
+            hashNumber(&hash, window.bytes.end);
+            hashNumber(&hash, window.owned_words.start);
+            hashNumber(&hash, window.owned_words.end);
+        }
+        return hash.finalResult();
     }
     pub fn identity(self: Plan, index: usize) !Identity {
         if (index >= self.windows.len) return error.InvalidLongDocumentWindow;
@@ -226,24 +251,9 @@ fn planOwned(owner: *Owner, text: []const u8, schema_fingerprint: [32]u8, option
     const copied = try a.dupe(u8, text);
     const offsets = try boundary.OffsetMap.init(a, copied, options.max_document_bytes);
     try check(options.control);
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly-gliner25-window-plan/v1\x00");
-    hash.update(&schema_fingerprint);
-    if (options.inference_fingerprint) |profile| hash.update(&profile);
-    hashNumber(&hash, text.len);
-    hash.update(text);
-    hashNumber(&hash, @backingInt(options.word_splitter));
-    hashNumber(&hash, @backingInt(options.mode));
-    hashNumber(&hash, @backingInt(options.other_record_identity));
-    for (planned_windows) |window| {
-        hashNumber(&hash, window.bytes.start);
-        hashNumber(&hash, window.bytes.end);
-        hashNumber(&hash, window.owned_words.start);
-        hashNumber(&hash, window.owned_words.end);
-    }
-    var fingerprint: [32]u8 = undefined;
-    hash.final(&fingerprint);
-    return .{ .owner = owner, .text = copied, .words = ranges, .windows = planned_windows, .offsets = offsets, .schema_fingerprint = schema_fingerprint, .inference_fingerprint = options.inference_fingerprint, .fingerprint = fingerprint, .descriptor = .{ .mode = options.mode, .other_record_identity = options.other_record_identity } };
+    var result = Plan{ .owner = owner, .text = copied, .words = ranges, .windows = planned_windows, .offsets = offsets, .schema_fingerprint = schema_fingerprint, .inference_fingerprint = options.inference_fingerprint, .fingerprint = undefined, .descriptor = .{ .mode = options.mode, .other_record_identity = options.other_record_identity }, .word_splitter = options.word_splitter };
+    result.fingerprint = result.computeFingerprint();
+    return result;
 }
 
 pub const MergeOptions = struct {
@@ -1179,6 +1189,25 @@ fn testSource(start: usize, end: usize) pipeline.SourceSpan {
 }
 fn testValue(text: []const u8, start: usize, end: usize, probability: f32) pipeline.Value {
     return .{ .text = text, .confidence = probability, .source = testSource(start, end), .token_span = null };
+}
+
+test "boundary preparation semantic rebinding preserves geometry and matches a fresh plan" {
+    const a = std.testing.allocator;
+    var options = testOptions();
+    var original = try plan(a, "A B C D E F", @splat(1), options);
+    defer original.deinit();
+    const before = original.fingerprint;
+    const next: [32]u8 = @splat(8);
+    options.inference_fingerprint = next;
+    var fresh = try plan(a, "A B C D E F", @splat(1), options);
+    defer fresh.deinit();
+    // This value borrows original's geometry; its owner remains original.
+    var view = original;
+    view.rebindInferenceProfile(next);
+    try std.testing.expectEqual(fresh.fingerprint, view.fingerprint);
+    try std.testing.expectEqual(before, original.fingerprint);
+    try std.testing.expect(view.windows.ptr == original.windows.ptr);
+    try fresh.validateIdentity(try view.identity(0));
 }
 
 test "gliner boundary long document planner is explicit source exact and accounts for synthetic words" {

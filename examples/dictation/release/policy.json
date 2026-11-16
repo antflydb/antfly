@@ -1,0 +1,21 @@
+{
+  "sparkle_version": "2.10.1",
+  "sparkle_tools_sha256": "1a856d2a9edb8e628de88121d7be04cf0e2167f8641650b78fca00b14244cf27",
+  "repository": "antflydb/antfly",
+  "bundle_id": "dev.antfly.dictation",
+  "minimum_system_version": "15.0",
+  "bucket": "antfly-releases",
+  "storage_prefix": "antfly-dictation",
+  "public_base_url": "https://releases.antfly.io/antfly-dictation",
+  "runtime": {
+    "tag": "v0.3.0",
+    "source_commit": "727b70d1e22714a11a1b6a06ede48c435241237c",
+    "archive": "antfly_0.3.0_Darwin_arm64.tar.gz",
+    "ledger_sha256": "1202c7add08c1205c4ba4720c1164bc19af0e5425b5802384323de54e101e9ed",
+    "sha256": "ae1cf137fae51ed79e6ebee5d4da4e22e48bce79f74e4a93cc9782a942b4b51b",
+    "size": 149762392,
+    "architecture": "arm64",
+    "apple_providers": true,
+    "payload_sha256": "1c03c78d1040a36475afeafe1b35ebc028c3e8814762d1176233f2b0be3a450c"
+  }
+}

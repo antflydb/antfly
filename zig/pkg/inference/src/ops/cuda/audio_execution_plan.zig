@@ -17,103 +17,10 @@
 //! last consumer has been submitted on the same stream. No request is rerun
 //! for planning; capture validates the complete allocation/free event sequence.
 const std = @import("std");
-pub const limit = 128 * 1024 * 1024;
-const Allocation = struct { bytes: usize, offset: usize, pointer: usize, live: bool = true };
-const Event = struct { slot: usize, allocate: bool };
-pub const Plan = struct {
-    allocations: [2048]Allocation = undefined,
-    events: [4096]Event = undefined,
-    count: usize = 0,
-    event_count: usize = 0,
-    peak: usize = 0,
-    output: usize = 0,
-    valid: bool = true,
-    fn event(self: *Plan, slot: usize, is_alloc: bool) void {
-        if (self.event_count == self.events.len) {
-            self.valid = false;
-            return;
-        }
-        self.events[self.event_count] = .{ .slot = slot, .allocate = is_alloc };
-        self.event_count += 1;
-    }
-    pub fn allocate(self: *Plan, bytes: usize, pointer: usize) void {
-        if (!self.valid) return;
-        if (self.count == self.allocations.len or bytes > limit) {
-            self.valid = false;
-            return;
-        }
-        const extent = std.mem.alignForward(usize, bytes, 256);
-        var offset: usize = 0;
-        while (true) {
-            var next = offset;
-            for (self.allocations[0..self.count]) |a| if (a.live and offset < a.offset + std.mem.alignForward(usize, a.bytes, 256) and a.offset < offset + extent) {
-                next = @max(next, a.offset + std.mem.alignForward(usize, a.bytes, 256));
-            };
-            if (next == offset) break;
-            offset = next;
-        }
-        if (offset > limit - extent) {
-            self.valid = false;
-            return;
-        }
-        self.allocations[self.count] = .{ .bytes = bytes, .offset = offset, .pointer = pointer };
-        self.event(self.count, true);
-        self.count += 1;
-        self.peak = @max(self.peak, offset + extent);
-    }
-    pub fn release(self: *Plan, pointer: usize) void {
-        if (!self.valid) return;
-        for (self.allocations[0..self.count], 0..) |*a, i| if (a.live and a.pointer == pointer) {
-            a.live = false;
-            self.event(i, false);
-            return;
-        };
-    }
-    pub fn finish(self: *Plan, pointer: usize) bool {
-        var live: usize = 0;
-        for (self.allocations[0..self.count], 0..) |a, i| if (a.live) {
-            live += 1;
-            if (a.pointer == pointer) self.output = i else self.valid = false;
-        };
-        self.valid = self.valid and live == 1;
-        return self.valid;
-    }
-};
-pub const Scope = struct {
-    plan: *Plan,
-    base: usize = 0,
-    cursor: usize = 0,
-    valid: bool = true,
-    pub fn owns(self: *const Scope, pointer: usize) bool {
-        return self.base != 0 and pointer >= self.base and pointer - self.base < self.plan.peak;
-    }
-    pub fn allocate(self: *Scope, bytes: usize) !usize {
-        if (!self.valid or self.cursor == self.plan.event_count) return error.AudioPlanChanged;
-        const e = self.plan.events[self.cursor];
-        if (!e.allocate or self.plan.allocations[e.slot].bytes != bytes) {
-            self.valid = false;
-            return error.AudioPlanChanged;
-        }
-        self.cursor += 1;
-        return self.base + self.plan.allocations[e.slot].offset;
-    }
-    pub fn release(self: *Scope, pointer: usize) void {
-        if (self.base == 0) {
-            self.plan.release(pointer);
-            return;
-        }
-        if (!self.valid or self.cursor == self.plan.event_count) {
-            self.valid = false;
-            return;
-        }
-        const e = self.plan.events[self.cursor];
-        if (e.allocate or self.base + self.plan.allocations[e.slot].offset != pointer) {
-            self.valid = false;
-            return;
-        }
-        self.cursor += 1;
-    }
-};
+const arena = @import("execution_arena.zig");
+pub const limit = arena.limit;
+pub const Plan = arena.Plan;
+pub const Scope = arena.Scope;
 pub const Entry = struct { key: u64 = 0, stamp: u64 = 0, warmed: bool = false, disabled: bool = false, plan: ?*Plan = null };
 pub const Cache = struct {
     entries: [8]Entry = @splat(.{}),

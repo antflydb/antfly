@@ -82,13 +82,35 @@ fn cloneUnit(alloc: Allocator, unit: extraction.Unit) !extraction.Unit {
     errdefer if (out.extraction_status) |value| alloc.free(value);
     out.source_sha256 = try dupeOptional(alloc, unit.source_sha256);
     errdefer if (out.source_sha256) |value| alloc.free(value);
+    out.ocr_failure_stage = try dupeOptional(alloc, unit.ocr_failure_stage);
+    errdefer if (out.ocr_failure_stage) |value| alloc.free(value);
+    out.ocr_trigger_reasons = try dupeOptional(alloc, unit.ocr_trigger_reasons);
+    errdefer if (out.ocr_trigger_reasons) |value| alloc.free(value);
+    out.ocr_embedded_quality = try dupeOptional(alloc, unit.ocr_embedded_quality);
+    errdefer if (out.ocr_embedded_quality) |value| alloc.free(value);
+    out.ocr_output_quality = try dupeOptional(alloc, unit.ocr_output_quality);
+    errdefer if (out.ocr_output_quality) |value| alloc.free(value);
     out.extraction_warning = try dupeOptional(alloc, unit.extraction_warning);
     errdefer if (out.extraction_warning) |value| alloc.free(value);
     out.page_label = try dupeOptional(alloc, unit.page_label);
     errdefer if (out.page_label) |value| alloc.free(value);
+    out.transcript_spans = if (unit.transcript_spans.len == 0) &.{} else try alloc.dupe(extraction.TranscriptSpan, unit.transcript_spans);
+    errdefer if (out.transcript_spans.len > 0) alloc.free(out.transcript_spans);
     out.text_regions = if (unit.text_regions.len == 0) &.{} else try alloc.dupe(extraction.TextRegion, unit.text_regions);
+    errdefer if (out.text_regions.len > 0) alloc.free(out.text_regions);
+    out.text_blocks = if (unit.text_blocks.len == 0) &.{} else try alloc.dupe(extraction.TextBlock, unit.text_blocks);
     out.byte_length = unit.byte_length;
+    out.native_text_quality = unit.native_text_quality;
+    out.native_text_diagnostics = unit.native_text_diagnostics;
     out.ocr_used = unit.ocr_used;
+    out.ocr_attempted = unit.ocr_attempted;
+    out.ocr_render_dpi = unit.ocr_render_dpi;
+    out.ocr_render_policy = unit.ocr_render_policy;
+    out.ocr_effective_render_dpi = unit.ocr_effective_render_dpi;
+    out.ocr_rendered_width = unit.ocr_rendered_width;
+    out.ocr_rendered_height = unit.ocr_rendered_height;
+    out.ocr_rendered_bytes = unit.ocr_rendered_bytes;
+    out.ocr_failure_retryable = unit.ocr_failure_retryable;
     out.ocr_confidence = unit.ocr_confidence;
     out.ocr_bbox = unit.ocr_bbox;
     out.transcript_used = unit.transcript_used;
@@ -223,11 +245,34 @@ pub fn extractDownloadedStreamingWithLimitsWithFailure(
     sink: extraction.UnitSink,
     out_failure: *abi.FailureIdentity,
 ) !void {
+    return extractDownloadedStreamingControlled(alloc, downloaded, source_url, config_json, raw_document_json, pdf_decode_limits, sink, out_failure, null);
+}
+
+fn extractDownloadedStreamingControlled(
+    alloc: Allocator,
+    downloaded: anytype,
+    source_url: []const u8,
+    config_json: []const u8,
+    raw_document_json: []const u8,
+    pdf_decode_limits: @TypeOf((extraction.Config{}).pdf_decode_limits),
+    sink: extraction.UnitSink,
+    out_failure: *abi.FailureIdentity,
+    control: ?@import("antfly_inference_execution_context").RequestContext,
+) !void {
     out_failure.* = .{};
     var context = Context{ .alloc = alloc, .sink = sink };
     var failure: abi.FailureIdentity = .{};
     const allocator = abi.Allocator.fromStd(&alloc);
+    const Control = struct {
+        fn canceled(raw: ?*const anyopaque) callconv(.c) u8 {
+            const ctx: *const ?@import("antfly_inference_execution_context").RequestContext = @ptrCast(@alignCast(raw.?));
+            if (ctx.*) |value| value.check() catch return 1;
+            return 0;
+        }
+    };
+    if (control) |value| try value.check();
     const status = abi.antfly_enrichment_extract_stream(&.{
+        .cancellation = .{ .context = &control, .is_cancelled = Control.canceled },
         .allocator = &allocator,
         .downloaded = .fromSlice(downloaded.data),
         .downloaded_content_type = .fromSlice(downloaded.content_type),
@@ -310,6 +355,16 @@ pub fn extractDownloadedAllocWithLimitsWithFailure(
     return try collector.finish();
 }
 
+pub fn extractDownloadedControlledAlloc(alloc: Allocator, downloaded: anytype, source_url: []const u8, config_json: []const u8, raw_document_json: []const u8, limits: @TypeOf((extraction.Config{}).pdf_decode_limits), out_failure: *abi.FailureIdentity, control: ?@import("antfly_inference_execution_context").RequestContext) !extraction.Result {
+    var collector = ResultCollector{ .alloc = alloc };
+    defer collector.deinit();
+    extractDownloadedStreamingControlled(alloc, downloaded, source_url, config_json, raw_document_json, limits, collector.sink(), out_failure, control) catch |err| {
+        if (control) |value| try value.check();
+        return err;
+    };
+    return collector.finish();
+}
+
 pub fn renderPdfPagePngAdaptiveAlloc(
     alloc: Allocator,
     pdf_bytes: []const u8,
@@ -335,7 +390,7 @@ pub fn renderPdfPagePngAdaptiveAllocWithFailure(
     max_working_set_bytes: usize,
     out_failure: *abi.FailureIdentity,
 ) !extraction.RenderedPdfPage {
-    return renderPdfPagePngAdaptiveControlledAllocWithFailure(alloc, alloc, pdf_bytes, page_number, dpi, max_pixels, max_dimension, max_decoded_stream_bytes, max_working_set_bytes, 0, out_failure);
+    return renderPdfPagePngAdaptiveControlledAllocWithFailure(alloc, alloc, pdf_bytes, page_number, dpi, max_pixels, max_dimension, max_decoded_stream_bytes, max_working_set_bytes, 0, .auto, out_failure);
 }
 
 pub fn renderPdfPagePngAdaptiveControlledAllocWithFailure(
@@ -349,6 +404,7 @@ pub fn renderPdfPagePngAdaptiveControlledAllocWithFailure(
     max_decoded_stream_bytes: usize,
     max_working_set_bytes: usize,
     render_timeout_ms: u64,
+    sampling: extraction.ImageSamplingPolicy,
     out_failure: *abi.FailureIdentity,
 ) !extraction.RenderedPdfPage {
     out_failure.* = .{};
@@ -363,6 +419,7 @@ pub fn renderPdfPagePngAdaptiveControlledAllocWithFailure(
         .pdf_bytes = .fromSlice(pdf_bytes),
         .page_number = @intCast(page_number),
         .dpi = dpi,
+        .sampling = @backingInt(sampling),
         .max_pixels = max_pixels,
         .max_dimension = max_dimension,
         .max_decoded_stream_bytes = @intCast(max_decoded_stream_bytes),
@@ -436,4 +493,35 @@ fn logProviderFailure(label: []const u8, failure: abi.FailureIdentity) void {
         failure.errorName(),
         failure.error_name_hash,
     });
+}
+
+test "document extraction client clone owns native metadata arrays" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            var spans = [_]extraction.TranscriptSpan{.{ .char_start = 0, .char_end = 4, .start_ms = 1, .end_ms = 2 }};
+            var regions = [_]extraction.TextRegion{.{ .span = .{ 0, 4 }, .bbox = .{ 1, 2, 3, 4 }, .font_size = 9, .italic = true }};
+            var blocks = [_]extraction.TextBlock{.{ .span = .{ 0, 4 }, .bbox = .{ 1, 2, 3, 4 }, .reading_order = 0, .font_size = 9, .italic = true }};
+            const source = extraction.Unit{
+                .unit_id = @constCast("page:000001"),
+                .unit_type = @constCast("page"),
+                .text = @constCast("text"),
+                .method = @constCast("pdf_text"),
+                .source_path = @constCast("page/1"),
+                .native_text_quality = .{ .trimmed_len = 4, .non_whitespace_chars = 4 },
+                .native_text_diagnostics = .{ .policy = .visible, .source_run_count = 1, .emitted_run_count = 1 },
+                .ocr_trigger_reasons = @constCast("too_short"),
+                .transcript_spans = &spans,
+                .text_regions = &regions,
+                .text_blocks = &blocks,
+            };
+            var cloned = try cloneUnit(alloc, source);
+            defer cloned.deinit(alloc);
+            try std.testing.expectEqualDeep(source, cloned);
+            try std.testing.expect(source.text.ptr != cloned.text.ptr);
+            try std.testing.expect(source.text_regions.ptr != cloned.text_regions.ptr);
+            try std.testing.expect(source.text_blocks.ptr != cloned.text_blocks.ptr);
+            try std.testing.expect(source.transcript_spans.ptr != cloned.transcript_spans.ptr);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

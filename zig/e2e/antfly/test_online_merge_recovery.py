@@ -147,6 +147,24 @@ def test_constraint_activation_wait_preserves_process_failure():
         wait_for_constraint_activation(Cluster(), None, "parent")
 
 
+def parse_owner_control(body, path):
+    """Inspect control objects and the batch codec's explicit version envelopes."""
+    try:
+        control = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    if (
+        isinstance(control, list)
+        and len(control) == 2
+        and control[0] in ("row-semantics-batch-v1", "document-revisions-batch-v1")
+    ):
+        control = control[1]
+    if not isinstance(control, dict):
+        return {}
+    control["_fault_path"] = path
+    return control
+
+
 class OwnerLinkFault:
     def __init__(self, window):
         self.window = window
@@ -386,6 +404,52 @@ class OwnerLinkFault:
         with self.lock:
             self.drop_next_reply = True
             self.healed = True
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'[{"operation":{"snapshot":{}}}]',
+        b'["unknown-v1",{"operation":{"snapshot":{}}}]',
+        b'"batch"',
+        b"null",
+        b"7",
+        b"\xff",
+    ],
+)
+def test_owner_link_fault_ignores_opaque_batch_roots(body):
+    fault = OwnerLinkFault("snapshot")
+    control = parse_owner_control(body, "/internal/groups/7/batch-routed-v1")
+    fault.observe_request(control)
+    assert not fault.block(0, control)
+    assert not fault.observed()
+    # Actual object control traffic still reaches the exact armed fault.
+    snapshot = parse_owner_control(
+        b'{"operation":{"snapshot":{}}}', "/internal/groups/7/online-merge-io"
+    )
+    assert fault.block(0, snapshot)
+    assert fault.observed() == {0}
+
+
+@pytest.mark.parametrize(
+    "marker", ["row-semantics-batch-v1", "document-revisions-batch-v1"]
+)
+@pytest.mark.parametrize(
+    "window,payload",
+    [
+        ("release", {"_online_source": {"release": {}}}),
+        (
+            "accept",
+            {"_merge_checkpoint": {"kind": "page_v4_accept"}, "_artifact_catalog": {}},
+        ),
+    ],
+)
+def test_owner_link_fault_matches_versioned_control_batches(marker, window, payload):
+    fault = OwnerLinkFault(window)
+    body = json.dumps([marker, payload]).encode()
+    control = parse_owner_control(body, "/internal/groups/7/batch-routed-v1")
+    assert fault.block(0, control)
+    assert fault.observed() == {0}
 
 
 def test_owner_link_failed_response_diagnostics_survive_heal_and_stay_bounded():
@@ -634,14 +698,9 @@ def owner_link_fault(request, monkeypatch):
                 # through unchanged unless the quorum outage is active.
                 control = {}
                 if index < 3 and self.command == "POST" and "/internal/" in self.path:
-                    try:
-                        control = json.loads(body)
-                    except (ValueError, UnicodeDecodeError):
-                        pass
-                    if isinstance(control, dict):
-                        # Test-only metadata: the original wire bytes below
-                        # are forwarded unchanged to the actual owner.
-                        control["_fault_path"] = self.path
+                    # Test-only metadata: the original wire bytes below
+                    # are forwarded unchanged to the actual owner.
+                    control = parse_owner_control(body, self.path)
                 raft_blocked = index >= 3 and fault.raft_cut.is_set()
                 if index < 3:
                     fault.observe_request(control)
@@ -1278,3 +1337,93 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
             timeout_s=60,
         ), cluster.debug_logs()
         timings.mark("verify.post_cutover_cascade")
+
+
+@pytest.mark.parametrize("lost_reply", [False, True])
+def test_merge_admission_observes_uncertain_submission_without_replaying(lost_reply):
+    attempts, observations = [], []
+    now = [0.0]
+
+    def submit(remaining):
+        attempts.append(remaining)
+        assert len(attempts) <= 2, "uncertain mutation was resubmitted"
+        if len(attempts) == 2 and lost_reply:
+            raise requests.Timeout("reply lost")
+        result = requests.Response()
+        result.status_code = 503
+        result._content = b"metadata authority unavailable"
+        result.headers["X-Antfly-Raft-Mutation-Outcome"] = (
+            "not-proposed-v1" if len(attempts) == 1 else "unknown-v1"
+        )
+        if len(attempts) == 1:
+            result.headers["X-Antfly-Metadata-Mutation-Not-Admitted"] = "true"
+        return result
+
+    def observe(remaining):
+        observations.append(remaining)
+        if len(observations) == 1:
+            raise requests.Timeout("observation timed out")
+        return len(observations) == 3
+
+    backups._admit_metadata_transition(
+        submit,
+        observe,
+        timeout_s=1,
+        clock=lambda: now[0],
+        sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+    )
+    assert len(attempts) == 2 and len(observations) == 3
+    assert all(0 < remaining <= 1 for remaining in attempts + observations)
+
+
+@pytest.mark.parametrize("outcome", [None, "unknown-v1", "not-proposed-v1"])
+def test_merge_admission_never_blindly_retries_unproven_rejections(outcome):
+    attempts = []
+    now = [0.0]
+
+    def submit(remaining):
+        attempts.append(remaining)
+        result = requests.Response()
+        result.status_code = 503
+        result._content = b"unavailable"
+        if outcome:
+            result.headers["X-Antfly-Raft-Mutation-Outcome"] = outcome
+        return result
+
+    with pytest.raises(AssertionError):
+        backups._admit_metadata_transition(
+            submit,
+            lambda remaining: False,
+            timeout_s=0.2,
+            clock=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        )
+    assert len(attempts) == 1
+
+
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_merge_admission_rejects_late_success(uncertain):
+    now = [0.0]
+
+    def submit(remaining):
+        result = requests.Response()
+        result.status_code = 503 if uncertain else 202
+        result._content = b""
+        if uncertain:
+            result.headers["X-Antfly-Raft-Mutation-Outcome"] = "unknown-v1"
+        else:
+            now[0] = 2
+        return result
+
+    def observe(remaining):
+        now[0] = 2
+        return True
+
+    with pytest.raises(AssertionError, match="exceeded its deadline"):
+        backups._admit_metadata_transition(
+            submit,
+            observe,
+            timeout_s=1,
+            clock=lambda: now[0],
+            sleep=lambda delay: now.__setitem__(0, now[0] + delay),
+        )

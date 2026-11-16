@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from . import _ffi, errors
-from ._database import Database, GraphDirection, TxnID, TxnStatus, WriteIntent
+from ._database import Database, GraphDirection, OutcomeReceiptStatus, TxnID, TxnStatus, WriteIntent
 from ._inference import Inference, PullProgress
 from ._json import decode_json_response, encode_text
 from ._library import LibraryNotFoundError
@@ -47,6 +47,7 @@ from .errors import (
     AntflyError,
     BusyError,
     CancelledError,
+    GraphError,
     IntentConflictError,
     InternalError,
     InvalidArgumentError,
@@ -62,12 +63,14 @@ from .errors import (
 )
 
 __all__ = [
+    "GraphError",
     "__version__",
     "Database",
     "WriteIntent",
     "TxnID",
     "TxnStatus",
     "GraphDirection",
+    "OutcomeReceiptStatus",
     "OpenMode",
     "Profile",
     "Storage",
@@ -180,8 +183,9 @@ class OpenOptions:
     semantics only for Storage.LITE, so creating directory storage surfaces
     the library's own error rather than being special-cased here.
 
-    busy_timeout, like sqlite3_busy_timeout, keeps retrying a native operation
-    while another process holds the database's writer lease. None
+    busy_timeout, like sqlite3_busy_timeout, retries Lite admission while
+    another process holds the writer lease or advances the allocator checkpoint.
+    Mutation bodies are never replayed by this admission retry. None
     or zero fails immediately with BusyError. Accepts a number of seconds
     (float/int) or a datetime.timedelta; the C ABI takes whole milliseconds,
     rounded up.

@@ -21,9 +21,20 @@ use antfly_embedded_sys::{self as sys, antfly_buffer, antfly_db, antfly_error_co
 
 use crate::error::{Error, Result};
 use crate::ffi::{
-    HandleGate, borrow_slice, check, path_has_suffix, path_to_bytes, path_to_cstring, take_buffer,
+    HandleGate, borrow_slice, check, check_outcome, path_has_suffix, path_to_bytes,
+    path_to_cstring, take_buffer,
 };
 use crate::options::{GraphDirection, OpenOptions, WriteIntent};
+
+/// The resolved outcome of a write that failed with
+/// [`Error::OutcomeUnknown`]; see [`Database::outcome_receipt_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeReceiptStatus {
+    /// The uncertain write applied.
+    Applied,
+    /// The uncertain write did not apply.
+    NotApplied,
+}
 
 /// The Antfly C ABI version this binding expects.
 pub const SUPPORTED_ABI_VERSION: u32 = 3;
@@ -455,7 +466,7 @@ impl Database {
             } else {
                 c_writes.as_ptr()
             };
-            check(unsafe {
+            check_outcome(unsafe {
                 sys::antfly_db_batch(
                     handle,
                     ptr,
@@ -470,9 +481,50 @@ impl Database {
     }
 
     /// Applies a public Antfly batch request and returns the JSON result.
+    /// An `OutcomeUnknown` failure carries its outcome receipt (see
+    /// [`Error::outcome_receipt`]).
     pub fn batch_json(&self, request: impl AsRef<[u8]>) -> Result<Vec<u8>> {
-        self.with_input_output(request.as_ref(), |h, input, out| unsafe {
-            sys::antfly_db_batch_json(h, input, out)
+        let request = request.as_ref();
+        self.with_handle(|handle| {
+            let mut out = antfly_buffer::default();
+            let code =
+                unsafe { sys::antfly_db_batch_json(handle, borrow_slice(request), &mut out) };
+            if let Err(error) = check_outcome(code) {
+                unsafe { take_buffer(out) };
+                return Err(error);
+            }
+            Ok(unsafe { take_buffer(out) })
+        })
+    }
+
+    /// Resolves an outcome receipt from an `OutcomeUnknown` batch or
+    /// autocommit SQL write, on any handle for the same database. Returns
+    /// [`Error::Stalled`] while the uncertain commit is not reconciled yet:
+    /// retry on a Lite database; for a directory database, close the issuing
+    /// handle and reopen first.
+    pub fn outcome_receipt_status(&self, receipt: &str) -> Result<OutcomeReceiptStatus> {
+        self.with_handle(|handle| {
+            let mut status: u8 = 0;
+            check(unsafe {
+                sys::antfly_db_outcome_receipt_status(
+                    handle,
+                    borrow_slice(receipt.as_bytes()),
+                    &mut status,
+                )
+            })?;
+            match status {
+                sys::ANTFLY_OUTCOME_RECEIPT_APPLIED => Ok(OutcomeReceiptStatus::Applied),
+                sys::ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED => Ok(OutcomeReceiptStatus::NotApplied),
+                _ => Err(Error::Internal),
+            }
+        })
+    }
+
+    /// Removes a resolved receipt's durable marker; afterwards the receipt
+    /// can no longer be resolved.
+    pub fn forget_outcome_receipt(&self, receipt: &str) -> Result<()> {
+        self.with_input(receipt.as_bytes(), |h, input| unsafe {
+            sys::antfly_db_outcome_receipt_forget(h, input)
         })
     }
 

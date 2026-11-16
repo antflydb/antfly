@@ -31,7 +31,7 @@ pub fn parsePolicy(raw: ?WirePolicy) !planning.Policy {
     if (raw) |value| inline for (@typeInfo(planning.Policy).@"struct".field_names) |name| {
         if (@field(value, name)) |number| {
             const T = @TypeOf(@field(policy, name));
-            @field(policy, name) = std.math.cast(T, number) orelse return error.InvalidChunkPolicy;
+            @field(policy, name) = if (T == bool) number else std.math.cast(T, number) orelse return error.InvalidChunkPolicy;
         }
     };
     try policy.validate();
@@ -39,12 +39,12 @@ pub fn parsePolicy(raw: ?WirePolicy) !planning.Policy {
 }
 pub fn wirePolicy(policy: planning.Policy) WirePolicy {
     var result = WirePolicy{};
-    inline for (@typeInfo(planning.Policy).@"struct".field_names) |name| @field(result, name) = @intCast(@field(policy, name));
+    inline for (@typeInfo(planning.Policy).@"struct".field_names) |name| @field(result, name) = if (@TypeOf(@field(policy, name)) == bool) @field(policy, name) else @intCast(@field(policy, name));
     return result;
 }
 pub fn coordinates(a: std.mem.Allocator, value: planning.Coordinates) !WireCoordinates {
     var result = WireCoordinates{ .kind = @tagName(value.kind) };
-    inline for (.{ "start_byte", "end_byte", "page", "start_ns", "end_ns", "first_picture", "picture_count", "start_sample", "end_sample", "sample_rate", "start_tick", "end_tick", "timescale", "page_rotation", "raster_width", "raster_height" }) |name| {
+    inline for (.{ "start_byte", "end_byte", "page", "start_ns", "end_ns", "first_picture", "picture_count", "start_sample", "end_sample", "sample_rate", "start_tick", "end_tick", "timescale", "page_rotation", "speaker_index", "raster_width", "raster_height" }) |name| {
         if (@field(value, name)) |number| @field(result, name) = std.math.cast(i64, number) orelse return error.InvalidChunkCoordinates;
     }
     if (value.picture_basis) |basis| result.picture_basis = @tagName(basis);

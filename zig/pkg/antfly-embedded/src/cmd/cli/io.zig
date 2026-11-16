@@ -196,7 +196,7 @@ pub fn readFileAlloc(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
 /// Runtime failures never imply that a submitted operation was rejected.
 pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     if (policy.enabled) {
-        emitError("CommandFailed", .command, null, .{ .string = fmt });
+        emitFormattedError("CommandFailed", .command, fmt, args);
     } else std.debug.print("error: " ++ fmt ++ "\n", args);
     std.process.exit(1);
 }
@@ -204,9 +204,28 @@ pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 /// Call only while validating input, before submitting the operation.
 pub fn argumentError(comptime fmt: []const u8, args: anytype) noreturn {
     if (policy.enabled) {
-        emitError("InvalidArguments", .argument, null, .{ .string = fmt });
+        emitFormattedError("InvalidArguments", .argument, fmt, args);
     } else std.debug.print("error: " ++ fmt ++ "\n", args);
     std.process.exit(1);
+}
+
+/// Agent output carries the formatted message, never the raw format string.
+fn emitFormattedError(code: []const u8, category: ErrorCategory, comptime fmt: []const u8, args: anytype) void {
+    const a = std.heap.page_allocator;
+    const message = formatMessage(a, fmt, args) orelse return emitError(code, category, null, .{ .string = fmt });
+    defer a.free(message);
+    emitError(code, category, null, .{ .string = message });
+}
+
+fn formatMessage(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ?[]u8 {
+    return std.fmt.allocPrint(allocator, fmt, args) catch null;
+}
+
+test "agent error messages are formatted with their arguments" {
+    const a = std.testing.allocator;
+    const message = formatMessage(a, "timed out after {d}ms waiting for index {s}", .{ @as(u64, 30000), "knowledge" }).?;
+    defer a.free(message);
+    try std.testing.expectEqualStrings("timed out after 30000ms waiting for index knowledge", message);
 }
 
 pub fn argumentFailure(err: anyerror) anyerror {

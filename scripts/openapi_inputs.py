@@ -24,12 +24,15 @@ from pathlib import Path
 
 import yaml
 
+# Prefer LibYAML without changing safe construction or caching mutable specs.
+SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
 _inputs: ContextVar[set[Path] | None] = ContextVar("openapi_inputs", default=None)
 
 
 def load_yaml(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
+        data = yaml.load(fh, Loader=SAFE_LOADER)
     inputs = _inputs.get()
     if inputs is not None:
         inputs.add(path.absolute())

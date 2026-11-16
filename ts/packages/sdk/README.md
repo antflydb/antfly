@@ -1,5 +1,24 @@
 # Antfly TypeScript SDK
 
+## LangChain integration foundations
+
+The companion `@antfly/langchain` package uses this SDK for all database and
+inference operations. Table/index/document lookup failures expose
+`AntflyHTTPError.status` and `.body`; missing records can be distinguished from
+authentication or server failures. Empty batch responses throw
+`AntflyResponseError` instead of manufacturing mutation counts. Callers must still
+inspect the returned batch `status` to distinguish committed, pending, and
+repair-required outcomes. Do not blindly retry a mutation after a missing response.
+
+`InferenceClient.embed()` and `embedDense()` accept retrieval task type,
+dimensions, instruction, item error policy, and cancellation options. `rerank()`
+also accepts an optional `AbortSignal`. These additions preserve the existing
+method forms.
+
+`embedDense()` throws if a per-item response contains any failures, preserving
+the positional mapping between inputs and returned vectors. Use `embed()` to
+inspect successful input indexes and per-item errors when handling partial results.
+
 A TypeScript SDK for interacting with the Antfly API, suitable for both frontend and backend applications.
 
 ## Installation
@@ -428,7 +447,30 @@ HTTP/S3 objects use a version-pinned `ChunkSourceReference`. See the
 [shared contract](../../../docs/plans/model-aware-media-chunking.md) for source
 security, rendering policies, limits and native database integration.
 
-## Native memory integer precision
+## Native memory
+
+```ts
+await client.memory.put("team");
+const { evidenceId } = await client.memory.remember("team", { text: "We deploy on Tuesdays." });
+const { data: brief } = await client.memory.brief("team", { token_budget: 800 });
+const { data: hits } = await client.memory.recall("team", { query: "deploy day" });
+await client.memory.outcome("team", {
+  id: "outcome-1",
+  task_id: "task-1",
+  success: true,
+  used_memory_ids: ["memory-id"],
+});
+```
+
+Mutating helpers (`remember`, `observe`, `outcome`, `pin`, `unpin`, `configure`,
+`maintain`, ...) generate an `Idempotency-Key` UUID unless you pass
+`{ idempotencyKey }`; pass a stable key to retry safely. A string in that position
+is still accepted as the key. `remember` derives the evidence id from an explicit
+key when you omit `id`, so retries send the same body. Every helper takes `{ database, namespace, branch }`
+to set `X-Antfly-Database`, `X-Antfly-Namespace`, and `X-Antfly-Memory-Branch`.
+`brief`, `consolidate`, and `recall` are reads and send no key.
+
+### Integer precision
 
 Use `client.memory` or the typed `client.memoryApi` for `/memory/v1` endpoints.
 Safe JSON integers remain JavaScript numbers; larger native resource IDs,
@@ -439,3 +481,36 @@ Unsafe integer numbers are rejected because their original value is already lost
 `parseMemoryJSON` and `stringifyMemoryJSON` provide the same codec for external
 persistence or logging. The ordinary `client.api` surface retains its existing
 number types; native memory endpoints live on `client.memoryApi`.
+
+## Optional source management
+
+Import from `@antfly/sdk/sources`. The explicit base URL points to the Go source
+server or Colony's instance-scoped management mount, not the database listener.
+
+```typescript
+import { SourcesClient } from "@antfly/sdk/sources";
+const sources = new SourcesClient({
+  baseUrl: "https://sources.example.com/sources/v1",
+  token: sourceManagementToken,
+});
+const run = await sources.startRun(sourceId, submissionKey);
+const receipt = await sources.run(sourceId, run.id);
+```
+
+Reuse a submission key after an ambiguous response; use a new key for new work.
+Inspect both execution state and publication outcome. Provider credentials and
+media delivery stay in the selected runtime. `StandaloneSourcesClient` exposes
+standalone-only credential installation and legacy whole-profile operations.
+
+## Kysely
+
+The optional `@antfly/sdk/kysely` subpath includes `createAntflyPostgres`, which
+owns the server pool, parser policy, scoped introspection/type generation, and
+migration lifecycle. Named databases, ordered namespace lookup, qualified table
+types, and migration history in separate schemas follow Antfly's native catalog.
+
+Low-level dialect, introspection, type generation, bootstrap, and exact NUMERIC
+parser/cursor helpers remain available, alongside `antflySearch` for embedded
+SQL search composition. Install Kysely 0.29.6+ separately. See the
+[Kysely reference](docs/kysely.md) for setup, scopes, migrations, integer mappings,
+and native backend capabilities.

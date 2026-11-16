@@ -15,6 +15,7 @@
 
 //! Source ownership is selected by the build root. Keep physical imports out
 //! of control roots: Zig tracks literal imports even in inactive branches.
+pub const lake_execution_backend = @import("api/lake_execution_build_impl.zig");
 pub const physical_db = @import("antfly_local_sources").storage_db_db;
 pub const selected_db = @import("antfly_local_sources").storage_db_mod;
 pub const table_reads = @import("api/table_reads.zig");
@@ -24,3 +25,5 @@ pub const local_write = @import("antfly_local_sources").storage_local_write;
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+pub const storage_engine = @import("antfly_local_sources").storage_engine;

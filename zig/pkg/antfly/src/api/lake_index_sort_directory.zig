@@ -194,24 +194,3 @@ pub fn decode(a: A, bytes: []const u8) !Record {
     if (!std.mem.eql(u8, bytes[0..32], &try layout(a, record.bound))) return error.InvalidNativeLakeTextCorpus;
     return record;
 }
-
-/// Historical flat directories hashed only field name/direction and scalar
-/// domain. Do not reinterpret their aggregate under the cohort encoding.
-pub fn decodeLegacy(a: A, bytes: []const u8) !Record {
-    if (bytes.len <= 32) return error.InvalidNativeLakeTextCorpus;
-    const record = try std.json.parseFromSliceLeaky(Record, a, bytes[32..], .{});
-    const bound = record.bound orelse return record;
-    if (bound.fields.len == 0 or bound.fields.len != bound.first.len or bound.fields.len != bound.last.len) return error.InvalidNativeLakeTextCorpus;
-    var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update("native-sort-endpoint-layout-v1");
-    for (bound.fields, bound.first, bound.last) |field, low, high| {
-        if (low.kind != high.kind or low.kind == .null_value) return error.InvalidNativeLakeTextCorpus;
-        const value = try std.json.Stringify.valueAlloc(a, .{ .{ .field = field.field, .desc = field.desc }, low.kind }, .{});
-        defer a.free(value);
-        hash.update(value);
-    }
-    var expected: [32]u8 = undefined;
-    hash.final(&expected);
-    if (!std.mem.eql(u8, bytes[0..32], &expected)) return error.InvalidNativeLakeTextCorpus;
-    return record;
-}

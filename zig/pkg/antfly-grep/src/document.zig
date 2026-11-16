@@ -16,6 +16,14 @@
 //! Versioned source identity shared by lexical and decision result events.
 const std = @import("std");
 pub const Provenance = struct {
+    artifact: ?std.json.Value = null,
+    artifact_revision: ?[]const u8 = null,
+    artifact_key: ?[]const u8 = null,
+    text_field: ?[]const u8 = null,
+    boundary: ?[]const u8 = null,
+    location: ?std.json.Value = null,
+    purpose: ?[]const u8 = null,
+    generated: ?bool = null,
     backend: enum { local, antfly } = .local,
     uri: ?[]const u8 = null,
     table: ?[]const u8 = null,

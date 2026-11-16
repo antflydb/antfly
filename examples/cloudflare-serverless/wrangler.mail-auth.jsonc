@@ -1,0 +1,80 @@
+{
+  "name": "antfly-mail-auth",
+  "main": "mail-auth-worker.mjs",
+  "compatibility_date": "2026-10-23",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": false,
+  "rules": [
+    {
+      "type": "CompiledWasm",
+      "globs": [
+        "**/*.wasm"
+      ],
+      "fallthrough": true
+    }
+  ],
+  "version_metadata": {
+    "binding": "WORKER_VERSION"
+  },
+  "vars": {
+    "AUTH_ORIGIN": "https://mail.example.com",
+    "MAIL_DOMAIN": "example.com",
+    "AUTH_STORAGE_ID": "example-mail-auth-v1"
+  },
+  "send_email": [
+    {
+      "name": "EMAIL"
+    }
+  ],
+  "limits": {
+    "cpu_ms": 30000
+  },
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  },
+  "observability": {
+    "enabled": false
+  },
+  "r2_buckets": [
+    {
+      "binding": "AUTH_DATA",
+      "bucket_name": "antfly-mail-auth"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "AUTH",
+        "class_name": "MailAuth"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "MailAuth"
+      ]
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "AUTH_MAIL_QUEUE",
+        "queue": "antfly-auth-mail"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "antfly-auth-mail",
+        "max_concurrency": 1,
+        "max_batch_size": 1,
+        "dead_letter_queue": "antfly-auth-mail-dead"
+      }
+    ]
+  }
+}

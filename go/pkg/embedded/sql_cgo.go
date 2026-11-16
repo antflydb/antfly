@@ -34,20 +34,30 @@ type SQLError struct {
 	Message       string `json:"message"`
 	Hint          string `json:"hint"`
 	Retryable     bool   `json:"retryable"`
+	// OutcomeReceipt is set when an autocommit SQL write ended with
+	// OutcomeUnknown and the database issued a receipt for it. Resolve it
+	// later with DB.OutcomeReceiptStatus.
+	OutcomeReceipt string `json:"-"`
 }
 
-func (e *SQLError) Error() string    { return fmt.Sprintf("antfly SQL %s: %s", e.Code, e.Message) }
-func (e *SQLError) SQLState() string { return e.Code }
+func (e *SQLError) Error() string          { return fmt.Sprintf("antfly SQL %s: %s", e.Code, e.Message) }
+func (e *SQLError) SQLState() string       { return e.Code }
+func (e *SQLError) outcomeReceipt() string { return e.OutcomeReceipt }
 func sqlError(body []byte, err error) error {
 	if err == nil {
 		return nil
 	}
 	var envelope struct {
-		Error         *SQLError `json:"error"`
-		TransactionID string    `json:"transaction_id"`
+		Error          *SQLError `json:"error"`
+		TransactionID  string    `json:"transaction_id"`
+		OutcomeReceipt string    `json:"outcome_receipt"`
 	}
 	if json.Unmarshal(body, &envelope) == nil && envelope.Error != nil {
 		envelope.Error.TransactionID = envelope.TransactionID
+		envelope.Error.OutcomeReceipt = envelope.OutcomeReceipt
+		if envelope.Error.OutcomeReceipt == "" {
+			envelope.Error.OutcomeReceipt, _ = OutcomeReceiptOf(err)
+		}
 		return envelope.Error
 	}
 	return err

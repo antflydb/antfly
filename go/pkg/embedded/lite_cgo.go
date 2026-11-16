@@ -88,9 +88,10 @@ const (
 
 // OpenOptions configures OpenWithOptions and CreateWithOptions.
 //
-// BusyTimeout, like sqlite3_busy_timeout, keeps retrying a native operation while
-// another process holds the database's writer lease. Zero fails
-// immediately with Busy. The C ABI takes whole milliseconds.
+// BusyTimeout, like sqlite3_busy_timeout, retries Lite admission while another
+// process holds the writer lease or advances the allocator checkpoint. Mutation
+// bodies are never replayed by this admission retry. Zero fails immediately with
+// Busy. The C ABI takes whole milliseconds.
 //
 // HostBudgetMB, BackendBudgetMB, CombinedBudgetMB, KVBudgetMB,
 // ScratchBudgetMB, and ProcessMemoryBudgetMB are explicit resource-budget
@@ -621,7 +622,7 @@ func (db *DB) Batch(writes []WriteIntent, timestampNS uint64) error {
 	}
 	defer cleanup()
 
-	return check(C.antfly_db_batch(
+	return checkOutcome(C.antfly_db_batch(
 		(*C.antfly_db)(handle),
 		cWrites,
 		C.size_t(len(writes)),
@@ -633,9 +634,55 @@ func (db *DB) Batch(writes []WriteIntent, timestampNS uint64) error {
 }
 
 // BatchJSON applies a public Antfly batch request and returns the JSON result.
+// An OutcomeUnknown failure carries an outcome receipt (see OutcomeReceiptOf).
 func (db *DB) BatchJSON(request []byte) ([]byte, error) {
-	return db.withInputOutput(request, func(handle unsafe.Pointer, input C.antfly_slice, out *C.antfly_buffer) C.antfly_error_code {
-		return C.antfly_db_batch_json((*C.antfly_db)(handle), input, out)
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	handle, release, err := db.acquire()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	defer runtime.KeepAlive(db)
+	input, cleanup := makeCStringSlice(request)
+	defer cleanup()
+
+	var out C.antfly_buffer
+	if err := checkOutcome(C.antfly_db_batch_json((*C.antfly_db)(handle), input, &out)); err != nil {
+		C.antfly_buffer_free(&out)
+		return nil, err
+	}
+	return takeBuffer(out), nil
+}
+
+// OutcomeReceiptStatus resolves an outcome receipt from an OutcomeUnknown
+// batch or autocommit SQL write, on any handle for the same database. It
+// returns Stalled while the uncertain commit is not reconciled yet: retry on
+// a Lite database; for a directory database, close the issuing handle and
+// reopen first.
+func (db *DB) OutcomeReceiptStatus(receipt string) (OutcomeReceiptStatus, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	handle, release, err := db.acquire()
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	defer runtime.KeepAlive(db)
+	input, cleanup := makeCStringSlice([]byte(receipt))
+	defer cleanup()
+	var status C.uint8_t
+	if err := check(C.antfly_db_outcome_receipt_status((*C.antfly_db)(handle), input, &status)); err != nil {
+		return 0, err
+	}
+	return OutcomeReceiptStatus(status), nil
+}
+
+// ForgetOutcomeReceipt removes a resolved receipt's durable marker.
+// Afterwards the receipt can no longer be resolved.
+func (db *DB) ForgetOutcomeReceipt(receipt string) error {
+	return db.withInput([]byte(receipt), func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {
+		return C.antfly_db_outcome_receipt_forget((*C.antfly_db)(handle), input)
 	})
 }
 
@@ -964,7 +1011,7 @@ func (db *DB) SQLJSON(request []byte) ([]byte, error) {
 	defer freeInput()
 	var out C.antfly_buffer
 	code := C.antfly_db_sql_json((*C.antfly_db)(handle), input, &out)
-	return takeBuffer(out), check(code)
+	return takeBuffer(out), checkOutcome(code)
 }
 
 // SearchJSON executes a JSON search request and returns the JSON result.
@@ -1222,6 +1269,26 @@ func takeBuffer(buffer C.antfly_buffer) []byte {
 	}
 	bytes := unsafe.Slice((*byte)(unsafe.Pointer(buffer.ptr)), int(buffer.len))
 	return append([]byte(nil), bytes...)
+}
+
+// checkOutcome is check for calls that issue outcome receipts. The receipt is
+// read before any other native call on this (locked) thread.
+func checkOutcome(code C.antfly_error_code) error {
+	if code != C.ANTFLY_OUTCOME_UNKNOWN {
+		return check(code)
+	}
+	receipt := lastOutcomeReceipt()
+	return withOutcomeReceipt(check(code), ErrorCode(code), receipt)
+}
+
+// lastOutcomeReceipt returns this thread's most recent outcome receipt, or ""
+// when the failed call issued none.
+func lastOutcomeReceipt() string {
+	var out C.antfly_buffer
+	if C.antfly_last_error_outcome_receipt(&out) != C.ANTFLY_OK {
+		return ""
+	}
+	return string(takeBuffer(out))
 }
 
 func check(code C.antfly_error_code) error {

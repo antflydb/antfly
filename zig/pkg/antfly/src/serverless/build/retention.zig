@@ -94,14 +94,14 @@ pub const Pruner = struct {
         operation_pruner.alloc = operation_alloc;
         operation_pruner.manifests = &manifests;
         var result = operation_pruner.pruneNamespaceAdmitted(namespace, keep_latest_versions, cancellation) catch |err| {
-            if (err == error.OutOfMemory and working_set.limit_exceeded) return error.GarbageCollectionBudgetExceeded;
+            if (err == error.OutOfMemory and working_set.limitExceeded()) return error.GarbageCollectionBudgetExceeded;
             return err;
         };
         errdefer result.deinit(operation_alloc);
         const owned_namespace = try self.alloc.dupe(u8, result.namespace);
         operation_alloc.free(result.namespace);
         result.namespace = owned_namespace;
-        std.debug.assert(working_set.live_bytes == 0);
+        std.debug.assert(working_set.liveBytes() == 0);
         return result;
     }
 
@@ -778,7 +778,9 @@ test "serverless retention snapshots HEAD before concurrent publication and fail
             const self = state(ptr);
             // Snapshot the listing, then let a publisher durably install a
             // new manifest and HEAD before the list request returns.
-            const versions = try self.manifests.listVersionsAlloc(namespace);
+            var borrowed = self.manifests.*;
+            borrowed.allocator = alloc;
+            const versions = try borrowed.listVersionsAlloc(namespace);
             errdefer alloc.free(versions);
             self.fired = true;
             try putTestManifest(self.manifests, 2, 2, self.artifact);
@@ -792,8 +794,10 @@ test "serverless retention snapshots HEAD before concurrent publication and fail
             }
             return versions;
         }
-        fn get(ptr: *anyopaque, _: Allocator, namespace: []const u8, version: u64) !manifest_mod.Manifest {
-            return state(ptr).manifests.getAlloc(namespace, version);
+        fn get(ptr: *anyopaque, alloc: Allocator, namespace: []const u8, version: u64) !manifest_mod.Manifest {
+            var borrowed = state(ptr).manifests.*;
+            borrowed.allocator = alloc;
+            return borrowed.getAlloc(namespace, version);
         }
         fn put(ptr: *anyopaque, manifest: manifest_mod.Manifest) !void {
             return state(ptr).manifests.put(manifest);
@@ -1278,9 +1282,9 @@ test "serverless retention pruner retains recent manifests and truncates WAL his
     defer build_first.deinit(alloc);
     var manifest_first = try manifest_store.getAlloc("docs", 1);
     defer manifest_first.deinit(alloc);
-    const first_artifact_a = try alloc.dupe(u8, manifest_first.artifacts[0].artifact_id);
+    const first_artifact_a = try alloc.dupe(u8, manifest_first.artifacts[@import("builder.zig").findArtifactIndex(manifest_first, .mutation_segment).?].artifact_id);
     defer alloc.free(first_artifact_a);
-    const first_artifact_b = try alloc.dupe(u8, manifest_first.artifacts[1].artifact_id);
+    const first_artifact_b = try alloc.dupe(u8, manifest_first.artifacts[@import("builder.zig").findArtifactIndex(manifest_first, .document_segment).?].artifact_id);
     defer alloc.free(first_artifact_b);
 
     const second = [_]@import("../api/types.zig").DocumentMutation{
@@ -1327,7 +1331,9 @@ test "serverless retention pruner retains recent manifests and truncates WAL his
     try std.testing.expectEqual(@as(u64, 3), wal_records[0].lsn);
 
     try std.testing.expectError(error.FileNotFound, artifact_store.getAlloc(first_artifact_a));
-    try std.testing.expectError(error.FileNotFound, artifact_store.getAlloc(first_artifact_b));
+    // Later generations still reference the reused packed body cache.
+    const retained_snapshot = try artifact_store.getAlloc(first_artifact_b);
+    defer alloc.free(retained_snapshot);
 }
 
 test "serverless retention concurrent pruners observe gc watermark conflict" {

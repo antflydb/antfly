@@ -11,7 +11,6 @@ go/pkg/
   embedded/          Go binding for local databases and inference
   sdk/               Go SDK
   docsaf/            Content ingestion (filesystem, web crawl, git, S3)
-  evalaf/            LLM/RAG evaluation framework
   genkit/            Firebase Genkit plugins (antfly, openrouter)
 ts/
   packages/sdk/      TypeScript SDK (@antfly/sdk)
@@ -99,8 +98,6 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 | Antfly embedded binding | `go/pkg/embedded/` |
 | Go SDK | `go/pkg/sdk/` |
 | docsaf | `go/pkg/docsaf/` |
-| evalaf | `go/pkg/evalaf/` |
-| evalaf antfly plugin | `go/pkg/evalaf/plugins/antfly/` |
 | Genkit plugin | `go/pkg/genkit/antfly/` |
 | Genkit OpenRouter | `go/pkg/genkit/openrouter/` |
 

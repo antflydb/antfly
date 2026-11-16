@@ -146,159 +146,8 @@ pub const Config = index_config.Config;
 pub const HllCardinalityConfig = index_config.HllCardinalityConfig;
 pub const max_hll_cardinality_materializations = index_config.max_hll_cardinality_materializations;
 
-pub fn validateConfig(cfg: Config) !void {
-    if (cfg.version != 1 and cfg.version != 2) return error.InvalidAlgebraicConfig;
-    if (cfg.version == 2) {
-        if (cfg.table.len == 0) return error.InvalidAlgebraicConfig;
-        if (cfg.capability_fingerprint.len == 0) return error.InvalidAlgebraicConfig;
-    }
-
-    try validateUniqueFieldNames(cfg.group_fields);
-    try validateUniqueFieldNames(cfg.measure_fields);
-    try validateUniqueFieldNames(cfg.time_fields);
-
-    for (cfg.group_fields) |field| {
-        if (field.name.len == 0 or field.path.len == 0 or field.type.len == 0) return error.InvalidAlgebraicConfig;
-    }
-    for (cfg.measure_fields) |field| {
-        if (field.name.len == 0 or field.path.len == 0 or field.type.len == 0) return error.InvalidAlgebraicConfig;
-    }
-    for (cfg.time_fields) |field| {
-        if (field.name.len == 0 or field.path.len == 0 or field.type.len == 0) return error.InvalidAlgebraicConfig;
-    }
-    for (cfg.joins, 0..) |join_cfg, i| {
-        if (join_cfg.name.len == 0) return error.InvalidAlgebraicConfig;
-        for (cfg.joins[0..i]) |prior| {
-            if (std.mem.eql(u8, prior.name, join_cfg.name)) return error.InvalidAlgebraicConfig;
-        }
-        if (join_cfg.left_fields.len == 0 or join_cfg.left_fields.len != join_cfg.right_fields.len) return error.InvalidAlgebraicConfig;
-        for (join_cfg.left_fields) |field_name| {
-            if (!fieldConfigExists(cfg.group_fields, field_name)) return error.InvalidAlgebraicConfig;
-        }
-        for (join_cfg.right_fields) |field_name| {
-            if (!fieldConfigExists(cfg.group_fields, field_name)) return error.InvalidAlgebraicConfig;
-        }
-        if ((join_cfg.left_type_field == null) != (join_cfg.left_type_value == null)) return error.InvalidAlgebraicConfig;
-        if ((join_cfg.right_type_field == null) != (join_cfg.right_type_value == null)) return error.InvalidAlgebraicConfig;
-        if (join_cfg.left_type_field) |field_name| {
-            if (fieldConfigRoleCount(cfg, field_name) != 1) return error.InvalidAlgebraicConfig;
-        }
-        if (join_cfg.right_type_field) |field_name| {
-            if (fieldConfigRoleCount(cfg, field_name) != 1) return error.InvalidAlgebraicConfig;
-        }
-        if (join_cfg.left_time_field) |field_name| {
-            if (!fieldConfigExists(cfg.time_fields, field_name)) return error.InvalidAlgebraicConfig;
-        }
-        if (join_cfg.right_time_field) |field_name| {
-            if (!fieldConfigExists(cfg.time_fields, field_name)) return error.InvalidAlgebraicConfig;
-        }
-        try join_mod.validateTemporal(join_cfg.left_time_field, join_cfg.right_time_field, join_cfg.temporal_bucket, join_cfg.temporal_window_seconds);
-        if (join_cfg.max_fanout) |value| {
-            if (value == 0) return error.InvalidAlgebraicConfig;
-        }
-    }
-
-    for (cfg.laws, 0..) |law_cfg, i| {
-        if (law_cfg.name.len == 0) return error.InvalidAlgebraicConfig;
-        for (cfg.laws[0..i]) |prior| {
-            if (std.mem.eql(u8, prior.name, law_cfg.name)) return error.InvalidAlgebraicConfig;
-        }
-        const law_id = law_mod.Id.parse(law_cfg.id) orelse return error.InvalidAlgebraicConfig;
-        if (law_cfg.structure.len > 0) {
-            const structure = std.meta.stringToEnum(law_mod.Structure, law_cfg.structure) orelse return error.InvalidAlgebraicConfig;
-            if (structure != law_mod.descriptor(law_id).structure) return error.InvalidAlgebraicConfig;
-        }
-        if (law_cfg.invertible and !law_mod.descriptor(law_id).invertible) return error.InvalidAlgebraicConfig;
-    }
-
-    for (cfg.materializations, 0..) |mat, i| {
-        if (mat.name.len == 0) return error.InvalidAlgebraicConfig;
-        for (cfg.materializations[0..i]) |prior| {
-            if (std.mem.eql(u8, prior.name, mat.name)) return error.InvalidAlgebraicConfig;
-        }
-        const op = algebra.Op.parse(mat.op) orelse return error.InvalidAlgebraicConfig;
-        const implicit_law = law_mod.fromOp(op);
-        if (mat.law) |law_name| {
-            const law_id = lawConfigId(cfg, law_name) orelse return error.InvalidAlgebraicConfig;
-            if (law_id != implicit_law) return error.InvalidAlgebraicConfig;
-        }
-        _ = law_mod.descriptor(implicit_law);
-        const group_fields = if (mat.axes.len > 0) mat.axes else mat.group_by;
-        for (mat.group_by) |field_name| {
-            if (!fieldConfigExists(cfg.group_fields, field_name)) return error.InvalidAlgebraicConfig;
-        }
-        for (group_fields) |field_name| {
-            if (!fieldConfigExists(cfg.group_fields, field_name)) return error.InvalidAlgebraicConfig;
-        }
-        if (mat.measure) |measure| {
-            if (!fieldConfigExists(cfg.measure_fields, measure)) return error.InvalidAlgebraicConfig;
-        } else if (op != .count) {
-            return error.InvalidAlgebraicConfig;
-        }
-        if (mat.time) |time| {
-            if (!fieldConfigExists(cfg.time_fields, time)) return error.InvalidAlgebraicConfig;
-            const bucket = mat.bucket orelse return error.InvalidAlgebraicConfig;
-            if (cylinder.Bucket.parse(bucket) == null) return error.InvalidAlgebraicConfig;
-        } else if (mat.bucket != null) {
-            return error.InvalidAlgebraicConfig;
-        }
-        if (mat.join) |join_name| {
-            if (!joinConfigExists(cfg.joins, join_name)) return error.InvalidAlgebraicConfig;
-            if (mat.group_side == null or mat.measure_side == null) return error.InvalidAlgebraicConfig;
-        } else {
-            if (mat.group_side != null or mat.measure_side != null) return error.InvalidAlgebraicConfig;
-        }
-        if (mat.implicit_query) {
-            const join_name = mat.join orelse return error.InvalidAlgebraicConfig;
-            const join_cfg = joinConfigForValidation(cfg.joins, join_name) orelse return error.InvalidAlgebraicConfig;
-            if (!join_mod.implicitQueryMaterializationProof(join_cfg, mat).safe()) return error.InvalidAlgebraicConfig;
-        }
-        if (mat.group_side) |side| {
-            if (!isJoinSide(side)) return error.InvalidAlgebraicConfig;
-        }
-        if (mat.measure_side) |side| {
-            if (!isJoinSide(side)) return error.InvalidAlgebraicConfig;
-        }
-    }
-    if (cfg.hll_cardinalities.len > max_hll_cardinality_materializations) return error.InvalidAlgebraicConfig;
-    for (cfg.hll_cardinalities, 0..) |hcfg, i| {
-        if (hcfg.name.len == 0 or hcfg.value_field.len == 0) return error.InvalidAlgebraicConfig;
-        if (!hllGroupFieldResolvable(cfg, hcfg.value_field)) return error.InvalidAlgebraicConfig;
-        if (hcfg.precision != 0 and (hcfg.precision < hll.min_precision or hcfg.precision > hll.max_precision)) {
-            return error.InvalidAlgebraicConfig;
-        }
-        for (cfg.hll_cardinalities[0..i]) |prior| {
-            if (std.mem.eql(u8, prior.name, hcfg.name)) return error.InvalidAlgebraicConfig;
-        }
-        for (hcfg.group_by, 0..) |axis, axis_idx| {
-            if (axis.len == 0) return error.InvalidAlgebraicConfig;
-            if (!hllGroupFieldResolvable(cfg, axis)) return error.InvalidAlgebraicConfig;
-            for (hcfg.group_by[0..axis_idx]) |prior_axis| {
-                if (std.mem.eql(u8, prior_axis, axis)) return error.InvalidAlgebraicConfig;
-            }
-        }
-    }
-    if (cfg.adaptive.observation_decay_retain_percent > 100) return error.InvalidAlgebraicConfig;
-    if (cfg.max_hll_contributions_per_document == 0 or
-        cfg.max_hll_contribution_bytes_per_document == 0 or
-        cfg.max_distributed_hll_partial_bytes == 0 or
-        cfg.max_hll_maintenance_rows_per_tick == 0 or
-        cfg.max_pending_hll_observation_entries == 0 or
-        cfg.max_pending_hll_observation_bytes == 0)
-    {
-        return error.InvalidAlgebraicConfig;
-    }
-    for (cfg.dynamic_field_rules) |rule| {
-        if (rule.type.len == 0) return error.InvalidAlgebraicConfig;
-        if (dynamicRuleRoleMask(rule.type) == 0) return error.InvalidAlgebraicConfig;
-        // Require a name/path selector (`match` / `path_match`). A rule with no
-        // selector would blanket-match every field, and a `match_mapping_type`-
-        // only rule would project facts at ingest that can never resolve at query
-        // time (no value to classify) — keep ingest and query symmetric by
-        // rejecting both here, matching schema_capability's compile-time guard.
-        if (rule.match == null and rule.path_match == null) return error.InvalidAlgebraicConfig;
-    }
-}
+// Control and the physical owner validate the same authored contract.
+pub const validateConfig = index_config.validateConfig;
 
 fn hllGroupFieldResolvable(cfg: Config, query_field: []const u8) bool {
     if (fieldConfigExists(cfg.group_fields, query_field)) return true;
@@ -2987,6 +2836,15 @@ const JoinScanBounds = struct {
     }
 };
 
+/// Request-owned budget shared by temporal scans across all aggregation roots.
+pub const TemporalScanBudget = struct {
+    remaining_cells: usize = 1_000_000,
+    /// Logical metric columns also count aliases of one physical state.
+    remaining_fold_cells: usize = 4_000_000,
+    remaining_bytes: usize = 64 * 1024 * 1024,
+    control: @import("../../../search/execution_control.zig").ExecutionControl = .{},
+};
+
 pub const Index = struct {
     alloc: Allocator,
     /// Public catalog identity used by planners and request access paths.
@@ -2996,6 +2854,8 @@ pub const Index = struct {
     /// selected by the active-root pointer.
     storage_namespace: []u8,
     parsed: std.json.Parsed(Config),
+    /// Immutable lookup compiled with the config; keys borrow parsed storage.
+    materialization_by_name: std.StringHashMapUnmanaged(usize) = .empty,
     /// Runtime proof that the active physical generation was completely built
     /// for `parsed`. Restored only from that generation's completion marker
     /// with a matching config hash and reset by every config reload.
@@ -3136,11 +2996,14 @@ pub const Index = struct {
         errdefer alloc.free(owned_name);
         const owned_storage_namespace = try alloc.dupe(u8, storage_namespace);
         errdefer alloc.free(owned_storage_namespace);
+        var materialization_by_name = try materializationNamesAlloc(alloc, parsed.value);
+        errdefer materialization_by_name.deinit(alloc);
         var self: Index = .{
             .alloc = alloc,
             .name = owned_name,
             .storage_namespace = owned_storage_namespace,
             .parsed = parsed,
+            .materialization_by_name = materialization_by_name,
         };
         errdefer self.freeHllRegistry();
         // Seed the runtime registry from the static config; adaptive promotions
@@ -3452,10 +3315,14 @@ pub const Index = struct {
         var parsed = try std.json.parseFromSlice(Config, self.alloc, config_json, .{ .allocate = .alloc_always });
         errdefer parsed.deinit();
         try validateConfig(parsed.value);
+        var materialization_by_name = try materializationNamesAlloc(self.alloc, parsed.value);
+        errdefer materialization_by_name.deinit(self.alloc);
         // Cached adaptive specs are derived from the old config; drop them so
         // they are recomputed lazily against the new one.
         self.invalidateAdaptiveReadySpecCache();
         const old = self.parsed;
+        self.materialization_by_name.deinit(self.alloc);
+        self.materialization_by_name = materialization_by_name;
         self.parsed = parsed;
         self.projection_config_ready = false;
         old.deinit();
@@ -3506,6 +3373,7 @@ pub const Index = struct {
         self.clearBulkDirtyPathPromotionDictionaries();
         self.clearPendingHllObservations();
         self.freeHllRegistry();
+        self.materialization_by_name.deinit(self.alloc);
         self.parsed.deinit();
         self.* = undefined;
     }
@@ -12551,22 +12419,26 @@ pub const Index = struct {
         return try self.scanDerivedJoinFoldEntriesTxn(txn, join_cfg, request, law_id, null);
     }
 
-    fn expressionRawValueForMaterializationTxn(
+    const PreparedMaterializedExpressionRead = struct {
+        law_id: law_mod.Id,
+        expression_id: []u8,
+    };
+
+    fn prepareMaterializedExpressionRead(self: *Index, mat: MaterializationConfig) !?PreparedMaterializedExpressionRead {
+        const op = algebra.Op.parse(mat.op) orelse return null;
+        const law_id = self.materializationLawId(mat, op);
+        return .{ .law_id = law_id, .expression_id = try self.materializedExpressionIdForLawAlloc(materializationExpression(mat, law_id), law_id) };
+    }
+
+    fn expressionRawValueForPreparedMaterializationTxn(
         self: *Index,
         txn: anytype,
-        materialization: []const u8,
+        prepared: PreparedMaterializedExpressionRead,
         axes_canonical: []const u8,
         bucket: ?[]const u8,
     ) !?[]u8 {
-        const mat_idx = self.materializationIndex(materialization) orelse return null;
-        const mat = self.config().materializations[mat_idx];
-        const op = algebra.Op.parse(mat.op) orelse return null;
-        const law_id = self.materializationLawId(mat, op);
-        const expr = materializationExpression(mat, law_id);
-        const expr_id = try self.materializedExpressionIdForLawAlloc(expr, law_id);
-        defer self.alloc.free(expr_id);
         const key = try tensor_mod.expressionKeyAlloc(self.alloc, self.storage_namespace, .{
-            .expr_id = expr_id,
+            .expr_id = prepared.expression_id,
             .axes_canonical = axes_canonical,
             .bucket = bucket,
         });
@@ -12575,27 +12447,78 @@ pub const Index = struct {
             error.NotFound => return null,
             else => return err,
         };
-        var row = try tensor_mod.rowFromBytesOrLayoutAlloc(self.alloc, raw_row, &.{law_id});
+        var row = try tensor_mod.rowFromBytesOrLayoutAlloc(self.alloc, raw_row, &.{prepared.law_id});
         defer row.deinit(self.alloc);
         if (row.slots.len == 0) return null;
         return if (row.slots[0].value) |value| try self.alloc.dupe(u8, value) else null;
     }
 
+    fn expressionRawValueForMaterializationTxn(
+        self: *Index,
+        txn: anytype,
+        materialization: []const u8,
+        axes_canonical: []const u8,
+        bucket: ?[]const u8,
+    ) !?[]u8 {
+        const mat_idx = self.materializationIndex(materialization) orelse return null;
+        const prepared = (try self.prepareMaterializedExpressionRead(self.config().materializations[mat_idx])) orelse return null;
+        defer self.alloc.free(prepared.expression_id);
+        return self.expressionRawValueForPreparedMaterializationTxn(txn, prepared, axes_canonical, bucket);
+    }
+
+    pub fn scanMaterializedExpressionRowsBounded(self: *Index, store: *docstore_mod.DocStore, materializations: []const []const u8, budget: *TemporalScanBudget) !?[]MaterializedExpressionRowEntry {
+        if (materializations.len == 0) return null;
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        return self.scanMaterializedExpressionRowsBudgetedTxn(&txn, materializations, budget);
+    }
+
     fn scanMaterializedExpressionRowsTxn(self: *Index, txn: anytype, materializations: []const []const u8) !?[]MaterializedExpressionRowEntry {
+        return self.scanMaterializedExpressionRowsBudgetedTxn(txn, materializations, null);
+    }
+
+    fn checkMaterializedExpressionScanAdmission(self: *const Index, budget: *TemporalScanBudget, scanned: usize, width: usize) !void {
+        try budget.control.check();
+        if (scanned >= (self.config().max_planner_scan_rows orelse std.math.maxInt(usize)) or width > budget.remaining_cells) return error.QueryCandidateBudgetExceeded;
+    }
+
+    fn scanMaterializedExpressionRowsBudgetedTxn(self: *Index, txn: anytype, materializations: []const []const u8, budget: ?*TemporalScanBudget) !?[]MaterializedExpressionRowEntry {
+        if (materializations.len == 0) return null;
+        if (budget) |limit| try limit.control.check();
         const first_mat_idx = self.materializationIndex(materializations[0]) orelse return null;
         const first_mat = self.config().materializations[first_mat_idx];
-        const first_op = algebra.Op.parse(first_mat.op) orelse return null;
-        const first_law_id = self.materializationLawId(first_mat, first_op);
-        const first_expr = materializationExpression(first_mat, first_law_id);
-        const first_expr_id = try self.materializedExpressionIdForLawAlloc(first_expr, first_law_id);
-        defer self.alloc.free(first_expr_id);
+        // Validate every requested name/layout even for an empty prefix. This
+        // uses the immutable catalog lookup without allocating expression plans.
         for (materializations[1..]) |name| {
+            if (budget) |limit| try limit.control.check();
             const mat_idx = self.materializationIndex(name) orelse return null;
             if (!sameLayoutShape(first_mat, self.config().materializations[mat_idx])) return null;
         }
-        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.storage_namespace, first_expr_id);
+        const first = (try self.prepareMaterializedExpressionRead(first_mat)) orelse return null;
+        defer self.alloc.free(first.expression_id);
+        const first_law_id = first.law_id;
+        const prefix = try tensor_mod.expressionPrefixAlloc(self.alloc, self.storage_namespace, first.expression_id);
         defer self.alloc.free(prefix);
-
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        if (budget) |limit| try limit.control.check();
+        if (entry_opt == null or !std.mem.startsWith(u8, entry_opt.?.key, prefix)) return try self.alloc.alloc(MaterializedExpressionRowEntry, 0);
+        // No bulk preparation until a matching row can be admitted. The first
+        // row is charged in the loop, together with every other visited row.
+        if (budget) |limit| try self.checkMaterializedExpressionScanAdmission(limit, 0, materializations.len);
+        const columns = try self.alloc.alloc(PreparedMaterializedExpressionRead, materializations.len - 1);
+        var prepared_count: usize = 0;
+        defer {
+            for (columns[0..prepared_count]) |column| self.alloc.free(column.expression_id);
+            self.alloc.free(columns);
+        }
+        for (materializations[1..], columns) |name, *column| {
+            if (budget) |limit| try limit.control.check();
+            const mat_idx = self.materializationIndex(name) orelse return null;
+            column.* = (try self.prepareMaterializedExpressionRead(self.config().materializations[mat_idx])) orelse return null;
+            prepared_count += 1;
+        }
         var out = std.ArrayListUnmanaged(MaterializedExpressionRowEntry).empty;
         errdefer {
             for (out.items) |*entry| entry.deinit(self.alloc);
@@ -12603,11 +12526,16 @@ pub const Index = struct {
         }
         var symbols = SymbolCache{};
         defer symbols.deinit(self.alloc);
-        var cursor = try txn.openCursor();
-        defer cursor.close();
-        var entry_opt = try cursor.seekAtOrAfter(prefix);
+        var scanned: usize = 0;
         while (entry_opt) |entry| : (entry_opt = try cursor.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (budget) |limit| {
+                try self.checkMaterializedExpressionScanAdmission(limit, scanned, materializations.len);
+                // Charge every visited row, even if decoding or predicates later
+                // discard it. Admission and execution share this one scan.
+                limit.remaining_cells -= materializations.len;
+                scanned += 1;
+            }
             const values = try self.alloc.alloc(?[]u8, materializations.len);
             errdefer {
                 for (values) |value| if (value) |bytes| self.alloc.free(bytes);
@@ -12666,14 +12594,26 @@ pub const Index = struct {
                 values[0] = if (row.slots[0].value) |value| try self.alloc.dupe(u8, value) else null;
             }
             var any_value = values[0] != null;
-            for (materializations[1..], 1..) |name, i| {
-                values[i] = try self.expressionRawValueForMaterializationTxn(txn, name, canonical_group, bucket_start);
+            for (columns, 1..) |column, i| {
+                if (budget) |limit| try limit.control.check();
+                values[i] = try self.expressionRawValueForPreparedMaterializationTxn(txn, column, canonical_group, bucket_start);
                 if (values[i] != null) any_value = true;
             }
             if (!any_value) {
                 self.alloc.free(group_key);
                 if (values.len > 0) self.alloc.free(values);
                 continue;
+            }
+            if (budget) |limit| {
+                // Export repeats each axis per metric; account for that shape
+                // before retaining rows, plus state and descriptor overhead.
+                var bytes = std.math.mul(usize, group_key.len + 64, materializations.len) catch return error.QueryCandidateBudgetExceeded;
+                for (values, materializations) |value, name| {
+                    bytes = std.math.add(usize, bytes, name.len) catch return error.QueryCandidateBudgetExceeded;
+                    if (value) |raw| bytes = std.math.add(usize, bytes, raw.len) catch return error.QueryCandidateBudgetExceeded;
+                }
+                if (bytes > limit.remaining_bytes) return error.QueryCandidateBudgetExceeded;
+                limit.remaining_bytes -= bytes;
             }
             try out.append(self.alloc, .{
                 .group_key = group_key,
@@ -15832,11 +15772,16 @@ pub const Index = struct {
         return try self.alloc.dupe(u8, raw);
     }
 
+    fn materializationNamesAlloc(a: Allocator, cfg: Config) !std.StringHashMapUnmanaged(usize) {
+        var names: std.StringHashMapUnmanaged(usize) = .empty;
+        errdefer names.deinit(a);
+        try names.ensureTotalCapacity(a, @intCast(cfg.materializations.len));
+        for (cfg.materializations, 0..) |mat, i| names.putAssumeCapacity(mat.name, i);
+        return names;
+    }
+
     fn materializationIndex(self: *const Index, materialization: []const u8) ?usize {
-        for (self.config().materializations, 0..) |mat, i| {
-            if (std.mem.eql(u8, mat.name, materialization)) return i;
-        }
-        return null;
+        return self.materialization_by_name.get(materialization);
     }
 
     fn joinConfigByName(self: *const Index, name: []const u8) ?JoinConfig {
@@ -30689,4 +30634,314 @@ test "algebraic adaptive backfill supports configured join tensors" {
     var expr_after_delete = (try idx.adaptiveMaterializedExpressionRawValueForRecommendationAlloc(&store, recommendation, axes, null)).?;
     defer expr_after_delete.deinit(idx.alloc);
     try std.testing.expectEqual(@as(f64, 32), try algebra.parseF64(expr_after_delete.raw.?));
+}
+
+test "time series prepared materialized scans release metadata on every allocation failure" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+            defer backend.close();
+            var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+            defer store.close();
+            var index = try Index.open(a, "series",
+                \\{"version":1,"table":"readings","time_fields":[{"name":"ts","path":"ts","type":"timestamp"}],"measure_fields":[{"name":"v","path":"v","type":"number"}],"materializations":[{"name":"rows","op":"count","time":"ts","bucket":"5m"},{"name":"total","op":"sum","measure":"v","time":"ts","bucket":"5m"},{"name":"global","op":"count"}]}
+            );
+            defer index.close();
+            var budget = TemporalScanBudget{};
+            const rows = (try index.scanMaterializedExpressionRowsBounded(&store, &.{ "rows", "total" }, &budget)) orelse return error.MissingTemporalResult;
+            defer {
+                for (rows) |*row| row.deinit(a);
+                a.free(rows);
+            }
+            try std.testing.expectEqual(@as(usize, 0), rows.len);
+            try std.testing.expectEqual(@as(usize, 1_000_000), budget.remaining_cells);
+            try std.testing.expect((try index.scanMaterializedExpressionRowsBounded(&store, &.{ "rows", "total", "missing" }, &budget)) == null);
+            try std.testing.expect((try index.scanMaterializedExpressionRowsBounded(&store, &.{ "rows", "global" }, &budget)) == null);
+            try std.testing.expect((try index.scanMaterializedExpressionRowsBounded(&store, &.{}, &budget)) == null);
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fixture.run, .{});
+}
+
+test "time series prepared populated scans clean failures and cancellation between columns" {
+    const a = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var index = try Index.open(a, "series",
+        \\{"version":1,"table":"readings","time_fields":[{"name":"ts","path":"ts","type":"timestamp"}],"measure_fields":[{"name":"v","path":"v","type":"number"}],"materializations":[{"name":"rows","op":"count","time":"ts","bucket":"5m"},{"name":"total","op":"sum","measure":"v","time":"ts","bucket":"5m"},{"name":"mean","op":"avg","measure":"v","time":"ts","bucket":"5m"}]}
+    );
+    defer index.close();
+    try index.applyBatch(&store, .{ .documents = &.{
+        .{ .key = "a", .action = .upsert, .cleaned_value = "{\"ts\":\"2026-11-06T12:01:00Z\",\"v\":10}" },
+        .{ .key = "b", .action = .upsert, .cleaned_value = "{\"ts\":\"2026-11-06T12:06:00Z\"}" },
+    } });
+    const Fixture = struct {
+        fn run(alloc: Allocator, idx: *Index, db: *docstore_mod.DocStore) !void {
+            const previous = idx.alloc;
+            idx.alloc = alloc;
+            defer idx.alloc = previous;
+            var budget = TemporalScanBudget{};
+            const rows = (try idx.scanMaterializedExpressionRowsBounded(db, &.{ "rows", "total", "mean" }, &budget)) orelse return error.MissingTemporalResult;
+            defer {
+                for (rows) |*row| row.deinit(alloc);
+                alloc.free(rows);
+            }
+            try std.testing.expectEqual(@as(usize, 2), rows.len);
+            var missing: usize = 0;
+            for (rows) |row| {
+                try std.testing.expectEqualStrings("1", row.values[0].?);
+                if (row.values[1]) |sum| {
+                    try std.testing.expectEqualStrings("10", sum);
+                    try std.testing.expect(row.values[2] != null);
+                } else {
+                    missing += 1;
+                    try std.testing.expect(row.values[2] == null);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 1), missing);
+            try std.testing.expectEqual(@as(usize, 999994), budget.remaining_cells);
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fixture.run, .{ &index, &store });
+    const Counter = struct {
+        remaining: usize,
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.remaining == 0) return true;
+            self.remaining -= 1;
+            return false;
+        }
+    };
+    var cancellations: usize = 0;
+    var in_row_cancellations: usize = 0;
+    var completions: usize = 0;
+    for (0..24) |stop| {
+        var counter = Counter{ .remaining = stop };
+        var budget = TemporalScanBudget{ .control = .{ .cancellation = .{ .ptr = &counter, .is_cancelled_fn = Counter.cancelled } } };
+        const rows = (index.scanMaterializedExpressionRowsBounded(&store, &.{ "rows", "total", "mean" }, &budget) catch |err| {
+            try std.testing.expectEqual(error.Canceled, err);
+            cancellations += 1;
+            if (budget.remaining_cells < 1_000_000) in_row_cancellations += 1;
+            continue;
+        }) orelse return error.MissingTemporalResult;
+        for (rows) |*row| row.deinit(a);
+        a.free(rows);
+        completions += 1;
+    }
+    try std.testing.expect(cancellations > 0 and in_row_cancellations > 0 and completions > 0);
+}
+
+test "time series materialization catalog reload is failure atomic" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var index = try Index.open(a, "series",
+                \\{"version":1,"table":"readings","materializations":[{"name":"old","op":"count"}]}
+            );
+            defer index.close();
+            index.reloadConfigJson(
+                \\{"version":1,"table":"readings","materializations":[{"name":"new","op":"count"}]}
+            ) catch |err| {
+                try std.testing.expectEqual(@as(?usize, 0), index.materializationIndex("old"));
+                try std.testing.expect(index.materializationIndex("new") == null);
+                return err;
+            };
+            try std.testing.expect(index.materializationIndex("old") == null);
+            try std.testing.expectEqual(@as(?usize, 0), index.materializationIndex("new"));
+            index.reloadConfigJson(
+                \\{"version":1,"table":"readings"}
+            ) catch |err| {
+                try std.testing.expectEqual(@as(?usize, 0), index.materializationIndex("new"));
+                return err;
+            };
+            try std.testing.expect(index.materializationIndex("new") == null);
+            try std.testing.expectEqual(@as(usize, 0), index.materialization_by_name.count());
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fixture.run, .{});
+}
+
+test "time series prepared scan benchmark covers narrow and wide catalogs" {
+    for ([_]usize{ 100, 1000, 4000 }) |width| {
+        const a = std.testing.allocator;
+        var config_json = std.Io.Writer.Allocating.init(a);
+        defer config_json.deinit();
+        try config_json.writer.writeAll("{\"version\":1,\"table\":\"readings\",\"group_fields\":[{\"name\":\"device\",\"path\":\"device\",\"type\":\"keyword\"}],\"materializations\":[");
+        const names = try a.alloc([]const u8, width);
+        defer a.free(names);
+        var initialized: usize = 0;
+        defer for (names[0..initialized]) |name| a.free(name);
+        for (names, 0..) |*name, i| {
+            name.* = try std.fmt.allocPrint(a, "rows_{d}", .{i});
+            initialized += 1;
+            if (i > 0) try config_json.writer.writeByte(',');
+            try config_json.writer.print("{{\"name\":\"{s}\",\"op\":\"count\",\"group_by\":[\"device\"]}}", .{name.*});
+        }
+        try config_json.writer.writeAll("]}");
+        var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+        defer backend.close();
+        var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        // Populate only the endpoints through a small catalog. Ingestion and
+        // large-catalog validation are setup, not part of scanner timings.
+        const seed_config = try std.fmt.allocPrint(a, "{{\"version\":1,\"table\":\"readings\",\"group_fields\":[{{\"name\":\"device\",\"path\":\"device\",\"type\":\"keyword\"}}],\"materializations\":[{{\"name\":\"{s}\",\"op\":\"count\",\"group_by\":[\"device\"]}},{{\"name\":\"{s}\",\"op\":\"count\",\"group_by\":[\"device\"]}}]}}", .{ names[0], names[width - 1] });
+        defer a.free(seed_config);
+        {
+            var seed = try Index.open(a, "series", seed_config);
+            defer seed.close();
+            try seed.applyBatch(&store, .{ .documents = &.{
+                .{ .key = "a", .action = .upsert, .cleaned_value = "{\"device\":\"one\"}" },
+                .{ .key = "b", .action = .upsert, .cleaned_value = "{\"device\":\"two\"}" },
+            } });
+        }
+        var index = try Index.open(a, "series", config_json.written());
+        defer index.close();
+        for ([_]usize{ 1, width }) |requested| {
+            var budget = TemporalScanBudget{};
+            const clock = @import("antfly_platform").time;
+            const started = clock.monotonicNs();
+            const selected = if (requested == 1) names[width - 1 ..] else names;
+            const rows = (try index.scanMaterializedExpressionRowsBounded(&store, selected, &budget)) orelse return error.MissingTemporalResult;
+            defer {
+                for (rows) |*row| row.deinit(a);
+                a.free(rows);
+            }
+            std.debug.print("TEMPORAL_SCAN catalog={d} requested={d} rows={d} elapsed_us={d}\n", .{ width, requested, rows.len, (clock.monotonicNs() - started) / std.time.ns_per_us });
+            try std.testing.expectEqual(@as(usize, 2), rows.len);
+            try std.testing.expectEqual(@as(usize, 1_000_000) - requested * rows.len, budget.remaining_cells);
+            for (rows) |row| {
+                try std.testing.expectEqual(requested, row.values.len);
+                try std.testing.expectEqualStrings("1", row.values[0].?);
+                try std.testing.expectEqualStrings("1", row.values[row.values.len - 1].?);
+                for (row.values) |value| if (value) |raw| try std.testing.expectEqualStrings("1", raw);
+            }
+        }
+    }
+}
+
+test "time series prepared scans bound empty and rejected preparation work" {
+    const Work = struct { allocations: usize, bytes: usize };
+    const CancelAfterValidation = struct {
+        remaining: usize,
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.remaining == 0) return true;
+            self.remaining -= 1;
+            return false;
+        }
+    };
+    const Fixture = struct {
+        fn measure(idx: *Index, db: *docstore_mod.DocStore, names: []const []const u8, empty: bool, budget: *TemporalScanBudget) !Work {
+            const previous = idx.alloc;
+            // In-place resize success depends on heap history; force the same
+            // allocation path for every catalog width and admission outcome.
+            var counter = std.testing.FailingAllocator.init(previous, .{ .resize_fail_index = 0 });
+            idx.alloc = counter.allocator();
+            defer idx.alloc = previous;
+            const cells = budget.remaining_cells;
+            const bytes = budget.remaining_bytes;
+            var rejected = false;
+            const clock = @import("antfly_platform").time;
+            const started = clock.monotonicNs();
+            {
+                const rows = idx.scanMaterializedExpressionRowsBounded(db, names, budget) catch |err| blk: {
+                    try std.testing.expect(!empty);
+                    try std.testing.expectEqual(error.QueryCandidateBudgetExceeded, err);
+                    rejected = true;
+                    break :blk null;
+                };
+                if (rows) |entries| {
+                    defer {
+                        for (entries) |*entry| entry.deinit(idx.alloc);
+                        idx.alloc.free(entries);
+                    }
+                    try std.testing.expect(empty);
+                    try std.testing.expectEqual(@as(usize, 0), entries.len);
+                } else try std.testing.expect(!empty and rejected);
+            }
+            try std.testing.expectEqual(cells, budget.remaining_cells);
+            try std.testing.expectEqual(bytes, budget.remaining_bytes);
+            try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
+            std.debug.print("TEMPORAL_SCAN_ADMISSION width={d} empty={any} allocations={d} bytes={d} elapsed_us={d}\n", .{ names.len, empty, counter.alloc_index, counter.allocated_bytes, (clock.monotonicNs() - started) / std.time.ns_per_us });
+            return .{ .allocations = counter.alloc_index, .bytes = counter.allocated_bytes };
+        }
+    };
+    const a = std.testing.allocator;
+    var empty_work: ?Work = null;
+    var cells_work: ?Work = null;
+    var limit_work: ?Work = null;
+    for ([_]usize{ 1, 100, 1000 }) |width| {
+        var config_json = std.Io.Writer.Allocating.init(a);
+        defer config_json.deinit();
+        try config_json.writer.writeAll("{\"version\":1,\"table\":\"readings\",\"group_fields\":[{\"name\":\"device\",\"path\":\"device\",\"type\":\"keyword\"}],\"materializations\":[");
+        const names = try a.alloc([]const u8, width);
+        defer a.free(names);
+        var initialized: usize = 0;
+        defer for (names[0..initialized]) |name| a.free(name);
+        for (names, 0..) |*name, i| {
+            name.* = try std.fmt.allocPrint(a, "rows_{d}", .{i});
+            initialized += 1;
+            if (i > 0) try config_json.writer.writeByte(',');
+            try config_json.writer.print("{{\"name\":\"{s}\",\"op\":\"count\",\"group_by\":[\"device\"]}}", .{name.*});
+        }
+        try config_json.writer.writeAll("]}");
+        var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+        defer backend.close();
+        var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var index = try Index.open(a, "series", config_json.written());
+        defer index.close();
+        const seed_config =
+            \\{"version":1,"table":"readings","group_fields":[{"name":"device","path":"device","type":"keyword"}],"materializations":[{"name":"rows_0","op":"count","group_by":["device"]}]}
+        ;
+        const documents = [_]derived_types.DerivedDocument{
+            .{ .key = "a", .action = .upsert, .cleaned_value = "{\"device\":\"one\"}" },
+            .{ .key = "b", .action = .upsert, .cleaned_value = "{\"device\":\"two\"}" },
+        };
+        // A nonmatching successor must behave like an empty cursor. Keep this
+        // legal index data rather than relying on an entirely empty backend.
+        {
+            var unrelated = try Index.openWithStorageNamespace(a, "unrelated", "series_zz", seed_config);
+            defer unrelated.close();
+            try unrelated.applyBatch(&store, .{ .documents = &documents });
+            const prepared = (try index.prepareMaterializedExpressionRead(index.config().materializations[0])).?;
+            defer a.free(prepared.expression_id);
+            const prefix = try tensor_mod.expressionPrefixAlloc(a, index.storage_namespace, prepared.expression_id);
+            defer a.free(prefix);
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            const next = (try cursor.seekAtOrAfter(prefix)) orelse return error.MissingTemporalResult;
+            try std.testing.expect(!std.mem.startsWith(u8, next.key, prefix));
+        }
+        var cancellation = CancelAfterValidation{ .remaining = width };
+        var canceled_budget = TemporalScanBudget{ .control = .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = CancelAfterValidation.cancelled } } };
+        try std.testing.expectError(error.Canceled, index.scanMaterializedExpressionRowsBounded(&store, names, &canceled_budget));
+        try std.testing.expectEqual(@as(usize, 1_000_000), canceled_budget.remaining_cells);
+        var empty_budget = TemporalScanBudget{ .remaining_cells = 0, .remaining_bytes = 0 };
+        const current_empty = try Fixture.measure(&index, &store, names, true, &empty_budget);
+        if (empty_work) |baseline| try std.testing.expectEqualDeep(baseline, current_empty) else empty_work = current_empty;
+        {
+            var seed = try Index.open(a, "series", seed_config);
+            defer seed.close();
+            try seed.applyBatch(&store, .{ .documents = &documents });
+        }
+        for ([_]usize{ 0, width - 1 }) |remaining| {
+            var budget = TemporalScanBudget{ .remaining_cells = remaining };
+            const current = try Fixture.measure(&index, &store, names, false, &budget);
+            if (cells_work) |baseline| try std.testing.expectEqualDeep(baseline, current) else cells_work = current;
+        }
+        const limited_json = try std.fmt.allocPrint(a, "{{\"max_planner_scan_rows\":0,{s}", .{config_json.written()[1..]});
+        defer a.free(limited_json);
+        var limited = try Index.open(a, "series", limited_json);
+        defer limited.close();
+        var budget = TemporalScanBudget{};
+        const current = try Fixture.measure(&limited, &store, names, false, &budget);
+        if (limit_work) |baseline| try std.testing.expectEqualDeep(baseline, current) else limit_work = current;
+    }
 }

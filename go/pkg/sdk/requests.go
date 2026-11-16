@@ -59,12 +59,12 @@ type BatchRequest struct {
 	// - Supports $set, $setOnInsert, $unset, $inc, $push, $pull, $addToSet, $min, and $max
 	Transforms []Transform `json:"transforms,omitempty"`
 
-	// SyncLevel Synchronization level for the batch operation:
-	// - "propose": Wait for Raft proposal acceptance (fastest, default)
-	// - "write": Wait for Pebble KV write
-	// - "full_text": Wait for full-text index WAL write
-	// - "enrichments": Pre-compute enrichments before Raft proposal
-	// - "full_index": Wait for all index writes to complete
+	// CommitRequires selects required precommit enrichment work. Leave empty to
+	// preserve the server or embedded compatibility default. Unsupported engines
+	// reject explicit requirements before committing.
+	CommitRequires CommitRequires `json:"commit_requires,omitempty"`
+
+	// SyncLevel selects the response acknowledgment/publication barrier.
 	SyncLevel SyncLevel `json:"sync_level,omitempty"`
 }
 
@@ -168,6 +168,9 @@ type QueryRequest struct {
 
 	// Indexes to search (required for semantic search)
 	Indexes []string `json:"indexes,omitempty"`
+
+	// LimitSet preserves an explicit zero limit. Leave false to use the server default.
+	LimitSet bool `json:"-"`
 
 	// Limit maximum number of results to return or topk for semantic_search
 	Limit int `json:"limit,omitempty"`
@@ -305,12 +308,20 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if reflect.ValueOf(q.Join).IsZero() {
+	if reflect.ValueOf(q.Join).IsZero() || q.LimitSet {
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal(data, &fields); err != nil {
 			return nil, err
 		}
-		delete(fields, "join")
+		if reflect.ValueOf(q.Join).IsZero() {
+			delete(fields, "join")
+		}
+		if q.LimitSet {
+			fields["limit"], err = json.Marshal(q.Limit)
+			if err != nil {
+				return nil, err
+			}
+		}
 		return json.Marshal(fields)
 	}
 	return data, nil
@@ -341,6 +352,13 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	q.FullTextIndex = oapiReq.FullTextIndex
 	q.Indexes = oapiReq.Indexes
 	q.Limit = oapiReq.Limit
+	var presence struct {
+		Limit *int `json:"limit"`
+	}
+	if err := json.Unmarshal(data, &presence); err != nil {
+		return err
+	}
+	q.LimitSet = presence.Limit != nil
 	q.MergeConfig = oapiReq.MergeConfig
 	q.Offset = oapiReq.Offset
 	q.OrderBy = oapiReq.OrderBy
@@ -393,6 +411,9 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 
 // MultiBatchRequest represents a cross-table batch operation.
 type MultiBatchRequest struct {
+	// CommitRequires is the default prerequisite for tables without an override.
+	CommitRequires CommitRequires `json:"commit_requires,omitempty"`
+
 	// Tables maps table names to their batch operations.
 	Tables map[string]BatchRequest `json:"tables"`
 

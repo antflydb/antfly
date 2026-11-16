@@ -73,6 +73,11 @@ pub const JobPhase = enum {
     queued,
     running,
     succeeded,
+    /// The job ran every pass, but some documents still fail. Their errors
+    /// are in the repair issues; running repair again retries them.
+    completed_with_failures,
+    /// The job itself broke: an invalid request, a stale control fence, or
+    /// an unsupported control outcome.
     failed,
     cancelled,
 };
@@ -113,7 +118,46 @@ pub const JobState = struct {
     created_at_millis: u64,
     last_updated_at_millis: u64,
     expires_at_millis: u64,
+    /// Rendered only, never persisted: documents that still fail, grouped by
+    /// error code from the current repair issues. Present on finished
+    /// non-control jobs.
+    remaining_failures: ?[]const RemainingFailure = null,
+    /// True when more issues exist than the summary scanned.
+    remaining_failures_truncated: ?bool = null,
 };
+
+/// One group of documents that still fail, with the operator's next step.
+pub const RemainingFailure = struct {
+    error_code: []const u8,
+    count: u64,
+    /// Highest repair attempt count among the group's documents.
+    attempts: u64,
+    transient: bool,
+    hint: []const u8,
+};
+
+pub const RemainingFailures = struct {
+    groups: []const RemainingFailure = &.{},
+    truncated: bool = false,
+};
+
+/// Groups listed repair issues for a response. Allocates in `arena`, which
+/// must outlive the rendered response; strings borrow from `issues`.
+pub fn remainingFailuresAlloc(arena: std.mem.Allocator, issues: []const db_mod.types.ArtifactRepairIssue, truncated: bool) !RemainingFailures {
+    const groups = try db_mod.types.repair_failure.groupIssuesAlloc(arena, issues);
+    const out = try arena.alloc(RemainingFailure, groups.len);
+    for (groups, out) |group, *slot| slot.* = .{
+        .error_code = group.error_code,
+        .count = group.count,
+        .attempts = group.max_attempts,
+        .transient = group.transient,
+        .hint = if (group.transient)
+            try std.fmt.allocPrint(arena, "retried within {d} repair attempt(s); run repair again", .{@max(group.max_attempts, 1)})
+        else
+            group.hint,
+    };
+    return .{ .groups = out, .truncated = truncated };
+}
 
 pub const BeginAdvanceResult = struct {
     encoded: []u8,
@@ -465,15 +509,14 @@ pub const Store = struct {
         total.missing_source_docs +|= pass.missing_source_docs;
         total.failed +|= pass.failed;
         total.unsupported +|= pass.unsupported;
-        if (std.mem.eql(u8, previous.target, "index") and previous.index != null) {
-            // Polling one rebuild observes the same debt until publication.
-            // These are current-state gauges, not repeated units of work.
-            total.unresolved = pass.unresolved;
-            total.in_progress = pass.in_progress;
-        } else {
-            total.unresolved +|= pass.unresolved;
-            total.in_progress +|= pass.in_progress;
-        }
+        // Pending work is a snapshot of this bounded pass for every target.
+        // Artifact jobs also poll durable provider submissions; accumulating
+        // these gauges counts the same queued source on every observation and
+        // leaves stale pending work even after successful publication.
+        // Earlier-page failures remain represented by cumulative work counts,
+        // debt_remaining and the authoritative remaining_failures summary.
+        total.unresolved = pass.unresolved;
+        total.in_progress = pass.in_progress;
         total.indexes_rebuilt +|= pass.indexes_rebuilt;
         // These are job-level state gauges for the one named index, not work
         // counters. A bounded retry may observe the same index repeatedly;
@@ -484,22 +527,29 @@ pub const Store = struct {
         total.controls_applied +|= pass.controls_applied;
         total.limit = pass.limit;
         total.has_more = pass.has_more;
-        total.debt_remaining = pass.debt_remaining;
+        // A later page may succeed while documents on an earlier page still
+        // failed. Keep that outcome when the traversal reaches its last page.
+        total.debt_remaining = pass.debt_remaining or (previous.control == null and
+            (total.failed != 0 or total.unsupported != 0 or total.missing_source_docs != 0));
         total.next_cursor = pass.next_cursor;
 
-        const retryable_in_progress = previous.control == null and pass.in_progress != 0 and pass.failed == 0 and pass.unsupported == 0 and pass.missing_source_docs == 0;
+        // A failed source or shard must not finish the job while another
+        // rebuild or provider submission still has work in progress.
+        const retryable_in_progress = previous.control == null and pass.in_progress != 0;
         // A successful pause/cancel intentionally leaves repair debt. Job
         // completion describes the control traversal, not index readiness.
         const failed_debt = if (previous.control != null)
             pass.failed != 0 or pass.unsupported != 0 or pass.missing_source_docs != 0
         else
-            pass.debt_remaining;
+            total.debt_remaining;
         const phase: JobPhase = if (previous.cancel_requested)
             .cancelled
         else if (pass.has_more or retryable_in_progress)
             .queued
         else if (failed_debt)
-            .failed
+            // Remaining document failures are a repair outcome, not a broken
+            // job. A control job that leaves failed debt did break.
+            if (previous.control == null) .completed_with_failures else .failed
         else
             .succeeded;
         const last_error: ?[]const u8 = if (phase == .cancelled) "cancel_requested" else if (phase == .failed) "repair_debt_remaining" else null;
@@ -549,7 +599,7 @@ pub const Store = struct {
             .attempt_id = previous.attempt_id,
             .table_name = previous.table_name,
             .phase = phaseString(final_phase),
-            .repair_status = repairStatusForPhase(final_phase, pass.has_more, pass.debt_remaining),
+            .repair_status = repairStatusForPhase(final_phase, total.has_more, total.debt_remaining),
             .target = previous.target,
             .control = previous.control,
             .repair_id = previous.repair_id,
@@ -740,6 +790,8 @@ pub const Store = struct {
         total.scanned +|= pass.scanned;
         total.groups_scanned +|= pass.groups_scanned;
         total.controls_applied +|= pass.controls_applied;
+        total.unresolved = pass.unresolved;
+        total.in_progress = pass.in_progress;
         total.limit = pass.limit;
         total.has_more = pass.has_more;
         total.debt_remaining = pass.has_more;
@@ -1135,6 +1187,7 @@ pub fn phaseString(phase: JobPhase) []const u8 {
         .queued => "queued",
         .running => "running",
         .succeeded => "succeeded",
+        .completed_with_failures => "completed_with_failures",
         .failed => "failed",
         .cancelled => "cancelled",
     };
@@ -1178,6 +1231,7 @@ fn validateJobState(state: JobState) !void {
 
 pub fn isTerminalPhase(phase: []const u8) bool {
     return std.mem.eql(u8, phase, phaseString(.succeeded)) or
+        std.mem.eql(u8, phase, phaseString(.completed_with_failures)) or
         std.mem.eql(u8, phase, phaseString(.failed)) or
         std.mem.eql(u8, phase, phaseString(.cancelled));
 }
@@ -1211,6 +1265,7 @@ pub fn validateStartRequest(req: StartRequest) !void {
 pub fn repairStatusForPhase(phase: JobPhase, has_more: bool, debt_remaining: bool) []const u8 {
     return switch (phase) {
         .succeeded => "complete",
+        .completed_with_failures => "debt_remaining",
         .failed => if (debt_remaining) "debt_remaining" else "stopped",
         .cancelled => "stopped",
         .queued, .running => if (has_more or debt_remaining) "in_progress" else "in_progress",
@@ -1365,6 +1420,150 @@ test "table repair job records bounded pass and continuation" {
     try std.testing.expectEqualStrings("queued", parsed_update.value.phase);
     try std.testing.expectEqualStrings("cursor-1", parsed_update.value.cursor.?);
     try std.testing.expectEqual(@as(u64, 2), parsed_update.value.result.repaired);
+}
+
+fn runOnePassForTest(alloc: std.mem.Allocator, store: *Store, req: StartRequest, pass: db_mod.types.ArtifactRepairResult) !std.json.Parsed(JobState) {
+    const started = try store.startJob(alloc, "docs", req);
+    defer alloc.free(started);
+    var parsed_start = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_start.deinit();
+    const begin = try store.beginAdvance(alloc, parsed_start.value);
+    defer alloc.free(begin.encoded);
+    var parsed_running = try std.json.parseFromSlice(JobState, alloc, begin.encoded, .{ .ignore_unknown_fields = true });
+    defer parsed_running.deinit();
+    const updated = try store.recordPass(alloc, parsed_running.value, pass);
+    defer alloc.free(updated);
+    return try std.json.parseFromSlice(JobState, alloc, updated, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+}
+
+test "repair job with documents still failing completes with failures, not failed" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+
+    var finished = try runOnePassForTest(alloc, &store, .{ .target = "index", .index = "knowledge" }, .{
+        .scanned = 2,
+        .failed = 2,
+        .unresolved = 2,
+        .debt_remaining = true,
+    });
+    defer finished.deinit();
+    try std.testing.expectEqualStrings("completed_with_failures", finished.value.phase);
+    try std.testing.expectEqualStrings("debt_remaining", finished.value.repair_status);
+    try std.testing.expect(finished.value.last_error == null);
+    try std.testing.expect(isTerminalPhase(finished.value.phase));
+    try validateJobState(finished.value);
+
+    // A job that cannot run stays failed.
+    const started = try store.startJob(alloc, "docs", .{ .target = "index", .index = "knowledge" });
+    defer alloc.free(started);
+    var parsed_start = try std.json.parseFromSlice(JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_start.deinit();
+    const broken = try store.markPhase(alloc, parsed_start.value, .failed, "InvalidArgument");
+    defer alloc.free(broken);
+    var parsed_broken = try std.json.parseFromSlice(JobState, alloc, broken, .{ .ignore_unknown_fields = true });
+    defer parsed_broken.deinit();
+    try std.testing.expectEqualStrings("failed", parsed_broken.value.phase);
+    try std.testing.expectEqualStrings("InvalidArgument", parsed_broken.value.last_error.?);
+
+    // A control traversal that leaves failed debt did break.
+    var control = try runOnePassForTest(alloc, &store, .{ .target = "index", .index = "knowledge", .control = .pause_automatic }, .{
+        .scanned = 1,
+        .failed = 1,
+        .debt_remaining = true,
+    });
+    defer control.deinit();
+    try std.testing.expectEqualStrings("failed", control.value.phase);
+}
+
+test "repair job retains failures from earlier enrichment pages" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+    var cursor = "artifact-cursor".*;
+    var first = try runOnePassForTest(alloc, &store, .{ .target = "index", .index = "knowledge", .limit = 1 }, .{
+        .scanned = 1,
+        .failed = 1,
+        .unresolved = 1,
+        .has_more = true,
+        .debt_remaining = true,
+        .next_cursor = &cursor,
+    });
+    defer first.deinit();
+    try std.testing.expectEqualStrings("queued", first.value.phase);
+    try std.testing.expectEqualStrings("artifact-cursor", first.value.cursor.?);
+    const begin = try store.beginAdvance(alloc, first.value);
+    defer alloc.free(begin.encoded);
+    var running = try std.json.parseFromSlice(JobState, alloc, begin.encoded, .{});
+    defer running.deinit();
+    const updated = try store.recordPass(alloc, running.value, .{ .scanned = 1, .repaired = 1 });
+    defer alloc.free(updated);
+    var finished = try std.json.parseFromSlice(JobState, alloc, updated, .{});
+    defer finished.deinit();
+    try std.testing.expectEqualStrings("completed_with_failures", finished.value.phase);
+    try std.testing.expect(finished.value.result.debt_remaining);
+    try std.testing.expectEqual(@as(u64, 1), finished.value.result.failed);
+    try std.testing.expectEqual(@as(u64, 1), finished.value.result.repaired);
+    try validateJobState(finished.value);
+}
+
+test "plain repair after a finished job starts a fresh job" {
+    const alloc = std.testing.allocator;
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+    for ([_]bool{ true, false }) |with_failures| {
+        var first = try runOnePassForTest(alloc, &store, .{ .target = "index", .index = "knowledge" }, .{
+            .scanned = 1,
+            .failed = @intFromBool(with_failures),
+            .debt_remaining = with_failures,
+        });
+        defer first.deinit();
+        try std.testing.expect(isTerminalPhase(first.value.phase));
+        const again = try store.startJob(alloc, "docs", .{ .target = "index", .index = "knowledge" });
+        defer alloc.free(again);
+        var parsed_again = try std.json.parseFromSlice(JobState, alloc, again, .{ .ignore_unknown_fields = true });
+        defer parsed_again.deinit();
+        try std.testing.expect(parsed_again.value.job_id > first.value.job_id);
+        try std.testing.expectEqualStrings("queued", parsed_again.value.phase);
+        try std.testing.expect(parsed_again.value.cursor == null);
+    }
+}
+
+test "rendered remaining failures are never persisted in job state" {
+    const alloc = std.testing.allocator;
+    var state = JobState{
+        .job_id = 1,
+        .table_name = "docs",
+        .phase = "completed_with_failures",
+        .repair_status = "debt_remaining",
+        .target = "index",
+        .limit = 100,
+        .created_at_millis = 1,
+        .last_updated_at_millis = 1,
+        .expires_at_millis = 2,
+    };
+    const issues = [_]db_mod.types.ArtifactRepairIssue{
+        .{ .reason = .enrichment_failed, .generation_error = "ModelNotFound", .generation_attempts = 1 },
+        .{ .reason = .enrichment_failed, .generation_error = "ModelNotFound", .attempts = 2 },
+        .{ .reason = .enrichment_failed, .generation_error = "EmbedRateLimited", .attempts = 3 },
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const remaining = try remainingFailuresAlloc(arena.allocator(), &issues, false);
+    try std.testing.expectEqual(@as(usize, 2), remaining.groups.len);
+    try std.testing.expectEqual(@as(u64, 2), remaining.groups[0].count);
+    try std.testing.expect(std.mem.indexOf(u8, remaining.groups[0].hint, "antfly inference pull") != null);
+    try std.testing.expect(remaining.groups[1].transient);
+    try std.testing.expect(std.mem.indexOf(u8, remaining.groups[1].hint, "3 repair attempt(s); run repair again") != null);
+
+    state.remaining_failures = remaining.groups;
+    const rendered = try std.json.Stringify.valueAlloc(alloc, state, .{ .emit_null_optional_fields = false });
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"remaining_failures\"") != null);
+    state.remaining_failures = null;
+    const persisted = try encodeState(alloc, state);
+    defer alloc.free(persisted);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "remaining_failures") == null);
 }
 
 test "forced index repair job dispatches force only once" {
@@ -1574,6 +1773,8 @@ test "named index repair cancellation remains nonterminal until durable controls
         .scanned = 64,
         .groups_scanned = 64,
         .controls_applied = 64,
+        .in_progress = 1,
+        .unresolved = 1,
         .has_more = true,
         .next_cursor = try alloc.dupe(u8, "group:65"),
     };
@@ -1584,6 +1785,8 @@ test "named index repair cancellation remains nonterminal until durable controls
     defer parsed_continuing.deinit();
     try std.testing.expectEqualStrings("queued", parsed_continuing.value.phase);
     try std.testing.expectEqualStrings("group:65", parsed_continuing.value.cursor.?);
+    try std.testing.expectEqual(@as(u64, 1), parsed_continuing.value.result.in_progress);
+    try std.testing.expectEqual(@as(u64, 1), parsed_continuing.value.result.unresolved);
     const continuing_pending = (try store.nextPendingMaintenanceAlloc(alloc)).?;
     defer alloc.free(continuing_pending);
 
@@ -1601,6 +1804,8 @@ test "named index repair cancellation remains nonterminal until durable controls
     defer parsed_cancelled.deinit();
     try std.testing.expectEqualStrings("cancelled", parsed_cancelled.value.phase);
     try std.testing.expect(!requiresDurableCancel(parsed_cancelled.value));
+    try std.testing.expectEqual(@as(u64, 0), parsed_cancelled.value.result.in_progress);
+    try std.testing.expectEqual(@as(u64, 0), parsed_cancelled.value.result.unresolved);
 }
 
 test "named index repair cancellation restarts its durable traversal after job store recovery" {
@@ -1970,4 +2175,96 @@ test "cancelling a control traversal stops without issuing inverse controls" {
         defer alloc.free(stale.encoded);
         try std.testing.expect(!stale.started);
     }
+}
+
+test "repair job waits for pending work despite failed documents" {
+    const a = std.testing.allocator;
+    var store = Store.init(a, .{});
+    defer store.deinit();
+    var result = try runOnePassForTest(a, &store, .{ .target = "index", .index = "dv_a" }, .{ .failed = 1, .in_progress = 1, .indexes_degraded_after = 1, .unresolved = 2, .debt_remaining = true });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("queued", result.value.phase);
+    try std.testing.expect(!isTerminalPhase(result.value.phase));
+    const begin = try store.beginAdvance(a, result.value);
+    defer a.free(begin.encoded);
+    var running = try std.json.parseFromSlice(JobState, a, begin.encoded, .{});
+    defer running.deinit();
+    const updated = try store.recordPass(a, running.value, .{});
+    defer a.free(updated);
+    var finished = try std.json.parseFromSlice(JobState, a, updated, .{});
+    defer finished.deinit();
+    try std.testing.expectEqualStrings("completed_with_failures", finished.value.phase);
+    try std.testing.expectEqual(@as(u64, 0), finished.value.result.in_progress);
+    try std.testing.expectEqual(@as(u64, 1), finished.value.result.failed);
+}
+
+test "async repair job pending gauges remain bounded across polls and settle on publication" {
+    const a = std.testing.allocator;
+    for ([_]StartRequest{
+        .{ .target = "artifact", .kind = .asset },
+        .{ .target = "artifact", .kind = .asset, .index = "document_text" },
+        .{ .target = "index", .index = "document_text" },
+    }) |req| {
+        var store = Store.init(a, .{});
+        defer store.deinit();
+        var current = try runOnePassForTest(a, &store, req, .{
+            .scanned = 1,
+            .reprocessed = 1,
+            .in_progress = 1,
+            .unresolved = 1,
+            .has_more = true,
+            .debt_remaining = true,
+        });
+        defer current.deinit();
+        // Polls use serialized state just like separate HTTP requests or a
+        // recovered owner. They must not count another provider submission.
+        for (0..4) |i| {
+            const begin = try store.beginAdvance(a, current.value);
+            defer a.free(begin.encoded);
+            var running = try std.json.parseFromSlice(JobState, a, begin.encoded, .{});
+            defer running.deinit();
+            const complete = i == 3;
+            const encoded = try store.recordPass(a, running.value, if (complete)
+                .{ .scanned = 1, .repaired = 1 }
+            else
+                .{ .scanned = 1, .in_progress = 1, .unresolved = 1, .debt_remaining = true });
+            defer a.free(encoded);
+            const next = try std.json.parseFromSlice(JobState, a, encoded, .{ .allocate = .alloc_always });
+            current.deinit();
+            current = next;
+            try std.testing.expectEqual(@as(u64, 1), current.value.result.reprocessed);
+            try std.testing.expectEqual(@as(u64, if (complete) 0 else 1), current.value.result.in_progress);
+            try std.testing.expectEqual(@as(u64, if (complete) 0 else 1), current.value.result.unresolved);
+            try std.testing.expectEqualStrings(if (complete) "succeeded" else "queued", current.value.phase);
+        }
+        try std.testing.expectEqual(@as(u64, 1), current.value.result.repaired);
+    }
+}
+
+test "artifact repair final pass keeps earlier failures while clearing pending gauges" {
+    const a = std.testing.allocator;
+    var store = Store.init(a, .{});
+    defer store.deinit();
+    var first = try runOnePassForTest(a, &store, .{ .target = "artifact", .kind = .asset }, .{
+        .scanned = 1,
+        .failed = 1,
+        .unresolved = 1,
+        .has_more = true,
+        .debt_remaining = true,
+    });
+    defer first.deinit();
+    const begin = try store.beginAdvance(a, first.value);
+    defer a.free(begin.encoded);
+    var running = try std.json.parseFromSlice(JobState, a, begin.encoded, .{});
+    defer running.deinit();
+    const encoded = try store.recordPass(a, running.value, .{ .scanned = 1, .repaired = 1 });
+    defer a.free(encoded);
+    var final = try std.json.parseFromSlice(JobState, a, encoded, .{});
+    defer final.deinit();
+    try std.testing.expectEqualStrings("completed_with_failures", final.value.phase);
+    try std.testing.expectEqual(@as(u64, 1), final.value.result.failed);
+    try std.testing.expectEqual(@as(u64, 1), final.value.result.repaired);
+    try std.testing.expectEqual(@as(u64, 0), final.value.result.in_progress);
+    try std.testing.expectEqual(@as(u64, 0), final.value.result.unresolved);
+    try std.testing.expect(final.value.result.debt_remaining);
 }

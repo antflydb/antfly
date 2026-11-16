@@ -403,7 +403,7 @@ metadata only through its proved retention interval. Bounded, resource-accounted
 memos hold copied identities and declarations; every query still validates source
 coverage, permissions and reader authority. See the protocol-44 implementation
 and qualification details in
-[`NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md`](../../zig/NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md).
+the [native lake performance log](../design/sql/history/native-lake-performance-log.md).
 
 Filesystem object-store prefix listings descend only through the prefix's
 complete path components. The final partial component remains a string filter,
@@ -559,9 +559,12 @@ cutover guarantee before its underlying protocol is qualified.
 
 The native row ingress is `POST /db/v1/tables/{tableName}/lake/changes`.
 It is available for a current-snapshot Iceberg binding with `iceberg_writer`
-and either managed or REST catalog authority. It requires table admin permission
-and independent Antfly artifact storage with `storage.primary`; lake read
+and either managed or REST catalog authority. It requires table write permission
+without a row filter, plus independent Antfly artifact storage with `storage.primary`; lake read
 credentials alone cannot authorize ingestion or publication writes.
+Catalog initialization, file commits and maintenance still require table admin
+permission. CDC admission does not evaluate per-row write policies, so a filtered
+writer or administrator cannot use this endpoint to bypass those policies.
 
 A transaction supplies `batch_id`, `source`, `epoch`, `checkpoint`, optional
 `expected_checkpoint`, `key_fields`, and an ordered `changes` array. Each change
@@ -597,14 +600,48 @@ so a recreated table or changed binding cannot inherit another writer's queue.
 WAL segments and receipts are retained; automated reader-safe WAL retention is
 not enabled by this path.
 
-One transaction is drained per publication-worker pass. The native writer
+Each publication-worker pass group-commits the pending WAL suffix. Contiguous
+accepted transactions that share a source, epoch and key definition, and whose
+checkpoints chain exactly, fold into one Iceberg snapshot of at most 16,384
+changes and 8 MiB of payload. If the pinned WAL root expires after a valid prefix
+has been decoded, the worker commits that owned prefix and opens a fresh cut for
+the next pass. It never renews an expired lazy root or converts request deadlines,
+cancellation, integrity errors or an unreadable first record into success. A
+forward reader shares one pinned WAL index traversal and hydrates only the group
+plus at most one lookahead transaction;
+saved intents replay without rereading pending payloads. Groups stop before a
+checkpoint cycle would make the final checkpoint equal the initial predecessor.
+The snapshot's coverage is the group's last LSN
+and its checkpoint is the last member's checkpoint. Later images of a key replace
+earlier ones, so the result equals committing each member in order. A lone
+transaction keeps its original batch and attempt identity. The saved intent is
+keyed by the group's first LSN, so a restart replays the exact group it chose
+even if more transactions arrived since. Grouping keeps snapshot count, catalog
+commits and index publications proportional to drain passes rather than to
+producer transactions, and lets a full 64-record pending window clear in one
+pass. The native writer
 preserves Parquet field IDs and nullability and writes immutable Parquet data,
 Iceberg equality deletes, data/delete manifests, and a manifest list. Repeated
 keys in a transaction keep their final mutation. Deletes and replacement data
 share a new sequence number: equality deletes suppress earlier versions and
 leave their replacement rows visible. Unpartitioned manifests allow global key
 deletes across existing partition specs without rewriting historical files.
-Existing manifest references are retained in the new snapshot. The writer
+Existing manifest references are retained in the new snapshot. Once 100 small
+(below 1 MiB) Antfly-written unpartitioned manifests of one content kind
+accumulate, the next commit rewrites them into manifests of at most 1 MiB each.
+Input decoding reuses scratch for one manifest at a time. Exact Avro entry sizes
+and one shared schema header determine output batches, so repeated large headers
+do not prevent merging. Outputs filled to three quarters of their record capacity
+use a `-full.avro` suffix and leave the merge pool; large headers alone do not seal
+an otherwise mostly empty output. Entries keep their
+original snapshot and sequence numbers with EXISTING status. Manifests that
+carry partitions or column bounds are never merged. Without merging, each commit
+and each reader's planning step would grow with the total number of commits.
+Commits also trim `metadata-log` to the newest
+`write.metadata.previous-versions-max` entries (default 100). As in Iceberg,
+zero and negative signed 32-bit values retain one previous file; larger positive
+values remain valid. Malformed values fail the commit. Managed recovery
+uses the immutable record chain, not that log. The writer
 supports flat primitive scalar schemas; unsupported nested and decimal schemas
 fail admission explicitly instead of dropping fields or encoding JSON as text.
 
@@ -694,8 +731,24 @@ transplanted into a newer parent.
 
 Vacuum first expires unprotected Iceberg snapshots through the catalog CAS,
 then marks retained snapshot file graphs and sweeps only unreachable objects
-with native ownership proofs. Defaults retain seven days and the newest two
-snapshots; named refs, current/live index publications, and durable snapshot
+with native ownership proofs. One job expires at most `max_expired` (default
+256) eligible snapshots, oldest first, and reports the rest as
+`remaining_snapshots`. This backlog is recomputed from current catalog metadata
+on every job turn, including saved-job replay after restarts or deletion limits.
+Before removing snapshots, version-two jobs save authenticated inventory chunks
+of at most 256 KiB beside the maintenance journal. Snapshot roots share immutable
+manifest inventories, and sweeps visit their union once. The root journal holds
+only snapshot/root references and at most 2 MiB of shared-node cache, so repeated
+ancestor file lists cannot overflow its 4 MiB limit. A replay uses the saved
+inventories even after another safe sweep has collected the source manifests.
+Version-one inline jobs remain replayable; older binaries fail closed on new jobs.
+Dry runs keep these inventories in memory. Within a job each immutable manifest
+is read once, even though snapshots carry their ancestors' manifests forward.
+When a scheduled job
+completes with a backlog, the scheduler plans the next bounded job immediately
+under a fresh operation ID. A large backlog therefore drains over consecutive
+passes instead of exceeding one job's 256 MiB read budget forever. Defaults
+retain seven days and the newest two snapshots; named refs, current/live index publications, and durable snapshot
 readers are roots. SQL scans, compaction and index construction hold renewable
 snapshot pins (two-minute leases, thirty-second renewals and thirty-second
 retirement grace). Hosts must keep clock skew within that grace, as with the
@@ -704,8 +757,25 @@ must share the durable artifact/pin authority; moving it requires a coordinated
 reader drain and retention migration. Snapshot readers need write access to
 that shared pin lane even when source data credentials are read-only. Renewal
 failures or expired readers fail
-closed, including during cached reads. A full reader mark pass precedes any
-shared-file deletion. Native ownership markers bind URI, content digest and
+closed, including during cached reads. Before shared-file deletion, the managed
+catalog requires a complete reachability proof bound to the exact metadata
+document. It checkpoints bootstrap work, caches immutable manifest inventories,
+and shares that proof between vacuum selection and authoritative retirement.
+A completed proof is usable in the same turn; marking and traversal share one
+mutation budget, so continuous catalog advancement does not require a pause in
+ingestion. Final membership lookup and deadline-bound retirement consume the
+prepared proof without starting another mark pass. Planning caches large source
+manifest lists in its private journal and resumes chunk ranges across turns.
+Each operation owns its temporary input cache. Closing admission after the
+immutable job is durable fences new planners; active writers hold bounded
+60-second leases with the existing 30-second clock-skew grace. Completion waits
+for bounded cache cleanup, including no-op and rejected jobs. Immutable replay
+journals and authoritative catalog reachability proofs remain separate from
+these disposable inputs.
+Retirement-only HEAD changes reuse the proof. Append-only root changes extend
+partially completed work; root removal or replacement rebuilds the exact set
+from cached inventories. Every retirement still uses the current HEAD CAS.
+Native ownership markers bind URI, content digest and
 ETag; deletes are conditional on that original ETag. Unmarked external files,
 legacy files, catalog history and orphan uploads outside retired snapshot graphs
 are retained. This is intentionally conservative migration behavior.
@@ -3919,3 +3989,31 @@ residual physical selections resolve the admitted window's authenticated inverse
 map through the existing bounded cache. Point probes retain their paged path.
 Segment membership receives its already computed document base, avoiding a prefix
 walk for every newly opened probe in a fragmented snapshot.
+
+## Deferred native lake qualification
+
+These items remain open from the native lake execution work (see
+[native index execution contracts](../../zig/LAKES.md#native-index-execution-contracts)):
+
+- **Real-provider retention enforcement.** Certificate-based cloud audit bypass
+  stays off (`lake_indexes.cloud_generations.qualified_retention: false`) until
+  actual S3 COMPLIANCE and GCS Locked retention behavior is qualified against live
+  buckets. As of 2026-10-13, GCS and R2 were available and a credentialed AWS S3
+  target had not been selected. R2 is not assumed to enforce S3 Object Lock.
+- **Representative archive benchmarks.** Measure the merged baseline before
+  claiming speedups or changing strategy thresholds, envelope sizes or bucket
+  sizes. Cover many-small-file and many-segment-in-one-file layouts, selective and
+  broad terms, conjunctions and phrases, top-K and exact counts, metadata filters,
+  typed cursor pages, and small appends/replacements. Report result equivalence,
+  latency distributions, peak RSS, provider requests and bytes, admitted
+  inventories and readers, spill bytes, publication reads/writes and GC work.
+  Separate genuinely empty-cache execution, restart after readiness warming, and
+  repeated warm queries, and record the commit, build mode, dataset shape, cache
+  policy and resource limits with each measurement. Deterministic work-count
+  regressions remain required even when wall-clock results improve.
+- **Remaining execution gaps.** A fully virtual snapshot for profiled, overlay,
+  multi-source and early-source request shapes; cross-query fairness beyond
+  bounded admission; latency-adaptive queue sizing; typed nested Parquet/JSON
+  paths; source-native incremental inventory proofs (the proof census and
+  canonical coverage hash remain linear in file count); and the cause of the
+  complete-membership fallback still observed for limit-20 metadata probes.

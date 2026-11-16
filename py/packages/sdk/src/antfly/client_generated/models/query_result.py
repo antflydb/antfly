@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -29,6 +29,8 @@ class QueryResult:
     Attributes:
         took (int): Duration of the query in milliseconds.
         status (int): HTTP status code of the query operation.
+        resolved_indexes (list[str] | Unset): Concrete index names selected for this query before embedding and
+            execution.
         source_ranking (QueryResultBaseSourceRanking | Unset): Ranking contract for a composed result.
         next_source_cursor (str | Unset): Opaque continuation for composed queries. Pass as source_cursor with the same
             query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication
@@ -37,6 +39,9 @@ class QueryResult:
             complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the
             configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and
             recipe. Unavailable retained generations return 409.
+        live_read (bool | Unset): True when an ordered query read live state because this deployment's storage (Lite)
+            cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued with search_after or
+            search_before.
         evaluation (QueryResultBaseEvaluation | Unset): Function evaluation scope, population, usage, and scoped
             aggregations.
         hits (QueryHits | Unset): A list of query hits.
@@ -55,9 +60,11 @@ class QueryResult:
 
     took: int
     status: int
+    resolved_indexes: list[str] | Unset = UNSET
     source_ranking: QueryResultBaseSourceRanking | Unset = UNSET
     next_source_cursor: str | Unset = UNSET
     remote_snapshot: str | Unset = UNSET
+    live_read: bool | Unset = UNSET
     evaluation: QueryResultBaseEvaluation | Unset = UNSET
     hits: QueryHits | Unset = UNSET
     aggregations: QueryResultBaseAggregations | Unset = UNSET
@@ -74,6 +81,10 @@ class QueryResult:
 
         status = self.status
 
+        resolved_indexes: list[str] | Unset = UNSET
+        if not isinstance(self.resolved_indexes, Unset):
+            resolved_indexes = self.resolved_indexes
+
         source_ranking: str | Unset = UNSET
         if not isinstance(self.source_ranking, Unset):
             source_ranking = self.source_ranking.value
@@ -81,6 +92,8 @@ class QueryResult:
         next_source_cursor = self.next_source_cursor
 
         remote_snapshot = self.remote_snapshot
+
+        live_read = self.live_read
 
         evaluation: dict[str, Any] | Unset = UNSET
         if not isinstance(self.evaluation, Unset):
@@ -122,12 +135,16 @@ class QueryResult:
                 "status": status,
             }
         )
+        if resolved_indexes is not UNSET:
+            field_dict["resolved_indexes"] = resolved_indexes
         if source_ranking is not UNSET:
             field_dict["source_ranking"] = source_ranking
         if next_source_cursor is not UNSET:
             field_dict["next_source_cursor"] = next_source_cursor
         if remote_snapshot is not UNSET:
             field_dict["remote_snapshot"] = remote_snapshot
+        if live_read is not UNSET:
+            field_dict["live_read"] = live_read
         if evaluation is not UNSET:
             field_dict["evaluation"] = evaluation
         if hits is not UNSET:
@@ -164,6 +181,8 @@ class QueryResult:
 
         status = d.pop("status")
 
+        resolved_indexes = cast(list[str], d.pop("resolved_indexes", UNSET))
+
         _source_ranking = d.pop("source_ranking", UNSET)
         source_ranking: QueryResultBaseSourceRanking | Unset
         if isinstance(_source_ranking, Unset):
@@ -174,6 +193,8 @@ class QueryResult:
         next_source_cursor = d.pop("next_source_cursor", UNSET)
 
         remote_snapshot = d.pop("remote_snapshot", UNSET)
+
+        live_read = d.pop("live_read", UNSET)
 
         _evaluation = d.pop("evaluation", UNSET)
         evaluation: QueryResultBaseEvaluation | Unset
@@ -231,9 +252,11 @@ class QueryResult:
         query_result = cls(
             took=took,
             status=status,
+            resolved_indexes=resolved_indexes,
             source_ranking=source_ranking,
             next_source_cursor=next_source_cursor,
             remote_snapshot=remote_snapshot,
+            live_read=live_read,
             evaluation=evaluation,
             hits=hits,
             aggregations=aggregations,

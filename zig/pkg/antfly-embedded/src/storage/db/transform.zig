@@ -15,13 +15,23 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const types = @import("types.zig");
+const types = @import("mutation_values.zig");
 
 pub fn resolveDocumentTransform(
     alloc: Allocator,
     existing_json: ?[]const u8,
     transform: types.DocumentTransform,
 ) !?[]u8 {
+    return resolveDocumentTransformWithCancellation(alloc, existing_json, transform, .none);
+}
+
+pub fn resolveDocumentTransformWithCancellation(
+    alloc: Allocator,
+    existing_json: ?[]const u8,
+    transform: types.DocumentTransform,
+    cancellation: @import("antfly_cancellation").CancellationToken,
+) !?[]u8 {
+    try cancellation.check();
     // The mutable tree and operands share one request-budgeted scratch region.
     // Parse the base directly into it instead of cloning a second full DOM.
     // Only the final encoded document escapes this scope.
@@ -39,7 +49,11 @@ pub fn resolveDocumentTransform(
         break :blk parsed;
     } else std.json.Value{ .object = std.json.ObjectMap.empty };
 
-    for (prepared.operations) |*op| try applyPreparedTransformOp(scratch_alloc, &root, op, is_insert);
+    for (prepared.operations) |*op| {
+        try cancellation.check();
+        try applyPreparedTransformOp(scratch_alloc, &root, op, is_insert);
+    }
+    try cancellation.check();
 
     return try std.json.Stringify.valueAlloc(alloc, root, .{});
 }
@@ -48,12 +62,7 @@ pub fn resolveDocumentTransform(
 ///
 /// Keep this independent of document state so an unsupported request cannot
 /// become an acknowledged no-op merely because its target is absent.
-pub fn validateDocumentTransform(alloc: Allocator, transform: types.DocumentTransform) !void {
-    for (transform.operations) |op| {
-        var prepared = try prepareTransformOp(alloc, op, false);
-        prepared.deinit(alloc);
-    }
-}
+pub const validateDocumentTransform = @import("mutation_validation.zig").validateDocumentTransform;
 
 pub fn validateTransformOpType(op: types.TransformOpType) !void {
     switch (op) {
@@ -925,4 +934,11 @@ test "invalid transform operands are rejected before missing-document no-op reso
             .operations = &overflowing_integer_increment,
         }),
     );
+}
+
+test "commit requirements transform cancellation precedes allocation" {
+    var failed = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, resolveDocumentTransformWithCancellation(failed.allocator(), "{}", .{ .key = "doc", .operations = &.{.{ .op = .unset, .path = "x" }} }, @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled)));
+    try std.testing.expect(!failed.has_induced_failure);
 }

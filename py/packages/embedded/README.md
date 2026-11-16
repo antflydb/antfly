@@ -99,14 +99,14 @@ what it can and cannot interrupt). It raises `UnsupportedError` if this
 build does not link the inference runtime or the runtime cannot start.
 
 For decision question types and examples, see the
-[typed decision guide](../../../docs/guides/decisions.md).
+[typed decision guide](../../../docs/reference/decisions.md).
 
 Each call takes the request JSON and returns the response JSON of the
 matching `/ai/v1` route of the Antfly inference HTTP API: `embed()`,
 `rerank()`, `chunk()`, `generate()`, `generate_batch()` (up to 128
 non-streaming requests per call; per-item failures are reported in the
-response, not raised), `rewrite()`, `decide()`, `extract()`, `read()` (OCR),
-`transcribe()`, and `list_models()`. Requests accept the same `dict` / `str`
+response, not raised), `rewrite()`, `decide()`, `extract()`, `read()` (documents, images, audio),
+and `list_models()`. Requests accept the same `dict` / `str`
 / `bytes` JSON forms as `Database` methods, and responses honor the same
 `raw=True` convention. `generate()` and `generate_batch()` requests always
 return complete responses; `"stream": true` raises `InvalidArgumentError`
@@ -230,7 +230,9 @@ for the full C ABI contract.
 Multiple writable Lite connections may remain open, including across processes.
 Native operations queue within a process and take a kernel writer lease across
 processes. Pass `busy_timeout=<seconds or datetime.timedelta>` to `create()`/`open()`
-to wait for a competing operation. Closing one connection leaves others usable.
+to retry admission while another process holds the writer lease or advances the
+allocator checkpoint. This admission retry never replays a mutation body.
+Closing one connection leaves others usable.
 
 ## Graph edges and index readiness
 
@@ -293,7 +295,7 @@ inventory; retry until it is `true` or your own deadline expires.
   select the destination kind).
 - **Embedded inference (no database)**: `Inference.open()`, `embed()`,
   `rerank()`, `chunk()`, `generate()`, `generate_stream()`,
-  `generate_batch()`, `rewrite()`, `decide()`, `extract()`, `read()`, `transcribe()`,
+  `generate_batch()`, `rewrite()`, `decide()`, `extract()`, `read()` (documents, images, audio),
   `list_models()`, `pull()` (with a `PullProgress` dataclass for progress
   callbacks; both `pull()` and `generate_stream()` accept a callback that
   can cancel the call by returning `False`). See "Embedded inference (no
@@ -308,6 +310,16 @@ inventory; retry until it is `true` or your own deadline expires.
   `OutcomeUnknownError`, `UnsupportedError`, `StalledError`,
   `CancelledError`, `InternalError`. Unrecognized codes raise `AntflyError`
   directly.
+- **Outcome receipts**: when `batch()`, `batch_json()`, or an autocommit
+  `sql()` write fails with ANTFLY_OUTCOME_UNKNOWN, the `OutcomeUnknownError`
+  (or `SQLStateError`, and the DB-API error mapped from either) carries
+  `.outcome_receipt` (`None` when the call issued none). Resolve it on any
+  handle for the same database with `db.outcome_receipt_status(receipt)`,
+  which returns `OutcomeReceiptStatus.APPLIED` or `.NOT_APPLIED`, or raises
+  `StalledError` while the uncertain commit is not reconciled yet (Lite:
+  retry; directory database: close the issuing handle and reopen first).
+  Call `db.forget_outcome_receipt(receipt)` once resolved; afterwards it can
+  no longer be resolved.
 
 `create()` provisions the default `full_text_index_v0` full-text index,
 matching the server's table-create behavior, so `add_index()` is only
@@ -331,6 +343,22 @@ Tests that need `libantfly` skip cleanly when it cannot be found, unless
 `tests/test_conformance.py` runs every case in
 `zig/pkg/antfly-embedded/capi-conformance/cases/*.json` through this public API, the
 same declarative cases the Go and Rust bindings run.
+
+Use `uv run pytest --durations=25` to separate fixture setup from test calls.
+The SQL FK/subquery regression keeps synchronous commits and checks reopen
+persistence; `ANTFLY_EMBEDDED_SQL_STRESS=1` runs the original 400-transaction
+stress workload. The ordinary case crosses the deletion boundary with nine
+children and checks the surviving keys. A native C ABI regression separately
+forces a runtime-generation refresh between the subquery and commit.
+
+Resolver restore tests share only immutable backup bytes and a backup file.
+Each restore API/storage combination gets its own database and verifies source
+isolation after migration. Background-progress tests must observe the real
+worker without calling `run_until_idle()`: the native Lite diagnostic
+`pending_work_stats()["background_publications"]["maintenance_rounds"]` counts
+namespace rounds reaching replay/idle completion, while `maintenance_errors`
+reports failures. Stability checks require further rounds with unchanged
+derived targets instead of assuming a fixed sleep was sufficient.
 
 ## SQL and multiple tables
 
@@ -374,3 +402,31 @@ backups.
 
 See [the native SQL contract](../../../zig/CAPI.md#database-sql) for
 savepoints, supported isolation, and unknown commit outcomes.
+
+## Cypher and SQL graph composition
+
+`graph_catalog_json`, `cypher_json`, and `graph_write_status` expose durable named graphs, Cypher queries and mutations, and
+transaction receipts through libantfly. Catalog requests use `action` (`put`,
+`get`, `list`, `drop`), a graph `name`, and a `definition` for puts. Replacement
+and drop require the current decimal-string `expected_revision`.
+
+Queries use the same request contract as the server: `query`, `parameters` or
+lossless `typed_parameters`, optional limits, and `write_request_id`. Results
+contain tagged graph values; integer values are decimal strings. Native writes
+return a commit receipt. Retain the request ID and resolve an unknown outcome
+through the status method instead of replaying the query. `GraphError` preserves
+the diagnostic code, span, outcome, and transaction ID when available.
+
+SQL datetime properties use integer epoch nanoseconds in Cypher; pass integers
+for CREATE, MERGE, and SET. Timestamp strings remain available through SQL.
+Cypher node writes reject native ingestion controls `_edges` and `_embeddings`;
+use relationship patterns and the native batch API respectively. Relationship
+IDs are opaque and remain stable across property updates and reopening.
+
+Local SQL supports `GRAPH_TABLE` over these catalogs, including ordinary-table
+joins and staged SQL rows in an explicit transaction. Graph definitions pin
+local table and graph-index identities across reopen. Raw embedded calls reject
+protected tables; authenticated principal queries use the server API.
+
+See [the Cypher contract](../../../zig/CYPHER.md) for grammar, mapping, value,
+mutation, and deployment semantics.

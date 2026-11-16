@@ -25,9 +25,9 @@ const rebuild = @import("../serverless/build/lake_rebuild.zig");
 const A = std.mem.Allocator;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
-pub const metadata_version: u16 = 4;
+pub const metadata_version: u16 = 5;
 pub fn supportsMetadata(version: u16) bool {
-    return version == 2 or version == 3 or version == metadata_version;
+    return version == 4 or version == metadata_version;
 }
 pub const Root = struct {
     version: u16 = metadata_version,
@@ -49,7 +49,7 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: local.serverless_manifes
     try state.validate(root.file_states, root.generation.domain);
     if (root.file_directory) |directory| {
         try directory.validate();
-        if (root.version < 3 or root.file_states.len != 0) return error.InvalidNativeLakeFileState;
+        if (root.file_states.len != 0) return error.InvalidNativeLakeFileState;
     }
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeSparseRoot;
     if (!std.mem.eql(u8, &scope.domain, &root.generation.domain)) return error.InvalidNativeLakeSparseRoot;
@@ -316,4 +316,14 @@ test "external lake fresh sparse fragment mutations keep quantization error boun
         }
     }
     try std.testing.expect(compactions >= 10);
+}
+
+test "external lake sparse roots reject obsolete metadata versions" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("obsolete-lake_index_native_sparse");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    // Missing objects must not be read for unsupported root formats.
+    for ([_]u16{ 2, 3 }) |version| try std.testing.expectError(error.InvalidNativeLakeSparseRoot, loadRoot(a, fs.artifactStore(), .{ .kind = .sparse_segment, .metadata_version = @intCast(version), .artifact_id = "missing", .byte_len = 1, .checksum = "missing" }, .none, null));
 }

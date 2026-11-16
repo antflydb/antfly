@@ -39,7 +39,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/antflydb/antfly.git",
+    "url": "git+https://github.com/antflydb/antfly.git",
     "directory": "ts/packages/web"
+  },
+  "homepage": "https://github.com/antflydb/antfly/tree/main/ts/packages/web#readme",
+  "bugs": {
+    "url": "https://github.com/antflydb/antfly/issues"
   }
 }

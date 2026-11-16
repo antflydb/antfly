@@ -11,7 +11,7 @@ function Textarea({ className, ...props }: React.ComponentProps<"textarea">) {
         // readout. Code-like fields can opt back in with font-mono.
         "font-sans text-sm text-foreground placeholder:text-muted-foreground",
         // structure: square, token-width border, no shadow
-        "field-sizing-content flex min-h-20 w-full rounded-none border-(length:--border-width) border-input bg-transparent",
+        "field-sizing-content flex min-h-20 w-full rounded-md border-(length:--border-width) border-input bg-transparent",
         "px-3 py-2",
         // focus
         "outline-none transition-[border-color,box-shadow]",

@@ -462,9 +462,16 @@ pub const Replay = struct {
     }
     pub const CaptureBatch = struct {
         vectors: []const rows.ColumnVector,
-        pub fn physical(raw: *anyopaque, _: A, ordinal: usize) !?local.sql_execution_batch.PhysicalColumn {
+        pub fn physical(raw: *anyopaque, a: A, ordinal: usize) !?local.sql_execution_batch.PhysicalColumn {
             const self: *CaptureBatch = @ptrCast(@alignCast(raw));
             const column = self.vectors[ordinal];
+            if (column.values == .vector_f32) {
+                const values = try a.alloc([]const u8, column.rowCount());
+                for (values, column.values.vector_f32, 0..) |*bytes, vector, row| bytes.* = if (column.nulls.isNull(row)) "" else try @import("antfly_vector").codec.encodePackedF32BytesAlloc(a, vector);
+                var encoded = column;
+                encoded.values = .{ .bytes = values };
+                return .{ .vector = encoded, .range = .{ .count = column.rowCount() }, .kind = .string };
+            }
             const kind: local.sql_ast.ColumnType = switch (column.values) {
                 .i64, .dictionary_i64 => .integer,
                 .f64, .dictionary_f64 => .number,
@@ -474,7 +481,7 @@ pub const Replay = struct {
             };
             var vector = column;
             // JSON source columns are serialized bytes in the replay contract.
-            if (vector.values == .json) vector.values = .{ .bytes = vector.values.json };
+            if (column.values == .json) vector.values = .{ .bytes = column.values.json };
             return .{ .vector = vector, .range = .{ .count = column.rowCount() }, .kind = kind, .element = if (kind == .number) .float64 else null };
         }
         pub fn identity(raw: *anyopaque, row: usize, ordinal: usize) !?u64 {
@@ -501,7 +508,7 @@ pub const Replay = struct {
                 .bool => |v| .{ .bool = v[row] },
                 .bytes, .json => |v| .{ .string = v[row] },
                 .dictionary_bytes => |v| .{ .string = v.at(row) },
-                .vector_f32 => return error.UnsupportedExternalLakeIndex,
+                .vector_f32 => |v| .{ .string = try @import("antfly_vector").codec.encodePackedF32BytesAlloc(a, v[row]) },
             } };
         }
     };

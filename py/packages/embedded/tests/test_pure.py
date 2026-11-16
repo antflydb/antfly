@@ -20,6 +20,8 @@ libantfly available, so lint/type-check jobs have real test coverage.
 
 from __future__ import annotations
 
+import ctypes
+import json
 from pathlib import Path
 
 import pytest
@@ -158,3 +160,79 @@ def test_models_directory_survives_options_marshalling(monkeypatch: pytest.Monke
     gc.collect()
     assert ctypes.string_at(options.models_dir.ptr, options.models_dir.len) == "/tmp/model-café".encode()
     assert keep_alive is not None
+
+
+class _ReceiptLibrary:
+    """Fake libantfly whose last call failed with an outcome receipt."""
+
+    def __init__(self, receipt: bytes | None) -> None:
+        self.receipt = receipt
+        self.calls: list[str] = []
+        self._held: list[object] = []
+
+    def antfly_last_error_outcome_receipt(self, out):
+        self.calls.append("receipt")
+        if self.receipt is None:
+            return errors.NOT_FOUND
+        data = (ctypes.c_uint8 * len(self.receipt)).from_buffer_copy(self.receipt)
+        self._held.append(data)
+        buffer = out._obj
+        buffer.ptr = ctypes.cast(data, ctypes.POINTER(ctypes.c_uint8))
+        buffer.len = len(self.receipt)
+        return errors.OK
+
+    def antfly_buffer_free(self, buffer):
+        self.calls.append("free")
+
+    def antfly_last_error_code(self):
+        self.calls.append("code")
+        return errors.OUTCOME_UNKNOWN
+
+    def antfly_last_error_detail(self):
+        return b"commit durability unconfirmed"
+
+
+RECEIPT = "or1:000102030405060708090a0b0c0d0e0f:3"
+
+
+def test_outcome_unknown_carries_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
+    library = _ReceiptLibrary(RECEIPT.encode())
+    monkeypatch.setattr(_ffi, "_lib", library)
+    monkeypatch.setattr(_ffi, "get_lib", lambda: library)
+    with pytest.raises(errors.OutcomeUnknownError, match="durability") as result:
+        errors.raise_for_outcome_code(errors.OUTCOME_UNKNOWN)
+    assert result.value.outcome_receipt == RECEIPT
+    assert library.calls[0] == "receipt"
+
+
+def test_outcome_unknown_without_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
+    library = _ReceiptLibrary(None)
+    monkeypatch.setattr(_ffi, "_lib", library)
+    with pytest.raises(errors.OutcomeUnknownError) as result:
+        errors.raise_for_outcome_code(errors.OUTCOME_UNKNOWN)
+    assert result.value.outcome_receipt is None
+    assert errors.OutcomeUnknownError().outcome_receipt is None
+
+
+def test_other_codes_do_not_read_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
+    library = _ReceiptLibrary(RECEIPT.encode())
+    monkeypatch.setattr(_ffi, "_lib", library)
+    with pytest.raises(errors.BusyError):
+        errors.raise_for_outcome_code(errors.BUSY)
+    assert "receipt" not in library.calls
+
+
+def test_sql_error_body_carries_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
+    from antfly_embedded._sql import SQLStateError, output
+
+    library = _ReceiptLibrary(None)
+    monkeypatch.setattr(_ffi, "_lib", library)
+    monkeypatch.setattr(_ffi, "get_lib", lambda: library)
+    body = json.dumps(
+        {"error": {"code": "40003", "message": "commit outcome unknown"}, "outcome_receipt": RECEIPT}
+    ).encode()
+    data = (ctypes.c_uint8 * len(body)).from_buffer_copy(body)
+    buffer = _ffi.AntflyBuffer(ptr=ctypes.cast(data, ctypes.POINTER(ctypes.c_uint8)), len=len(body))
+    with pytest.raises(SQLStateError) as result:
+        output(errors.OUTCOME_UNKNOWN, buffer)
+    assert result.value.outcome_receipt == RECEIPT

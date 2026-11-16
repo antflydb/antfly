@@ -17,7 +17,10 @@ class InferenceGenerateUsage:
     Attributes:
         prompt_tokens (int): Number of tokens in the prompt
         completion_tokens (int): Number of tokens in the completion
-        total_tokens (int): Total tokens used (prompt + completion)
+        total_tokens (int): Total token budget consumed (measured prompt and completion tokens plus unmeasured
+            allowances).
+        unmeasured_tokens (int | Unset): Conservative provider-declared token allowance spent on document calls without
+            measurements. Included in total_tokens; not measured or billable usage.
         model_calls (int | Unset): Cumulative logical child invocations for a document run.
         physical_model_calls (int | Unset): Physical child operation invocations, separate from logical composite calls.
         rendered_pixels (int | Unset): Cumulative rendered or decoded pixels charged by document work.
@@ -30,6 +33,7 @@ class InferenceGenerateUsage:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    unmeasured_tokens: int | Unset = UNSET
     model_calls: int | Unset = UNSET
     physical_model_calls: int | Unset = UNSET
     rendered_pixels: int | Unset = UNSET
@@ -45,6 +49,8 @@ class InferenceGenerateUsage:
         completion_tokens = self.completion_tokens
 
         total_tokens = self.total_tokens
+
+        unmeasured_tokens = self.unmeasured_tokens
 
         model_calls = self.model_calls
 
@@ -69,6 +75,8 @@ class InferenceGenerateUsage:
                 "total_tokens": total_tokens,
             }
         )
+        if unmeasured_tokens is not UNSET:
+            field_dict["unmeasured_tokens"] = unmeasured_tokens
         if model_calls is not UNSET:
             field_dict["model_calls"] = model_calls
         if physical_model_calls is not UNSET:
@@ -95,6 +103,8 @@ class InferenceGenerateUsage:
 
         total_tokens = d.pop("total_tokens")
 
+        unmeasured_tokens = d.pop("unmeasured_tokens", UNSET)
+
         model_calls = d.pop("model_calls", UNSET)
 
         physical_model_calls = d.pop("physical_model_calls", UNSET)
@@ -113,6 +123,7 @@ class InferenceGenerateUsage:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
+            unmeasured_tokens=unmeasured_tokens,
             model_calls=model_calls,
             physical_model_calls=physical_model_calls,
             rendered_pixels=rendered_pixels,

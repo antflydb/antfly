@@ -36,7 +36,6 @@ pub const Provider = struct {
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
-    use_openai_schema: bool = false,
     max_completion_tokens: ?i64 = null,
     reasoning_effort: ?[]const u8 = null,
     temperature: ?f32 = null,
@@ -88,7 +87,6 @@ pub const Provider = struct {
     }
 
     pub fn setCompletionOptions(self: *Provider, max_completion_tokens: ?i64, reasoning_effort: ?[]const u8) void {
-        self.use_openai_schema = true;
         self.max_completion_tokens = max_completion_tokens;
         self.reasoning_effort = reasoning_effort;
     }
@@ -146,6 +144,7 @@ pub const Provider = struct {
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
+            .follow_redirects = false,
             .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
@@ -185,23 +184,10 @@ pub const Provider = struct {
         };
     }
 
-    /// Use the upstream generated request for OpenAI. Compatible servers retain
-    /// the shared wire encoder and their non-OpenAI sampling extensions.
+    /// All Chat Completions providers share the generated upstream request.
+    /// Keep vendor extensions outside that schema instead of maintaining a
+    /// second encoder for compatible servers.
     fn chatRequestJsonAlloc(self: *const Provider, alloc: std.mem.Allocator, model: []const u8, messages: []const inference.ChatMessage) ![]u8 {
-        const options = inference.ChatRequestOptions{
-            .response_format_json = self.response_format_json,
-            .logprobs = self.logprobs,
-            .tools_json = self.tools_json,
-            .tool_choice_json = self.tool_choice_json,
-            .max_tokens = self.max_tokens,
-            .temperature = self.temperature,
-            .top_p = self.top_p,
-            .top_k = self.top_k,
-            .frequency_penalty = self.frequency_penalty,
-            .presence_penalty = self.presence_penalty,
-        };
-        if (!self.use_openai_schema) return inference.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .openai_compatible, options);
-
         // Reuse multimodal/tool message adaptation, then let the generated
         // upstream type own provider parameter names and optional-field encoding.
         const envelope = try inference.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .openai_compatible, .{
@@ -238,7 +224,7 @@ pub const Provider = struct {
         var request = openai_api.types.CreateChatCompletionRequest{
             .model = .{ .string = model },
             .messages = wire_messages,
-            .tools = if (parsed.value.object.get("tools")) |tools| tools.array.items else null,
+            .tools = try inference.chatToolsFromValue(parsed.value.object.get("tools")),
             .tool_choice = parsed.value.object.get("tool_choice"),
             .response_format = parsed.value.object.get("response_format"),
             .logprobs = if (self.logprobs) .{ .value = true } else .absent,
@@ -268,6 +254,7 @@ pub const Provider = struct {
         const Response = struct {
             usage: std.json.Value = .null,
             choices: []const struct {
+                finish_reason: ?[]const u8 = null,
                 logprobs: ?std.json.Value = null,
                 message: struct {
                     content: ?[]const u8 = null,
@@ -287,6 +274,7 @@ pub const Provider = struct {
         const json_body = try self.chatRequestJsonAlloc(self.allocator, model, messages);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
+            .follow_redirects = false,
             .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
@@ -303,17 +291,30 @@ pub const Provider = struct {
         const choices = parsed.value.choices;
         var synthesized = false;
         if (choices.len > 0) {
+            const choice = choices[0];
+            // Compatible servers may omit upstream envelope fields, and the
+            // generated response represents choices as untyped JSON. Project
+            // the fields we consume, including the completion outcome.
+            const finish_reason = if (choice.finish_reason) |reason|
+                std.meta.stringToEnum(inference.GenerationFinishReason, reason)
+            else
+                null;
+            const content = choice.message.content orelse "";
+            const call_count = if (choice.message.tool_calls) |calls| calls.len else 0;
+            if (content.len == 0 and call_count == 0 and finish_reason == .length)
+                return error.InferenceOutputIncomplete;
             const proof = if (choices[0].logprobs) |evidence| try std.json.Stringify.valueAlloc(alloc, evidence, .{}) else null;
             errdefer if (proof) |value| alloc.free(value);
             var tool_calls = try cloneOpenAIToolCalls(alloc, choices[0].message.tool_calls);
             errdefer freeToolCalls(alloc, tool_calls);
-            if (choices[0].message.content) |content| {
+            if (choices[0].message.content) |text| {
                 if (tool_calls.len == 0) {
-                    tool_calls = try inference.synthesizeForcedToolCallFromContent(alloc, content, self.tools_json, self.tool_choice_json);
+                    tool_calls = try inference.synthesizeForcedToolCallFromContent(alloc, text, self.tools_json, self.tool_choice_json);
                     synthesized = tool_calls.len > 0;
                 }
                 return .{
-                    .content = try alloc.dupe(u8, content),
+                    .content = try alloc.dupe(u8, text),
+                    .finish_reason = finish_reason,
                     .tool_calls = tool_calls,
                     .tool_calls_synthesized = synthesized,
                     .token_logprobs_json = proof,
@@ -324,6 +325,7 @@ pub const Provider = struct {
             if (tool_calls.len > 0) {
                 return .{
                     .content = try alloc.dupe(u8, ""),
+                    .finish_reason = finish_reason,
                     .tool_calls = tool_calls,
                     .tool_calls_synthesized = synthesized,
                     .token_logprobs_json = proof,
@@ -561,13 +563,81 @@ test "openai generate round trip and empty choices failure" {
     try std.testing.expectEqual(error.GenerateRequestFailed, state.err);
 }
 
+test "openai compatible generation preserves finish reasons and rejects empty truncation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = struct {
+        choice: []const u8,
+        reason: ?inference.GenerationFinishReason = null,
+        content: []const u8 = "",
+        calls: usize = 0,
+        failure: ?anyerror = null,
+    };
+    const cases = [_]Case{
+        .{ .choice = "{\"message\":{\"content\":\"\",\"reasoning\":\"thinking\"},\"finish_reason\":\"length\"}", .failure = error.InferenceOutputIncomplete },
+        .{ .choice = "{\"message\":{\"content\":null,\"reasoning_content\":\"thinking\"},\"finish_reason\":\"length\"}", .failure = error.InferenceOutputIncomplete },
+        .{ .choice = "{\"message\":{\"tool_calls\":[]},\"finish_reason\":\"length\"}", .failure = error.InferenceOutputIncomplete },
+        .{ .choice = "{\"message\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}", .reason = .length, .content = "partial" },
+        .{ .choice = "{\"message\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}", .reason = .stop, .content = "ok" },
+        .{ .choice = "{\"message\":{\"content\":\"\"},\"finish_reason\":\"content_filter\"}", .reason = .content_filter },
+        .{ .choice = "{\"message\":{\"content\":\"legacy\"}}", .content = "legacy" },
+        .{ .choice = "{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call-1\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}", .reason = .tool_calls, .calls = 1 },
+        .{ .choice = "{\"message\":{\"content\":\"\",\"tool_calls\":[{\"id\":\"call-1\",\"function\":{\"name\":\"search\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"length\"}", .reason = .length, .calls = 1 },
+    };
+    const Run = struct {
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) void {
+            server.handleOne() catch |err| {
+                failure.* = err;
+            };
+        }
+    };
+    for (cases) |case| {
+        const body = try std.fmt.allocPrint(a, "{{\"choices\":[{s}],\"usage\":{{\"prompt_tokens\":2,\"completion_tokens\":256,\"total_tokens\":258}}}}", .{case.choice});
+        defer a.free(body);
+        var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/chat/completions", .respond = .{ .body = body } }});
+        defer server.deinit();
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Run.serve, .{ &server, &failure });
+        var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var provider = Provider.init(a, &client, server.baseUrl());
+        defer provider.deinit();
+        const result = provider.generator().generate(a, "thinking-model", &.{.{ .role = .user, .content = .{ .text = "Hi" } }});
+        if (case.failure) |err| {
+            try std.testing.expectError(err, result);
+        } else {
+            var generated = try result;
+            defer generated.deinit();
+            try std.testing.expectEqual(case.reason, generated.finish_reason);
+            try std.testing.expectEqualStrings(case.content, generated.content);
+            try std.testing.expectEqual(case.calls, generated.tool_calls.len);
+            try std.testing.expectEqual(@as(u64, 256), generated.usage.?.output_tokens);
+        }
+        try group.await(io);
+        if (failure) |err| return err;
+    }
+}
+
+test "openai generated request omits null tools and rejects invalid tool shapes" {
+    const a = std.testing.allocator;
+    var provider = Provider{ .allocator = a, .http = undefined, .base_url = "http://localhost/v1", .tools_json = "null" };
+    const body = try provider.chatRequestJsonAlloc(a, "m", &.{});
+    defer a.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.object.contains("tools"));
+    provider.tools_json = "{}";
+    try std.testing.expectError(error.InvalidGeneratorToolConfig, provider.chatRequestJsonAlloc(a, "m", &.{}));
+}
+
 test "generating backend OpenAI preserves numeric literals in tools and response schemas" {
     const a = std.testing.allocator;
     const provider = Provider{
         .allocator = a,
         .http = undefined,
         .base_url = "https://api.openai.com/v1",
-        .use_openai_schema = true,
         .tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"antfly_output\",\"parameters\":{\"type\":\"number\",\"const\":1.0000000000000001}}}]",
         .response_format_json = "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"test\",\"schema\":{\"type\":\"number\",\"minimum\":1e-400}}}",
     };

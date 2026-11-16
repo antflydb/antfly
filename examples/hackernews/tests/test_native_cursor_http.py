@@ -148,6 +148,8 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
                 "false",
                 "--models-dir",
                 str(tmp_path / "models"),
+                "--process-memory-budget-mb",
+                "4096",
             ],
             stdout=log,
             stderr=log,
@@ -391,9 +393,19 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
                 )
             )
         assert implicit_unpinned.value.code == 409, implicit_unpinned.value.__notes__
+
+        # The filesystem artifact repository is also below data/, but owns
+        # authoritative linked generations. Delete only per-DB cache manifests.
+        def owner_cuts():
+            return [
+                path
+                for path in (tmp_path / "data").rglob("query-cut.json")
+                if path.parent.parent.name.endswith(".query-pins")
+            ]
+
         # Owner files are disposable caches. Recovery must preserve the old
         # cut from durable artifacts rather than capture today's live rows.
-        retained_files = list((tmp_path / "data").rglob("query-cut.json"))
+        retained_files = owner_cuts()
         assert retained_files
         for manifest in retained_files:
             manifest.unlink(missing_ok=True)
@@ -403,7 +415,7 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
             3,
             4,
         ], partial
-        assert not list((tmp_path / "data").rglob("query-cut.json"))
+        assert not owner_cuts()
         for manifest in retained_files:
             try:
                 shutil.rmtree(manifest.parent)
@@ -417,9 +429,9 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
         ]
         # Replacement readers fetch authenticated pages from the manifest;
         # resuming a cursor must not copy the complete generation back to disk.
-        assert not list((tmp_path / "data").rglob("query-cut.json"))
+        assert not owner_cuts()
         # Losing both copies fails closed while the public capability remains.
-        for manifest in (tmp_path / "data").rglob("query-cut.json"):
+        for manifest in owner_cuts():
             shutil.rmtree(manifest.parent)
         if artifact_provider == "gcs":
             subprocess.run(
@@ -434,8 +446,15 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
                 capture_output=True,
                 text=True,
             )
+        elif artifact_provider == "filesystem":
+            remote_manifests = list(
+                (tmp_path / "data").rglob("native-query-links/**/query-cut.json")
+            )
+            assert remote_manifests
+            for manifest in remote_manifests:
+                manifest.unlink()
         else:
-            remote_root = s3.root if s3 else tmp_path / "data"
+            remote_root = s3.root
             remote_manifests = list(
                 remote_root.rglob("native-query-generations/**/*.json")
             )

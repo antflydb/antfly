@@ -19,11 +19,20 @@ const std = @import("std");
 const A = std.mem.Allocator;
 const indexed = @import("indexed.zig");
 pub const Source = struct {
+    acquisition_id: ?[]const u8 = null,
+    knowledge: ?std.json.Value = null,
+    search_version: u32 = 1,
+    artifacts: []const std.json.Value = &.{},
+    fields: ?@import("record_view.zig").Fields = null,
+    streams: []const @import("record_view.zig").Stream = &.{},
+    publication: []const u8 = "text",
+    document_version: u32 = 1,
     published_revision: ?[]const u8 = null,
     id: []const u8,
+    row_source_id: ?[]const u8 = null,
     alias: ?[]const u8 = null,
     table: []const u8,
-    document_field: []const u8,
+    document_field: []const u8 = "grep",
     filter: std.json.Value,
     access_id: ?[]const u8 = null,
     status: []const u8,
@@ -36,14 +45,32 @@ pub const Catalog = struct {
     principals: []const []const u8 = &.{},
 };
 pub fn table(source: Source) !indexed.Table {
-    if (source.filter != .object or !std.mem.eql(u8, source.document_field, "grep")) return error.InvalidSourceCatalog;
+    if ((source.document_version != 1 and source.document_version != 3) or (source.document_version < 3 and std.mem.eql(u8, source.publication, "media"))) return error.UnsupportedSourceKind;
+    if (source.filter != .object or (source.document_version < 3 and !std.mem.eql(u8, source.document_field, "grep")) or (source.document_version == 3 and source.fields == null)) return error.InvalidSourceCatalog;
     if (source.id.len == 0 or source.id.len > 512 or std.mem.indexOfAny(u8, source.id, "\x00\r\n") != null or source.table.len == 0 or std.mem.indexOfAny(u8, source.table, "\x00\r\n") != null or std.mem.eql(u8, source.table, ".") or std.mem.eql(u8, source.table, "..")) return error.InvalidSourceCatalog;
+    if (source.row_source_id) |id| {
+        if (id.len != 36) return error.InvalidSourceCatalog;
+        for (id, 0..) |char, i| {
+            switch (i) {
+                8, 13, 18, 23 => if (char != '-') return error.InvalidSourceCatalog,
+                else => if (!std.ascii.isDigit(char) and (char < 'a' or char > 'f')) return error.InvalidSourceCatalog,
+            }
+        }
+        const conjuncts = source.filter.object.get("conjuncts") orelse return error.InvalidSourceCatalog;
+        if (source.filter.object.count() != 1 or conjuncts != .array or conjuncts.array.items.len != 2) return error.InvalidSourceCatalog;
+        for (conjuncts.array.items, [_][]const u8{ "source_id", "doc_type" }, [_][]const u8{ id, "source_item" }) |term, field, value| {
+            if (term != .object or term.object.count() != 2) return error.InvalidSourceCatalog;
+            const actual_field = term.object.get("field") orelse return error.InvalidSourceCatalog;
+            const actual_value = term.object.get("equals") orelse return error.InvalidSourceCatalog;
+            if (actual_field != .string or actual_value != .string or !std.mem.eql(u8, actual_field.string, field) or !std.mem.eql(u8, actual_value.string, value)) return error.InvalidSourceCatalog;
+        }
+    }
     if (source.access_id) |id| {
         if (id.len == 0 or id.len > 128) return error.InvalidSourceCatalog;
         for (id) |char| if (!std.ascii.isAlphanumeric(char) and char != '_' and char != '-') return error.InvalidSourceCatalog;
     }
     if (!std.mem.eql(u8, source.status, "searchable") and !std.mem.eql(u8, source.status, "pending") and !std.mem.eql(u8, source.status, "syncing") and !std.mem.eql(u8, source.status, "stale")) return error.InvalidSourceCatalog;
-    return .{ .name = source.id, .alias = source.alias, .table = source.table, .source_id = source.id, .document_field = source.document_field, .source_filter = source.filter, .access_id = source.access_id, .status = source.status, .valid_until = source.valid_until, .published_revision = source.published_revision };
+    return .{ .acquisition_id = source.acquisition_id, .knowledge = source.knowledge, .search_version = source.search_version, .artifacts = source.artifacts, .fields = source.fields, .streams = source.streams, .name = source.id, .alias = source.alias, .table = source.table, .source_id = source.id, .row_source_id = source.row_source_id, .document_field = source.document_field, .source_filter = source.filter, .access_id = source.access_id, .status = source.status, .valid_until = source.valid_until, .published_revision = source.published_revision };
 }
 pub fn load(a: A, io: std.Io, path: []const u8) ![]const u8 {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(32 * 1024 * 1024));
@@ -56,7 +83,11 @@ pub fn load(a: A, io: std.Io, path: []const u8) ![]const u8 {
     if (catalog.version != 2 or catalog.sources.len == 0 or catalog.sources.len > 1000 or catalog.principals.len > 262144) return error.InvalidSourceCatalog;
     try @import("providers.zig").validateCustom(catalog.endpoint);
     var tables: std.ArrayList(indexed.Table) = .empty;
-    for (catalog.sources) |source| try tables.append(state, try table(source));
+    for (catalog.sources) |source| {
+        if (source.document_version == 2 and std.mem.eql(u8, source.publication, "media")) continue;
+        try tables.append(state, try table(source));
+    }
+    if (tables.items.len == 0) return error.NoConnectedSources;
     return std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 1), .endpoint = catalog.endpoint, .tables = tables.items, .principals = catalog.principals }, .{});
 }
 
@@ -86,17 +117,27 @@ fn discoverSelected(a: A, io: std.Io, endpoint: []const u8, catalog_table: []con
     var wire_bytes: usize = 0;
     var policy: ?[]const u8 = null;
     const query = if (source_id) |id|
-        try std.json.Stringify.valueAlloc(state, .{ .conjuncts = .{ .{ .equals = "source_catalog", .field = "doc_type" }, .{ .equals = id, .field = "source.id" } } }, .{})
+        try std.json.Stringify.valueAlloc(state, .{ .doc_id = .{ .ids = [_][]const u8{id} } }, .{})
     else
         try state.dupe(u8, "{\"equals\":\"source_catalog\",\"field\":\"doc_type\"}");
+    // Ordinary catalog tables need no secondary indexes. Discovery explicitly
+    // admits bounded value verification; selected publication checks use the
+    // primary document ID. Existing page, wire and memory bounds still apply.
+    const execution: indexed.Execution = .{ .value_verification = .{
+        .allow_scan = source_id == null,
+        .max_documents = 10_000,
+        .max_bytes = 32 * 1024 * 1024,
+        .max_regex_work = 1_000_000,
+    } };
     for (0..1024) |_| {
-        const body = try std.json.Stringify.valueAlloc(state, .{ .query = try std.json.parseFromSliceLeaky(std.json.Value, state, query, .{}), .fields = [_][]const u8{ "version", "doc_type", "source", "document_version", "published_revision" }, .limit = @as(u32, 64), .order_by = [_]struct { field: []const u8, desc: bool }{.{ .field = "_id", .desc = false }}, .remote_snapshot = snapshot, .search_after = if (previous) |id| @as(?[1][]const u8, .{id}) else null }, .{ .emit_null_optional_fields = false });
+        const body = try std.json.Stringify.valueAlloc(state, .{ .query = try std.json.parseFromSliceLeaky(std.json.Value, state, query, .{}), .execution = execution, .fields = [_][]const u8{ "version", "doc_type", "source", "document_version", "published_revision" }, .limit = @as(u32, 64), .order_by = [_]struct { field: []const u8, desc: bool }{.{ .field = "_id", .desc = false }}, .remote_snapshot = snapshot, .search_after = if (previous) |id| @as(?[1][]const u8, .{id}) else null }, .{ .emit_null_optional_fields = false });
         var response = response: {
             for (0..2) |attempt| {
                 const token = if (session) |cloud| cloud.token() else credential;
                 const auth = if (token) |value| try std.fmt.allocPrint(state, "Bearer {s}", .{value}) else null;
                 var headers: std.ArrayList([2][]const u8) = .empty;
                 try headers.append(state, .{ "Content-Type", "application/json" });
+                try headers.append(state, .{ "User-Agent", "antfly-grep/" ++ @import("grep_build_options").version });
                 if (auth) |value| try headers.append(state, .{ "Authorization", value });
                 if (policy) |value| try headers.append(state, .{ "X-Antfly-Catalog-Access", value });
                 var result = try http.post(url, .{ .borrowed_body = body, .headers = headers.items, .timeout_ms = timeout_ms, .max_response_size = 1024 * 1024, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false });
@@ -135,10 +176,16 @@ fn discoverSelected(a: A, io: std.Io, endpoint: []const u8, catalog_table: []con
         } else snapshot = result.remote_snapshot;
         if (result.hits.hits.len > 64) return error.InvalidSourceCatalog;
         for (result.hits.hits) |hit| {
-            if (hit._source.version != 1 or hit._source.document_version != 1 or !std.mem.eql(u8, hit._source.doc_type, "source_catalog") or !std.mem.eql(u8, hit._id, hit._source.source.id)) return error.InvalidSourceCatalog;
+            if (source_id) |id| if (!std.mem.eql(u8, id, hit._id)) return error.InvalidSourceCatalog;
+            if (hit._source.version != 1 or (hit._source.document_version != 1 and hit._source.document_version != 2 and hit._source.document_version != 3) or !std.mem.eql(u8, hit._source.doc_type, "source_catalog") or !std.mem.eql(u8, hit._id, hit._source.source.id)) return error.InvalidSourceCatalog;
             if (previous) |id| if (std.mem.order(u8, id, hit._id) != .lt) return error.InvalidSourceCatalog;
             if (std.mem.eql(u8, hit._source.source.status, "searchable") and (hit._source.source.valid_until == null or hit._source.published_revision.len == 0)) return error.InvalidSourceCatalog;
             previous = hit._id;
+            if (hit._source.document_version == 2) {
+                if (hit._source.source.document_version != 2 or !std.mem.eql(u8, hit._source.source.publication, "media")) return error.InvalidSourceCatalog;
+                if (source_id != null) return error.UnsupportedSourceKind;
+                continue;
+            }
             _ = try table(hit._source.source);
             var binding = hit._source.source;
             binding.published_revision = hit._source.published_revision;
@@ -175,7 +222,9 @@ pub fn validatePublication(a: A, io: std.Io, options: *const @import("options.zi
         if (!std.mem.eql(u8, current.name, expected.name)) continue;
         if (!std.mem.eql(u8, current.status orelse "", "searchable")) return error.SourceNotSearchable;
         if (current.valid_until) |until| if (std.Io.Clock.real.now(io).toSeconds() >= until) return error.SourceNotSearchable;
-        const before = try std.json.Stringify.valueAlloc(a, expected, .{});
+        var binding = expected;
+        binding.selected_stream = null; // Request-local selection is not catalog authority.
+        const before = try std.json.Stringify.valueAlloc(a, binding, .{});
         defer a.free(before);
         const after = try std.json.Stringify.valueAlloc(a, current, .{});
         defer a.free(after);
@@ -183,4 +232,31 @@ pub fn validatePublication(a: A, io: std.Io, options: *const @import("options.zi
         return;
     }
     return error.SourcePublicationChanged;
+}
+
+test "media bindings cannot be interpreted as text tables" {
+    const media: Source = .{
+        .id = "media-source",
+        .table = "files",
+        .document_field = "grep",
+        .filter = .null,
+        .status = "searchable",
+        .publication = "media",
+        .document_version = 2,
+    };
+    try std.testing.expectError(error.UnsupportedSourceKind, table(media));
+    var invalid = media;
+    invalid.document_version = 1;
+    try std.testing.expectError(error.UnsupportedSourceKind, table(invalid));
+}
+
+test "portable source acquisition and knowledge metadata survive strict catalog decoding" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(Catalog, a,
+        \\{"version":2,"endpoint":"http://127.0.0.1:8080/db/v1","sources":[{"id":"source","table":"docs","status":"searchable","filter":{},"acquisition_id":"current-config","knowledge":{"version":1}}]}
+    , .{});
+    defer parsed.deinit();
+    const binding = try table(parsed.value.sources[0]);
+    try std.testing.expectEqualStrings("current-config", binding.acquisition_id.?);
+    try std.testing.expectEqual(@as(i64, 1), binding.knowledge.?.object.get("version").?.integer);
 }

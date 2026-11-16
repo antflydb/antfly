@@ -1,0 +1,19 @@
+CUDA artifact source policy passes: /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu (15 compiler-managed dev-only runtime-wired candidates included)
+quant kernel generated sources check: 69 files + Metal/CUDA runtime regions
+inference-test
++- run test w
+1/44 architectures.gliner.boundary_engine.test.gliner boundary engine eager encoder host allocation cleanup on padded batch...OK
+2/44 architectures.deberta.test.DeBERTa native bucketed relative projections preserve values and clean up allocation failures...OK
+3/44 extractors.gliner_boundary_executor.test.boundary full context learned native base word capacity...full-context learned native: body_words=4096 prompt_tokens=4105 windows=1
+native serving heap: peak=186167928 limit=536870912 live=0
+OK
+4/44 extractors.gliner_boundary_executor.test.boundary full context learned native base token capacity...full-context learned native: prompt_tokens=16381/16384 windows=1 default_work_budget
+native serving heap: peak=517336416 limit=536870912 live=0
+OK
+5/44 extractors.gliner_boundary_executor.test.boundary full context learned native grouped words...full-context learned native: body_words=4096 prompt_tokens=16440 windows=4
+native serving heap: peak=384021726 limit=536870912 live=0
+OK
+6/44 pipelines.gliner_boundary_pipeline.test.gliner boundary pipeline Python parity pinned base checkpoint all inference tasks...OK
+6 selected; 6 passed; 0 skipped.
+failed command: cd pkg/inference/. && /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/.zig-cache/o/0a2aed6daf5f3101540ffda5e3044461/test --test-filter "DeBERTa native bucketed relative projections" --test-filter "gliner boundary engine eager encoder host allocation cleanup" --test-filter "gliner boundary pipeline Python parity pinned base" --test-filter "boundary full context learned native"
+

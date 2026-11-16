@@ -23,6 +23,8 @@ make build && ./antfly standalone
 docker run -p 127.0.0.1:8080:8080 ghcr.io/antflydb/antfly:latest standalone --host 0.0.0.0
 ```
 
+For production, [configure and verify the process open-file limit](docs/operations/open-file-limits.md) (recommended: 65,536; supported minimum: 256).
+
 These quickstarts run without authentication and are intended for local development. Keep Docker ports bound to loopback. Before allowing remote access, [enable authentication and provision a unique admin password](docs/reference/auth.md#secure-deployment), then configure TLS at a reverse proxy.
 
 That gives you the [Antfarm dashboard](ts/apps/antfarm) at `http://localhost:8080` — playgrounds for search, RAG, knowledge graphs, embeddings, reranking, and more.
@@ -73,13 +75,13 @@ See [LICENSING.md](LICENSING.md) for third-party notices and source ownership.
 - **Hybrid search** — full-text (BM25), dense vectors ([RaBitQ](https://arxiv.org/abs/2405.12497)-compressed with [SPFresh](https://arxiv.org/abs/2410.14452)-style updates), and sparse vectors ([SPLADE](https://arxiv.org/abs/2107.05720)), fused with [reciprocal rank](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf) or relative score fusion in one query
 - **Full-text search** — Lucene-style segments with [highlighting](zig/pkg/antfly-embedded/src/search/highlight.zig), geo, regex, wildcard, and fuzzy queries, plus English and ten [Snowball](https://snowballstem.org/) stemmer languages
 - **RAG agents** — built-in [retrieval-augmented generation](zig/pkg/antfly/src/api/retrieval_agent.zig) with streaming, multi-turn chat, tool calling (graph traversal, plus web search through an Exa connection), confidence scoring, and [TOON](docs/reference/toon-format.md) document rendering to cut prompt tokens
-- **Query-builder agent** — turns a natural-language question into a structured Antfly query, with [evaluation metrics](go/pkg/evalaf) to measure retrieval quality
+- **Query-builder agent** — turns a natural-language question into a structured Antfly query
 - **Graph indexes** — automatic relationship extraction and [graph traversal](zig/pkg/antfly-embedded/src/graph) over your data
-- **Multimodal** — index and search [images, audio, and video](docs/guides/multimodal.mdx) with CLIP, CLAP, and vision-language models
+- **Multimodal** — index and search [images, audio, and video](docs/guides/multimodal.mdx) in one vector space with [EmbeddingGemma 2](docs/guides/models/embeddinggemma2.mdx)
 - **Reranking** — cross-encoder and [late-interaction](https://arxiv.org/abs/2004.12832) ([ColBERT](zig/pkg/inference/RERANKING.md), ColQwen2) reranking with score-based pruning to cut the noise
 - **Aggregations** — stats, terms facets, histogram, date histogram, range, and geo-distance [aggregations](zig/pkg/antfly-embedded/src/search/aggregation.zig) for analytics
 - **Transactions** — ACID transactions at the shard level with distributed coordination
-- **Document TTL** — automatic [document expiration](docs/guides/ttl-example.md) so you don't have to clean up yourself
+- **Document TTL** — automatic [document expiration](docs/reference/ttl.md) so you don't have to clean up yourself
 - **PostgreSQL CDC** — [mirror a Postgres table](docs/guides/cdc-replication.mdx) into Antfly over logical replication, every insert, update, and delete included
 - **CLI** — one `antfly` binary for the server, tables, queries, backups, auth, and the [model registry](docs/guides/inference.mdx) (`antfly inference pull owner/model`)
 - **Secrets** — reference credentials as [`${secret:...}` keystore entries or env vars](docs/reference/secrets.md) instead of putting them in config
@@ -98,16 +100,14 @@ See [LICENSING.md](LICENSING.md) for third-party notices and source ownership.
 - **MCP and A2A protocols** — [protocol adapters](zig/pkg/antfly/src/api/protocol_adapters.zig) let agents and LLMs use Antfly directly, and an [n8n guide](docs/guides/n8n.mdx) wires it into workflows
 - **Relational tables** — `storage_mode: relational` tables with typed packed rows, `relational` indexes, row query and mutate APIs, databases, a system catalog, and tablespaces
 - **Antfarm** — [web dashboard](ts/apps/antfarm) with playgrounds for search, RAG, chat, knowledge graphs, embeddings, reranking, chunking, extraction, OCR, transcription, and evals
-
-### In progress
-
-- **SQL and the Postgres wire protocol** — SQL lowered to native typed plans, a `psql`-compatible server, and lake tables over Iceberg and Parquet. Tracked in [#145](https://github.com/antflydb/antfly/pull/145)
+- **SQL and the Postgres wire protocol** — SQL lowered to native typed plans and an opt-in [`psql`-compatible server](zig/pkg/antfly/src/pgwire/README.md) with transactions, prepared statements, and cursors
+- **Lake tables** — query read-only [Parquet and Iceberg](zig/LAKES.md) data in object storage in place, with search indexes stored alongside it
 
 ## Documentation
 
 [antfly.io/docs](https://antfly.io/docs), or the source under [`docs/`](docs). Good starting points:
 
-- [Quickstart](docs/guides/quickstart.mdx), [Document Engine](docs/guides/document-engine.mdx), and [Hybrid Search](docs/guides/hybrid-search.mdx)
+- [Quickstart](docs/guides/quickstart.mdx), [Document Engine](docs/guides/document-engine.mdx), [Hybrid Search](docs/guides/hybrid-search.mdx), and [Time series](docs/guides/time-series.mdx)
 - [Multimodal](docs/guides/multimodal.mdx), [Artifact Indexes](docs/guides/artifact-indexes.mdx), and [Inference](docs/guides/inference.mdx) with the [supported models](docs/guides/supported-models.mdx)
 - [Documentation index](docs/README.md)
 - [Antfly Lite](docs/guides/lite.mdx), [Architecture](docs/architecture.mdx), and [Object storage](docs/reference/s3-storage.md)
@@ -153,7 +153,6 @@ Antfly inference handles the ML side: embeddings, chunking, reranking, classific
 | Package | What it does | Source |
 |---------|--------------|--------|
 | docsaf | Ingest content from the filesystem, web crawls and sitemaps, git repos, S3, and Google Drive | [`go/pkg/docsaf`](go/pkg/docsaf) |
-| evalaf | LLM/RAG/agent evaluation ("promptfoo for Go") | [`go/pkg/evalaf`](go/pkg/evalaf) |
 | Genkit plugin | Firebase Genkit integration for retrieval and docstore | [`go/pkg/genkit/antfly`](go/pkg/genkit/antfly) |
 | Native memory | Evidence-backed temporal agent memory over HTTP, MCP and embedded APIs | [Design and contracts](zig/MEMORY.md) |
 | embedded | Go, Python, Rust, and TypeScript bindings for local databases and inference over the C ABI | [`go/pkg/embedded`](go/pkg/embedded), [`py/packages/embedded`](py/packages/embedded), [`rs/crates/embedded`](rs/crates/embedded), [`ts/packages/embedded`](ts/packages/embedded) |

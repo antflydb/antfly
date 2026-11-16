@@ -1019,7 +1019,7 @@ pub const Reader = struct {
                 return err;
             }) |record| {
                 if (record.key.len != prefix.len + 1 or !std.mem.startsWith(u8, record.key, prefix) or count == branches.len) return error.InvalidNativeLakeTermDirectory;
-                const branch = if (self.directory.version == 2) try directory_mod.Branch.decode(record.value) else try directory_mod.Branch.decodeLegacy(record.value);
+                const branch = try directory_mod.Branch.decode(record.value);
                 if (branch.first[0] != branch.last[0] or branch.first[0] != record.key[prefix.len]) return error.InvalidNativeLakeTermDirectory;
                 branches[count] = branch;
                 count += 1;

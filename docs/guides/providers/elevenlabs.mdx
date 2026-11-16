@@ -1,0 +1,35 @@
+---
+title: ElevenLabs
+description: ElevenLabs text-to-speech in Antfly
+order: 10
+---
+
+The `elevenlabs` provider synthesizes speech with the ElevenLabs API.
+
+## What It Provides
+
+| Component | Inputs | Notes |
+|---|---|---|
+| Speech synthesizer | Text | Default model `eleven_multilingual_v2`; MP3 output at 44.1 kHz |
+
+A `voice_id` is required, either in the configuration or per request. Speed and
+output-format overrides are rejected.
+
+## Credentials
+
+`api_key`, sent as `xi-api-key`. It has no environment variable default; use a
+secret reference.
+
+## Example
+
+```json
+{
+  "text_to_speech": {
+    "narrator": {
+      "provider": "elevenlabs",
+      "voice_id": "your-voice-id",
+      "api_key": "${secret:elevenlabs.api_key}"
+    }
+  }
+}
+```

@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Consumer-independent acquired source record v3",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "source",
+    "content",
+    "permissions",
+    "metadata"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 3
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "provider",
+        "item_id",
+        "uri",
+        "path",
+        "revision",
+        "indexed_at"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$"
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$"
+        },
+        "item_id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$"
+        },
+        "uri": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$"
+        },
+        "indexed_at": {
+          "type": "integer"
+        }
+      }
+    },
+    "content": {
+      "type": "object",
+      "required": [
+        "mime_type"
+      ],
+      "properties": {
+        "mime_type": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$"
+        },
+        "text": {
+          "type": "string"
+        },
+        "resource": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "uri",
+            "mime_type",
+            "version",
+            "version_kind",
+            "length"
+          ],
+          "properties": {
+            "type": {
+              "const": "source"
+            },
+            "uri": {
+              "type": "string",
+              "format": "uri"
+            },
+            "mime_type": {
+              "type": "string",
+              "minLength": 1
+            },
+            "version": {
+              "type": "string",
+              "pattern": "^\"[^\"\\r\\n]+\"$"
+            },
+            "version_kind": {
+              "const": "strong_etag"
+            },
+            "length": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "text"
+          ],
+          "not": {
+            "required": [
+              "resource"
+            ]
+          }
+        },
+        {
+          "required": [
+            "resource"
+          ],
+          "not": {
+            "required": [
+              "text"
+            ]
+          }
+        }
+      ]
+    },
+    "permissions": {
+      "$ref": "source-record-v1.json#/properties/permissions"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}

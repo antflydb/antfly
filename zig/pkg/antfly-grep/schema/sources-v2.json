@@ -33,7 +33,6 @@
         "required": [
           "id",
           "table",
-          "document_field",
           "status",
           "filter"
         ],
@@ -53,7 +52,6 @@
           },
           "document_field": {
             "type": "string",
-            "minLength": 1,
             "default": "grep"
           },
           "filter": {
@@ -78,9 +76,558 @@
             "maxLength": 128,
             "pattern": "^[A-Za-z0-9_-]+$",
             "description": "Optional server-specific access-view precondition, never a capability."
+          },
+          "fields": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "uri",
+              "path",
+              "revision",
+              "indexed_at",
+              "permissions",
+              "metadata"
+            ],
+            "properties": {
+              "uri": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\u0000\\r\\n]+$"
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\u0000\\r\\n]+$"
+              },
+              "revision": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\u0000\\r\\n]+$"
+              },
+              "indexed_at": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\u0000\\r\\n]+$"
+              },
+              "permissions": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\u0000\\r\\n]+$"
+              },
+              "metadata": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\u0000\\r\\n]+$"
+              }
+            }
+          },
+          "streams": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/$defs/SearchStream"
+            }
+          },
+          "document_version": {
+            "enum": [
+              1,
+              2,
+              3
+            ]
+          },
+          "publication": {
+            "enum": [
+              "text",
+              "media",
+              "native"
+            ]
+          },
+          "acquisition_id": {
+            "type": "string"
+          },
+          "published_revision": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$"
+          },
+          "search_version": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2
+          },
+          "artifacts": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/$defs/ArtifactBinding"
+            }
+          },
+          "knowledge": {
+            "$ref": "#/$defs/KnowledgeDeclaration"
           }
         }
       }
+    }
+  },
+  "$defs": {
+    "SearchStream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "artifact": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "index": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true,
+          "description": "Legacy full-text binding; incompatible with retrieval. Use search_version=2 and retrieval for new configurations."
+        },
+        "field": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "purpose": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "location_field": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "default": {
+          "type": "boolean",
+          "x-go-type-skip-optional-pointer": true,
+          "description": "Legacy default for exact matching; version 2 uses defaults on each retrieval mode."
+        },
+        "generated": {
+          "type": "boolean",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "boundary": {
+          "enum": [
+            "record",
+            "unit"
+          ],
+          "x-go-type-skip-optional-pointer": true,
+          "type": "string"
+        },
+        "resource_field": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "retrieval": {
+          "$ref": "#/$defs/RetrievalBindings",
+          "x-go-type-skip-optional-pointer": false
+        }
+      }
+    },
+    "RetrievalBindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "exact": {
+          "$ref": "#/$defs/ExactRetrieval",
+          "x-go-type-skip-optional-pointer": false
+        },
+        "full_text": {
+          "$ref": "#/$defs/FullTextRetrieval",
+          "x-go-type-skip-optional-pointer": false
+        },
+        "semantic": {
+          "$ref": "#/$defs/SemanticRetrieval",
+          "x-go-type-skip-optional-pointer": false
+        }
+      }
+    },
+    "ExactRetrieval": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "type": "boolean"
+        }
+      }
+    },
+    "FullTextRetrieval": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "default": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "index"
+      ]
+    },
+    "SemanticRetrieval": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "member_artifacts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "maxItems": 64,
+          "x-go-type-skip-optional-pointer": true
+        },
+        "vector_space": {
+          "$ref": "#/$defs/VectorSpace"
+        },
+        "query_inputs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "text",
+              "vector"
+            ],
+            "x-go-type-skip-optional-pointer": true
+          },
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "x-go-type-skip-optional-pointer": true
+        },
+        "default": {
+          "type": "boolean"
+        },
+        "external": {
+          "type": "boolean"
+        },
+        "member_field": {
+          "type": "string",
+          "description": "Projection returned from semantic members. Chunk-backed embeddings use text even when their ancestor representation is scalar ($). Managed textual streams must declare this field."
+        }
+      },
+      "required": [
+        "index",
+        "vector_space",
+        "query_inputs"
+      ]
+    },
+    "VectorSpace": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "dimension": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "metric": {
+          "type": "string",
+          "enum": [
+            "cosine",
+            "inner_product",
+            "l2_squared"
+          ],
+          "x-go-type-skip-optional-pointer": true
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "query_preprocessing": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "document_preprocessing": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "query_modality": {
+          "type": "string",
+          "enum": [
+            "text",
+            "image",
+            "audio",
+            "multimodal"
+          ],
+          "x-go-type-skip-optional-pointer": true
+        },
+        "document_modality": {
+          "type": "string",
+          "enum": [
+            "text",
+            "image",
+            "audio",
+            "multimodal"
+          ],
+          "x-go-type-skip-optional-pointer": true
+        }
+      },
+      "required": [
+        "id",
+        "dimension",
+        "metric",
+        "model",
+        "revision",
+        "query_preprocessing",
+        "document_preprocessing",
+        "query_modality",
+        "document_modality"
+      ]
+    },
+    "ArtifactBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "artifact": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "purpose": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "content_type": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "schema_uri": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "location_field": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\u0000\\r\\n]+$",
+          "x-go-type-skip-optional-pointer": true
+        },
+        "generated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "artifact",
+        "content_type"
+      ]
+    },
+    "KnowledgeDeclaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "instance_one_audience"
+          ],
+          "description": "Requires an independently configured runtime deployment boundary; never grants authorization. Mixed-audience matching/promotion is unsupported."
+        },
+        "audience": {
+          "type": "string",
+          "description": "Opaque runtime-controlled audience identity; all participating inputs, entities, curation and graph outputs must share this audience."
+        },
+        "entities": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/EntityBinding"
+          },
+          "x-go-type-skip-optional-pointer": true
+        },
+        "graphs": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/GraphBinding"
+          },
+          "x-go-type-skip-optional-pointer": true
+        }
+      },
+      "required": [
+        "version",
+        "mode",
+        "audience"
+      ]
+    },
+    "EntityBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "index": {
+          "type": "string",
+          "description": "Native graph index owning the resolver."
+        },
+        "resolver": {
+          "type": "string"
+        },
+        "table": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string",
+          "description": "Stable key prefix ending in /. Candidate enumeration/order is never part of identity."
+        },
+        "source_artifact": {
+          "type": "string"
+        },
+        "resolution_artifact": {
+          "type": "string"
+        },
+        "schema_uri": {
+          "type": "string"
+        },
+        "location_field": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "index",
+        "resolver",
+        "table",
+        "namespace",
+        "source_artifact",
+        "resolution_artifact"
+      ]
+    },
+    "GraphBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "index": {
+          "type": "string"
+        },
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "string"
+          },
+          "x-go-type-skip-optional-pointer": true
+        },
+        "entities": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string"
+          },
+          "x-go-type-skip-optional-pointer": true
+        },
+        "temporal": {
+          "$ref": "#/$defs/GraphTemporalBinding"
+        },
+        "location_field": {
+          "type": "string"
+        },
+        "schema_uri": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "index",
+        "artifacts",
+        "temporal"
+      ]
+    },
+    "GraphTemporalBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mapping": {
+          "type": "string",
+          "enum": [
+            "native_intervals_v1"
+          ]
+        },
+        "history": {
+          "type": "string",
+          "enum": [
+            "current_state"
+          ],
+          "description": "Filters retained current relationship metadata; no complete historical replay promise. Missing valid bounds are open; known_at requires created_at."
+        }
+      },
+      "required": [
+        "mapping",
+        "history"
+      ]
     }
   }
 }

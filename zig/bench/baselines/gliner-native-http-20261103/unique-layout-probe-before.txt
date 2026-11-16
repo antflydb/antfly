@@ -1,0 +1,117 @@
+CUDA artifact source policy passes: /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu (15 compiler-managed dev-only runtime-wired candidates included)
+quant kernel generated sources check: 69 files + Metal/CUDA runtime regions
+inference-test
++- run test failure
+1/39 architectures.deberta.test.DeBERTa native bucketed relative projections preserve values and clean up allocation failures...thread 35979621 panic: double free of [addr: 1019a2e28, len: 104 (0x68) align: 8]
+alloc: 
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:874:47: 0x1002efe6f in buildRelativePositionEmbInfoWithLayout (test)
+    const full_to_unique = try allocator.alloc(i64, num_rel);
+                                              ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1465:72: 0x1002f1a73 in run (test)
+            const relative = try buildRelativePositionEmbInfoWithLayout(&cb, allocator, cfg, 7, true);
+                                                                       ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/testing.zig:1163:69: 0x1002f1edf in checkAllAllocationFailures__func_1007 (test)
+        if (@call(.auto, test_fn, .{failing_allocator_inst.allocator()} ++ extra_args)) |_| {
+                                                                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/lib/platform/src/allocator.zig:109:47: 0x1002f214f in checkAllAllocationFailures__func_1006 (test)
+    try std.testing.checkAllAllocationFailures(stable.allocator(), test_fn, extra_args);
+                                              ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1470:54: 0x100305573 in test.DeBERTa native bucketed relative projections preserve values and clean up allocation failures (test)
+    try platform.allocator.checkAllAllocationFailures(a, UniqueCheck.run, .{ &store, config });
+                                                     ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/test_runner_filter.zig:131:25: 0x1002d1e47 in main (test)
+        if (test_fn.func()) |_| {
+                        ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/start.zig:789:88: 0x1002d2723 in callMain (test)
+    if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                       ^
+(additional stack frames may have been skipped...)
+
+first free: 
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:896:23: 0x1002f07f7 in buildRelativePositionEmbInfoWithLayout (test)
+        allocator.free(full_to_unique);
+                      ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1465:72: 0x1002f1a73 in run (test)
+            const relative = try buildRelativePositionEmbInfoWithLayout(&cb, allocator, cfg, 7, true);
+                                                                       ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/testing.zig:1163:69: 0x1002f1edf in checkAllAllocationFailures__func_1007 (test)
+        if (@call(.auto, test_fn, .{failing_allocator_inst.allocator()} ++ extra_args)) |_| {
+                                                                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/lib/platform/src/allocator.zig:109:47: 0x1002f214f in checkAllAllocationFailures__func_1006 (test)
+    try std.testing.checkAllAllocationFailures(stable.allocator(), test_fn, extra_args);
+                                              ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1470:54: 0x100305573 in test.DeBERTa native bucketed relative projections preserve values and clean up allocation failures (test)
+    try platform.allocator.checkAllAllocationFailures(a, UniqueCheck.run, .{ &store, config });
+                                                     ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-co(msg truncated)
+error return context:
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:325:82: 0x1001f21e3 in allocBytesAligned__func_211 (test)
+    const byte_ptr = self.rawAlloc(byte_count, alignment, return_address) orelse return error.OutOfMemory;
+                                                                                 ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:311:5: 0x1003b147f in allocWithSizeAndAlignment__func_1279 (test)
+    return self.allocBytesAligned(alignment, byte_count, return_address);
+    ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:299:55: 0x1016c9f9f in allocAdvancedWithRetAddr (test)
+    const ptr: [*]align(a.toByteUnits()) T = @ptrCast(try self.allocWithSizeAndAlignment(@sizeOf(T), a, n, return_address));
+                                                      ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:223:5: 0x1016ca00f in alloc__func_988 (test)
+    return self.allocAdvancedWithRetAddr(T, null, n, @returnAddress());
+    ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:481:21: 0x1016c9dbb in dupe__func_990 (test)
+    const new_buf = try allocator.alloc(T, m.len);
+                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/native_compute.zig:7038:20: 0x1004f9d23 in layerNormOp (test)
+    const output = try self.allocator.dupe(f32, getData(input));
+                   ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/ops/ops.zig:4165:9: 0x1002ef0af in layerNorm (test)
+        return self.vtable.layerNorm(self.ptr, input, gamma, beta, dim, eps);
+        ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:942:17: 0x1002efa23 in normalizedRelativeEmbeddingLookup (test)
+        else => return err,
+                ^
+
+stack trace:
+/Users/ajroetker/bin/zig-0.17.0/lib/std/heap/SafeAllocator.zig:518:30: 0x1002e622b in startModify (test)
+                        panic(
+                             ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/heap/SafeAllocator.zig:1121:18: 0x1002eade7 in free (test)
+    f.startModify(.freeing, s, .{ .memory = memory, .alignment = alignment });
+                 ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:165:25: 0x1003117db in rawFree (test)
+    return a.vtable.free(a.ptr, memory, alignment, ret_addr);
+                        ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:165:25: 0x100310c67 in rawFree (test)
+    return a.vtable.free(a.ptr, memory, alignment, ret_addr);
+                        ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/mem/Allocator.zig:165:25: 0x100316e9b in rawFree (test)
+    return a.vtable.free(a.ptr, memory, alignment, ret_addr);
+                        ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:875:28: 0x1002f08a3 in buildRelativePositionEmbInfoWithLayout (test)
+    errdefer allocator.free(full_to_unique);
+                           ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1465:72: 0x1002f1a73 in run (test)
+            const relative = try buildRelativePositionEmbInfoWithLayout(&cb, allocator, cfg, 7, true);
+                                                                       ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/testing.zig:1163:69: 0x1002f1edf in checkAllAllocationFailures__func_1007 (test)
+        if (@call(.auto, test_fn, .{failing_allocator_inst.allocator()} ++ extra_args)) |_| {
+                                                                    ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/lib/platform/src/allocator.zig:109:47: 0x1002f214f in checkAllAllocationFailures__func_1006 (test)
+    try std.testing.checkAllAllocationFailures(stable.allocator(), test_fn, extra_args);
+                                              ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/architectures/deberta.zig:1470:54: 0x100305573 in test.DeBERTa native bucketed relative projections preserve values and clean up allocation failures (test)
+    try platform.allocator.checkAllAllocationFailures(a, UniqueCheck.run, .{ &store, config });
+                                                     ^
+/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/pkg/inference/src/test_runner_filter.zig:131:25: 0x1002d1e47 in main (test)
+        if (test_fn.func()) |_| {
+                        ^
+/Users/ajroetker/bin/zig-0.17.0/lib/std/start.zig:789:88: 0x1002d2723 in callMain (test)
+    if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                       ^
+???:?:?: 0x193227e7f in start (/usr/lib/dyld)
+error: process terminated with signal ABRT (expected exited with code 0)
+failed command: cd pkg/inference/. && /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/.zig-cache/o/1d4e544533da1ae3b6a8871a744cae38/test --test-filter "DeBERTa native bucketed relative projections"
+
+Build Summary: 29/31 steps succeeded (1 failed); 23/23 tests passed
+inference-test transitive failure
++- run test failure
+

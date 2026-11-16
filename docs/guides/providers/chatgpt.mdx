@@ -1,0 +1,27 @@
+---
+title: ChatGPT Plan
+description: Use a personal ChatGPT plan as the generator in a locally hosted Antfly
+order: 10
+---
+
+The `chatgpt` provider connects a personal ChatGPT plan to a locally hosted
+Antfly. You authorize it from Antfarm or the CLI; Antfly keeps the OAuth
+credentials and selects the plan's models for chat and retrieval answers.
+Connecting a plan grants no database permissions.
+
+## What It Provides
+
+| Component | Inputs | Notes |
+|---|---|---|
+| Generator | Text | Local standalone deployments |
+
+## Limits
+
+- Image inputs are not supported.
+- `api_url`, `max_tokens`, `max_completion_tokens`, and `rate_limit` cannot be set; the plan governs usage.
+- A ChatGPT generator cannot be part of a fallback chain or retry policy, so a request never moves to a billed provider without your choice.
+- Connections can be disabled with the `chatgpt` setting in the server configuration.
+
+## Related
+
+- [ChatGPT plan integration](https://github.com/antflydb/antfly/blob/main/zig/CHATGPT.md): design and connection flow

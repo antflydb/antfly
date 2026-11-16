@@ -955,11 +955,7 @@ fn vacuumAflitePath(allocator: Allocator, path: []const u8) !antfly.lite.backend
 }
 
 fn prepareCompactLite(lite: *LiteDb) !void {
-    try lite.db.maintenanceDriver().runUntilIdle();
-    try lite.db.forceCompactTextIndexes();
-    try lite.db.drainScheduledTextMerges();
-    try lite.db.sync(true);
-    try lite.db.syncIndexes(true);
+    try lite.prepareCompact();
 }
 
 fn compactLite(lite: *LiteDb) !CompactReport {
@@ -974,7 +970,7 @@ fn batchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
     var owned = try batch_api.parseBatchRequest(allocator, body);
     defer owned.deinit(allocator);
 
-    try db.batch(owned.req);
+    try db.batch(db_mod.types.fromPublicMutation(owned.req));
     return try batch_api.encodeBatchResponse(allocator, owned.result());
 }
 
@@ -1037,7 +1033,7 @@ fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
         var failure: kernel_owner_abi.FailureIdentity = .{};
         const response = try local_query_client.executeJsonAlloc(
             allocator,
-            @ptrCast(db),
+            db,
             "docs",
             body,
             .public,

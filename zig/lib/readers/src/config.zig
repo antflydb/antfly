@@ -18,6 +18,9 @@ pub const cloudflare = @import("antfly_cloudflare_config");
 
 const Allocator = std.mem.Allocator;
 
+/// Public native OCR output ceiling; model and deployment limits may narrow it.
+pub const max_output_tokens: usize = 8192;
+
 pub const default_native_batch_size: usize = 8;
 pub const max_native_batch_size: usize = 64;
 

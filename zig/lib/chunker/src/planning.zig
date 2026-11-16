@@ -39,8 +39,10 @@ pub const Coordinates = struct {
     timescale: ?u32 = null,
     page_box: ?[4]f64 = null,
     page_rotation: ?i32 = null,
+    speaker_index: ?u32 = null,
 
     pub fn validate(self: Coordinates) !void {
+        if (self.speaker_index) |index| if (self.kind != .audio or index >= 64) return error.InvalidChunkCoordinates;
         if ((self.raster_width == null) != (self.raster_height == null)) return error.InvalidChunkCoordinates;
         if (self.raster_width) |width| if (width == 0 or self.raster_height.? == 0) return error.InvalidChunkCoordinates;
         if (self.region) |box| {
@@ -98,10 +100,12 @@ pub const Policy = struct {
     tile_width: u32 = 0,
     tile_height: u32 = 0,
     tile_overlap: u32 = 0,
+    audio_speaker_turns: bool = false,
     audio_pause_ns: i64 = 0,
     audio_pause_search_ns: i64 = 5 * std.time.ns_per_s,
     audio_silence_milli: u16 = 10,
     pub fn validate(self: Policy) !void {
+        if (self.audio_speaker_turns and (self.overlap_ns != 0 or self.audio_pause_ns != 0)) return error.InvalidChunkPolicy;
         if (self.video_hold > 1) return error.InvalidChunkPolicy;
         if (self.max_text_bytes < 4 or self.max_text_bytes > 16 * 1024 * 1024) return error.InvalidChunkPolicy;
         if (self.audio_pause_ns < 0 or self.audio_pause_search_ns < 0 or self.audio_silence_milli > 1000) return error.InvalidChunkPolicy;
@@ -162,7 +166,11 @@ pub const Identity = struct {
         number(&plan, model.max_frames);
         number(&plan, @intCast(model.max_audio_ns));
         number(&plan, @intCast(model.min_audio_ns));
-        inline for (@typeInfo(Policy).@"struct".field_names) |name| number(&plan, @intCast(@field(policy, name)));
+        inline for (@typeInfo(Policy).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "audio_speaker_turns")) {
+                if (policy.audio_speaker_turns) field(&plan, "speaker-turns-v1");
+            } else number(&plan, @intCast(@field(policy, name)));
+        }
         return .{ .source = fingerprint, .plan = plan.finalResult() };
     }
     fn field(hash: *std.crypto.hash.sha2.Sha256, bytes: []const u8) void {

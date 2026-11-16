@@ -33,12 +33,14 @@ pub const Provider = if (build_options.bench_minimal_deps) enum {
 pub const TextChunkOptions = if (build_options.bench_minimal_deps) struct {
     target_tokens: u32 = 0,
     overlap_tokens: u32 = 0,
+    min_chars: u32 = 0,
     separator: []const u8 = "",
 
     pub fn clone(self: TextChunkOptions, alloc: Allocator) !TextChunkOptions {
         return .{
             .target_tokens = self.target_tokens,
             .overlap_tokens = self.overlap_tokens,
+            .min_chars = self.min_chars,
             .separator = if (self.separator.len > 0) try alloc.dupe(u8, self.separator) else "",
         };
     }
@@ -54,8 +56,8 @@ pub const AudioChunkOptions = if (build_options.bench_minimal_deps) struct {
     overlap_duration_ms: u32 = 0,
 } else lib.AudioChunkOptions;
 
-pub const EmbeddingTarget = if (build_options.bench_minimal_deps) @import("inference_api").ChunkEmbeddingTarget else lib.EmbeddingTarget;
-pub const MediaPolicy = if (build_options.bench_minimal_deps) @import("inference_api").MediaChunkPolicy else lib.MediaPolicy;
+pub const EmbeddingTarget = if (build_options.bench_minimal_deps) @import("antfly_chunking_api_openapi").ChunkEmbeddingTarget else lib.EmbeddingTarget;
+pub const MediaPolicy = if (build_options.bench_minimal_deps) @import("antfly_chunking_api_openapi").MediaChunkPolicy else lib.MediaPolicy;
 
 pub const Replay = if (build_options.bench_minimal_deps) struct { source_version: []const u8, source_fingerprint: []const u8, plan_id: []const u8, ordinal: u64 } else lib.Replay;
 pub fn cloneReplay(a: Allocator, value: Replay) !Replay {
@@ -203,6 +205,10 @@ pub fn parseConfigFromValue(alloc: Allocator, value: std.json.Value) !Config {
         if (text_value.object.get("overlap_tokens")) |overlap_tokens| {
             cfg.text.overlap_tokens = parseU32Value(overlap_tokens) orelse return error.InvalidChunkerConfig;
         }
+        if (text_value.object.get("min_chars")) |minimum| {
+            cfg.text.min_chars = parseU32Value(minimum) orelse return error.InvalidChunkerConfig;
+            if (cfg.text.min_chars > 1_000_000) return error.InvalidChunkerConfig;
+        }
         if (text_value.object.get("separator")) |separator| {
             if (separator != .string) return error.InvalidChunkerConfig;
             cfg.text.separator = try alloc.dupe(u8, separator.string);
@@ -290,7 +296,7 @@ pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
         try appendJsonFieldName(alloc, &out, &wrote, "threshold");
         try appendJsonFloat(alloc, &out, threshold);
     }
-    if (cfg.text.target_tokens != 0 or cfg.text.overlap_tokens != 0 or cfg.text.separator.len > 0) {
+    if (cfg.text.target_tokens != 0 or cfg.text.overlap_tokens != 0 or cfg.text.min_chars != 0 or cfg.text.separator.len > 0) {
         try appendJsonFieldName(alloc, &out, &wrote, "text");
         try out.append(alloc, '{');
         var wrote_text = false;
@@ -301,6 +307,10 @@ pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
         if (cfg.text.overlap_tokens != 0) {
             try appendJsonFieldName(alloc, &out, &wrote_text, "overlap_tokens");
             try appendJsonNumber(alloc, &out, cfg.text.overlap_tokens);
+        }
+        if (cfg.text.min_chars != 0) {
+            try appendJsonFieldName(alloc, &out, &wrote_text, "min_chars");
+            try appendJsonNumber(alloc, &out, cfg.text.min_chars);
         }
         if (cfg.text.separator.len > 0) {
             try appendJsonFieldName(alloc, &out, &wrote_text, "separator");

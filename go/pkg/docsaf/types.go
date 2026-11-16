@@ -90,6 +90,13 @@ type ContentSource interface {
 	Traverse(ctx context.Context) (<-chan ContentItem, <-chan error)
 }
 
+// MetadataSource enumerates provider metadata without downloading or exporting
+// content. Content is nil; checksums are provider values, not computed hashes.
+// Cancellation and listing errors use the same channel contract as Traverse.
+type MetadataSource interface {
+	List(context.Context) (<-chan ContentItem, <-chan error)
+}
+
 // ContentProcessor processes content bytes into document sections.
 // It works with raw bytes, making it suitable for both filesystem and web sources.
 type ContentProcessor interface {

@@ -25,6 +25,7 @@ pub fn isRetryableError(err: anyerror) bool {
         error.LeaderTransferInProgress,
         error.MetadataLinearizableReadTimeout,
         error.MetadataSnapshotHeadMismatch,
+        error.MetadataSnapshotUnavailable,
         error.ReconcileLeaseNotHeld,
         error.NativeRestoreIdentityProtocolUnavailable,
         => true,
@@ -48,11 +49,12 @@ pub fn isMutationNotAdmittedError(err: anyerror) bool {
 
 /// Once an earlier step in a compound metadata operation may have been
 /// admitted, a later pre-admission rejection no longer proves that the whole
-/// HTTP mutation is safe to replay. Preserve that distinction explicitly so
+/// HTTP mutation is safe to replay. A later command proven not applied also
+/// says nothing about the earlier prefix. Preserve that distinction so
 /// transport adapters cannot accidentally emit the strong non-admission
 /// contract for a partially completed operation.
 pub fn afterPossibleAdmission(err: anyerror) anyerror {
-    return if (isMutationNotAdmittedError(err))
+    return if (isMutationNotAdmittedError(err) or err == error.MetadataMutationNotApplied)
         error.MetadataMutationOutcomeUnknown
     else
         err;
@@ -64,6 +66,8 @@ test "metadata authority retry classification is fail closed" {
     try std.testing.expect(isRetryableError(error.LeaderTransferInProgress));
     try std.testing.expect(isRetryableError(error.MetadataLinearizableReadTimeout));
     try std.testing.expect(isRetryableError(error.MetadataSnapshotHeadMismatch));
+    try std.testing.expect(isRetryableError(error.MetadataSnapshotUnavailable));
+    try std.testing.expect(!isMutationNotAdmittedError(error.MetadataSnapshotUnavailable));
     try std.testing.expect(isRetryableError(error.ReconcileLeaseNotHeld));
     try std.testing.expect(isRetryableError(error.NativeRestoreIdentityProtocolUnavailable));
     try std.testing.expect(!isRetryableError(error.InvalidArguments));
@@ -78,6 +82,7 @@ test "metadata mutation non-admission classification excludes ambiguous authorit
     try std.testing.expect(!isMutationNotAdmittedError(error.ReconcileLeaseNotHeld));
     try std.testing.expect(!isMutationNotAdmittedError(error.OutOfMemory));
     try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, afterPossibleAdmission(error.NotLeader));
+    try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, afterPossibleAdmission(error.MetadataMutationNotApplied));
     try std.testing.expectEqual(error.OutOfMemory, afterPossibleAdmission(error.OutOfMemory));
 }
 

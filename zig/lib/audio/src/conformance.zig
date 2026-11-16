@@ -1011,18 +1011,9 @@ fn appendJsonString(
     allocator: std.mem.Allocator,
     text: []const u8,
 ) !void {
-    try buf.append(allocator, '"');
-    for (text) |ch| {
-        switch (ch) {
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            else => try buf.append(allocator, ch),
-        }
-    }
-    try buf.append(allocator, '"');
+    var writer: std.Io.Writer.Allocating = .fromArrayList(allocator, buf);
+    defer buf.* = writer.toArrayList();
+    std.json.Stringify.encodeJsonString(text, .{}, &writer.writer) catch return error.OutOfMemory;
 }
 
 pub fn assertInterleavedShape(
@@ -1153,4 +1144,15 @@ test "lane summary json export is stable" {
         "[{\"lane\":\"passing\",\"case_count\":11},{\"lane\":\"decode_but_not_claimed\",\"case_count\":3},{\"lane\":\"unsupported\",\"case_count\":1}]",
         buf.items,
     );
+}
+
+test "conformance JSON strings round-trip control characters" {
+    const a = std.testing.allocator;
+    const raw = "nul\x00bell\x07esc\x1bquote\"slash\\";
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(a);
+    try appendJsonString(&out, a, raw);
+    const parsed = try std.json.parseFromSlice([]const u8, a, out.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(raw, parsed.value);
 }

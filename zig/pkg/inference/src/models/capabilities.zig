@@ -43,13 +43,17 @@ pub fn modelSupportsCapability(
     // gliner_boundary_qualification.require() before any request executes.
     if (std.mem.eql(u8, gliner_model_type, gliner_boundary.model_type) and !gliner_boundary.runtime_available) return false;
     if (hasCapability(capabilities, capability)) return true;
+    // Entity-only profiles use the public NER name. Treat it as extraction
+    // without inheriting the legacy family's classifier or relation heads.
+    if (std.mem.eql(u8, capability, "extraction") and hasCapability(capabilities, "named_entity_recognition")) return true;
     // A recognized serving capability list is authoritative. This lets a
     // GLiNER span artifact expose only its reviewed decision head without
     // inheriting the legacy family's entity and relation capabilities.
     for (capabilities) |declared| {
         if (std.mem.eql(u8, declared, "classification") or
             std.mem.eql(u8, declared, "relations") or
-            std.mem.eql(u8, declared, "extraction")) return false;
+            std.mem.eql(u8, declared, "extraction") or
+            std.mem.eql(u8, declared, "named_entity_recognition")) return false;
     }
     if (std.mem.eql(u8, model_kind, "classifier")) {
         return std.mem.eql(u8, capability, "classification");
@@ -61,8 +65,16 @@ pub fn modelSupportsCapability(
         std.mem.eql(u8, capability, "extraction");
 }
 
+/// Gemma 4 generators project sampled video frames through their image tower.
+/// Older manifests omit video from `inputs`, so the checkpoint architecture and
+/// its projector decide. Other multimodal generators reject video.
+pub fn generatorAcceptsVideo(manifest: *const manifest_mod.ModelManifest) bool {
+    return manifest.model_type == .generator and manifest.gguf_projector_path != null and
+        (manifest.gguf_generator_gemma4 or std.mem.eql(u8, manifest.config_model_arch, "gemma4"));
+}
+
 pub fn modelAcceptsInput(manifest: *const manifest_mod.ModelManifest, input: []const u8) bool {
-    if (std.mem.eql(u8, input, "video")) return manifest.embedding_style == .embedding_gemma2 and modelAcceptsInput(manifest, "image");
+    if (std.mem.eql(u8, input, "video")) return generatorAcceptsVideo(manifest) or manifest.embedding_style == .embedding_gemma2 and modelAcceptsInput(manifest, "image");
     return modelKindAcceptsInput(
         @tagName(manifest.model_type),
         manifest.gliner_model_type,
@@ -122,6 +134,20 @@ test "explicit GLiNER serving capabilities do not gain family capabilities" {
     try std.testing.expect(modelSupportsCapability("extractor", "gliner2", decision_capabilities, "classification"));
     try std.testing.expect(!modelSupportsCapability("extractor", "gliner2", decision_capabilities, "relations"));
     try std.testing.expect(!modelSupportsCapability("extractor", "gliner2", decision_capabilities, "extraction"));
+}
+
+test "specialty capability declarations expose only their reviewed task" {
+    const pii = &.{"named_entity_recognition"};
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", pii, "named_entity_recognition"));
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", pii, "extraction"));
+    for ([_][]const u8{ "classification", "relations", "zero_shot", "multi_label", "typed_decisions" }) |capability| {
+        try std.testing.expect(!modelSupportsCapability("extractor", "gliner2", pii, capability));
+    }
+    const gliguard = &.{"classification"};
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", gliguard, "classification"));
+    for ([_][]const u8{ "named_entity_recognition", "extraction", "relations", "typed_decisions" }) |capability| {
+        try std.testing.expect(!modelSupportsCapability("extractor", "gliner2", gliguard, capability));
+    }
 }
 
 test "modelKindAcceptsInput infers text and image modalities" {
@@ -222,4 +248,19 @@ test "rewriters are blocked because the onnx seq2seq import panics" {
     var rewriter = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     rewriter.model_type = .rewriter;
     try std.testing.expectEqual(CompatibilityLevel.incompatible, modelClassCompatibility(&rewriter));
+}
+
+test "only Gemma 4 generators with a projector accept video generation" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .generator, .config_model_arch = "gemma4", .gguf_projector_path = "mmproj.gguf" };
+    try std.testing.expect(generatorAcceptsVideo(&manifest));
+    try std.testing.expect(modelAcceptsInput(&manifest, "video"));
+    manifest.gguf_projector_path = null;
+    try std.testing.expect(!generatorAcceptsVideo(&manifest));
+    manifest.gguf_projector_path = "mmproj.gguf";
+    manifest.config_model_arch = "qwen3vl";
+    try std.testing.expect(!generatorAcceptsVideo(&manifest));
+    manifest.config_model_arch = "gemma4";
+    manifest.model_type = .embedder;
+    try std.testing.expect(!generatorAcceptsVideo(&manifest));
 }

@@ -77,6 +77,24 @@ pub const MutationBarrier = struct {
         return .{ .barrier = self };
     }
 
+    /// Wait under the caller's cancellation/deadline contract. Admission is
+    /// still through the same reader gate, including nested thread ownership.
+    pub fn acquireSharedChecked(self: *@This(), control: anytype) !SharedLease {
+        try control.ensureActive();
+        _ = self.shared_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.shared_waiters.fetchSub(1, .acq_rel);
+        while (true) {
+            try control.ensureActive();
+            if (self.tryAcquireShared()) |acquired| {
+                var lease = acquired;
+                errdefer lease.release();
+                try control.ensureActive();
+                return lease;
+            }
+            @import("antfly_platform").clock.Clock.real().sleepMs(1);
+        }
+    }
+
     pub fn tryAcquireShared(self: *@This()) ?SharedLease {
         if (shared_barrier) |held| {
             if (held != self) return null;
@@ -198,4 +216,27 @@ test "storage.hot_standby mutation barrier recovers after failed try acquisition
 
     var next_mutation = barrier.tryAcquireShared() orelse return error.TestExpectedEqual;
     next_mutation.release();
+}
+
+test "mutation barrier checked shared admission cancels without bypassing capture" {
+    const Control = struct {
+        checks: usize = 0,
+        limit: usize,
+        pub fn ensureActive(self: *@This()) error{Canceled}!void {
+            self.checks += 1;
+            if (self.checks >= self.limit) return error.Canceled;
+        }
+    };
+    var barrier: MutationBarrier = .{};
+    var capture = barrier.acquireExclusive();
+    var canceled = Control{ .limit = 3 };
+    try std.testing.expectError(error.Canceled, barrier.acquireSharedChecked(&canceled));
+    try std.testing.expectEqual(@as(u64, 0), barrier.pendingSharedAcquisitions());
+    capture.release();
+    // Cancellation racing the grant releases both the thread-local lease and
+    // resource gate, so the next exclusive capture can still proceed.
+    var raced = Control{ .limit = 3 };
+    try std.testing.expectError(error.Canceled, barrier.acquireSharedChecked(&raced));
+    var next = barrier.tryAcquireExclusive() orelse return error.TestUnexpectedResult;
+    next.release();
 }

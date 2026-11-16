@@ -1,0 +1,721 @@
+{
+  "format": "deduplicated-extraction-output-v1",
+  "raw_report_sha256": "e68499e11bcd048a3f8c23fec2e75bfe96b81a47e56d2d6342f60e9cedd83224",
+  "report": {
+    "format_version": 1,
+    "status": "complete",
+    "scope": "warm_http",
+    "host": {
+      "system": "Darwin",
+      "machine": "arm64",
+      "kernel": "27.0.0",
+      "cpuinfo": null,
+      "affinity": null,
+      "cgroup": null,
+      "mountinfo": null,
+      "meminfo": null,
+      "commit": "2ca873bf37a1ff2d2faf6c586a5fcd1cdb6e1ec5",
+      "source_dirty": false,
+      "untracked_source_sha256": {},
+      "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "kernel_override": "auto",
+      "thread_override": null
+    },
+    "cases_sha256": "c70cef0a51560e2756926a925f60f9b5b381268cba59e7bca74430b1e17ec038",
+    "artifacts": {
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-local-baseline/zig/zig-out/bin/antfly-inference-http-server": "ac7506cb30411829e21a1d80539d4339498a7517dd1071f2ba27c1ce7ba6548f",
+      "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/qualify-gliner-http-completion/zig/zig-out/bin/antfly-inference-http-server": "20f15770db057b64b3c2bf36e37758f5d6509f0a1b9b7287bc9a18b17ed8c06e",
+      "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/config.json": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1",
+      "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/encoder_config/config.json": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4",
+      "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/model.safetensors": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+      "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer.json": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+      "/Users/ajroetker/.antfly/inference/models/fastino/gliner2.5-base-v1/tokenizer_config.json": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+    },
+    "arms": {
+      "baseline": "http://127.0.0.1:18775",
+      "candidate": "http://127.0.0.1:18776"
+    },
+    "warmup": 3,
+    "pairs": 20,
+    "concurrency": 1,
+    "round_scope": "single_request",
+    "timing": {
+      "client_latency": "HTTP send through response-body read; excludes JSON parsing and oracle comparison",
+      "burst": "barrier release through last response-body read; includes client dispatch and payload encoding"
+    },
+    "performance_release_qualified": false,
+    "samples": [
+      {
+        "case_id": "full_word_reference",
+        "pair": 0,
+        "order": [
+          "baseline",
+          "candidate"
+        ],
+        "host_load_average": [
+          10.1953125,
+          12.22705078125,
+          13.4931640625
+        ],
+        "baseline": {
+          "duration_ns": 12254505458,
+          "response_completed_ns": 645709951131541,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "candidate": {
+          "duration_ns": 12689095708,
+          "response_completed_ns": 645722640406166,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 1,
+        "order": [
+          "candidate",
+          "baseline"
+        ],
+        "host_load_average": [
+          13.2626953125,
+          12.7861328125,
+          13.6572265625
+        ],
+        "candidate": {
+          "duration_ns": 14014004334,
+          "response_completed_ns": 645736655149750,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "baseline": {
+          "duration_ns": 15019268208,
+          "response_completed_ns": 645751675161333,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 2,
+        "order": [
+          "baseline",
+          "candidate"
+        ],
+        "host_load_average": [
+          14.38525390625,
+          13.11865234375,
+          13.74853515625
+        ],
+        "baseline": {
+          "duration_ns": 16568469583,
+          "response_completed_ns": 645768244724083,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "candidate": {
+          "duration_ns": 19370271791,
+          "response_completed_ns": 645787617706166,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 3,
+        "order": [
+          "candidate",
+          "baseline"
+        ],
+        "host_load_average": [
+          17.701171875,
+          14.046875,
+          14.05859375
+        ],
+        "candidate": {
+          "duration_ns": 17324099791,
+          "response_completed_ns": 645804943764416,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "baseline": {
+          "duration_ns": 11510228167,
+          "response_completed_ns": 645816454834875,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 4,
+        "order": [
+          "baseline",
+          "candidate"
+        ],
+        "host_load_average": [
+          17.83984375,
+          14.53759765625,
+          14.24169921875
+        ],
+        "baseline": {
+          "duration_ns": 11456393916,
+          "response_completed_ns": 645827911551041,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "candidate": {
+          "duration_ns": 11716526541,
+          "response_completed_ns": 645839628258541,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 5,
+        "order": [
+          "candidate",
+          "baseline"
+        ],
+        "host_load_average": [
+          15.41015625,
+          14.19384765625,
+          14.125
+        ],
+        "candidate": {
+          "duration_ns": 11614009333,
+          "response_completed_ns": 645851242463458,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "baseline": {
+          "duration_ns": 13343553666,
+          "response_completed_ns": 645864586187541,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 6,
+        "order": [
+          "baseline",
+          "candidate"
+        ],
+        "host_load_average": [
+          15.48193359375,
+          14.36962890625,
+          14.193359375
+        ],
+        "baseline": {
+          "duration_ns": 12644290958,
+          "response_completed_ns": 645877234571416,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "candidate": {
+          "duration_ns": 11828091333,
+          "response_completed_ns": 645889063510208,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 7,
+        "order": [
+          "candidate",
+          "baseline"
+        ],
+        "host_load_average": [
+          15.20556640625,
+          14.38818359375,
+          14.2041015625
+        ],
+        "candidate": {
+          "duration_ns": 11183143209,
+          "response_completed_ns": 645900249112000,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "baseline": {
+          "duration_ns": 10587878708,
+          "response_completed_ns": 645910837588708,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 8,
+        "order": [
+          "baseline",
+          "candidate"
+        ],
+        "host_load_average": [
+          14.140625,
+          14.20947265625,
+          14.14453125
+        ],
+        "baseline": {
+          "duration_ns": 10430597375,
+          "response_completed_ns": 645921268553125,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "candidate": {
+          "duration_ns": 10781217875,
+          "response_completed_ns": 645932050355333,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 9,
+        "order": [
+          "candidate",
+          "baseline"
+        ],
+        "host_load_average": [
+          13.275390625,
+          13.98876953125,
+          14.0654296875
+        ],
+        "candidate": {
+          "duration_ns": 11203143333,
+          "response_completed_ns": 645943253845333,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "baseline": {
+          "duration_ns": 11001329250,
+          "response_completed_ns": 645954255313375,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 10,
+        "order": [
+          "baseline",
+          "candidate"
+        ],
+        "host_load_average": [
+          12.52197265625,
+          13.763671875,
+          13.98193359375
+        ],
+        "baseline": {
+          "duration_ns": 10875845917,
+          "response_completed_ns": 645965131305583,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "candidate": {
+          "duration_ns": 13613378333,
+          "response_completed_ns": 645978745019541,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 11,
+        "order": [
+          "candidate",
+          "baseline"
+        ],
+        "host_load_average": [
+          12.65576171875,
+          13.71337890625,
+          13.9580078125
+        ],
+        "candidate": {
+          "duration_ns": 12577227292,
+          "response_completed_ns": 645991322613375,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "baseline": {
+          "duration_ns": 10976325542,
+          "response_completed_ns": 646002299386625,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 12,
+        "order": [
+          "baseline",
+          "candidate"
+        ],
+        "host_load_average": [
+          13.705078125,
+          13.89111328125,
+          14.01513671875
+        ],
+        "baseline": {
+          "duration_ns": 11525666334,
+          "response_completed_ns": 646013825738750,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "candidate": {
+          "duration_ns": 11355213291,
+          "response_completed_ns": 646025181636666,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 13,
+        "order": [
+          "candidate",
+          "baseline"
+        ],
+        "host_load_average": [
+          19.52734375,
+          15.158203125,
+          14.4619140625
+        ],
+        "candidate": {
+          "duration_ns": 10670672125,
+          "response_completed_ns": 646035852458333,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "baseline": {
+          "duration_ns": 10285370666,
+          "response_completed_ns": 646046137967166,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 14,
+        "order": [
+          "baseline",
+          "candidate"
+        ],
+        "host_load_average": [
+          16.345703125,
+          14.71044921875,
+          14.31640625
+        ],
+        "baseline": {
+          "duration_ns": 10330988917,
+          "response_completed_ns": 646056469128833,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "candidate": {
+          "duration_ns": 11258027542,
+          "response_completed_ns": 646067727307333,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 15,
+        "order": [
+          "candidate",
+          "baseline"
+        ],
+        "host_load_average": [
+          14.75146484375,
+          14.43994140625,
+          14.22705078125
+        ],
+        "candidate": {
+          "duration_ns": 10682323291,
+          "response_completed_ns": 646078409781916,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "baseline": {
+          "duration_ns": 10570035333,
+          "response_completed_ns": 646088979975791,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 16,
+        "order": [
+          "baseline",
+          "candidate"
+        ],
+        "host_load_average": [
+          14.89990234375,
+          14.4921875,
+          14.25
+        ],
+        "baseline": {
+          "duration_ns": 10361435584,
+          "response_completed_ns": 646099341560125,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "candidate": {
+          "duration_ns": 10866837167,
+          "response_completed_ns": 646110208561458,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 17,
+        "order": [
+          "candidate",
+          "baseline"
+        ],
+        "host_load_average": [
+          12.83935546875,
+          14.03564453125,
+          14.091796875
+        ],
+        "candidate": {
+          "duration_ns": 11755564542,
+          "response_completed_ns": 646121964307125,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "baseline": {
+          "duration_ns": 11541268083,
+          "response_completed_ns": 646133505735833,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 18,
+        "order": [
+          "baseline",
+          "candidate"
+        ],
+        "host_load_average": [
+          13.1982421875,
+          14.0595703125,
+          14.099609375
+        ],
+        "baseline": {
+          "duration_ns": 11649755958,
+          "response_completed_ns": 646145155655083,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "candidate": {
+          "duration_ns": 11399045541,
+          "response_completed_ns": 646156555238291,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      },
+      {
+        "case_id": "full_word_reference",
+        "pair": 19,
+        "order": [
+          "candidate",
+          "baseline"
+        ],
+        "host_load_average": [
+          14.7587890625,
+          14.40966796875,
+          14.22705078125
+        ],
+        "candidate": {
+          "duration_ns": 11593969792,
+          "response_completed_ns": 646168149373500,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        },
+        "baseline": {
+          "duration_ns": 14069785708,
+          "response_completed_ns": 646182220163458,
+          "output_sha256": "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa"
+        }
+      }
+    ],
+    "comparisons": {
+      "full_word_reference": {
+        "candidate_ns": {
+          "min": 10670672125.0,
+          "median": 11603989562.5,
+          "mean": 12374793108.2,
+          "p95": 17426408391.0,
+          "max": 19370271791.0,
+          "cv": 0.17769884710367248
+        },
+        "baseline_ns": {
+          "min": 10285370666.0,
+          "median": 11483311041.5,
+          "mean": 11850149666.55,
+          "p95": 15096728276.75,
+          "max": 16568469583.0,
+          "cv": 0.1404755838916053
+        },
+        "candidate_over_baseline": {
+          "lower_95": 0.9978362240955022,
+          "median": 1.0281460036571801,
+          "upper_95": 1.052492666606661,
+          "samples": 2000,
+          "seed": 20260730,
+          "estimator": "median_paired_log_ratio"
+        }
+      }
+    }
+  },
+  "responses_by_canonical_json_sha256": {
+    "8c4e2f95137f29d7d8d709df8fbb00de8b16313907a281d372ab8ff2cb06f1aa": {
+      "object": "extraction",
+      "model": "fastino/gliner2.5-base-v1",
+      "schema_version": 2,
+      "data": [
+        {
+          "offset_unit": "utf8_bytes",
+          "entities": [
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9849634766578674,
+              "start": 1216,
+              "end": 1230
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9846357107162476,
+              "start": 1160,
+              "end": 1174
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9843752980232239,
+              "start": 1104,
+              "end": 1118
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9837195873260498,
+              "start": 1048,
+              "end": 1062
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9832635521888733,
+              "start": 992,
+              "end": 1006
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9820375442504883,
+              "start": 936,
+              "end": 950
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9817119836807251,
+              "start": 880,
+              "end": 894
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9809082746505737,
+              "start": 824,
+              "end": 838
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9798761606216431,
+              "start": 712,
+              "end": 726
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9796745181083679,
+              "start": 768,
+              "end": 782
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9791415333747864,
+              "start": 656,
+              "end": 670
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9763534069061279,
+              "start": 600,
+              "end": 614
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9756321310997009,
+              "start": 544,
+              "end": 558
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9739342927932739,
+              "start": 488,
+              "end": 502
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9713005423545837,
+              "start": 432,
+              "end": 446
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9694907665252686,
+              "start": 376,
+              "end": 390
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.967592179775238,
+              "start": 320,
+              "end": 334
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9634624123573303,
+              "start": 264,
+              "end": 278
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9588097333908081,
+              "start": 208,
+              "end": 222
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9535868167877197,
+              "start": 152,
+              "end": 166
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.9390444755554199,
+              "start": 96,
+              "end": 110
+            },
+            {
+              "label": "concept",
+              "text": "search queries",
+              "score": 0.8440619707107544,
+              "start": 40,
+              "end": 54
+            }
+          ],
+          "long_document": {
+            "version": 1,
+            "window_count": 1,
+            "window_policy": "source_words_midpoint_ownership",
+            "classification_aggregation": "owned_word_weighted_mean_raw_logits",
+            "duplicate_score": "maximum_calibrated_score",
+            "natural_record_identity": "exact_source_anchor",
+            "other_record_identity": "occurrence",
+            "solver_optimality_scope": "retained_candidate_graph"
+          }
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 4105,
+        "completion_tokens": 0,
+        "total_tokens": 4105
+      }
+    }
+  }
+}

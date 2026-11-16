@@ -12,7 +12,7 @@ function Input({ className, type, ...props }: React.ComponentProps<"input">) {
         // readout. Identifier-ish fields can opt back in with font-mono.
         "font-sans text-sm text-foreground placeholder:text-muted-foreground",
         // structure: square, deliberate token-width (--border-width) border, no shadow
-        "h-9 w-full min-w-0 rounded-none border-(length:--border-width) border-input bg-transparent",
+        "h-9 w-full min-w-0 rounded-md border-(length:--border-width) border-input bg-transparent",
         "px-3 py-1.5",
         // selection / file input
         "selection:bg-primary selection:text-primary-foreground",

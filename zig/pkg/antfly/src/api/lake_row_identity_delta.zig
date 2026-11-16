@@ -60,7 +60,6 @@ pub const Builder = struct {
         self.pending.encoded_bytes = true;
         for (&self.edits) |*edit| {
             edit.* = Mutations.init(a, manager, pages.store());
-            edit.private_pages.phase = pages.artifacts.io_phase;
         }
         errdefer self.deinit();
         const ma = self.arena.allocator();
@@ -251,8 +250,18 @@ pub const Builder = struct {
     }
     pub fn finish(self: *Builder, namespace: identity.logical.Digest, recipe: identity.logical.Digest, cut: identity.logical.Digest) !Root {
         try self.finishExtensionFile();
-        var scratch = std.heap.ArenaAllocator.init(self.a);
-        defer scratch.deinit();
+        var rows: @import("lake_index_sort_stream.zig").Records = .{ .sort = &self.pending };
+        defer rows.deinit();
+        // A fresh complete map has no queued removals or retained membership.
+        // The pending stream already proves strict ID order. A single cohort
+        // adds a constant prefix, preserving that order for input evidence.
+        const fresh = self.unchanged.count() == 0;
+        const ordered_ids = fresh and self.space.by_id == null and self.edits[2].ordinal == 0;
+        const ordered_inputs = fresh and self.space.input_versions == null and self.cohorts.len == 1 and self.edits[6].ordinal == 0;
+        var id_tree: tree.SortedBuilder = .{ .alloc = self.a, .store = self.pages.store() };
+        defer id_tree.deinit();
+        var input_tree: tree.SortedBuilder = .{ .alloc = self.a, .store = self.pages.store() };
+        defer input_tree.deinit();
         const input_offset: usize = if (self.space.compact) 16 else 48;
         var previous_id: ?[32]u8 = null;
         var inverse: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
@@ -268,12 +277,10 @@ pub const Builder = struct {
         defer if (retained) |*cursor| cursor.deinit();
         var candidate: ?tree.Cursor.Record = null;
         while (true) {
-            _ = scratch.reset(.retain_capacity);
-            const a = scratch.allocator();
-            const row = (try self.pending.next(a)) orelse break;
-            if (row.keys.len != 1 or row.values.len != 1 or row.keys[0].value != .string or row.values[0].value != .string or row.keys[0].value.string.len != 32 or row.values[0].value.string.len != input_offset + self.cohorts.len * 32) return error.InvalidLogicalRowIdentity;
-            const id = row.keys[0].value.string;
-            const value = row.values[0].value.string;
+            const row = (try rows.next()) orelse break;
+            const id = row.key;
+            const value = row.value;
+            if (id.len != 32 or value.len != input_offset + self.cohorts.len * 32) return error.InvalidLogicalRowIdentity;
             if (previous_id) |previous| if (std.mem.eql(u8, &previous, id)) return error.DuplicateLogicalRowKey;
             previous_id = id[0..32].*;
             if (retained) |*cursor| {
@@ -293,7 +300,7 @@ pub const Builder = struct {
             var state: [64]u8 = undefined;
             state[0..32].* = id[0..32].*;
             if (!self.space.compact) state[32..64].* = value[16..48].*;
-            try self.edits[2].addRecord(id, if (self.space.compact) value[0..16] else &forward);
+            if (ordered_ids) try id_tree.add(id, if (self.space.compact) value[0..16] else &forward) else try self.edits[2].addRecord(id, if (self.space.compact) value[0..16] else &forward);
             const location = identity.locationKey(name, coordinate.group, coordinate.row);
             if (!self.space.compact) try self.edits[3].addRecord(&location, &state);
             try self.edits[4].addRecord(value[0..16], if (self.space.compact) id else &state);
@@ -303,17 +310,17 @@ pub const Builder = struct {
                 var input_key: [64]u8 = undefined;
                 input_key[0..32].* = input_recipe.digest;
                 input_key[32..64].* = id[0..32].*;
-                try self.edits[6].addRecord(&input_key, value[input_offset + i * 32 ..][0..32]);
+                if (ordered_inputs) try input_tree.add(&input_key, value[input_offset + i * 32 ..][0..32]) else try self.edits[6].addRecord(&input_key, value[input_offset + i * 32 ..][0..32]);
             }
         }
         const old = if (self.prior != null and self.unchanged.count() != 0) self.prior.?.current else self.space;
         self.space.files = try self.edits[0].finish(old.files);
         self.space.file_slots = try self.edits[1].finish(old.file_slots);
-        self.space.by_id = try self.edits[2].finish(old.by_id);
+        self.space.by_id = if (ordered_ids) try id_tree.finish() else try self.edits[2].finish(old.by_id);
         self.space.by_file = try self.edits[4].finish(old.by_file);
         self.space.by_location = if (self.space.compact) self.space.by_file else try self.edits[3].finish(old.by_location);
         self.space.by_order = try self.edits[5].finish(old.by_order);
-        self.space.input_versions = try self.edits[6].finish(old.input_versions);
+        self.space.input_versions = if (ordered_inputs) try input_tree.finish() else try self.edits[6].finish(old.input_versions);
         self.space.rows = if (self.space.by_id) |ref| ref.records else 0;
         const root: Root = .{ .domain = self.pages.domain, .namespace = namespace, .values_recipe = recipe, .values_format = if (self.space.compact) identity.cohort_values_format else @import("lake_row_fingerprints.zig").format, .cut = cut, .current = self.space };
         try root.validate(self.a);
@@ -574,5 +581,54 @@ test "external lake supplemental cohorts reject duplicate omitted and mismatched
             // Membership equality alone must never certify value/index reuse.
             try std.testing.expect(!try identity.proveReuse(a, &pages, root, &complete));
         }
+    }
+}
+
+test "external lake ordered identity publication matches mutation fallback for fresh single and multiple cohorts" {
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("ordered-identity-maps");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.call, .async_writes = false };
+    defer manager.deinit();
+    var reads: u64 = 0;
+    var writes: u64 = 0;
+    var pages: Pages = .{ .domain = @splat(7), .attempt = @splat(1), .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    const recipes = [_]@import("lake_row_input_recipes.zig").Recipe{
+        .{ .name = "one", .digest = @splat(11), .columns = &.{"one"} },
+        .{ .name = "two", .digest = @splat(22), .columns = &.{"two"} },
+    };
+    for (1..3) |cohort_count| {
+        const direct = try Builder.createWithOptions(a, &manager, &pages, &.{"file"}, null, null, recipes[0..cohort_count], "source", "snapshot", true);
+        defer direct.deinit();
+        const fallback = try Builder.createWithOptions(a, &manager, &pages, &.{"file"}, null, null, recipes[0..cohort_count], "source", "snapshot", true);
+        defer fallback.deinit();
+        // An absent deletion changes no rows but makes the mutation stream
+        // unordered, requiring the general reducer and testing the proof gate.
+        const absent_id: [32]u8 = @splat(255);
+        const absent_input: [64]u8 = @splat(255);
+        try fallback.edits[2].addRecord(&absent_id, null);
+        try fallback.edits[6].addRecord(&absent_input, null);
+        for (0..48) |i| {
+            var id: [32]u8 = @splat(0);
+            std.mem.writeInt(u64, id[24..32], 48 - i, .big);
+            const state: State = .{ .id = id, .values = id };
+            const coordinate: Coordinate = .{ .file = 0, .group = 0, .row = i };
+            const inputs = [_][32]u8{ @splat(@intCast(i + 1)), @splat(@intCast(i + 2)) };
+            try direct.addWithInputs(state, coordinate, inputs[0..cohort_count]);
+            try fallback.addWithInputs(state, coordinate, inputs[0..cohort_count]);
+        }
+        const actual = try direct.finish(@splat(1), @splat(2), @splat(3));
+        const expected = try fallback.finish(@splat(1), @splat(2), @splat(3));
+        try std.testing.expectEqual(@as(u64, 48), actual.current.rows);
+        try std.testing.expectEqual(@as(u64, 48 * cohort_count), actual.current.input_versions.?.records);
+        inline for (.{ "by_id", "by_file", "by_order", "input_versions" }) |field| try std.testing.expect(try tree.equivalent(a, pages.store(), @field(expected.current, field), @field(actual.current, field), .{}));
     }
 }

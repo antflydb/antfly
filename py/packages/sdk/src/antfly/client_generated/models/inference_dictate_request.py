@@ -24,9 +24,12 @@ class InferenceDictateRequest:
         model (str): Transcriber model from models_dir/transcribers/. Example: openai/whisper-tiny.
         audio (str): Base64-encoded audio clip (WAV, Opus, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in
             windows.
+        transcript_text (str | Unset): Clean an already finalized recognition segment without running recognition
+            again. Supported by named transcribers advertising text_cleanup. Set
+            audio to the empty string and omit attachments and recognition hints.
+            Partial hypotheses must never be submitted as finalized segments.
         language (str | Unset): Force the transcript language (ISO 639-1). Omit for automatic detection. Example: en.
-        timestamps (bool | Unset): Enable timestamp-aware decoding. Omitted preserves the endpoint default (off for
-            transcribe, on for dictate).
+        timestamps (bool | Unset): Enable timestamp-aware decoding. Omitted preserves the dictation default (on).
         cleanup_model (str | Unset): Generator model from models_dir/generators/ that rewrites the transcript. Omit to
             return the raw transcript. Example: ggml-org/gemma-4-E4B-it-GGUF.
         style (InferenceDictationStyle | Unset): How the cleanup pass rewrites the transcript. `clean` removes fillers
@@ -59,6 +62,7 @@ class InferenceDictateRequest:
 
     model: str
     audio: str
+    transcript_text: str | Unset = UNSET
     language: str | Unset = UNSET
     timestamps: bool | Unset = UNSET
     cleanup_model: str | Unset = UNSET
@@ -77,6 +81,8 @@ class InferenceDictateRequest:
         model = self.model
 
         audio = self.audio
+
+        transcript_text = self.transcript_text
 
         language = self.language
 
@@ -118,6 +124,8 @@ class InferenceDictateRequest:
                 "audio": audio,
             }
         )
+        if transcript_text is not UNSET:
+            field_dict["transcript_text"] = transcript_text
         if language is not UNSET:
             field_dict["language"] = language
         if timestamps is not UNSET:
@@ -153,6 +161,8 @@ class InferenceDictateRequest:
         model = d.pop("model")
 
         audio = d.pop("audio")
+
+        transcript_text = d.pop("transcript_text", UNSET)
 
         language = d.pop("language", UNSET)
 
@@ -196,6 +206,7 @@ class InferenceDictateRequest:
         inference_dictate_request = cls(
             model=model,
             audio=audio,
+            transcript_text=transcript_text,
             language=language,
             timestamps=timestamps,
             cleanup_model=cleanup_model,

@@ -62,6 +62,7 @@ pub const Limits = struct {
 };
 pub const Column = describe.Column;
 pub const Output = struct {
+    resolved_indexes: ?[]const []const u8 = null,
     columns: []const Column = &.{},
     rows: []const []const Json = &.{},
     native_rows: ?[]const []const Datum = null,
@@ -83,7 +84,7 @@ pub const Output = struct {
     /// representation. Keep the public result envelope explicit at every ABI.
     pub fn jsonStringify(self: Output, writer: anytype) !void {
         if (self.native_rows != null) return error.WriteFailed;
-        try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .ddl_receipt = self.ddl_receipt });
+        try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .ddl_receipt = self.ddl_receipt, .resolved_indexes = self.resolved_indexes });
     }
 };
 /// An execution-scoped allocator whose control state outlives returned rows or
@@ -268,7 +269,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
         const estimate_parameters = if (estimate_frame) |invocation| try invocation.compatibilityValues(arena) else parameters;
         const rendered = try @import("explain.zig").renderMeasured(arena, explanation, binding, if (explanation.analyze) &profile else null, backend, estimate_parameters);
         const row = try arena.dupe(Json, &.{.{ .string = rendered }});
-        return .{ .columns = try arena.dupe(Column, &.{.{ .name = "QUERY PLAN", .type = .string }}), .rows = try arena.dupe([]const Json, &.{row}), .command_tag = "EXPLAIN" };
+        return .{ .columns = try arena.dupe(Column, &.{.{ .name = "QUERY PLAN", .type = .string }}), .rows = try arena.dupe([]const Json, &.{row}), .command_tag = "EXPLAIN", .resolved_indexes = try resolvedGraphIndexNames(arena, binding) };
     }
     const ddl = @import("ddl_runtime.zig");
     if (ddl.accepts(compiled.statement)) {
@@ -295,10 +296,13 @@ fn runWithBinding(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: c
     if (backend.spill_manager == null and limits.spill_bytes != 0) if (backend.execution_io) |io| {
         manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes };
     };
+    var attribution = try IndexAttribution.init(arena, binding);
+    if (backend.index_attribution) |host| host.bind(host.ptr, attribution.observer());
+    defer if (backend.index_attribution) |host| host.bind(host.ptr, null);
     const context = Context{ .alloc = alloc, .arena = arena, .backend = statement_backend, .binding = binding, .parameters = prepared_parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink };
     const stage = if (limits.profile) |profile| try profile.registerStage(@tagName(compiled.statement), if (binding.table) |table| table.physical_name else null) else null;
     const started = if (limits.profile) |profile| profile.now() else null;
-    const output = context.run(compiled.statement) catch |err| {
+    var output = context.run(compiled.statement) catch |err| {
         if (limits.profile) |profile| profile.record(stage, started, 0, false, true);
         return err;
     };
@@ -306,7 +310,70 @@ fn runWithBinding(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: c
     if (limits.profile) |profile| {
         if (context.spill) |spill| profile.spill_written_bytes = spill.written_bytes;
     }
+    output.resolved_indexes = attribution.value();
     return output;
+}
+
+pub const IndexAttribution = struct {
+    a: std.mem.Allocator,
+    names: std.ArrayList([]const u8) = .empty,
+    pub fn init(a: std.mem.Allocator, bound: describe.BoundStatement) !@This() {
+        var self: @This() = .{ .a = a };
+        if (try resolvedGraphIndexNames(a, bound)) |names| try self.names.appendSlice(a, names);
+        return self;
+    }
+    pub fn observer(self: *@This()) @import("cypher").backend.IndexObserver {
+        return .{ .ptr = self, .record = record };
+    }
+    fn record(ptr: *anyopaque, name: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        for (self.names.items) |prior| if (std.mem.eql(u8, prior, name)) return;
+        const owned = try self.a.dupe(u8, name);
+        errdefer self.a.free(owned);
+        try self.names.append(self.a, owned);
+    }
+    pub fn value(self: @This()) ?[]const []const u8 {
+        return if (self.names.items.len == 0) null else self.names.items;
+    }
+};
+
+pub fn resolvedGraphIndexNames(a: std.mem.Allocator, bound: describe.BoundStatement) !?[]const []const u8 {
+    const relation = bound.relation;
+
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |name| a.free(name);
+        names.deinit(a);
+    }
+    if (relation) |relations| for (relations.scans) |scan| if (scan.table.graph) |graph| {
+        const selected = try @import("cypher").dependencies.selectedIndexes(scratch.allocator(), graph.definition.query, graph.graph);
+        for (selected) |name| {
+            const found = for (names.items) |prior| {
+                if (std.mem.eql(u8, prior, name)) break true;
+            } else false;
+            if (!found) {
+                const owned = try a.dupe(u8, name);
+                errdefer a.free(owned);
+                try names.append(a, owned);
+            }
+        }
+    };
+    for ([_]?*const describe.BoundStatement{ bound.insert_source, bound.returning, if (bound.joined_mutation) |joined| joined.input else null, if (bound.joined_mutation) |joined| joined.returning_binding else null, if (bound.merge_mutation) |merge| merge.input else null }) |child| if (child) |nested| {
+        for (try resolvedGraphIndexNames(scratch.allocator(), nested.*) orelse &.{}) |name| {
+            const duplicate = for (names.items) |prior| {
+                if (std.mem.eql(u8, prior, name)) break true;
+            } else false;
+            if (!duplicate) {
+                const owned = try a.dupe(u8, name);
+                errdefer a.free(owned);
+                try names.append(a, owned);
+            }
+        }
+    };
+    if (names.items.len == 0) return null;
+    return try names.toOwnedSlice(a);
 }
 
 pub const RowSink = struct {
@@ -423,6 +490,21 @@ pub const Context = struct {
                 return count_rows_result;
             };
             return null;
+        }
+        pub fn weights(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan, multiplicity: catalog.Multiplicity) !bool {
+            try self.open(context, table, request);
+            if (self.cursor) |cursor| if (cursor.enable_weights) |enable| return enable(cursor.ptr, multiplicity);
+            return false;
+        }
+        pub fn groups(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan, aggregates: []const catalog.AggregateWeight, orders: []const @import("cypher").runtime.NodeCursor.GroupOrder, grouped: *@import("operators.zig").Grouped) !bool {
+            try self.open(context, table, request);
+            if (self.cursor) |cursor| if (cursor.enable_groups) |enable| return enable(cursor.ptr, aggregates, orders, grouped);
+            return false;
+        }
+        pub fn aggregateWeights(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan, aggregates: []const catalog.AggregateWeight) !bool {
+            try self.open(context, table, request);
+            if (self.cursor) |cursor| if (cursor.enable_aggregate_weights) |enable| return enable(cursor.ptr, aggregates);
+            return false;
         }
         pub fn columns(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.ColumnPage {
             try self.open(context, table, request);
@@ -929,6 +1011,16 @@ pub const Context = struct {
             for (self.binding.order_keys, orders) |key, *order| order.* = .{ .descending = key.descending, .nulls_first = key.nulls_first };
             top_k = try operators.TopK.initWithSpill(self.alloc, offset + limit + @intFromBool(statement.limit == null), orders, self.limits.retained_bytes, self.spill);
         }
+        // Sorting is a bag consumer when every evaluated expression is
+        // repeatable. The graph cursor proves that requested columns form an
+        // endpoint-local tuple; SQL retains its own coercions and sort keys.
+        const weight_safe = top_k != null and blk: {
+            if (self.binding.scalars.predicate) |p| if (!p.repeatable()) break :blk false;
+            for (self.binding.scalars.projections) |p| if (p) |program| if (!program.repeatable()) break :blk false;
+            for (self.binding.scalars.orders) |p| if (p) |program| if (!program.repeatable()) break :blk false;
+            break :blk true;
+        };
+        const weighted_top = weight_safe and try scan_state.weights(self, table_def, scan_request, .capped);
         const deferred = try self.arena.alloc(bool, fields.items.len);
         @memset(deferred, false);
         if (top_k != null) for (self.binding.scalars.projections, 0..) |optional, index| {
@@ -958,6 +1050,9 @@ pub const Context = struct {
                 metadata_counted = true;
             }
         }
+        const weighted_count = statement.count_all and !metadata_counted and !predicates.empty and
+            (self.binding.scalars.predicate == null or self.binding.scalars.predicate.?.repeatable()) and
+            try scan_state.weights(self, table_def, scan_request, .exact);
         while (!predicates.empty and !metadata_counted) {
             try self.checkpoint();
             page_count += 1;
@@ -978,7 +1073,7 @@ pub const Context = struct {
             request.limit = @intCast(wanted);
             const page = try scan_state.page(self, page_arena.allocator(), table_def, request);
             defer page.deinit();
-            if (page.rows.len > wanted) return error.InvalidSqlBackendResponse;
+            if (page.rows.len > wanted or ((weighted_top or weighted_count) and (page.multiplicities == null or page.multiplicities.?.len != page.rows.len))) return error.InvalidSqlBackendResponse;
             if (page.rows.len > self.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
             var first: usize = 0;
             while (first < page.rows.len) {
@@ -1018,7 +1113,10 @@ pub const Context = struct {
                     try @import("decision_eval.zig").evaluateBatchWithLimits(scratch, self.backend.decision_provider, &optional.?, selected_cells.items, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))
                 else
                     null;
-                if (!defer_projection and !statement.count_all and (top_k != null or (self.sink != null and self.sink.?.append_batch != null))) {
+                // Native batches represent individual rows. A weighted graph
+                // page must admit its bag count through addWeighted instead;
+                // ordinary batch admission would silently lose multiplicities.
+                if (!weighted_top and !defer_projection and !statement.count_all and (top_k != null or (self.sink != null and self.sink.?.append_batch != null))) {
                     const selection = try scratch.alloc(usize, selected_cells.items.len);
                     const ordinals = try scratch.alloc(u64, selected_cells.items.len);
                     var selected_count: usize = 0;
@@ -1098,7 +1196,11 @@ pub const Context = struct {
                         if (values[row_index].value != .bool) return error.SqlTypeMismatch;
                         if (!values[row_index].value.bool) continue;
                     }
-                    scanned += 1;
+                    if (weighted_count) {
+                        const weight = std.math.cast(usize, page.multiplicities.?[first + row_index]) orelse return error.SqlNumericOutOfRange;
+                        scanned = std.math.add(usize, scanned, weight) catch return error.SqlNumericOutOfRange;
+                        if (scanned > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+                    } else scanned += 1;
                     if (statement.count_all) continue;
                     if (top_k) |*operator| {
                         const values = try scratch.alloc(Datum, fields.items.len + if (defer_projection) self.binding.scalars.columns.len else @as(usize, 0));
@@ -1118,7 +1220,8 @@ pub const Context = struct {
                                 break :blk try describe.coerceDatum(scratch, cell, column.type, column.element_type);
                             },
                         };
-                        try operator.add(.{ .values = values, .keys = keys, .ordinal = visited });
+                        const candidate: operators.Row = .{ .values = values, .keys = keys, .ordinal = visited };
+                        if (weighted_top) try operator.addWeighted(candidate, page.multiplicities.?[first + row_index]) else try operator.add(candidate);
                         continue;
                     }
                     if (scanned <= offset) continue;
@@ -1168,6 +1271,23 @@ pub const Context = struct {
             after = owned_next;
         }
         if (top_k) |*operator| {
+            if (weighted_top) {
+                if (self.sink) |sink| {
+                    try operator.drainWeighted(self.alloc, offset, limit, statement.limit == null, sink);
+                } else {
+                    for (try operator.finishWeightedPage(self.arena, offset, limit, statement.limit == null)) |row| {
+                        const cells = try self.arena.alloc(Json, row.values.len);
+                        const nulls = try self.arena.alloc(bool, row.values.len);
+                        for (row.values, cells, nulls, columns) |datum, *cell, *flag, column| {
+                            cell.* = try self.outputDatum(datum, column.type, column.element_type);
+                            flag.* = datum.sql_null;
+                        }
+                        try rows.append(self.arena, cells);
+                        try null_rows.append(self.arena, nulls);
+                    }
+                }
+                return .{ .columns = columns, .rows = rows.items, .sql_nulls = null_rows.items, .command_tag = "SELECT" };
+            }
             if (self.sink != null and !defer_projection) return self.emitTop(operator, offset, limit, statement.limit == null);
             const ordered = try operator.finishPage(self.arena, offset, limit + @intFromBool(statement.limit == null));
             const remaining = ordered.len;
@@ -5820,7 +5940,9 @@ test "external lake SQL finalized join state preserves empty globals HAVING and 
 }
 
 test "external lake SQL plain count consumes resident and spilled typed join partials" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     for ([_][]const u8{
         "SELECT COUNT(*) FROM (VALUES (1),(1)) l(k) JOIN (VALUES (1),(1)) r(k) ON l.k=r.k",
         "SELECT COUNT(*) FROM (VALUES (NULL),(NULL)) l(k) JOIN (VALUES (NULL),(NULL)) r(k) ON l.k=r.k",
@@ -6442,4 +6564,132 @@ test "SQL EXPLAIN roadmap estimates use native parameter frames without reading 
     defer mutation.deinit();
     try std.testing.expectError(error.SqlEstimateRequiresReadOnly, execute(a, iface, &mutation, &.{}, .{}));
     try std.testing.expectEqual(@as(usize, 0), backend.writes);
+}
+
+test "SQL ordered scalar groups keep the cut alive and stop after accepted HAVING groups" {
+    const Driver = struct {
+        expected_filter: enum { none, key, empty } = .none,
+        position: usize = 0,
+        pulls: usize = 0,
+        skipped: usize = 0,
+        closed: usize = 0,
+        fn cast(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = .integer }, .{ .name = "score", .path = "score", .type = .integer } } };
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.TestUnexpectedResult;
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.TestUnexpectedResult;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn rows(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            return error.TestUnexpectedResult;
+        }
+        fn close(ptr: *anyopaque) void {
+            cast(ptr).closed += 1;
+        }
+        fn closeGroups(_: *anyopaque) void {}
+        fn open(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            return .{ .ptr = ptr, .next = rows, .close = close, .enable_groups = groups };
+        }
+        fn groups(ptr: *anyopaque, requests: []const catalog.AggregateWeight, order: []const @import("cypher").runtime.NodeCursor.GroupOrder, grouped: *operators.Grouped) !bool {
+            try std.testing.expectEqual(@as(usize, 1), requests.len);
+            try std.testing.expect(requests[0].observer == .distinct);
+            try std.testing.expectEqual(@as(usize, 1), order.len);
+            try std.testing.expect(!order[0].descending and order[0].nulls_first);
+            switch (cast(ptr).expected_filter) {
+                .none => try std.testing.expect(requests[0].observer_filter == null),
+                .key => {
+                    const filter = requests[0].observer_filter.?;
+                    try std.testing.expect(filter == .comparison);
+                    try std.testing.expectEqualStrings("id", filter.comparison.column);
+                    try std.testing.expectEqual(@as(i64, 63), filter.comparison.datum().value.integer);
+                },
+                .empty => {
+                    const filter = requests[0].observer_filter.?;
+                    try std.testing.expect(filter == .any and filter.any.len == 0);
+                },
+            }
+            try grouped.adoptFinalized(.{ .ptr = ptr, .count = 64, .exact_count = false, .ordered = true, .batch_rows = 1, .skip = skip, .next = next, .close = closeGroups }, 100);
+            return true;
+        }
+        fn skip(ptr: *anyopaque, maximum: usize) !usize {
+            const self = cast(ptr);
+            const count = @min(maximum, 64 - self.position);
+            self.position += count;
+            self.skipped += count;
+            return count;
+        }
+        fn next(ptr: *anyopaque, a: std.mem.Allocator, maximum: usize, _: bool) !?operators.GroupBatch {
+            const self = cast(ptr);
+            try std.testing.expectEqual(@as(usize, 0), self.closed);
+            try std.testing.expect(maximum > 0);
+            self.pulls += 1;
+            if (self.position == 64) return null;
+            const id = self.position;
+            self.position += 1;
+            const keys = try a.dupe(Datum, &.{Datum.json(.{ .integer = @intCast(id) })});
+            const values = try a.dupe(Datum, &.{Datum.json(.{ .integer = @intCast(id % 2) })});
+            return .{ .keys = .{ .rows = try a.dupe([]const Datum, &.{keys}) }, .aggregates = .{ .rows = try a.dupe([]const Datum, &.{values}) }, .ordinals = try a.dupe(u64, &.{id}) };
+        }
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint, .open_scan = open } };
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "count(DISTINCT score)+0", "coalesce(count(DISTINCT score),0)", "-(-count(DISTINCT score))" }) |output| {
+        const query = try std.fmt.allocPrint(a, "SELECT id,{s} FROM docs GROUP BY id HAVING count(DISTINCT score)>0 ORDER BY id NULLS FIRST OFFSET 2 LIMIT 3", .{output});
+        defer a.free(query);
+        var compiled = try compiler.compile(a, query, .{});
+        defer compiled.deinit();
+        var driver: Driver = .{};
+        var result = try execute(a, driver.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        for (result.output.rows, [_][]const u8{ "5", "7", "9" }) |row, id| {
+            try std.testing.expectEqualStrings(id, row[0].string);
+            try std.testing.expectEqualStrings("1", row[1].string);
+        }
+        try std.testing.expectEqual(@as(usize, 10), driver.pulls);
+        try std.testing.expectEqual(@as(usize, 0), driver.skipped);
+        try std.testing.expectEqual(@as(usize, 1), driver.closed);
+    }
+    {
+        var compiled = try compiler.compile(a, "SELECT id,count(DISTINCT score) FROM docs GROUP BY id ORDER BY id NULLS FIRST OFFSET 40 LIMIT 3", .{});
+        defer compiled.deinit();
+        var driver: Driver = .{};
+        var result = try execute(a, driver.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 40), driver.skipped);
+        try std.testing.expectEqual(@as(usize, 3), driver.pulls);
+        try std.testing.expectEqualStrings("40", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("42", result.output.rows[2][0].string);
+    }
+    // Bind the parameter through SQL's typed invocation before licensing a cut.
+    {
+        var compiled = try compiler.compile(a, "SELECT id,count(DISTINCT score) FROM docs GROUP BY id HAVING id=$1 AND count(DISTINCT score)>0 ORDER BY id NULLS FIRST LIMIT 1", .{});
+        defer compiled.deinit();
+        var driver: Driver = .{ .expected_filter = .key };
+        var result = try execute(a, driver.backend(), &compiled, &.{.{ .integer = 63 }}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("63", result.output.rows[0][0].string);
+    }
+    for ([_]bool{ false, true }) |empty| {
+        var compiled = try compiler.compile(a, if (empty)
+            "SELECT id,count(DISTINCT score) FROM docs GROUP BY id HAVING false ORDER BY id NULLS FIRST LIMIT 1"
+        else
+            "SELECT id,count(DISTINCT score) FROM docs GROUP BY id HAVING id=63 AND count(DISTINCT score)>0 ORDER BY id NULLS FIRST LIMIT 1", .{});
+        defer compiled.deinit();
+        var driver: Driver = .{ .expected_filter = if (empty) .empty else .key };
+        var result = try execute(a, driver.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, if (empty) 0 else 1), result.output.rows.len);
+        if (!empty) try std.testing.expectEqualStrings("63", result.output.rows[0][0].string);
+        try std.testing.expectEqual(@as(usize, 1), driver.closed);
+    }
 }

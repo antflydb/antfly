@@ -29,6 +29,19 @@ pub const MappedArtifact = struct {
     bytes: []align(std.heap.page_size_min) u8,
     context: ?*anyopaque = null,
     release: ?*const fn (*anyopaque) void = null,
+    /// Optional positional-read optimization. It may only read the pinned
+    /// inode, and returns false when unavailable; the mapping remains authority.
+    /// Checked dispatch preserves I/O failures across compiled storage owners.
+    try_read_into: ?*const fn (*anyopaque, usize, []u8) anyerror!bool = null,
+    read_dispatch: callback_abi.CallbackDispatch = ReadBoundary.local_dispatch,
+    const ReadBoundary = callback_abi.Boundary(struct { try_read_into: *const fn (*anyopaque, usize, []u8) anyerror!bool });
+
+    pub fn readAllAt(self: MappedArtifact, out: []u8, offset: usize) !void {
+        if (offset > self.bytes.len or out.len > self.bytes.len - offset) return error.EndOfStream;
+        if (out.len == 0) return;
+        if (self.try_read_into) |read| if (try ReadBoundary.call("try_read_into", self.read_dispatch, read, .{ self.context.?, offset, out })) return;
+        @memcpy(out, self.bytes[offset..][0..out.len]);
+    }
 
     pub fn deinit(self: *MappedArtifact) void {
         if (@import("builtin").os.tag != .freestanding) std.posix.munmap(self.bytes);
@@ -50,8 +63,48 @@ pub const SourceVisitor = struct {
         return VisitorBoundary.call("consume", self.dispatch, self.callback, .{ self.context, offset, bytes });
     }
 };
+/// Optional provider-owned immutable interpretations. The loader is borrowed
+/// only during acquire; cached values contain no source or request callbacks.
+pub const Decoded = struct {
+    retained_bytes: usize = 0,
+    value: *const anyopaque,
+    owner: *anyopaque,
+    item: *anyopaque,
+    release_fn: *const fn (*anyopaque, *anyopaque) void,
+    pub fn release(self: @This()) void {
+        self.release_fn(self.owner, self.item);
+    }
+};
+pub const DecodeClass = enum { navigation, text_page };
+/// A resident-only probe cannot invoke a loader or start provider I/O.
+/// Its identity is identical to the corresponding required decode request.
+pub const DecodeKey = struct {
+    class: DecodeClass = .navigation,
+    offset: u64,
+    length: u64,
+    interpretation: [32]u8,
+};
+pub const DecodeRequest = struct {
+    /// Payload pages have separate residency from compact navigation.
+    class: DecodeClass = .navigation,
+    offset: u64,
+    length: u64,
+    interpretation: [32]u8,
+    context: *anyopaque,
+    decode: *const fn (*anyopaque, std.mem.Allocator) anyerror!*const anyopaque,
+    dispatch: callback_abi.CallbackDispatch = DecodeBoundary.local_dispatch,
+    const DecodeBoundary = callback_abi.Boundary(struct { decode: *const fn (*anyopaque, std.mem.Allocator) anyerror!*const anyopaque });
+    pub fn key(self: @This()) DecodeKey {
+        return .{ .class = self.class, .offset = self.offset, .length = self.length, .interpretation = self.interpretation };
+    }
+    pub fn invoke(self: @This(), a: std.mem.Allocator) !*const anyopaque {
+        return DecodeBoundary.call("decode", self.dispatch, self.decode, .{ self.context, a });
+    }
+};
 const SourceBoundary = callback_abi.Boundary(struct {
     read_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
+    acquire_decoded: ?*const fn (*anyopaque, DecodeRequest) anyerror!?Decoded,
+    lookup_decoded: ?*const fn (*anyopaque, DecodeKey) anyerror!?Decoded,
     checksum: ?*const fn (*anyopaque, u64, u64) anyerror!u32,
     read_authenticated: ?*const fn (*anyopaque, u64, u64, usize, []u8, ?u32) anyerror!void,
     visit_range: ?*const fn (*anyopaque, u64, u64, SourceVisitor) anyerror!void,
@@ -90,6 +143,10 @@ pub const Source = union(enum) {
         resource_manager: ?*resources.ResourceManager = null,
         read_io: ?std.Io = null,
         check_read_context: ?*const fn (*anyopaque) anyerror!void = null,
+        acquire_decoded: ?*const fn (*anyopaque, DecodeRequest) anyerror!?Decoded = null,
+        /// Optional no-load lookup, with the same live authority checks as a
+        /// required acquisition. A miss never starts decoding or provider I/O.
+        lookup_decoded: ?*const fn (*anyopaque, DecodeKey) anyerror!?Decoded = null,
         /// Opt-in idle expiry for source caches. A successful acquisition
         /// protects all source operations until its matching release.
         acquire_use: ?*const fn (*anyopaque) bool = null,
@@ -97,6 +154,26 @@ pub const Source = union(enum) {
         enable_idle_expiry: ?*const fn (*anyopaque) void = null,
     };
 
+    pub fn lookupDecoded(self: Source, key: DecodeKey) !?Decoded {
+        if (key.offset > self.len() or key.length > self.len() - key.offset) return error.EndOfStream;
+        if (self != .ranges) return null;
+        const lookup = self.ranges.lookup_decoded orelse return null;
+        try self.checkReadContext();
+        const value = (try SourceBoundary.call("lookup_decoded", self.ranges.boundary_dispatch, lookup, .{ self.ranges.ptr, key })) orelse return null;
+        errdefer value.release();
+        try self.checkReadContext();
+        return value;
+    }
+    pub fn acquireDecoded(self: Source, request: DecodeRequest) !?Decoded {
+        if (request.offset > self.len() or request.length > self.len() - request.offset) return error.EndOfStream;
+        if (self != .ranges) return null;
+        const acquire = self.ranges.acquire_decoded orelse return null;
+        try self.checkReadContext();
+        const value = (try SourceBoundary.call("acquire_decoded", self.ranges.boundary_dispatch, acquire, .{ self.ranges.ptr, request })) orelse return null;
+        errdefer value.release();
+        try self.checkReadContext();
+        return value;
+    }
     pub fn checkReadContext(self: Source) !void {
         if (self == .ranges) if (self.ranges.check_read_context) |check|
             try SourceBoundary.call("check_read_context", self.ranges.boundary_dispatch, check, .{self.ranges.ptr});

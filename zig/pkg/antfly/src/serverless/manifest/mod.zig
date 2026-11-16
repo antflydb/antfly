@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const decoded_cache = @import("decoded_cache.zig");
 pub const types = @import("types.zig");
 pub const codec = @import("codec.zig");
 pub const store = @import("store.zig");

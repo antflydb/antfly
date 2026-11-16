@@ -32,6 +32,7 @@ spec.loader.exec_module(generator)
 class GeneratorTests(unittest.TestCase):
     def test_host_toolchain_cannot_change_embedded_compression(self):
         with (
+            patch.object(Path, "cwd", return_value=Path("/other/sdk/query")),
             patch.dict(
                 os.environ, {"GOTOOLCHAIN": "local", "GOWORK": "/other/go.work"}
             ),
@@ -51,3 +52,30 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(kwargs["env"]["GOTOOLCHAIN"], "go" + expected)
         self.assertEqual(kwargs["env"]["GOWORK"], "off")
         self.assertTrue(kwargs["check"])
+
+    def test_public_sdk_generation_always_applies_checked_transport_hooks(self):
+        sdk_root = Path(generator.__file__).resolve().parents[1] / "go/pkg/sdk"
+        with (
+            patch.object(Path, "cwd", return_value=sdk_root),
+            patch.object(
+                sys, "argv", ["generate_go_sdk.py", "--config=cfg.yaml", "schema.yaml"]
+            ),
+            patch.object(generator.subprocess, "run") as run,
+        ):
+            generator.main()
+        self.assertEqual(len(run.call_args_list), 2)
+        first, hooks = run.call_args_list
+        self.assertEqual(hooks.args[0], ["go", "run", "./internal/gensqlpolicy"])
+        self.assertEqual(first.kwargs["env"], hooks.kwargs["env"])
+        self.assertTrue(hooks.kwargs["check"])
+
+    def test_transport_hook_failure_fails_generation(self):
+        sdk_root = Path(generator.__file__).resolve().parents[1] / "go/pkg/sdk"
+        failure = generator.subprocess.CalledProcessError(1, "gensqlpolicy")
+        with (
+            patch.object(Path, "cwd", return_value=sdk_root),
+            patch.object(sys, "argv", ["generate_go_sdk.py"]),
+            patch.object(generator.subprocess, "run", side_effect=[None, failure]),
+        ):
+            with self.assertRaises(generator.subprocess.CalledProcessError):
+                generator.main()

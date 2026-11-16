@@ -155,19 +155,20 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
         progress.result.scanned_rows = try std.math.add(u64, progress.result.scanned_rows, scanned);
         if (live.items.len != 0) {
             if (progress.outputs.len == 65536) return error.LakeWriteTooLarge;
-            const output = try catalog.compaction.writeOutput(scratch, progress.parent, destination, job.operation_id, progress.outputs.len, live.items);
-            const appended = try scratch.alloc(catalog.compaction.Output, progress.outputs.len + 1);
+            const output = try catalog.compaction.writeOutputs(scratch, progress.parent, destination, job.operation_id, progress.outputs.len, live.items);
+            const appended = try scratch.alloc(catalog.compaction.Output, try std.math.add(usize, progress.outputs.len, output.len));
             @memcpy(appended[0..progress.outputs.len], progress.outputs);
-            appended[progress.outputs.len] = output;
+            if (appended.len > 65536) return error.LakeWriteTooLarge;
+            @memcpy(appended[progress.outputs.len..], output);
             progress.outputs = appended;
-            progress.result.output_rows += output.rows;
+            progress.result.output_rows += live.items.len;
             progress.result.output_files = progress.outputs.len;
         }
         if (progress.file == progress.selection.files.len) {
             const prepared = try catalog.compaction.prepareOutputs(scratch, progress.parent, destination, progress.selection, progress.outputs, progress.timestamp_ms);
             progress.attempt = .{ .id = try std.fmt.allocPrint(scratch, "compact-{s}", .{catalog.types.digestHex(job.operation_id)}), .expected = progress.parent.metadata_location, .body = prepared.body, .timestamp_ms = progress.timestamp_ms, .result = progress.result };
         }
-        var advanced = client.putObject(queue.bucket, key, try encodeProgress(scratch, progress), .{ .if_match_etag = saved.?.metadata.etag orelse return error.MissingObjectEtag, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
+        var advanced = client.compareAndPut(queue.bucket, key, try encodeProgress(scratch, progress), saved.?.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
             error.PreconditionFailed, error.ConditionalCheckFailed => return error.LakeMaintenanceAlreadyStarted,
             else => return err,
         };
@@ -188,7 +189,7 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
     }
 
     progress.result.complete = true;
-    var finished = try client.putObject(queue.bucket, key, try encodeProgress(scratch, progress), .{ .if_match_etag = saved.?.metadata.etag orelse return error.MissingObjectEtag, .cancellation = catalog.types.contextCancellation(&context) });
+    var finished = try client.compareAndPut(queue.bucket, key, try encodeProgress(scratch, progress), saved.?.metadata.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = catalog.types.contextCancellation(&context) });
     finished.deinit(client.allocator);
     return progress.result;
 }

@@ -46,10 +46,15 @@ pub const CompactionResult = struct {
 };
 
 pub const Compactor = struct {
+    probe_only: bool = false,
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
     manifests: *manifest_mod.ManifestStore,
     progress: *catalog_mod.ProgressStore,
+    /// Optional hosted preflight admission. Native callers keep their existing
+    /// behavior; these bounds do not replace allocator and transport limits.
+    max_documents: ?u64 = null,
+    max_artifact_bytes: ?u64 = null,
 
     pub fn init(
         alloc: Allocator,
@@ -83,17 +88,69 @@ pub const Compactor = struct {
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
     ) !CompactionResult {
-        var fallback: ?std.Io.Threaded = if (cancellation == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
-        defer if (fallback) |*value| value.deinit();
-        const io = if (cancellation) |token| token.io else fallback.?.io();
+        if (cancellation) |token| return self.compactHeadWithIo(namespace, publication_guard, token);
+        if (comptime @import("builtin").os.tag == .freestanding) {
+            return error.MaintenanceIoRequired;
+        } else {
+            var fallback = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer fallback.deinit();
+            return self.compactHeadWithIo(namespace, publication_guard, .{ .io = fallback.io() });
+        }
+    }
+
+    fn pagedNoop(self: *Compactor, namespace: []const u8, current: manifest_mod.Manifest, cancellation: ?maintenance_cancellation.Token) !?CompactionResult {
+        if (builder_mod.hasPagedText(current) and builder_mod.findArtifactIndex(current, .document_facts) != null and
+            builder_mod.allArtifactsPagedOrAbsent(current, .text_segment) and builder_mod.allArtifactsPagedOrAbsent(current, .vector_segment) and builder_mod.allArtifactsPagedOrAbsent(current, .sparse_segment) and builder_mod.findArtifactIndex(current, .graph_segment) == null)
+        {
+            // These serving trees are already maintained by bounded COW
+            // updates. There is no flat corpus snapshot to reconstruct.
+            var bridge = maintenance_cancellation.GraphBridge{ .maintenance = cancellation };
+            var reads: u64 = 4 * 1024 * 1024;
+            var writes: u64 = 0;
+            var pages = @import("../graph_segment/page_store.zig").PageStore{ .domain = @import("../graph_segment/page_store.zig").PageStore.namespaceDomain(namespace), .artifacts = self.artifacts, .cancellation = bridge.token(), .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+            for (current.artifacts) |ref| if (ref.kind == .text_segment) {
+                const root = try @import("../text_segment/paged.zig").loadRoot(self.alloc, &pages, ref);
+                defer root.deinit();
+                if ((if (root.value.docs) |page| page.records else 0) != current.stats.document_count) return error.DocumentFactsSourceChanged;
+            };
+            for (current.artifacts) |ref| if (ref.kind == .vector_segment or ref.kind == .sparse_segment) {
+                const root = try @import("../paged_projection.zig").load(self.alloc, &pages, ref);
+                defer root.deinit();
+            };
+            return .{ .namespace = try self.alloc.dupe(u8, namespace), .published = false, .version = current.version, .artifact_count = current.artifacts.len };
+        }
+        return null;
+    }
+
+    fn compactHeadWithIo(
+        self: *Compactor,
+        namespace: []const u8,
+        publication_guard: ?work_lease.PublicationGuard,
+        cancellation: maintenance_cancellation.Token,
+    ) !CompactionResult {
+        const io = cancellation.io;
         if (publication_guard == null) {
+            // COW serving roots have no flat snapshot to compact. Protect and
+            // validate the immutable source before acquiring a writer lease.
+            var source = try builder_mod.GraphSourceProtection.init(self.progress, namespace, cancellation);
+            if (source.version != 0) {
+                var current = try self.manifests.getAlloc(namespace, source.version);
+                defer current.deinit(self.alloc);
+                if (try self.pagedNoop(namespace, current, source.token(io))) |result| {
+                    var owned = result;
+                    errdefer owned.deinit(self.alloc);
+                    try maintenance_cancellation.check(source.token(io));
+                    return owned;
+                }
+            }
+            if (self.probe_only) return error.CompactionNeedsPublicationLease;
             var owner_bytes: [16]u8 = undefined;
             io.random(&owner_bytes);
             const owner = std.fmt.bytesToHex(&owner_bytes, .lower);
             var held = (try work_lease.acquireHeld(try self.progress.workLeaseProvider(), io, namespace, &owner, 30 * std.time.ns_per_s)) orelse
                 return error.WorkLeaseLost;
             defer _ = held.release() catch false;
-            return self.compactHeadGuardedUntil(namespace, held.guard(), held.cancellation(cancellation orelse .{ .io = io }));
+            return self.compactHeadGuardedUntil(namespace, held.guard(), held.cancellation(cancellation));
         }
         var protection = try builder_mod.GraphSourceProtection.init(self.progress, namespace, cancellation);
         var scoped_artifacts = self.artifacts.*;
@@ -116,6 +173,13 @@ pub const Compactor = struct {
         const current_head = try self.progress.getHead(namespace);
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
+        if (try self.pagedNoop(namespace, current, cancellation)) |result| return result;
+        if (self.max_documents) |maximum| if (current.stats.document_count > maximum) return error.CompactionBudgetExceeded;
+        if (self.max_artifact_bytes) |maximum| {
+            var bytes: u64 = 0;
+            for (current.artifacts) |artifact| bytes = std.math.add(u64, bytes, artifact.byte_len) catch return error.CompactionBudgetExceeded;
+            if (bytes > maximum) return error.CompactionBudgetExceeded;
+        }
         const facts_index = builder_mod.findArtifactIndex(current, .document_facts);
         const mutation_index = if (facts_index != null) null else builder_mod.findArtifactIndex(current, .mutation_segment);
         const before_docs = if (facts_index) |idx|
@@ -221,7 +285,7 @@ pub const Compactor = struct {
             latest_docs,
             overlay_mutations,
             graph_index_names,
-            true,
+            builder_mod.findArtifactIndex(current, .graph_segment) != null,
             try builder_mod.graphPublicationAttempt(publication_guard, namespace, cancellation.?.io),
             cancellation,
         );
@@ -741,6 +805,14 @@ test "serverless compactor rewrites head into compacted searchable artifacts" {
     defer before.deinit(alloc);
 
     var compactor = Compactor.init(alloc, &artifact_store, &manifest_store, &progress_store);
+    compactor.max_documents = 1;
+    try std.testing.expectError(error.CompactionBudgetExceeded, compactor.compactHead("docs"));
+    try std.testing.expectEqual(build.version, try progress_store.getHead("docs"));
+    compactor.max_documents = null;
+    compactor.max_artifact_bytes = 1;
+    try std.testing.expectError(error.CompactionBudgetExceeded, compactor.compactHead("docs"));
+    try std.testing.expectEqual(build.version, try progress_store.getHead("docs"));
+    compactor.max_artifact_bytes = null;
     var result = try compactor.compactHead("docs");
     defer result.deinit(alloc);
     try std.testing.expect(result.published);

@@ -44,10 +44,14 @@ pub const Config = struct {
     /// samples (32 ms) scored by Silero instead of the energy rule. The
     /// weights outlive every config that points at them.
     silero: ?*const silero_vad.Weights = null,
+    /// Borrowed by a Config; owning requests retain it through processing and
+    /// streaming Session.init takes its own reference until Session.deinit.
+    silero_owner: ?*silero_vad.SharedWeights = null,
     /// Speech probability at or above which a Silero frame counts as speech.
     silero_threshold: f32 = 0.5,
 
     pub fn validate(self: Config) !void {
+        if (self.silero_owner) |owner| if (self.silero != &owner.weights) return error.InvalidVadConfig;
         if (self.frame_ms == 0) return error.InvalidVadConfig;
         if (!(self.threshold >= 0) or !(self.threshold <= 1)) return error.InvalidVadConfig;
         if (!(self.silero_threshold >= 0) or !(self.silero_threshold <= 1)) return error.InvalidVadConfig;

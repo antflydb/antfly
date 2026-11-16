@@ -1,0 +1,207 @@
+---
+title: "Search Antfly from Inside PostgreSQL"
+description: "A PostgreSQL table whose text column is searchable by keyword, meaning, or both through an Antfly-backed index, queried from ordinary SQL"
+order: 13
+---
+
+<Questions>
+- Can I run Antfly search from a PostgreSQL query?
+- How do I install the antfly_postgres extension?
+- How do I create an Antfly index on a PostgreSQL column?
+- How do I run semantic or hybrid search from SQL in PostgreSQL?
+- How do I keep a PostgreSQL table synced to Antfly with a trigger?
+</Questions>
+
+## The Result
+
+A text column in PostgreSQL gets an index whose data lives in Antfly. The `@@@` operator sends the search to Antfly and PostgreSQL returns the matching rows. The same operator takes semantic and hybrid queries once the Antfly table has an embeddings index:
+
+```sql
+CREATE INDEX docs_content ON docs USING antfly (content)
+  WITH (url = 'http://127.0.0.1:8080/db/v1/', collection = 'docs');
+
+SET enable_seqscan = off;
+SELECT id, content FROM docs WHERE content @@@ 'fix computer';
+```
+
+```
+ id |           content
+----+------------------------------
+  1 | how to fix a broken computer
+(1 row)
+```
+
+The `antfly_postgres` extension lives in the Antfly repository at [`rs/crates/postgres`](https://github.com/antflydb/antfly/tree/main/rs/crates/postgres) and is Apache-2.0.
+
+## Before You Start
+
+PostgreSQL 13 through 18 with its `pg_config` on your path and a superuser role, Rust, and Antfly running in standalone mode on the same host with authentication off:
+
+```bash
+pg_config --version
+curl -s http://127.0.0.1:8080/db/v1/tables
+```
+
+The extension sends its HTTP requests without credentials, which is why Antfly runs without auth here. Standalone binds to loopback by default, so only processes on the PostgreSQL host can reach it.
+
+## Build It
+
+### 1. Build and Install the Extension
+
+The extension is built from source with [pgrx](https://github.com/pgcentralfoundation/pgrx) 0.17.0:
+
+```bash
+cargo install cargo-pgrx --version 0.17.0 --locked
+cargo pgrx init --pg18 "$(which pg_config)"
+
+git clone https://github.com/antflydb/antfly.git
+cd antfly/rs/crates/postgres
+cargo pgrx install
+```
+
+The crate's `pg13` through `pg18` features select the PostgreSQL version; `pg18` is the default. On macOS, export `RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup"` first, because the extension links against symbols that live in the PostgreSQL server binary. The crate's `Makefile` sets this for `make build`.
+
+Then, as a superuser:
+
+```sql
+CREATE EXTENSION antfly_postgres;
+SELECT antfly_status('http://127.0.0.1:8080/db/v1/');
+```
+
+`antfly_status` checks that the URL parses. It does not contact the server; the first `CREATE INDEX` does.
+
+### 2. Create an Antfly Index
+
+```sql
+CREATE TABLE docs (id bigint PRIMARY KEY, content text);
+INSERT INTO docs VALUES
+  (1, 'how to fix a broken computer'),
+  (2, 'best recipes for chocolate cake'),
+  (3, 'introduction to machine learning');
+
+CREATE INDEX docs_content ON docs USING antfly (content)
+  WITH (url = 'http://127.0.0.1:8080/db/v1/', collection = 'docs');
+```
+
+`CREATE INDEX` creates the Antfly table named by `collection` (the PostgreSQL table name when omitted) if it does not exist, then pushes every row. Each row becomes a document with two fields: `id`, the row's physical location (`ctid`) encoded as `block_offset`, and `content`, the column's text, whatever the column is called. Rows where the column is NULL are skipped.
+
+Always set `url`, and include the `/db/v1/` prefix. The default, `http://localhost:8080`, does not reach the API.
+
+After that, each `INSERT` and each `UPDATE` of the column pushes the new row version to Antfly before the statement returns.
+
+### 3. Search with `@@@`
+
+A plain string on the right of `@@@` is a full-text query string:
+
+```sql
+SET enable_seqscan = off;
+EXPLAIN SELECT id FROM docs WHERE content @@@ 'fix computer';
+--  Index Scan using docs_content on docs ...
+SELECT id, content FROM docs WHERE content @@@ 'fix computer';
+```
+
+`@@@` filters only through the index. Evaluated outside an index scan, it is true for every row, so a sequential scan returns the whole table. The planner prefers a sequential scan on small tables; check the plan with `EXPLAIN` and turn off `enable_seqscan` for the session or transaction when it does.
+
+The query builders in the `antfly_postgres` schema return structured Antfly queries for `@@@`:
+
+```sql
+-- Full-text
+SELECT id FROM docs WHERE content @@@ antfly_postgres.search('fix computer');
+
+-- Semantic, against embeddings indexes on the Antfly table
+SELECT id FROM docs WHERE content @@@ antfly_postgres.semantic('fix my broken computer', indexes => ARRAY['content_embeddings']);
+
+-- Hybrid: both, fused by Antfly
+SELECT id FROM docs WHERE content @@@ antfly_postgres.hybrid(
+  full_text => 'computer repair', semantic => 'fix my broken computer', indexes => ARRAY['content_embeddings']);
+```
+
+`search` also takes `filter_prefix` and `filter_query`, and `semantic` and `hybrid` take `filter_prefix`. They apply to the Antfly documents, which for an index-built table have only the `id` (row location) and `content` fields.
+
+### 4. Add an Embeddings Index for Semantic Search
+
+The table that `CREATE INDEX` creates has no embeddings index. Add one in Antfly over the `content` field, with a model pulled as in [Search Wikipedia with local AI](/docs/guides/wikipedia-search):
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/docs/indexes/content_embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "embeddings",
+    "field": "content",
+    "embedder": {
+      "provider": "antfly",
+      "model": "google/embeddinggemma-2:bf16-safetensors-bundle-v1"
+    }
+  }'
+```
+
+Antfly embeds the existing documents in the background. Once it finishes, `semantic` and `hybrid` queries naming `content_embeddings` return results.
+
+### 5. Get Scores with `antfly_search`
+
+`@@@` returns rows but not scores. `antfly_search` runs a full-text query and returns Antfly's hits as a set-returning function:
+
+```sql
+antfly_search(base_url TEXT, collection TEXT, query TEXT, limit INT DEFAULT NULL)
+  RETURNS TABLE (id TEXT, score FLOAT8, data JSONB)
+```
+
+`limit` defaults to 10. `id` is the Antfly document ID, `score` the relevance, and `data` the stored document. Join it back to a table whose Antfly IDs match a column, which is what the trigger in the next step produces:
+
+```sql
+SELECT t.*, s.score
+FROM tickets t
+JOIN antfly_search('http://127.0.0.1:8080/db/v1/', 'tickets', 'login fails after reset', 50) s
+  ON s.id = t.id::text
+ORDER BY s.score DESC;
+```
+
+### 6. Sync a Table with a Trigger
+
+`antfly_sync_trigger` keeps an Antfly table in step with a PostgreSQL table using your primary key as the document ID, and copies the whole row instead of one column. Create the Antfly table first, since the trigger does not:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/tickets -H "Content-Type: application/json" -d '{"num_shards": 1}'
+```
+
+```sql
+CREATE TRIGGER sync_to_antfly
+  AFTER INSERT OR UPDATE OR DELETE ON tickets
+  FOR EACH ROW
+  EXECUTE FUNCTION antfly_sync_trigger(
+    'http://127.0.0.1:8080/db/v1/',  -- Antfly base URL
+    'tickets',                        -- Antfly table
+    'id'                              -- ID column, text or bigint (default 'id')
+  );
+```
+
+Inserts and updates write the row as a document; deletes remove it. Columns of type text, bigint, integer, double precision, boolean, and jsonb are copied; other types are left out of the document.
+
+## Tradeoffs
+
+The decision is where the cost of keeping Antfly in step lands, and what you accept when a push fails.
+
+Both the index and the trigger push synchronously, one HTTP request per row, inside the writing transaction. A bulk load runs at the speed of those round trips, and `CREATE INDEX` on a large table takes as long as one request per row. If a push fails, PostgreSQL logs a `WARNING` and the write commits anyway, so Antfly can miss rows. The push also happens before commit, so a transaction that later rolls back can leave its rows in Antfly.
+
+The index never deletes from Antfly. `DELETE` and the old version of an updated row leave their documents behind, and `VACUUM` does not reconcile them. PostgreSQL drops those hits because their row versions are no longer visible, but the Antfly table grows with every update. To reclaim it, delete the Antfly table and `REINDEX` the PostgreSQL index, which recreates and repopulates it. The trigger deletes on `DELETE` and overwrites on `UPDATE`, so its table does not accumulate dead versions.
+
+Each `@@@` scan fetches up to 10,000 hits from Antfly. The index has no ordering operator, so PostgreSQL cannot `ORDER BY` relevance through it; use `antfly_search` and order by `score` when ranking matters. The index covers one text column.
+
+When PostgreSQL is the system of record and you want indexing, enrichment, and search to happen without per-row work in your write path, [CDC replication](/docs/guides/cdc-replication) streams changes from the WAL instead, with no extension to install.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Install the antfly_postgres extension on my local PostgreSQL 18 and add hybrid search over the content column of my docs table", and use this page to judge the result.
+
+## Next Steps
+
+- [Stream PostgreSQL into Antfly](/docs/guides/cdc-replication): keep Antfly in step from the WAL instead of from triggers
+- [Tune Hybrid Search](/docs/guides/hybrid-search): what `hybrid` fuses and how to weight it
+- [Query PostgreSQL in Place with Foreign Sources](/docs/guides/foreign-sources): the reverse direction, with live PostgreSQL rows joined into Antfly queries

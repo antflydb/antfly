@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  audioReaderChoices,
   findIndexedResult,
   getMediaChunks,
   modelsAcceptingInput,
@@ -50,6 +51,41 @@ describe("inference playground contracts", () => {
     expect(modelsAcceptingInput(models, "audio").map((model) => model.name)).toEqual([
       "legacy",
       "audio",
+    ]);
+  });
+});
+
+describe("audio reader discovery", () => {
+  it("offers Gemma-only deployments without including text-only or unknown generators", () => {
+    expect(
+      audioReaderChoices(
+        [],
+        [],
+        [
+          { name: "gemma", inputs: ["text", "audio"] },
+          { name: "text", inputs: ["text"] },
+          { name: "legacy-generator" },
+        ]
+      )
+    ).toEqual([{ name: "gemma", forcedLanguage: false }]);
+  });
+  it("preserves legacy ASR and explicit capabilities across reader namespaces", () => {
+    expect(
+      audioReaderChoices(
+        [{ name: "whisper" }, { name: "text-asr", inputs: ["text"] }],
+        [
+          { name: "audio-plan", inputs: ["audio"], audio_read: { forced_language: false } },
+          { name: "legacy-ocr" },
+        ],
+        [
+          { name: "whisper", inputs: ["audio"] },
+          { name: "future", inputs: ["audio"], audio_read: { forced_language: true } },
+        ]
+      )
+    ).toEqual([
+      { name: "whisper", forcedLanguage: true },
+      { name: "audio-plan", forcedLanguage: false },
+      { name: "future", forcedLanguage: true },
     ]);
   });
 });

@@ -14,6 +14,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const operation_metrics = @import("operation_metrics.zig");
+
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 /// Charge the entire request round trip (rounded upward), conservatively
@@ -35,6 +37,13 @@ pub const Client = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Provider state supports overlapping requests when its construction
+        /// allocator and each result allocator are also concurrency-safe.
+        /// Custom transports and in-memory implementations opt in explicitly.
+        supports_concurrent_requests: bool = false,
+        supports_guarded_put: bool = false,
+        put_at_revision: ?*const fn (*anyopaque, Allocator, []const u8, []const u8, []const u8, types.ObjectRevision, types.PutOptions) anyerror!types.PutResult = null,
+        delete_at_revision: ?*const fn (*anyopaque, []const u8, []const u8, types.ObjectRevision, types.DeleteOptions) anyerror!void = null,
         supports_object_versions: ?*const fn (*anyopaque, Allocator, []const u8, ?types.CancellationToken) anyerror!bool = null,
         /// Optional provider-enforced protection of current object names against
         /// deletion AND replacement. Version retention alone is insufficient.
@@ -47,10 +56,16 @@ pub const Client = struct {
         bucket_exists: *const fn (*anyopaque, []const u8, types.BucketOptions) anyerror!bool,
         make_bucket: *const fn (*anyopaque, []const u8, types.BucketOptions) anyerror!void,
         put_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult,
+        put_objects: ?*const fn (*anyopaque, Allocator, []const u8, []const types.PutObjectRequest) anyerror![]types.PutResult = null,
         put_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8, types.PutOptions) anyerror!types.PutResult = null,
         get_file: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!void = null,
         get_file_with_options: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8, types.GetOptions) anyerror!void = null,
         get_prefix: ?*const fn (*anyopaque, Allocator, std.Io, []const u8, []const u8, []const u8) anyerror!usize = null,
+        /// Preferred speculative read window, bounded by the caller's own cap.
+        /// Match the transport's useful parallelism rather than issuing extra
+        /// waves of misses on short tails. Exact requested batches are unchanged.
+        preferred_read_window: u8 = 8,
+        get_objects: ?*const fn (*anyopaque, Allocator, []const u8, []const types.GetObjectRequest) anyerror![]?types.GetResult = null,
         get_object: *const fn (*anyopaque, Allocator, []const u8, []const u8, types.GetOptions) anyerror!types.GetResult,
         get_object_attributes: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!types.ObjectAttributes,
         stat_object: *const fn (*anyopaque, Allocator, []const u8, []const u8) anyerror!types.ObjectMetadata,
@@ -63,22 +78,34 @@ pub const Client = struct {
     /// Availability of version operations, independently of bucket versioning
     /// state. Permission/transport errors never authorize name-only deletion.
     pub fn supportsObjectVersions(self: Client, bucket: []const u8, token: ?types.CancellationToken) !bool {
+        const operation = operation_metrics.runtime.start(.version_support);
+        defer operation.finish();
+        errdefer operation.failed();
         if (token) |value| try value.check();
         const supported = if (self.vtable.supports_object_versions) |call| try call(self.ptr, self.allocator, bucket, token) else self.vtable.list_object_versions != null;
         if (token) |value| try value.check();
         return supported;
     }
     pub fn immutablePrefixUntil(self: *Client, bucket: []const u8, prefix: []const u8, token: ?types.CancellationToken) !?u64 {
+        const operation = operation_metrics.runtime.start(.retention);
+        defer operation.finish();
+        errdefer operation.failed();
         if (token) |value| try value.check();
         const call = self.vtable.immutable_prefix_until orelse return null;
         return call(self.ptr, bucket, prefix, token);
     }
     pub fn validateImmutableUntil(self: *Client, bucket: []const u8, until_ms: u64, token: ?types.CancellationToken) !bool {
+        const operation = operation_metrics.runtime.start(.retention);
+        defer operation.finish();
+        errdefer operation.failed();
         if (token) |value| try value.check();
         const call = self.vtable.validate_immutable_until orelse return false;
         return call(self.ptr, bucket, until_ms, token);
     }
     pub fn versionRetention(self: *Client, bucket: []const u8, key: []const u8, version: []const u8, token: ?types.CancellationToken) !?types.VersionRetention {
+        const operation = operation_metrics.runtime.start(.retention);
+        defer operation.finish();
+        errdefer operation.failed();
         if (token) |value| try value.check();
         // S3's null version can be replaced when versioning is suspended.
         if (version.len == 0 or version.len > 4096 or std.mem.eql(u8, version, "null")) return null;
@@ -92,6 +119,9 @@ pub const Client = struct {
         return result;
     }
     pub fn providerTime(self: *Client, bucket: []const u8, token: ?types.CancellationToken) !?u64 {
+        const operation = operation_metrics.runtime.start(.provider_time);
+        defer operation.finish();
+        errdefer operation.failed();
         if (token) |value| try value.check();
         const call = self.vtable.provider_time orelse return null;
         const started = @import("antfly_platform").time.monotonicNs();
@@ -109,6 +139,9 @@ pub const Client = struct {
     }
 
     pub fn bucketExistsWithOptions(self: *Client, bucket: []const u8, opts: types.BucketOptions) !bool {
+        const operation = operation_metrics.runtime.start(.bucket_probe);
+        defer operation.finish();
+        errdefer operation.failed();
         if (opts.cancellation) |token| try token.check();
         return try self.vtable.bucket_exists(self.ptr, bucket, opts);
     }
@@ -118,22 +151,100 @@ pub const Client = struct {
     }
 
     pub fn makeBucketWithOptions(self: *Client, bucket: []const u8, opts: types.BucketOptions) !void {
+        const operation = operation_metrics.runtime.start(.bucket_create);
+        defer operation.finish();
+        errdefer operation.failed();
         if (opts.cancellation) |token| try token.check();
         try self.vtable.make_bucket(self.ptr, bucket, opts);
     }
 
-    pub fn putObject(self: *Client, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
+    /// Null means create-only. A non-null revision must come from the same
+    /// object's captured payload/metadata. No read/check/unconditional fallback.
+    pub fn compareAndPut(self: *Client, bucket: []const u8, key: []const u8, body: []const u8, revision: ?types.ObjectRevision, opts: types.PutOptions) !types.PutResult {
+        const operation = operation_metrics.runtime.start(.conditional_put);
+        defer operation.finish();
+        errdefer operation.failed();
+        if (opts.if_match_etag != null or opts.if_none_match) return error.InvalidArgument;
         if (opts.cancellation) |token| try token.check();
+        if (opts.guard != null and !self.vtable.supports_guarded_put) return error.ObjectOperationUnsupported;
+        operation.input(body.len);
+        var conditional = opts;
+        if (revision) |value| switch (value) {
+            .etag => |etag| {
+                if (etag.len == 0) return error.InvalidArgument;
+                conditional.if_match_etag = etag;
+            },
+            .generation => {
+                const call = self.vtable.put_at_revision orelse return error.ObjectOperationUnsupported;
+                return call(self.ptr, self.allocator, bucket, key, body, value, opts);
+            },
+        } else conditional.if_none_match = true;
+        return self.putObject(bucket, key, body, conditional);
+    }
+
+    pub fn compareAndDelete(self: *Client, bucket: []const u8, key: []const u8, revision: types.ObjectRevision, opts: types.DeleteOptions) !void {
+        const operation = operation_metrics.runtime.start(.conditional_delete);
+        defer operation.finish();
+        errdefer operation.failed();
+        if (opts.if_match_etag != null or opts.version_id != null) return error.InvalidArgument;
+        if (opts.cancellation) |token| try token.check();
+        switch (revision) {
+            .etag => |etag| {
+                if (etag.len == 0) return error.InvalidArgument;
+                var conditional = opts;
+                conditional.if_match_etag = etag;
+                return self.deleteObject(bucket, key, conditional);
+            },
+            .generation => {
+                const call = self.vtable.delete_at_revision orelse return error.ObjectOperationUnsupported;
+                return call(self.ptr, bucket, key, revision, opts);
+            },
+        }
+    }
+
+    pub fn putObject(self: *Client, bucket: []const u8, key: []const u8, body: []const u8, opts: types.PutOptions) !types.PutResult {
+        const operation = operation_metrics.runtime.start(.put);
+        defer operation.finish();
+        errdefer operation.failed();
+        if (opts.cancellation) |token| try token.check();
+        if (opts.guard != null and !self.vtable.supports_guarded_put) return error.ObjectOperationUnsupported;
+        operation.input(body.len);
         return try self.vtable.put_object(self.ptr, self.allocator, bucket, key, body, opts);
     }
 
+    /// No atomicity or ordering guarantee. Callers publish references only after
+    /// every upload succeeds and must tolerate immutable orphan objects.
+    pub fn putObjects(self: *Client, bucket: []const u8, items: []const types.PutObjectRequest) ![]types.PutResult {
+        const operation = operation_metrics.runtime.start(.put_batch);
+        defer operation.finish();
+        errdefer operation.failed();
+        if (items.len == 0 or items.len > 8) return error.InvalidObjectBatch;
+        for (items) |item| if (item.options.guard != null) return error.ObjectOperationUnsupported;
+        for (items) |item| if (item.options.cancellation) |token| try token.check();
+        for (items) |item| operation.input(item.body.len);
+        if (self.vtable.put_objects) |call| return call(self.ptr, self.allocator, bucket, items);
+        const results = try self.allocator.alloc(types.PutResult, items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |*result| result.deinit(self.allocator);
+            self.allocator.free(results);
+        }
+        for (items, results) |item, *result| {
+            result.* = try self.putObject(bucket, item.key, item.body, item.options);
+            initialized += 1;
+        }
+        return results;
+    }
+
     pub fn putFile(self: *Client, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
+        if (opts.guard != null) return error.ObjectOperationUnsupported;
         var io_impl = threadedIo();
         defer io_impl.deinit();
         return try self.putFileWithIo(io_impl.io(), bucket, key, src_path, opts);
     }
 
     pub fn putFileWithIo(self: *Client, io: std.Io, bucket: []const u8, key: []const u8, src_path: []const u8, opts: types.PutOptions) !types.PutResult {
+        if (opts.guard != null) return error.ObjectOperationUnsupported;
         if (opts.cancellation) |token| try token.check();
         if (self.vtable.put_file) |put_file| {
             return try put_file(self.ptr, self.allocator, io, bucket, key, src_path, opts);
@@ -152,6 +263,9 @@ pub const Client = struct {
     }
 
     pub fn getObject(self: *Client, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
+        const operation = operation_metrics.runtime.start(.get);
+        defer operation.finish();
+        errdefer operation.failed();
         // Providers may pin GET to an ETag obtained by their metadata probe.
         // Mutable catalog/WAL heads can change between those requests. A fresh
         // probe is safe only when the caller did not bind an object version;
@@ -161,13 +275,54 @@ pub const Client = struct {
             if (opts.cancellation) |token| try token.check();
             var result = self.vtable.get_object(self.ptr, self.allocator, bucket, key, opts) catch |err| {
                 attempts += 1;
-                if (err == error.PreconditionFailed and opts.version_id == null and opts.if_match_etag == null and attempts < 4) continue;
+                if (err == error.PreconditionFailed and opts.version_id == null and opts.if_match_etag == null and attempts < 4) {
+                    _ = operation_metrics.runtime.retries.fetchAdd(1, .monotonic);
+                    continue;
+                }
                 return err;
             };
+            operation.output(result.body.len);
             errdefer result.deinit(self.allocator);
             if (opts.cancellation) |token| try token.check();
             return result;
         }
+    }
+
+    /// No cross-object atomicity. Every started read settles before an error;
+    /// callers own all returned bodies and metadata. Providers without a batch
+    /// capability preserve the normal getObject retry/cancellation semantics.
+    pub fn getObjects(self: *Client, bucket: []const u8, items: []const types.GetObjectRequest) ![]?types.GetResult {
+        const operation = operation_metrics.runtime.start(.get_batch);
+        defer operation.finish();
+        errdefer operation.failed();
+        if (items.len == 0 or items.len > 8) return error.InvalidObjectBatch;
+        for (items) |item| if (item.options.cancellation) |token| try token.check();
+        if (self.vtable.get_objects) |call| {
+            const results = try call(self.ptr, self.allocator, bucket, items);
+            errdefer {
+                for (results) |*result| if (result.*) |*value| value.deinit(self.allocator);
+                self.allocator.free(results);
+            }
+            if (results.len != items.len) return error.InvalidObjectBatch;
+            for (results) |result| if (result) |value| operation.output(value.body.len);
+            for (items) |item| if (item.options.cancellation) |token| try token.check();
+            return results;
+        }
+        const results = try self.allocator.alloc(?types.GetResult, items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |*result| if (result.*) |*value| value.deinit(self.allocator);
+            self.allocator.free(results);
+        }
+        for (items, results) |item, *result| {
+            result.* = self.getObject(bucket, item.key, item.options) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            if (result.*) |value| operation.output(value.body.len);
+            initialized += 1;
+        }
+        return results;
     }
 
     pub fn getFile(self: *Client, bucket: []const u8, key: []const u8, dest_path: []const u8, opts: types.GetOptions) !void {
@@ -239,6 +394,9 @@ pub const Client = struct {
     }
 
     pub fn getObjectAttributes(self: *Client, bucket: []const u8, key: []const u8) !types.ObjectAttributes {
+        const operation = operation_metrics.runtime.start(.attributes);
+        defer operation.finish();
+        errdefer operation.failed();
         return try self.vtable.get_object_attributes(self.ptr, self.allocator, bucket, key);
     }
 
@@ -254,6 +412,9 @@ pub const Client = struct {
     }
 
     pub fn statObjectWithOptions(self: *Client, bucket: []const u8, key: []const u8, opts: types.StatOptions) !types.ObjectMetadata {
+        const operation = operation_metrics.runtime.start(.stat);
+        defer operation.finish();
+        errdefer operation.failed();
         if (opts.cancellation) |token| try token.check();
         var metadata = if (self.vtable.stat_object_with_options) |stat_with_options|
             try stat_with_options(self.ptr, self.allocator, bucket, key, opts)
@@ -268,12 +429,18 @@ pub const Client = struct {
     }
 
     pub fn deleteObject(self: *Client, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
+        const operation = operation_metrics.runtime.start(.delete);
+        defer operation.finish();
+        errdefer operation.failed();
         if (opts.cancellation) |token| try token.check();
         try self.vtable.delete_object(self.ptr, bucket, key, opts);
         if (opts.cancellation) |token| try token.check();
     }
 
     pub fn listObjects(self: *Client, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
+        const operation = operation_metrics.runtime.start(.list);
+        defer operation.finish();
+        errdefer operation.failed();
         if (opts.max_keys == 0) return error.InvalidPageSize;
         if (opts.max_keys > max_list_page_keys) return error.PageSizeTooLarge;
         if (opts.start_after != null and opts.continuation_token != null) return error.AmbiguousContinuation;
@@ -285,6 +452,9 @@ pub const Client = struct {
     }
 
     pub fn listObjectVersions(self: *Client, bucket: []const u8, opts: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {
+        const operation = operation_metrics.runtime.start(.list_versions);
+        defer operation.finish();
+        errdefer operation.failed();
         if (opts.max_keys == 0) return error.InvalidPageSize;
         if (opts.max_keys > max_list_page_keys) return error.PageSizeTooLarge;
         if (opts.version_id_marker != null and opts.key_marker == null)
@@ -463,4 +633,68 @@ var unique_counter: std.atomic.Value(u64) = .init(0);
 fn uniqueNs(io: std.Io) u64 {
     const now = std.Io.Timestamp.now(io, .awake);
     return @as(u64, @intCast(now.toNanoseconds())) +% unique_counter.fetchAdd(1, .monotonic);
+}
+
+test "guarded objectstore writes fail closed without transactional capability" {
+    const a = std.testing.allocator;
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("fixture");
+    const options: types.PutOptions = .{ .guard = .{ .key = "progress/HEAD", .etag = "old-epoch" } };
+    try std.testing.expectError(error.ObjectOperationUnsupported, client.putObject("fixture", "progress/REINDEX", "checkpoint", options));
+    try std.testing.expectError(error.ObjectOperationUnsupported, client.putObjects("fixture", &.{.{ .key = "progress/REINDEX", .body = "checkpoint", .options = options }}));
+    try std.testing.expectError(error.ObjectOperationUnsupported, client.putFile("fixture", "progress/REINDEX", "missing-file", options));
+    try std.testing.expectError(error.ObjectOperationUnsupported, client.putFileWithIo(std.testing.io, "fixture", "progress/REINDEX", "missing-file", options));
+    try std.testing.expectError(error.FileNotFound, client.statObject("fixture", "progress/REINDEX"));
+}
+
+test "revision conditional publication is atomic and unsupported generation never falls back" {
+    const a = std.testing.allocator;
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var first = try client.compareAndPut("db", "HEAD", "one", null, .{});
+    defer first.deinit(a);
+    try std.testing.expectError(error.PreconditionFailed, client.compareAndPut("db", "HEAD", "overwrite", null, .{}));
+    var captured = try client.getObject("db", "HEAD", .{});
+    defer captured.deinit(a);
+    const revision = captured.metadata.writeRevision().?;
+    var owned = try revision.clone(a);
+    defer owned.deinit(a);
+    var next = try client.compareAndPut("db", "HEAD", "two", owned, .{});
+    defer next.deinit(a);
+    try std.testing.expectError(error.PreconditionFailed, client.compareAndPut("db", "HEAD", "stale", owned, .{}));
+    try std.testing.expectError(error.PreconditionFailed, client.compareAndDelete("db", "HEAD", owned, .{}));
+    try std.testing.expectError(error.ObjectOperationUnsupported, client.compareAndPut("db", "HEAD", "bad", .{ .generation = "1" }, .{}));
+    try std.testing.expectError(error.ObjectOperationUnsupported, client.compareAndDelete("db", "HEAD", .{ .generation = "1" }, .{}));
+    var unchanged = try client.getObject("db", "HEAD", .{});
+    defer unchanged.deinit(a);
+    try std.testing.expectEqualStrings("two", unchanged.body);
+}
+
+test "object read batches preserve misses and release every allocation on fallback failure" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            var memory = @import("memory.zig").MemoryClient.init(std.testing.allocator);
+            defer memory.deinit();
+            var base = memory.client();
+            try base.makeBucket("db");
+            var stored = try base.putObject("db", "one", "first", .{});
+            stored.deinit(std.testing.allocator);
+            stored = try base.putObject("db", "two", "second", .{});
+            stored.deinit(std.testing.allocator);
+            base.allocator = a;
+            const results = try base.getObjects("db", &.{ .{ .key = "one" }, .{ .key = "missing" }, .{ .key = "two" } });
+            defer {
+                for (results) |*result| if (result.*) |*value| value.deinit(a);
+                a.free(results);
+            }
+            try std.testing.expectEqualStrings("first", results[0].?.body);
+            try std.testing.expectEqual(null, results[1]);
+            try std.testing.expectEqualStrings("second", results[2].?.body);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

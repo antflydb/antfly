@@ -94,6 +94,8 @@ pub fn build(b: *std.Build) void {
         @panic("finetune aggregate does not compile command checks");
     const runtime_abi = checks.step.dependencies.items[0].cast(std.Build.Step.Compile).?.root_module.import_table.get("antfly_runtime_abi") orelse
         @panic("missing command check runtime ABI");
+    const document_runs = checks.step.dependencies.items[0].cast(std.Build.Step.Compile).?.root_module.import_table.get("antfly_document_runs") orelse
+        @panic("missing command check document-run owner");
     var actual = std.StringHashMap(*std.Build.Module).init(b.allocator);
     for (checks.step.dependencies.items) |dependency| {
         const group = dependency.cast(std.Build.Step.Compile) orelse @panic("unexpected command check dependency");
@@ -113,8 +115,11 @@ pub fn build(b: *std.Build) void {
             std.debug.panic("finetune aggregate does not compile {s}", .{spec.name});
         var expected = std.StringHashMap(void).init(b.allocator);
         expected.put("antfly_runtime_abi", {}) catch @panic("OOM");
+        expected.put("antfly_document_runs", {}) catch @panic("OOM");
         if (module.value.import_table.get("antfly_runtime_abi") != runtime_abi)
             @panic("command lost its shared runtime ABI identity");
+        if (module.value.import_table.get("antfly_document_runs") != document_runs)
+            @panic("command lost its shared document-run identity");
         for (spec.imports) |dependency| {
             expected.put(@tagName(dependency), {}) catch @panic("OOM");
             if (dependency == .onnx_graph) expected.put("onnx_data", {}) catch @panic("OOM");
