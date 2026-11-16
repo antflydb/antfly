@@ -7855,7 +7855,7 @@ pub const NativeFile = struct {
         var durable_ceiling_offset: ?u64 = null;
         if (scan_region) |r| {
             const published = r.readLogState();
-            durable_ceiling_offset = published.durable_offset;
+            durable_ceiling_offset = publishedDurableCeiling(published);
             if (published.checkpoint_sequence > folded_through) {
                 var header_bytes: [header_size]u8 = undefined;
                 try readHeaderExactAt(self.file, io, &header_bytes);
@@ -8197,6 +8197,18 @@ pub const NativeFile = struct {
     /// genuinely durable fold (explicit API, the 25%-remaining
     /// backpressure, or this same idle path once byte pressure makes it
     /// durable) runs that part of the epilogue then.
+    /// The offset past which a `corrupt_record` stop is an in-flight append
+    /// rather than lost data, or null when the shared region carries no
+    /// publication at all. A region reinitialized after every process
+    /// exited (or a missing sidecar, as after copying the data file) reads
+    /// all zeros; treating that as a ceiling of 0 would turn real
+    /// mid-log corruption into a silent truncation of everything after
+    /// it. Any live writer has published a nonzero sequence.
+    fn publishedDurableCeiling(state: shared_lock_region.Region.LogState) ?u64 {
+        if (state.durable_sequence == 0 and state.checkpoint_sequence == 0) return null;
+        return state.durable_offset;
+    }
+
     pub fn checkpointRedoLogWithDurability(self: *NativeFile, durable: bool) anyerror!void {
         if (comptime builtin.is_test) if (self.test_fail_checkpoint_redo_log) |err| {
             self.test_fail_checkpoint_redo_log = null;
@@ -9004,7 +9016,7 @@ pub const NativeFile = struct {
             // instead walks into the sequence a deferred fold consumed
             // without appending a record, which reads as a gap
             // (`NativeRedoLogCorrupt`).
-            var rctx: ReplayCtx = .{ .file = self, .io = io, .start_after_sequence = @max(redo.durable_sequence, redo.checkpoint_sequence), .durable_ceiling_offset = published.durable_offset };
+            var rctx: ReplayCtx = .{ .file = self, .io = io, .start_after_sequence = @max(redo.durable_sequence, redo.checkpoint_sequence), .durable_ceiling_offset = publishedDurableCeiling(published) orelse std.math.maxInt(u64) };
             try inode_lock.withRedoOverlayLock(entry, io, &rctx, ReplayCtx.run);
 
             const outcome = rctx.outcome;
@@ -9478,7 +9490,7 @@ pub const NativeFile = struct {
                 // function is reached in-process, but `self.file` is the
                 // same physical, cross-process file either of the other
                 // two races on.
-                const ceiling = if (self.regionForInode() catch null) |r| r.readLogState().durable_offset else null;
+                const ceiling = if (self.regionForInode() catch null) |r| publishedDurableCeiling(r.readLogState()) else null;
                 if (outcome.stop_reason == .corrupt_record and (ceiling == null or outcome.valid_bytes < ceiling.?)) return error.NativeRedoLogCorrupt;
                 redo.writer.tail = outcome.valid_bytes;
                 redo.writer.last_sequence = outcome.last_sequence;
@@ -35048,6 +35060,46 @@ test "lite redo log cold open tolerates a corrupt-looking record at or past the 
     const value = (try reopened.getDocumentAlloc(a, "alpha")) orelse return error.TestUnexpectedResult;
     defer a.free(value);
     try std.testing.expectEqualStrings("one", value);
+}
+
+test "lite redo log cold open stays strict about corruption when the region carries no publication" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-durable-ceiling-unpublished.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one");
+    try writer.commitTransaction();
+
+    const io = std.testing.io;
+    const tail = writer.redo.?.writer.tail;
+    const last_sequence = writer.redo.?.writer.last_sequence.?;
+
+    // The same complete-header, wrong-checksum record the sibling test
+    // plants. `Writer.append` writes the payload before the header, so
+    // with no writer in flight this is real corruption, not a torn append.
+    const bad: redo_log.RecordHeader = .{
+        .payload_len = 3,
+        .commit_sequence = last_sequence + 1,
+        .crc32 = 0xdeadbeef,
+    };
+    var header_buf: [redo_log.header_len]u8 = undefined;
+    bad.encode(&header_buf);
+    try writer.file.writePositionalAll(io, &header_buf, writer.header.redo_log_offset + tail);
+    try writer.file.writePositionalAll(io, "xyz", writer.header.redo_log_offset + tail + redo_log.header_len);
+    try writer.file.sync(io);
+
+    // A region reinitialized after every process exited, or a missing
+    // sidecar, carries no log publication. Its zero offset must not read
+    // as "everything is past the durable ceiling".
+    const region = (try writer.regionForInode()).?;
+    region.publishLogState(.{ .checkpoint_sequence = 0, .durable_sequence = 0, .durable_offset = 0 });
+
+    try std.testing.expectError(error.NativeRedoLogCorrupt, NativeFile.openWithIo(a, io, path, .{ .read_only = true }));
 }
 
 test "lite redo log cross-process: checkpointer defers reclaim while a forked child is pinned, reclaims after kill -9" {
