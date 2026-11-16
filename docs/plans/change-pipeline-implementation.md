@@ -2578,6 +2578,50 @@ before prepare without advancing the applied marker. The focused run completed w
 in `completion-resolution-zero-effect-test.log`: all seven history-consumer
 cases and the local storage discovery suite passed.
 
+## In progress: assembling qualified participant receipts
+
+`history_resolution_wire.Assembly` owns a validated copy of the frozen plan and
+collects cut-qualified read replies in canonical participant order. It checks
+request transaction/manifest/version/owner binding before accepting a positive
+receipt, treats absence as unproven without clearing prior evidence, deduplicates
+identical receipts and rejects conflicts. Encoding requires every participant,
+including guard/checkpoint no-effect participants, and validates the resulting
+certificate. Wire validation does not authenticate a source: callers must use
+the trusted original-owner read port and its catalog/auth/deadline protections.
+This collector is not itself durable publication or authorization to expose a
+public coordinated frame.
+
+The standalone wire/assembly contract run passed all seven tests in
+`completion-certificate-assembly-test.log`. The real-Raft fixture now feeds its
+signed positive/retried HTTP receipt into the assembler and parses the complete
+certificate. That integration run completed with exit 0 in
+`completion-certificate-raft-test.log`: all six real-Raft tests passed.
+Durable all-owner publication,
+reserved-to-retained accounting, certificate/receipt GC independent of primary
+coordinator metadata, original-root handoff retention and production coordinator
+integration remain mandatory next work.
+
+### Next publication/accounting invariants
+
+A qualified complete certificate is the input to a private ordered publication,
+not a public caller-supplied assertion. Every required owner must durably publish
+it under the original physical participant fence and compare its own included
+receipt with the immutable locally stored resolution. A checksummed envelope or
+structural certificate validation alone does not authenticate remote evidence.
+Original-owner read authorization and the operation's original deadline remain
+required through collection and publication.
+
+Publication must atomically move the promised reservation into retained bytes
+covering all surviving completion material (plan, local receipt, certificate and
+fixed record overhead). Exact retries must preserve bytes and accounting;
+conflicting publications must fail without advancing the ordered marker.
+Primary coordinator metadata GC must not destroy the retained evidence or release
+its charge early. Retained certificate/receipt GC needs its own owner-fenced
+eligibility and exact accounting transition, including zero-effect participants.
+Original-root retirement and topology handoff must preserve the evidence and row
+history until their consumers no longer need it. These are pending implementation
+requirements, not guarantees supplied by the assembler.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

@@ -43869,6 +43869,16 @@ fn consumerTests() type {
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const positive_retry = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
                 try std.testing.expectEqualDeep(positive.resolution, positive_retry.resolution);
+                var certificate = try resolution_operations.wire.Assembly.init(a, try plan.manifest(1001));
+                defer certificate.deinit();
+                try std.testing.expectError(error.SourceOutcomeUnresolved, certificate.encode(a));
+                try std.testing.expect(try certificate.add(positive_input.binding(), positive));
+                try std.testing.expect(try certificate.add(positive_input.binding(), positive_retry));
+                const certificate_bytes = try certificate.encode(a);
+                defer a.free(certificate_bytes);
+                var checked_certificate = try completion_contract.parse(a, certificate_bytes);
+                defer checked_certificate.deinit();
+                try std.testing.expectEqual(@as(usize, 1), checked_certificate.value.certificate.resolutions.len);
             }
             const rejected = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 99 } });
             try std.testing.expectEqual(.checkpoint_conflict, rejected.outcome.?.rejected);

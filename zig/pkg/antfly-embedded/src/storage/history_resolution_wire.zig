@@ -90,6 +90,75 @@ pub const Reply = struct {
         }
     }
 };
+/// Collects outputs of trusted, cut-qualified owner reads. Wire validation
+/// does not authenticate a producer: the caller must use the frozen owner read
+/// port and preserve its original routing, authorization and deadline checks.
+/// The complete plan is owned so recovery collection cannot borrow a newer
+/// routing projection or a caller's temporary manifest buffers.
+pub const Assembly = struct {
+    allocator: A,
+    plan: std.json.Parsed(completion.AdmissionEnvelope),
+    commit_version: u64,
+    receipts: []?completion.Resolution,
+    received: usize = 0,
+
+    pub fn init(a: A, frozen: completion.Manifest) !Assembly {
+        try frozen.validate();
+        const raw = try completion.encodeAdmission(a, frozen.admission());
+        defer a.free(raw);
+        var plan = try completion.parseAdmission(a, raw);
+        errdefer plan.deinit();
+        const receipts = try a.alloc(?completion.Resolution, frozen.participants.len);
+        @memset(receipts, null);
+        return .{ .allocator = a, .plan = plan, .commit_version = frozen.commit_version, .receipts = receipts };
+    }
+    pub fn deinit(self: *Assembly) void {
+        self.allocator.free(self.receipts);
+        self.plan.deinit();
+        self.* = undefined;
+    }
+    pub fn manifest(self: *const Assembly) completion.Manifest {
+        return self.plan.value.admission.manifest(self.commit_version) catch unreachable;
+    }
+    /// Absence is unproven and does not clear a previously qualified receipt.
+    /// Repeated identical receipts are idempotent even at a stronger read cut.
+    pub fn add(self: *Assembly, request: Request, reply: Reply) !bool {
+        try reply.validate(request);
+        const frozen = self.manifest();
+        if (!equal(request.transaction_id, frozen.transaction_id) or !equal(request.manifest_digest, frozen.digest()) or request.commit_version != frozen.commit_version) return error.HistoryCorrupt;
+        var low: usize = 0;
+        var high = frozen.participants.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            switch (std.mem.order(u8, &frozen.participants[middle].namespace, &request.namespace)) {
+                .lt => low = middle + 1,
+                .gt => high = middle,
+                .eq => {
+                    const participant = frozen.participants[middle];
+                    if (!equal(request.owner_fence, participant.owner_fence)) return error.HistoryCorrupt;
+                    const receipt = reply.resolution orelse return false;
+                    try receipt.validate(frozen);
+                    if (self.receipts[middle]) |previous| {
+                        if (!equal(previous.digest(), receipt.digest())) return error.DecisionConflict;
+                    } else {
+                        self.receipts[middle] = receipt;
+                        self.received += 1;
+                    }
+                    return true;
+                },
+            }
+        }
+        return error.InvalidParticipant;
+    }
+    pub fn encode(self: *const Assembly, a: A) ![]u8 {
+        if (self.received != self.receipts.len) return error.SourceOutcomeUnresolved;
+        const receipts = try a.alloc(completion.Resolution, self.receipts.len);
+        defer a.free(receipts);
+        for (self.receipts, receipts) |receipt, *destination| destination.* = receipt orelse return error.SourceOutcomeUnresolved;
+        return completion.encode(a, .{ .manifest = self.manifest(), .resolutions = receipts });
+    }
+};
+
 pub fn decodeRequest(a: A, raw: []const u8) !Request {
     if (raw.len == 0 or raw.len > max_bytes) return error.InvalidHistoryAdmission;
     var parsed = std.json.parseFromSlice(Request, a, raw, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidHistoryAdmission;
@@ -144,4 +213,56 @@ test "history resolution wire binds identity authority and actual read cut witho
     request.minimum_applied_index = 0;
     try std.testing.expectError(error.HistoryCorrupt, Reply.init(request, .{ .native_sequence = 99 }, receipt));
     try std.testing.expect((try Reply.init(request, .{}, null)).resolution == null);
+}
+
+test "completion receipt assembly requires every qualified frozen participant" {
+    const a = std.testing.allocator;
+    const participants = [_]completion.Participant{
+        .{ .namespace = @splat(1), .owner_fence = @splat(3), .roles = completion.Roles.effects, .locator = "one", .input_digest = @splat(7) },
+        .{ .namespace = @splat(2), .owner_fence = @splat(4), .roles = completion.Roles.guards | completion.Roles.checkpoint, .locator = "two", .input_digest = @splat(8) },
+    };
+    const manifest: completion.Manifest = .{ .version = 2, .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = participants[0].namespace, .coordinator_fence = participants[0].owner_fence, .commit_version = 10, .participants = &participants };
+    var collection = try Assembly.init(a, manifest);
+    defer collection.deinit();
+    var position: completion.Digest = @splat(0);
+    std.mem.writeInt(u64, position[0..8], 1, .little);
+    std.mem.writeInt(u64, position[8..16], 7, .little);
+    position[31] = 1;
+    const effect: completion.Resolution = .{ .namespace = participants[0].namespace, .owner_fence = participants[0].owner_fence, .manifest_digest = manifest.digest(), .commit_version = 10, .source_position = position, .outcome = .{ .effects = .{ .sequence = 1, .frame_digest = @splat(9) } } };
+    const empty: completion.Resolution = .{ .namespace = participants[1].namespace, .owner_fence = participants[1].owner_fence, .manifest_digest = manifest.digest(), .commit_version = 10, .source_position = position, .outcome = .{ .no_effect = completion.noEffectProof(manifest, participants[1].namespace, position) } };
+    const first: Request = .{ .authority = .raft, .namespace = effect.namespace, .transaction_id = manifest.transaction_id, .owner_fence = effect.owner_fence, .manifest_digest = manifest.digest(), .commit_version = 10, .minimum_applied_index = 1 };
+    var second = first;
+    second.namespace = empty.namespace;
+    second.owner_fence = empty.owner_fence;
+    const cut: Cut = .{ .term = 1, .index = 7 };
+    try std.testing.expect(!try collection.add(first, try Reply.init(first, cut, null)));
+    try std.testing.expectError(error.SourceOutcomeUnresolved, collection.encode(a));
+    try std.testing.expect(try collection.add(second, try Reply.init(second, cut, empty)));
+    try std.testing.expect(try collection.add(second, try Reply.init(second, cut, empty)));
+    try std.testing.expectEqual(@as(usize, 1), collection.received);
+    try std.testing.expectError(error.SourceOutcomeUnresolved, collection.encode(a));
+    var foreign = first;
+    foreign.transaction_id[0] ^= 1;
+    try std.testing.expectError(error.HistoryCorrupt, collection.add(foreign, try Reply.init(foreign, cut, null)));
+    foreign = first;
+    foreign.owner_fence[0] ^= 1;
+    try std.testing.expectError(error.HistoryCorrupt, collection.add(foreign, try Reply.init(foreign, cut, null)));
+    foreign = first;
+    foreign.namespace = @splat(11);
+    try std.testing.expectError(error.InvalidParticipant, collection.add(foreign, try Reply.init(foreign, cut, null)));
+    var forged = try Reply.init(first, cut, effect);
+    forged.request_digest[0] ^= 1;
+    try std.testing.expectError(error.HistoryCorrupt, collection.add(first, forged));
+    try std.testing.expectEqual(@as(usize, 1), collection.received);
+    try std.testing.expect(try collection.add(first, try Reply.init(first, cut, effect)));
+    try std.testing.expect(!try collection.add(first, try Reply.init(first, cut, null)));
+    var changed = effect;
+    changed.outcome.effects.frame_digest[0] ^= 1;
+    try std.testing.expectError(error.DecisionConflict, collection.add(first, try Reply.init(first, cut, changed)));
+    const raw = try collection.encode(a);
+    defer a.free(raw);
+    var parsed = try completion.parse(a, raw);
+    defer parsed.deinit();
+    try std.testing.expectEqualDeep(effect, parsed.value.certificate.resolutions[0]);
+    try std.testing.expectEqualDeep(empty, parsed.value.certificate.resolutions[1]);
 }
