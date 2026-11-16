@@ -132,6 +132,19 @@ pub fn shallowLayoutId(comptime T: type) u64 {
     };
 }
 
+/// Anonymous container types are named `Parent__struct_<N>` with an `N` that
+/// varies between compilations, so a field typed with one gives the owner and
+/// its clients different layout ids. Such fields must use a named type.
+fn requireStableFieldTypeName(comptime T: type, comptime field: []const u8, comptime Field: type) void {
+    const name = @typeName(Field);
+    for ([_][]const u8{ "__struct_", "__union_", "__enum_", "__opaque_" }) |marker| {
+        if (std.mem.indexOf(u8, name, marker) != null) @compileError(
+            "native ABI field " ++ @typeName(T) ++ "." ++ field ++ " has anonymous type " ++ name ++
+                "; declare it as a named type so its layout id is stable across compilations",
+        );
+    }
+}
+
 fn computeShallowLayoutId(comptime T: type) u64 {
     var hash: u64 = stableId(@tagName(@typeInfo(T)));
     hashInteger(&hash, @sizeOf(T));
@@ -141,6 +154,7 @@ fn computeShallowLayoutId(comptime T: type) u64 {
         .@"struct" => |structure| {
             hashBytes(&hash, @tagName(structure.layout));
             inline for (structure.field_names, structure.field_types) |reflected_name, Field| {
+                requireStableFieldTypeName(T, reflected_name, Field);
                 hashBytes(&hash, reflected_name);
                 hashBytes(&hash, @typeName(Field));
                 hashInteger(&hash, @offsetOf(T, reflected_name));
