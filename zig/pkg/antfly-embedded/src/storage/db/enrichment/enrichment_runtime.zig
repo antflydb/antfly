@@ -30871,6 +30871,12 @@ const OrderedDenseTextBatch = struct {
             previous = fingerprint;
         }
     }
+    fn failPlanning(self: *@This(), runtime: *EnrichmentRuntime, err: anyerror) !void {
+        // Planning has not selected a physical call: every retained owner is
+        // affected, and must be classified while its captured token is alive.
+        self.scope.enterOwned(batchFailureFingerprint(Item, self.items.items), .{ .ordered_text = self.items.items });
+        return self.fail(runtime, self.items.items, err);
+    }
     fn flush(self: *@This(), runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder, consumers: []const []const u8) !void {
         if (self.items.items.len == 0) return;
         defer self.clear();
@@ -30879,7 +30885,7 @@ const OrderedDenseTextBatch = struct {
         const limits: DenseBatchLimits = .{ .items = effectiveRequestEmbedBatchItems(runtime, request), .bytes = requestEmbedBatchBytes(runtime.alloc, request) };
         var planned = provider.withTextGeneration(self.generation);
         const parallelism = if (runtime.dense_result_cache) |cache| (if (cache.concurrent) denseBatchParallelism(planned) else 1) else denseBatchParallelism(planned);
-        const max_items = if (self.generation.lease != null) try planned.partBatchLimit(name, request.expected_dims, limits.items) else limits.items;
+        const max_items = if (self.generation.lease != null) planned.partBatchLimit(name, request.expected_dims, limits.items) catch |err| return self.failPlanning(runtime, err) else limits.items;
         // Each task owns one physical call. Its result survives sibling errors;
         // nested planners must not multiply the wave's concurrency allowance.
         planned.dense_batch_concurrency = 1;
@@ -30902,7 +30908,7 @@ const OrderedDenseTextBatch = struct {
                 return values;
             }
         };
-        const texts = try runtime.alloc.alloc([]const u8, self.items.items.len);
+        const texts = runtime.alloc.alloc([]const u8, self.items.items.len) catch |err| return self.failPlanning(runtime, err);
         defer runtime.alloc.free(texts);
         for (self.items.items, texts) |item, *text| text.* = item.text;
         const io = concurrencyIo(runtime);
@@ -32595,13 +32601,18 @@ fn processChunkedDenseWindow(
                                     ordered_batch.items.clearAndFree(ordered_batch.alloc);
                                     ordered_batch.retry_budgets.clearAndFree(ordered_batch.alloc);
                                     _ = tracked.releaseUnusedCredit();
+                                    if (own_demand) ordered_batch.collection_items_limit = @max(@as(usize, 1), ordered_batch.collection_items_limit / 2);
+                                    // Submitted outputs are not accepted yet. Restarting
+                                    // this document here can repeatedly embed its prefix
+                                    // while the publication owner waits for this lane.
+                                    // Yield with durable debt and resume after acceptance.
                                     scope.enterRequest(request);
-                                    continue :collect;
+                                    break :pressure error.ArtifactPublicationPending;
                                 }
                                 ordered_batch.items.clearAndFree(ordered_batch.alloc);
                                 ordered_batch.retry_budgets.clearAndFree(ordered_batch.alloc);
                                 _ = tracked.releaseUnusedCredit();
-                                if (!own_demand) return error.ResourceBudgetExceeded;
+                                if (!own_demand) break :pressure error.ResourceBudgetExceeded;
                                 if (ordered_batch.collection_items_limit > 1) {
                                     ordered_batch.collection_items_limit = @max(@as(usize, 1), ordered_batch.collection_items_limit / 2);
                                     scope.enterRequest(request);
@@ -42806,6 +42817,8 @@ test "ordered materialized chunk embeddings honor memo callback concurrency" {
 test "ordered materialized chunk embeddings drain collection under memory pressure" {
     try testOrderedChunkVectorCarry(true, .collection_pressure);
     try testOrderedChunkVectorCarry(true, .collection_too_large);
+    try testOrderedChunkVectorCarry(true, .collection_multi);
+    try testOrderedChunkVectorCarry(true, .collection_contention);
 }
 
 test "ordered materialized chunk embeddings use bounded parallel provider batches" {
@@ -42838,7 +42851,12 @@ test "ordered materialized chunk embeddings preserve relational retry budgets" {
     try testOrderedChunkVectorCarry(true, .relational_retry);
 }
 
-const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, memo_serial, memo_parallel, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current };
+test "ordered materialized chunk embeddings retain owners across planning failures" {
+    try testOrderedChunkVectorCarry(true, .planning_terminal);
+    try testOrderedChunkVectorCarry(true, .planning_retry);
+}
+
+const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, memo_serial, memo_parallel, planning_terminal, planning_retry, collection_multi, collection_contention, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current };
 
 fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
@@ -42859,6 +42877,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         generation: u8 = 1,
         change_generation: bool = false,
         fail_first_batch: bool = false,
+        planning_error: ?anyerror = null,
         fail_text: ?[]const u8 = null,
         retry_text: bool = false,
         cancel_text: ?[]const u8 = null,
@@ -42924,6 +42943,11 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             self.capability_calls += 1;
             if (self.capability_calls == self.fail_metadata_at) return if (self.terminal_metadata) error.UnsupportedEmbeddingProvider else error.UnexpectedProviderFailure;
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .batch = .{ .mode = .native, .preferred_items = 32, .max_items = 32 }, .output = .embedding, .model_revision = @splat(self.generation) };
+        }
+        fn batchLimit(ptr: *anyopaque, _: []const u8, _: u32, _: inference_work.CapabilityLease, requested: usize) !usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.planning_error) |err| return err;
+            return requested;
         }
         fn planned(ptr: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, _: ?inference_request_context.RequestContext, _: inference_work.CapabilityLease) ![]const []const f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -43043,7 +43067,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\"},\"uri\":{\"type\":\"string\"}},\"additionalProperties\":false}}}}"
     else
         "{}");
-    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = if (batching == .terminal) 4 else 100 });
+    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = if (batching == .terminal or batching == .collection_multi) 4 else 100 });
     try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .source_artifact_name = "chunks", .expected_dims = if (dense) 2 else 0, .execution = if (batching == .bytes or batching == .parallel_bytes or batching == .parallel_oversize or batching == .legacy_bytes or batching == .legacy_boundary_terminal) .{ .batch_items = 32, .batch_bytes = if (batching == .legacy_bytes or batching == .legacy_boundary_terminal) 20 else 22 } else null });
     try db.addIndex(.{ .name = "vector", .kind = if (dense) .dense_vector else .sparse_vector, .config_json = if (dense) "{\"field\":\"dense\",\"dims\":2,\"embedding_name\":\"model\"}" else "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
     if (batching == .mixed_publication_pending) {
@@ -43345,7 +43369,46 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             runtime.config.dense_embedder.?.computation_key_fn = Harness.computationKey;
             runtime.dense_result_cache = .{ .concurrent = batching == .memo_parallel, .ptr = &harness, .lookup = Harness.memoLookup, .remember = Harness.memoRemember };
         }
-        if (batching == .collection_pressure or batching == .collection_too_large) {
+        if (batching == .planning_terminal or batching == .planning_retry) {
+            var scheduler = try ScopedReplay.load(runtime);
+            defer scheduler.deinit(alloc);
+            runtime.retry_scheduler = &scheduler;
+            defer runtime.retry_scheduler = null;
+            for (&requests) |*request| request.sequence = index;
+            runtime.config.dense_embedder.?.part_batch_limit_fn = Harness.batchLimit;
+            harness.planning_error = if (batching == .planning_terminal) error.InvalidInferenceCapabilities else error.UnexpectedProviderFailure;
+            var scope: FailureScope = .{};
+            if (batching == .planning_terminal) {
+                try processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope);
+                try std.testing.expectEqual(@as(u64, count), runtime.fatal_error_count);
+            } else {
+                try std.testing.expectError(error.UnexpectedProviderFailure, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
+                try std.testing.expectEqual(@as(usize, count), scheduler.state.tickets.items.len);
+            }
+            try std.testing.expectEqual(@as(usize, 0), harness.provider_calls);
+            return;
+        }
+        if (batching == .collection_contention) {
+            var scheduler = try ScopedReplay.load(runtime);
+            defer scheduler.deinit(alloc);
+            runtime.retry_scheduler = &scheduler;
+            defer runtime.retry_scheduler = null;
+            runtime.config.resource_manager = &pressure_manager;
+            for (&requests) |*request| request.sequence = index;
+            var scope: FailureScope = .{};
+            scope.enterRequest(requests[0]);
+            try std.testing.expect(try scope.shouldYield(runtime, error.ResourceBudgetExceeded));
+            scope.deferRetry(error.ResourceBudgetExceeded);
+            var foreign = try pressure_manager.reserve(.relational_preparation_working_set, pressure_limit);
+            defer foreign.release();
+            try std.testing.expectError(error.ResourceBudgetExceeded, processChunkedDenseWindow(runtime, requests[1..], &cache, &window, &scope));
+            // LaneOutcome may credit the already parked error only after ALL
+            // abandoned requests have independent durable debt.
+            try std.testing.expectEqual(@as(usize, count), scheduler.state.tickets.items.len);
+            try std.testing.expectEqual(@as(usize, 0), harness.provider_calls);
+            return;
+        }
+        if (batching == .collection_pressure or batching == .collection_too_large or batching == .collection_multi) {
             runtime.config.resource_manager = &pressure_manager;
             var scope: FailureScope = .{};
             const denied_before = test_ordered_collection_pressure_drains.load(.acquire);
@@ -43355,9 +43418,32 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                 try std.testing.expectEqual(@as(usize, 0), harness.provider_calls);
                 try std.testing.expectEqual(@as(u64, count), runtime.fatal_error_count);
             } else {
-                try std.testing.expectError(error.ArtifactPublicationPending, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
-                try std.testing.expectEqual(@as(usize, count), harness.provider_calls);
-                try std.testing.expectEqual(before + count, harness.queued.items.len);
+                var complete = false;
+                var accepted = before;
+                for (0..256) |_| {
+                    var pending = false;
+                    processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope) catch |err| switch (err) {
+                        error.ArtifactPublicationPending => pending = true,
+                        else => return err,
+                    };
+                    // Deliberately withhold acceptance until the lane yields:
+                    // a pressure recovery must never spin on an unaccepted prefix.
+                    for (harness.queued.items[accepted..]) |bytes| {
+                        var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, bytes);
+                        defer decoded.deinit();
+                        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
+                        index += 1;
+                    }
+                    accepted = harness.queued.items.len;
+                    if (!pending) {
+                        complete = true;
+                        break;
+                    }
+                }
+                try std.testing.expect(complete);
+                const expected: usize = count * (if (batching == .collection_multi) @as(usize, 3) else 1);
+                try std.testing.expectEqual(expected, harness.provider_calls);
+                try std.testing.expectEqual(before + expected, harness.queued.items.len);
                 for (harness.batches.items) |size| try std.testing.expect(size <= 32);
             }
             try std.testing.expect(test_ordered_collection_pressure_drains.load(.acquire) > denied_before);
