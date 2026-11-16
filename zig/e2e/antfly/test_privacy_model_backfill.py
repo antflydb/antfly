@@ -66,6 +66,7 @@ def test_protected_model_backfill_batches(
     started = time.monotonic()
     status_seconds = 0.0
     status_calls = 0
+    reader_auth = ""
 
     def cpu_seconds():
         try:
@@ -146,7 +147,7 @@ def test_protected_model_backfill_batches(
                 "fields": ["body"],
                 "limit": 10,
             },
-            headers={"Authorization": _basic_auth("reader", "reader")},
+            headers={"Authorization": reader_auth},
             timeout=15,
         )
 
@@ -166,6 +167,12 @@ def test_protected_model_backfill_batches(
                 assert all("@" not in hit["body"] for hit in hits), hits
 
     try:
+        # Thousands of oracle reads should authenticate with a durable key,
+        # rather than repeatedly running the password-verification workload.
+        admin_key = api.post(
+            "/auth/v1/users/admin/api-keys", {"name": "migration-oracle"}
+        )
+        api.s.headers["Authorization"] = f"Bearer {admin_key['encoded']}"
         api.create_table(table)
         add_index("a", "fixture")
         api.put(f"/tables/{table}/privacy", policy(endpoint))
@@ -182,6 +189,10 @@ def test_protected_model_backfill_batches(
                 ],
             },
         )
+        reader_key = api.post(
+            "/auth/v1/users/reader/api-keys", {"name": "migration-query"}
+        )
+        reader_auth = f"Bearer {reader_key['encoded']}"
         before_requests = len(calls["snapshot"]())
         before_extractions = len(calls["extract"])
         status_seconds = status_calls = 0
