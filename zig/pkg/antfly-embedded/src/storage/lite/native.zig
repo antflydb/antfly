@@ -8223,11 +8223,31 @@ pub const NativeFile = struct {
         // referenced page the ledger never counted (indistinguishable
         // from an `allocateFresh` page whose own retain never ran) and
         // fails with `error.InvalidNativeAllocator`.
-        if (staged_pages.len != 0 and self.header.indexed_reclamation) {
-            const pending = try self.allocator.alloc(u64, staged_pages.len);
-            for (staged_pages, pending) |p, *out| out.* = p.page_id;
-            self.redo_fold_retain_pending = pending;
-        }
+        //
+        // perf/lwa-verify-crash: deliberately NOT assigned here. See the
+        // assignment just before `redo_fold_retire_pending` below for why:
+        // `staged_pages` covers every page-shaped write since the last
+        // fold, across *every* key, including ones a later version in
+        // this same window superseded before this fold ever ran (the
+        // `retiring_chains`/`redo_fold_retire_pending` case just below).
+        // Publishing this list before that superseded-chain analysis has
+        // finished lets an unrelated private flush mid-loop (`putDocumentBatch`'s
+        // own `TransactionWrites.max_keys` early-flush gate, triggered by
+        // a large backlog of *unrelated* pending heads) drain it early and
+        // retain a superseded chain's pages as if they were a live
+        // continuation -- `validateIndexedOwnership`'s later "surviving
+        // owner" filter then sees that premature retain as
+        // `ledger_state.count(chain.root) != 0` and treats it as proof the
+        // chain is still referenced, silently dropping it from
+        // `retiring_chains` instead of queuing it for retirement. The
+        // chain's pages end up permanently retained (an unreachable
+        // phantom reference) with no live owner and no pending retirement
+        // ever able to release them -- reproduced live by the
+        // `lite_sqlite_comparison.py --workers 8` benchmark and the test
+        // below. `staged_pages` itself stays alive for the rest of this
+        // function (freed only by the `defer` registered where it was
+        // captured), so computing `redo_fold_retain_pending` from it down
+        // below, alongside `redo_fold_retire_pending`, costs nothing extra.
         // §9 (redo, re-fold guard): the sequence boundary this fold is
         // building on top of -- `redo.checkpoint_sequence` is not
         // advanced to `new_checkpoint_sequence` until this function's own
@@ -8393,6 +8413,20 @@ pub const NativeFile = struct {
             self.redo_fold_retire_pending = retiring_owned;
         } else {
             self.allocator.free(retiring_owned);
+        }
+        // perf/lwa-verify-crash: assigned here, alongside `redo_fold_retire_pending`
+        // above, rather than back where `staged_pages` was captured -- see
+        // that assignment's own doc comment for why: this generic sweep
+        // must never become visible to a private flush before the
+        // superseded-chain analysis just above has finished deciding
+        // which of `staged_pages` belongs to a chain that must be
+        // *retired*, not retained as live. `staged_pages` is still alive
+        // here (freed only by the `defer` registered where it was
+        // captured).
+        if (staged_pages.len != 0 and self.header.indexed_reclamation) {
+            const pending = try self.allocator.alloc(u64, staged_pages.len);
+            for (staged_pages, pending) |p, *out| out.* = p.page_id;
+            self.redo_fold_retain_pending = pending;
         }
         // Builds the real pages above, then (via `flushTransactionWrites`,
         // `commitTransactionWithDurability`, `publishCheckpoint`, all
@@ -35565,6 +35599,126 @@ test "lite redo log a pin survives checkpoint and reclaim: a superseded multi-pa
     const pinned_value = (try file.getDocumentAtCheckpointAlloc(a, checkpoint_at_large, "doc")).?;
     defer a.free(pinned_value);
     try std.testing.expectEqualSlices(u8, large, pinned_value);
+}
+
+// Regression (perf/lwa-verify-crash): `checkpointRedoLog`'s own fold used to
+// permanently strand a superseded multi-page external value chain's pages
+// -- retained forever, never reachable, never retired -- whenever an
+// *unrelated* backlog of pending heads was large enough to make
+// `putDocumentBatch`'s own `TransactionWrites.max_keys` early-flush gate
+// fire from inside the fold, before `checkpointRedoLogWithDurability`'s own
+// "surviving owner" filter had decided which chains in this same window are
+// superseded (`retiring_chains`/`redo_fold_retire_pending`) rather than
+// still live.
+//
+// `redo_fold_retain_pending` (the generic sweep that retains every
+// page-shaped write this fold's overlay snapshot staged, so a surviving
+// chain's own continuation pages are not left uncounted) used to be
+// populated at the very top of `checkpointRedoLogWithDurability`, before
+// that per-root loop even starts. A private flush mid-loop -- triggered
+// here by `putDocumentBatch` itself, once the backlog of distinct document
+// heads crosses `TransactionWrites.max_keys` -- drained that generic sweep
+// early, retaining the *superseded* chain's root and continuation pages as
+// if they were a live continuation. By the time the surviving-owner filter
+// ran afterward, `ledger_state.count(chain.root) != 0` looked exactly like
+// "something still references this," so the chain was silently dropped
+// from `retiring_chains` and no retirement was ever queued for it --
+// reproduced live by the `lite_sqlite_comparison.py --workers 8` benchmark
+// and a minimal single-process repro (bootstrap batches, no overwrites of
+// user-visible keys at all) as `error.UnexpectedNativePageKind` (also seen
+// as `InvalidNativeAllocator`/`NativeRedoLogCorrupt`) surfaced from
+// `validateIndexedOwnership`'s `decodePagePayload(raw, .data)` fallback: a
+// page the ledger believes is a lone, unindexed `.data` block turns out to
+// still physically be a `.value` page from the stranded chain.
+//
+// Fixed by deferring `redo_fold_retain_pending`'s assignment to the same
+// point `redo_fold_retire_pending` is assigned (both are safe to publish
+// only once the superseded-chain analysis has finished), so a private
+// flush mid-loop sees neither field populated and defers all of this
+// ledger bookkeeping to the fold's own final, real commit.
+test "lite redo log fold does not strand a superseded multi-page external value when an unrelated backlog forces an early flush mid-fold" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-fold-superseded-backlog.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, 8 * 1024 * 1024);
+    defer file.close();
+
+    // A backlog of unrelated document heads, all diverted (never folded)
+    // in the same uncheckpointed window as the superseded chain below --
+    // strictly more than `TransactionWrites.max_keys` (1024), the
+    // threshold `putDocumentBatch` itself checks before it will ever call
+    // `flushTransactionWrites` from inside the fold's own per-root loop.
+    const filler_count = 1100;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const filler_keys = try arena.allocator().alloc([]const u8, filler_count);
+    for (filler_keys, 0..) |*key, i| key.* = try std.fmt.allocPrint(arena.allocator(), "filler-{d:0>6}", .{i});
+    const filler_docs = try arena.allocator().alloc(DocumentMutation, filler_count);
+    for (filler_keys, filler_docs) |key, *doc| doc.* = .{ .key = key, .value = "small payload" };
+
+    try file.beginTransaction();
+    try file.putDocumentBatch(filler_docs);
+    try file.commitTransaction();
+
+    // The chain that must end up superseded: two versions of the same key,
+    // each a multi-page external value chain (`writeValuePagesAllocated`'s
+    // simple linked-chain path, since both stay well under 64 KiB), both
+    // written -- and both still only staged in the overlay, never folded
+    // -- before the fold below ever runs.
+    const old_value = try a.alloc(u8, 8_000);
+    defer a.free(old_value);
+    @memset(old_value, 'O');
+    const new_value = try a.alloc(u8, 9_000);
+    defer a.free(new_value);
+    @memset(new_value, 'N');
+
+    try file.beginTransaction();
+    try file.putDocument("target-doc", old_value);
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("target-doc", new_value);
+    try file.commitTransaction();
+
+    // One unrelated catalog mutation, also only staged/diverted so far:
+    // `checkpointRedoLogWithDurability`'s own per-root loop processes
+    // catalog roots (0, 1) before documents (2), so this gives
+    // `self.transaction_writes` something already staged by the time
+    // `putDocumentBatch`'s own early-flush gate fires below -- a
+    // `flushTransactionWrites` call `self.transaction_writes == null`
+    // would otherwise turn into a silent no-op (`orelse return`), masking
+    // the bug this test exists to catch.
+    try file.beginTransaction();
+    try file.putCatalogRecord("unrelated-catalog-key", "unrelated-catalog-value");
+    try file.commitTransaction();
+
+    // One fold applies the backlog and the superseded chain together: the
+    // backlog's own size (`filler_count + 1 > TransactionWrites.max_keys`)
+    // is what makes `putDocumentBatch` flush mid-fold, inside
+    // `checkpointRedoLogWithDurability`'s own per-root loop.
+    try file.checkpointRedoLog();
+
+    // The live checkpoint sees the overwrite...
+    const current = (try file.getDocumentAlloc(a, "target-doc")).?;
+    defer a.free(current);
+    try std.testing.expectEqualSlices(u8, new_value, current);
+
+    // ...and the allocator ledger is fully self-consistent: no page is
+    // simultaneously unreachable from every live record/pending retirement
+    // and still counted as owned (the old chain's stranded-reference
+    // shape this regression reproduces). `check()` walks exactly that
+    // graph via `validateIndexedAllocator`/`validateIndexedOwnership`.
+    const report = try file.check();
+    try std.testing.expect(report.valid);
+
+    // A maintenance pass must also be able to fully drain the old chain's
+    // retirement once no reader can still need it -- it would never make
+    // any progress on a page `redo_fold_retain_pending`'s sweep wrongly
+    // retained with no matching retirement ever queued.
+    _ = try file.reclaimPagesForMaintenanceWithCancel(1024, null, true);
+    try std.testing.expect((try file.check()).valid);
 }
 
 // Regression: `checkpointRedoLog`'s own fold used to re-apply an overlay
