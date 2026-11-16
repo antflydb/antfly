@@ -44,6 +44,7 @@ pub const Plan = struct {
     participant_ids: []const []const u8,
     begin_timestamp: u64,
     created_at_ns: u64,
+    source_purpose: ?[32]u8,
 
     pub fn deinit(self: *Plan) void {
         self.arena.deinit();
@@ -61,6 +62,8 @@ pub const Plan = struct {
         const participants = try owned.alloc(Participant, inputs.len);
         const members = try owned.alloc(completion.Participant, inputs.len);
         var begin_timestamp: u64 = 0;
+        var source_purpose: ?[32]u8 = null;
+        var checkpoint_count: usize = 0;
         var total_payload_bytes: usize = 0;
         var unique_locators: std.StringHashMapUnmanaged(void) = .empty;
         for (inputs, 0..) |input, i| {
@@ -70,6 +73,8 @@ pub const Plan = struct {
             const mutation = input.prepare.transaction orelse return error.InvalidBatchRequest;
             if (mutation != .prepare) return error.InvalidBatchRequest;
             const vote = mutation.prepare;
+            if (i == 0) source_purpose = vote.source_purpose else if (!std.meta.eql(source_purpose, vote.source_purpose)) return error.SourceTransactionIdentityConflict;
+            if (input.roles & completion.Roles.checkpoint != 0) checkpoint_count += 1;
             const owner = vote.completion_owner orelse return error.InvalidBatchRequest;
             if (!std.mem.eql(u8, &vote.txn_id, &transaction_id)) return error.SourceTransactionIdentityConflict;
             if (!std.mem.eql(u8, &owner.digest(), &input.owner.digest()) or vote.topology_epoch != input.owner.topology_epoch) return error.TopologyChanged;
@@ -86,6 +91,7 @@ pub const Plan = struct {
             participants[i] = .{ .owner = input.owner, .locator = name, .prepare_bytes = bytes };
             members[i] = .{ .namespace = input.owner.namespace, .owner_fence = input.owner.digest(), .roles = input.roles, .input_digest = completion.preparedInputDigest(input.owner.namespace, bytes), .locator = name, .routed_owner = input.owner };
         }
+        if (source_purpose != null and checkpoint_count != 1) return error.InvalidSourceAdmission;
         // Admission order is canonical, independent of route enumeration or
         // fanout completion order. Keep the corresponding payloads together.
         for (1..participants.len) |i| {
@@ -110,7 +116,7 @@ pub const Plan = struct {
             ids[follower] = participant.locator;
             follower += 1;
         }
-        return .{ .arena = arena, .admission = admission, .admission_bytes = encoded, .participants = participants, .participant_ids = ids, .begin_timestamp = begin_timestamp, .created_at_ns = created_at_ns };
+        return .{ .arena = arena, .admission = admission, .admission_bytes = encoded, .participants = participants, .participant_ids = ids, .begin_timestamp = begin_timestamp, .created_at_ns = created_at_ns, .source_purpose = source_purpose };
     }
 
     /// Derive a retry identity from canonical namespace order and the complete
@@ -132,7 +138,7 @@ pub const Plan = struct {
         if (index >= self.participants.len) return error.InvalidTxnRecord;
         const owner = self.participants[index].owner;
         try self.admission.requireRoutedOwner(owner);
-        return .{ .sync_level = .write, .transaction = .{ .begin = .{ .txn_id = self.admission.transaction_id, .begin_timestamp = self.begin_timestamp, .created_at_ns = self.created_at_ns, .topology_epoch = owner.topology_epoch, .retain_terminal = true, .participants = self.participant_ids, .completion_admission = self.admission_bytes, .completion_owner = owner } } };
+        return .{ .sync_level = .write, .transaction = .{ .begin = .{ .txn_id = self.admission.transaction_id, .begin_timestamp = self.begin_timestamp, .created_at_ns = self.created_at_ns, .topology_epoch = owner.topology_epoch, .retain_terminal = true, .participants = self.participant_ids, .completion_admission = self.admission_bytes, .completion_owner = owner, .source_purpose = self.source_purpose } } };
     }
 
     /// Parsed retry input has independent ownership and can outlive this plan.

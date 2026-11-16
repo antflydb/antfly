@@ -3695,3 +3695,60 @@ rejection with unchanged mutation counts. Formatting and diff checks passed.
 The full source-global checkpoint and frozen-payload adapter, public feeds,
 bootstrap/retention, production pgoutput, and existing-client qualification
 remain required. Neither issue is complete.
+
+### Whole-source purpose through retained Raft completion
+
+Source ownership is now a distinct private completion command field, independent
+of the single-root `source_admission.Command` that owns a local checkpoint.
+`TransactionIntentRequest.completion_source_purpose` is mutually exclusive with
+that command and requires a qualified completion owner and a nonzero fingerprint.
+Canonical PREPARE encoding includes it in the retained input digest. Frozen plans
+require identical purposes at every participant and exactly one declared
+checkpoint participant. The declaration does not by itself implement a source
+head or supply checkpoint writes.
+
+Private `begin_source_completion_v1`, `prepare_source_completion_v1`, and
+`resolve_source_completion_v1` reject omission, zero purposes, ordinary phase
+downgrades, and missing owners. Source BEGIN requires terminal retention and a
+v3 routed admission. Native BEGIN commits purpose, admission, credits and the
+actual applied marker atomically; PREPARE retains it on both ordered branches.
+Resolution and retained recovery/visibility retries carry the same purpose.
+Existing native purpose fences reject substitution, while ordinary expiry still
+cannot abort source-owned pending work. No root-local checkpoint command is
+copied to followers.
+
+These formats require all-applying-member Raft floor 35. Ordinary completion
+floors remain 31/32/33 and root-policy controls remain 34. Engine descriptor 50
+rejects older by-value transaction layouts and supplies the new native source
+completion methods. The opaque owner JSON ABI remains 104. No public endpoint
+or SDK contract is added.
+
+Qualification so far: `source-completion-protocol-test.log` passed both protocol
+classifier cases; `source-completion-purpose-test.log` passed 42 history/support
+and Raft envelope cases. `source-completion-purpose-native-test.log` passed all
+34 codec/runtime cases, including source phase round trips and downgrade/missing
+purpose rejection. `source-completion-purpose-raft-test.log` passed all 13 actual
+Raft/control/recovery cases without skips or leaks. The signed HTTP/native Raft
+fixture exercises source BEGIN, no-effect PREPARE, COMMIT, decision observations,
+repeated completion recovery, and a later full-index barrier. Earlier fixture
+failures (shadowed names, metadata type alias, and tagged-envelope assumptions)
+were corrected before these successful runs. A two-owner recovery qualification
+and existing bound-adapter regression are being checked separately.
+
+This is the retained native/Raft transport prerequisite. Production source
+journal integration, durable frozen-input recovery, the source-global checkpoint
+head, writable Iceberg admission, and the remaining public-feed/bootstrap/retention
+and pgoutput/client requirements remain unfinished under the full active goal.
+
+Final qualification for this change: `source-completion-purpose-two-owner-test.log`
+passed all 13 Raft/control/recovery cases. The stateful two-owner fixture requires
+the exact source purpose on the missing follower's terminal request, rejects
+mixed purposes and multiple checkpoint owners before admission, and verifies
+that a second recovery pass adds no resolution or publication mutations.
+`source-completion-bound-regression-test.log`,
+`ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build source-admission-test -j2`,
+passed all five bound-adapter cases, including receipt eviction, native/metadata
+restart after lost replies, and transform replay protection. Both suites ended
+successfully with no skips, failures or leaks. Formatting and diff checks passed.
+These results do not claim that the production source worker now uses this
+transport or that its source-global checkpoint has been implemented.

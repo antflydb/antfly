@@ -25689,12 +25689,30 @@ pub const DB = struct {
     /// are committed in the same native transaction.
     pub fn beginReplicatedCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: ?@import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity });
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity, null);
+    }
+
+    pub fn beginReplicatedSourceCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: OrderedApplyReceipt, purpose: [32]u8) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedSourceCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, identity, purpose });
+        if (std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, true, identity, purpose);
+    }
+
+    fn beginReplicatedCompletionTransactionInternal(self: *DB, encoded_plan: []const u8, owner: ?@import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt, purpose: ?[32]u8) !transactions_mod.TxnId {
         const completion = @import("../transaction_completion.zig");
         if (self.isClosed()) return error.StorageUnavailable;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var parsed = try completion.parseAdmission(self.alloc, encoded_plan);
         defer parsed.deinit();
         const plan = parsed.value.admission;
+        if (purpose != null and plan.version < 3) return error.ChangefeedCapabilityUnsupported;
+        if (purpose != null) {
+            var checkpoints: usize = 0;
+            for (plan.participants) |member| if (member.roles & completion.Roles.checkpoint != 0) {
+                checkpoints += 1;
+            };
+            if (checkpoints != 1) return error.InvalidSourceAdmission;
+        }
         lockApply(self);
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
@@ -25721,13 +25739,14 @@ pub const DB = struct {
                 var saved = (try manager.getCompletionAdmission(self.alloc, plan.transaction_id)) orelse return error.InvalidTxnRecord;
                 defer saved.deinit();
                 if (!std.mem.eql(u8, &saved.value.digest, &parsed.value.digest)) return error.DecisionConflict;
+                if (!std.meta.eql(try manager.getSourcePurpose(plan.transaction_id), purpose)) return error.SourceTransactionIdentityConflict;
                 return plan.transaction_id;
             },
             .apply => {},
         }
         var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker = orderedApplyReceiptWrite(identity, &value_buf);
-        const extra: transactions_mod.MutationExtraBatch = .{ .writes = &.{marker} };
+        const extra: transactions_mod.MutationExtraBatch = .{ .writes = &.{marker}, .source_purpose = purpose };
         if (std.mem.eql(u8, &namespace, &plan.coordinator_namespace))
             try manager.initTransactionWithCompletionAdmission(plan, timestamp_ns, created_at_ns, retain_terminal, extra)
         else
@@ -26387,6 +26406,8 @@ pub const DB = struct {
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
     ) !void {
+        const source_purpose = try req.sourcePurpose();
+        if (req.completion_source_purpose != null and ordered_receipt == null) return error.ChangefeedCapabilityUnsupported;
         {
             // Serialize this observation with decisions and prepared writes.
             // An actual already-applied Raft entry is immutable and must stay
@@ -26405,7 +26426,7 @@ pub const DB = struct {
             }
             var manager = try self.core.initTxnManager();
             defer manager.deinit();
-            if (try manager.completionPrepareStatus(txn_id, req.completion_input_digest, if (req.source_admission) |command| command.fingerprint() else null, req.completion_owner)) |prepared| {
+            if (try manager.completionPrepareStatus(txn_id, req.completion_input_digest, source_purpose, req.completion_owner)) |prepared| {
                 if (ordered_receipt == null) {
                     var read = try self.core.store.beginReadTxn();
                     defer read.abort();
@@ -26814,13 +26835,13 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .completion_owner = req.completion_owner, .completion_input_digest = req.completion_input_digest, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .completion_owner = req.completion_owner, .completion_input_digest = req.completion_input_digest, .source_purpose = source_purpose, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
                 .completion_owner = req.completion_owner,
                 .completion_input_digest = req.completion_input_digest,
-                .source_purpose = if (req.source_admission) |command| command.fingerprint() else null,
+                .source_purpose = source_purpose,
                 .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
@@ -27253,6 +27274,12 @@ pub const DB = struct {
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("resolveReplicatedCompletionTransactionAtOrderedReceipt", .{ self, txn_id, status, commit_version, identity, resolved_participant, completion_owner });
         try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .write, .none, identity, resolved_participant, null, completion_owner);
+    }
+
+    pub fn resolveReplicatedSourceCompletionTransactionAtOrderedReceipt(self: *DB, txn_id: types.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, identity: OrderedApplyReceipt, resolved_participant: ?[]const u8, owner: @import("../transaction_completion.zig").RoutedOwner, purpose: [32]u8) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveReplicatedSourceCompletionTransactionAtOrderedReceipt", .{ self, txn_id, status, commit_version, identity, resolved_participant, owner, purpose });
+        if (std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
+        try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .write, .none, identity, resolved_participant, purpose, owner);
     }
 
     pub const resolveTransactionIntentsInternal = local_mutation.resolveTransactionIntentsInternal;

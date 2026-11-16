@@ -44536,6 +44536,39 @@ fn consumerTests() type {
                     }
                     try std.testing.expectEqual(@as(usize, 2), late_fence.validations);
                 }
+                const SourceCompletion = struct {
+                    noinline fn run(source_alloc: std.mem.Allocator, origin_server: *DataServer, source_binding: @import("../api/completion_plan.zig").completion.RoutedOwner, source_fence: antfly.metadata_api.CatalogRouteFence, source_participant: @import("../api/completion_participant.zig").Port) !void {
+                        const source_plans = @import("../api/completion_plan.zig");
+                        const source_native_types = antfly.db.types;
+                        const source_id: [16]u8 = @splat(116);
+                        const source_purpose: [32]u8 = @splat(117);
+                        const source_prepare = try (source_native_types.TransactionIntentRequest{ .completion_owner = source_binding, .completion_source_purpose = source_purpose }).completionBatch(source_id, 4000, source_binding.topology_epoch);
+                        const source_locator = try @import("../api/distributed_txn.zig").participantIdForGroup(source_alloc, "docs", source_binding.group_id);
+                        defer source_alloc.free(source_locator);
+                        try std.testing.expectError(error.InvalidSourceAdmission, source_plans.Plan.freeze(source_alloc, source_id, @splat(118), source_binding, &.{.{ .owner = source_binding, .locator = source_locator, .roles = source_plans.completion.Roles.guards, .prepare = source_prepare }}, 4001));
+                        var source_plan = try source_plans.Plan.freeze(source_alloc, source_id, @splat(118), source_binding, &.{.{ .owner = source_binding, .locator = source_locator, .roles = source_plans.completion.Roles.checkpoint, .prepare = source_prepare }}, 4001);
+                        defer source_plan.deinit();
+                        try std.testing.expectEqual(source_purpose, source_plan.source_purpose.?);
+                        try source_participant.submit(source_alloc, &source_plan, 0, source_fence, .begin, .{});
+                        const source_query: @import("../api/history_decision_operations.zig").Request = .{ .version = 1, .owner = source_binding, .transaction_id = source_id, .minimum_applied_index = 1 };
+                        var source_pending = try origin_server.historyDecisionPort().read(source_alloc, source_fence, "docs", source_query, .{});
+                        defer source_pending.deinit();
+                        try std.testing.expectEqual(.pending, source_pending.value.decision.?.record.status);
+                        try std.testing.expectEqual(source_purpose, source_pending.value.decision.?.record.source_purpose.?);
+                        try source_participant.submit(source_alloc, &source_plan, 0, source_fence, .prepare, .{});
+                        try source_participant.submit(source_alloc, &source_plan, 0, source_fence, .{ .resolve = .{ .status = .committed, .commit_version = 4002 } }, .{});
+                        var source_recovery = origin_server.completionRecovery();
+                        source_recovery.participants = source_participant;
+                        try std.testing.expectEqual(.complete, try source_recovery.run(source_alloc, source_binding, source_fence, "docs", source_id, .{}));
+                        try std.testing.expectEqual(.complete, try source_recovery.run(source_alloc, source_binding, source_fence, "docs", source_id, .{}));
+                        var source_committed = try origin_server.historyDecisionPort().read(source_alloc, source_fence, "docs", source_query, .{});
+                        defer source_committed.deinit();
+                        try std.testing.expectEqual(.committed, source_committed.value.decision.?.record.status);
+                        try std.testing.expectEqual(source_purpose, source_committed.value.decision.?.record.source_purpose.?);
+                        try source_participant.submitRetained(source_alloc, source_query.binding(), source_committed.value, 0, source_fence, .{ .visibility = .full_index }, .{});
+                    }
+                };
+                try SourceCompletion.run(a, origin, current_owner, route.fence().?, remote_participant);
                 const HostedAdmission = struct {
                     noinline fn run(alloc: std.mem.Allocator, endpoint_uri: []const u8, source_catalog: antfly.public_api.table_catalog.CatalogSource, executor: antfly.common.http.RequestExecutor, root_path: []const u8, credential: []const u8) !void {
                         const Router = struct {
@@ -44651,7 +44684,7 @@ fn consumerTests() type {
             try std.testing.expect(policy_applied.outcome.?.applied.consumer == null);
             const policy_observed = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect_policy = .{ .namespace = namespace, .authority = ref.authority } });
             try std.testing.expectEqualDeep(policy_applied.outcome.?.applied.policy, policy_observed.outcome.?.applied.policy);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_source_completion_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
         }
 
         test "data raft ordered history proposal authority fences term membership and missing owners" {
@@ -44724,7 +44757,7 @@ fn consumerTests() type {
         }
 
         test "data raft ordered history protocol preflight distinguishes incompatible and unavailable peers" {
-            inline for (.{ @import("history_control_entry.zig").required_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version, @import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version }) |required| {
+            inline for (.{ @import("history_control_entry.zig").required_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version, @import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_completion_protocol_version }) |required| {
                 const a = std.testing.allocator;
                 const Fake = struct {
                     versions: [3]u16 = .{ required, required - 1, required },

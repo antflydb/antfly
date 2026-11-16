@@ -283,6 +283,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
                 try std.testing.expect(self.published[0] and self.published[1]);
                 try std.testing.expect(request.transaction.? == .resolve);
                 try std.testing.expectEqual(.committed, request.transaction.?.resolve.status);
+                try std.testing.expectEqualDeep(self.state.source_purpose, request.transaction.?.resolve.source_purpose);
                 try std.testing.expectEqual(@as(usize, 0), request.writes.len);
                 try std.testing.expectEqual(@as(usize, 0), request.transforms.len);
                 self.visibility_calls[index] += 1;
@@ -292,6 +293,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
 
             switch (request.transaction.?) {
                 .resolve => |terminal| {
+                    try std.testing.expectEqualDeep(self.state.source_purpose, terminal.source_purpose);
                     try std.testing.expectEqual(@as(local.storage_db_selected_root.db.types.TxnStatus, if (self.state.status == .committed) .committed else .aborted), terminal.status);
                     try std.testing.expectEqual(@as(u64, if (self.state.status == .committed) 20 else 30), terminal.commit_version);
                     if (self.state.status == .pending and terminal.status == .aborted) {
@@ -444,4 +446,32 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqualDeep([_]usize{ 2, 2 }, fake.visibility_calls);
     try std.testing.expectEqual(publications_after_completion, fake.publishes);
     try std.testing.expectEqual(writes_before_visibility, fake.resolves);
+
+    // Source ownership must survive recovery of a different original owner,
+    // not just an idempotent resolution at the coordinator itself.
+    const source_purpose: [32]u8 = @splat(21);
+    for (&frozen_inputs, 0..) |*input, index| {
+        input.roles = if (index == 0) completion.Roles.checkpoint else completion.Roles.guards;
+        input.prepare.transaction.?.prepare.source_purpose = source_purpose;
+    }
+    frozen_inputs[1].prepare.transaction.?.prepare.source_purpose = @splat(22);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, plan_mod.Plan.freeze(a, admission.transaction_id, @splat(23), owners[0], &frozen_inputs, 11));
+    frozen_inputs[1].prepare.transaction.?.prepare.source_purpose = source_purpose;
+    frozen_inputs[1].roles = completion.Roles.checkpoint;
+    try std.testing.expectError(error.InvalidSourceAdmission, plan_mod.Plan.freeze(a, admission.transaction_id, @splat(23), owners[0], &frozen_inputs, 11));
+    frozen_inputs[1].roles = completion.Roles.guards;
+    var source_frozen = try plan_mod.Plan.freeze(a, admission.transaction_id, @splat(23), owners[0], &frozen_inputs, 11);
+    defer source_frozen.deinit();
+    fake.admission = source_frozen.admission;
+    fake.state.source_purpose = source_purpose;
+    fake.resolved = .{ true, false };
+    fake.published = .{ false, false };
+    const source_resolves_before = fake.resolves;
+    const source_publishes_before = fake.publishes;
+    try std.testing.expectEqual(.complete, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));
+    try std.testing.expectEqual(source_resolves_before + 1, fake.resolves);
+    try std.testing.expectEqual(source_publishes_before + 2, fake.publishes);
+    try std.testing.expectEqual(.complete, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));
+    try std.testing.expectEqual(source_resolves_before + 1, fake.resolves);
+    try std.testing.expectEqual(source_publishes_before + 2, fake.publishes);
 }

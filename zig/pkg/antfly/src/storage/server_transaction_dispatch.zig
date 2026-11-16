@@ -98,7 +98,10 @@ pub fn applyReplicatedTransactionMutationInternal(
                 defer plan.deinit();
                 const member = try plan.value.admission.member(binding.namespace);
                 if (!std.mem.eql(u8, member.locator, local_participant)) return error.InvalidParticipant;
-                _ = try db.beginReplicatedCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, begin.retain_terminal, entry);
+                if (begin.source_purpose) |purpose| {
+                    if (!begin.retain_terminal) return error.InvalidBatchRequest;
+                    _ = try db.beginReplicatedSourceCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, entry, purpose);
+                } else _ = try db.beginReplicatedCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, begin.retain_terminal, entry);
                 return;
             }
             const coordinator = std.mem.eql(u8, begin.participants[0], local_participant);
@@ -137,6 +140,7 @@ pub fn applyReplicatedTransactionMutationInternal(
             const namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(db.core.identity_namespace);
             const intents: db_mod.types.TransactionIntentRequest = .{
                 .completion_owner = prepare.completion_owner,
+                .completion_source_purpose = prepare.source_purpose,
                 .completion_input_digest = completion.preparedInputDigest(namespace, encoded_input),
                 .document_version_scheme = req.document_version_scheme,
                 .row_policy_principal_proof = req.row_policy_principal_proof,
@@ -182,7 +186,10 @@ pub fn applyReplicatedTransactionMutationInternal(
                 if (resolve.completion_owner) |binding| {
                     try @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req);
                     if (req.restore_staging_scope != null or binding.group_id != group_id) return error.TopologyChanged;
-                    try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding);
+                    if (resolve.source_purpose) |purpose|
+                        try db.resolveReplicatedSourceCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding, purpose)
+                    else
+                        try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding);
                     return;
                 }
                 try db.resolveReplicatedTransactionAtOrderedReceipt(

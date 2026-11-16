@@ -69,7 +69,7 @@ pub const Port = struct {
             },
             .resolve => |terminal| blk: {
                 if (terminal.status == .pending or (terminal.status == .committed and terminal.commit_version <= plan.begin_timestamp)) return error.InvalidTxnRecord;
-                break :blk .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = owner, .txn_id = plan.admission.transaction_id, .status = terminal.status, .commit_version = terminal.commit_version } } };
+                break :blk .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = owner, .source_purpose = plan.source_purpose, .txn_id = plan.admission.transaction_id, .status = terminal.status, .commit_version = terminal.commit_version } } };
             },
             .publish => |bytes| blk: {
                 parsed_certificate = try completion.parse(a, bytes);
@@ -107,9 +107,9 @@ pub const Port = struct {
                 // Re-observe the durable terminal mutation through the normal
                 // owner-fenced synchronization boundary. This cannot execute
                 // original effects, create admission, or change the decision.
-                break :blk .{ .sync_level = level, .transaction = .{ .resolve = .{ .completion_owner = owner, .txn_id = admission.transaction_id, .status = .committed, .commit_version = decision.record.commit_version } } };
+                break :blk .{ .sync_level = level, .transaction = .{ .resolve = .{ .completion_owner = owner, .source_purpose = decision.record.source_purpose, .txn_id = admission.transaction_id, .status = .committed, .commit_version = decision.record.commit_version } } };
             },
-            .resolve => .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = owner, .txn_id = admission.transaction_id, .status = if (decision.record.status == .committed) .committed else .aborted, .commit_version = if (decision.record.status == .committed) decision.record.commit_version else decision.record.finalized_at_ns } } },
+            .resolve => .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = owner, .source_purpose = decision.record.source_purpose, .txn_id = admission.transaction_id, .status = if (decision.record.status == .committed) .committed else .aborted, .commit_version = if (decision.record.status == .committed) decision.record.commit_version else decision.record.finalized_at_ns } } },
             .publish => |bytes| blk: {
                 const manifest = try decision.committedManifest();
                 parsed = try completion.parse(a, bytes);
@@ -135,7 +135,7 @@ pub const Port = struct {
         const owner = try admission.recoveryOwner(member.namespace);
         const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
         try validateParticipantFence(owner, locator.group_id, fence);
-        const request: types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = owner, .txn_id = admission.transaction_id, .status = .aborted, .commit_version = timestamp_ns } } };
+        const request: types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = owner, .source_purpose = decision.record.source_purpose, .txn_id = admission.transaction_id, .status = .aborted, .commit_version = timestamp_ns } } };
         return self.writeRequest(a, fence, owner, locator.table_name, request, context, scope.deadline_ns);
     }
 
