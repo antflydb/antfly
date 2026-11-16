@@ -120,6 +120,17 @@ const EntryPool = std.heap.MemoryPool(VersionedOverlayEntry);
 
 const OverlayMap = std.StringHashMapUnmanaged(*VersionedOverlayEntry);
 
+/// Clear the tombstones a batch of removals left in `map`. Zig's hash map
+/// marks a removed slot as a tombstone and does not count it against the
+/// load budget, so a map that keeps inserting and removing (every fold's
+/// `reclaim`, every flushed page) never grows and never rehashes. Each
+/// lookup that misses then probes past every tombstone, and the writer's
+/// many overlay probes per commit slow down without bound. Callers hold
+/// `SharedRedoOverlay.mutex`; this invalidates pointers into `map`.
+fn compactAfterRemovals(map: anytype, ctx: anytype) void {
+    if (map.count() == 0) map.clearRetainingCapacity() else map.rehash(ctx);
+}
+
 /// Ordered key index, one per root, mirroring exactly the key set each
 /// `OverlayMap` holds (same owned key bytes -- a node's `.key` is the
 /// identical slice the hashmap already owns, never a second copy).
@@ -430,6 +441,7 @@ pub const SharedRedoOverlay = struct {
         for (flushed) |p| {
             if (self.pages.fetchRemove(p.page_id)) |kv| allocator.free(kv.value);
         }
+        if (flushed.len != 0) compactAfterRemovals(&self.pages, std.hash_map.AutoContext(u64){});
     }
 
     /// Drops every staged page, once a checkpoint has folded them all
@@ -1032,6 +1044,7 @@ pub const SharedRedoOverlay = struct {
                     _ = removed.value.destroyChain(allocator, &self.entry_pool);
                 }
             }
+            if (drop_keys.items.len != 0) compactAfterRemovals(map, std.hash_map.StringContext{});
         }
     }
 
@@ -1213,6 +1226,42 @@ test "redo overlay reclaim keeps versions a live pin still needs and drops the r
     overlay.reclaim(a, std.testing.io, 3);
     try std.testing.expectEqual(@as(?VersionedOverlayEntry, null), try overlay.resolveAlloc(a, std.testing.io, 2, "k", 3));
     try std.testing.expectEqual(@as(usize, 0), overlay.count(std.testing.io, 2));
+}
+
+test "redo overlay reclaim leaves no tombstones behind in its key maps" {
+    const a = std.testing.allocator;
+    var overlay: SharedRedoOverlay = .{};
+    defer overlay.deinit(a);
+    const Probe = struct {
+        fn tombstones(map: anytype) usize {
+            const metadata = map.metadata orelse return 0;
+            var n: usize = 0;
+            for (metadata[0..map.capacity()]) |slot| n += @intFromBool(slot.isTombstone());
+            return n;
+        }
+    };
+
+    var key_buf: [16]u8 = undefined;
+    for (1..65) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
+        try overlay.appendVersion(a, std.testing.io, 2, key, i, try owned_allocator.dupe(u8, "v"), false, 0, 0);
+    }
+
+    // A fold covering half the keys drops those; the rest stay and must
+    // still resolve, with the dropped slots rehashed away.
+    overlay.reclaim(a, std.testing.io, 32);
+    try std.testing.expectEqual(@as(usize, 32), overlay.count(std.testing.io, 2));
+    try std.testing.expectEqual(@as(usize, 0), Probe.tombstones(&overlay.maps[2]));
+    for (33..65) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
+        const found = (try overlay.resolveAlloc(a, std.testing.io, 2, key, i)).?;
+        a.free(found.value);
+    }
+
+    // A fold covering everything empties the map entirely.
+    overlay.reclaim(a, std.testing.io, 64);
+    try std.testing.expectEqual(@as(usize, 0), overlay.count(std.testing.io, 2));
+    try std.testing.expectEqual(@as(usize, 0), Probe.tombstones(&overlay.maps[2]));
 }
 
 // perf/lwa-overlay-order: tests for the ordered key index (`ordered`,
