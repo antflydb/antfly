@@ -25170,6 +25170,9 @@ pub const HostedProvisionedTableWriteSource = struct {
     /// Production metadata writers enable the signed retained-history path.
     /// Physical-only adapters may expose just the legacy local callback set.
     completion_admission: bool = false,
+    provision_history_policy: bool = false,
+    history_policy_guard: ?@import("history_policy_provisioning.zig").Guard = null,
+    history_policy_cache: @import("history_policy_provisioning.zig").Cache = .{},
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     router: table_router.HostedGroupRouter,
@@ -25202,6 +25205,13 @@ pub const HostedProvisionedTableWriteSource = struct {
             .router = router,
             .executor = executor,
         };
+    }
+
+    pub fn withHistoryPolicyProvisioning(self: *HostedProvisionedTableWriteSource, guard: ?@import("history_policy_provisioning.zig").Guard) *HostedProvisionedTableWriteSource {
+        self.provision_history_policy = true;
+        self.history_policy_guard = guard;
+        self.completion_admission = true;
+        return self;
     }
 
     pub fn withCompletionAdmission(self: *HostedProvisionedTableWriteSource) *HostedProvisionedTableWriteSource {
@@ -26515,7 +26525,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
         _ = worker_impl.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
-        var completion_transport: @import("hosted_completion.zig").Hosted = .{ .catalog = self.catalog, .router = self.router, .executor = self.executor, .secret = self.internal_service_secret, .issuer = self.internal_service_issuer };
+        var completion_transport: @import("hosted_completion.zig").Hosted = .{ .catalog = self.catalog, .router = self.router, .executor = self.executor, .secret = self.internal_service_secret, .issuer = self.internal_service_issuer, .provision_policy = self.provision_history_policy, .policy_guard = self.history_policy_guard, .policy_cache = &self.history_policy_cache };
         const commit_version = begin_timestamp + 1;
         return try distributed_txn.executeMultiTableCommitWithOptions(
             alloc,

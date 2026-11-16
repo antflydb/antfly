@@ -34,17 +34,38 @@ pub const Hosted = struct {
     executor: @import("../raft/transport/http_common.zig").RequestExecutor,
     secret: ?[]const u8,
     issuer: ?[]const u8,
+    provision_policy: bool = false,
+    policy_guard: ?@import("history_policy_provisioning.zig").Guard = null,
+    policy_cache: ?*@import("history_policy_provisioning.zig").Cache = null,
 
     /// Returned callbacks borrow this adapter only for the synchronous commit.
     /// Native retained state, not this adapter, owns subsequent recovery.
     pub fn coordinator(self: *Hosted) @import("completion_admission.zig").Coordinator {
-        return .{ .owners = .{ .ptr = self, .read_fn = Reader(owner_ops, owner_ops.Reply, "fetchGroupHistoryOwner").read }, .recovery = .{
+        return .{ .owners = .{ .ptr = self, .read_fn = owner }, .recovery = .{
             .catalog = self.catalog,
             .decisions = .{ .ptr = self, .read_fn = Reader(decision_ops, decision_ops.Reply, "fetchGroupHistoryDecision").read },
             .resolutions = .{ .ptr = self, .read_fn = Reader(resolution_ops, resolution_ops.wire.Reply, "fetchGroupHistoryResolution").read },
             .publications = .{ .ptr = self, .read_fn = Reader(publication_ops, publication_ops.Reply, "fetchGroupHistoryPublication").read },
             .participants = .{ .writer = .{ .ptr = self, .write_fn = write } },
         } };
+    }
+    fn owner(ptr: *anyopaque, a: A, fence: metadata.CatalogRouteFence, table: []const u8, input: owner_ops.Request, context: Context) !owner_ops.Reply {
+        const self: *Hosted = @ptrCast(@alignCast(ptr));
+        if (!self.provision_policy) return Reader(owner_ops, owner_ops.Reply, "fetchGroupHistoryOwner").read(ptr, a, fence, table, input, context);
+        const provisioner: @import("history_policy_provisioning.zig").Provisioner = .{ .controls = self.controlPort(), .owners = .{ .ptr = self, .read_fn = Reader(owner_ops, owner_ops.Reply, "fetchGroupHistoryOwner").read }, .guard = self.policy_guard, .cache = self.policy_cache };
+        return provisioner.ensure(a, fence, table, input, context);
+    }
+    pub fn controlPort(self: *Hosted) @import("history_control_operations.zig").Port {
+        return .{ .ptr = self, .execute_fn = control };
+    }
+    fn control(ptr: *anyopaque, a: A, fence: metadata.CatalogRouteFence, table: []const u8, input: @import("history_control_operations.zig").wire.Request, original: Context) !@import("history_control_operations.zig").wire.Response {
+        const self: *Hosted = @ptrCast(@alignCast(ptr));
+        var scope = try owner_ops.Scope.init(fence, original);
+        const context = scope.context();
+        const uri = try self.endpoint(a, fence.route.group_id, context);
+        defer a.free(uri);
+        var signed = self.client(a);
+        return signed.fetchGroupHistoryControl(uri, fence.route.group_id, table, input, fence, context);
     }
     fn client(self: *Hosted, a: A) client_mod.ApiHttpClient {
         var result = client_mod.ApiHttpClient.init(a, self.executor);

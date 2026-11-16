@@ -43828,7 +43828,7 @@ fn consumerTests() type {
             std.mem.writeInt(u64, namespace[8..16], 601, .big);
             std.mem.writeInt(u64, namespace[16..24], 601, .big);
             const control = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
-            const grant: control.Grant = .{ .namespace = namespace, .authority = @splat(1), .consumer = @splat(2), .definition = @splat(3), .sequence = 1, .expires_at_seconds = 1000, .policy_revision = 1 };
+            const grant: control.Grant = .{ .namespace = namespace, .authority = try @import("../api/history_policy_provisioning.zig").authority(route.fence().?), .consumer = @splat(2), .definition = @splat(3), .sequence = 1, .expires_at_seconds = 1000, .policy_revision = 1 };
             var unknown_group = route.fence().?;
             unknown_group.route.group_id = 602;
             try std.testing.expectError(error.GroupLeaderUnavailable, server.submitHistoryControlLocal(a, unknown_group, "docs", .{ .enroll = grant }));
@@ -44565,7 +44565,7 @@ fn consumerTests() type {
                         defer alloc.free(cache_root);
                         defer antfly.public_api.table_writes.closeHostedManagedDbCacheForRoot(cache_root);
                         var hosted = antfly.public_api.table_writes.HostedProvisionedTableWriteSource.init(cache_root, source_catalog, hosted_router.router(), executor);
-                        _ = hosted.withInternalServiceAuth(credential, "history-runtime").withCompletionAdmission();
+                        _ = hosted.withInternalServiceAuth(credential, "history-runtime").withHistoryPolicyProvisioning(null);
                         const source = hosted.source();
                         const input = [_]@import("../api/distributed_txn.zig").TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "hosted-completion", .value = "{\"v\":9}" }} }};
                         const hosted_outcome = (try source.commitTransactionWithId(alloc, @splat(115), 3000, &input, .write)).?;

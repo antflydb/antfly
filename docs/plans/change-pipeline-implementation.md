@@ -3583,3 +3583,64 @@ quota/CAS, reopen and post-retirement capture checks in the same case pass.
 This supersedes the preceding milestone's claim that a grant authorization
 revision must match the configured retention revision. Automatic provisioning
 and the rest of the full issue scope remain outstanding.
+
+### Provision retained capture before hosted CDC transaction admission
+
+The production metadata HTTP CDC worker now enables initial root-policy
+provisioning on its hosted transaction writer. Each original native participant
+must have a confirmed policy and qualified owner before the coordinator can send
+its first BEGIN. Provisioning inspects the root's existing policy and preserves
+administrative revision/ceiling choices. An unconfigured or mismatched-authority
+inspection is not an absence proof: only an exact initial revision-1/predecessor-0
+CAS at the native default ceiling is attempted, and native namespace/authority
+checks independently prevent takeover. No resize is authorized by this path.
+Unknown inspection/configuration responses defer admission; a later pass starts
+with inspection and can observe an installed policy without resubmitting it.
+
+The system retention authority derives from the metadata group and incarnation,
+excluding names, schema/index publications, leader terms and feed authorization
+revisions. Future public feed factories must use the same system authority.
+Existing roots bound to another authority fail closed until explicit handoff;
+configuration is not a consumer enrollment, source ACK, or bootstrap cut.
+The CDC worker's existing metadata work permit is checked before/after each
+provisioning boundary through the callback ABI.
+
+A bounded 64-entry cache belongs to the hosted writer, not native storage or a
+consumer lease. Each hit still requires a fresh qualified owner/cut/ceiling and
+valid work permit. Its proof binds the complete original owner digest, ceiling
+and confirmed native control index; physical-generation or budget changes force
+inspection again. Supported policy controls cannot remove activation on the same
+physical owner; any future disable contract must invalidate this proof. Cache access uses a nonblocking atomic mutex; a contended lookup falls back to
+inspection and a contended update is skipped. Cache locks are not held across
+RPCs, and cache contention never blocks admission. This avoids appending policy
+inspection entries for every unchanged transaction while keeping ownership and
+capacity observations fresh. No new native ABI or RPC is
+introduced; the existing signed control and owner protocols are reused.
+
+Qualification: `cdc-root-policy-provisioning-qualified-test.log`,
+`ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build history-control-apply-test -j2`
+with loopback networking, passed all 13 cases without skips, failures or leaks.
+The actual hosted commit callback now initializes the policy through signed
+HTTP/native Raft before committing and retrying with full-index visibility.
+Stateful checks cover existing administrative policies, lost inspection, an
+applied configuration with lost reply followed by read reconciliation, conflicting
+authority, lagging native owner cut, revoked metadata lease, cache reuse and
+invalidation by physical generation/ceiling changes.
+`cdc-policy-metadata-worker-test.log`,
+`ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build antfly-metadata-service-test -j2`,
+passed all 137 metadata service/control-loop regressions without skips or leaks.
+License, formatting and diff checks passed.
+
+This provisions hosted transactional destinations. It does not finish direct
+snapshot batch integration, source-global checkpoint/head anchoring, zero-effect
+source transactions, native standalone completion, coherent bootstrap, timed
+retention or obligation release, public feeds, writable Iceberg destination
+commits, typed pgoutput production wiring, or existing-client qualification.
+Those remain required by the unchanged full goal.
+
+Final qualification after the shared-writer cache synchronization change:
+`cdc-root-policy-provisioning-final-test.log`,
+`ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build history-control-apply-test antfly-metadata-service-test -j2`,
+passed all 150 cases (13 provisioning/Raft, 137 metadata service), with no skips,
+failures or leaks. The added contention check holds the cache unavailable and
+verifies that provisioning completes through inspection without blocking.
