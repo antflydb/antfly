@@ -820,6 +820,42 @@ pub const NativeHistoryRetirement = struct {
     grant: u64,
 };
 
+/// Private canonical prepare_source_checkpoint_v1 payload, admitted only with data-Raft protocol 37. This command is included in frozen PREPARE input and is never accepted from public batch JSON. The named checkpoint participant predicates on the previous head and commits the new head with transaction resolution. Physical checkpoint authority is routed and frozen separately; binding is the immutable logical source scope.
+pub const NativeSourceCheckpointCommand = struct {
+    binding: NativeHistoryDigest,
+    purpose: NativeHistoryDigest,
+    sequence: u64,
+    checkpoint: []const u8,
+    expected_checkpoint: OpenApiOptionalNullable([]const u8) = .absent,
+    accepted_at_ns: u64,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("binding");
+        try jw.write(self.binding);
+        try jw.objectField("purpose");
+        try jw.write(self.purpose);
+        try jw.objectField("sequence");
+        try jw.write(self.sequence);
+        try jw.objectField("checkpoint");
+        try jw.write(self.checkpoint);
+        switch (self.expected_checkpoint) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("expected_checkpoint");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("expected_checkpoint");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("accepted_at_ns");
+        try jw.write(self.accepted_at_ns);
+        try jw.endObject();
+    }
+};
+
 pub const NativeSourcePlanChunkQuery = struct {
     root: NativeSourcePlanRoot,
     spec: NativeSourcePlanSpec,

@@ -18,6 +18,7 @@ const std = @import("std");
 
 pub fn isRawMetadataKey(key: []const u8) bool {
     return @import("source_admission.zig").isKey(key) or
+        @import("source_checkpoint.zig").isKey(key) or
         @import("range_protection.zig").counterBucket(key) != null or
         @import("range_protection.zig").indexCounterDigest(key) != null or
         std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or

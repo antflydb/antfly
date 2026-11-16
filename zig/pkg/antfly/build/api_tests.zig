@@ -484,6 +484,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("completion-begin-wire-test", "Verify frozen completion BEGIN encoding and downgrade rejection").dependOn(&b.addRunArtifact(completion_begin_tests).step);
+    const api_kernel_abi_filters = &.{ "API kernel", "API imported runtime capability" };
+    const api_kernel_abi_tests = b.addTest(.{
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api HTTP runtime discovery"}, api_kernel_abi_filters),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("api-kernel-abi-test", "Verify API callback layout and rejection of incompatible contexts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, api_kernel_abi_tests, api_kernel_abi_filters).step);
     const source_plan_http_filters = &.{"source plan HTTP"};
     const source_plan_http_tests = b.addTest(.{
         .root_module = options.api_http_runtime_test_mod,

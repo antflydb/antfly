@@ -46,6 +46,7 @@ pub const Plan = struct {
     begin_timestamp: u64,
     created_at_ns: u64,
     source_purpose: ?[32]u8,
+    source_checkpoint: bool = false,
 
     pub fn deinit(self: *Plan) void {
         self.arena.deinit();
@@ -65,6 +66,7 @@ pub const Plan = struct {
         var begin_timestamp: u64 = 0;
         var source_purpose: ?[32]u8 = null;
         var checkpoint_count: usize = 0;
+        var source_checkpoint = false;
         var total_payload_bytes: usize = 0;
         var unique_locators: std.StringHashMapUnmanaged(void) = .empty;
         for (inputs, 0..) |input, i| {
@@ -76,6 +78,11 @@ pub const Plan = struct {
             const vote = mutation.prepare;
             if (i == 0) source_purpose = vote.source_purpose else if (!std.meta.eql(source_purpose, vote.source_purpose)) return error.SourceTransactionIdentityConflict;
             if (input.roles & completion.Roles.checkpoint != 0) checkpoint_count += 1;
+            if (vote.source_checkpoint) |checkpoint| {
+                try checkpoint.validate();
+                if (vote.source_purpose == null or !std.mem.eql(u8, &checkpoint.purpose, &vote.source_purpose.?) or input.roles & completion.Roles.checkpoint == 0) return error.InvalidSourceAdmission;
+                source_checkpoint = true;
+            }
             const owner = vote.completion_owner orelse return error.InvalidBatchRequest;
             if (!std.mem.eql(u8, &vote.txn_id, &transaction_id)) return error.SourceTransactionIdentityConflict;
             if (!std.mem.eql(u8, &owner.digest(), &input.owner.digest()) or vote.topology_epoch != input.owner.topology_epoch) return error.TopologyChanged;
@@ -117,7 +124,7 @@ pub const Plan = struct {
             ids[follower] = participant.locator;
             follower += 1;
         }
-        return .{ .arena = arena, .admission = admission, .admission_bytes = encoded, .participants = participants, .participant_ids = ids, .begin_timestamp = begin_timestamp, .created_at_ns = created_at_ns, .source_purpose = source_purpose };
+        return .{ .arena = arena, .admission = admission, .admission_bytes = encoded, .participants = participants, .participant_ids = ids, .begin_timestamp = begin_timestamp, .created_at_ns = created_at_ns, .source_purpose = source_purpose, .source_checkpoint = source_checkpoint };
     }
 
     /// Derive a retry identity from canonical namespace order and the complete
@@ -145,6 +152,7 @@ pub const Plan = struct {
         if (self.participant_ids.len != self.participants.len or !std.mem.eql(u8, self.participant_ids[0], (try self.admission.member(self.admission.coordinator_namespace)).locator)) return error.InvalidParticipant;
         var follower: usize = 1;
         var checkpoints: usize = 0;
+        var has_checkpoint_command = false;
         for (self.participants, 0..) |participant, index| {
             var request = try self.prepare(a, index);
             defer request.deinit(a);
@@ -154,11 +162,17 @@ pub const Plan = struct {
             if (!std.mem.eql(u8, &mutation.prepare.txn_id, &self.admission.transaction_id) or mutation.prepare.completion_owner == null or !std.mem.eql(u8, &mutation.prepare.completion_owner.?.digest(), &participant.owner.digest()) or mutation.prepare.topology_epoch != participant.owner.topology_epoch) return error.SourceTransactionIdentityConflict;
             const member = try self.admission.member(participant.owner.namespace);
             if (member.roles & completion.Roles.checkpoint != 0) checkpoints += 1;
+            if (mutation.prepare.source_checkpoint) |checkpoint| {
+                try checkpoint.validate();
+                if (self.source_purpose == null or !std.mem.eql(u8, &checkpoint.purpose, &self.source_purpose.?) or member.roles & completion.Roles.checkpoint == 0) return error.InvalidSourceAdmission;
+                has_checkpoint_command = true;
+            }
             if (!std.mem.eql(u8, &participant.owner.namespace, &self.admission.coordinator_namespace)) {
                 if (follower >= self.participant_ids.len or !std.mem.eql(u8, self.participant_ids[follower], participant.locator)) return error.InvalidParticipant;
                 follower += 1;
             }
         }
+        if (has_checkpoint_command != self.source_checkpoint) return error.SourcePayloadConflict;
         if (self.source_purpose != null and checkpoints != 1) return error.InvalidSourceAdmission;
         var size: usize = frozen_header_bytes + self.admission_bytes.len;
         var payload_bytes: usize = 0;
@@ -250,7 +264,7 @@ pub const Plan = struct {
         if (index >= self.participants.len) return error.InvalidTxnRecord;
         const owner = self.participants[index].owner;
         try self.admission.requireRoutedOwner(owner);
-        return .{ .sync_level = .write, .transaction = .{ .begin = .{ .txn_id = self.admission.transaction_id, .begin_timestamp = self.begin_timestamp, .created_at_ns = self.created_at_ns, .topology_epoch = owner.topology_epoch, .retain_terminal = true, .participants = self.participant_ids, .completion_admission = self.admission_bytes, .completion_owner = owner, .source_purpose = self.source_purpose } } };
+        return .{ .sync_level = .write, .transaction = .{ .begin = .{ .txn_id = self.admission.transaction_id, .begin_timestamp = self.begin_timestamp, .created_at_ns = self.created_at_ns, .topology_epoch = owner.topology_epoch, .retain_terminal = true, .participants = self.participant_ids, .completion_admission = self.admission_bytes, .completion_owner = owner, .source_purpose = self.source_purpose, .source_checkpoint = self.source_checkpoint } } };
     }
 
     /// Parsed retry input has independent ownership and can outlive this plan.

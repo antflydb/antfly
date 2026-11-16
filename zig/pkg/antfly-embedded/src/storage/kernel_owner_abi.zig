@@ -28,7 +28,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 94 adds read-only exact retained-history outcome recovery.
 // Version 95 adds request-bound read-only retained grant observations.
 // Version 96 adds cut-bound immutable participant resolution reads.
-pub const abi_version: u32 = 104;
+// Version 105 fences source-checkpoint failure statuses across owner calls.
+pub const abi_version: u32 = 105;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

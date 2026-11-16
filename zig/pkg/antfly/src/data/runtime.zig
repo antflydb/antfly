@@ -1350,6 +1350,9 @@ const RaftTableApplyStateMachine = struct {
         SourcePendingWork,
         SourcePayloadConflict,
         SourceAdmissionBackpressure,
+        SourceCheckpointConflict,
+        SourceTransactionIdentityConflict,
+        SourceAlreadyCommitted,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
@@ -1378,6 +1381,9 @@ const RaftTableApplyStateMachine = struct {
                 error.SourcePendingWork => .SourcePendingWork,
                 error.SourcePayloadConflict => .SourcePayloadConflict,
                 error.SourceAdmissionBackpressure => .SourceAdmissionBackpressure,
+                error.SourceCheckpointConflict => .SourceCheckpointConflict,
+                error.SourceTransactionIdentityConflict => .SourceTransactionIdentityConflict,
+                error.SourceAlreadyCommitted => .SourceAlreadyCommitted,
 
                 error.InvalidArtifactCatalogCommand => .InvalidArtifactCatalogCommand,
                 error.ArtifactCatalogEpochChanged => .ArtifactCatalogEpochChanged,
@@ -1444,6 +1450,9 @@ const RaftTableApplyStateMachine = struct {
                 .SourcePendingWork => error.SourcePendingWork,
                 .SourcePayloadConflict => error.SourcePayloadConflict,
                 .SourceAdmissionBackpressure => error.SourceAdmissionBackpressure,
+                .SourceCheckpointConflict => error.SourceCheckpointConflict,
+                .SourceTransactionIdentityConflict => error.SourceTransactionIdentityConflict,
+                .SourceAlreadyCommitted => error.SourceAlreadyCommitted,
 
                 .InvalidArtifactCatalogCommand => error.InvalidArtifactCatalogCommand,
                 .ArtifactCatalogEpochChanged => error.ArtifactCatalogEpochChanged,
@@ -43778,7 +43787,7 @@ fn consumerTests() type {
             const http = antfly.common.http;
             const a = std.testing.allocator;
             const Fake = struct {
-                const Mode = enum { valid, wrong_counts, malformed, duplicate, missing_ack, wrong_content_type, outcome_header, oversized, lost };
+                const Mode = enum { valid, wrong_counts, malformed, duplicate, missing_ack, wrong_content_type, outcome_header, oversized, lost, source_conflict, source_unknown, source_empty };
                 mode: Mode = .valid,
                 calls: usize = 0,
                 fn realtimeNs(_: *anyopaque) i128 {
@@ -43795,25 +43804,26 @@ fn consumerTests() type {
                     try std.testing.expect(request.timeout_ms.? > 0 and request.timeout_ms.? <= 1000);
                     if (request.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
                     if (self.mode == .lost) return error.ConnectionResetByPeer;
-                    var response: http.HttpResponse = .{ .status = 201 };
+                    var response: http.HttpResponse = .{ .status = if (self.mode == .source_conflict or self.mode == .source_unknown or self.mode == .source_empty) 409 else 201 };
                     errdefer response.deinit(alloc);
                     response.content_type = try alloc.dupe(u8, if (self.mode == .wrong_content_type) "text/plain" else "application/json");
                     response.body = if (self.mode == .oversized) try alloc.alloc(u8, 4097) else try alloc.dupe(u8, switch (self.mode) {
+                        .source_conflict, .source_unknown, .source_empty => "SourcePayloadConflict",
                         .malformed => "{",
                         .duplicate => "{\"inserted\":0,\"inserted\":0,\"deleted\":0,\"transformed\":0}",
                         .wrong_counts => "{\"inserted\":1,\"deleted\":0,\"transformed\":0}",
                         else => "{\"inserted\":0,\"deleted\":0,\"transformed\":0}",
                     });
                     if (self.mode == .oversized) @memset(response.body, 'x');
-                    response.headers = try alloc.alloc(http.Header, if (self.mode == .missing_ack) 0 else if (self.mode == .outcome_header) 2 else 1);
+                    response.headers = try alloc.alloc(http.Header, if (self.mode == .missing_ack) 0 else if (self.mode == .outcome_header or self.mode == .source_unknown or self.mode == .source_empty) 2 else 1);
                     @memset(response.headers, .{ .name = &.{}, .value = &.{} });
                     if (response.headers.len > 0) {
                         response.headers[0].name = try alloc.dupe(u8, antfly.metadata_api.catalog_route_fence_ack_header);
                         response.headers[0].value = try alloc.dupe(u8, antfly.metadata_api.catalog_route_fence_ack_value);
                     }
-                    if (self.mode == .outcome_header) {
+                    if (self.mode == .outcome_header or self.mode == .source_unknown or self.mode == .source_empty) {
                         response.headers[1].name = try alloc.dupe(u8, antfly.public_api.internal_batch_forwarding.outcome_header);
-                        response.headers[1].value = try alloc.dupe(u8, antfly.public_api.internal_batch_forwarding.outcome_unknown_v1);
+                        response.headers[1].value = try alloc.dupe(u8, if (self.mode == .source_empty) "" else antfly.public_api.internal_batch_forwarding.outcome_unknown_v1);
                     }
                     return response;
                 }
@@ -43825,7 +43835,7 @@ fn consumerTests() type {
             const fence: antfly.metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .catalog_revision = 9, .table_id = 7, .topology_epoch = 4, .route = .{ .group_id = 601, .range_id = 601, .identity_namespace = .{ .table_id = 7, .shard_id = 601, .range_id = 601 } } };
             const forwarding: antfly.public_api.internal_batch_forwarding.Context = .{ .remaining_ms = 1000, .forwards_remaining = 0, .campaign_allowed = false };
             _ = try adapter.writer().write(a, .{ .catalog = fence }, 601, "docs/a?", .{}, forwarding, .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s });
-            for ([_]Fake.Mode{ .wrong_counts, .malformed, .duplicate, .missing_ack, .wrong_content_type, .outcome_header, .oversized, .lost }) |mode| {
+            for ([_]Fake.Mode{ .wrong_counts, .malformed, .duplicate, .missing_ack, .wrong_content_type, .outcome_header, .oversized, .lost, .source_unknown, .source_empty }) |mode| {
                 fake.mode = mode;
                 const before = fake.calls;
                 if (adapter.writer().write(a, .{ .catalog = fence }, 601, "docs/a?", .{}, forwarding, .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s })) |_| return error.TestExpectedError else |err| switch (err) {
@@ -43834,6 +43844,10 @@ fn consumerTests() type {
                 }
                 try std.testing.expectEqual(before + 1, fake.calls);
             }
+            fake.mode = .source_conflict;
+            const before_conflict = fake.calls;
+            try std.testing.expectError(error.SourcePayloadConflict, adapter.writer().write(a, .{ .catalog = fence }, 601, "docs/a?", .{}, forwarding, .{}));
+            try std.testing.expectEqual(before_conflict + 1, fake.calls);
         }
 
         test "data raft ordered history completion participant preserves command scopes and never retries mutations" {
@@ -44872,7 +44886,7 @@ fn consumerTests() type {
                         const source_native_types = antfly.db.types;
                         const source_id: [16]u8 = @splat(116);
                         const source_purpose: [32]u8 = @splat(117);
-                        const source_prepare = try (source_native_types.TransactionIntentRequest{ .completion_owner = source_binding, .completion_source_purpose = source_purpose }).completionBatch(source_id, 4000, source_binding.topology_epoch);
+                        const source_prepare = try (source_native_types.TransactionIntentRequest{ .completion_owner = source_binding, .completion_source_purpose = source_purpose, .completion_source_checkpoint = .{ .binding = @splat(121), .purpose = source_purpose, .sequence = 1, .checkpoint = "source:1", .accepted_at_ns = 4001 } }).completionBatch(source_id, 4000, source_binding.topology_epoch);
                         const source_locator = try @import("../api/distributed_txn.zig").participantIdForGroup(source_alloc, "docs", source_binding.group_id);
                         defer source_alloc.free(source_locator);
                         try std.testing.expectError(error.InvalidSourceAdmission, source_plans.Plan.freeze(source_alloc, source_id, @splat(118), source_binding, &.{.{ .owner = source_binding, .locator = source_locator, .roles = source_plans.completion.Roles.guards, .prepare = source_prepare }}, 4001));
@@ -44885,6 +44899,8 @@ fn consumerTests() type {
                         };
                         defer source_plan.deinit();
                         try std.testing.expectEqual(source_purpose, source_plan.source_purpose.?);
+                        try std.testing.expect(source_plan.source_checkpoint);
+                        try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_source_checkpoint_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(source_alloc, try source_plan.begin(0)));
                         try source_participant.submit(source_alloc, &source_plan, 0, source_fence, .begin, .{});
                         const source_query: @import("../api/history_decision_operations.zig").Request = .{ .version = 1, .owner = source_binding, .transaction_id = source_id, .minimum_applied_index = 1 };
                         var source_pending = try origin_server.historyDecisionPort().read(source_alloc, source_fence, "docs", source_query, .{});
@@ -44902,8 +44918,29 @@ fn consumerTests() type {
                         try std.testing.expectEqual(.committed, source_committed.value.decision.?.record.status);
                         try std.testing.expectEqual(source_purpose, source_committed.value.decision.?.record.source_purpose.?);
                         try source_participant.submitRetained(source_alloc, source_query.binding(), source_committed.value, 0, source_fence, .{ .visibility = .full_index }, .{});
+                        // A committed head rejects a conflicting first sequence.
+                        // An aborted second sequence must leave its predecessor
+                        // available to a different, subsequently committed input.
+                        for ([_]u8{ 122, 124, 126, 128 }) |attempt_id| {
+                            const attempt_purpose: [32]u8 = @splat(attempt_id + 1);
+                            const conflict = attempt_id == 122;
+                            const gap = attempt_id == 124;
+                            const attempt_prepare = try (source_native_types.TransactionIntentRequest{ .completion_owner = source_binding, .completion_source_purpose = attempt_purpose, .completion_source_checkpoint = .{ .binding = @splat(121), .purpose = attempt_purpose, .sequence = if (conflict) 1 else if (gap) 3 else 2, .checkpoint = if (attempt_id == 126) "source:aborted" else "source:2", .expected_checkpoint = if (conflict) null else "source:1", .accepted_at_ns = 4101 + @as(u64, attempt_id) } }).completionBatch(@splat(attempt_id), 4100 + @as(u64, attempt_id), source_binding.topology_epoch);
+                            var attempt_plan = try source_plans.Plan.freeze(source_alloc, @splat(attempt_id), @splat(attempt_id + 2), source_binding, &.{.{ .owner = source_binding, .locator = source_locator, .roles = source_plans.completion.Roles.checkpoint, .prepare = attempt_prepare }}, 4101 + @as(u64, attempt_id));
+                            defer attempt_plan.deinit();
+                            try std.testing.expect(attempt_plan.source_checkpoint);
+                            try source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .begin, .{});
+                            if (conflict or gap) {
+                                try std.testing.expectError(if (gap) error.SourceCheckpointConflict else error.SourcePayloadConflict, source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .prepare, .{}));
+                            } else try source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .prepare, .{});
+                            try source_participant.submit(source_alloc, &attempt_plan, 0, source_fence, .{ .resolve = .{ .status = if (attempt_id == 128) .committed else .aborted, .commit_version = 4102 + @as(u64, attempt_id) } }, .{});
+                            origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
+                            const attempt_recovery = try source_recovery.run(source_alloc, source_binding, source_fence, "docs", @splat(attempt_id), .{});
+                            try std.testing.expectEqual(@as(@TypeOf(attempt_recovery), if (attempt_id == 128) .complete else .aborted), attempt_recovery);
+                        }
                     }
                 };
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 try SourceCompletion.run(a, origin, current_owner, route.fence().?, remote_participant);
                 const HostedAdmission = struct {
                     noinline fn run(alloc: std.mem.Allocator, endpoint_uri: []const u8, source_catalog: antfly.public_api.table_catalog.CatalogSource, executor: antfly.common.http.RequestExecutor, root_path: []const u8, credential: []const u8) !void {
@@ -45021,7 +45058,7 @@ fn consumerTests() type {
             try std.testing.expect(policy_applied.outcome.?.applied.consumer == null);
             const policy_observed = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect_policy = .{ .namespace = namespace, .authority = ref.authority } });
             try std.testing.expectEqualDeep(policy_applied.outcome.?.applied.policy, policy_observed.outcome.?.applied.policy);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_source_plan_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_source_checkpoint_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
         }
 
         test "data raft ordered history proposal authority fences term membership and missing owners" {
@@ -45094,7 +45131,7 @@ fn consumerTests() type {
         }
 
         test "data raft ordered history protocol preflight distinguishes incompatible and unavailable peers" {
-            inline for (.{ @import("history_control_entry.zig").required_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version, @import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_completion_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_plan_protocol_version }) |required| {
+            inline for (.{ @import("history_control_entry.zig").required_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version, @import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_completion_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_plan_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_checkpoint_protocol_version }) |required| {
                 const a = std.testing.allocator;
                 const Fake = struct {
                     versions: [3]u16 = .{ required, required - 1, required },

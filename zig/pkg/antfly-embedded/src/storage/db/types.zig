@@ -218,12 +218,14 @@ pub const TransactionMutation = union(enum) {
         completion_admission: ?[]const u8 = null,
         completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
         source_purpose: ?[32]u8 = null,
+        source_checkpoint: bool = false,
     },
     prepare: struct {
         txn_id: TxnId,
         topology_epoch: u64,
         completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
         source_purpose: ?[32]u8 = null,
+        source_checkpoint: ?@import("../source_checkpoint.zig").Command = null,
     },
     resolve: struct {
         completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
@@ -1773,6 +1775,7 @@ pub const TransactionIntentRequest = struct {
     completion_input_digest: ?[32]u8 = null,
     /// Whole-source ownership only; root-local checkpoint admission stays separate.
     completion_source_purpose: ?[32]u8 = null,
+    completion_source_checkpoint: ?@import("../source_checkpoint.zig").Command = null,
     /// Trusted source transaction metadata; public mutation JSON never sets it.
     source_admission: ?@import("../source_admission.zig").Command = null,
     document_version_scheme: DocumentVersionScheme = .admit_current,
@@ -1800,6 +1803,11 @@ pub const TransactionIntentRequest = struct {
     integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
 
     pub fn sourcePurpose(self: @This()) !?[32]u8 {
+        if (self.completion_source_checkpoint) |checkpoint| {
+            try checkpoint.validate();
+            const purpose = self.completion_source_purpose orelse return error.InvalidSourceAdmission;
+            if (!std.mem.eql(u8, &checkpoint.purpose, &purpose)) return error.SourceTransactionIdentityConflict;
+        }
         if (self.completion_source_purpose) |purpose| {
             if (self.source_admission != null or self.completion_owner == null or std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
             return purpose;
@@ -1821,7 +1829,7 @@ pub const TransactionIntentRequest = struct {
         var request: BatchRequest = .{
             .timestamp_ns = begin_timestamp,
             .sync_level = .write,
-            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .completion_owner = owner, .source_purpose = self.completion_source_purpose } },
+            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .completion_owner = owner, .source_purpose = self.completion_source_purpose, .source_checkpoint = self.completion_source_checkpoint } },
         };
         // Compile-time exhaustiveness prevents newly added intent adjuncts
         // from being silently omitted from the frozen canonical input.
@@ -1829,6 +1837,7 @@ pub const TransactionIntentRequest = struct {
             if (comptime std.mem.eql(u8, name, "completion_owner") or
                 std.mem.eql(u8, name, "completion_input_digest") or
                 std.mem.eql(u8, name, "completion_source_purpose") or
+                std.mem.eql(u8, name, "completion_source_checkpoint") or
                 std.mem.eql(u8, name, "source_admission")) continue;
             if (comptime !@hasField(BatchRequest, name)) @compileError("unmapped completion PREPARE field: " ++ name);
             @field(request, name) = @field(self, name);

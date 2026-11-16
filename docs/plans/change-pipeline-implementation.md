@@ -4205,3 +4205,75 @@ source-global head/checkpoint and production destination/worker integration
 remain required, as do empty-target provisioning, public changefeeds, coherent
 bootstrap/retention, production pgoutput and existing-client qualification.
 Neither issue nor the full goal is complete.
+
+### Native checkpoint intent and protocol-37 source admission
+
+`storage/source_checkpoint.zig` adds the checkpoint head intent for a qualified
+source completion participant. Its binding is the logical source scope, not a
+row shard, upload attempt, feed cursor or PostgreSQL LSN. The command retains the
+source-purpose fingerprint, original acceptance time, monotonic source sequence,
+opaque checkpoint and exact predecessor. Planning returns a protected metadata
+write plus an exact-value predicate; it performs no standalone write. Native
+PREPARE attaches both to the transaction. Commit resolves the head with the
+other intents; abort discards it. The transaction manager permits this metadata
+intent only for a source-owned declared checkpoint participant. Ordinary writes
+cannot address its protected prefix.
+
+The bounded current-head record uses the checksummed `SCP1` binary format and
+retains sequence, purpose, transaction identity, acceptance time and checkpoint.
+Checkpoint bytes are never ordered. Exact current retries resolve as already
+committed; altered retries conflict, old sequences expire, and gaps or wrong
+predecessors fail. This is one current head per binding, not a historical batch
+receipt window or a complete source-lifecycle fence.
+
+The trusted intent and canonical private PREPARE now carry the checkpoint
+command. Frozen plans bind it into the participant input digest and reconstruct
+it from retained AFP1 bytes. A plan containing a head write emits
+`begin_source_checkpoint_v1` and `prepare_source_checkpoint_v1`, requiring
+all-applying-member data-Raft protocol 37 before BEGIN. BEGIN includes an explicit
+checkpoint marker; stripping the new phase tag is rejected. PREPARE requires the
+exact command and matching source purpose. Public batch JSON rejects these
+private envelopes. Existing source-purpose-only version-35 envelopes remain
+readable and retain their previous floor.
+
+Engine descriptor 52 and API-kernel ABI 26 fence changed by-value mutation and
+callback layouts. Storage-owner ABI 105 fences the new append-only failure
+statuses: checkpoint conflict 940, transaction identity conflict 941 and already
+committed 942. The shared failure envelope layout remains ABI 89. Source
+validation identities cross the complete native/owner/operation/HTTP stack as
+explicit typed rejections; unknown-outcome markers, including empty markers,
+still prevent confirmation. Expected deterministic source rejections advance
+the applied Raft position so a following explicit abort can proceed.
+
+Qualification: `source-checkpoint-contract-test.log` passes the direct head
+contract test, including cyclic opaque positions, exact/altered retries,
+corruption and old-sequence fencing. `source-checkpoint-error-boundary-test.log`
+passes exact status/envelope round-trips including numeric identities 940–942.
+`source-checkpoint-native-test.log` completes
+`completion-begin-wire-test history-control-apply-test` with exit 0: 29 codec
+cases, six API discovery/codec cases, and all 13 native Raft cases pass without
+skips or leaks. The real signed cross-node completion fixture restores a frozen
+checkpoint plan, verifies its BEGIN requires version 37, commits the first head,
+rejects a conflicting first sequence and a sequence gap, explicitly aborts those
+transactions, prepares then aborts a second checkpoint, and successfully commits
+a different second checkpoint from the original predecessor. It also exercises
+typed source errors and unknown/empty-outcome markers without mutation retries.
+Initial qualification identified missing RPC and storage-owner rejection mappings
+and a test expectation for `.aborted`; these were corrected before the final run.
+
+Stable checkpoint-authority provisioning/routing, source-scope retirement fences,
+historical retry/receipt bounds, production source journal/destination/worker
+integration and cross-topology qualification remain outstanding. The native
+checkpoint intent does not advertise those capabilities by itself. Public feeds,
+coherent bootstrap/retention, production pgoutput and pinned existing-client
+qualification also remain required. Neither issue nor the full goal is complete.
+
+Final boundary qualification: `source-checkpoint-abi-test.log` completes
+`api-kernel-abi-test history-resolution-owner-test` with the compiled-owner ABI
+filter and exit 0. The actual compiled storage-owner ABI case and all eight API
+kernel/layout/import cases pass without skips or leaks. The new reusable
+`api-kernel-abi-test` target checks incompatible contexts as well as C layouts.
+`source-checkpoint-final-generated-check.log` completes source-catalog,
+engine-error, C-header and OpenAPI checks successfully. All changed Zig files
+pass formatting checks; the diff check passes. Unrelated model-explorer JSON
+from generation was restored before committing.

@@ -26851,6 +26851,13 @@ pub const DB = struct {
             for (source_plan.deletes) |key| try intents.append(preparation_alloc, .{ .key = key, .value = null });
             try predicates.append(preparation_alloc, .{ .key = source_plan.head_key, .comparison = .exact_value, .expected_value = source_plan.head_before });
         }
+        if (req.completion_source_checkpoint) |checkpoint| {
+            var checkpoint_read = try self.core.store.beginProbeTxn();
+            defer checkpoint_read.abort();
+            const checkpoint_plan = try @import("../source_checkpoint.zig").prepare(source_arena.allocator(), &checkpoint_read, txn_id, source_purpose.?, checkpoint);
+            try intents.append(preparation_alloc, .{ .key = checkpoint_plan.key, .value = checkpoint_plan.value });
+            try predicates.append(preparation_alloc, .{ .key = checkpoint_plan.key, .comparison = .exact_value, .expected_value = checkpoint_plan.before });
+        }
         if (row_policy_principal) |principal| {
             const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
             try self.enforceRowPolicyIntentsLocked(view, intents.items, graph_sources, principal, graph_alloc, &predicates, preparation_alloc);

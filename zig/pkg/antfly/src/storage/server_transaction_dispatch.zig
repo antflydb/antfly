@@ -141,6 +141,7 @@ pub fn applyReplicatedTransactionMutationInternal(
             const intents: db_mod.types.TransactionIntentRequest = .{
                 .completion_owner = prepare.completion_owner,
                 .completion_source_purpose = prepare.source_purpose,
+                .completion_source_checkpoint = prepare.source_checkpoint,
                 .completion_input_digest = completion.preparedInputDigest(namespace, encoded_input),
                 .document_version_scheme = req.document_version_scheme,
                 .row_policy_principal_proof = req.row_policy_principal_proof,

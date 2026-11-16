@@ -3427,6 +3427,12 @@ pub const ApiHttpClient = struct {
             // Only a matching typed rejection proves a terminal validation
             // result. An unknown-outcome header above always takes precedence;
             // an unexpected HTTP status remains an ambiguous forwarded write.
+            const source_errors = @import("source_transaction_errors.zig");
+            if (source_errors.decode(resp.body)) |reason| {
+                if (outcome != null and !std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)) return error.RaftBatchWriteOutcomeUnknown;
+                if (resp.status == source_errors.status(reason)) return reason;
+                return error.RaftBatchWriteOutcomeUnknown;
+            }
             const row_errors = @import("relational_row_errors.zig");
             if (row_errors.decode(resp.body)) |reason| {
                 if (resp.status == row_errors.status(reason)) return reason;

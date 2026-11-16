@@ -40,7 +40,7 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 36;
+pub const batch_protocol_version: u16 = 37;
 /// Frozen completion BEGIN and owner/input-fenced PREPARE require durable
 /// activation across every applying member before proposal or native apply.
 pub const batch_completion_admission_protocol_version: u16 = 31;
@@ -56,6 +56,12 @@ pub const batch_history_policy_protocol_version: u16 = 34;
 pub const batch_source_completion_protocol_version: u16 = 35;
 /// Version 36 activates separately dispatched, frozen-owner source-plan staging.
 pub const batch_source_plan_protocol_version: u16 = 36;
+/// Version 37 admits atomic source-global checkpoint head intents.
+pub const batch_source_checkpoint_protocol_version: u16 = 37;
+fn hasCheckpoint(value: anytype) bool {
+    if (comptime !@hasField(@TypeOf(value), "source_checkpoint")) return false;
+    return if (@TypeOf(value.source_checkpoint) == bool) value.source_checkpoint else value.source_checkpoint != null;
+}
 fn completionEnvelopeVersion(a: @import("std").mem.Allocator, bytes: []const u8, comptime certificate: bool) !u16 {
     const std = @import("std");
     if (bytes.len == 0 or bytes.len > 16 * 1024 * 1024) return error.InvalidTxnRecord;
@@ -68,8 +74,8 @@ pub fn completionProtocolVersion(a: @import("std").mem.Allocator, request: anyty
     const mutation = request.transaction orelse return null;
     return switch (mutation) {
         .publish_completion => |value| if (try completionEnvelopeVersion(a, value.certificate, true) >= 3) batch_completion_recovery_protocol_version else batch_completion_publication_protocol_version,
-        .begin => |value| if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_admission) |bytes| (if (try completionEnvelopeVersion(a, bytes, false) >= 3) batch_completion_recovery_protocol_version else batch_completion_admission_protocol_version) else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
-        .prepare => |value| if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
+        .begin => |value| if (hasCheckpoint(value)) batch_source_checkpoint_protocol_version else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_admission) |bytes| (if (try completionEnvelopeVersion(a, bytes, false) >= 3) batch_completion_recovery_protocol_version else batch_completion_admission_protocol_version) else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
+        .prepare => |value| if (hasCheckpoint(value)) batch_source_checkpoint_protocol_version else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
         .resolve => |value| if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
         else => null,
     };

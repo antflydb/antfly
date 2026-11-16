@@ -49,7 +49,7 @@ fn logUnknownTransitionFailure(group_id: u64, action: metadata_mod.TransitionAct
     std.log.warn("private transition failed group_id={} action={s} err={s}", .{ group_id, @tagName(action), @errorName(err) });
 }
 
-pub const Error = operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
+pub const Error = @import("source_transaction_errors.zig").Error || operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
     RetainedEffectsFull,
     AuthoritativeLookupMissing,
     TopologyChanged,
@@ -674,6 +674,7 @@ pub const Operations = struct {
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable, error.Unavailable => return error.GroupLeaderUnavailable,
             else => {
+                if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("routed Raft batch failed group_id={} table={s} err={s}", .{

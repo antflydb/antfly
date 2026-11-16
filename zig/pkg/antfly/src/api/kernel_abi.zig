@@ -29,7 +29,8 @@ pub const StatusDetail = error_abi.Detail;
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
 // Version 25 includes qualified source-plan callback ports in server config.
-pub const abi_version: u32 = 25;
+// Version 26 changes routed batch callbacks with source checkpoint mutations.
+pub const abi_version: u32 = 26;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

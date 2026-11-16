@@ -874,6 +874,7 @@ pub const TxnManager = struct {
                 if (!std.mem.eql(u8, &binding.namespace, namespace)) return error.HistoryResynchronizationRequired;
                 try frozen.value.admission.requireRoutedOwner(binding);
             } else if (extra_batch.completion_input_digest != null or extra_batch.completion_owner != null) return error.ChangefeedCapabilityUnsupported;
+            for (intents) |intent| if (@import("source_checkpoint.zig").isKey(intent.key) and (record.source_purpose == null or participant.roles & completion.Roles.checkpoint == 0)) return error.InvalidParticipant;
             if (participant.roles & completion.Roles.effects == 0) {
                 if (extra_batch.graph_sources.len != 0) return error.InvalidParticipant;
                 for (intents) |intent| if (participant.roles & completion.Roles.checkpoint == 0 or !isRawMetadataIntentKey(intent.key)) return error.InvalidParticipant;

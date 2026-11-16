@@ -4014,6 +4014,8 @@ pub const AntflyApiHandler = struct {
         // A Raft apply can reject validation after proposal. Preserve its typed
         // reason, without claiming the operation was never proposed. The
         // coordinator still has to establish an authoritative abort.
+        if (@import("source_transaction_errors.zig").classify(err)) |reason|
+            return textResponse(ctx, @import("source_transaction_errors.zig").status(reason), @errorName(reason));
         if (@import("relational_row_errors.zig").classify(err)) |reason|
             return textResponse(ctx, @import("relational_row_errors.zig").status(reason), @errorName(reason));
         if (@import("relational_integrity_errors.zig").classify(err)) |reason|
