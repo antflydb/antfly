@@ -14,7 +14,7 @@ See: [Antfly Inference](/docs/guides/inference) | [Local Model Compatibility](/d
 
 ### CDC & Foreign Sources
 
-Two ways to work with an external PostgreSQL table. **CDC** (`replication_sources` on a table) uses logical replication to stream inserts, updates, and deletes into canonical Antfly storage. **Foreign sources** (`foreign_sources` on a query) read or join the external table at request time without ingesting it, and support only filters, field selection, and paging.
+Two ways to work with an external PostgreSQL table. **CDC** (`replication_sources` on a table) uses logical replication to stream inserts, updates, and deletes into canonical Antfly storage. **Foreign sources** (`foreign_sources` on a query) query the external table at request time without ingesting it. They filter, select fields, page, aggregate, and join with Antfly tables, with the foreign table on either side of the join or nested inside it.
 
 See: [Mirror a PostgreSQL Table](/docs/guides/cdc-replication) | [CDC design](https://github.com/antflydb/antfly/blob/main/zig/CDC.md)
 
@@ -32,7 +32,7 @@ See: [Artifact Indexes](/docs/guides/artifact-indexes) | [Artifacts design](http
 
 ### Lake Tables
 
-*In progress.* Lake query mode serves Parquet datasets and Iceberg tables that stay in your object storage through the same relational row plans, pushing predicates and projections down into file reads instead of copying every row into Antfly. It ships with the SQL work tracked in [#145](https://github.com/antflydb/antfly/pull/145).
+Lake query mode serves read-only Parquet datasets and Iceberg tables that stay in your object storage through the same relational row plans, pushing predicates and projections down into file reads instead of copying every row into Antfly. Lake writes and broader ingestion are in development.
 
 See: [Lake design](https://github.com/antflydb/antfly/blob/main/zig/LAKES.md) | [Remote table serving](https://github.com/antflydb/antfly/blob/main/zig/REMOTE_TABLE_SERVING.md)
 
@@ -48,7 +48,7 @@ See: [Relational mode design](https://github.com/antflydb/antfly/blob/main/zig/R
 
 ### SQL & pgwire
 
-*In progress.* SQL is lowered to Antfly's native typed plans, and an optional PostgreSQL wire-protocol (pgwire) listener lets `psql`-compatible clients connect. Tracked in [#145](https://github.com/antflydb/antfly/pull/145).
+SQL is lowered to Antfly's native typed plans, and an opt-in PostgreSQL wire-protocol (pgwire) listener lets `psql` and PostgreSQL drivers connect, with transactions, savepoints, prepared statements, and cursors. SQL support is bounded by the implemented dialect; the wire protocol does not imply full PostgreSQL compatibility.
 
 See: [SQL design](https://github.com/antflydb/antfly/blob/main/docs/design/sql/extraction.md) | [pgwire transport](https://github.com/antflydb/antfly/blob/main/zig/pkg/antfly/src/pgwire/README.md)
 
