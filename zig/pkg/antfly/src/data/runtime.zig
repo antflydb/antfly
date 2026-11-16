@@ -7127,9 +7127,9 @@ pub const DataServer = struct {
             self.routedRaftBatchWriter()
         else
             null;
-        api_server_cfg.native_source_plan_control = if (linked_storage and self.data_raft != null) self.sourcePlanControlPort() else null;
-        api_server_cfg.native_source_plan_observe = if (linked_storage and self.data_raft != null) self.sourcePlanObservePort() else null;
-        api_server_cfg.native_source_plan_chunk = if (linked_storage and self.data_raft != null) self.sourcePlanChunkPort() else null;
+        api_server_cfg.native_source_plan_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = sourcePlanControlOperation } else null;
+        api_server_cfg.native_source_plan_observe = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourcePlanObserveOperation } else null;
+        api_server_cfg.native_source_plan_chunk = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourcePlanChunkOperation } else null;
         api_server_cfg.native_history_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = historyControlOperation } else null;
         api_server_cfg.native_history_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPageOperation } else null;
         api_server_cfg.native_history_grant = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyGrantOperation } else null;
@@ -13524,7 +13524,7 @@ pub const DataServer = struct {
         return .{ .ptr = self, .read_fn = historyPublicationRoutedOperation };
     }
 
-    const HistoryOperation = enum { control, page, grant, resolution, publication, owner, decision };
+    const HistoryOperation = enum { control, page, grant, resolution, publication, owner, decision, source_plan_control, source_plan_observe, source_plan_chunk };
     fn historyRequestType(comptime kind: HistoryOperation) type {
         return switch (kind) {
             .control => @import("../api/history_control_operations.zig").wire.Request,
@@ -13534,6 +13534,9 @@ pub const DataServer = struct {
             .decision => @import("../api/history_decision_operations.zig").Request,
             .owner => @import("../api/history_owner_operations.zig").Request,
             .publication => @import("../api/history_publication_operations.zig").Request,
+            .source_plan_control => SourcePlanHttp.ControlRequest,
+            .source_plan_observe => SourcePlanHttp.ObserveRequest,
+            .source_plan_chunk => SourcePlanHttp.ChunkRequest,
         };
     }
     fn historyResultType(comptime kind: HistoryOperation) type {
@@ -13545,6 +13548,9 @@ pub const DataServer = struct {
             .decision => @import("../api/history_decision_operations.zig").Reply,
             .owner => @import("../api/history_owner_operations.zig").Reply,
             .publication => @import("../api/history_publication_operations.zig").Reply,
+            .source_plan_control => SourcePlanHttp.ControlReply,
+            .source_plan_observe => SourcePlanHttp.control.Observation,
+            .source_plan_chunk => SourcePlanHttp.control.Read,
         };
     }
     fn historyControlRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.control), context: antfly.public_api.operation.RequestContext) !historyResultType(.control) {
@@ -13569,19 +13575,33 @@ pub const DataServer = struct {
     }
     fn historyRoutedOperation(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, comptime kind: HistoryOperation, input: historyRequestType(kind), original: antfly.public_api.operation.RequestContext) !historyResultType(kind) {
         if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
-        try original.ensureActive();
+        var request_scope = try @import("../api/history_publication_operations.zig").Scope.init(original_fence, original);
+        const bounded_original = request_scope.context();
+        try bounded_original.ensureActive();
         try original_fence.validate();
         if (table.len == 0 or table.len > 1024) return error.InvalidCatalogRouteFence;
         var namespace: [24]u8 = undefined;
         std.mem.writeInt(u64, namespace[0..8], original_fence.route.identity_namespace.table_id, .big);
         std.mem.writeInt(u64, namespace[8..16], original_fence.route.identity_namespace.shard_id, .big);
         std.mem.writeInt(u64, namespace[16..24], original_fence.route.identity_namespace.range_id, .big);
-        try input.validate(namespace);
+        if (comptime kind == .source_plan_control) {
+            try input.validate(alloc);
+        } else if (comptime kind == .source_plan_observe or kind == .source_plan_chunk) {
+            try input.validate();
+        } else try input.validate(namespace);
+        if (comptime kind == .source_plan_control or kind == .source_plan_observe or kind == .source_plan_chunk) {
+            const incarnation = original_fence.metadata_incarnation orelse return error.InvalidCatalogRouteFence;
+            if (input.source_owner.group_id != original_fence.route.group_id or
+                input.source_owner.metadata_group_id != original_fence.metadata_group_id or
+                input.source_owner.topology_epoch != original_fence.topology_epoch or
+                !std.mem.eql(u8, &input.source_owner.metadata_incarnation, &incarnation) or
+                !std.mem.eql(u8, &input.source_owner.namespace, &namespace)) return error.InvalidCatalogRouteFence;
+        }
         const Clock = antfly.public_api.table_catalog.RoutingBudget;
         var clock = Clock.initIo(null, self.dataRaftIo());
         const now = clock.nowNs();
-        clock.deadline_ns = @min(clock.deadlineFrom(.{ .deadline_ns = original.deadline_ns, .io = original.deadline_io }) orelse std.math.maxInt(u64), now +| 5 * std.time.ns_per_s);
-        var context = original;
+        clock.deadline_ns = @min(clock.deadlineFrom(.{ .deadline_ns = bounded_original.deadline_ns, .io = bounded_original.deadline_io }) orelse std.math.maxInt(u64), now +| 5 * std.time.ns_per_s);
+        var context = bounded_original;
         context.deadline_ns = clock.deadline_ns;
         context.deadline_io = clock.io;
         try context.ensureActive();
@@ -13605,6 +13625,9 @@ pub const DataServer = struct {
             .decision => historyDecisionOperation(self, alloc, fence, table, input, context),
             .owner => historyOwnerOperation(self, alloc, fence, table, input, context),
             .publication => historyPublicationOperation(self, alloc, fence, table, input, context),
+            .source_plan_control => sourcePlanControlOperation(self, alloc, fence, table, input, context),
+            .source_plan_observe => sourcePlanObserveOperation(self, alloc, fence, table, input, context),
+            .source_plan_chunk => sourcePlanChunkOperation(self, alloc, fence, table, input, context),
         };
         // Only a compact, deadline-aware peer capture may discover a remote
         // endpoint. Never use the generic admin-snapshot routing fallback or
@@ -13619,7 +13642,7 @@ pub const DataServer = struct {
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
         var lane = try self.acquireDataRaftForwardLaneUntil(group, clock.deadline_ns.?, .{ .discovery = .cached, .cancellation = &cancellation });
         defer lane.release();
-        var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{ .max_response_bytes = if (kind == .page) @import("../api/history_page_operations.zig").wire.prefix_bytes + @as(usize, input.request.max_bytes) else if (kind == .decision) @import("../api/history_decision_operations.zig").max_reply_bytes else @import("../api/history_control_operations.zig").wire.max_bytes });
+        var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{ .max_response_bytes = if (kind == .page) @import("../api/history_page_operations.zig").wire.prefix_bytes + @as(usize, input.request.max_bytes) else if (kind == .decision) @import("../api/history_decision_operations.zig").max_reply_bytes else if (kind == .source_plan_chunk) SourcePlanHttp.max_bytes else @import("../api/history_control_operations.zig").wire.max_bytes });
         defer executor.deinit();
         var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
         _ = client.withInternalServiceAuth(self.api_server_cfg.internal_service_secret, self.api_server_cfg.internal_service_issuer);
@@ -13631,6 +13654,9 @@ pub const DataServer = struct {
             .decision => client.fetchGroupHistoryDecision(uri, group, table, input, fence, context),
             .owner => client.fetchGroupHistoryOwner(uri, group, table, input, fence, context),
             .publication => client.fetchGroupHistoryPublication(uri, group, table, input, fence, context),
+            .source_plan_control => client.fetchGroupSourcePlanControl(uri, group, table, input, fence, context),
+            .source_plan_observe => client.fetchGroupSourcePlanObservation(uri, group, table, input, fence, context),
+            .source_plan_chunk => client.fetchGroupSourcePlanChunk(uri, group, table, input, fence, context),
         };
     }
 
@@ -13712,7 +13738,7 @@ pub const DataServer = struct {
                 .decision => owner.orderedHistoryDecisionRouted(alloc, fence, table, input.binding()),
                 .owner => captureHistoryOwner(owner, alloc, fence, table, input, context),
                 .publication => owner.orderedHistoryPublicationRouted(alloc, fence, table, input.binding()),
-                .control => unreachable,
+                .control, .source_plan_control, .source_plan_observe, .source_plan_chunk => unreachable,
             }) catch |err| switch (err) {
                 error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.StorageKernelOwnerTransitionRequired, error.StorageOwnerAdmissionPending, error.ResourceBudgetExceeded => {
                     try self.sleepDataRaftRetry(std.time.ns_per_ms);
@@ -13727,13 +13753,25 @@ pub const DataServer = struct {
     }
 
     pub fn sourcePlanControlPort(self: *DataServer) @import("../api/source_plan_operations.zig").ControlPort {
-        return .{ .ptr = self, .execute_fn = sourcePlanControlOperation };
+        return .{ .ptr = self, .execute_fn = sourcePlanControlRoutedOperation };
     }
     pub fn sourcePlanObservePort(self: *DataServer) @import("../api/source_plan_operations.zig").ObservePort {
-        return .{ .ptr = self, .read_fn = sourcePlanObserveOperation };
+        return .{ .ptr = self, .read_fn = sourcePlanObserveRoutedOperation };
     }
     pub fn sourcePlanChunkPort(self: *DataServer) @import("../api/source_plan_operations.zig").ChunkPort {
-        return .{ .ptr = self, .read_fn = sourcePlanChunkOperation };
+        return .{ .ptr = self, .read_fn = sourcePlanChunkRoutedOperation };
+    }
+    fn sourcePlanControlRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: SourcePlanHttp.ControlRequest, context: antfly.public_api.operation.RequestContext) !SourcePlanHttp.ControlReply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_plan_control, request, context);
+    }
+    fn sourcePlanObserveRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: SourcePlanHttp.ObserveRequest, context: antfly.public_api.operation.RequestContext) !SourcePlanHttp.control.Observation {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_plan_observe, request, context);
+    }
+    fn sourcePlanChunkRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: SourcePlanHttp.ChunkRequest, context: antfly.public_api.operation.RequestContext) !SourcePlanHttp.control.Read {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_plan_chunk, request, context);
     }
     fn sourcePlanControlOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: SourcePlanHttp.ControlRequest, context: antfly.public_api.operation.RequestContext) !SourcePlanHttp.ControlReply {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
@@ -44175,7 +44213,7 @@ fn consumerTests() type {
                 };
                 const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
                 defer a.destroy(api_server);
-                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .internal_service_accept_legacy_unauthenticated = true, .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_source_plan_control = server.sourcePlanControlPort(), .native_source_plan_observe = server.sourcePlanObservePort(), .native_source_plan_chunk = server.sourcePlanChunkPort(), .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_decision = .{ .ptr = server, .read_fn = DataServer.historyDecisionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .internal_service_accept_legacy_unauthenticated = true, .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_source_plan_control = .{ .ptr = server, .execute_fn = DataServer.sourcePlanControlOperation }, .native_source_plan_observe = .{ .ptr = server, .read_fn = DataServer.sourcePlanObserveOperation }, .native_source_plan_chunk = .{ .ptr = server, .read_fn = DataServer.sourcePlanChunkOperation }, .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_decision = .{ .ptr = server, .read_fn = DataServer.historyDecisionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
                 var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
@@ -44909,7 +44947,7 @@ fn consumerTests() type {
                     }
                 };
                 try HostedAdmission.run(a, base, catalog, try origin.distributedReadExecutor(), root, secret);
-                try SourcePlanHttpFixture.run(a, server, try origin.distributedReadExecutor(), base, secret, route.fence().?, current_owner);
+                try SourcePlanHttpFixture.run(a, server, origin, try origin.distributedReadExecutor(), base, secret, route.fence().?, current_owner);
             }
             const rejected = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 99 } });
             try std.testing.expectEqual(.checkpoint_conflict, rejected.outcome.?.rejected);
@@ -60446,7 +60484,7 @@ const SourcePlanHttpFixture = struct {
         try std.testing.expectEqual(@as(u16, 200), response.status);
         return SourcePlanHttp.decodeControlReply(a2, value, response.body);
     }
-    fn run(a2: std.mem.Allocator, actual: *DataServer, executor: antfly.common.http.RequestExecutor, source_plan_endpoint: []const u8, credential: []const u8, fence: antfly.metadata_api.CatalogRouteFence, original_owner: SourcePlanHttp.Owner) !void {
+    fn run(a2: std.mem.Allocator, actual: *DataServer, origin_server: *DataServer, executor: antfly.common.http.RequestExecutor, source_plan_endpoint: []const u8, credential: []const u8, fence: antfly.metadata_api.CatalogRouteFence, original_owner: SourcePlanHttp.Owner) !void {
         const frozen = @import("../api/completion_plan.zig");
         const storage = SourcePlanHttp.control.storage;
         const root_scope = try SourcePlanHttp.entry.rootFor(original_owner);
@@ -60470,6 +60508,9 @@ const SourcePlanHttpFixture = struct {
         defer quota_response.deinit(a2);
         try std.testing.expectEqual(@as(u16, 200), quota_response.status);
         const quota = try SourcePlanHttp.native.decodeObservation(a2, quota_query, quota_response.body);
+        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
+        const remote_quota = try origin_server.sourcePlanObservePort().read(a2, fence, "docs", quota_input, .{});
+        try std.testing.expectEqualDeep(quota, remote_quota);
         var checksum: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &checksum, .{});
         const chunk_hashes = [_][32]u8{storage.chunkDigest(0, bytes)};
@@ -60496,7 +60537,8 @@ const SourcePlanHttpFixture = struct {
         };
         request.operation = .recover;
         request.receipt = accepted.receipt;
-        const recovered = try requestControl(a2, executor, source_plan_endpoint, token, fence_json, request);
+        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
+        const recovered = try origin_server.sourcePlanControlPort().execute(a2, fence, "docs", request, .{});
         try std.testing.expect(recovered.confirmed() and recovered.outcome.? == .applied);
         {
             lockAtomic(&actual.data_raft_mutex);
@@ -60524,6 +60566,10 @@ const SourcePlanHttpFixture = struct {
         try std.testing.expectEqual(@as(u16, 200), read_response.status);
         const owned = try SourcePlanHttp.native.decodeChunkReply(a2, read.request, read_response.body);
         defer a2.free(owned.bytes);
+        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
+        const remote_owned = try origin_server.sourcePlanChunkPort().read(a2, fence, "docs", read, .{});
+        defer a2.free(remote_owned.bytes);
+        try std.testing.expectEqualSlices(u8, owned.bytes, remote_owned.bytes);
         var restored = try frozen.Plan.restoreFrozen(a2, owned.bytes, spec.plan_digest);
         defer restored.deinit();
         try std.testing.expectEqual(purpose, restored.source_purpose.?);

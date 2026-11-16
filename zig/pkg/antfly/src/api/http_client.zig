@@ -3112,6 +3112,130 @@ pub const ApiHttpClient = struct {
     /// One authenticated attempt only. Any failure after entering transport is
     /// unconfirmed, including malformed success replies. Recovery retains its
     /// original receipt and is never rewritten into submission.
+    const SourcePlanWire = @import("../data/source_plan_http_wire.zig");
+    const SourcePlanOperation = enum { control, observe, chunk };
+    fn sourcePlanInput(comptime kind: SourcePlanOperation) type {
+        return switch (kind) {
+            .control => SourcePlanWire.ControlRequest,
+            .observe => SourcePlanWire.ObserveRequest,
+            .chunk => SourcePlanWire.ChunkRequest,
+        };
+    }
+    fn sourcePlanResult(comptime kind: SourcePlanOperation) type {
+        return switch (kind) {
+            .control => SourcePlanWire.ControlReply,
+            .observe => SourcePlanWire.control.Observation,
+            .chunk => SourcePlanWire.control.Read,
+        };
+    }
+    pub fn fetchGroupSourcePlanControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: SourcePlanWire.ControlRequest, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !SourcePlanWire.ControlReply {
+        return self.fetchGroupSourcePlan(base_uri, group_id, table, .control, input, fence, context);
+    }
+    pub fn fetchGroupSourcePlanObservation(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: SourcePlanWire.ObserveRequest, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !SourcePlanWire.control.Observation {
+        return self.fetchGroupSourcePlan(base_uri, group_id, table, .observe, input, fence, context);
+    }
+    /// The caller owns the decoded binary in the returned Read.
+    pub fn fetchGroupSourcePlanChunk(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: SourcePlanWire.ChunkRequest, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !SourcePlanWire.control.Read {
+        return self.fetchGroupSourcePlan(base_uri, group_id, table, .chunk, input, fence, context);
+    }
+    fn fetchGroupSourcePlan(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, comptime kind: SourcePlanOperation, input: sourcePlanInput(kind), fence: route_metadata_api.CatalogRouteFence, original: @import("antfly_local_sources").api_operation.RequestContext) !sourcePlanResult(kind) {
+        // This scope intersects both original cancellation/deadline authorities.
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
+        try context.ensureActive();
+        if (self.internal_service == null) return error.Unauthorized;
+        try fence.validate();
+        if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
+        if (comptime kind == .control) try input.validate(self.alloc) else try input.validate();
+        const owner = input.source_owner;
+        const identity = fence.route.identity_namespace;
+        const incarnation = fence.metadata_incarnation orelse return error.InvalidCatalogRouteFence;
+        if (owner.group_id != group_id or owner.metadata_group_id != fence.metadata_group_id or owner.topology_epoch != fence.topology_epoch or
+            !std.mem.eql(u8, &owner.metadata_incarnation, &incarnation) or
+            std.mem.readInt(u64, owner.namespace[0..8], .big) != identity.table_id or
+            std.mem.readInt(u64, owner.namespace[8..16], .big) != identity.shard_id or
+            std.mem.readInt(u64, owner.namespace[16..24], .big) != identity.range_id) return error.InvalidCatalogRouteFence;
+        const digest = if (kind == .control) try input.digest(self.alloc) else {};
+        const unknown = if (kind == .control) SourcePlanWire.ControlReply{ .request_digest = digest, .receipt = input.receipt } else {};
+        const table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(table);
+        const suffix = switch (kind) {
+            .control => routes.Routes.source_plan_control_suffix,
+            .observe => routes.Routes.source_plan_observe_suffix,
+            .chunk => routes.Routes.source_plan_chunk_suffix,
+        };
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, table, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
+        defer self.alloc.free(body);
+        if (body.len > SourcePlanWire.max_bytes) return error.InvalidSourcePlanWire;
+        const route_json = try std.json.Stringify.valueAlloc(self.alloc, fence, .{});
+        defer self.alloc.free(route_json);
+        if (route_json.len > 16384) return error.InvalidCatalogRouteFence;
+        const timeout = @min(try context.remainingTimeoutMs() orelse route_metadata_api.catalog_route_default_deadline_ms, 5000);
+        var timeout_buffer: [10]u8 = undefined;
+        const timeout_text = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{timeout});
+        var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
+        const max_reply = if (kind == .chunk) SourcePlanWire.max_bytes else SourcePlanWire.max_control_reply_bytes;
+        try context.ensureActive();
+        // A mutation has one transport attempt. Any post-dispatch ambiguity
+        // preserves only original recovery authority; callers must not replay.
+        var response = self.executeRequest(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .headers = &.{
+            .{ .name = route_metadata_api.catalog_route_fence_header, .value = route_json },
+            .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = timeout_text },
+        }, .timeout_ms = timeout, .cancellation = &cancellation, .max_response_bytes = max_reply }) catch |err| {
+            if (comptime kind == .control) return unknown;
+            return switch (err) {
+                error.OutOfMemory, error.Canceled, error.Cancelled, error.DeadlineExceeded => err,
+                else => error.ReadUnavailable,
+            };
+        };
+        defer response.deinit(self.alloc);
+        if (comptime kind == .control) {
+            if (response.status != 200 or response.body.len > max_reply) return unknown;
+        } else {
+            try context.ensureActive();
+            if (response.body.len > max_reply) return error.InvalidRemoteResponse;
+            if (response.status != 200) return switch (response.status) {
+                401 => error.Unauthorized,
+                403 => error.Forbidden,
+                404, 501 => error.ChangefeedCapabilityUnsupported,
+                409 => error.HistoryResynchronizationRequired,
+                503 => error.ReadUnavailable,
+                else => error.InvalidRemoteResponse,
+            };
+        }
+        const ack = response.header(route_metadata_api.catalog_route_fence_ack_header);
+        const content_type = response.header("Content-Type") orelse response.content_type;
+        if (ack == null or !std.mem.eql(u8, ack.?, route_metadata_api.catalog_route_fence_ack_value) or
+            content_type == null or !std.ascii.eqlIgnoreCase(content_type.?, "application/json"))
+        {
+            if (comptime kind == .control) return unknown;
+            return error.InvalidRemoteResponse;
+        }
+        if (comptime kind == .control) {
+            var result = SourcePlanWire.decodeControlReply(self.alloc, input, response.body) catch return unknown;
+            if (response.header(internal_batch_forwarding.outcome_header) != null) result.outcome = null;
+            context.ensureActive() catch {
+                result.outcome = null;
+                return result;
+            };
+            return result;
+        } else {
+            if (response.header(internal_batch_forwarding.outcome_header) != null) return error.InvalidRemoteResponse;
+            const result = switch (kind) {
+                .observe => try SourcePlanWire.native.decodeObservation(self.alloc, input.query, response.body),
+                .chunk => try SourcePlanWire.native.decodeChunkReply(self.alloc, input.request, response.body),
+                .control => unreachable,
+            };
+            errdefer if (kind == .chunk) self.alloc.free(result.bytes);
+            try context.ensureActive();
+            return result;
+        }
+    }
+
     pub fn fetchGroupHistoryControl(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -7910,4 +8034,165 @@ test "history decision client preserves owned coordinator decisions with one sig
             .cancelled => try std.testing.expectError(error.Canceled, attempt),
         }
     }
+}
+
+test "source plan HTTP client makes one signed attempt and preserves recovery authority" {
+    const a = std.testing.allocator;
+    const wire = @import("../data/source_plan_http_wire.zig");
+    const secret = "source-plan-client-test-secret-long-enough";
+    const Fake = struct {
+        const Mode = enum { good, rejected, lost, missing_ack, wrong_type, marker, empty_marker, wrong_digest, wrong_receipt, malformed, unavailable, cancel };
+        mode: Mode = .good,
+        calls: usize = 0,
+        cancelled: bool = false,
+        expected: wire.ControlRequest,
+        fn isCancelled(ptr: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(ptr))).cancelled;
+        }
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("http://node:8080/internal/v1/groups/17/tables/docs%2Ftenant/source-plan/control-v1", request.uri);
+            try std.testing.expectEqual(@as(?usize, 4096), request.max_response_bytes);
+            try std.testing.expect(request.timeout_ms.? > 0 and request.timeout_ms.? <= 5000);
+            try std.testing.expect(request.cancellation != null);
+            var parsed = try wire.parse(wire.ControlRequest, alloc, request.body);
+            defer parsed.deinit();
+            try std.testing.expectEqualDeep(self.expected, parsed.value);
+            try std.testing.expect(request.header(route_metadata_api.catalog_route_deadline_ms_header) != null);
+            try internal_service_auth.verifyToken(alloc, request.header(internal_service_auth.header_name).?, .{ .secret = secret, .issuer = "source-plan-test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            if (self.mode == .lost) return error.ConnectionResetByPeer;
+            if (self.mode == .unavailable) return http_route_helpers.textResponseWithHeaders(alloc, 503, "unavailable", &.{});
+            if (self.mode == .cancel) self.cancelled = true;
+            var reply: wire.ControlReply = .{ .request_digest = try self.expected.digest(alloc), .receipt = self.expected.receipt orelse .{ .term = 1, .index = 2 }, .outcome = .{ .applied = .{ .present = true } } };
+            if (self.mode == .rejected) reply.outcome = .{ .rejected = .pending };
+            if (self.mode == .wrong_digest) reply.request_digest[0] ^= 1;
+            if (self.mode == .wrong_receipt) reply.receipt.?.index += 1;
+            const body = try std.json.Stringify.valueAlloc(alloc, reply, .{});
+            defer alloc.free(body);
+            const ResponseHeader = @typeInfo(@typeInfo(@TypeOf(http_route_helpers.textResponseWithHeaders)).@"fn".param_types[3].?).pointer.child;
+            var headers: [3]ResponseHeader = undefined;
+            var count: usize = 0;
+            if (self.mode != .missing_ack) {
+                headers[count] = .{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = route_metadata_api.catalog_route_fence_ack_value };
+                count += 1;
+            }
+            headers[count] = .{ .name = "Content-Type", .value = if (self.mode == .wrong_type) "text/plain" else "application/json" };
+            count += 1;
+            if (self.mode == .marker or self.mode == .empty_marker) {
+                headers[count] = .{ .name = internal_batch_forwarding.outcome_header, .value = if (self.mode == .empty_marker) "" else internal_batch_forwarding.outcome_unknown_v1 };
+                count += 1;
+            }
+            return http_route_helpers.textResponseWithHeaders(alloc, 200, if (self.mode == .malformed) "{}" else body, headers[0..count]);
+        }
+    };
+    var fixture = try wire.test_support.Fixture.init();
+    var input = try fixture.begin();
+    input.operation = .recover;
+    input.receipt = .{ .term = 1, .index = 2 };
+    var fake: Fake = .{ .expected = input };
+    var client = ApiHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    const fence: route_metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = fixture.source_owner.metadata_incarnation, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    try std.testing.expectError(error.Unauthorized, client.fetchGroupSourcePlanControl("http://node:8080", 17, "docs/tenant", input, fence, .{}));
+    _ = client.withInternalServiceAuth(secret, "source-plan-test");
+    try std.testing.expectError(error.InvalidCatalogRouteFence, client.fetchGroupSourcePlanControl("http://node:8080", 18, "docs/tenant", input, fence, .{}));
+    var expired = fence;
+    expired.admission_deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, client.fetchGroupSourcePlanControl("http://node:8080", 17, "docs/tenant", input, expired, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    for (std.enums.values(Fake.Mode)) |mode| {
+        fake.mode = mode;
+        fake.cancelled = false;
+        const before = fake.calls;
+        const result = try client.fetchGroupSourcePlanControl("http://node:8080", 17, "docs/tenant", input, fence, .{ .cancellation = .{ .ptr = &fake, .is_cancelled_fn = Fake.isCancelled } });
+        try std.testing.expectEqual(before + 1, fake.calls);
+        try std.testing.expectEqual(input.receipt, result.receipt);
+        try std.testing.expectEqual(mode == .good or mode == .rejected, result.confirmed());
+    }
+    fake.cancelled = false;
+    fake.mode = .lost;
+    input.operation = .submit;
+    input.receipt = null;
+    fake.expected = input;
+    const unknown = try client.fetchGroupSourcePlanControl("http://node:8080", 17, "docs/tenant", input, fence, .{});
+    try std.testing.expectEqual(null, unknown.receipt);
+    try std.testing.expect(!unknown.confirmed());
+}
+
+test "source plan HTTP client validates observation binding and owns authenticated chunk bytes" {
+    const a = std.testing.allocator;
+    const wire = @import("../data/source_plan_http_wire.zig");
+    const Fake = struct {
+        const Mode = enum { good, wrong_binding, corrupt_chunk, marker, missing_ack, wrong_type, lost, resync };
+        mode: Mode = .good,
+        fixture: *const wire.test_support.Fixture,
+        observation: wire.control.Observation,
+        query: wire.control.Query,
+        read: wire.control.ReadRequest,
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.mode == .lost) return error.ConnectionResetByPeer;
+            if (self.mode == .resync) return http_route_helpers.textResponseWithHeaders(alloc, 409, "source plan operation unavailable", &.{});
+            const chunk = std.mem.endsWith(u8, request.uri, "/chunk-v1");
+            try std.testing.expectEqual(@as(?usize, if (chunk) wire.max_bytes else 4096), request.max_response_bytes);
+            const body = if (chunk) blk: {
+                var frame = self.fixture.frame;
+                if (self.mode == .corrupt_chunk) frame[90] ^= 1;
+                const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(frame.len));
+                defer alloc.free(encoded);
+                const base64 = std.base64.standard.Encoder.encode(encoded, &frame);
+                var digest = self.read.digest();
+                if (self.mode == .wrong_binding) digest[0] ^= 1;
+                break :blk try std.json.Stringify.valueAlloc(alloc, wire.native.ChunkReply{ .version = 1, .request_digest = digest, .observation = self.observation, .chunk_base64 = base64 }, .{});
+            } else blk: {
+                var digest = self.query.digest();
+                if (self.mode == .wrong_binding) digest[0] ^= 1;
+                break :blk try std.json.Stringify.valueAlloc(alloc, wire.native.ObservationReply{ .version = 1, .query_digest = digest, .observation = self.observation }, .{});
+            };
+            defer alloc.free(body);
+            const ResponseHeader = @typeInfo(@typeInfo(@TypeOf(http_route_helpers.textResponseWithHeaders)).@"fn".param_types[3].?).pointer.child;
+            var headers: [3]ResponseHeader = undefined;
+            var count: usize = 0;
+            if (self.mode != .missing_ack) {
+                headers[count] = .{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = route_metadata_api.catalog_route_fence_ack_value };
+                count += 1;
+            }
+            headers[count] = .{ .name = "Content-Type", .value = if (self.mode == .wrong_type) "text/plain" else "application/json" };
+            count += 1;
+            if (self.mode == .marker) {
+                headers[count] = .{ .name = internal_batch_forwarding.outcome_header, .value = "" };
+                count += 1;
+            }
+            return http_route_helpers.textResponseWithHeaders(alloc, 200, body, headers[0..count]);
+        }
+    };
+    var fixture = try wire.test_support.Fixture.init();
+    const observation = try fixture.sealed(a);
+    const query: wire.control.Query = .{ .root = observation.root, .spec = try fixture.spec(), .minimum_applied_index = 1 };
+    const read: wire.control.ReadRequest = .{ .query = query, .seal = observation.status.?.seal.?, .ordinal = 0 };
+    var fake: Fake = .{ .fixture = &fixture, .observation = observation, .query = query, .read = read };
+    var client = ApiHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    _ = client.withInternalServiceAuth("source-plan-client-test-secret-long-enough", "source-plan-test");
+    const fence: route_metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = fixture.source_owner.metadata_incarnation, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    const observe_input: wire.ObserveRequest = .{ .version = 1, .source_owner = fixture.source_owner, .query = query };
+    const chunk_input: wire.ChunkRequest = .{ .version = 1, .source_owner = fixture.source_owner, .request = read };
+    try std.testing.expectEqualDeep(observation, try client.fetchGroupSourcePlanObservation("http://node:8080", 17, "docs", observe_input, fence, .{}));
+    const owned = try client.fetchGroupSourcePlanChunk("http://node:8080", 17, "docs", chunk_input, fence, .{});
+    defer a.free(owned.bytes);
+    try std.testing.expectEqualSlices(u8, &fixture.frame, owned.bytes);
+    for ([_]Fake.Mode{ .wrong_binding, .corrupt_chunk, .marker, .missing_ack, .wrong_type, .lost, .resync }) |mode| {
+        fake.mode = mode;
+        const before = fake.calls;
+        const expected = switch (mode) {
+            .wrong_binding, .corrupt_chunk => error.InvalidSourcePlanWire,
+            .lost => error.ReadUnavailable,
+            .resync => error.HistoryResynchronizationRequired,
+            else => error.InvalidRemoteResponse,
+        };
+        try std.testing.expectError(expected, client.fetchGroupSourcePlanChunk("http://node:8080", 17, "docs", chunk_input, fence, .{}));
+        try std.testing.expectEqual(before + 1, fake.calls);
+    }
+    try std.testing.expectEqualSlices(u8, &fixture.frame, owned.bytes);
 }

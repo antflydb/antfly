@@ -4125,3 +4125,45 @@ skips or leaks in `source-plan-http-capability-test.log` (exit 0). Its first
 sandboxed run failed only at the two local TCP binds; the final run granted local
 socket access. Source-catalog validation, `zig fmt --check` on every changed Zig
 file, and `git diff --check` pass.
+
+### Routed source-plan transport
+
+Source-plan control, observation and chunk worker ports now use the same bounded
+known-leader capture and forwarding lane as retained-history operations. Routing
+requires the original physical namespace, metadata incarnation and topology
+owner. It does not fall back to an administrative snapshot or placement scan
+when the leader is unknown. HTTP ingress retains local-only callbacks, preventing
+forwarding loops. Routed operations intersect caller and route-fence deadlines
+and cancellation before discovery or local dispatch.
+
+The signed HTTP client makes one transport attempt per operation. Mutation
+ambiguity preserves the original recovery receipt; it never retries submission
+or receipt recovery automatically. Control replies require the original request
+digest, exact recovery receipt, route acknowledgment, JSON content type and valid
+phase evidence. Any unknown-outcome marker, including an empty marker, prevents
+confirmation. Observations bind the requested query; owned chunk bytes bind the
+read request, live seal, ordinal and chunk hash. Cancellation after chunk decode
+frees the decoded allocation. Conflict responses to reads fail closed with
+resynchronization required; they do not authorize a replacement upload or a
+source checkpoint advance.
+
+Qualification: `source-plan-routed-http-test.log` completes with exit 0 for
+`source-plan-http-test history-control-apply-test`. All eight source-plan HTTP
+and client tests and all 13 native Raft tests pass without skips or leaks.
+Client tests cover signed escaped routes, one bounded attempt, original receipt
+preservation, lost and malformed responses, request/receipt substitution,
+missing acknowledgments, wrong content types, unknown markers, cancellation,
+expired route budgets, corrupt chunk bytes, and resynchronization. The actual
+signed HTTP/native/Raft fixture now recovers a lost accepted receipt through a
+second node without advancing the log, reads its quota through that node, and
+retrieves independently owned sealed bytes through routed chunk reads.
+
+The first run identified fixture header-type and peer-view freshness issues,
+which were corrected. A subsequent run lost its cache files during compilation;
+the final cold rebuild completed successfully. Formatting and diff checks pass.
+
+This supplies routed transport, not the production source delivery adapter.
+The source-global head/checkpoint, native empty-target provisioning, worker and
+destination integrations, public feeds, coherent bootstrap/retention, production
+pgoutput and existing-client qualification remain required. The full goal and
+both implementation issues remain incomplete.
