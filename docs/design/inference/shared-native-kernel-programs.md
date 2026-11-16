@@ -204,7 +204,7 @@ complete merely because a shared primitive exists.
 The common-program tests pass, including the admission contract that preserves
 A100/L4 baselines. Ownership verification checks emitted regions/files, actual
 shared-source fingerprints and include closure. The direct annotations cover
-119 of 645 Tile regions; this is provenance at the annotated region, not a
+128 of 651 Tile regions; this is provenance at the annotated region, not a
 percentage of serving kernels or a transitive call-graph coverage metric.
 Unclassified regions are not evidence of dead code or duplicated algorithms.
 
@@ -365,3 +365,46 @@ portable conformance kernels, that total maintained code fell 20%, that each
 top-tier model has a new end-to-end benchmark, or that every model is faster
 than an external runtime. Those require separate measurements and, where
 appropriate, further compiler/schedule work rather than relabeling coverage.
+
+### Retained-family consolidation batch
+
+This audit covers the retained families together. Compatible phases share their
+existing owners, with implementation batched before qualification:
+
+- Scalar shuffle folds use `native_statistics.CudaShuffle`. XOR versus down,
+  native typed maximum versus `fmaxf`, and explicit RN addition remain policies.
+  Partial fragment folds with ascending or interleaved schedules stay distinct.
+- Ranked top-k insertion is shared by the Metal per-thread scan, tree merge and
+  final merge. Its positive ranked predicate rejects NaNs and breaks ties by ID;
+  legacy sampling retains its different NaN admission and encounter-order ties.
+  Serial/SIMD radix histograms share four-bit prefix geometry while retaining
+  their original accumulation orders.
+- Q4×Q8 contributions use one static DP4A traversal. Signed centering and GGML
+  unsigned nibble correction remain separate numerical profiles. The unused
+  duplicate aligned-word source fragment is removed.
+- WMMA score products share a live accumulator traversal with the complete
+  dot/store path. Preloaded A fragments and persistent P/V accumulators retain
+  their distinct acquisition, rescaling and synchronization schedules.
+- CUDA and Metal AdamW moments/update use existing FExpr expressions. Callers
+  retain their sqrt dialect, bias correction, stores, gradient clearing, alias
+  handling and optional nonfinite flag. CPU optimizer variants with a variance
+  clamp or different decay association are deliberately separate.
+
+The PyTorch-derived Welford training normalization is a single licensed,
+ordered implementation; there is no duplicate Welford algorithm to remove.
+The quantized HMMA family already routes wrappers into one static tile. Keep
+both rather than add forwarding owners or substitute a different algorithm.
+This batch adds no source file or parallel compiler. Generated copies and new
+provenance annotations do not count as maintained-source reduction.
+
+Qualification: 52 core tests and seven ownership tests pass; both generators
+pass freshness checks, and the ownership verifier accepts 857 emitted items
+across 64 canonical native files. Sixty local Metal cases pass against frozen
+kernels and independent sorted/optimizer references in default and safe math.
+The full Metal shader has identical compiler tokens to the frozen baseline.
+CUDA 13.2 regeneration on Glowworm produces byte-identical portable PTX,
+seven-architecture fatbin and SM89 cubin. The final marker-newline repair has
+identical compiler tokens across the complete 49-file CUDA input closure.
+These identity checks preserve instruction/resource/performance parity; this
+consolidation does not claim a binary-size reduction or a new speedup. The
+isolated CUDA qualification checkout/cache and local probe binary are removed.

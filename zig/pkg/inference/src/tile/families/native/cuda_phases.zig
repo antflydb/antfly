@@ -434,7 +434,12 @@ pub const elementwise = .{
     }),
     .gelu_derivative_x = tile.native_math.geluDerivative(tile.fexpr.lit(1).minus(tile.fexpr.operand("t").times(tile.fexpr.operand("t")))).renderNative(tile.native_math.cuda, .{ .value = "x", .t = "t", .x2 = "x2" }, null),
 };
+const AdamW = @import("antfly_tile").native_math.AdamW;
+const math_cuda = @import("antfly_tile").native_math.cuda;
 pub const training = .{
+    .adamw_first = AdamW.first.renderNative(math_cuda, .{ .beta1 = "beta1", .m = "m[i]", .g = "g" }, null),
+    .adamw_second = AdamW.second.renderNative(math_cuda, .{ .beta2 = "beta2", .v = "v[i]", .g = "g" }, null),
+    .adamw_update = AdamW.update.renderNative(math_cuda, .{ .m_hat = "m_hat", .root_v = "sqrtf(v_hat)", .eps = "eps", .decay = "weight_decay", .w = "w" }, null),
     .training_tensor_sum = @import("row_statistics.zig").native_stages.training_tensor_sum,
     .relative_probability_vjp_sum = @import("row_statistics.zig").native_stages.relative_probability_vjp_sum,
     .relative_softmax = relativeSoftmax(true),
@@ -460,16 +465,7 @@ const paged_key_dot =
 ;
 
 const qk_mma_dot =
-    \\{{indent}}wmma::fragment<wmma::accumulator, 16, 16, 16, float> dot;
-    \\{{indent}}wmma::fill_fragment(dot, 0.0f);
-    \\{{indent}}#pragma unroll
-    \\{{indent}}for (unsigned int d = 0u; d < D; d += 16u) {
-    \\{{indent}}    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf;
-    \\{{indent}}    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
-    \\{{indent}}    wmma::load_matrix_sync(qf, qt + qr * 16u * P + d, P);
-    \\{{indent}}    wmma::load_matrix_sync(kf, kt + kc * 16u * P + d, P);
-    \\{{indent}}    wmma::mma_sync(dot, qf, kf, dot);
-    \\{{indent}}}
+    \\{{indent}}ANTFLY_CUDA_WMMA_LIVE_DOT16_F32(dot, half, wmma::col_major, d, D, qt + qr * 16u * P + d, P, kt + kc * 16u * P + d, P, qf, kf)
 ;
 
 const relative_softmax =

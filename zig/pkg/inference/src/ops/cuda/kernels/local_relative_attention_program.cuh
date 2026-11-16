@@ -79,10 +79,14 @@ __device__ __forceinline__ void antfly_local_relative_attention_program(
     }
     if constexpr (Arithmetic == AntflyLocalRelativeArithmetic::IndependentF32) {
         float maximum=lane_score;
-        for(int offset=16;offset>0;offset>>=1)maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffffu,maximum,offset));
+        // tile-codegen:begin statistics.relative_shuffle.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+for(int offset=16;offset>0;offset>>=1)maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffffu,maximum,offset));
+// tile-codegen:end statistics.relative_shuffle.0 family
         float probability=lane<context?expf(__fsub_rn(lane_score,maximum)):0.f;
         float denominator=probability;
-        for(int offset=16;offset>0;offset>>=1)denominator=__fadd_rn(denominator,__shfl_xor_sync(0xffffffffu,denominator,offset));
+        // tile-codegen:begin statistics.relative_shuffle.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+for(int offset=16;offset>0;offset>>=1)denominator=__fadd_rn(denominator,__shfl_xor_sync(0xffffffffu,denominator,offset));
+// tile-codegen:end statistics.relative_shuffle.1 family
         probability=__fdiv_rn(probability,denominator);
         // Uniform iterations keep every lane in each shuffle, including when
         // the head width has a tail. Quotient/remainder avoids width+31 overflow.
@@ -179,9 +183,11 @@ extern "C" __global__ void antfly_local_relative_source_softmax_f32(
     }
     float maximum=score;
     for(int offset=16;offset>0;offset>>=1)maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffffu,maximum,offset));
+
     float probability=lane<context?expf(__fsub_rn(score,maximum)):0.f;
     float denominator=probability;
     for(int offset=16;offset>0;offset>>=1)denominator=__fadd_rn(denominator,__shfl_xor_sync(0xffffffffu,denominator,offset));
+
     if(lane<context)scores[score_index]=__fdiv_rn(probability,denominator);
 }
 extern "C" __global__ void antfly_local_relative_source_publish_bf16_values_f32(

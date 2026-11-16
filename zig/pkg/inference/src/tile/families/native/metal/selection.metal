@@ -22,15 +22,13 @@ kernel void termite_lm_head_top8_suppress_partials(device const float *logits [[
     uint start = block * block_size; uint end = min(start + block_size, p.out_dim);
     for (uint token_id = start + uint(tid); token_id < end; token_id += uint(tg_size)) {
         if (termite_argmax_suppressed_token(token_id, suppress_ids, p.suppress_count)) continue;
-        float value = logits[token_id]; if (!termite_lm_head_candidate_better(value, token_id, best_values[top_k - 1u], best_ids[top_k - 1u])) continue;
-        uint at = top_k - 1u; while (at > 0u && termite_lm_head_candidate_better(value, token_id, best_values[at - 1u], best_ids[at - 1u])) { best_values[at] = best_values[at - 1u]; best_ids[at] = best_ids[at - 1u]; --at; }
-        best_values[at] = value; best_ids[at] = token_id;
+        float value = logits[token_id]; {{ranked_insert}}
     }
     for (uint k = 0u; k < top_k; ++k) { shared_values[k * uint(tg_size) + uint(tid)] = best_values[k]; shared_ids[k * uint(tg_size) + uint(tid)] = best_ids[k]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = uint(tg_size) >> 1u; stride > 0u; stride >>= 1u) {
         if (uint(tid) < stride) {
-            for (uint candidate = 0u; candidate < top_k; ++candidate) { float value = shared_values[candidate * uint(tg_size) + uint(tid) + stride]; uint token_id = shared_ids[candidate * uint(tg_size) + uint(tid) + stride]; if (!termite_lm_head_candidate_better(value, token_id, best_values[top_k - 1u], best_ids[top_k - 1u])) continue; uint at = top_k - 1u; while (at > 0u && termite_lm_head_candidate_better(value, token_id, best_values[at - 1u], best_ids[at - 1u])) { best_values[at] = best_values[at - 1u]; best_ids[at] = best_ids[at - 1u]; --at; } best_values[at] = value; best_ids[at] = token_id; }
+            for (uint candidate = 0u; candidate < top_k; ++candidate) { float value = shared_values[candidate * uint(tg_size) + uint(tid) + stride]; uint token_id = shared_ids[candidate * uint(tg_size) + uint(tid) + stride]; {{ranked_insert}} }
             for (uint k = 0u; k < top_k; ++k) { shared_values[k * uint(tg_size) + uint(tid)] = best_values[k]; shared_ids[k * uint(tg_size) + uint(tid)] = best_ids[k]; }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -42,7 +40,7 @@ kernel void termite_lm_head_top8_suppress_partials(device const float *logits [[
 kernel void termite_lm_head_top8_reduce(device const float *partial_values [[buffer(0)]], device uint *partial_ids [[buffer(1)]], constant uint &candidate_count [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
     if (gid != 0u) return; const uint top_k = 8u; thread float best_values[8]; thread uint best_ids[8];
     for (uint k = 0u; k < top_k; ++k) { best_values[k] = -INFINITY; best_ids[k] = 0xffffffffu; }
-    for (uint candidate = 0u; candidate < candidate_count; ++candidate) { float value = partial_values[candidate]; uint token_id = partial_ids[candidate]; if (!termite_lm_head_candidate_better(value, token_id, best_values[top_k - 1u], best_ids[top_k - 1u])) continue; uint at = top_k - 1u; while (at > 0u && termite_lm_head_candidate_better(value, token_id, best_values[at - 1u], best_ids[at - 1u])) { best_values[at] = best_values[at - 1u]; best_ids[at] = best_ids[at - 1u]; --at; } best_values[at] = value; best_ids[at] = token_id; }
+    for (uint candidate = 0u; candidate < candidate_count; ++candidate) { float value = partial_values[candidate]; uint token_id = partial_ids[candidate]; {{ranked_insert}} }
     for (uint k = 0u; k < top_k; ++k) partial_ids[k] = best_ids[k];
 }
 // native-program:entry termite_lm_head_q6_k_rescore_top8

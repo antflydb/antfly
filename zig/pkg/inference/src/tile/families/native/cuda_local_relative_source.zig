@@ -60,10 +60,10 @@ pub const source_0 = program.render(
     \\        if(query>=rows||key<0||key>=rows||key>query||query-key>relative-1-exclude_farthest||valid[key]==0.f)score=invalid_value;
     \\    }
     \\    float maximum=score;
-    \\    for(int offset=16;offset>0;offset>>=1)maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffffu,maximum,offset));
+    \\    {{warp_maximum}}
     \\    float probability=lane<context?expf(__fsub_rn(score,maximum)):0.f;
     \\    float denominator=probability;
-    \\    for(int offset=16;offset>0;offset>>=1)denominator=__fadd_rn(denominator,__shfl_xor_sync(0xffffffffu,denominator,offset));
+    \\    {{warp_sum}}
     \\    if(lane<context)scores[score_index]=__fdiv_rn(probability,denominator);
     \\}
     \\extern "C" __global__ void antfly_local_relative_source_publish_bf16_values_f32(
@@ -76,6 +76,8 @@ pub const source_0 = program.render(
     \\}
     \\
 , .{
+    .warp_maximum = @import("row_statistics.zig").cuda_relative_shuffle.source_0,
+    .warp_sum = @import("row_statistics.zig").cuda_relative_shuffle.source_1,
     .query_scale = expr(query_recipe, "input", "query_scale", "scales[d]", ""),
     .key_scale = expr(key_recipe, "key_input", "key_scale", "", ""),
     .cap = expr(cap_recipe, "content", "relative_value", "cap", ""),

@@ -403,3 +403,27 @@ test "BF16 softmax schedule admission retains unqualified device baselines" {
     for ([_]usize{ 1, 31, 270, 511, 512 }) |columns| try std.testing.expect(schedule.supportsNarrow(columns, 12, 1));
     for ([_]usize{ 0, 513, 8192, std.math.maxInt(usize) }) |columns| try std.testing.expect(!schedule.supportsNarrow(columns, 12, 1));
 }
+
+// Check ordered optimizer expressions against independently written F32
+// formulas across small/large gradients, zero decay and distinct beta values.
+test "shared AdamW stages retain moment and decay association" {
+    const AdamW = core.native_math.AdamW;
+    inline for (.{ @as(f32, 0), @as(f32, 0.9), @as(f32, 0.999) }) |beta| {
+        for (0..2048) |i| {
+            const g: f32 = @as(f32, @floatFromInt(i)) / 31 - 33;
+            const m: f32 = g / 11;
+            const v: f32 = @abs(g) + 0.001;
+            const got_m = AdamW.first.evaluate(struct {}, .{ .value = g, .beta1 = beta, .m = m, .g = g });
+            const got_v = AdamW.second.evaluate(struct {}, .{ .value = g, .beta2 = beta, .v = v, .g = g });
+            const want_m: f32 = beta * m + (1 - beta) * g;
+            const want_v: f32 = beta * v + (1 - beta) * g * g;
+            try std.testing.expectEqual(@as(u32, @bitCast(want_m)), @as(u32, @bitCast(got_m)));
+            try std.testing.expectEqual(@as(u32, @bitCast(want_v)), @as(u32, @bitCast(got_v)));
+            const root = @sqrt(got_v / 0.01);
+            const mh = got_m / 0.1;
+            const got_update = AdamW.update.evaluate(struct {}, .{ .value = g, .m_hat = mh, .root_v = root, .eps = @as(f32, 1e-8), .decay = beta, .w = m });
+            const want_update: f32 = mh / (root + @as(f32, 1e-8)) + beta * m;
+            try std.testing.expectEqual(@as(u32, @bitCast(want_update)), @as(u32, @bitCast(got_update)));
+        }
+    }
+}

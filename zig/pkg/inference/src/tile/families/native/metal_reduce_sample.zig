@@ -24,6 +24,7 @@ const phases = .{
     .merge = (tile.native_sampling.TopK{ .count = "top_k", .value = "v", .id = "partial_ids[i]" }).insert(),
 };
 const trees = .{
+    .radix4_geometry = tile.native_sampling.radix4_geometry,
     .maximum = tile.native_statistics.Tree.native(.{
         .integer = "uint",
         .lane = "uint(tid)",
@@ -65,11 +66,11 @@ pub const source_0 =
         \\    float subtotal = 0.0f; for (uint i = uint(tid); i < state->block_count; i += uint(tg_size)) subtotal += partials[i]; {{sum}} if (tid == 0u) { state->total_mass = shared[0]; state->target_mass = top_p * shared[0]; state->mass_above = 0.0f; state->prefix = 0u; state->cutoff_key = 0u; state->pass = 0u; }
         \\}
         \\kernel void termite_sample_nucleus_radix_histogram_serial(device const float *logits [[buffer(0)]], device const float *probs [[buffer(1)]], device float *histograms [[buffer(2)]], device const termite_metal_nucleus_state *state [[buffer(3)]], constant termite_metal_sample_logits_params &p [[buffer(4)]], device const termite_metal_penalty_entry *penalties [[buffer(5)]], ushort tid [[thread_index_in_threadgroup]], uint block [[threadgroup_position_in_grid]]) {
-        \\    if (tid >= 16u) return; const uint block_size = 1024u; uint start = block * block_size; uint end = min(start + block_size, p.out_dim); uint shift = 28u - state->pass * 4u; uint prefix_mask = state->pass == 0u ? 0u : (0xffffffffu << (32u - state->pass * 4u)); float mass = 0.0f;
+        \\    if (tid >= 16u) return; const uint block_size = 1024u; uint start = block * block_size; uint end = min(start + block_size, p.out_dim); {{radix4_geometry}} float mass = 0.0f;
         \\    for (uint i = start; i < end; ++i) { float prob = probs[i]; if (!(prob > 0.0f)) continue; uint key = as_type<uint>(prob); if ((key & prefix_mask) == state->prefix && ((key >> shift) & 15u) == uint(tid)) mass += prob; } histograms[block * 16u + uint(tid)] = mass;
         \\}
         \\kernel void termite_sample_nucleus_radix_histogram(device const float *logits [[buffer(0)]], device const float *probs [[buffer(1)]], device float *histograms [[buffer(2)]], device const termite_metal_nucleus_state *state [[buffer(3)]], constant termite_metal_sample_logits_params &p [[buffer(4)]], device const termite_metal_penalty_entry *penalties [[buffer(5)]], threadgroup float *simd_histograms [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort simdgroup [[simdgroup_index_in_threadgroup]], uint block [[threadgroup_position_in_grid]]) {
-        \\    const uint block_size = 1024u; uint start = block * block_size; uint end = min(start + block_size, p.out_dim); uint shift = 28u - state->pass * 4u; uint prefix_mask = state->pass == 0u ? 0u : (0xffffffffu << (32u - state->pass * 4u)); thread float bins[16]; for (uint b = 0u; b < 16u; ++b) bins[b] = 0.0f;
+        \\    const uint block_size = 1024u; uint start = block * block_size; uint end = min(start + block_size, p.out_dim); {{radix4_geometry}} thread float bins[16]; for (uint b = 0u; b < 16u; ++b) bins[b] = 0.0f;
         \\    for (uint i = start + uint(tid); i < end; i += uint(tg_size)) { float prob = probs[i]; if (!(prob > 0.0f)) continue; uint key = as_type<uint>(prob); if ((key & prefix_mask) != state->prefix) continue; bins[(key >> shift) & 15u] += prob; }
         \\    for (uint b = 0u; b < 16u; ++b) { float mass = simd_sum(bins[b]); if (lane == 0u) simd_histograms[uint(simdgroup) * 16u + b] = mass; } threadgroup_barrier(mem_flags::mem_threadgroup);
         \\    if (tid < 16u) { float mass = 0.0f; uint simdgroup_count = (uint(tg_size) + 31u) >> 5u; for (uint group = 0u; group < simdgroup_count; ++group) mass += simd_histograms[group * 16u + uint(tid)]; histograms[block * 16u + uint(tid)] = mass; }

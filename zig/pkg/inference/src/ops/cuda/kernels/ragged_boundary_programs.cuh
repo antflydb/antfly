@@ -8,11 +8,15 @@ namespace {
 using uint = unsigned int;
 template<class T> __device__ __forceinline__ T gliner25_clamp(T v, T lo, T hi) { return min(max(v, lo), hi); }
 __device__ __forceinline__ float gliner25_warp_sum(float v) {
-    for (int d=16; d; d>>=1) v += __shfl_xor_sync(0xffffffffu, v, d);
+    // tile-codegen:begin statistics.ragged_shuffle.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+for (int d=16; d; d>>=1) v+=__shfl_xor_sync(0xffffffffu,v,d);
+// tile-codegen:end statistics.ragged_shuffle.0 family
     return v;
 }
 template<class T> __device__ __forceinline__ T gliner25_warp_max(T v) {
-    for (int d=16; d; d>>=1) v = max(v, __shfl_xor_sync(0xffffffffu, v, d));
+    // tile-codegen:begin statistics.ragged_shuffle.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+for (int d=16; d; d>>=1) v=max(v,__shfl_xor_sync(0xffffffffu,v,d));
+// tile-codegen:end statistics.ragged_shuffle.1 family
     return v;
 }
 struct Gliner25BoundaryParams { uint kind; uint dims[8]; float scalars[4]; };

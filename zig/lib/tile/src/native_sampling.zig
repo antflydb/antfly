@@ -36,3 +36,18 @@ pub fn uniform(comptime id: []const u8, comptime seed: []const u8) []const u8 {
         \\
     , .{ .id = id, .seed = seed });
 }
+
+/// Ranked candidate insertion: value descending, then lowest unsigned ID.
+/// In contrast to legacy TopK, NaNs are rejected by the positive predicate.
+/// Expansion stays in the caller loop to preserve array scalarization/liveness.
+pub fn rankedInsert(comptime better: []const u8) []const u8 {
+    return render(
+        \\if (!{{better}}(value, token_id, best_values[top_k - 1u], best_ids[top_k - 1u])) continue;
+        \\uint at = top_k - 1u; while (at > 0u && {{better}}(value, token_id, best_values[at - 1u], best_ids[at - 1u])) { best_values[at] = best_values[at - 1u]; best_ids[at] = best_ids[at - 1u]; --at; }
+        \\best_values[at] = value; best_ids[at] = token_id;
+    , .{ .better = better });
+}
+
+/// Positive F32 probability keys, four bits per pass. The guarded mask avoids
+/// shifting a U32 by 32 on the first pass. Histogram accumulation stays native.
+pub const radix4_geometry = "uint shift = 28u - state->pass * 4u; uint prefix_mask = state->pass == 0u ? 0u : (0xffffffffu << (32u - state->pass * 4u));";

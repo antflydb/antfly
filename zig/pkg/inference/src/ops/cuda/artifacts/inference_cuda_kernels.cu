@@ -15400,16 +15400,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
         }
         __syncthreads();
         const unsigned int qr = warp / 4u, kc = warp % 4u;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> dot;
-        wmma::fill_fragment(dot, 0.0f);
-        #pragma unroll
-        for (unsigned int d = 0u; d < D; d += 16u) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
-            wmma::load_matrix_sync(qf, qt + qr * 16u * P + d, P);
-            wmma::load_matrix_sync(kf, kt + kc * 16u * P + d, P);
-            wmma::mma_sync(dot, qf, kf, dot);
-        }
+        ANTFLY_CUDA_WMMA_LIVE_DOT16_F32(dot, half, wmma::col_major, d, D, qt + qr * 16u * P + d, P, kt + kc * 16u * P + d, P, qf, kf)
         wmma::store_matrix_sync(scores + qr * 16u * N + kc * 16u, dot, N, wmma::mem_row_major);
         __syncthreads();
         #pragma unroll
@@ -15777,16 +15768,7 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attenti
         #pragma unroll
         for (unsigned int g = 0u; g < 2u; ++g) {
             const unsigned int qr = warp / 4u + g * 2u, kc = warp % 4u;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> dot;
-            wmma::fill_fragment(dot, 0.0f);
-            #pragma unroll
-            for (unsigned int d = 0u; d < D; d += 16u) {
-                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf;
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
-                wmma::load_matrix_sync(qf, qt + qr * 16u * P + d, P);
-                wmma::load_matrix_sync(kf, kt + kc * 16u * P + d, P);
-                wmma::mma_sync(dot, qf, kf, dot);
-            }
+            ANTFLY_CUDA_WMMA_LIVE_DOT16_F32(dot, half, wmma::col_major, d, D, qt + qr * 16u * P + d, P, kt + kc * 16u * P + d, P, qf, kf)
             wmma::store_matrix_sync(shared_scores + qr * 16u * S + kc * 16u, dot, S, wmma::mem_row_major);
         }
         __syncthreads();

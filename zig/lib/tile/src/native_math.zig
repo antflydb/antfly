@@ -193,3 +193,11 @@ pub fn geluDerivative(comptime sech2: f.FExpr) f.FExpr {
 pub fn rotary(comptime upper: bool) f.FExpr {
     return if (upper) f.acc.times(f.operand("sine")).plus(f.operand("other").times(f.operand("cosine"))) else f.acc.times(f.operand("cosine")).minus(f.operand("other").times(f.operand("sine")));
 }
+
+/// AdamW stages share arithmetic, not optimizer state/publication semantics.
+/// The second moment deliberately multiplies (1-beta)*g*g left-to-right.
+pub const AdamW = struct {
+    pub const first = f.operand("beta1").times(f.operand("m")).plus(f.lit(1).minus(f.operand("beta1")).times(f.operand("g")));
+    pub const second = f.operand("beta2").times(f.operand("v")).plus(f.lit(1).minus(f.operand("beta2")).times(f.operand("g")).times(f.operand("g")));
+    pub const update = f.operand("m_hat").dividedBy(f.operand("root_v").plus(f.operand("eps"))).plus(f.operand("decay").times(f.operand("w")));
+};

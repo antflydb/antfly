@@ -167,3 +167,22 @@ pub const Bf16ScoreSoftmax = struct {
     }
     pub const header = std.fmt.comptimePrint("#define ANTFLY_BF16_SCORE_SOFTMAX_THREADS {d}u\n#define ANTFLY_BF16_SCORE_SOFTMAX_NARROW_LIMIT {d}u\n", .{ threads, narrow_limit });
 };
+
+/// Scalar CUDA shuffle fold. Callers own participation, loop bounds and
+/// broadcast. RN addition and generic integer maximum are explicit policies.
+pub const CudaShuffle = struct {
+    value: []const u8,
+    offset: []const u8 = "offset",
+    loop: []const u8,
+    operation: enum { sum, maximum },
+    add: ?[]const u8 = null,
+    maximum: []const u8 = "fmaxf",
+    xor: bool = true,
+    pub fn native(comptime p: CudaShuffle) []const u8 {
+        const other = (if (p.xor) "__shfl_xor_sync" else "__shfl_down_sync") ++ "(0xffffffffu," ++ p.value ++ "," ++ p.offset ++ ")";
+        return p.loop ++ p.value ++ (switch (p.operation) {
+            .sum => if (p.add) |add| "=" ++ add ++ "(" ++ p.value ++ "," ++ other ++ ")" else "+=" ++ other,
+            .maximum => "=" ++ p.maximum ++ "(" ++ p.value ++ "," ++ other ++ ")",
+        }) ++ ";\n";
+    }
+};

@@ -149,3 +149,13 @@ pub const bf16_narrow_exports = struct {
         \\
     ;
 };
+
+const CudaShuffle = @import("antfly_tile").native_statistics.CudaShuffle;
+pub const cuda_relative_shuffle = struct {
+    pub const source_0 = (CudaShuffle{ .value = "maximum", .loop = "for(int offset=16;offset>0;offset>>=1)", .operation = .maximum }).native();
+    pub const source_1 = (CudaShuffle{ .value = "denominator", .loop = "for(int offset=16;offset>0;offset>>=1)", .operation = .sum, .add = "__fadd_rn" }).native();
+};
+pub const cuda_ragged_shuffle = struct {
+    pub const source_0 = (CudaShuffle{ .value = "v", .offset = "d", .loop = "for (int d=16; d; d>>=1) ", .operation = .sum }).native();
+    pub const source_1 = (CudaShuffle{ .value = "v", .offset = "d", .loop = "for (int d=16; d; d>>=1) ", .operation = .maximum, .maximum = "max" }).native();
+};

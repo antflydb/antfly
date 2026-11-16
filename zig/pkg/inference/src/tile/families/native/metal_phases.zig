@@ -192,3 +192,11 @@ pub const source_0 = program.metal(program.render(
     \\}
     \\
 , .{ .derivative = tile.fexpr.binding(tile.native_math.geluDerivative(tile.fexpr.operand("sech2")), tile.native_math.metal, .{ .value = "x", .t = "t", .x2 = "x2", .sech2 = "sech2" }) }));
+
+const AdamW = @import("antfly_tile").native_math.AdamW;
+const math_metal = @import("antfly_tile").native_math.metal;
+pub const adamw = struct {
+    pub const source_0 = program.metal("    float mv = " ++ AdamW.first.renderNative(math_metal, .{ .beta1 = "p.beta1", .m = "m[gid]", .g = "g" }, null) ++ ";\n" ++
+        "    float vv = " ++ AdamW.second.renderNative(math_metal, .{ .beta2 = "p.beta2", .v = "v[gid]", .g = "g" }, null) ++ ";\n");
+    pub const source_1 = program.metal("    float update = " ++ AdamW.update.renderNative(math_metal, .{ .m_hat = "mh", .root_v = "sqrt(vh)", .eps = "p.eps", .decay = "p.weight_decay", .w = "w" }, null) ++ ";\n");
+};

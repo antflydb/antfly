@@ -31,14 +31,14 @@ extern "C" __global__ void termite_training_adamw_f32(ANTFLY_CUDA_TRAIN_ADAMW_PA
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     float g = grad[i] * grad_scale;
-    float next_m = beta1 * m[i] + (1.0f - beta1) * g;
-    float next_v = beta2 * v[i] + (1.0f - beta2) * g * g;
+    float next_m = {{adamw_first}};
+    float next_v = {{adamw_second}};
     m[i] = next_m;
     v[i] = next_v;
     float m_hat = next_m / bias_correction1;
     float v_hat = next_v / bias_correction2;
     float w = weight[i];
-    weight[i] = w - lr * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * w);
+    weight[i] = w - lr * ({{adamw_update}});
 }
 // native-program:entry termite_training_sum_squares_f32
 extern "C" __global__ void termite_training_sum_squares_f32(

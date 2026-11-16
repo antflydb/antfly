@@ -2538,77 +2538,47 @@ const helper_q4_0_word_u16 = SourceFragment{
     ,
 };
 
-const helper_q4_0_word_u16_no_comment = SourceFragment{
-    .name = "antfly_q4_0_word_u16",
-    .source =
-    \\static __device__ __forceinline__ unsigned int antfly_q4_0_word_u16(const unsigned char *payload) {
-    \\    const unsigned short *halves = (const unsigned short *)payload;
-    \\    return (unsigned int)halves[0] | ((unsigned int)halves[1] << 16);
-    \\}
-    ,
-};
-
-const helper_q4_0_q8_dot16 = SourceFragment{
-    .name = "antfly_q4_0_q8_dot16",
-    .source =
-    \\static __device__ __forceinline__ float antfly_q4_0_q8_dot16(
-    \\    const unsigned char *q4_bp,
-    \\    float q8_d,
-    \\    unsigned int iqs,
-    \\    int q8_low0,
-    \\    int q8_high0,
-    \\    int q8_low1,
-    \\    int q8_high1
-    \\) {
-    \\    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
-    \\    const unsigned int base0 = iqs * 4u;
-    \\    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
-    \\    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
-    \\    const unsigned int low0 = __vadd4(word0 & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    \\    const unsigned int high0 = __vadd4((word0 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    \\    const unsigned int low1 = __vadd4(word1 & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    \\    const unsigned int high1 = __vadd4((word1 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    \\    int sumi = __dp4a((int)low0, q8_low0, 0);
-    \\    sumi = __dp4a((int)high0, q8_high0, sumi);
-    \\    sumi = __dp4a((int)low1, q8_low1, sumi);
-    \\    sumi = __dp4a((int)high1, q8_high1, sumi);
-    \\    return q4_d * q8_d * (float)sumi;
-    \\}
-    ,
-};
-
-pub const helper_q4_0_ggml_q8_1_dot16 = SourceFragment{
-    .name = "antfly_q4_0_ggml_q8_1_dot16",
-    .source =
-    \\// One of two 16-value contributions for a Q4_0/Q8_1 block. Keeping Q4
-    \\// nibbles unsigned removes four packed-byte centering instructions; each
-    \\// contribution applies half of the block-wide -8*sum correction.
-    \\static __device__ __forceinline__ float antfly_q4_0_ggml_q8_1_dot16(
-    \\    const unsigned char *q4_bp,
-    \\    float q8_d,
-    \\    float q8_sum,
-    \\    unsigned int iqs,
-    \\    int q8_low0,
-    \\    int q8_high0,
-    \\    int q8_low1,
-    \\    int q8_high1
-    \\) {
-    \\    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
-    \\    const unsigned int base0 = iqs * 4u;
-    \\    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
-    \\    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
-    \\    const unsigned int low0 = word0 & 0x0f0f0f0fu;
-    \\    const unsigned int high0 = (word0 >> 4) & 0x0f0f0f0fu;
-    \\    const unsigned int low1 = word1 & 0x0f0f0f0fu;
-    \\    const unsigned int high1 = (word1 >> 4) & 0x0f0f0f0fu;
-    \\    int sumi = __dp4a((int)low0, q8_low0, 0);
-    \\    sumi = __dp4a((int)high0, q8_high0, sumi);
-    \\    sumi = __dp4a((int)low1, q8_low1, sumi);
-    \\    sumi = __dp4a((int)high1, q8_high1, sumi);
-    \\    return q4_d * (q8_d * (float)sumi - 4.0f * q8_sum);
-    \\}
-    ,
-};
+// One four-DP4A traversal, statically specialized for signed centering or
+// unsigned GGML half-block correction. Keep the correction association exact.
+fn q4Q8DotSource(comptime ggml: bool) []const u8 {
+    return (if (ggml) "// One of two 16-value contributions for a Q4_0/Q8_1 block. Keeping Q4\n" ++
+        "// nibbles unsigned removes four packed-byte centering instructions; each\n" ++
+        "// contribution applies half of the block-wide -8*sum correction.\n" else "") ++ @import("../tile/native_program.zig").render(
+        \\static __device__ __forceinline__ float {{name}}(
+        \\    const unsigned char *q4_bp,
+        \\    float q8_d,{{sum_parameter}}
+        \\    unsigned int iqs,
+        \\    int q8_low0,
+        \\    int q8_high0,
+        \\    int q8_low1,
+        \\    int q8_high1
+        \\) {
+        \\    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
+        \\    const unsigned int base0 = iqs * 4u;
+        \\    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
+        \\    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
+        \\    const unsigned int low0 = {{low0}};
+        \\    const unsigned int high0 = {{high0}};
+        \\    const unsigned int low1 = {{low1}};
+        \\    const unsigned int high1 = {{high1}};
+        \\    int sumi = __dp4a((int)low0, q8_low0, 0);
+        \\    sumi = __dp4a((int)high0, q8_high0, sumi);
+        \\    sumi = __dp4a((int)low1, q8_low1, sumi);
+        \\    sumi = __dp4a((int)high1, q8_high1, sumi);
+        \\    return {{result}};
+        \\}
+    , .{
+        .name = if (ggml) "antfly_q4_0_ggml_q8_1_dot16" else "antfly_q4_0_q8_dot16",
+        .sum_parameter = if (ggml) "\n    float q8_sum," else "",
+        .low0 = if (ggml) "word0 & 0x0f0f0f0fu" else "__vadd4(word0 & 0x0f0f0f0fu, 0xf8f8f8f8u)",
+        .high0 = if (ggml) "(word0 >> 4) & 0x0f0f0f0fu" else "__vadd4((word0 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u)",
+        .low1 = if (ggml) "word1 & 0x0f0f0f0fu" else "__vadd4(word1 & 0x0f0f0f0fu, 0xf8f8f8f8u)",
+        .high1 = if (ggml) "(word1 >> 4) & 0x0f0f0f0fu" else "__vadd4((word1 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u)",
+        .result = if (ggml) "q4_d * (q8_d * (float)sumi - 4.0f * q8_sum)" else "q4_d * q8_d * (float)sumi",
+    });
+}
+const helper_q4_0_q8_dot16 = SourceFragment{ .name = "antfly_q4_0_q8_dot16", .source = q4Q8DotSource(false) };
+pub const helper_q4_0_ggml_q8_1_dot16 = SourceFragment{ .name = "antfly_q4_0_ggml_q8_1_dot16", .source = q4Q8DotSource(true) };
 
 const q8_legacy_policy = SourceFragment{
     .name = "antfly_q8_legacy",
