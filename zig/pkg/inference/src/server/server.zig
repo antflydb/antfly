@@ -1309,6 +1309,10 @@ pub fn httpBodyLimitBytesFromMib(mib: usize) error{InvalidHttpBodyLimit}!usize {
 pub const RequestLimits = platform.resource_policy.InferenceRequestLimits;
 
 pub const NodeConfig = struct {
+    /// Fixed before model/client creation; CUDA requires explicit device and
+    /// allocator capacities. F32 remains the default qualification profile.
+    pjrt_memory_policy: ?session_factory.PjrtSessionOptions.MemoryPolicy = null,
+    pjrt_precision: session_factory.PjrtSessionOptions.Precision = .f32,
     audio_readers: []const transcribing_api.NamedConfig = &.{},
     chunking_limits: @import("../pipelines/media_chunk_limits.zig").Limits = .{},
     models_dir: []const u8 = "./models",
@@ -1901,6 +1905,12 @@ fn modelBackendToNativeChoice(value: api.ModelBackend) native_backend_choice.Cho
         .xla => .xla,
         .webgpu, .wasm => .webgpu,
     };
+}
+
+/// Whole-program XLA requests own a real PJRT session; partitioned requests
+/// retain the existing native graph-attachment contract.
+fn usesPjrtGenerationSession(selection: GenerateBackendSelection) bool {
+    return selection.compiled_partition_backend == .pjrt and selection.compiled_attachment_target == .whole_model;
 }
 
 fn configureGenerateBackendPreference(
@@ -4608,6 +4618,8 @@ pub const Node = struct {
             null;
         errdefer if (cuda_owner) |owner| owner.deinit();
         var session_manager = backends_mod.SessionManager.init(allocator);
+        session_manager.pjrt_memory_policy = config.pjrt_memory_policy;
+        session_manager.pjrt_precision = config.pjrt_precision;
         session_manager.process_termination_available = config.process_termination_available;
         session_manager.native_call_policy = config.native_call_policy;
         if (!config.inference_proxy) try session_manager.validateRequiredBackendPolicy();
@@ -17380,7 +17392,7 @@ pub const Node = struct {
         // Native generation (CPU/GPU GPT arch forward pass).
         var model_handle = if (backend_selection.native_choice != .auto) blk: {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
-            configureGenerateBackendPreference(&request_session_manager, backend_selection);
+            if (usesPjrtGenerationSession(backend_selection)) request_session_manager.preferred_backends = &.{.pjrt} else configureGenerateBackendPreference(&request_session_manager, backend_selection);
             break :blk self.model_manager.acquireFromDirWithPreferredBackendsAndControl(model_path, request_session_manager.preferred_backends, false, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
                 return modelLoadFailureResponse(ctx, err);
         } else self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
@@ -17423,6 +17435,13 @@ pub const Node = struct {
                 ),
             });
         };
+        if (usesPjrtGenerationSession(backend_selection)) {
+            if (body.context_management != null or body.kv_cache != null or native_transfer != null or
+                body.cache_dtype != null or config.prompt_cache_enabled or
+                effective_draft_model_name != null or auto_draft_sibling != null or config.speculation_requested)
+                return ctx.status(400).json(.{ .@"error" = "UNSUPPORTED_FEATURE", .message = "whole-model XLA uses full-prefix execution; context/KV policies, checkpoints, caching and speculation require the native decoder" });
+            return self.generatePjrt(ctx, body, model_path, model, messages.items, config, if (tool_parser) |*parser| parser else null, want_stream, include_stream_usage, execution_control, executor_contract.batch.max_input_tokens_per_item, completion);
+        }
         var prepared_context: ?context_management.PrepareResult = null;
         defer if (prepared_context) |*prepared| prepared.deinit();
         if (body.context_management) |policy| {
@@ -18616,10 +18635,78 @@ pub const Node = struct {
             }
             return nativeCheckpointResponse(ctx, prepare, body.model, execution_control, completion);
         };
+        return self.finishGenerate(ctx, body, result, config, if (tool_parser) |*parser| parser else null, context_diagnostics, if (wants_logprobs) token_evidence.entries.items else null);
+    }
+
+    /// Request-owned orchestration only. Learned stages execute through the
+    /// model's PJRT session; no native KV pool or request-private client exists.
+    fn generatePjrt(self: *Node, ctx: *httpx.Context, body: anytype, model_path: []const u8, model: *model_manager_mod.LoadedModel, messages: []const generation.Message, config: generation.GenerationConfig, parser: ?*tool_parser_mod.Parser, stream: bool, include_usage: bool, control: InferenceExecutionControl, input_limit: ?usize, completion: *?DeferredGenerationCompletion) !httpx.Response {
+        if (model.session.backend() != .pjrt) return modelLoadFailureResponse(ctx, error.GenerationBackendSelectionMismatch);
+        const client = session_factory.getPjrtClientPtr(model.session) orelse
+            return modelLoadFailureResponse(ctx, error.GenerationBackendSelectionMismatch);
+        const gpt_config = session_factory.getGptConfig(model.session) orelse
+            return modelLoadFailureResponse(ctx, error.MissingDecoderConfig);
+        var estimate: ?NativePromptEstimate = null;
+        defer if (estimate) |*value| value.deinit();
+        const tokens = self.estimateNativePromptTokens(ctx.allocator, model_path, model, gpt_config, messages, config.max_tokens, 0, config.enable_thinking, config.grammar != null, &estimate) catch |err|
+            return generationErrorResponse(ctx, err);
+        if (input_limit) |limit| if (tokens > limit)
+            return inferenceExecutorContractFailureResponse(ctx, error.InferenceInputTokensExceeded);
+        const slot = model.generation_admission.acquire(control, true, runtime.scheduler.generation_admission.Limits.forRequests(self.config.max_concurrent_requests, null)) catch |err| {
+            if (err == error.GenerationQueueFull) return modelResourceBusyResponse(ctx);
+            return inferenceFailureResponse(ctx, err);
+        };
+        defer slot.release();
+        // Pay the host preprocessing envelope before provider work. Compiled
+        // stage calls separately admit their device work and returned buffers.
+        const media = try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, .native, estimate.?.media_admission);
+        var preparation = model.session.withAdmissionControl(control).admitRetainedMedia(media.host_scratch_bytes, media.backend_scratch_bytes) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        defer preparation.deinit();
+        var compute = @import("../backends/compute_provider.zig").acquireWithControl(model.session, ctx.allocator, control) catch |err|
+            return inferenceFailureResponse(ctx, err);
+        defer compute.deinit();
+        // The outer guard protects the entire pipeline, including host/device
+        // cleanup. Nested session calls keep soft cancellation but do not arm
+        // the same worker monitor a second time.
+        var borrowed = control;
+        borrowed.hard_cancellation = null;
+        borrowed.native_call_policy = .in_process;
+        compute.backend.execution_control = borrowed;
+        var cache = graph_mod.cache.GraphCache.init(ctx.allocator);
+        defer cache.deinitWithBackend(&compute.backend);
+        var pipeline = generation.NativeGenerationPipeline{
+            .allocator = ctx.allocator,
+            .io = ctx.io,
+            .cb = compute.backend,
+            .execution_control = borrowed,
+            .gpt_config = gpt_config,
+            .session = model.session,
+            .tokenizer = model.getTokenizer(),
+            .add_bos_token = model.manifest.add_bos_token,
+            .bos_token = model.manifest.bos_token,
+            .chat_template = model.chat_tmpl,
+            .model_dir = model_path,
+            .gguf_projector_path = model.manifest.gguf_projector_path,
+            .graph_cache = &cache,
+            .compiled_partition_backend = .pjrt,
+            .compiled_attachment_target = .whole_model,
+            .pjrt_client = client,
+            .generation_admission = &model.generation_admission,
+            .media_prepaid = .{ .process_bytes = media.host_scratch_bytes },
+        };
+        defer pipeline.deinit();
+        if (stream) return self.streamGenerate(ctx, body.model, &pipeline, null, messages, config, parser, include_usage, null, completion);
+        var result = pipeline.generate(messages, config) catch |err| return generationErrorResponse(ctx, err);
+        defer result.deinit();
+        return self.finishGenerate(ctx, body, result, config, parser, null, null);
+    }
+
+    fn finishGenerate(self: *Node, ctx: *httpx.Context, body: anytype, result: generation.GenerationResult, config: generation.GenerationConfig, tool_parser: ?*tool_parser_mod.Parser, context_diagnostics: ?api.ContextDiagnostics, logprobs: anytype) !httpx.Response {
         var response_text = result.text;
         var tool_response_text: ?[]u8 = null;
         defer if (tool_response_text) |text| ctx.allocator.free(text);
-        const parsed_tool_calls = if (tool_parser) |*parser| blk: {
+        const parsed_tool_calls = if (tool_parser) |parser| blk: {
             parser.reset();
             _ = parser.feed(result.text) catch |err|
                 return generationErrorResponse(ctx, err);
@@ -18663,7 +18750,7 @@ pub const Node = struct {
                 config.speculation_calibration,
             ),
             context_diagnostics,
-            if (wants_logprobs) token_evidence.entries.items else null,
+            logprobs,
         );
     }
 
@@ -38313,6 +38400,45 @@ test "taskMatchesModelListing prefers explicit tasks when present" {
     try std.testing.expect(taskMatchesModelListing("generators", "generator", "", &.{"generate"}, &.{}, false));
     try std.testing.expect(taskMatchesModelListing("extractors", "generator", "", &.{"extract"}, &.{}, false));
     try std.testing.expect(!taskMatchesModelListing("extractors", "generator", "", &.{"generate"}, &.{"extraction"}, false));
+}
+
+test "whole-model PJRT generation serves real HTTP responses and refunds request resources" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_PJRT_DECODER_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .pjrt_memory_policy = .cpu, .native_call_policy = .in_process });
+    defer node.deinit();
+    const selection = try parseGenerateBackendSelection(.xla, "compiled", "whole-model");
+    try std.testing.expect(usesPjrtGenerationSession(selection));
+    var handle = try node.model_manager.acquireFromDirWithPreferredBackendsAndControl(path, &.{.pjrt}, false, .{ .io = std.testing.io });
+    defer handle.release();
+    const model = handle.get();
+    try std.testing.expectEqual(backends_mod.BackendType.pjrt, model.session.backend());
+    const domain = node.model_manager.resource_domain.?;
+    var previous: ?[]u8 = null;
+    defer if (previous) |bytes| a.free(bytes);
+    for (0..2) |_| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const request_allocator = arena.allocator();
+        var request = try httpx.Request.init(request_allocator, .POST, "/ai/v1/generate");
+        defer request.deinit();
+        var ctx = httpx.Context.init(request_allocator, std.testing.io, &request);
+        const body = api.GenerateRequest{ .model = "fixture", .messages = &.{} };
+        var completion: ?Node.DeferredGenerationCompletion = null;
+        const response = try node.generatePjrt(&ctx, body, path, model, &.{.{ .role = "user", .content = "Say hello." }}, .{ .max_tokens = 2, .temperature = 0, .enable_thinking = false }, null, false, false, .{ .io = std.testing.io, .native_call_policy = .in_process }, null, &completion);
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect(completion == null);
+        const parsed = try std.json.parseFromSlice(std.json.Value, request_allocator, response.body.?, .{});
+        const choices = parsed.value.object.get("choices").?.array.items;
+        const content = choices[0].object.get("message").?.object.get("content").?.string;
+        try std.testing.expect(content.len != 0);
+        if (previous) |expected| try std.testing.expectEqualStrings(expected, content) else previous = try a.dupe(u8, content);
+        const amounts = domain.admission.snapshot();
+        try std.testing.expectEqual(@as(usize, 0), amounts.host_scratch_bytes);
+        try std.testing.expectEqual(@as(usize, 0), amounts.backend_scratch_bytes);
+    }
+    try std.testing.expect(!usesPjrtGenerationSession(try parseGenerateBackendSelection(.xla, "compiled", "partitioned")));
 }
 
 test "generate backend selection keeps compiled mode explicit" {
