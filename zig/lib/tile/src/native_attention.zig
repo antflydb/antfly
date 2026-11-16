@@ -94,6 +94,84 @@ pub const RelativeRow64 = struct {
         const rows = std.math.mul(usize, batch, heads) catch return error.InvalidLayout;
         return std.math.mul(usize, rows, groups) catch error.InvalidLayout;
     }
+    /// Shared warp-striped relative attention schedule. Half storage retains
+    /// its 256-token admission and left-associated six-term score; F32 retains
+    /// the 512-token schedule and independent per-product accumulation.
+    pub const Storage = enum { f16, f32 };
+    pub fn cudaStream(comptime storage: Storage) []const u8 {
+        return @import("source_template.zig").render(
+            \\    constexpr unsigned int kWarpsPerBlock = {{queries}}u;
+            \\    constexpr unsigned int kHeadDim = {{head_dim}}u;
+            \\    if (seq_len == 0u || seq_len > {{max_sequence}}u || head_dim != kHeadDim || blockDim.x != {{threads}}u) return;
+            \\
+            \\    const unsigned int lane = threadIdx.x & 31u;
+            \\    const unsigned int warp = threadIdx.x >> 5u;
+            \\    const unsigned int block = blockIdx.x;
+            \\    const unsigned int query_group = block % ((seq_len + kWarpsPerBlock - 1u) / kWarpsPerBlock);
+            \\    const unsigned int bh = block / ((seq_len + kWarpsPerBlock - 1u) / kWarpsPerBlock);
+            \\    const unsigned int head = bh % num_heads;
+            \\    const unsigned int b = bh / num_heads;
+            \\    const unsigned int qi = query_group * kWarpsPerBlock + warp;
+            \\    if (b >= batch || qi >= seq_len) return;
+            \\
+            \\    const unsigned int hidden = num_heads * head_dim;
+            \\    const unsigned int head_off = head * head_dim;
+            \\    const unsigned int q_base = (b * seq_len + qi) * hidden + head_off;
+            \\    const float scale = rsqrtf((float)head_dim * 3.0f);
+            \\    const float q0 = {{load_begin}}q[q_base + lane]{{load_end}};
+            \\    const float q1 = {{load_begin}}q[q_base + lane + 32u]{{load_end}};
+            \\
+            \\    float running_max = -3.402823466e+38f;
+            \\    float running_sum = 0.0f;
+            \\    float value0 = 0.0f;
+            \\    float value1 = 0.0f;
+            \\    for (unsigned int ki = 0u; ki < seq_len; ++ki) {
+            \\        if (mask[b * seq_len + ki] == 0ll) continue;
+            \\        const unsigned int k_base = (b * seq_len + ki) * hidden + head_off;
+            \\        const unsigned int rel_idx = qi + seq_len - 1u - ki;
+            \\        const unsigned int rel_base = rel_idx * hidden + head_off;
+            \\        const float k0 = {{load_begin}}k[k_base + lane]{{load_end}};
+            \\        const float k1 = {{load_begin}}k[k_base + lane + 32u]{{load_end}};
+            \\        const float kr0 = {{load_begin}}k_r[rel_base + lane]{{load_end}};
+            \\        const float kr1 = {{load_begin}}k_r[rel_base + lane + 32u]{{load_end}};
+            \\        const float qr0 = {{load_begin}}q_r[rel_base + lane]{{load_end}};
+            \\        const float qr1 = {{load_begin}}q_r[rel_base + lane + 32u]{{load_end}};
+            \\{{score}}
+            \\        score += __shfl_down_sync(0xffffffffu, score, 16);
+            \\        score += __shfl_down_sync(0xffffffffu, score, 8);
+            \\        score += __shfl_down_sync(0xffffffffu, score, 4);
+            \\        score += __shfl_down_sync(0xffffffffu, score, 2);
+            \\        score += __shfl_down_sync(0xffffffffu, score, 1);
+            \\        score = __shfl_sync(0xffffffffu, score, 0) * scale;
+            \\
+            \\        const float next_max = fmaxf(running_max, score);
+            \\        const float alpha = expf(running_max - next_max);
+            \\        const float beta = expf(score - next_max);
+            \\        value0 = value0 * alpha + beta * {{load_begin}}v[k_base + lane]{{load_end}};
+            \\        value1 = value1 * alpha + beta * {{load_begin}}v[k_base + lane + 32u]{{load_end}};
+            \\        running_sum = running_sum * alpha + beta;
+            \\        running_max = next_max;
+            \\    }
+            \\    const float inv_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+            \\    dst[q_base + lane] = value0 * inv_sum;
+            \\    dst[q_base + lane + 32u] = value1 * inv_sum;
+        , .{
+            .queries = @import("std").fmt.comptimePrint("{d}", .{queries_per_group}),
+            .head_dim = @import("std").fmt.comptimePrint("{d}", .{head_dim}),
+            .threads = @import("std").fmt.comptimePrint("{d}", .{threads}),
+            .max_sequence = @import("std").fmt.comptimePrint("{d}", .{if (storage == .f16) 256 else max_sequence}),
+            .load_begin = if (storage == .f16) "__half2float(__ushort_as_half(" else "",
+            .load_end = if (storage == .f16) "))" else "",
+            .score = if (storage == .f16)
+                "        float score = q0 * k0 + q1 * k1 + q0 * kr0 + q1 * kr1 + qr0 * k0 + qr1 * k1;"
+            else
+                "        // Preserve the fused FP32 kernel's per-lane accumulation order.\n" ++
+                    "        float score = 0.0f;\n" ++ @import("native_projection.zig").accumulate(&.{
+                    .{ .left = "q0", .right = "k0" }, .{ .left = "q0", .right = "kr0" }, .{ .left = "qr0", .right = "k0" },
+                    .{ .left = "q1", .right = "k1" }, .{ .left = "q1", .right = "kr1" }, .{ .left = "qr1", .right = "k1" },
+                }, .termwise, "score"),
+        });
+    }
     pub const header = @import("std").fmt.comptimePrint(
         "#define ANTFLY_RELATIVE_ROW64_THREADS {d}u\n#define ANTFLY_RELATIVE_ROW64_QUERIES {d}u\n#define ANTFLY_RELATIVE_ROW64_HEAD_DIM {d}u\n#define ANTFLY_RELATIVE_ROW64_MAX_SEQUENCE {d}u\n",
         .{ threads, queries_per_group, head_dim, max_sequence },

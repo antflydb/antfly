@@ -43,19 +43,13 @@ pub const attention = .{
         .barrier = "__syncthreads();",
         .planes = &.{.{ .partial = "reductions", .value = "local_sum" }},
     }),
-    .relative_queries = @import("std").fmt.comptimePrint("{d}", .{@import("antfly_tile").native_attention.RelativeRow64.queries_per_group}),
-    .relative_head_dim = @import("std").fmt.comptimePrint("{d}", .{@import("antfly_tile").native_attention.RelativeRow64.head_dim}),
-    .relative_max_sequence = @import("std").fmt.comptimePrint("{d}", .{@import("antfly_tile").native_attention.RelativeRow64.max_sequence}),
-    .relative_threads = @import("std").fmt.comptimePrint("{d}", .{@import("antfly_tile").native_attention.RelativeRow64.threads}),
 
     .relative_products = @import("antfly_tile").native_projection.accumulate(&.{
         .{ .left = "q_value", .right = "k_value" },           .{ .left = "q_value", .right = "k_r[rel_base + j]" },
         .{ .left = "q_r[rel_base + j]", .right = "k_value" },
     }, .termwise, "partial"),
-    .relative_products_pair = @import("antfly_tile").native_projection.accumulate(&.{
-        .{ .left = "q0", .right = "k0" }, .{ .left = "q0", .right = "kr0" }, .{ .left = "qr0", .right = "k0" },
-        .{ .left = "q1", .right = "k1" }, .{ .left = "q1", .right = "kr1" }, .{ .left = "qr1", .right = "k1" },
-    }, .termwise, "score"),
+    .relative_stream_f16 = @import("antfly_tile").native_attention.RelativeRow64.cudaStream(.f16),
+    .relative_stream_f32 = @import("antfly_tile").native_attention.RelativeRow64.cudaStream(.f32),
     .relative_softmax = relativeSoftmax(false),
     .qk_mma_dot_single = program.render(qk_mma_dot, .{ .indent = "        " }),
     .qk_mma_dot_grouped = program.render(qk_mma_dot, .{ .indent = "            " }),

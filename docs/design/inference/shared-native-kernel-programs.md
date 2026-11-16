@@ -488,3 +488,29 @@ Cache-hit/invalidation assertions pass without relaxation, and affinity restorat
 is checked. The timestamp-preservation experiment was rejected. Qualification
 receipts retain both baseline failures and successful controls. The isolated
 checkout/cache and local integer-probe binary are removed after collection.
+
+### Relative warp-stream schedule
+
+`native_attention.RelativeRow64.cudaStream` owns the complete warp-striped
+relative-attention streaming schedule for F16 and F32 input storage. The typed
+storage policy retains the F16 path's 256-token limit and six-term expression,
+and the F32 path's 512-token limit and independent per-product accumulation.
+Both retain F32 output, mask handling, query-tail admission, shuffle order,
+serial key traversal and online recurrence. Historical exports remain ABI
+adapters. Four unused scalar bindings and the duplicate body are removed; no
+new production owner, entrypoint or native include is added.
+
+The complete generated CUDA translation unit is byte-for-byte identical to the
+committed baseline, and both emitted body token streams match their frozen
+versions. Glowworm passes 54 cases across both storage policies, query tails,
+all/partial/empty masks and over-limit F16 admission. Supported cases match the
+frozen kernels bit-for-bit and an independent double-precision reference with
+maximum absolute error below 6.2e-7. These checks preserve the existing native
+instructions and resources; no new timing or binary-size improvement is claimed.
+The four maintained owner files, including bindings and ownership metadata,
+shrink by 540 bytes and 38 lines. Generated copies earn no reduction credit.
+The private GPU checkout and probe binaries are removed after qualification.
+
+Both generator freshness checks, 52 core tests and seven ownership tests pass.
+The final ownership verifier accepts 859 emitted items and 65 canonical native
+files, classifying both stream exports as shared bodies.
