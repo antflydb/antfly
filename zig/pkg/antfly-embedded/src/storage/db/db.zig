@@ -57552,7 +57552,7 @@ fn appendGeneratedBatchFromEnrichment(
         for (owned_counter_values.items) |value| batch_ctx.alloc.free(value);
         owned_counter_values.deinit(batch_ctx.alloc);
     }
-    try appendSourceRevisionWritesForEffects(batch_ctx.alloc, sequence, &store_writes, store_delete_keys.items, store_promotions, &.{}, &owned_counter_keys, &owned_counter_values);
+    try appendSourceRevisionWritesForEffects(batch_ctx.alloc, sequence, &store_writes, store_delete_keys.items, store_promotions, batch.changed_artifact_keys, &owned_counter_keys, &owned_counter_values);
     try DB.appendDenseArtifactCounterMutationsWithPromotions(
         batch_ctx.alloc,
         batch_ctx.store,
