@@ -1187,6 +1187,10 @@ fn resolveTransactionIntentsWithSyncLevelAndCancellation(self: *DB, txn_id: @imp
     return .{ .value = self.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, commit_version, sync_level, visibility_cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn resolveReplicatedCompletionTransactionAtOrderedReceipt(self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8, completion_owner: @import("transaction_completion.zig").RoutedOwner) engine.Outcome(void) {
+    return .{ .value = self.resolveReplicatedCompletionTransactionAtOrderedReceipt(txn_id, status, commit_version, identity, resolved_participant, completion_owner) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn resolveReplicatedTransactionAtOrderedReceipt(self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, sync_level: types.SyncLevel, visibility_cancellation: types.CancellationToken, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8) engine.Outcome(void) {
     return .{ .value = self.resolveReplicatedTransactionAtOrderedReceipt(txn_id, status, commit_version, sync_level, visibility_cancellation, identity, resolved_participant) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

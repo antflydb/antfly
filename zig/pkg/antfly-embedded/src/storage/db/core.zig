@@ -2356,6 +2356,16 @@ pub const DBCore = struct {
     ) !transactions_mod.ResolutionOutcome {
         var manager = try self.initTxnManager();
         defer manager.deinit();
+        if (try manager.getCompletionAdmission(self.alloc, txn_id)) |saved| {
+            var plan = saved;
+            defer plan.deinit();
+            if (plan.value.admission.version == 2) {
+                const binding = extra_batch.completion_owner orelse return error.InvalidHistoryAdmission;
+                const namespace = @import("online_source_contract.zig").namespaceBytes(self.identity_namespace);
+                if (!std.mem.eql(u8, &binding.namespace, &namespace) or binding.root_generation != self.root_generation) return error.HistoryResynchronizationRequired;
+                try plan.value.admission.requireRoutedOwner(binding);
+            } else if (extra_batch.completion_owner != null) return error.ChangefeedCapabilityUnsupported;
+        } else if (extra_batch.completion_owner != null) return error.SourceTransactionIdentityConflict;
         return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
     }
 

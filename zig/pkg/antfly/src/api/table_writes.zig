@@ -40529,7 +40529,11 @@ fn implementationTests() type {
             db = try db_mod.DB.open(a, path, options);
             opened = true;
             try db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 6 });
-            try db.resolveReplicatedTransactionAtOrderedReceipt(v2_id, .committed, 40, .write, .none, .{ .term = 1, .index = 7 }, null);
+            try std.testing.expectError(error.InvalidHistoryAdmission, db.resolveReplicatedTransactionAtOrderedReceipt(v2_id, .committed, 40, .write, .none, .{ .term = 1, .index = 7 }, null));
+            try std.testing.expectEqual(@as(u64, 6), (try db.orderedApplyReceipt()).?.index);
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.resolveReplicatedCompletionTransactionAtOrderedReceipt(v2_id, .committed, 40, .{ .term = 1, .index = 7 }, null, replacement_owner));
+            try std.testing.expect((try db.get(a, "v2-row")) == null);
+            try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(v2_id, .committed, 40, .{ .term = 1, .index = 7 }, null, routed_owner);
             const receipt = try db.historyResolution(a, .{ .authority = .raft, .namespace = namespace, .transaction_id = v2_id, .owner_fence = routed_owner.digest(), .manifest_digest = (try v2.manifest(40)).digest(), .commit_version = 40, .minimum_applied_index = 7 });
             try std.testing.expect(receipt.resolution != null);
             try std.testing.expectEqual(@as(u64, 7), receipt.cut.index);

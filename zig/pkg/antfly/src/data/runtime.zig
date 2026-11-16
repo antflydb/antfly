@@ -13933,6 +13933,7 @@ pub const DataServer = struct {
                 const owner = switch (req.transaction.?) {
                     .begin => |begin| begin.completion_owner orelse return error.InvalidHistoryAdmission,
                     .prepare => |prepare| prepare.completion_owner orelse return error.InvalidHistoryAdmission,
+                    .resolve => |resolve| resolve.completion_owner orelse return error.InvalidHistoryAdmission,
                     else => return error.InvalidBatchRequest,
                 };
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
@@ -43855,7 +43856,7 @@ fn consumerTests() type {
                 const encoded_plan = try completion_contract.encodeAdmission(a, plan);
                 defer a.free(encoded_plan);
                 const begin: antfly.db.types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .begin = .{ .txn_id = txn_id, .begin_timestamp = 1000, .created_at_ns = platform_time.realtimeNs(), .topology_epoch = current_owner.topology_epoch, .retain_terminal = true, .participants = &.{locator}, .completion_admission = encoded_plan, .completion_owner = current_owner } } };
-                for ([_]antfly.db.types.BatchRequest{ begin, prepare, .{ .sync_level = .write, .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = .committed, .commit_version = 1001 } } } }) |command| {
+                for ([_]antfly.db.types.BatchRequest{ begin, prepare, .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = current_owner, .txn_id = txn_id, .status = .committed, .commit_version = 1001 } } } }) |command| {
                     try server.proposeRaftBatchGroupWithLeaderWait(a, 601, "docs", command, .{ .discovery = .cached, .write_route_fence = route.fence(), .admission_deadline_ns = server.dataRaftMonotonicNs() + 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
                 }
                 try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_admission_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));

@@ -27061,7 +27061,7 @@ pub const DB = struct {
         try command.validate();
         _ = try self.nativeSourceAdmissionNamespace();
         if (command.table_id != self.core.identity_namespace.table_id) return error.SourceTableMismatch;
-        try self.resolveTransactionIntentsInternal(command.transactionId(), status, command.accepted_at_ns + 1, sync_level, cancellation, null, null, command.fingerprint());
+        try self.resolveTransactionIntentsInternal(command.transactionId(), status, command.accepted_at_ns + 1, sync_level, cancellation, null, null, command.fingerprint(), null);
     }
 
     pub fn resolveTransactionIntents(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
@@ -27104,6 +27104,7 @@ pub const DB = struct {
             null,
             null,
             null,
+            null,
         );
     }
 
@@ -27127,7 +27128,22 @@ pub const DB = struct {
             identity,
             resolved_participant,
             null,
+            null,
         );
+    }
+
+    /// Ordered resolution with the original physical participant authority.
+    pub fn resolveReplicatedCompletionTransactionAtOrderedReceipt(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+        identity: OrderedApplyReceipt,
+        resolved_participant: ?[]const u8,
+        completion_owner: @import("../transaction_completion.zig").RoutedOwner,
+    ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveReplicatedCompletionTransactionAtOrderedReceipt", .{ self, txn_id, status, commit_version, identity, resolved_participant, completion_owner });
+        try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .write, .none, identity, resolved_participant, null, completion_owner);
     }
 
     pub const resolveTransactionIntentsInternal = local_mutation.resolveTransactionIntentsInternal;

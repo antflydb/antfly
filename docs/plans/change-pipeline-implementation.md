@@ -2543,6 +2543,30 @@ cannot prove cross-root completion or topology recovery. Complete certificate
 publication, production source/coordinator wiring and all public feed/bootstrap/
 retention/pgoutput/existing-client requirements remain mandatory.
 
+## In progress: fenced terminal completion resolution
+
+The new private `resolve_completion_v1` phase carries the original routed owner
+and participates in protocol-31 preflight/apply-floor checks. Legacy phases
+cannot carry this binding or silently downgrade its presence. Proposal admission
+revalidates the current compact catalog and owner descriptor. The native core
+checks v2 saved-plan membership/fence and physical namespace/root generation in
+the same apply-lock scope as terminal mutation. Zero-effect, abort, terminal
+retry and materialized row paths carry the same binding. Existing ordinary and
+v1 resolution signatures remain available; they cannot resolve a v2 completion
+plan without its authority.
+
+The compiled engine descriptor is 44 and owner ABI is 98 for this revision.
+Source/control catalog generation passed. New tests reject missing authority
+and replacement-root resolution without advancing the applied marker or exposing
+rows, then resolve with the original owner and read the receipt. The real Raft
+fixture now supplies owner-bound resolution as well. Wire tests cover downgrade,
+missing owner and mixed row mutations. `completion-resolution-fence-test.log` finished with exit 0: the wire/local
+suites, all seven history-consumer tests, compiled-owner reopen test and six
+actual-Raft tests passed. This qualifies owner-bound row resolution/reopen and
+its negative authority cases. Explicit v2 zero-effect/abort/fresh-entry terminal
+retry cases still need extension. Certificate publication, original-root
+handoff retention and production recovery callers remain outstanding.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

@@ -224,6 +224,7 @@ pub const TransactionMutation = union(enum) {
         completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
     },
     resolve: struct {
+        completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
         txn_id: TxnId,
         status: TxnStatus,
         commit_version: u64,

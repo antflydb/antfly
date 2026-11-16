@@ -288,6 +288,7 @@ pub const TxnSummaryPage = struct {
 };
 
 pub const ResolutionExtraBatch = struct {
+    completion_owner: ?completion.RoutedOwner = null,
     source_purpose: ?[32]u8 = null,
     /// Borrowed through this resolution attempt. Terminal-decision retries do
     /// not attach it: they must never re-certify already applied row effects.

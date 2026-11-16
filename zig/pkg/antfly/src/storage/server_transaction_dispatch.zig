@@ -88,7 +88,7 @@ pub fn applyReplicatedTransactionMutationInternal(
             }
             if (!local_present) return error.InvalidBatchRequest;
             if (begin.completion_admission) |raw| {
-                try @import("antfly_local_sources").api_internal_batch.validateCompletionBeginRequest(req);
+                try @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req);
                 const entry = raft_entry orelse return error.ChangefeedCapabilityUnsupported;
                 const binding = begin.completion_owner orelse return error.InvalidHistoryAdmission;
                 if (binding.group_id != group_id) return error.TopologyChanged;
@@ -179,6 +179,12 @@ pub fn applyReplicatedTransactionMutationInternal(
                     transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
                     else => return err,
                 };
+                if (resolve.completion_owner) |binding| {
+                    try @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req);
+                    if (req.restore_staging_scope != null or binding.group_id != group_id) return error.TopologyChanged;
+                    try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding);
+                    return;
+                }
                 try db.resolveReplicatedTransactionAtOrderedReceipt(
                     resolve.txn_id,
                     resolve.status,
@@ -192,6 +198,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                     if (defer_coordinator_ack) null else local_participant,
                 );
             } else {
+                if (resolve.completion_owner != null) return error.ChangefeedCapabilityUnsupported;
                 try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
                     resolve.txn_id,
                     resolve.status,

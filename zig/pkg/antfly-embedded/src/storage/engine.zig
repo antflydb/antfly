@@ -342,6 +342,7 @@ pub const VTable = struct {
     nativeSourceAdmissionNamespace: *const fn (self: *DB) Outcome([24]u8),
     sourceAdmissionStatus: *const fn (self: *DB, command: @import("source_admission.zig").Command) Outcome(@import("source_admission.zig").Status),
     resolveTransactionIntentsWithSyncLevelAndCancellation: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, sync_level: types.SyncLevel, visibility_cancellation: types.CancellationToken) Outcome(void),
+    resolveReplicatedCompletionTransactionAtOrderedReceipt: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8, completion_owner: @import("transaction_completion.zig").RoutedOwner) Outcome(void),
     resolveReplicatedTransactionAtOrderedReceipt: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, sync_level: types.SyncLevel, visibility_cancellation: types.CancellationToken, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8) Outcome(void),
     relationalTopologyIdentity: *const fn (self: *DB) Outcome(DB.RelationalTopologyIdentity),
     relationalHandoffManifest: *const fn (self: *DB, alloc: std.mem.Allocator, source: @import("db/relational_integrity_topology.zig").Fence, destination: @import("db/relational_integrity_topology.zig").Fence, lower: []const u8, upper: []const u8, primary_sequence: u64) Outcome(@import("db/relational_integrity_handoff.zig").Manifest),
@@ -572,7 +573,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 43,
+    version: u32 = 44,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -748,7 +749,7 @@ pub fn descriptorForValidation() *const Descriptor {
     return antfly_storage_engine_get_descriptor_v29();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 43 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 44 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or
