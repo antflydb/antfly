@@ -224,6 +224,7 @@ def test_protected_model_backfill_batches(
         behavior["model_gate"].clear()
         behavior["hold_after_document_calls"] = 2 if crash_during_backfill else 0
         pre_crash_work = []
+        persisted_before_crash = set()
         add_index("b", "fixture-v2")
         report["index_create_seconds"] = time.monotonic() - began
         assert behavior["model_held"].wait(timeout=20), (
@@ -232,12 +233,27 @@ def test_protected_model_backfill_batches(
         if crash_during_backfill:
 
             def partially_published():
-                coverage = api.get(f"/tables/{table}/indexes/b")["status"]["coverage"]
-                produced = coverage["produced"]
-                if coverage["observation_complete"] and 0 < produced < document_count:
-                    report["durably_produced_before_crash"] = produced
-                    return True
-                return False
+                nonlocal persisted_before_crash
+                status = api.get(f"/tables/{table}/indexes/b")["status"]
+                report["last_partial_status"] = status
+                completed = {
+                    text
+                    for row in calls["snapshot"]()[before_requests:]
+                    if row["model"] == "fixture-v2" and row["status"] == 200
+                    for text in row["inputs"]
+                    if "Orchard schedule." in text
+                }
+                # The privacy barrier deliberately hides partial B output from
+                # searches/inspection. Its published physical count is separate
+                # from whole-index coverage. With one vector per unique input,
+                # equality accounts for every completed provider result.
+                count = status["published_doc_count"]
+                if not 0 < count == len(completed) < document_count:
+                    return False
+                persisted_before_crash = completed
+                report["durably_produced_before_crash"] = count
+                report["verified_inputs_before_crash"] = sorted(completed)
+                return True
 
             assert wait_until(partially_published, timeout_s=30, interval_s=0.1), report
             pre_crash_work = [
@@ -265,6 +281,23 @@ def test_protected_model_backfill_batches(
             cpu_before = cpu_seconds()
             report["server_cpu_scope"] = "post-restart"
             assert behavior["model_held"].wait(timeout=20)
+
+            def recovered_publication():
+                status = api.get(f"/tables/{table}/indexes/b")["status"]
+                report["recovered_partial_status"] = status
+                # The provider withholds every new document response. A
+                # recovered prefix therefore comes from durable stored work.
+                return status["published_doc_count"] >= len(persisted_before_crash)
+
+            assert wait_until(recovered_publication, timeout_s=30, interval_s=0.1), (
+                report
+            )
+            assert not any(
+                row["status"] == 200 and document_request(row)
+                for row in calls["snapshot"]()
+                if row["model"] == "fixture-v2"
+                and row["started"] > pre_crash_work[-1]["started"]
+            ), "recovery must precede newly completed inference"
             report["crashed_during_backfill"] = True
         held_since = time.monotonic()
         assert not complete("b")
@@ -323,7 +356,12 @@ def test_protected_model_backfill_batches(
             assert set(actual) == protected and all(
                 actual[x] >= 1 for x in protected
             ), actual
-            attempted_before_crash = {x for r in pre_crash_work for x in r["inputs"]}
+            attempted_before_crash = {
+                x
+                for r in pre_crash_work
+                for x in r["inputs"]
+                if x not in persisted_before_crash
+            }
             assert all(
                 count == 1 or text in attempted_before_crash
                 for text, count in actual.items()

@@ -36406,6 +36406,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("publishVectorBlockBasesOnlineReported", .{ self, options });
         var catalog_lease = self.tryAcquireIndexCatalogReadLease() orelse return .{ .busy = true };
         defer catalog_lease.release();
+        if (self.core.index_manager.vector_block_storage == null) return .{};
         var session_lock = lockAtomicWithBackoffProfiled(
             &self.async_context.dense_admission.mutex,
             &self.async_context.stats.dense_finish_mutex,
@@ -36414,14 +36415,27 @@ pub const DB = struct {
         session_lock.unlock();
         if (!claimed) return .{ .busy = true };
         defer finishDenseProjectionFinalization(self.async_context);
-        const initial = try self.core.index_manager.publishVectorBlockBasesOnlineReported(options);
-        var published = initial.published;
-        var deferred = initial.deferred;
+        const allow_primary_snapshot = options.allow_primary_snapshot and
+            try denseCorpusCoverageAllowsPrimarySnapshot(self.async_context);
+        var published: usize = 0;
+        var deferred = false;
+        for (self.core.index_manager.dense_indexes.items) |entry| {
+            if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
+            if (entry.index.leann != null or self.core.index_manager.repairUnavailable(entry.config.name)) continue;
+            var index_options = options;
+            index_options.only_index = entry.config.name;
+            index_options.allow_primary_snapshot = allow_primary_snapshot;
+            const result = try self.core.index_manager.publishVectorBlockBasesOnlineReported(index_options);
+            published += result.published;
+            deferred = deferred or result.deferred;
+        }
         // Fail-closed reconstruction cannot depend on its own clean marker
         // to enter acceleration maintenance. Permit only candidates whose
         // durable terminal outcomes already cover the current source corpus.
         // Nothing here activates the repair or certifies a stale generation.
         for (self.core.index_manager.dense_indexes.items) |entry| {
+            if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
+            if (entry.index.leann != null) continue;
             if (!self.core.index_manager.repairUnavailable(entry.config.name)) continue;
             const checkpoint = self.core.index_manager.denseProjectionCheckpointMetadata(entry.config.name) orelse continue;
             if (checkpoint.status != .rebuilding) continue;
@@ -36429,6 +36443,8 @@ pub const DB = struct {
             if (entry.index.stats().active_count != expected) continue;
             var repair_options = options;
             repair_options.covered_rebuilding_index = entry.config.name;
+            repair_options.only_index = entry.config.name;
+            repair_options.allow_primary_snapshot = allow_primary_snapshot;
             const repair = try self.core.index_manager.publishVectorBlockBasesOnlineReported(repair_options);
             published += repair.published;
             deferred = deferred or repair.deferred;
@@ -62736,6 +62752,38 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
     return try denseTargetCountForIndexContextWithCoverage(ctx, index_name, .all_sources);
 }
 
+// The exact-vector store is shared: repairing A scans B's artifacts too.
+// One complete sibling must not repeatedly rebuild the corpus while another
+// producer is still publishing small batches. Native-only maintenance remains
+// eligible independently of this whole-corpus scan admission.
+fn denseCorpusCoverageAllowsPrimarySnapshot(ctx: *AsyncContext) !bool {
+    for (ctx.index_manager.dense_indexes.items) |entry| {
+        if (entry.index.leann != null) continue;
+        if (!try denseIndexSourceCoverageComplete(ctx, entry.config.name)) return false;
+    }
+    return true;
+}
+
+// Materialized vector cardinality is not source completion: one document
+// may emit many chunks, and a provider can pause between small output batches.
+// Use the current incarnation's terminal source outcomes to admit expensive
+// primary scans, independently of native WAL/query eligibility.
+fn denseIndexSourceCoverageComplete(ctx: *AsyncContext, index_name: []const u8) !bool {
+    const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return false;
+    const counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
+    const present: u2 = @as(u2, @intFromBool(counts.produced != null)) +
+        @as(u2, @intFromBool(counts.skipped != null)) +
+        @as(u2, @intFromBool(counts.terminal_failed != null));
+    // Authored/external and legacy projections may have no producer outcomes.
+    // Preserve their existing repair path; the first generated outcome creates
+    // the complete tuple and subsequent partial batches must wait.
+    if (present == 0) return true;
+    if (present != 3) return error.InvalidDerivedCoverageCounter;
+    const successful = std.math.add(u64, counts.produced.?, counts.skipped.?) catch return error.InvalidDerivedCoverageCounter;
+    const terminal = std.math.add(u64, successful, counts.terminal_failed.?) catch return error.InvalidDerivedCoverageCounter;
+    return if (counts.source_total) |total| terminal == total else false;
+}
+
 const DenseTargetCoverage = enum { all_sources, materialized };
 
 var test_dense_target_after_coverage_capture: ?*const fn (*AsyncContext) anyerror!void = null;
@@ -63842,6 +63890,7 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
     session_lock.unlock();
     if (!claimed) return true;
     defer finishDenseProjectionFinalization(ctx);
+    const allow_primary_snapshot = try denseCorpusCoverageAllowsPrimarySnapshot(ctx);
     var pending = false;
     for (manager.dense_indexes.items) |entry| {
         if (ctx.background_closing.load(.acquire)) return false;
@@ -63862,6 +63911,7 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
             .require_quiescence = checkpoint.status == .clean,
             .covered_rebuilding_index = entry.config.name,
             .only_index = entry.config.name,
+            .allow_primary_snapshot = allow_primary_snapshot,
         });
         if (!manager.vectorBlockReadyForDenseIndexAtSequence(entry.config.name, sequence, expected)) {
             pending = true;
@@ -155337,7 +155387,10 @@ fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_siz
         try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config, .coverage_generation = i + 1 });
         if (i == 0) try db.batch(.{ .writes = writes, .sync_level = .write });
         if (workers) {
-            try waitForProtectedBackfillWithoutDrain(a, &db, name, writes[0].key, document_count, i != 0);
+            waitForProtectedBackfillWithoutDrain(a, &db, name, writes[0].key, document_count, i != 0) catch |err| {
+                std.debug.print("PROTECTED-BACKFILL incomplete docs={d} index={s} batches={d} completed_items={d} primary_scans={d} native_merges={d}\n", .{ document_count, name, probe.batches.load(.acquire) - calls_before, probe.items.load(.acquire) - items_before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before, index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before });
+                return err;
+            };
         } else try db.runUntilIdle();
         std.debug.print("\nPROTECTED-BACKFILL docs={d} index={s} wall_ms={d} batches={d} completed_items={d} primary_scans={d} native_merges={d}\n", .{ document_count, name, (monotonicTimeNs() -| started) / std.time.ns_per_ms, probe.batches.load(.acquire) - calls_before, probe.items.load(.acquire) - items_before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before, index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before });
         const verified = try verifyProtectedBackfillOutput(a, &db, name, embedding, writes, dimensions, chunk_size < 1024);
@@ -155381,6 +155434,9 @@ fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_siz
 // make this owner complete. This exercises the real bootstrap/debounce policy.
 fn waitForProtectedBackfillWithoutDrain(a: Allocator, db: *DB, name: []const u8, document: []const u8, count: usize, keep_a_serving: bool) !void {
     const deadline = monotonicTimeNs() + 120 * std.time.ns_per_s;
+    var next_a_check_ns: u64 = 0;
+    var availability_queries: usize = 0;
+    var availability_query_ns: u64 = 0;
     while (true) {
         var covered = false;
         const stats = try db.stats(a);
@@ -155404,11 +155460,18 @@ fn waitForProtectedBackfillWithoutDrain(a: Allocator, db: *DB, name: []const u8,
                     var result = try db.search(a, .{ .index_name = name, .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });
                     defer result.deinit();
                     try std.testing.expect(result.hits.len != 0);
+                    if (keep_a_serving) std.debug.print("PROTECTED-BACKFILL availability index={s} queries={d} query_wall_ms={d}\n", .{ name, availability_queries, availability_query_ns / std.time.ns_per_ms });
                     return;
                 }
             }
         }
-        if (keep_a_serving) {
+        // This verifies background progress under sampled queries, not a
+        // saturation workload. Full exact-vector searches with the checked
+        // Debug allocator must leave the producer/maintenance owners CPU time.
+        // The deterministic scoped-frontier regression checks the publication
+        // boundary directly, independently of this sampling interval.
+        if (keep_a_serving and monotonicTimeNs() >= next_a_check_ns) {
+            const query_started_ns = monotonicTimeNs();
             var result = db.search(a, .{ .index_name = "A", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 }) catch |err| {
                 const applied = try db.core.loadAppliedSequence(a, "A");
                 const target = try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, applied);
@@ -155440,9 +155503,17 @@ fn waitForProtectedBackfillWithoutDrain(a: Allocator, db: *DB, name: []const u8,
             };
             defer result.deinit();
             try std.testing.expect(result.hits.len != 0);
+            availability_queries += 1;
+            availability_query_ns +|= monotonicTimeNs() -| query_started_ns;
+            next_a_check_ns = monotonicTimeNs() + std.time.ns_per_s;
         }
-        try std.testing.expect(monotonicTimeNs() < deadline);
-        sleepNs(10 * std.time.ns_per_ms);
+        if (monotonicTimeNs() >= deadline) {
+            const diagnostic = try std.json.Stringify.valueAlloc(a, .{ .indexes = stats.indexes, .enrichment = stats.enrichment }, .{});
+            defer a.free(diagnostic);
+            std.debug.print("PROTECTED-BACKFILL timeout index={s} covered={} native_ready={} availability_queries={d} query_wall_ms={d} state={s}\n", .{ name, covered, native_ready, availability_queries, availability_query_ns / std.time.ns_per_ms, diagnostic });
+            return error.ProtectedBackfillTimedOut;
+        }
+        sleepNs(100 * std.time.ns_per_ms);
     }
 }
 

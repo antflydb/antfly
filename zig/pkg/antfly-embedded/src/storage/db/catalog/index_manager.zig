@@ -5109,7 +5109,7 @@ pub const IndexManager = struct {
     }
 
     pub fn ensureVectorBlockBaseAtAppliedSequence(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
-        return self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(name, applied_sequence, false);
+        return self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(name, applied_sequence, false, true);
     }
 
     fn vectorBlockUsesDesiredEncoding(self: *IndexManager) bool {
@@ -5128,7 +5128,7 @@ pub const IndexManager = struct {
         return true;
     }
 
-    fn ensureVectorBlockBaseAtAppliedSequenceWithEncoding(self: *IndexManager, name: []const u8, applied_sequence: u64, require_storage_encoding: bool) !void {
+    fn ensureVectorBlockBaseAtAppliedSequenceWithEncoding(self: *IndexManager, name: []const u8, applied_sequence: u64, require_storage_encoding: bool, allow_primary_snapshot: bool) !void {
         if (self.vector_block_storage == null) return;
         const converting = require_storage_encoding and !self.vectorBlockUsesDesiredEncoding();
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
@@ -5200,6 +5200,12 @@ pub const IndexManager = struct {
         // sequence-mismatched native state falls through to the pinned primary
         // snapshot repair path below.
         if (!converting and try self.compactVectorBlockGenerationAtStableTip(entry, applied_sequence)) return;
+
+        // A gap in provider work is not a completed corpus. Keep exact
+        // fallback available while producers fill it, and permit native WAL
+        // reuse/compaction above, without rescanning all primary artifacts
+        // after every partial output batch.
+        if (!allow_primary_snapshot) return error.VectorBlockSourceCoveragePending;
 
         // Only one snapshot builder may reserve the next immutable generation.
         // Ordinary WAL appends continue under vector_block_build_mu while the
@@ -12154,6 +12160,10 @@ pub const IndexManager = struct {
         /// clean marker still require the final source/identity revalidation.
         covered_rebuilding_index: ?[]const u8 = null,
         only_index: ?[]const u8 = null,
+        /// The owning DB has terminal outcomes for the source corpus. False
+        /// still permits exact native WAL reuse and compaction; only the
+        /// corpus-wide primary repair scan is deferred.
+        allow_primary_snapshot: bool = true,
         /// Recurring work debounces quiet gaps in streaming input; explicit
         /// repair handoffs may immediately attempt their committed boundary.
         require_quiescence: bool = true,
@@ -12227,10 +12237,11 @@ pub const IndexManager = struct {
                 self.vector_block_stable_tip_index.store(0, .release);
                 self.vector_block_stable_tip_finalizing.store(false, .release);
             };
-            self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(entry.config.name, sequence, options.require_storage_encoding) catch |err| switch (err) {
+            self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(entry.config.name, sequence, options.require_storage_encoding, options.allow_primary_snapshot) catch |err| switch (err) {
                 error.PostingCheckpointSequenceMismatch,
                 error.VectorBlockSnapshotAdvancedWithoutWal,
                 error.VectorBlockGenerationReservationLost,
+                error.VectorBlockSourceCoveragePending,
                 => {
                     deferred = true;
                     continue;
