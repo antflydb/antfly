@@ -179,5 +179,6 @@ test "completion begin wire executes retained owner validation across the privat
 
 test "source plan HTTP discovery" {
     _ = @import("api/source_plan_operations.zig");
+    _ = @import("api/source_plan_delivery.zig");
     _ = @import("data/source_plan_http_wire.zig");
 }

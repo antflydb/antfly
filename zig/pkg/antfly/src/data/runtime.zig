@@ -60587,5 +60587,26 @@ const SourcePlanHttpFixture = struct {
         var expired = try post(a2, executor, source_plan_endpoint, "chunk-v1", token, fence_json, read);
         defer expired.deinit(a2);
         try std.testing.expectEqual(@as(u16, 409), expired.status);
+        // Exercise the delivery bridge itself with the production routed ports.
+        const Transfer = @import("../api/source_plan_delivery.zig").Transfer;
+        const artifact = @import("../metadata/source_artifact_control.zig");
+        var next_spec = spec;
+        const next_quota = try origin_server.sourcePlanObservePort().read(a2, fence, "docs", quota_input, .{});
+        next_spec.storage_epoch = next_quota.quota.epoch;
+        next_spec.namespace = storage.namespaceFor(root_scope, next_spec.storage_epoch);
+        std.mem.writeInt(u64, next_spec.attempt[0..8], 2, .big);
+        const transfer: Transfer = .{ .owner = original_owner, .fence = fence, .table = "docs", .spec = next_spec, .controls = origin_server.sourcePlanControlPort(), .observations = origin_server.sourcePlanObservePort(), .chunks = origin_server.sourcePlanChunkPort() };
+        var artifact_record: artifact.Record = .{ .reservation = @splat(215), .spec = .{ .namespace = next_spec.namespace, .binding = next_spec.binding, .domain = next_spec.domain, .attempt = next_spec.attempt, .bytes = next_spec.bytes, .checksum = next_spec.checksum, .plan_digest = next_spec.plan_digest } };
+        artifact_record.stamp = try transfer.seal(a2, artifact_record, bytes, .{});
+        artifact_record.phase = .sealed;
+        const recovered_bytes = try transfer.load(a2, artifact_record, .{});
+        defer a2.free(recovered_bytes);
+        try std.testing.expectEqualSlices(u8, bytes, recovered_bytes);
+        var recovered_plan = try frozen.Plan.restoreFrozen(a2, recovered_bytes, next_spec.plan_digest);
+        defer recovered_plan.deinit();
+        try std.testing.expectEqual(purpose, recovered_plan.source_purpose.?);
+        artifact_record.phase = .garbage;
+        artifact_record.retirement = @splat(216);
+        try std.testing.expect((try transfer.reclaim(a2, artifact_record, .{})) != null);
     }
 };

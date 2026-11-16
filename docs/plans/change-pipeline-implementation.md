@@ -4167,3 +4167,41 @@ The source-global head/checkpoint, native empty-target provisioning, worker and
 destination integrations, public feeds, coherent bootstrap/retention, production
 pgoutput and existing-client qualification remain required. The full goal and
 both implementation issues remain incomplete.
+
+### Metadata-reserved source-plan delivery bridge
+
+`api/source_plan_delivery.zig` supplies the routed artifact-store bridge needed
+by source delivery adapters. It verifies the metadata record's lifecycle and
+exact artifact specification before using storage. Each transfer pass intersects
+the original and route-fence deadlines/cancellation with a bounded five-second
+budget. Upload validates whole-object, frozen-plan and chunk commitments before
+BEGIN, resumes from the qualified received bitmap, and stops immediately after
+an uncertain command. A subsequent pass observes the immutable upload identity;
+completed chunks and the first successful seal are reused.
+
+Loading requires a sealed/accepted record and its exact recorded stamp. It
+returns independently owned frozen bytes, validates every chunk against the
+live seal and ordinal hash, and rechecks whole-object and frozen-plan identity.
+No provider rows are needed for this read. Reclamation requires a validated
+metadata garbage record with a nonzero retirement proof. A pass fences if
+necessary and performs one bounded native reclaim command; a partial result
+returns null, keeping the metadata charge until an actual reclamation proof is
+available. The caller must load the current journal record under source ownership;
+this bridge does not independently query metadata or infer retirement authority.
+
+Qualification: `source-plan-delivery-test.log` completes `source-plan-http-test`
+with exit 0, all nine cases passing without skips or leaks. The bridge test drops
+replies after BEGIN, chunk and seal independently, verifies immediate stop and
+bitmap-based resume without duplicate phase mutations, retrieves retained owned
+bytes, rejects an altered specification and expired route, and rejects premature
+or malformed retirement. `source-plan-delivery-native-test.log` completes
+`history-control-apply-test` with exit 0, all 13 cases passing without skips or
+leaks. Its real signed HTTP/native/Raft fixture uses the bridge through a second
+node to upload/seal a genuine frozen completion plan, recover and restore it,
+and reclaim it. Source catalog, formatting and diff checks pass.
+
+The bridge is not yet wired into the production source journal adapter. The
+source-global head/checkpoint and production destination/worker integration
+remain required, as do empty-target provisioning, public changefeeds, coherent
+bootstrap/retention, production pgoutput and existing-client qualification.
+Neither issue nor the full goal is complete.
