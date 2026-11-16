@@ -155473,6 +155473,14 @@ test "privacy scoped readiness serves A while sibling B backfills" {
     }
     const vector = try embedder_mod.DeterministicDenseEmbedder.embedDense(&embedder.deterministic, scratch, embeddings[0], "Orchard guidance.", 3);
     const req: types.SearchRequest = .{ .index_name = "A", .dense = .{ .vector = vector, .k = 1 }, .include_stored = true };
+    const a_applied = try db.core.loadAppliedSequence(a, "A");
+    const sibling_tail = try appendDerivedBatchRecord(&db, .{ .documents = &.{.{
+        .key = "doc",
+        .action = .preserve_base_document,
+        .targets = &.{.{ .kind = .dense_vector, .index_name = "B" }},
+    }} });
+    try std.testing.expect(sibling_tail > a_applied);
+    try std.testing.expectEqual(sibling_tail, try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, a_applied));
     const calls = embedder.calls;
     var result = try db.search(a, req);
     defer result.deinit();

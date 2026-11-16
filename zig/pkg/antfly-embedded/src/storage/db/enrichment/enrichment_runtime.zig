@@ -43113,9 +43113,9 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-vector-carry", .{tmp.sub_path});
     defer alloc.free(path);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    // Minimal ordered capture needs about 52 KiB in this fixture. 64 KiB
-    // admits that operation but denies accumulated cross-document inputs.
-    const pressure_limit: u64 = if (batching == .collection_too_large) 1024 else 64 * 1024;
+    // Admit transient capture AND accepted-output census scratch. Long IDs
+    // below make accumulated inputs exceed this cap without oversized items.
+    const pressure_limit: u64 = if (batching == .collection_too_large) 1024 else 256 * 1024;
     budgets[@backingInt(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .soft_limit_bytes = pressure_limit, .hard_limit_bytes = pressure_limit };
     var pressure_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer pressure_manager.deinit(alloc);
@@ -43387,7 +43387,10 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         defer for (keys[0..initialized]) |key| alloc.free(key);
         var index: u64 = 5;
         for (&requests, &keys, 0..) |*request, *key, i| {
-            key.* = try std.fmt.allocPrint(alloc, "batch-doc-{d}", .{i});
+            key.* = if (batching == .collection_pressure or batching == .collection_multi)
+                try std.fmt.allocPrint(alloc, "batch-doc-{d}-{s}", .{ i, &@as([2048]u8, @splat('k')) })
+            else
+                try std.fmt.allocPrint(alloc, "batch-doc-{d}", .{i});
             initialized += 1;
             const body = if (batching == .parallel_oversize and i == 1)
                 try alloc.dupe(u8, "{\"body\":\"123456789012345678901234567890123\"}")

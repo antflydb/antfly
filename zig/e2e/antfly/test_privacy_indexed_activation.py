@@ -207,9 +207,13 @@ def privacy_provider(request):
                         if backfill
                         else (),
                     )
-                except OSError:
+                except OSError as exc:
                     with records_lock:
-                        row.update(completed=time.monotonic(), status=502)
+                        row.update(
+                            completed=time.monotonic(),
+                            status=502,
+                            response_error=type(exc).__name__,
+                        )
                     raise
                 else:
                     with records_lock:
