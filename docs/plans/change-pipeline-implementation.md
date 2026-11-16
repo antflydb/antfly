@@ -2160,6 +2160,25 @@ qualification. The direct storage read does not itself establish leadership or
 authorize a public caller. Coordinated public feeds remain disabled, and the
 broader full issue acceptance requirements remain open.
 
+## In progress: signed completion receipt transport contract
+
+The internal OpenAPI spec now defines service-only POST
+`/groups/{group_id}/tables/{table_name}/history/resolution-v1`, with strict
+4096-byte request/response bounds, an immutable catalog route fence and required
+shared remaining-time header. The request binds the original transaction,
+participant namespace, owner fence, manifest digest, committed version and
+positive minimum Raft applied index. Native authority is excluded from HTTP.
+The response binds that request and exposes the actual qualified storage cut
+with either local effects/no-effect evidence or unproven null absence. Neither
+null nor one participant's positive evidence authorizes global completion or
+replay of an uncertain mutation.
+
+`make generate` completed successfully in
+`history-resolution-http-generate.log`, producing the internal route and type
+bindings. Unrelated model-explorer generation drift was removed. This is the
+specification and generated binding stage only: the signed handler, HTTP client,
+DataServer port and real network receipt qualification remain to be implemented.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

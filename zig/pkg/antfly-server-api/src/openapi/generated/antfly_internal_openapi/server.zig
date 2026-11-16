@@ -44,6 +44,17 @@ pub fn parseReadNativeRetainedHistoryPageBody(allocator: std.mem.Allocator, body
     return std.json.parseFromSlice(types.NativeHistoryPageRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Read an immutable participant completion receipt at a qualified cut
+pub const ReadNativeTransactionCompletionResolutionPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for readNativeTransactionCompletionResolution.
+pub fn parseReadNativeTransactionCompletionResolutionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeHistoryResolutionRequest) {
+    return std.json.parseFromSlice(types.NativeHistoryResolutionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for createHAReplicationStreamingSlot.
 pub fn parseCreateHAReplicationStreamingSlotBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyCreateReplicationSlotRequest) {
     return std.json.parseFromSlice(types.StandbyCreateReplicationSlotRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -75,6 +86,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/control-v1", .operation_id = "controlNativeRetainedHistory", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/grant-v1", .operation_id = "observeNativeRetainedHistoryGrant", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/page-v1", .operation_id = "readNativeRetainedHistoryPage", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/resolution-v1", .operation_id = "readNativeTransactionCompletionResolution", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/standby/replication/identify", .operation_id = "identifyHAReplicationSystem", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/standby/replication/slots", .operation_id = "createHAReplicationStreamingSlot", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/standby/replication/start", .operation_id = "startHAReplication", .request_body = .buffered, .streaming_response = false },
@@ -96,6 +108,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "controlNativeRetainedHistory")) @compileError("ServerRouter: Impl missing required method 'controlNativeRetainedHistory'");
         if (!@hasDecl(Impl, "observeNativeRetainedHistoryGrant")) @compileError("ServerRouter: Impl missing required method 'observeNativeRetainedHistoryGrant'");
         if (!@hasDecl(Impl, "readNativeRetainedHistoryPage")) @compileError("ServerRouter: Impl missing required method 'readNativeRetainedHistoryPage'");
+        if (!@hasDecl(Impl, "readNativeTransactionCompletionResolution")) @compileError("ServerRouter: Impl missing required method 'readNativeTransactionCompletionResolution'");
         if (!@hasDecl(Impl, "identifyHAReplicationSystem")) @compileError("ServerRouter: Impl missing required method 'identifyHAReplicationSystem'");
         if (!@hasDecl(Impl, "createHAReplicationStreamingSlot")) @compileError("ServerRouter: Impl missing required method 'createHAReplicationStreamingSlot'");
         if (!@hasDecl(Impl, "startHAReplication")) @compileError("ServerRouter: Impl missing required method 'startHAReplication'");
@@ -115,6 +128,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/groups/:group_id/tables/:table_name/history/control-v1", httpx.Handler.bind(self.impl, controlNativeRetainedHistory));
             try server.post("/groups/:group_id/tables/:table_name/history/grant-v1", httpx.Handler.bind(self.impl, observeNativeRetainedHistoryGrant));
             try server.post("/groups/:group_id/tables/:table_name/history/page-v1", httpx.Handler.bind(self.impl, readNativeRetainedHistoryPage));
+            try server.post("/groups/:group_id/tables/:table_name/history/resolution-v1", httpx.Handler.bind(self.impl, readNativeTransactionCompletionResolution));
             try server.get("/standby/replication/identify", httpx.Handler.bind(self.impl, identifyHAReplicationSystem));
             try server.post("/standby/replication/slots", httpx.Handler.bind(self.impl, createHAReplicationStreamingSlot));
             try server.post("/standby/replication/start", httpx.Handler.bind(self.impl, startHAReplication));
@@ -151,6 +165,14 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.readNativeRetainedHistoryPage(ctx, group_id, table_name);
         }
 
+        /// Read an immutable participant completion receipt at a qualified cut
+        /// POST /groups/{group_id}/tables/{table_name}/history/resolution-v1
+        fn readNativeTransactionCompletionResolution(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.readNativeTransactionCompletionResolution(ctx, group_id, table_name);
+        }
+
         /// Identify this primary replication system
         /// GET /standby/replication/identify
         fn identifyHAReplicationSystem(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -183,6 +205,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn controlNativeRetainedHistory(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn observeNativeRetainedHistoryGrant(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn readNativeRetainedHistoryPage(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn readNativeTransactionCompletionResolution(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn identifyHAReplicationSystem(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createHAReplicationStreamingSlot(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn startHAReplication(self: *Impl, ctx: *httpx.Context) !httpx.Response

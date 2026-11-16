@@ -439,6 +439,122 @@ pub const NativeHistoryRenew = struct {
     next: u64,
 };
 
+pub const NativeHistoryResolutionCut = struct {
+    native_sequence: i64,
+    term: u64,
+    index: u64,
+};
+
+pub const NativeHistoryResolutionError = struct {
+    version: i64,
+    code: []const u8,
+};
+
+pub const NativeHistoryResolutionEvidenceValue = struct {
+    namespace: NativeHistoryNamespace,
+    owner_fence: NativeHistoryDigest,
+    manifest_digest: NativeHistoryDigest,
+    commit_version: u64,
+    source_position: NativeHistoryDigest,
+    outcome: std.json.Value,
+};
+
+pub const NativeHistoryResolutionEvidence = ?NativeHistoryResolutionEvidenceValue;
+
+pub const NativeHistoryResolutionReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    cut: NativeHistoryResolutionCut,
+    resolution: NativeHistoryResolutionEvidence,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "request_digest", "request_digest", false },
+        .{ "cut", "cut", false },
+        .{ "resolution", "resolution", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("resolution");
+        try jw.write(self.resolution);
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryResolutionRequest = struct {
+    version: i64,
+    authority: []const u8,
+    namespace: NativeHistoryNamespace,
+    transaction_id: NativeHistoryConsumerId,
+    owner_fence: NativeHistoryDigest,
+    manifest_digest: NativeHistoryDigest,
+    commit_version: u64,
+    minimum_applied_index: u64,
+    minimum_native_sequence: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "authority", "authority", false },
+        .{ "namespace", "namespace", false },
+        .{ "transaction_id", "transaction_id", false },
+        .{ "owner_fence", "owner_fence", false },
+        .{ "manifest_digest", "manifest_digest", false },
+        .{ "commit_version", "commit_version", false },
+        .{ "minimum_applied_index", "minimum_applied_index", false },
+        .{ "minimum_native_sequence", "minimum_native_sequence", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("authority");
+        try jw.write(self.authority);
+        try jw.objectField("namespace");
+        try jw.write(self.namespace);
+        try jw.objectField("transaction_id");
+        try jw.write(self.transaction_id);
+        try jw.objectField("owner_fence");
+        try jw.write(self.owner_fence);
+        try jw.objectField("manifest_digest");
+        try jw.write(self.manifest_digest);
+        try jw.objectField("commit_version");
+        try jw.write(self.commit_version);
+        try jw.objectField("minimum_applied_index");
+        try jw.write(self.minimum_applied_index);
+        if (self.minimum_native_sequence) |value| {
+            try jw.objectField("minimum_native_sequence");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const NativeHistoryRetirement = struct {
     namespace: NativeHistoryNamespace,
     authority: NativeHistoryDigest,

@@ -63,6 +63,86 @@ paths:
             X-Antfly-Raft-Mutation-Outcome:
               schema: {type: string, enum: [not-proposed-v1, not-applied-v1, unknown-v1, committed-v1]}
         '504': {description: Shared deadline exhausted; mutation may have committed}
+  /groups/{group_id}/tables/{table_name}/history/resolution-v1:
+    post:
+      tags: [retained-history]
+      operationId: readNativeTransactionCompletionResolution
+      summary: Read an immutable participant completion receipt at a qualified cut
+      description: |
+        Signed service-only read, including during legacy migration. Requires an
+        immutable catalog route fence and one shared relative routing budget.
+        The owner establishes a current leader ReadIndex and validates frozen
+        owner and catalog identity before and after reading the receipt and
+        persisted applied cut in one storage snapshot. Replies bind the exact
+        logical request, retaining the actual observed cut. The original owner
+        fence identifies the frozen transaction participant, not today's leader.
+        A null resolution is unproven absence, never a zero-effect certificate
+        or permission to replay an uncertain mutation. A positive resolution
+        authenticates local effects or positive no-effect evidence; it does not
+        certify global completion without every frozen manifest participant.
+        HTTP accepts only raft authority, a positive minimum_applied_index and
+        minimum_native_sequence zero. Both bodies are limited to 4096 bytes.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema: {type: integer, format: uint64, minimum: 1}
+        - name: table_name
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 1024}
+        - name: X-Antfly-Catalog-Route-Fence
+          in: header
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 16384}
+        - name: X-Antfly-Routing-Remaining-Ms
+          in: header
+          required: true
+          schema: {type: integer, minimum: 1, maximum: 5000}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NativeHistoryResolutionRequest'}
+      responses:
+        '200':
+          description: Request-bound local resolution and actual storage cut; null is unproven absence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryResolutionReply'}
+        '400':
+          description: Invalid request or catalog fence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryResolutionError'}
+        '401':
+          description: Missing or invalid signed service authority.
+        '403':
+          description: Internal service authority required.
+        '409':
+          description: Retention scope or topology conflicts; inspect the typed code.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryResolutionError'}
+        '413':
+          description: Request exceeds the 4096 byte admission limit.
+        '500':
+          description: Corrupt receipt or internal owner failure.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryResolutionError'}
+        '501':
+          description: Unsupported native owner profile.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryResolutionError'}
+        '503':
+          description: Leader, routing, deadline or storage admission is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryResolutionError'}
   /groups/{group_id}/tables/{table_name}/history/grant-v1:
     post:
       tags: [retained-history]
@@ -433,6 +513,16 @@ components:
               maxItems: 32
               items: {type: integer, minimum: 0, maximum: 255}
             sequence: {type: integer, minimum: 1}
+    NativeHistoryResolutionRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"authority":{"type":"string","enum":["raft"]},"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"transaction_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"owner_fence":{"$ref":"#/components/schemas/NativeHistoryDigest"},"manifest_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"commit_version":{"type":"integer","format":"uint64","minimum":1},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1},"minimum_native_sequence":{"type":"integer","enum":[0]}},"required":["version","authority","namespace","transaction_id","owner_fence","manifest_digest","commit_version","minimum_applied_index"]}
+    NativeHistoryResolutionCut:
+      {"type":"object","additionalProperties":false,"properties":{"native_sequence":{"type":"integer","enum":[0]},"term":{"type":"integer","format":"uint64","minimum":1},"index":{"type":"integer","format":"uint64","minimum":1}},"required":["native_sequence","term","index"]}
+    NativeHistoryResolutionEvidence:
+      {"type":"object","additionalProperties":false,"properties":{"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"owner_fence":{"$ref":"#/components/schemas/NativeHistoryDigest"},"manifest_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"commit_version":{"type":"integer","format":"uint64","minimum":1},"source_position":{"$ref":"#/components/schemas/NativeHistoryDigest"},"outcome":{"oneOf":[{"type":"object","additionalProperties":false,"properties":{"effects":{"type":"object","additionalProperties":false,"properties":{"sequence":{"type":"integer","format":"uint64","minimum":1},"frame_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["sequence","frame_digest"]}},"required":["effects"]},{"type":"object","additionalProperties":false,"properties":{"no_effect":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["no_effect"]}]}},"required":["namespace","owner_fence","manifest_digest","commit_version","source_position","outcome"],"nullable":true}
+    NativeHistoryResolutionReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"cut":{"$ref":"#/components/schemas/NativeHistoryResolutionCut"},"resolution":{"$ref":"#/components/schemas/NativeHistoryResolutionEvidence"}},"required":["version","request_digest","cut","resolution"]}
+    NativeHistoryResolutionError:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"code":{"type":"string","enum":["invalid_request","resynchronization_required","topology_changed","unsupported","unavailable","corrupt_resolution","internal_error"]}},"required":["version","code"]}
     NativeHistoryGrantIdentity:
       {"type":"object","additionalProperties":false,"properties":{"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"authority":{"$ref":"#/components/schemas/NativeHistoryDigest"},"consumer":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"definition":{"$ref":"#/components/schemas/NativeHistoryDigest"},"sequence":{"type":"integer","format":"uint64","minimum":1},"policy_revision":{"type":"integer","format":"uint64","minimum":1}},"required":["namespace","authority","consumer","definition","sequence","policy_revision"]}
     NativeHistoryGrantActive:
