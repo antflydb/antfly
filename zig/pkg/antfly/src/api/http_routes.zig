@@ -20,7 +20,7 @@ pub const sql_max_request_body_bytes: usize = 4 << 20;
 /// Transport admission shared by native and linked-kernel registrars. Resolve
 /// before buffering so a SQL request cannot consume the much larger batch cap.
 pub fn publicPostBodyLimit(path: []const u8) ?usize {
-    if (isInternalHistoryControlPath(path) or isInternalHistoryPagePath(path) or isInternalHistoryGrantPath(path) or isInternalHistoryResolutionPath(path) or isInternalHistoryPublicationPath(path) or isInternalHistoryOwnerPath(path)) return 4096;
+    if (isInternalHistoryControlPath(path) or isInternalHistoryPagePath(path) or isInternalHistoryGrantPath(path) or isInternalHistoryResolutionPath(path) or isInternalHistoryPublicationPath(path) or isInternalHistoryOwnerPath(path) or isInternalHistoryDecisionPath(path)) return 4096;
     if (isInternalDocumentReadPath(path)) return @import("antfly_public_limits").max_document_read_body_bytes;
     if (isPrivacyFindingsPath(path)) return @import("antfly_public_limits").max_privacy_findings_body_bytes;
     if (privacyMutationBodyLimit(path)) |limit| return limit;
@@ -77,6 +77,9 @@ pub fn isInternalHistoryPagePath(path: []const u8) bool {
 }
 pub fn isInternalHistoryResolutionPath(path: []const u8) bool {
     return isInternalHistoryPath(path, "resolution-v1");
+}
+pub fn isInternalHistoryDecisionPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "decision-v1");
 }
 pub fn isInternalHistoryOwnerPath(path: []const u8) bool {
     return isInternalHistoryPath(path, "owner-v1");
@@ -232,6 +235,7 @@ pub const Routes = struct {
     pub const history_page_suffix = "/history/page-v1";
     pub const history_grant_suffix = "/history/grant-v1";
     pub const history_resolution_suffix = "/history/resolution-v1";
+    pub const history_decision_suffix = "/history/decision-v1";
     pub const history_owner_suffix = "/history/owner-v1";
     pub const history_publication_suffix = "/history/publication-v1";
     pub const merge_suffix = "/merge";

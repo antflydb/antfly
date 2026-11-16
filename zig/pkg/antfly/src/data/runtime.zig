@@ -7077,6 +7077,7 @@ pub const DataServer = struct {
         api_server_cfg.native_history_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPageOperation } else null;
         api_server_cfg.native_history_grant = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyGrantOperation } else null;
         api_server_cfg.native_history_resolution = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyResolutionOperation } else null;
+        api_server_cfg.native_history_decision = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyDecisionOperation } else null;
         api_server_cfg.native_history_owner = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyOwnerOperation } else null;
         api_server_cfg.native_history_publication = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPublicationOperation } else null;
         api_server_cfg.native_history_roots = if (linked_storage and (self.data_raft != null or self.remote_metadata != null)) self.historyRootsSource() else null;
@@ -13386,13 +13387,14 @@ pub const DataServer = struct {
         return .{ .ptr = self, .read_fn = historyPublicationRoutedOperation };
     }
 
-    const HistoryOperation = enum { control, page, grant, resolution, publication, owner };
+    const HistoryOperation = enum { control, page, grant, resolution, publication, owner, decision };
     fn historyRequestType(comptime kind: HistoryOperation) type {
         return switch (kind) {
             .control => @import("../api/history_control_operations.zig").wire.Request,
             .page => @import("../api/history_page_operations.zig").Request,
             .grant => @import("../api/history_grant_operations.zig").Request,
             .resolution => @import("../api/history_resolution_operations.zig").Request,
+            .decision => @import("../api/history_decision_operations.zig").Request,
             .owner => @import("../api/history_owner_operations.zig").Request,
             .publication => @import("../api/history_publication_operations.zig").Request,
         };
@@ -13403,6 +13405,7 @@ pub const DataServer = struct {
             .page => @import("../api/history_page_operations.zig").pages.Page,
             .grant => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation,
             .resolution => @import("../api/history_resolution_operations.zig").wire.Reply,
+            .decision => @import("../api/history_decision_operations.zig").Reply,
             .owner => @import("../api/history_owner_operations.zig").Reply,
             .publication => @import("../api/history_publication_operations.zig").Reply,
         };
@@ -13462,6 +13465,7 @@ pub const DataServer = struct {
             .page => historyPageOperation(self, alloc, fence, table, input, context),
             .grant => historyGrantOperation(self, alloc, fence, table, input, context),
             .resolution => historyResolutionOperation(self, alloc, fence, table, input, context),
+            .decision => historyDecisionOperation(self, alloc, fence, table, input, context),
             .owner => historyOwnerOperation(self, alloc, fence, table, input, context),
             .publication => historyPublicationOperation(self, alloc, fence, table, input, context),
         };
@@ -13478,7 +13482,7 @@ pub const DataServer = struct {
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
         var lane = try self.acquireDataRaftForwardLaneUntil(group, clock.deadline_ns.?, .{ .discovery = .cached, .cancellation = &cancellation });
         defer lane.release();
-        var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{ .max_response_bytes = if (kind == .page) @import("../api/history_page_operations.zig").wire.prefix_bytes + @as(usize, input.request.max_bytes) else @import("../api/history_control_operations.zig").wire.max_bytes });
+        var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{ .max_response_bytes = if (kind == .page) @import("../api/history_page_operations.zig").wire.prefix_bytes + @as(usize, input.request.max_bytes) else if (kind == .decision) @import("../api/history_decision_operations.zig").max_reply_bytes else @import("../api/history_control_operations.zig").wire.max_bytes });
         defer executor.deinit();
         var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
         _ = client.withInternalServiceAuth(self.api_server_cfg.internal_service_secret, self.api_server_cfg.internal_service_issuer);
@@ -13487,9 +13491,22 @@ pub const DataServer = struct {
             .page => client.fetchGroupHistoryPage(uri, group, table, input, fence, context),
             .grant => client.fetchGroupHistoryGrant(uri, group, table, input, fence, context),
             .resolution => client.fetchGroupHistoryResolution(uri, group, table, input, fence, context),
+            .decision => client.fetchGroupHistoryDecision(uri, group, table, input, fence, context),
             .owner => client.fetchGroupHistoryOwner(uri, group, table, input, fence, context),
             .publication => client.fetchGroupHistoryPublication(uri, group, table, input, fence, context),
         };
+    }
+
+    pub fn historyDecisionPort(self: *DataServer) @import("../api/history_decision_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = historyDecisionRoutedOperation };
+    }
+    fn historyDecisionRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.decision), context: antfly.public_api.operation.RequestContext) !historyResultType(.decision) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .decision, input, context);
+    }
+    fn historyDecisionOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.decision), context: antfly.public_api.operation.RequestContext) !historyResultType(.decision) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyLocalRead(alloc, fence, table, .decision, input, context);
     }
 
     pub fn historyOwnerPort(self: *DataServer) @import("../api/history_owner_operations.zig").Port {
@@ -13555,6 +13572,7 @@ pub const DataServer = struct {
                 .page => owner.orderedHistoryPageRouted(alloc, fence, table, input.request),
                 .grant => owner.orderedHistoryGrantRouted(alloc, fence, table, input.identity),
                 .resolution => owner.orderedHistoryResolutionRouted(alloc, fence, table, input.binding()),
+                .decision => owner.orderedHistoryDecisionRouted(alloc, fence, table, input.binding()),
                 .owner => captureHistoryOwner(owner, alloc, fence, table, input, context),
                 .publication => owner.orderedHistoryPublicationRouted(alloc, fence, table, input.binding()),
                 .control => unreachable,
@@ -13565,7 +13583,7 @@ pub const DataServer = struct {
                 },
                 else => return err,
             };
-            errdefer if (kind == .page) result.deinit();
+            errdefer if (kind == .page or kind == .decision) result.deinit();
             try context.ensureActive();
             return result;
         }
@@ -43717,7 +43735,7 @@ fn consumerTests() type {
                 };
                 const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
                 defer a.destroy(api_server);
-                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .internal_service_accept_legacy_unauthenticated = true, .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_decision = .{ .ptr = server, .read_fn = DataServer.historyDecisionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
                 var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
@@ -44154,20 +44172,15 @@ fn consumerTests() type {
                 try std.testing.expectEqualDeep(positive.resolution, positive_retry.resolution);
                 const decision_wire = @import("antfly_local_sources").storage_history_decision_wire;
                 const decision_query: decision_wire.Query = .{ .owner = current_owner, .transaction_id = txn_id };
-                var recovered_decision = blk: {
-                    var decision_fence = route.fence().?;
-                    decision_fence.admission_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
-                    while (true) {
-                        break :blk owner.orderedHistoryDecisionRouted(a, decision_fence, "docs", decision_query) catch |err| switch (err) {
-                            error.ReadUnavailable, error.StorageReadTemporarilyUnavailable => {
-                                if (platform_time.monotonicNs() >= decision_fence.admission_deadline_ns.?) return error.DeadlineExceeded;
-                                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
-                                continue;
-                            },
-                            else => return err,
-                        };
-                    }
-                };
+                const decision_input: @import("../api/history_decision_operations.zig").Request = .{ .version = 1, .owner = current_owner, .transaction_id = txn_id, .minimum_applied_index = 1 };
+                const decision_uri = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/601/tables/docs/history/decision-v1", .{base});
+                defer a.free(decision_uri);
+                // Even migration mode must not expose private participant
+                // membership or coordinator records without service authority.
+                var unauthorized_decision = try (try origin.distributedReadExecutor()).execute(a, .{ .method = .POST, .uri = decision_uri, .content_type = "application/json", .body = "{}", .timeout_ms = 1000, .max_response_bytes = 4096 });
+                defer unauthorized_decision.deinit(a);
+                try std.testing.expectEqual(@as(u16, 401), unauthorized_decision.status);
+                var recovered_decision = try origin.historyDecisionPort().read(a, route.fence().?, "docs", decision_input, .{});
                 defer recovered_decision.deinit();
                 try recovered_decision.value.validate(decision_query);
                 const committed = recovered_decision.value.decision orelse return error.TestExpectedRetainedDecision;

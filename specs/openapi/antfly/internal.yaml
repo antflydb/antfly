@@ -63,6 +63,84 @@ paths:
             X-Antfly-Raft-Mutation-Outcome:
               schema: {type: string, enum: [not-proposed-v1, not-applied-v1, unknown-v1, committed-v1]}
         '504': {description: Shared deadline exhausted; mutation may have committed}
+  /groups/{group_id}/tables/{table_name}/history/decision-v1:
+    post:
+      tags: [retained-history]
+      operationId: readNativeHistoryCoordinatorDecision
+      summary: Read the retained coordinator decision and original participant admission
+      description: |
+        Signed service-only read, including during legacy migration. Reads the
+        coordinator record and retained admission v3 from one native snapshot
+        after ReadIndex, under the complete original physical owner and catalog
+        route fence. Validates the owner and quorum before and after the read.
+        The reply binds the request and actual persisted native cut and owns all
+        retained original participant identities. A null decision is unproven
+        absence; pending and aborted records cannot yield a committed manifest.
+        The read cannot authorize replay, presume-abort, checkpoint advancement
+        or retention release. One original relative deadline bounds all work.
+        Requests are limited to 4096 bytes and replies to 16781312 bytes.
+        Membership and record metadata are private service information.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema: {type: integer, format: uint64, minimum: 1}
+        - name: table_name
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 1024}
+        - name: X-Antfly-Catalog-Route-Fence
+          in: header
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 16384}
+        - name: X-Antfly-Catalog-Route-Deadline-Ms
+          in: header
+          required: true
+          schema: {type: integer, minimum: 1, maximum: 5000}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NativeHistoryDecisionRequest'}
+      responses:
+        '200':
+          description: Request-bound coordinator record, original admission and actual native cut.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryDecisionReply'}
+        '400':
+          description: Invalid request or catalog fence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryDecisionError'}
+        '401':
+          description: Missing or invalid signed service authority.
+        '403':
+          description: Internal service authority required.
+        '409':
+          description: Retention scope or topology conflicts; inspect the typed code.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryDecisionError'}
+        '413':
+          description: Request exceeds the 4096 byte admission limit.
+        '500':
+          description: Corrupt history or internal owner failure.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryDecisionError'}
+        '501':
+          description: Unsupported native owner profile.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryDecisionError'}
+        '503':
+          description: Leader, routing, deadline or storage admission is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryDecisionError'}
   /groups/{group_id}/tables/{table_name}/history/owner-v1:
     post:
       tags: [retained-history]
@@ -668,6 +746,22 @@ components:
             sequence: {type: integer, minimum: 1}
     NativeHistoryPublicationOwner:
       {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"metadata_group_id":{"type":"integer","format":"uint64","minimum":1},"metadata_incarnation":{"$ref":"#/components/schemas/NativeHistoryDigest","description":"Canonical 32-byte nonzero lowercase hexadecimal incarnation encoded as ASCII bytes."},"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"table_binding":{"$ref":"#/components/schemas/NativeHistoryDigest"},"root_generation":{"type":"integer","format":"uint64","minimum":0},"group_id":{"type":"integer","format":"uint64","minimum":1},"topology_epoch":{"type":"integer","format":"uint64","minimum":0}},"required":["version","metadata_group_id","metadata_incarnation","namespace","table_binding","root_generation","group_id","topology_epoch"]}
+    NativeHistoryDecisionRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"transaction_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1}},"required":["version","owner","transaction_id","minimum_applied_index"]}
+    NativeHistoryDecisionRecord:
+      {"type":"object","additionalProperties":false,"properties":{"status":{"type":"string","enum":["pending","committed","aborted"]},"begin_timestamp":{"type":"integer","format":"uint64","minimum":1},"created_at_ns":{"type":"integer","format":"uint64","minimum":1},"commit_version":{"type":"integer","format":"uint64","minimum":0},"finalized_at_ns":{"type":"integer","format":"uint64","minimum":0},"prepared":{"type":"boolean"},"intents_resolved":{"type":"boolean"},"digest":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["status","begin_timestamp","created_at_ns","commit_version","finalized_at_ns","prepared","intents_resolved","digest"]}
+    NativeHistoryDecisionParticipant:
+      {"type":"object","additionalProperties":false,"properties":{"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"owner_fence":{"$ref":"#/components/schemas/NativeHistoryDigest"},"roles":{"type":"integer","minimum":1,"maximum":7},"input_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"locator":{"type":"string","minLength":1,"maxLength":1024},"routed_owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"}},"required":["namespace","owner_fence","roles","input_digest","locator","routed_owner"]}
+    NativeHistoryDecisionAdmission:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[3]},"transaction_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"admission_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"coordinator_namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"coordinator_fence":{"$ref":"#/components/schemas/NativeHistoryDigest"},"participants":{"type":"array","minItems":1,"maxItems":1024,"items":{"$ref":"#/components/schemas/NativeHistoryDecisionParticipant"}}},"required":["version","transaction_id","admission_digest","coordinator_namespace","coordinator_fence","participants"]}
+    NativeHistoryDecisionAdmissionEnvelope:
+      {"type":"object","additionalProperties":false,"properties":{"admission":{"$ref":"#/components/schemas/NativeHistoryDecisionAdmission"},"digest":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["admission","digest"]}
+    NativeHistoryDecisionEvidence:
+      {"type":"object","additionalProperties":false,"properties":{"record":{"$ref":"#/components/schemas/NativeHistoryDecisionRecord"},"admission":{"$ref":"#/components/schemas/NativeHistoryDecisionAdmissionEnvelope"}},"required":["record","admission"],"nullable":true}
+    NativeHistoryDecisionReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"cut":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"},"decision":{"$ref":"#/components/schemas/NativeHistoryDecisionEvidence"}},"required":["version","request_digest","cut","decision"]}
+    NativeHistoryDecisionError:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"code":{"type":"string","enum":["invalid_request","resynchronization_required","topology_changed","unsupported","unavailable","corrupt_decision","internal_error"]}},"required":["version","code"]}
     NativeHistoryOwnerRequest:
       {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"expected_table_binding":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["version","expected_table_binding"]}
     NativeHistoryOwnerObservation:

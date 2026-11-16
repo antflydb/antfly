@@ -22,6 +22,17 @@ pub fn parseControlNativeRetainedHistoryBody(allocator: std.mem.Allocator, body:
     return std.json.parseFromSlice(types.NativeHistoryControlRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Read the retained coordinator decision and original participant admission
+pub const ReadNativeHistoryCoordinatorDecisionPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for readNativeHistoryCoordinatorDecision.
+pub fn parseReadNativeHistoryCoordinatorDecisionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeHistoryDecisionRequest) {
+    return std.json.parseFromSlice(types.NativeHistoryDecisionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Observe retained consumer admission without proposing a command
 pub const ObserveNativeRetainedHistoryGrantPathParams = struct {
     group_id: []const u8,
@@ -106,6 +117,7 @@ pub const Route = struct {
 pub const routes = [_]Route{
     .{ .method = "POST", .path = "/catalog/changefeed-state-v1", .operation_id = "accessInternalChangefeedState", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/control-v1", .operation_id = "controlNativeRetainedHistory", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/decision-v1", .operation_id = "readNativeHistoryCoordinatorDecision", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/grant-v1", .operation_id = "observeNativeRetainedHistoryGrant", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/owner-v1", .operation_id = "captureNativeHistoryOwner", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/page-v1", .operation_id = "readNativeRetainedHistoryPage", .request_body = .buffered, .streaming_response = true },
@@ -130,6 +142,7 @@ pub fn ServerRouter(comptime Impl: type) type {
     comptime {
         if (!@hasDecl(Impl, "accessInternalChangefeedState")) @compileError("ServerRouter: Impl missing required method 'accessInternalChangefeedState'");
         if (!@hasDecl(Impl, "controlNativeRetainedHistory")) @compileError("ServerRouter: Impl missing required method 'controlNativeRetainedHistory'");
+        if (!@hasDecl(Impl, "readNativeHistoryCoordinatorDecision")) @compileError("ServerRouter: Impl missing required method 'readNativeHistoryCoordinatorDecision'");
         if (!@hasDecl(Impl, "observeNativeRetainedHistoryGrant")) @compileError("ServerRouter: Impl missing required method 'observeNativeRetainedHistoryGrant'");
         if (!@hasDecl(Impl, "captureNativeHistoryOwner")) @compileError("ServerRouter: Impl missing required method 'captureNativeHistoryOwner'");
         if (!@hasDecl(Impl, "readNativeRetainedHistoryPage")) @compileError("ServerRouter: Impl missing required method 'readNativeRetainedHistoryPage'");
@@ -152,6 +165,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         pub fn register(self: *const @This(), server: anytype) !void {
             try server.post("/catalog/changefeed-state-v1", httpx.Handler.bind(self.impl, accessInternalChangefeedState));
             try server.post("/groups/:group_id/tables/:table_name/history/control-v1", httpx.Handler.bind(self.impl, controlNativeRetainedHistory));
+            try server.post("/groups/:group_id/tables/:table_name/history/decision-v1", httpx.Handler.bind(self.impl, readNativeHistoryCoordinatorDecision));
             try server.post("/groups/:group_id/tables/:table_name/history/grant-v1", httpx.Handler.bind(self.impl, observeNativeRetainedHistoryGrant));
             try server.post("/groups/:group_id/tables/:table_name/history/owner-v1", httpx.Handler.bind(self.impl, captureNativeHistoryOwner));
             try server.post("/groups/:group_id/tables/:table_name/history/page-v1", httpx.Handler.bind(self.impl, readNativeRetainedHistoryPage));
@@ -175,6 +189,14 @@ pub fn ServerRouter(comptime Impl: type) type {
             const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
             const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
             return impl.controlNativeRetainedHistory(ctx, group_id, table_name);
+        }
+
+        /// Read the retained coordinator decision and original participant admission
+        /// POST /groups/{group_id}/tables/{table_name}/history/decision-v1
+        fn readNativeHistoryCoordinatorDecision(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.readNativeHistoryCoordinatorDecision(ctx, group_id, table_name);
         }
 
         /// Observe retained consumer admission without proposing a command
@@ -247,6 +269,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //
 //   fn accessInternalChangefeedState(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn controlNativeRetainedHistory(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn readNativeHistoryCoordinatorDecision(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn observeNativeRetainedHistoryGrant(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn captureNativeHistoryOwner(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn readNativeRetainedHistoryPage(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response

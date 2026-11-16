@@ -235,6 +235,95 @@ pub const NativeHistoryControlResponse = struct {
     }
 };
 
+pub const NativeHistoryDecisionAdmission = struct {
+    version: i64,
+    transaction_id: NativeHistoryConsumerId,
+    admission_digest: NativeHistoryDigest,
+    coordinator_namespace: NativeHistoryNamespace,
+    coordinator_fence: NativeHistoryDigest,
+    participants: []const NativeHistoryDecisionParticipant,
+};
+
+pub const NativeHistoryDecisionAdmissionEnvelope = struct {
+    admission: NativeHistoryDecisionAdmission,
+    digest: NativeHistoryDigest,
+};
+
+pub const NativeHistoryDecisionError = struct {
+    version: i64,
+    code: []const u8,
+};
+
+pub const NativeHistoryDecisionEvidenceValue = struct {
+    record: NativeHistoryDecisionRecord,
+    admission: NativeHistoryDecisionAdmissionEnvelope,
+};
+
+pub const NativeHistoryDecisionEvidence = ?NativeHistoryDecisionEvidenceValue;
+
+pub const NativeHistoryDecisionParticipant = struct {
+    namespace: NativeHistoryNamespace,
+    owner_fence: NativeHistoryDigest,
+    roles: i64,
+    input_digest: NativeHistoryDigest,
+    locator: []const u8,
+    routed_owner: NativeHistoryPublicationOwner,
+};
+
+pub const NativeHistoryDecisionRecord = struct {
+    status: []const u8,
+    begin_timestamp: u64,
+    created_at_ns: u64,
+    commit_version: u64,
+    finalized_at_ns: u64,
+    prepared: bool,
+    intents_resolved: bool,
+    digest: NativeHistoryDigest,
+};
+
+pub const NativeHistoryDecisionReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    cut: NativeHistoryPublicationCut,
+    decision: NativeHistoryDecisionEvidence,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "request_digest", "request_digest", false },
+        .{ "cut", "cut", false },
+        .{ "decision", "decision", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("decision");
+        try jw.write(self.decision);
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryDecisionRequest = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    transaction_id: NativeHistoryConsumerId,
+    minimum_applied_index: u64,
+};
+
 pub const NativeHistoryDigest = []const i64;
 
 pub const NativeHistoryGrant = struct {

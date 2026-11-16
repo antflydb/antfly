@@ -3204,3 +3204,40 @@ original prepared/resolved committed record and v3 owner identities. The fixture
 assembles and publishes its complete certificate from that persisted admission.
 Sparse-cut, physical owner and minimum-index checks remain qualified. The eight
 pure wire/contract cases also pass. Formatting, license and diff checks passed.
+
+### Signed remote coordinator decision read
+
+The internal `history/decision-v1` endpoint carries the coherent native decision
+observation across nodes. The spec was updated and `make generate` completed
+before handler implementation. Requests bind the full original coordinator owner
+and transaction ID to a catalog route fence and one relative 1–5000 ms budget.
+Membership and admission metadata remain signed service-only, including during
+legacy unauthenticated migration. Requests are capped at 4096 bytes and replies
+at 16 MiB plus 4096 bytes, with that reply limit applied to both the selected
+forwarding executor and the client request.
+
+The typed port validates metadata incarnation, group, topology and namespace
+before dispatch. DataServer uses known eligible leader routing and bounded local
+read-admission retries. Replies require a fence acknowledgement and JSON content
+type, reject mutation-outcome headers, and explicitly require the envelope
+version. All variable participant data is owned beyond response teardown; forged,
+expired or canceled results release that ownership before returning an error.
+The HTTP handler serializes the observation value and then destroys its arena.
+
+The real-Raft fixture now requests the retained decision through a coordinator
+with no local replica, over signed HTTP, and assembles its certificate from the
+returned native admission. New ingress/client tests cover record states, original
+owner substitution, missing versions/acks, malformed or oversized responses,
+unknown/duplicate request fields, lost transport and cancellation. Qualification
+is pending. Production coordinator execution/recovery and all remaining full
+objective requirements remain open.
+
+`completion-decision-http-test.log` completed with exit 0: all 23 RPC and
+authentication cases and nine real-Raft cases passed, with no failures, skips or
+leaks. `completion-decision-http-qualified-test.log` passed the same 32 cases
+again with legacy unauthenticated migration enabled on the serving fixture:
+an unsigned request to the mounted decision endpoint returns 401, followed by
+successful signed remote decision recovery and complete certificate assembly.
+OpenAPI generation, formatting, license and diff checks passed. The existing
+application/source coordinator and background completion driver still require
+integration; neither issue is ready to close.

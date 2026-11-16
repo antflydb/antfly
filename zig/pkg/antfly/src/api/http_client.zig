@@ -2741,6 +2741,83 @@ pub const ApiHttpClient = struct {
         return result;
     }
 
+    pub fn fetchGroupHistoryDecision(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        input: @import("history_decision_operations.zig").Request,
+        fence: route_metadata_api.CatalogRouteFence,
+        original_context: @import("antfly_local_sources").api_operation.RequestContext,
+    ) !@import("history_decision_operations.zig").Reply {
+        const contract = @import("history_decision_operations.zig");
+        var scope = try contract.Scope.init(fence, original_context);
+        const context = scope.context();
+        try context.ensureActive();
+        if (self.internal_service == null) return error.Unauthorized;
+        try fence.validate();
+        if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], fence.route.identity_namespace.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], fence.route.identity_namespace.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], fence.route.identity_namespace.range_id, .big);
+        try input.validate(namespace);
+        try input.validateFence(fence);
+        if (input.owner.group_id != group_id) return error.InvalidHistoryAdmission;
+        const table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, table, routes.Routes.history_decision_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
+        defer self.alloc.free(body);
+        if (body.len > contract.max_bytes) return error.InvalidHistoryAdmission;
+        const encoded_fence = try std.json.Stringify.valueAlloc(self.alloc, fence, .{});
+        defer self.alloc.free(encoded_fence);
+        if (encoded_fence.len > 16384) return error.InvalidCatalogRouteFence;
+        const timeout = @min(try context.remainingTimeoutMs() orelse route_metadata_api.catalog_route_default_deadline_ms, 5000);
+        var buffer: [10]u8 = undefined;
+        const budget = try std.fmt.bufPrint(&buffer, "{d}", .{timeout});
+        var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
+        try context.ensureActive();
+        var response = self.executeRequest(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .headers = &.{
+            .{ .name = route_metadata_api.catalog_route_fence_header, .value = encoded_fence },
+            .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = budget },
+        }, .timeout_ms = timeout, .cancellation = &cancellation, .max_response_bytes = contract.max_reply_bytes }) catch |err| return switch (err) {
+            error.OutOfMemory, error.Canceled, error.Cancelled, error.DeadlineExceeded => err,
+            else => error.ReadUnavailable,
+        };
+        defer response.deinit(self.alloc);
+        try context.ensureActive();
+        if (response.body.len > contract.max_reply_bytes or response.header(internal_batch_forwarding.outcome_header) != null) return error.InvalidRemoteResponse;
+        if (response.status != 200) {
+            if (response.status == 401) return error.Unauthorized;
+            if (response.status == 403) return error.Forbidden;
+            if (response.status == 404) return error.ChangefeedCapabilityUnsupported;
+            var parsed = std.json.parseFromSlice(contract.ErrorResponse, self.alloc, response.body, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch return error.InvalidRemoteResponse;
+            defer parsed.deinit();
+            if (parsed.value.version != 1 or parsed.value.status() != response.status) return error.InvalidRemoteResponse;
+            return switch (parsed.value.code) {
+                .invalid_request => error.InvalidHistoryAdmission,
+                .resynchronization_required => error.HistoryResynchronizationRequired,
+                .topology_changed => error.TopologyChanged,
+                .unsupported => error.ChangefeedCapabilityUnsupported,
+                .unavailable => error.ReadUnavailable,
+                .corrupt_decision => error.HistoryCorrupt,
+                .internal_error => error.UnexpectedHttpStatus,
+            };
+        }
+        const ack = response.header(route_metadata_api.catalog_route_fence_ack_header) orelse return error.InvalidRemoteResponse;
+        if (!std.mem.eql(u8, ack, route_metadata_api.catalog_route_fence_ack_value) or response.header(internal_batch_forwarding.outcome_header) != null) return error.InvalidRemoteResponse;
+        const content_type = response.header("Content-Type") orelse response.content_type orelse return error.InvalidRemoteResponse;
+        if (!std.ascii.eqlIgnoreCase(content_type, "application/json")) return error.InvalidRemoteResponse;
+        var result = try contract.decodeReply(self.alloc, response.body, input);
+        errdefer result.deinit();
+        try context.ensureActive();
+        return result;
+    }
+
     pub fn fetchGroupHistoryPublication(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -7725,6 +7802,112 @@ test "history owner client preserves qualified owners with one signed bounded at
             .unsupported => try std.testing.expectError(error.ChangefeedCapabilityUnsupported, result),
             .lost => try std.testing.expectError(error.ReadUnavailable, result),
             .cancelled => try std.testing.expectError(error.Canceled, result),
+        }
+    }
+}
+
+test "history decision client preserves owned coordinator decisions with one signed bounded attempt" {
+    const a = std.testing.allocator;
+    const contract = @import("history_decision_operations.zig");
+    const secret = "history-decision-client-test-secret";
+    const Fake = struct {
+        const Mode = enum { absent, committed, pending, aborted, scope, floor, owner_changed, missing_version, missing_ack, wrong_type, mutation_header, conflict, wrong_error, unsupported, oversized, lost, cancelled };
+        mode: Mode = .absent,
+        input: contract.Request,
+        calls: usize = 0,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("http://node:8080/internal/v1/groups/17/tables/docs%2Ftenant/history/decision-v1", request.uri);
+            try std.testing.expectEqual(@as(?usize, contract.max_reply_bytes), request.max_response_bytes);
+            try std.testing.expect(request.timeout_ms.? > 0 and request.timeout_ms.? <= 5000);
+            try std.testing.expect(request.cancellation != null);
+            try std.testing.expect(request.header(route_metadata_api.catalog_route_fence_header) != null);
+            try std.testing.expect(request.header(route_metadata_api.catalog_route_deadline_ms_header) != null);
+            try std.testing.expectEqualDeep(self.input, try contract.decode(alloc, request.body, self.input.owner.namespace));
+            try internal_service_auth.verifyToken(alloc, request.header(internal_service_auth.header_name).?, .{ .secret = secret, .issuer = "decision-test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            if (self.mode == .lost) return error.ConnectionResetByPeer;
+            if (self.mode == .unsupported) return http_route_helpers.textResponseWithHeaders(alloc, 404, "unknown endpoint", &.{});
+            if (self.mode == .conflict or self.mode == .wrong_error) {
+                const body = try std.json.Stringify.valueAlloc(alloc, contract.ErrorResponse.fromError(error.TopologyChanged), .{});
+                defer alloc.free(body);
+                return http_route_helpers.textResponseWithHeaders(alloc, if (self.mode == .wrong_error) 500 else 409, body, &.{});
+            }
+            var members = [_]contract.wire.completion.Participant{.{ .namespace = self.input.owner.namespace, .owner_fence = self.input.owner.digest(), .input_digest = @splat(4), .roles = 6, .locator = "original-checkpoint-owner", .routed_owner = self.input.owner }};
+            const admission: contract.wire.completion.Admission = .{ .version = 3, .transaction_id = self.input.transaction_id, .admission_digest = @splat(5), .coordinator_namespace = self.input.owner.namespace, .coordinator_fence = self.input.owner.digest(), .participants = &members };
+            var record: contract.wire.Record = .{ .status = .committed, .begin_timestamp = 10, .created_at_ns = 11, .commit_version = 20, .finalized_at_ns = 20, .prepared = true, .intents_resolved = true, .digest = @splat(6) };
+            if (self.mode == .pending) {
+                record.status = .pending;
+                record.commit_version = 0;
+                record.finalized_at_ns = 0;
+                record.intents_resolved = false;
+            }
+            if (self.mode == .aborted) {
+                record.status = .aborted;
+                record.commit_version = 0;
+                record.finalized_at_ns = 30;
+            }
+            var reply: contract.wire.Reply = .{ .request_digest = self.input.binding().digest(), .cut = .{ .term = 2, .index = 10 }, .decision = if (self.mode == .absent) null else .{ .record = record, .admission = .{ .admission = admission, .digest = admission.digest() } } };
+            if (self.mode == .scope) reply.request_digest[0] ^= 1;
+            if (self.mode == .floor) reply.cut.index = 0;
+            if (self.mode == .owner_changed) members[0].routed_owner.?.root_generation += 1;
+            if (self.mode == .oversized) {
+                const raw = try alloc.alloc(u8, contract.max_reply_bytes + 1);
+                defer alloc.free(raw);
+                @memset(raw, ' ');
+                return http_route_helpers.textResponseWithHeaders(alloc, 200, raw, &.{});
+            }
+            const full = try std.json.Stringify.valueAlloc(alloc, reply, .{});
+            defer alloc.free(full);
+            const missing = if (self.mode == .missing_version) try std.fmt.allocPrint(alloc, "{{{s}", .{full[(std.mem.indexOfScalar(u8, full, ',') orelse unreachable) + 1 ..]}) else null;
+            defer if (missing) |raw| alloc.free(raw);
+            const body = missing orelse full;
+            if (self.mode == .cancelled) self.cancelled.store(true, .release);
+            if (self.mode == .mutation_header) return http_route_helpers.textResponseWithHeaders(alloc, 200, body, &.{ .{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = "1" }, .{ .name = "Content-Type", .value = "application/json" }, .{ .name = internal_batch_forwarding.outcome_header, .value = internal_batch_forwarding.outcome_not_proposed_v1 } });
+            return http_route_helpers.textResponseWithHeaders(alloc, 200, body, if (self.mode == .missing_ack) &.{.{ .name = "Content-Type", .value = "application/json" }} else &.{ .{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = "1" }, .{ .name = "Content-Type", .value = if (self.mode == .wrong_type) "text/html" else "application/json" } });
+        }
+    };
+    const fence: route_metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 17, .big);
+    std.mem.writeInt(u64, namespace[16..24], 19, .big);
+    const input: contract.Request = .{ .version = 1, .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(2), .root_generation = 0, .group_id = 17, .topology_epoch = 1 }, .transaction_id = @splat(1), .minimum_applied_index = 5 };
+    var fake: Fake = .{ .input = input };
+    var client = ApiHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    try std.testing.expectError(error.Unauthorized, client.fetchGroupHistoryDecision("http://node:8080", 17, "docs/tenant", input, fence, .{}));
+    _ = client.withInternalServiceAuth(secret, "decision-test");
+    try std.testing.expectError(error.InvalidCatalogRouteFence, client.fetchGroupHistoryDecision("http://node:8080", 18, "docs/tenant", input, fence, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    var expired_fence = fence;
+    expired_fence.admission_deadline_ns = platform_time.monotonicNs() -| 1;
+    try std.testing.expectError(error.DeadlineExceeded, client.fetchGroupHistoryDecision("http://node:8080", 17, "docs/tenant", input, expired_fence, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    for (std.meta.tags(Fake.Mode)) |mode| {
+        fake.mode = mode;
+        fake.cancelled.store(false, .release);
+        const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&fake.cancelled) };
+        const calls = fake.calls;
+        const attempt = client.fetchGroupHistoryDecision("http://node:8080", 17, "docs/tenant", input, fence, context);
+        try std.testing.expectEqual(calls + 1, fake.calls);
+        switch (mode) {
+            .absent, .committed, .pending, .aborted => {
+                var result = try attempt;
+                defer result.deinit();
+                if (mode == .absent) {
+                    try std.testing.expect(result.value.decision == null);
+                } else {
+                    try std.testing.expectEqualStrings("original-checkpoint-owner", result.value.decision.?.admission.admission.participants[0].locator);
+                    if (mode == .committed) try std.testing.expectEqual(@as(u64, 20), (try result.value.decision.?.committedManifest()).commit_version) else try std.testing.expectError(error.SourceOutcomeUnresolved, result.value.decision.?.committedManifest());
+                }
+            },
+            .scope, .floor, .owner_changed, .missing_version => try std.testing.expectError(error.HistoryCorrupt, attempt),
+            .missing_ack, .wrong_type, .mutation_header, .wrong_error, .oversized => try std.testing.expectError(error.InvalidRemoteResponse, attempt),
+            .conflict => try std.testing.expectError(error.TopologyChanged, attempt),
+            .unsupported => try std.testing.expectError(error.ChangefeedCapabilityUnsupported, attempt),
+            .lost => try std.testing.expectError(error.ReadUnavailable, attempt),
+            .cancelled => try std.testing.expectError(error.Canceled, attempt),
         }
     }
 }
