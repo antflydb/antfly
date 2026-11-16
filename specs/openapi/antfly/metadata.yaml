@@ -15525,17 +15525,24 @@ paths:
         - data_operations
       description: |
         Executes supported SQL statements through the current catalog and native
-        execution contracts. Stored views use CREATE [OR REPLACE] VIEW,
-        ALTER VIEW RENAME TO, and DROP VIEW [CASCADE | RESTRICT] on this same
-        endpoint. Views retain durable source identities; owner/invoker access
-        reuses native row policies and caller/owner filters without changing
-        the caller's SQL identity. Document fields can be projected with
-        jsonb_to_record and declared SQL types, including typed arrays.
-        Parameters are bound separately from statement text. Source, DDL,
-        session, and transaction capabilities are checked explicitly; not every
-        PostgreSQL statement or cross-source transaction is supported.
-        Reads require the native retained statement-snapshot capabilities of
-        their sources, not an implied global SQL transaction snapshot.
+        typed plans, including reads over read-only lake attachments. Stored
+        views use CREATE [OR REPLACE] VIEW, ALTER VIEW RENAME TO, and DROP VIEW
+        [CASCADE | RESTRICT] on this same endpoint. Views retain durable source
+        identities; owner/invoker access reuses native row policies and
+        caller/owner filters without changing the caller's SQL identity.
+        Document fields can be projected with jsonb_to_record and declared SQL
+        types, including typed arrays. Parameters are bound separately from
+        statement text. DDL returns a durable `ddl_receipt`; a 202 response
+        means the declaration was admitted and validation is pending, and
+        admitted DDL must not be replayed. BEGIN starts a SQL session: send the
+        returned `session_id` with later statements until COMMIT or ROLLBACK.
+        Open a connection with `/sql/connections` to keep scope and settings
+        across requests, and use `/sql/prepared` for prepared statements.
+        Source, DDL, session, and transaction capabilities are checked
+        explicitly; not every PostgreSQL statement or cross-source transaction
+        is supported. Reads require the native retained statement-snapshot
+        capabilities of their sources, not an implied global SQL transaction
+        snapshot.
         Unsupported statement shapes fail explicitly; the server never
         silently substitutes a different query or truncates the result.
       operationId: executeSQL
