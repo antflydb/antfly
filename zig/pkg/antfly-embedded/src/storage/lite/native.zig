@@ -7855,7 +7855,7 @@ pub const NativeFile = struct {
         var durable_ceiling_offset: ?u64 = null;
         if (scan_region) |r| {
             const published = r.readLogState();
-            durable_ceiling_offset = publishedDurableCeiling(published);
+            durable_ceiling_offset = publishedDurableCeiling(r, published);
             if (published.checkpoint_sequence > folded_through) {
                 var header_bytes: [header_size]u8 = undefined;
                 try readHeaderExactAt(self.file, io, &header_bytes);
@@ -8204,9 +8204,16 @@ pub const NativeFile = struct {
     /// all zeros; treating that as a ceiling of 0 would turn real
     /// mid-log corruption into a silent truncation of everything after
     /// it. Any live writer has published a nonzero sequence.
-    fn publishedDurableCeiling(state: shared_lock_region.Region.LogState) ?u64 {
-        if (state.durable_sequence == 0 and state.checkpoint_sequence == 0) return null;
-        return state.durable_offset;
+    ///
+    /// A reset region also reads all zeros between a live writer's first
+    /// append and its first publication; a cold open in that window must
+    /// still tolerate that writer's in-flight record. So an unpublished
+    /// state is a ceiling of 0 while another live process holds the writer
+    /// lease, and no ceiling (strict) otherwise.
+    fn publishedDurableCeiling(region: *const shared_lock_region.Region, state: shared_lock_region.Region.LogState) ?u64 {
+        if (state.durable_sequence != 0 or state.checkpoint_sequence != 0) return state.durable_offset;
+        const own_pid: u32 = antfly_platform.process.currentId() orelse 0;
+        return if (region.foreignLiveWriter(own_pid)) 0 else null;
     }
 
     pub fn checkpointRedoLogWithDurability(self: *NativeFile, durable: bool) anyerror!void {
@@ -9016,7 +9023,7 @@ pub const NativeFile = struct {
             // instead walks into the sequence a deferred fold consumed
             // without appending a record, which reads as a gap
             // (`NativeRedoLogCorrupt`).
-            var rctx: ReplayCtx = .{ .file = self, .io = io, .start_after_sequence = @max(redo.durable_sequence, redo.checkpoint_sequence), .durable_ceiling_offset = publishedDurableCeiling(published) orelse std.math.maxInt(u64) };
+            var rctx: ReplayCtx = .{ .file = self, .io = io, .start_after_sequence = @max(redo.durable_sequence, redo.checkpoint_sequence), .durable_ceiling_offset = publishedDurableCeiling(region, published) orelse std.math.maxInt(u64) };
             try inode_lock.withRedoOverlayLock(entry, io, &rctx, ReplayCtx.run);
 
             const outcome = rctx.outcome;
@@ -9490,7 +9497,7 @@ pub const NativeFile = struct {
                 // function is reached in-process, but `self.file` is the
                 // same physical, cross-process file either of the other
                 // two races on.
-                const ceiling = if (self.regionForInode() catch null) |r| publishedDurableCeiling(r.readLogState()) else null;
+                const ceiling = if (self.regionForInode() catch null) |r| publishedDurableCeiling(r, r.readLogState()) else null;
                 if (outcome.stop_reason == .corrupt_record and (ceiling == null or outcome.valid_bytes < ceiling.?)) return error.NativeRedoLogCorrupt;
                 redo.writer.tail = outcome.valid_bytes;
                 redo.writer.last_sequence = outcome.last_sequence;
@@ -10362,6 +10369,20 @@ pub const NativeFile = struct {
         if (builtin.mode == .debug) std.debug.assert(self.reader_fence_lock == null);
         self.reader_fence_lock = handle;
     }
+    /// `acquireReaderFence` without the inode lock: registers only the
+    /// coordinator epoch, which claims this reader's shared-region slot so
+    /// another process's reclaim frontier sees it. For a plain (not
+    /// externally locked) read generation the inode lock adds nothing --
+    /// in-process reuse already honors `inode_lock.pinReader` -- and
+    /// waiting for it deadlocks a read issued while this same process holds
+    /// the file exclusively, such as a read inside an open write.
+    pub fn acquireReaderRegionFence(self: *NativeFile, sequence: u64, owner: *NativeFile) !void {
+        const coordinator = self.reader_coordinator orelse return;
+        const fence = try coordinator.registerEpoch(self.file, try self.regionForInode(), (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false);
+        if (self.reader_fence) |stale| coordinator.unregister(stale);
+        self.reader_fence = fence;
+    }
+
     pub fn releaseReaderFence(self: *NativeFile) void {
         if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
         self.reader_fence = null;

@@ -3914,7 +3914,10 @@ pub const Store = struct {
                 // inode fence until exec/close, even after its parent closed
                 // the descriptor. Wait for that fence instead of failing an
                 // otherwise uncontended same-owner read.
-                try generation.file.acquireReaderFence(pin.sequence, &self.file);
+                if (generation.scoped_reader_lock)
+                    try generation.file.acquireReaderFence(pin.sequence, &self.file)
+                else
+                    try generation.file.acquireReaderRegionFence(pin.sequence, &self.file);
             }
             generation.kernel_readers += 1;
         }
