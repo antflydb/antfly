@@ -78,14 +78,7 @@ pub const source_2 =
         \\    const uint block_size = 1024u;
         \\    uint start = block * block_size;
         \\{{suppressed_argmax_candidates}}
-        \\    for (uint stride = uint(tg_size) >> 1u; stride > 0u; stride >>= 1u) {
-        \\        if (uint(tid) < stride) {
-        \\            float other = sh_vals[uint(tid) + stride];
-        \\            uint other_idx = sh_ids[uint(tid) + stride];
-        \\            if (other > sh_vals[tid] || (other == sh_vals[tid] && other_idx < sh_ids[tid])) { sh_vals[tid] = other; sh_ids[tid] = other_idx; }
-        \\        }
-        \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\    }
+        \\    termite_argmax_partial_tree(sh_vals, sh_ids, tid, tg_size);
         \\    if (tid == 0u) { partial_values[block] = sh_vals[0]; partial_ids[block] = sh_ids[0]; }
         \\}
         \\kernel void termite_lighton_batch_argmax_reduce(device const float *partial_values [[buffer(0)]], device const uint *partial_ids [[buffer(1)]], device uint *output [[buffer(2)]], constant uint &partial_count [[buffer(3)]], uint gid [[thread_position_in_grid]]) {

@@ -7387,9 +7387,11 @@ TERMITE_METAL_ABI_DECLARE_TAGGED(conv2d_f32)
     "    }\n"
 
 // Online rescale and score-to-weight conversion in the original 256-key scalar schedule.
+// tile-codegen:begin attention.online_phases.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 #define TERMITE_MSL_SEGMENT_SCALAR_WEIGHTS \
     "            float new_max = max(run_max, chunk_best); float rescale = run_max <= neg ? 0.0f : exp(run_max - new_max); float local_sum = 0.0f;\n" \
     "            for (uint j = lid; j < n; j += width) { float score = scores[j]; float w = score <= neg ? 0.0f : exp(score - new_max); scores[j] = w; local_sum += w; }\n"
+// tile-codegen:end attention.online_phases.0 family
 
 // Scalar value accumulation and final chunk barrier; reduction ownership remains at each caller.
 #define TERMITE_MSL_SEGMENT_SCALAR_PV \
@@ -7506,6 +7508,7 @@ TERMITE_METAL_ABI_DECLARE_TAGGED(conv2d_f32)
 
 // One 32-query tiled traversal. Mask, dropout and publication policies stay
 // explicit; the native QK/PV schedules and barriers are shared unchanged.
+// tile-codegen:begin attention.online_phases.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 #define TERMITE_MSL_SEGMENT_FLASH32_BODY(Query, OutputInit, KeyPosition, Visible, Probability, ScoreComment) \
     "    simdgroup_float8x8 qm[8];\n" \
     "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n" \
@@ -7539,6 +7542,7 @@ TERMITE_METAL_ABI_DECLARE_TAGGED(conv2d_f32)
     "        }\n" \
     TERMITE_MSL_SEGMENT_MMA_PV \
     "    }\n"
+// tile-codegen:end attention.online_phases.1 family
 
 // Compatible entry contracts have one source owner. These macros emit the
 // original argument names, buffer slots, types and execution builtins exactly.
@@ -7944,13 +7948,19 @@ static NSString *termite_metal_tensor_program_source(void) {
         "            if (!isfinite(x))\n"
         "                x = -INFINITY;\n"
         "            float m = simd_max(x), nm = max(maxima[row], m),\n"
+// tile-codegen:begin attention.online_phases.2 family (do not edit; run: zig build tile-kernel-codegen -- --write)
         "                  c = isfinite(maxima[row]) && isfinite(nm) ? exp(maxima[row] - nm) : 0;\n"
+// tile-codegen:end attention.online_phases.2 family
+// tile-codegen:begin attention.online_phases.3 family (do not edit; run: zig build tile-kernel-codegen -- --write)
         "            float e = isfinite(x) ? exp(x - nm) : 0;\n"
+// tile-codegen:end attention.online_phases.3 family
         "            prob[row * 32 + lane] = e;\n"
         "            float sum = simd_sum(e);\n"
         "            if (lane == 0) {\n"
         "                maxima[row] = nm;\n"
+// tile-codegen:begin attention.online_phases.4 family (do not edit; run: zig build tile-kernel-codegen -- --write)
         "                denom[row] = denom[row] * c + sum;\n"
+// tile-codegen:end attention.online_phases.4 family
         "                correction[row] = c;\n"
         "            }\n"
         "        }\n"
@@ -8275,6 +8285,7 @@ static NSString *termite_metal_tensor_program_source(void) {
 #define TERMITE_MSL_ABI_PAGED_GQA_SPLIT_STAGE(Name) \
     "kernel void " #Name "(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float4 *partial_o [[buffer(5)]], constant termite_metal_paged_attention_params &p [[buffer(6)]], constant termite_metal_decode_gqa_split_params &schedule [[buffer(7)]], threadgroup char *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
 
+// tile-codegen:begin attention.online_phases.5 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 #define TERMITE_MSL_PAGED_GQA_SPLIT_STAGE_TILE \
     "    const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint q_stride = p.num_heads * hd; const uint kv_head_base = kv_h * hd; const uint k_row_halfs = p.key_row_bytes / 2u; const uint query_pos = p.query_position_offset + qi; const float scale = rsqrt(float(hd));\n" \
     "    threadgroup half *sq = (threadgroup half *)shmem; threadgroup char *fb = shmem + 8u * hd * 2u;\n" \
@@ -8297,15 +8308,18 @@ static NSString *termite_metal_tensor_program_source(void) {
     "    threadgroup_barrier(mem_flags::mem_threadgroup);\n" \
     "    const uint hd4 = hd / 4u; const uint dslice4 = dslice / 4u; for (uint i = uint(tid); i < heads_per_group * hd4; i += 256u) { uint j = i / hd4; uint d4 = i - j * hd4; uint owner = d4 / dslice4; uint dv = d4 - owner * dslice4; uint h = kv_h * heads_per_group + j; uint qh = qi * p.num_heads + h; uint so_base = owner * 8u * dslice + j * dslice + dv * 4u; partial_o[(qh * hd4 + d4) * split_count + split] = float4(so[so_base], so[so_base + 1u], so[so_base + 2u], so[so_base + 3u]); }\n" \
     "}\n"
+// tile-codegen:end attention.online_phases.5 family
 
 #define TERMITE_MSL_ABI_PAGED_GQA_SPLIT_REDUCE(Name) \
     "kernel void " #Name "(device const float4 *partial_o [[buffer(0)]], device float4 *output [[buffer(1)]], constant termite_metal_paged_attention_params &p [[buffer(2)]], constant termite_metal_decode_gqa_split_params &schedule [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
 
+// tile-codegen:begin attention.online_phases.6 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 #define TERMITE_MSL_PAGED_GQA_SPLIT_REDUCE_TILE \
     "    const uint qh = qi * p.num_heads + h; const uint hd4 = hd / 4u; const device float *partial_stats = reinterpret_cast<const device float *>(partial_o + p.q_len * p.num_heads * hd4 * split_count);\n" \
     "    float S = lane < split_count ? partial_stats[qh * (2u * split_count) + uint(lane)] : 0.0f; float M = lane < split_count ? partial_stats[qh * (2u * split_count) + split_count + uint(lane)] : -3.402823466e+38f; float merged_m = simd_max(M); float weight = lane < split_count && S > 0.0f ? exp(M - merged_m) : 0.0f; float denom = simd_sum(S * weight); float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;\n" \
     "    for (uint d4 = uint(sgitg); d4 < hd4; d4 += schedule.reduce_simdgroups) { float4 value = lane < split_count ? partial_o[(qh * hd4 + d4) * split_count + uint(lane)] : float4(0.0f); float4 merged = simd_sum(value * weight); if (lane == 0u) output[qh * hd4 + d4] = merged * inv_denom; }\n" \
     "}\n"
+// tile-codegen:end attention.online_phases.6 family
 
 // Shared range admission, key staging and publication for native segment tiles.
 // These source phases retain the exact qualified compiler inputs and schedules.
@@ -8386,6 +8400,7 @@ static NSString *termite_metal_tensor_program_source(void) {
     "                const uint distance = qp[r] >= kp[c] ? uint(qp[r]) - uint(kp[c]) : uint(kp[c]) - uint(qp[r]);\n" \
     "                const bool visible = r < nq && c < nk && ((key >= x[0] && key < x[1]) || (key >= x[2] && key < x[3]) || (key >= x[4] && key < x[5])) && (p.window == 0xffffffffu || distance <= p.window);\n"
 
+// tile-codegen:begin attention.online_phases.7 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 #define ANTFLY_MSL_SEGMENT_SOFTMAX8(Weights) \
     "            float mx = max(x0, x1);\n" \
     "            mx = max(mx, simd_shuffle_xor(mx, 1)); mx = max(mx, simd_shuffle_xor(mx, 2));\n" \
@@ -8395,6 +8410,7 @@ static NSString *termite_metal_tensor_program_source(void) {
     Weights "            float sum = w0 + w1;\n" \
     "            sum += simd_shuffle_xor(sum, 1); sum += simd_shuffle_xor(sum, 2);\n" \
     "            if (L % 4u == 0u) { lrow[r] = lrow[r] * a + sum; mrow[r] = mnew; alpha[r] = a; }\n"
+// tile-codegen:end attention.online_phases.7 family
 
 // Dense Q16 phases keep single-head and paired-head storage and native schedules.
 // Direct-half and staged tails retain their original casts, strides and barriers.
@@ -8441,8 +8457,10 @@ static NSString *termite_metal_tensor_program_source(void) {
 #define ANTFLY_MSL_VISION64_QK(Matrix) \
     "simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f); for (uint d = 0u; d < 64u; d += 8u) { " Matrix " mq; " Matrix " mk; simdgroup_load(mq, sq + qgroup * 512u + d, 64u); simdgroup_load(mk, skv + subgroup * 512u + d, 64u, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } simdgroup_store(ms, ss + qgroup * 256u + subgroup * 8u, 32u);"
 
+// tile-codegen:begin attention.online_phases.8 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 #define ANTFLY_MSL_VISION64_ONLINE(Passes,Tile) \
     "for (uint pass = 0u; pass < " Passes "; ++pass) { const uint j = uint(sgitg) + pass * 8u; const uint qi = q0 + j; const uint kk = uint(lane); const uint ki = key_start + kk; float sc = qi < p.seq_len && ki < p.seq_len ? ss[j * 32u + kk] : neg_inf; if (!isfinite(sc)) sc = neg_inf; const float row_max = simd_max(sc); const float m_old = sM[j]; const float m_new = max(m_old, row_max); float corr = 0.0f; float e = 0.0f; if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; } sp[j * 32u + kk] = " Tile "(e); const float row_sum = simd_sum(e); if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; const uint local_j = j & 7u; sdiag[(j >> 3u) * 64u + local_j * 8u + local_j] = corr; } }"
+// tile-codegen:end attention.online_phases.8 family
 
 #define ANTFLY_MSL_VISION64_PV(Matrix,Accumulator) \
     "for (uint kk8 = 0u; kk8 < 4u; ++kk8) { " Matrix " mp; simdgroup_load(mp, sp + qgroup * 256u + kk8 * 8u, 32u); for (uint dt = 0u; dt < 2u; ++dt) { " Matrix " mv; simdgroup_load(mv, skv + kk8 * 512u + dslice + dt * 8u, 64u); simdgroup_multiply_accumulate(" Accumulator ", mp, mv, " Accumulator "); } }"
@@ -12075,14 +12093,7 @@ static NSString *termite_metal_shader_source(void) {
            "    sh_vals[tid] = best;\n"
            "    sh_ids[tid] = best_idx;\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint stride = uint(tg_size) >> 1u; stride > 0u; stride >>= 1u) {\n"
-           "        if (uint(tid) < stride) {\n"
-           "            float other = sh_vals[uint(tid) + stride];\n"
-           "            uint other_idx = sh_ids[uint(tid) + stride];\n"
-           "            if (other > sh_vals[tid] || (other == sh_vals[tid] && other_idx < sh_ids[tid])) { sh_vals[tid] = other; sh_ids[tid] = other_idx; }\n"
-           "        }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    }\n"
+           "    termite_argmax_partial_tree(sh_vals, sh_ids, tid, tg_size);\n"
            "    if (tid == 0u) { partial_values[block] = sh_vals[0]; partial_ids[block] = sh_ids[0]; }\n"
            "}\n"
            "kernel void termite_lighton_batch_argmax_reduce(device const float *partial_values [[buffer(0)]], device const uint *partial_ids [[buffer(1)]], device uint *output [[buffer(2)]], constant uint &partial_count [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
@@ -12101,12 +12112,16 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            // tile-codegen:end argmax.2 family
            "inline void termite_whisper_lse_push(thread float &m, thread float &s, float v) {\n"
+// tile-codegen:begin attention.online_phases.9 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "    if (v > m) { s = s * exp(m - v) + 1.0f; m = v; } else { s += exp(v - m); }\n"
+// tile-codegen:end attention.online_phases.9 family
            "}\n"
            "inline void termite_whisper_lse_merge(thread float &m, thread float &s, float m2, float s2) {\n"
            "    if (s2 <= 0.0f) return;\n"
            "    if (s <= 0.0f) { m = m2; s = s2; return; }\n"
+// tile-codegen:begin attention.online_phases.10 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "    if (m2 > m) { s = s * exp(m - m2) + s2; m = m2; } else { s += s2 * exp(m2 - m); }\n"
+// tile-codegen:end attention.online_phases.10 family
            "}\n"
            "inline void termite_whisper_best_push(thread float &bv, thread uint &bi, float v, uint i) {\n"
            "    if (bi == 0xffffffffu || v > bv || (v == bv && i < bi)) { bv = v; bi = i; }\n"
@@ -13373,7 +13388,9 @@ static NSString *termite_metal_shader_source(void) {
            "    if(valid_count==0){for(uint c=0;c<context;++c)scores[c]=0.0f;}\n"
            "    else {\n"
            "        float sum_exp=0.0f;\n"
+// tile-codegen:begin attention.online_phases.11 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "        for(uint c=0;c<context;++c){float e=exp(scores[c]-max_score);scores[c]=e;sum_exp+=e;}\n"
+// tile-codegen:end attention.online_phases.11 family
            "        for(uint c=0;c<context;++c)scores[c]=sum_exp==0.0f?0.0f:scores[c]/sum_exp;\n"
            "    }\n"
            "}\n"
@@ -14737,8 +14754,12 @@ static NSString *termite_metal_shader_source(void) {
            "            float dot = 0;\n"
            "            TERMITE_FOR_UNROLL(uint d = 0; d < count; ++d) dot += qv[d] * k[key * kv_hidden + kh * D + d * 32u + L];\n"
            "            const float score = simd_sum(dot) * scale, next = max(maximum, score);\n"
+// tile-codegen:begin attention.online_phases.12 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "            const float a = maximum == -INFINITY ? 0.0f : exp(maximum - next), b = exp(score - next);\n"
+// tile-codegen:end attention.online_phases.12 family
+// tile-codegen:begin attention.online_phases.13 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "            denominator = denominator * a + b;\n"
+// tile-codegen:end attention.online_phases.13 family
            "            TERMITE_FOR_UNROLL(uint d = 0; d < count; ++d) ov[d] = ov[d] * a + v[key * kv_hidden + kh * D + d * 32u + L] * b;\n"
            "            maximum = next;\n"
            "        }\n"
@@ -15468,11 +15489,15 @@ static NSString *termite_metal_shader_source(void) {
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        for (uint key_local = 0u; key_local < 32u; ++key_local) { const uint key = key_start + key_local; for (uint r = 0u; r < Rows; ++r) { float score = neg_inf; if (active[r] && key < p.seq_len) score = simd_sum(q0[r] * kv_tile[key_local][uint(lane)] + q1[r] * kv_tile[key_local][uint(lane) + 32u]) * 0.125f; if (lane == 0u) weights[uint(sgitg) * Rows + r][key_local] = score; } }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+// tile-codegen:begin attention.online_phases.14 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "        float old_scale[Rows]; for (uint r = 0u; r < Rows; ++r) { const uint row = uint(sgitg) * Rows + r; old_scale[r] = 0.0f; if (active[r]) { const float score = weights[row][uint(lane)]; const float tile_max = simd_max(score); const float next_max = max(running_max[r], tile_max); old_scale[r] = key_start == 0u ? 0.0f : exp(running_max[r] - next_max); const uint key = key_start + uint(lane); const float weight = key < p.seq_len ? exp(score - next_max) : 0.0f; weights[row][uint(lane)] = weight; denom[r] = denom[r] * old_scale[r] + simd_sum(weight); running_max[r] = next_max; } else { weights[row][uint(lane)] = 0.0f; } }\n"
+// tile-codegen:end attention.online_phases.14 family
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        for (uint element = uint(tid); element < 2048u; element += 256u) { const uint key_local = element / 64u; const uint d = element & 63u; const uint key = key_start + key_local; kv_tile[key_local][d] = key < p.seq_len ? v[(b * p.seq_len + key) * hidden + h * 64u + d] : 0.0f; }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+// tile-codegen:begin attention.online_phases.15 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "        for (uint r = 0u; r < Rows; ++r) { if (active[r]) { const uint row = uint(sgitg) * Rows + r; float tile_acc0 = 0.0f; float tile_acc1 = 0.0f; for (uint key_local = 0u; key_local < 32u; ++key_local) { const float weight = weights[row][key_local]; tile_acc0 += weight * kv_tile[key_local][uint(lane)]; tile_acc1 += weight * kv_tile[key_local][uint(lane) + 32u]; } acc0[r] = acc0[r] * old_scale[r] + tile_acc0; acc1[r] = acc1[r] * old_scale[r] + tile_acc1; } }\n"
+// tile-codegen:end attention.online_phases.15 family
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "    for (uint r = 0u; r < Rows; ++r) { if (active[r]) { output[q_base[r] + uint(lane)] = denom[r] > 0.0f ? acc0[r] / denom[r] : 0.0f; output[q_base[r] + uint(lane) + 32u] = denom[r] > 0.0f ? acc1[r] / denom[r] : 0.0f; } }\n"
@@ -15578,10 +15603,14 @@ static NSString *termite_metal_shader_source(void) {
            "    const float best = simd_max(local_best); threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float denom;\n"
            "    if (Parallel) {\n"
+// tile-codegen:begin attention.online_phases.16 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "    float partial = 0.0f; for (uint ki = uint(lane); ki < p.seq_len; ki += 32u) { float weight = exp(scores[ki] - best); scores[ki] = weight; partial += weight; }\n"
+// tile-codegen:end attention.online_phases.16 family
            "    denom = simd_sum(partial); threadgroup_barrier(mem_flags::mem_threadgroup); \n"
            "    } else {\n"
+// tile-codegen:begin attention.online_phases.17 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "    if (lane == 0u) { float denom = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { const float weight = exp(scores[ki] - best); scores[ki] = weight; denom += weight; } scores[p.seq_len] = denom; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+// tile-codegen:end attention.online_phases.17 family
            "    denom = scores[p.seq_len]; \n"
            "    }\n"
            "    float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { const uint v_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * 32u : (bh * p.seq_len + ki) * 32u; accum += scores[ki] * v[v_base + uint(lane)]; } output[q_base + uint(lane)] = denom > 0.0f ? accum / denom : 0.0f;\n"
@@ -17037,7 +17066,9 @@ static NSString *termite_metal_shader_source(void) {
            ANTFLY_MSL_DENSE_CAUSAL_SCORE("ss[j * 32u + kk]")
            "            float m_old; float m_new; float corr; float row_sum;\n"
            "            antfly_attention_online_row32(sc, sM, j, sp, j * 32u + kk, m_old, m_new, corr, row_sum);\n"
+// tile-codegen:begin attention.online_phases.18 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "            if (lane == 0u) { uint rb = j >> 3u; uint jr = j & 7u; sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; sdiag[rb * 64u + jr * 8u + jr] = corr; }\n"
+// tile-codegen:end attention.online_phases.18 family
            "        }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            ANTFLY_MSL_DENSE_Q16_RESCALE("sdiag + rb * 64u")

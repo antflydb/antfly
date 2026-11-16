@@ -46,6 +46,7 @@ pub const paths = [_][]const u8{
     "src/tile/families.zig",
     "src/tile/families/native.zig",
     "src/tile/families/native/attention_programs.zig",
+    "src/tile/families/native/attention_shared_phases.zig",
     "src/tile/families/native/audio_bindings.zig",
     "src/tile/families/native/convolution_bindings.zig",
     "src/tile/families/native/cuda/attention_direct.cu",

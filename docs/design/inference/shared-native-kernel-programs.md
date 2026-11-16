@@ -183,40 +183,166 @@ complete merely because a shared primitive exists.
   native contraction/valid-tail policies, index widths and bias order explicit.
   Matrix convolution reuses stencil coordinates while retaining MMA staging.
 
+- [x] Route the remaining matching CUDA projection/include trees and Metal
+  attention/training trees through the same statistics program. Preserve
+  caller-owned publication barriers, bounded planes and explicit RN addition.
+- [x] Generate segmented, split, SIMD/MMA and cooperative-matrix online math
+  from the common attention expressions: 34 more Metal expressions and three
+  CUDA expressions. Reuse the existing CUDA visible-window phase and shared
+  weighted-output equation. Native schedule shells are relocated without
+  counting that relocation as algorithm reduction.
+- [x] Remove the duplicated batched argmax reduction by calling its existing
+  shared helper; preserve its tie, empty-lane, suppression and nonfinite rules.
+- [x] Split BF16 shared-tree and warp-finish kernels into static entrypoints,
+  rather than combining their register allocations in a runtime branch. The
+  loader and production launchers consume the new operation-named exports.
+  Admit the optimized schedule only on physically qualified GB10; other
+  devices retain the original entrypoints and register contract.
+
 ### Qualification and retained findings
 
-The expanded batch passed 67 selected inference tests with real EG2 image,
-GLiNER and Whisper fixtures and no skips. The standalone architecture FFT
-module has a separate qualification target; a main-suite filter does not include
-that module. Separate CPU GRU tests preserve exact
-results; paired timing controls cover widths 1, 33, 768 and 2560. Local Metal
-qualification covers both fast and safe math, F32/F16/BF16 projections, direct
-convolution, FFT/log-mel, GRU, transpose and windows. Glowworm qualification uses
-frozen-versus-generated CUDA kernels and AA/AB/BA shared-GPU controls; a full
-CUDA-enabled host test binary also compiles successfully.
+The common-program tests pass, including the admission contract that preserves
+A100/L4 baselines. Ownership verification checks emitted regions/files, actual
+shared-source fingerprints and include closure. The direct annotations cover
+116 of 643 Tile regions; this is provenance at the annotated region, not a
+percentage of serving kernels or a transitive call-graph coverage metric.
+Unclassified regions are not evidence of dead code or duplicated algorithms.
 
-An initial generic Metal window decomposition regressed latency about 11%.
-Restore the qualified early exit and batched quotient/remainder decomposition
-as a static schedule within the common program. This repaired schedule passes
-the paired median/p95 gates. Keep the failed prototype results in qualification
-receipts; do not replace its schedule with the CUDA decomposition. The CUDA
-pack schedule retains parity and reduces register use from 24 to 22.
+CPU qualification includes 67 selected inference tests with real EG2 image,
+GLiNER and Whisper fixtures, with no skips. The standalone FFT module separately
+passes its independent DFT/tail/silence test; a main-suite filter does not import
+that module. FFT paired timing passes all 18 controls/comparisons. Q4-K/Q5-K
+header recipes pass independent GGUF decoding tests and all 18 paired timing
+comparisons; the isolated header microbenchmark improves approximately 5–14%.
+These measurements are not full-model speedup claims.
 
-These are operation and affected-path qualifications, not a claim that every
-top-tier model has a new full-model performance result or that all remaining
-native algorithms have been migrated. The inventory currently annotates 37 of
-599 tile regions; unclassified does not mean dead code or prove duplication.
-Large retained owners still requiring audit include split attention, nucleus
-sampling and K-quant programs. Some already share native specialization
-templates, which must not be counted as new cross-backend algorithm sharing.
+The follow-up CPU block-dot migration removes seven independent Q4_0/Q4_1,
+Q5_0/Q5_1 and Q8_0/Q8_1/Q8_K arithmetic bodies. Their serving adapters now
+lower the existing quantization recipe, also used by CUDA/Metal decoding,
+through two CPU reduction families. Centered formats retain deferred scaling;
+affine formats retain scale/minimum on each product; Q8 retains its vector
+accumulator and runtime 256-value loop. Contiguous byte components lower to
+vector loads. Explicit Q4_0 unrolling preserves its qualified compiler schedule;
+other low-bit formats retain their native loop schedule. The frozen comparison
+retains failed scalar-gather and unrolling prototypes. This is common packed
+semantics and fewer independently authored arithmetic bodies, not a new
+whole-model acceleration or a large total source-size reduction.
+Qualification covers 72 selected serving-path tests without skips, independent
+GGUF/F64-reference dots at widths 4/8/16, and 63 AA/AB/BA codelet timing gates
+on local Apple Silicon. All median gates pass against frozen routines; Q5
+codelets improve approximately 7–19%, while Q4/Q8 retain near-baseline latency.
+These timings do not qualify physical x86 CPU performance.
 
-- [ ] Row/statistics batch fully migrated and qualified.
-- [ ] Layout/storage batch fully migrated and qualified.
-- [ ] Projection batch fully migrated and qualified.
-- [ ] Attention batch fully migrated and qualified.
-- [ ] Audio/convolution batch fully migrated and qualified.
-- [ ] Launch contracts, ownership inventory and dead-code cleanup complete.
+The next CPU batch shares five raw K-quant dot bodies and nine prepared integer
+staging paths through those same recipes, including removal of the private Q4
+value-unpack helper. The Q6×Q8 raw integer-dot routine retains its native
+schedule and stored Q8 subblock-sum correction: the shared extraction prototype
+was bitwise correct but consistently 2–4% slower, so it was not admitted.
+SIMD lowering
+uses conservative unsigned bounds to retain byte shifts/masks, and keeps the
+native subblock and offset induction variables explicit. Uniform scale/minimum
+expressions stay scalar. Q3 retains integer scale-header staging and Q4 retains
+paired low/high-half traversal; flattening either schedule regressed the first
+prototype. The shared decoder uses aligned byte lowering while Q5_1 retains
+its qualified wide-integer decode schedule. These static choices belong to
+operation/format schedules, not model adapters.
+Qualification passes independent aligned/unaligned recipe and F64-reference
+checks, 102 selected inference tests with no skips, and 234 retained AA/AB/BA
+timing gates. Nine prepared-block transforms improve 2.5–7.8× locally; several
+format decoders improve approximately 5–18%. The five raw K-quant float dots
+remain near baseline. Frozen bytes and guard regions match. The Q6×Q8 rejected
+prototype is recorded separately and excluded from retained-path totals. These
+are local CPU codelet results, not physical x86 or full-model speedup claims.
 
-The existing native source families remain valid production schedules throughout
-the migration. Partial progress must identify the exact migrated operations and
-remaining bodies rather than describe all kernels as generated from shared IR.
+K-quant prepared headers also share one staged serializer. It derives factors,
+integer codes and centering from the existing recipes, preserving Q3 integer
+staging, contiguous little-endian F32 planes and Q6's scales-only header. This
+removes the five private format writers and the unused Q4/Q5 scratch arguments.
+The reference test reconstructs all 256 weights against independent GGUF
+outputs, including signed, zero and subnormal scales. Frozen full headers and
+prepared values match byte-for-byte. Against the already optimized preceding
+batch, local preparation improves approximately 23–26% for Q2_K and 11–16% for
+Q6_K; Q3_K/Q4_K/Q5_K retain parity. Q4_K/Q5_K native instructions and operands
+are identical after normalizing only compiler basic-block namespaces.
+
+Header timing uses AA, ABBA and BAAB controls with dispatch selected outside
+the timer and the same output buffer for both arms. Earlier separate-buffer
+runs exposed destination-alignment bias even in AA and unchanged-code cases;
+those receipts remain recorded. All 45 final timing gates pass. The baseline
+pins the complete preceding recipe module so later lowering changes cannot
+silently alter the frozen writer dependency closure. These gains concern
+prepared-block construction, not model inference latency.
+
+Local Metal qualification includes both fast and safe math. The matrix and
+statistics/sampling matrix passes 338 correctness cases and 846 timing gates.
+The expanded audio/frontend/convolution matrix passes 138 cases and 414 gates;
+attention/training reductions pass 88 cases and 264 gates; batched argmax passes
+40 cases and 120 gates, including tails, ties, all suppression and nonfinite
+inputs. Earlier failed prototypes and timing controls remain in the receipts.
+
+Glowworm qualification is explicitly shared-GPU qualification. The combined
+production launcher suite passes 66 selected tests with no skips, including
+156 projection profiles and mutable-operand graph replays. Physical Racecheck
+reports zero hazards for the repaired selected-log-probability, relative-row,
+cross-attention, channel-attention and BF16 softmax cases. The CUDA 13.2
+production PTX/fatbin/sm89 artifacts are regenerated and preserve all 492
+historical exports; two new generic warp-finish exports serve the optimized
+schedule. At compute_120, 485 of the historical exports have identical PTX
+instructions/register declarations after normalizing comments, whitespace,
+private operation-symbol renames and compiler namespaces only.
+
+Two failed prototypes are material to the retained schedules:
+
+- A generic Metal window decomposition regressed latency about 11%. The shared
+  program retains Metal's qualified early exit and batched quotient/remainder
+  decomposition. Repaired median/p95 gates pass. CUDA pack retains parity and
+  reduces register use from 24 to 22.
+- Combining narrow and wide BF16 softmax schedules regressed some wide rows
+  about 8–18%, despite passing numerical checks. Separate static entrypoints
+  restore the original 23/20-register wide-row kernels without spills. All 66
+  BF16 frozen/reference cases and 198 median gates pass. Larger narrow grids
+  are 17–33% faster on GB10. Physical A100/L4 performance admission is deferred;
+  their serving path retains the original shared-tree kernel.
+
+Shared-GPU p95 outliers also occur in AA controls. Those runs establish the
+reported median results and numerical/resource checks, not unconditional tail
+latency parity. A high-magnitude Metal attention fixture produces the same
+F32-versus-F64 error in frozen and migrated kernels; its failed strict-reference
+receipt is retained separately from normalized-fixture qualification. No
+precision tolerance was widened to make that case pass.
+
+The final attention-expression migration preserves compiler-input bytes after
+removing ownership marker comments. The sole batched argmax change replaces a
+loop with an existing helper whose loop body is byte-identical; its separate
+hardware/reference/timing matrix qualifies that call.
+
+### Retained schedules and migration boundary
+
+The common algorithms listed in the six batches now have production consumers,
+shared source owners, admission/precision contracts and affected-path evidence:
+
+- [x] Row/statistics phases, normalization adapters, scratch publication and
+  sampling insertion/random-stream phases.
+- [x] Dense row/layout transforms, views, first match, transpose, windows and
+  page reconstruction.
+- [x] Ordered dots, shared projection trees, Metal register tiles, compatible
+  quantized staging/traversal and CPU packed-header recipes.
+- [x] Visibility, relative products, online state/rescaling and compatible
+  attention reduction phases, including split/cooperative-matrix callers.
+- [x] FFT, sparse mel/frontend phases and compatible direct/tiled convolution
+  and matrix-stencil addressing.
+- [x] Generated launch constants, ownership/freshness checks, operation naming
+  guards and removal of the replaced template/CPU helpers and duplicate bodies.
+
+This closes the listed common-program migration, not the existence of native
+code. Warp/SIMD/Welford schedules, coupled index/top-k and radix reductions,
+format-specific SIMD/DP4A/MMA traversal, tensor-core fragments, vendor GEMM/FFT,
+and distinct training replay/rounding algorithms remain native specializations.
+Some already shared one implementation before this work. Their retained source
+must be counted, and renames/generated copies earn no reduction credit.
+
+There is no claim here that every native instruction is generated from the
+portable conformance kernels, that total maintained code fell 20%, that each
+top-tier model has a new end-to-end benchmark, or that every model is faster
+than an external runtime. Those require separate measurements and, where
+appropriate, further compiler/schedule work rather than relabeling coverage.

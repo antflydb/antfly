@@ -29,6 +29,7 @@ The agent-facing rules are in `zig/pkg/inference/src/ops/AGENTS.md`.
 | Dense attention physical storage | `src/ops/kernel_geometry.zig` (`DenseAttentionLayout`) | Token-major 2D and head-major 3D/4D contracts; reject mixed layouts and preserve backend compatibility defaults |
 | CPU online attention rows | `linalg.attention.updateOnlineRow` | Conditional/scalar/SIMD maxima, empty-tile handling, rescale guards, vector width and statistic read/store order |
 | CPU causal query tiles | `linalg.attention.flashCausalAttentionHostInto` | Original tile sizes, packed strides, alignment and reduction order; explicit scratch and destination; ordinary empty shapes retain compatibility |
+| CPU packed quantization | `src/graph/quant_recipe.zig` (`dotBlock`, `dotKBlock`, `decode`, `unpackIntegerBlock`, `writeScaleHeader`) | Packed expressions, ordered low/high halves, centered versus affine scaling, SIMD byte bounds, subblock/offset induction, Q3 integer-header staging, Q4 paired halves, retained Q5_1 wide decode, prepared byte ABI and deferred Q6×Q8 sum correction |
 | Quantized Metal matrix phases | `ANTFLY_MSL_QUANT_SWIZZLE16`, `ANTFLY_MSL_MATRIX_4X1_*`, `ANTFLY_MSL_MATRIX_4X2_*` | Swizzle groups, scalar/vector acquisition, unroll and SIMD barriers, M32/M64 right-operand advance, output pitch and scratch publication |
 | Wide CPU segment GEMM | `native.WideSegmentAttentionGemm` | 512-query BLAS tile, explicit key reuse; model admission remains in adapters |
 | F32 attention input normalization and partial M-RoPE | `src/ops/cuda/attention_inputs_f32.zig` | Separate Q/K norms, gate extraction, coordinate axes and partial rotary width |
@@ -71,6 +72,12 @@ products/butterflies (`native_audio`). `native_convolution.Direct` specializes
 1D as a unit-width spatial axis; preserve the caller's signedness and bias
 policies. Native CUDA fixed-size FFT and sparse mel arithmetic use `native_audio` too;
 vendor FFT and distinct MMA schedules remain separate choices.
+Shared online expressions also supply segmented, split and cooperative-matrix
+programs through `attention_shared_phases`; their native source tokens remain
+unchanged. Relocating those schedule shells is not algorithm-reduction credit.
+Keep BF16 softmax's shared-tree and warp-finish register allocations in separate
+entrypoints. `native_statistics.Bf16ScoreSoftmax` owns geometry and qualified
+dispatch admission; unqualified devices retain the baseline entrypoint.
 Transpose's descriptor generates launch constants for the production host
 adapters. Window packing retains distinct batched-remainder and derived-window
 decompositions: substituting the latter regressed Metal timing in qualification.

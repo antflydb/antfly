@@ -1,3 +1,4 @@
+// tile-codegen:begin attention.scalar_online family (do not edit; run: zig build tile-kernel-codegen -- --write)
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 // Included after native route guards and live device-scalar acquisition; no include guard.
@@ -57,3 +58,4 @@
         unsigned int out_idx = (b * q_seq_len + qi) * q_hidden + head * head_dim + lane;
         dst[out_idx] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
     }
+// tile-codegen:end attention.scalar_online family

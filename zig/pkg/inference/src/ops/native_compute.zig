@@ -14175,21 +14175,19 @@ fn prepareNativeQuantizedStorageInPlace(storage: *QuantizedStorage) !void {
         const prepared = try storage.allocator.alloc(u8, block_count * prepared_block_size);
         errdefer storage.allocator.free(prepared);
 
-        var scales: [8]u8 = undefined;
-        var mins: [8]u8 = undefined;
         for (0..block_count) |block_idx| {
             const block = storage.raw_bytes[block_idx * block_size ..][0..block_size];
             const prepared_block = prepared[block_idx * prepared_block_size ..][0..prepared_block_size];
             switch (known) {
-                .Q4_K => writePreparedQ4KBlock(prepared_block, block, &scales, &mins),
-                .Q5_K => writePreparedQ5KBlock(prepared_block, block, &scales, &mins),
-                .Q6_K => writePreparedQ6KBlock(prepared_block, block),
+                .Q4_K => writePreparedKBlock(.q4_k, prepared_block, block),
+                .Q5_K => writePreparedKBlock(.q5_k, prepared_block, block),
+                .Q6_K => writePreparedKBlock(.q6_k, prepared_block, block),
                 .Q8_0 => writePreparedQ8_0Block(prepared_block, block),
                 .Q8_1 => writePreparedQ8_1Block(prepared_block, block),
                 .Q1_0 => writePreparedQ1_0Block(prepared_block, block),
                 .Q4_0, .Q4_1, .Q5_0, .Q5_1 => writePreparedLegacyBlock(known, prepared_block, block),
-                .Q2_K => writePreparedQ2KBlock(prepared_block, block),
-                .Q3_K => writePreparedQ3KBlock(prepared_block, block),
+                .Q2_K => writePreparedKBlock(.q2_k, prepared_block, block),
+                .Q3_K => writePreparedKBlock(.q3_k, prepared_block, block),
                 else => unreachable,
             }
         }
@@ -14440,84 +14438,12 @@ fn ensurePreparedKBlock(
     }
 }
 
-fn writePreparedQ4KBlock(
-    dest: []u8,
-    raw_block: []const u8,
-    scales_out: *[8]u8,
-    mins_out: *[8]u8,
-) void {
-    std.debug.assert(dest.len == prepared_q4_k_block_bytes);
-    const d = decodeFp16Le(raw_block[0], raw_block[1]);
-    const dmin = decodeFp16Le(raw_block[2], raw_block[3]);
-    @import("../graph/quant_recipe.zig").unpackScaleMinHeader(u8, raw_block[4..16], scales_out, mins_out);
-    for (0..8) |i| {
-        writeF32Le(dest[prepared_q4_k_dsc_offset + i * 4 ..][0..4], d * @as(f32, @floatFromInt(scales_out[i])));
-        writeF32Le(dest[prepared_q4_k_dmn_offset + i * 4 ..][0..4], dmin * @as(f32, @floatFromInt(mins_out[i])));
-    }
-    unpackQ4KValues(raw_block[16..144], dest[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes]);
-}
-
-fn writePreparedQ5KBlock(
-    dest: []u8,
-    raw_block: []const u8,
-    scales_out: *[8]u8,
-    mins_out: *[8]u8,
-) void {
-    std.debug.assert(dest.len == prepared_q4_k_block_bytes);
-    const d = decodeFp16Le(raw_block[0], raw_block[1]);
-    const dmin = decodeFp16Le(raw_block[2], raw_block[3]);
-    @import("../graph/quant_recipe.zig").unpackScaleMinHeader(u8, raw_block[4..16], scales_out, mins_out);
-    for (0..8) |i| {
-        writeF32Le(dest[prepared_q4_k_dsc_offset + i * 4 ..][0..4], d * @as(f32, @floatFromInt(scales_out[i])));
-        writeF32Le(dest[prepared_q4_k_dmn_offset + i * 4 ..][0..4], dmin * @as(f32, @floatFromInt(mins_out[i])));
-    }
-
-    const qh = raw_block[16..48];
-    const ql = raw_block[48..176];
-    const values = dest[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
-    for (0..8) |sub| {
-        const chunk = sub / 2;
-        const is_high = sub % 2 == 1;
-        const ql_off = chunk * 32;
-        const out_off = sub * 32;
-        const high_shift: u3 = @intCast(sub);
-        for (0..32) |i| {
-            const low = if (is_high) ql[ql_off + i] >> 4 else ql[ql_off + i] & 0x0F;
-            const high = ((qh[i] >> high_shift) & 0x01) << 4;
-            values[out_off + i] = low | high;
-        }
-    }
-}
-
-fn writePreparedQ6KBlock(dest: []u8, raw_block: []const u8) void {
-    std.debug.assert(dest.len == prepared_q4_k_block_bytes);
-    const ql = raw_block[0..128];
-    const qh = raw_block[128..192];
-    const scales = raw_block[192..208];
-    const d = decodeFp16Le(raw_block[208], raw_block[209]);
-    for (0..16) |sub| {
-        const scale_i8: i8 = @bitCast(scales[sub]);
-        writeF32Le(dest[sub * 4 ..][0..4], d * @as(f32, @floatFromInt(scale_i8)));
-    }
-
-    const values = dest[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
-    for (0..16) |sub| {
-        const half = sub / 8;
-        const group = (sub % 8) / 2;
-        const l_base = (sub % 2) * 16;
-        const ql_off = half * 64 + (group & 1) * 32;
-        const qh_off = half * 32;
-        const qh_shift: u3 = @intCast(group * 2);
-        const nibble_shift: u3 = @intCast((group / 2) * 4);
-        const out_off = sub * 16;
-        for (0..16) |i| {
-            const l = l_base + i;
-            const low4: i32 = (ql[ql_off + l] >> nibble_shift) & 0x0F;
-            const high2: i32 = (qh[qh_off + l] >> qh_shift) & 0x03;
-            const q: i8 = @intCast((low4 | (high2 << 4)) - 32);
-            values[out_off + i] = @bitCast(q);
-        }
-    }
+fn writePreparedKBlock(comptime format: quant_matmul.Format, dest: []u8, raw_block: []const u8) void {
+    const recipe = @import("../graph/quant_recipe.zig");
+    const header_bytes = if (format == .q2_k or format == .q3_k) prepared_k16_values_offset else prepared_q4_k_header_bytes;
+    std.debug.assert(dest.len == header_bytes + prepared_q4_k_values_bytes);
+    recipe.writeScaleHeader(format, raw_block, dest[0..header_bytes]);
+    recipe.unpackIntegerBlock(format, raw_block, dest[header_bytes..]);
 }
 
 fn writePreparedQ8_0Block(dest: []u8, raw_block: []const u8) void {
@@ -14562,106 +14488,14 @@ fn writePreparedLegacyBlock(
     writeF32Le(dest[prepared_legacy_min_offset..][0..4], m);
     const values = dest[prepared_legacy_values_offset..][0..prepared_legacy_values_bytes];
     switch (kind) {
-        .Q4_0 => {
-            std.debug.assert(raw_block.len == 18);
-            const qs = raw_block[2..18];
-            for (qs, 0..) |packed_byte, i| {
-                values[i] = @bitCast(@as(i8, @intCast(@as(i32, packed_byte & 0x0F) - 8)));
-                values[16 + i] = @bitCast(@as(i8, @intCast(@as(i32, packed_byte >> 4) - 8)));
-            }
-        },
-        .Q4_1 => {
-            std.debug.assert(raw_block.len == 20);
-            const qs = raw_block[4..20];
-            for (qs, 0..) |packed_byte, i| {
-                values[i] = @intCast(packed_byte & 0x0F);
-                values[16 + i] = @intCast(packed_byte >> 4);
-            }
-        },
-        .Q5_0 => {
-            std.debug.assert(raw_block.len == 22);
-            const qh = std.mem.readInt(u32, raw_block[2..6], .little);
-            const qs = raw_block[6..22];
-            for (qs, 0..) |packed_byte, i| {
-                const lo4: i32 = packed_byte & 0x0F;
-                const hi4: i32 = packed_byte >> 4;
-                const lo_hi1: i32 = @intCast((qh >> @as(u5, @intCast(i))) & 1);
-                const hi_hi1: i32 = @intCast((qh >> @as(u5, @intCast(i + 16))) & 1);
-                values[i] = @bitCast(@as(i8, @intCast((lo4 | (lo_hi1 << 4)) - 16)));
-                values[16 + i] = @bitCast(@as(i8, @intCast((hi4 | (hi_hi1 << 4)) - 16)));
-            }
-        },
-        .Q5_1 => {
-            std.debug.assert(raw_block.len == 24);
-            const qh = std.mem.readInt(u32, raw_block[4..8], .little);
-            const qs = raw_block[8..24];
-            for (qs, 0..) |packed_byte, i| {
-                const lo4: i32 = packed_byte & 0x0F;
-                const hi4: i32 = packed_byte >> 4;
-                const lo_hi1: i32 = @intCast((qh >> @as(u5, @intCast(i))) & 1);
-                const hi_hi1: i32 = @intCast((qh >> @as(u5, @intCast(i + 16))) & 1);
-                values[i] = @intCast(lo4 | (lo_hi1 << 4));
-                values[16 + i] = @intCast(hi4 | (hi_hi1 << 4));
-            }
-        },
+        inline .Q4_0, .Q4_1, .Q5_0, .Q5_1 => |tag| @import("../graph/quant_recipe.zig").unpackIntegerBlock(switch (tag) {
+            .Q4_0 => .q4_0,
+            .Q4_1 => .q4_1,
+            .Q5_0 => .q5_0,
+            .Q5_1 => .q5_1,
+            else => unreachable,
+        }, raw_block, values),
         else => unreachable,
-    }
-}
-
-fn writePreparedQ2KBlock(dest: []u8, raw_block: []const u8) void {
-    std.debug.assert(dest.len == prepared_k16_block_bytes);
-    std.debug.assert(raw_block.len == 84);
-    const scales_raw = raw_block[0..16];
-    const d = decodeFp16Le(raw_block[16], raw_block[17]);
-    const dmin = decodeFp16Le(raw_block[18], raw_block[19]);
-    const qs = raw_block[20..84];
-    const values = dest[prepared_k16_values_offset..][0..prepared_k16_values_bytes];
-    for (0..16) |sub| {
-        const sc = @as(f32, @floatFromInt(scales_raw[sub] & 0x0F));
-        const m = @as(f32, @floatFromInt(scales_raw[sub] >> 4));
-        writeF32Le(dest[prepared_k16_dsc_offset + sub * 4 ..][0..4], d * sc);
-        writeF32Le(dest[prepared_k16_dmn_offset + sub * 4 ..][0..4], dmin * m);
-        const chunk = sub / 8;
-        const group = (sub % 8) / 2;
-        const l_base = (sub % 2) * 16;
-        const q_base = chunk * 32;
-        const shift: u3 = @intCast(group * 2);
-        for (0..16) |i| {
-            values[sub * 16 + i] = (qs[q_base + l_base + i] >> shift) & 0x03;
-        }
-    }
-}
-
-fn writePreparedQ3KBlock(dest: []u8, raw_block: []const u8) void {
-    std.debug.assert(dest.len == prepared_k16_block_bytes);
-    std.debug.assert(raw_block.len == 110);
-    const hmask = raw_block[0..32];
-    const qs = raw_block[32..96];
-    const scale_data = raw_block[96..108];
-    const d = decodeFp16Le(raw_block[108], raw_block[109]);
-    var raw_scales: [16]i32 = undefined;
-    for (0..4) |i| {
-        raw_scales[i] = @as(i32, scale_data[i] & 0x0F) | (@as(i32, scale_data[8 + i] & 0x03) << 4);
-        raw_scales[i + 4] = @as(i32, scale_data[4 + i] & 0x0F) | (@as(i32, (scale_data[8 + i] >> 2) & 0x03) << 4);
-        raw_scales[i + 8] = @as(i32, (scale_data[i] >> 4) & 0x0F) | (@as(i32, (scale_data[8 + i] >> 4) & 0x03) << 4);
-        raw_scales[i + 12] = @as(i32, (scale_data[4 + i] >> 4) & 0x0F) | (@as(i32, (scale_data[8 + i] >> 6) & 0x03) << 4);
-    }
-    const values = dest[prepared_k16_values_offset..][0..prepared_k16_values_bytes];
-    for (0..16) |sub| {
-        writeF32Le(dest[prepared_k16_dsc_offset + sub * 4 ..][0..4], d * @as(f32, @floatFromInt(raw_scales[sub] - 32)));
-        writeF32Le(dest[prepared_k16_dmn_offset + sub * 4 ..][0..4], 0.0);
-        const chunk = sub / 8;
-        const group = (sub % 8) / 2;
-        const l_base = (sub % 2) * 16;
-        const q_base = chunk * 32;
-        const shift: u3 = @intCast(group * 2);
-        const hm_bit: u3 = @intCast(chunk * 4 + group);
-        for (0..16) |i| {
-            const l = l_base + i;
-            const low2 = @as(i32, (qs[q_base + l] >> shift) & 0x03);
-            const high1 = @as(i32, (hmask[l] >> hm_bit) & 0x01);
-            values[sub * 16 + i] = @bitCast(@as(i8, @intCast(low2 + high1 * 4 - 4)));
-        }
     }
 }
 
@@ -32894,40 +32728,11 @@ fn dotI2SBlockActivationQuantized(input_block: []const i8, block: []const u8, ac
 }
 
 fn dotQ5_0Block(input_block: []const f32, block: []const u8) f32 {
-    const d = decodeFp16Le(block[0], block[1]);
-    const qh = std.mem.readInt(u32, block[2..6], .little);
-    const qs = block[6..22];
-    var acc: f32 = 0.0;
-    for (qs, 0..) |packed_byte, i| {
-        const lo4: i32 = packed_byte & 0x0F;
-        const hi1: i32 = @intCast((qh >> @as(u5, @intCast(i))) & 1);
-        acc += input_block[i] * @as(f32, @floatFromInt((lo4 | (hi1 << 4)) - 16));
-    }
-    for (qs, 0..) |packed_byte, i| {
-        const lo4: i32 = packed_byte >> 4;
-        const hi1: i32 = @intCast((qh >> @as(u5, @intCast(i + 16))) & 1);
-        acc += input_block[16 + i] * @as(f32, @floatFromInt((lo4 | (hi1 << 4)) - 16));
-    }
-    return d * acc;
+    return @import("../graph/quant_recipe.zig").dotBlock(.q5_0, VEC_LEN, input_block, block);
 }
 
 fn dotQ5_1Block(input_block: []const f32, block: []const u8) f32 {
-    const d = decodeFp16Le(block[0], block[1]);
-    const m = decodeFp16Le(block[2], block[3]);
-    const qh = std.mem.readInt(u32, block[4..8], .little);
-    const qs = block[8..24];
-    var acc: f32 = 0.0;
-    for (qs, 0..) |packed_byte, i| {
-        const lo4: i32 = packed_byte & 0x0F;
-        const hi1: i32 = @intCast((qh >> @as(u5, @intCast(i))) & 1);
-        acc += input_block[i] * (d * @as(f32, @floatFromInt(lo4 | (hi1 << 4))) + m);
-    }
-    for (qs, 0..) |packed_byte, i| {
-        const lo4: i32 = packed_byte >> 4;
-        const hi1: i32 = @intCast((qh >> @as(u5, @intCast(i + 16))) & 1);
-        acc += input_block[16 + i] * (d * @as(f32, @floatFromInt(lo4 | (hi1 << 4))) + m);
-    }
-    return acc;
+    return @import("../graph/quant_recipe.zig").dotBlock(.q5_1, VEC_LEN, input_block, block);
 }
 
 fn dotQ1_0Block(input_block: []const f32, block: []const u8) f32 {
@@ -32956,80 +32761,23 @@ fn dotQ1_0Block(input_block: []const f32, block: []const u8) f32 {
 }
 
 fn dotQ4_0Block(input_block: []const f32, block: []const u8) f32 {
-    const d = decodeFp16Le(block[0], block[1]);
-    const qs = block[2..18];
-    var acc: f32 = 0.0;
-    for (qs, 0..) |packed_byte, i| {
-        const lo = @as(f32, @floatFromInt(@as(i32, packed_byte & 0x0F) - 8));
-        acc += input_block[i] * lo;
-    }
-    for (qs, 0..) |packed_byte, i| {
-        const hi = @as(f32, @floatFromInt(@as(i32, packed_byte >> 4) - 8));
-        acc += input_block[16 + i] * hi;
-    }
-    return d * acc;
+    return @import("../graph/quant_recipe.zig").dotBlock(.q4_0, VEC_LEN, input_block, block);
 }
 
 fn dotQ4_1Block(input_block: []const f32, block: []const u8) f32 {
-    const d = decodeFp16Le(block[0], block[1]);
-    const m = decodeFp16Le(block[2], block[3]);
-    const qs = block[4..20];
-    var acc: f32 = 0.0;
-    for (qs, 0..) |packed_byte, i| {
-        const lo = @as(f32, @floatFromInt(packed_byte & 0x0F));
-        acc += input_block[i] * (d * lo + m);
-    }
-    for (qs, 0..) |packed_byte, i| {
-        const hi = @as(f32, @floatFromInt(packed_byte >> 4));
-        acc += input_block[16 + i] * (d * hi + m);
-    }
-    return acc;
+    return @import("../graph/quant_recipe.zig").dotBlock(.q4_1, VEC_LEN, input_block, block);
 }
 
 fn dotQ8_0Block(input_block: []const f32, block: []const u8) f32 {
-    const d = decodeFp16Le(block[0], block[1]);
-    const qs = block[2..34];
-    var acc: F32xN = @splat(0.0);
-    comptime var i: usize = 0;
-    inline while (i < 32) : (i += VEC_LEN) {
-        const raw: U8xN = qs[i..][0..VEC_LEN].*;
-        const qi: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw));
-        const qf: F32xN = @floatFromInt(qi);
-        const inp: F32xN = input_block[i..][0..VEC_LEN].*;
-        acc += inp * qf;
-    }
-    return d * @reduce(.Add, acc);
+    return @import("../graph/quant_recipe.zig").dotBlock(.q8_0, VEC_LEN, input_block, block);
 }
 
 fn dotQ8_1Block(input_block: []const f32, block: []const u8) f32 {
-    const d = decodeFp16Le(block[0], block[1]);
-    // block[2..4] stores d * sum(qs) for optimized dot products.
-    const qs = block[4..36];
-    var acc: F32xN = @splat(0.0);
-    comptime var i: usize = 0;
-    inline while (i < 32) : (i += VEC_LEN) {
-        const raw: U8xN = qs[i..][0..VEC_LEN].*;
-        const qi: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw));
-        const qf: F32xN = @floatFromInt(qi);
-        const inp: F32xN = input_block[i..][0..VEC_LEN].*;
-        acc += inp * qf;
-    }
-    return d * @reduce(.Add, acc);
+    return @import("../graph/quant_recipe.zig").dotBlock(.q8_1, VEC_LEN, input_block, block);
 }
 
 fn dotQ8_KBlock(input_block: []const f32, block: []const u8) f32 {
-    const d = decodeF32Le(block[0], block[1], block[2], block[3]);
-    const qs = block[4..260];
-    var acc: F32xN = @splat(0.0);
-    var i: usize = 0;
-    while (i < 256) : (i += VEC_LEN) {
-        const raw: U8xN = qs[i..][0..VEC_LEN].*;
-        const qi: I32xN = @as(@Vector(VEC_LEN, i8), @bitCast(raw));
-        const qf: F32xN = @floatFromInt(qi);
-        const inp: F32xN = input_block[i..][0..VEC_LEN].*;
-        acc += inp * qf;
-    }
-    return d * @reduce(.Add, acc);
+    return @import("../graph/quant_recipe.zig").dotBlock(.q8_k, VEC_LEN, input_block, block);
 }
 
 fn dotQ8KQ8KBlock(q8_input: []const u8, q8_weight: []const u8) f32 {
@@ -33431,155 +33179,19 @@ fn dotIQ4XSBlock(input_block: []const f32, block: []const u8) f32 {
 }
 
 fn dotQ2_KBlock(input_block: []const f32, block: []const u8) f32 {
-    const scales_raw = block[0..16];
-    const d = decodeFp16Le(block[16], block[17]);
-    const dmin = decodeFp16Le(block[18], block[19]);
-    const qs = block[20..84];
-
-    const mask_03: U8xN = @splat(0x03);
-    var acc: F32xN = @splat(0.0);
-    for (0..16) |sub| {
-        const sc = @as(f32, @floatFromInt(scales_raw[sub] & 0x0F));
-        const m = @as(f32, @floatFromInt(scales_raw[sub] >> 4));
-        const dsc: F32xN = @splat(d * sc);
-        const dmn: F32xN = @splat(dmin * m);
-        const chunk = sub / 8;
-        const group = (sub % 8) / 2;
-        const l_base = (sub % 2) * 16;
-        const q_base = chunk * 32;
-        const shift: @Vector(VEC_LEN, u3) = @splat(@as(u3, @intCast(group * 2)));
-        const input_off = sub * 16;
-
-        comptime var i: usize = 0;
-        inline while (i < 16) : (i += VEC_LEN) {
-            const raw: U8xN = qs[q_base + l_base + i ..][0..VEC_LEN].*;
-            const q: I32xN = (raw >> shift) & mask_03;
-            const inp: F32xN = input_block[input_off + i ..][0..VEC_LEN].*;
-            acc += inp * (dsc * @as(F32xN, @floatFromInt(q)) - dmn);
-        }
-    }
-    return @reduce(.Add, acc);
+    return @import("../graph/quant_recipe.zig").dotKBlock(.q2_k, VEC_LEN, input_block, block);
 }
 
 fn dotQ3_KBlock(input_block: []const f32, block: []const u8) f32 {
-    const hmask = block[0..32];
-    const qs = block[32..96];
-    const scale_data = block[96..108];
-    const d = decodeFp16Le(block[108], block[109]);
-
-    var raw_scales: [16]i32 = undefined;
-    for (0..4) |i| {
-        raw_scales[i] = @as(i32, scale_data[i] & 0x0F) | (@as(i32, scale_data[8 + i] & 0x03) << 4);
-        raw_scales[i + 4] = @as(i32, scale_data[4 + i] & 0x0F) | (@as(i32, (scale_data[8 + i] >> 2) & 0x03) << 4);
-        raw_scales[i + 8] = @as(i32, (scale_data[i] >> 4) & 0x0F) | (@as(i32, (scale_data[8 + i] >> 4) & 0x03) << 4);
-        raw_scales[i + 12] = @as(i32, (scale_data[4 + i] >> 4) & 0x0F) | (@as(i32, (scale_data[8 + i] >> 6) & 0x03) << 4);
-    }
-
-    const mask_03: U8xN = @splat(0x03);
-    const mask_01: U8xN = @splat(0x01);
-    const four: I32xN = @splat(4);
-    var acc: F32xN = @splat(0.0);
-    for (0..16) |sub| {
-        const scale: F32xN = @splat(d * @as(f32, @floatFromInt(raw_scales[sub] - 32)));
-        const chunk = sub / 8;
-        const group = (sub % 8) / 2;
-        const l_base = (sub % 2) * 16;
-        const q_base = chunk * 32;
-        const shift: @Vector(VEC_LEN, u3) = @splat(@as(u3, @intCast(group * 2)));
-        const hm_shift: @Vector(VEC_LEN, u3) = @splat(@as(u3, @intCast(chunk * 4 + group)));
-        const input_off = sub * 16;
-
-        comptime var i: usize = 0;
-        inline while (i < 16) : (i += VEC_LEN) {
-            const l = l_base + i;
-            const qs_raw: U8xN = qs[q_base + l ..][0..VEC_LEN].*;
-            const hm_raw: U8xN = hmask[l..][0..VEC_LEN].*;
-            const low2: I32xN = (qs_raw >> shift) & mask_03;
-            const high1: I32xN = (hm_raw >> hm_shift) & mask_01;
-            const q: I32xN = low2 + high1 * four - four;
-            const inp: F32xN = input_block[input_off + i ..][0..VEC_LEN].*;
-            acc += inp * (scale * @as(F32xN, @floatFromInt(q)));
-        }
-    }
-    return @reduce(.Add, acc);
+    return @import("../graph/quant_recipe.zig").dotKBlock(.q3_k, VEC_LEN, input_block, block);
 }
 
 fn dotQ5_KBlock(input_block: []const f32, block: []const u8) f32 {
-    const d = decodeFp16Le(block[0], block[1]);
-    const dmin = decodeFp16Le(block[2], block[3]);
-    const scales = block[4..16];
-    const qh = block[16..48];
-    const ql = block[48..176];
-
-    var scs: [8]f32 = undefined;
-    var mins: [8]f32 = undefined;
-    @import("../graph/quant_recipe.zig").unpackScaleMinHeader(f32, scales, &scs, &mins);
-
-    const mask_0f: U8xN = @splat(0x0F);
-    const mask_01: U8xN = @splat(0x01);
-    const sixteen: I32xN = @splat(16);
-    var acc: F32xN = @splat(0.0);
-    for (0..8) |sub| {
-        const dsc: F32xN = @splat(d * scs[sub]);
-        const dmn: F32xN = @splat(dmin * mins[sub]);
-        const chunk = sub / 2;
-        const is_high = sub % 2 == 1;
-        const ql_off = chunk * 32;
-        const hb_shift: @Vector(VEC_LEN, u3) = @splat(@as(u3, @intCast(sub)));
-        const input_off = sub * 32;
-
-        var i: usize = 0;
-        while (i < 32) : (i += VEC_LEN) {
-            const ql_raw: U8xN = ql[ql_off + i ..][0..VEC_LEN].*;
-            const qh_raw: U8xN = qh[i..][0..VEC_LEN].*;
-            const low: I32xN = if (is_high) ql_raw >> @as(@Vector(VEC_LEN, u3), @splat(4)) else ql_raw & mask_0f;
-            const high: I32xN = (qh_raw >> hb_shift) & mask_01;
-            const q: I32xN = low + high * sixteen;
-            const inp: F32xN = input_block[input_off + i ..][0..VEC_LEN].*;
-            acc += inp * (dsc * @as(F32xN, @floatFromInt(q)) - dmn);
-        }
-    }
-    return @reduce(.Add, acc);
+    return @import("../graph/quant_recipe.zig").dotKBlock(.q5_k, VEC_LEN, input_block, block);
 }
 
 fn dotQ4_KBlock(input_block: []const f32, block: []const u8) f32 {
-    const d = decodeFp16Le(block[0], block[1]);
-    const dmin = decodeFp16Le(block[2], block[3]);
-    const scales = block[4..16];
-    const qs = block[16..144];
-
-    var scs: [8]f32 = undefined;
-    var mins: [8]f32 = undefined;
-    @import("../graph/quant_recipe.zig").unpackScaleMinHeader(f32, scales, &scs, &mins);
-
-    const mask_0f: U8xN = @splat(0x0F);
-    var acc: F32xN = @splat(0.0);
-    var q_off: usize = 0;
-    for (0..4) |chunk| {
-        const sub = chunk * 2;
-        const dsc0: F32xN = @splat(d * scs[sub]);
-        const dmn0: F32xN = @splat(dmin * mins[sub]);
-        const dsc1: F32xN = @splat(d * scs[sub + 1]);
-        const dmn1: F32xN = @splat(dmin * mins[sub + 1]);
-        const input_off = chunk * 64;
-
-        var i: usize = 0;
-        while (i < 32) : (i += VEC_LEN) {
-            const raw: U8xN = qs[q_off + i ..][0..VEC_LEN].*;
-            const lo: I32xN = raw & mask_0f;
-            const inp: F32xN = input_block[input_off + i ..][0..VEC_LEN].*;
-            acc += inp * (dsc0 * @as(F32xN, @floatFromInt(lo)) - dmn0);
-        }
-        i = 0;
-        while (i < 32) : (i += VEC_LEN) {
-            const raw: U8xN = qs[q_off + i ..][0..VEC_LEN].*;
-            const hi: I32xN = raw >> @splat(4);
-            const inp: F32xN = input_block[input_off + 32 + i ..][0..VEC_LEN].*;
-            acc += inp * (dsc1 * @as(F32xN, @floatFromInt(hi)) - dmn1);
-        }
-        q_off += 32;
-    }
-    return @reduce(.Add, acc);
+    return @import("../graph/quant_recipe.zig").dotKBlock(.q4_k, VEC_LEN, input_block, block);
 }
 
 inline fn dotQ4KPreparedBlock(input_block: []const f32, prepared_block: []const u8) f32 {
@@ -34738,40 +34350,7 @@ inline fn accumulateQ6KPreparedBlock4MR2(
 }
 
 fn dotQ6_KBlock(input_block: []const f32, block: []const u8) f32 {
-    const ql = block[0..128];
-    const qh = block[128..192];
-    const scales = block[192..208];
-    const d = decodeFp16Le(block[208], block[209]);
-
-    const mask_0f: U8xN = @splat(0x0F);
-    const mask_03: U8xN = @splat(0x03);
-    const offset_32: I32xN = @splat(32);
-    var acc: F32xN = @splat(0.0);
-    for (0..16) |sub| {
-        const scale: F32xN = @splat(d * @as(f32, @floatFromInt(@as(i8, @bitCast(scales[sub])))));
-        const half = sub / 8;
-        const group = (sub % 8) / 2;
-        const l_base = (sub % 2) * 16;
-        const ql_off = half * 64 + (group & 1) * 32;
-        const qh_off = half * 32;
-        const qh_shift: @Vector(VEC_LEN, u3) = @splat(@as(u3, @intCast(group * 2)));
-        const nibble_shift: @Vector(VEC_LEN, u3) = @splat(@as(u3, @intCast((group / 2) * 4)));
-        const input_off = sub * 16;
-
-        // 16 elements in two SIMD passes of 8
-        comptime var i: usize = 0;
-        inline while (i < 16) : (i += VEC_LEN) {
-            const l = l_base + i;
-            const ql_raw: U8xN = ql[ql_off + l ..][0..VEC_LEN].*;
-            const qh_raw: U8xN = qh[qh_off + l ..][0..VEC_LEN].*;
-            const low4: I32xN = (ql_raw >> nibble_shift) & mask_0f;
-            const high2: I32xN = (qh_raw >> qh_shift) & mask_03;
-            const q: I32xN = (low4 | (high2 << @splat(4))) - offset_32;
-            const inp: F32xN = input_block[input_off + i ..][0..VEC_LEN].*;
-            acc += inp * (scale * @as(F32xN, @floatFromInt(q)));
-        }
-    }
-    return @reduce(.Add, acc);
+    return @import("../graph/quant_recipe.zig").dotKBlock(.q6_k, VEC_LEN, input_block, block);
 }
 
 fn dotQ6_KQ8_KBlock(q8_block: []const u8, q6_block: []const u8) f32 {
@@ -34817,20 +34396,6 @@ fn dotQ6_KQ8_KBlock(q8_block: []const u8, q6_block: []const u8) f32 {
         acc += (x_d * scale) * @as(f32, @floatFromInt(centered_dot));
     }
     return acc;
-}
-
-fn unpackQ4KValues(qs: []const u8, out: []u8) void {
-    std.debug.assert(qs.len == 128);
-    std.debug.assert(out.len == prepared_q4_k_values_bytes);
-    for (0..4) |chunk| {
-        const src_off = chunk * 32;
-        const dst_off = chunk * 64;
-        for (0..32) |i| {
-            const packed_byte = qs[src_off + i];
-            out[dst_off + i] = packed_byte & 0x0F;
-            out[dst_off + 32 + i] = packed_byte >> 4;
-        }
-    }
 }
 
 const PackedQuantizedMatrixMeta = struct {
@@ -45860,7 +45425,7 @@ test "prepared q6_k q8_k activation dot matches q8 dequantized input dot" {
     q6_raw[209] = 0x3C; // d = 1.0
 
     var prepared: [prepared_q4_k_block_bytes]u8 = undefined;
-    writePreparedQ6KBlock(&prepared, q6_raw);
+    writePreparedKBlock(.q6_k, &prepared, q6_raw);
 
     const expected = dotQ6_KBlock(&q8_dequant, q6_raw);
     const actual = dotQ6KPreparedQ8KBlock(q8_raw, &prepared);
