@@ -3502,3 +3502,60 @@ the full CDC source transaction contract complete: source-global admission,
 checkpoint/head anchors, root-policy activation and its rollout, retention
 obligation release, public feeds, bootstrap, destination-specific integration,
 pgoutput factory wiring and existing-client qualification remain outstanding.
+
+### Consumer-independent native root policy
+
+Private history controls now include configure_policy and inspect_policy, with
+generated internal API contracts. Configuration binds the physical namespace and
+control authority, an exact predecessor revision, a strictly newer revision and
+byte ceiling. Exact retries recover the same policy; substituted payloads or
+stale predecessors conflict. The fixed checksummed HCP1 policy record is charged
+to retained bytes. Resizing cannot undercut retained bytes plus promised credits.
+Configuration does not allocate a consumer, increment a consumer epoch, move an
+ACK or establish a bootstrap cut.
+
+A configured policy keeps native before/after capture enabled even with no
+consumer or prepared credit. Initial activation refuses existing prepared
+intents. Configured roots reject legacy BEGIN/PREPARE and pre-v3 completion
+admission/preparation, so an old unprepared transaction cannot cross activation
+and subsequently create unfenced effects. Abort remains available for preexisting
+legacy state. New consumer enrollment must match the configured policy revision;
+late enrollment uses the actual current history sequence. Capture remains on
+when the last consumer retires.
+
+Typed policy observations have a bounded HCO2 ordered receipt, preserving the
+192-byte envelope and strict checksumming/canonical validation. Existing HCO1
+receipts and consumer response shapes remain readable. Policy observations
+cannot masquerade as consumers or feed ACK/renew effects; the feed-intent
+validator explicitly refuses policy commands. Policy controls require data-Raft
+protocol 34 at admission and apply across all applying members, while previous
+controls retain protocol 30 and original v3 completion retains protocol 33.
+Existing command ordinals remain unchanged. The by-value engine command/result
+contract changed, requiring storage engine descriptor 49; opaque owner ABI 104
+is unchanged because its control boundary still carries bounded JSON bytes.
+
+Automatic table-policy provisioning/rollout, coherent bootstrap pins, native
+standalone completion, timed retention and deterministic frame commit time,
+completion obligation finalization/release, and full public-feed/source/client
+qualification are still outstanding. The current policy configures the byte
+ceiling and continuous capture; it does not implement the entire retention or
+bootstrap lifecycle.
+
+Qualification: `root-history-policy-abi49-qualified-test.log`,
+`ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build history-resolution-owner-test history-control-entry-test history-control-apply-test -Dstorage-owner-test-filter='compiled ordered history' -j2`
+with loopback networking enabled, passed 58 cases (4 compiled-owner, 13 storage
+support, 29 control-entry, 12 Raft), with no skips, failures or leaks. The native
+case proves capture before the first consumer (first enrollment has epoch 1 and
+start 1), a before/after page after enrollment, continued capture after retirement
+(next enrollment has epoch 2 and start 3), policy receipt recovery after reopen,
+revision/idempotence conflicts, a ceiling below retained data, stale grant policy
+revision rejection, old BEGIN/PREPARE and v2 admission rejection, and positive
+owner qualification before any consumer exists. Policy receipts reject forged
+reserved bytes, zero revisions and discriminator substitution even with
+recomputed checksums. The actual Raft owner admits configure/inspect only after
+protocol 34 activation; previous protocol and feed-intent tests remain green.
+The predecessor full run passed before the ABI change; the final successful run
+rebuilt producer and consumers using engine descriptor 49. The attempted direct
+engine import in the control-only test was removed rather than weakening its
+compilation boundary. API generation completed, unrelated model-explorer output
+was restored, and format/diff checks passed.

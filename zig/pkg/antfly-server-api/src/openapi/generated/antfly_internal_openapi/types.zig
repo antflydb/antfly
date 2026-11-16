@@ -117,11 +117,13 @@ pub const NativeHistoryAcknowledge = struct {
 };
 
 pub const NativeHistoryApplied = struct {
+    policy: ?NativeHistoryPolicySnapshot = null,
     consumer: ?NativeHistoryConsumer = null,
     reclaimed_frames: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "policy", "policy", true },
         .{ "consumer", "consumer", true },
         .{ "reclaimed_frames", "reclaimed_frames", true },
     };
@@ -136,6 +138,10 @@ pub const NativeHistoryApplied = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.policy) |value| {
+            try jw.objectField("policy");
+            try jw.write(value);
+        }
         if (self.consumer) |value| {
             try jw.objectField("consumer");
             try jw.write(value);
@@ -489,6 +495,26 @@ pub const NativeHistoryPageRead = struct {
 pub const NativeHistoryPageRequest = struct {
     version: i64,
     request: NativeHistoryPageRead,
+};
+
+/// Install or replace root capture policy by exact predecessor revision. Revision must advance; matching exact retries are idempotent. Limit includes retained data and outstanding credits. Initial activation is fenced against prepared legacy effects; it does not enroll a consumer, invent an ACK or establish a bootstrap cut. Requires data-Raft policy protocol activation.
+pub const NativeHistoryPolicyConfigure = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+    previous_revision: u64,
+    revision: u64,
+    limit: u64,
+};
+
+pub const NativeHistoryPolicyScope = struct {
+    namespace: NativeHistoryNamespace,
+    authority: NativeHistoryDigest,
+};
+
+/// Root-scoped retained capture policy, not a consumer lease or source acknowledgement.
+pub const NativeHistoryPolicySnapshot = struct {
+    revision: u64,
+    limit: u64,
 };
 
 pub const NativeHistoryPosition = struct {

@@ -52,6 +52,7 @@ pub fn resolve(a: std.mem.Allocator, state: control.State, namespace: control.Na
         if (current.policy_revision != validated.policy_revision or current.expires_at_seconds > state.expires_at) return error.ChangefeedConflict;
         if (item.consumer_epoch != 0 and (current.epoch != item.consumer_epoch or current.start != item.start or current.acknowledged < item.reclaimed_through or current.acknowledged > item.acknowledged.sequence)) return error.ChangefeedConflict;
         switch (command) {
+            .configure_policy, .inspect_policy => return error.ChangefeedCapabilityUnsupported,
             .enroll => |grant| {
                 if (observed.active.limit != grant.limit) return error.ChangefeedConflict;
                 if (item.consumer_epoch == 0 and current.acknowledged != current.start) return error.ChangefeedConflict;

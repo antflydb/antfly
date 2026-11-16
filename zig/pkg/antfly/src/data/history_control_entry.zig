@@ -20,6 +20,12 @@ const std = @import("std");
 const descriptor = @import("../storage/kernel_owner_descriptor.zig");
 const control = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer;
 pub const required_protocol_version = @import("../common/data_raft_protocol.zig").batch_history_control_protocol_version;
+pub fn requiredProtocol(command: control.Command) u16 {
+    return switch (command) {
+        .configure_policy, .inspect_policy => @import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version,
+        else => required_protocol_version,
+    };
+}
 pub const max_bytes = 16 * 1024 * 1024;
 pub const max_catalog_bytes = 1024 * 1024;
 pub const max_range_key_bytes = 64 * 1024;
@@ -32,7 +38,7 @@ pub const Entry = struct {
     history_control: struct { version: u8 = 1, command: control.Command },
 
     pub fn validate(self: Entry) !void {
-        if (self.batch != null or self.protocol != required_protocol_version or self.history_control.version != 1) return error.UnsupportedRaftBatchProtocolVersion;
+        if (self.batch != null or self.protocol != requiredProtocol(self.history_control.command) or self.history_control.version != 1) return error.UnsupportedRaftBatchProtocolVersion;
         if (self.table.len == 0 or self.table.len > 1024 or !std.unicode.utf8ValidateSlice(self.table) or std.mem.indexOfScalar(u8, self.table, 0) != null) return error.InvalidReplicatedBatch;
         const owner = self.storage_owner;
         if (owner.identity.table_id == 0 or owner.identity.shard_id == 0 or owner.identity.range_id == 0 or owner.schema_json.len > max_catalog_bytes or owner.indexes_json.len > max_catalog_bytes) return error.InvalidReplicatedBatch;
@@ -54,7 +60,7 @@ pub const Owned = struct {
     }
 };
 pub fn encode(a: std.mem.Allocator, entry: Entry, activated_protocol: u16) ![]u8 {
-    if (activated_protocol < required_protocol_version) return error.UnsupportedRaftBatchProtocolVersion;
+    if (activated_protocol < requiredProtocol(entry.history_control.command)) return error.UnsupportedRaftBatchProtocolVersion;
     try entry.validate();
     const bytes = try std.json.Stringify.valueAlloc(a, entry, .{ .emit_null_optional_fields = true });
     errdefer a.free(bytes);
@@ -193,4 +199,37 @@ test "history control entry binds bounded immutable owner data and requires acti
             try std.testing.expectEqualDeep(value, applying.history_control.value());
         }
     }.run, .{candidate});
+}
+
+test "history control entry root policy requires its complete activation floor" {
+    const a = std.testing.allocator;
+    const command: control.Command = .{ .configure_policy = .{ .namespace = @splat(1), .authority = @splat(2), .previous_revision = 0, .revision = 1, .limit = 16 * 1024 * 1024 } };
+    var entry: Entry = .{ .table = "docs", .protocol = requiredProtocol(command), .storage_owner = .{ .lsm_root_generation = 0, .identity = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .schema_json = "{}", .indexes_json = "{}" }, .history_control = .{ .command = command } };
+    try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, encode(a, entry, required_protocol_version));
+    const bytes = try encode(a, entry, requiredProtocol(command));
+    defer a.free(bytes);
+    var decoded = try decode(a, bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(entry, decoded.value());
+    entry.protocol = required_protocol_version;
+    try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, entry.validate());
+}
+
+test "history control entry policy receipts retain strict bounded canonical encoding" {
+    const ordered = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered;
+    const record: ordered.Record = .{ .namespace = @splat(1), .entry = .{ .term = 1, .index = 2 }, .command = @splat(3), .outcome = .{ .applied = .{ .policy = .{ .revision = 1, .limit = 16 * 1024 * 1024 } } } };
+    var bytes = try record.encode();
+    try std.testing.expectEqualStrings("HCO2", bytes[0..4]);
+    try std.testing.expectEqualDeep(record, try ordered.Record.decode(&bytes));
+    bytes[152] = 1;
+    std.crypto.hash.sha2.Sha256.hash(bytes[0..160], bytes[160..192], .{});
+    try std.testing.expectError(error.HistoryCorrupt, ordered.Record.decode(&bytes));
+    bytes = try record.encode();
+    @memset(bytes[136..144], 0);
+    std.crypto.hash.sha2.Sha256.hash(bytes[0..160], bytes[160..192], .{});
+    try std.testing.expectError(error.HistoryCorrupt, ordered.Record.decode(&bytes));
+    bytes = try record.encode();
+    @memcpy(bytes[0..4], "HCO1");
+    std.crypto.hash.sha2.Sha256.hash(bytes[0..160], bytes[160..192], .{});
+    try std.testing.expectError(error.HistoryCorrupt, ordered.Record.decode(&bytes));
 }

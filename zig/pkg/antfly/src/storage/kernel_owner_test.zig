@@ -5197,3 +5197,107 @@ test "compiled ordered history completion scheduling crosses the native maintena
     try std.testing.expectEqual(plan.admission.digest(), recorder.digest);
     try std.testing.expectEqual(abi.TxnStatus.pending, try owner.transactionStatus("docs", id));
 }
+
+test "compiled ordered history root policy captures without consumers and fences legacy admission" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const source = local.api_local_table_writes.table_write_source;
+    const control = source.history_consumer;
+    const Fixture = struct {
+        fn command(alloc: std.mem.Allocator, owner: *client.Owner, index: *u64, value: control.Command) !source.history_ordered.Outcome {
+            const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+            defer alloc.free(bytes);
+            index.* += 1;
+            var applied = try owner.orderedHistoryControlJson("docs", bytes, 1, index.*);
+            applied.deinit();
+            return owner.orderedHistoryOutcome(alloc, "docs", .{ .command = value, .entry = .{ .term = 1, .index = index.* }, .minimum_applied_index = index.* });
+        }
+        fn batch(alloc: std.mem.Allocator, owner: *client.Owner, index: *u64, value: local.storage_db_selected_root.db.types.BatchRequest) !void {
+            const bytes = try local.api_internal_batch.encodeBatchRequest(alloc, value);
+            defer alloc.free(bytes);
+            index.* += 1;
+            var applied = try applyRaftEntryEventually(owner, "docs", bytes, 1, index.*);
+            applied.deinit();
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const options: abi.OpenRequest = .{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 11, .identity_range_id = 13, .schema_json = .fromSlice("{}"), .indexes_json = .fromSlice("{}") };
+    var owner = try client.Owner.open(options);
+    var live = true;
+    defer if (live) owner.deinit();
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 11, .big);
+    std.mem.writeInt(u64, namespace[16..24], 13, .big);
+    var index: u64 = 0;
+    const first: local.storage_committed_history.Policy = .{ .namespace = namespace, .authority = @splat(1), .previous_revision = 0, .revision = 1, .limit = 16 * 1024 * 1024 };
+    try Fixture.batch(a, &owner, &index, .{ .transaction = .{ .begin = .{ .txn_id = @splat(41), .begin_timestamp = 10, .created_at_ns = 11, .topology_epoch = 1, .participants = &.{"table2:00000004:docs:7001"} } } });
+    try Fixture.batch(a, &owner, &index, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(41), .topology_epoch = 1 } }, .writes = &.{.{ .key = "legacy", .value = "{\"v\":1}" }} });
+    try std.testing.expectEqual(.prepared_transactions, (try Fixture.command(a, &owner, &index, .{ .configure_policy = first })).rejected);
+    try Fixture.batch(a, &owner, &index, .{ .transaction = .{ .resolve = .{ .txn_id = @splat(41), .status = .aborted, .commit_version = 20 } } });
+    try Fixture.batch(a, &owner, &index, .{ .transaction = .{ .begin = .{ .txn_id = @splat(42), .begin_timestamp = 30, .created_at_ns = 31, .topology_epoch = 1, .participants = &.{"table2:00000004:docs:7001"} } } });
+    const configured = try Fixture.command(a, &owner, &index, .{ .configure_policy = first });
+    try std.testing.expect(configured.applied.consumer == null);
+    try std.testing.expectEqual(@as(u64, 1), configured.applied.policy.?.revision);
+    try std.testing.expectEqual(first.limit, configured.applied.policy.?.limit);
+    const routed_owner: source.history_resolution_wire.completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(3), .root_generation = 0, .group_id = 7001, .topology_epoch = 1 };
+    const qualified = try owner.historyAdmission(a, "docs", .{ .owner = routed_owner });
+    try std.testing.expectEqual(first.limit, qualified.retention_limit_bytes);
+    const completion = source.history_resolution_wire.completion;
+    const legacy_admission: completion.Admission = .{ .version = 2, .transaction_id = @splat(44), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = routed_owner.digest(), .participants = &.{.{ .namespace = namespace, .owner_fence = routed_owner.digest(), .roles = completion.Roles.effects, .input_digest = @splat(8), .locator = "table2:00000004:docs:7001" }} };
+    const legacy_plan = try completion.encodeAdmission(a, legacy_admission);
+    defer a.free(legacy_plan);
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, Fixture.batch(a, &owner, &index, .{ .transaction = .{ .begin = .{ .txn_id = legacy_admission.transaction_id, .begin_timestamp = 60, .created_at_ns = 61, .topology_epoch = 1, .participants = &.{"table2:00000004:docs:7001"}, .retain_terminal = true, .completion_owner = routed_owner, .completion_admission = legacy_plan } } }));
+
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, Fixture.batch(a, &owner, &index, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(42), .topology_epoch = 1 } }, .writes = &.{.{ .key = "legacy", .value = "{\"v\":2}" }} }));
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, Fixture.batch(a, &owner, &index, .{ .transaction = .{ .begin = .{ .txn_id = @splat(43), .begin_timestamp = 40, .created_at_ns = 41, .topology_epoch = 1, .participants = &.{"table2:00000004:docs:7001"} } } }));
+    try Fixture.batch(a, &owner, &index, .{ .transaction = .{ .resolve = .{ .txn_id = @splat(42), .status = .aborted, .commit_version = 50 } } });
+    const large = try a.alloc(u8, 4 * 1024 * 1024);
+    defer a.free(large);
+    @memset(large, 'x');
+    const image = try std.fmt.allocPrint(a, "{{\"blob\":\"{s}\"}}", .{large});
+    defer a.free(image);
+    try Fixture.batch(a, &owner, &index, .{ .writes = &.{.{ .key = "row", .value = image }} });
+    try std.testing.expectEqualDeep(configured, try Fixture.command(a, &owner, &index, .{ .configure_policy = first }));
+    var changed = first;
+    changed.limit += 1;
+    try std.testing.expectEqual(.checkpoint_conflict, (try Fixture.command(a, &owner, &index, .{ .configure_policy = changed })).rejected);
+    changed = first;
+    changed.previous_revision = 1;
+    changed.revision = 2;
+    changed.limit = 4 * 1024 * 1024;
+    try std.testing.expectEqual(.full, (try Fixture.command(a, &owner, &index, .{ .configure_policy = changed })).rejected);
+    changed.limit = 2 * first.limit;
+    const upgraded = try Fixture.command(a, &owner, &index, .{ .configure_policy = changed });
+    const upgrade_index = index;
+    try std.testing.expectEqual(@as(u64, 2), upgraded.applied.policy.?.revision);
+    owner.deinit();
+    live = false;
+    owner = try client.Owner.open(options);
+    live = true;
+    try std.testing.expectEqualDeep(upgraded, try owner.orderedHistoryOutcome(a, "docs", .{ .command = .{ .configure_policy = changed }, .entry = .{ .term = 1, .index = upgrade_index }, .minimum_applied_index = upgrade_index }));
+    try std.testing.expectEqualDeep(upgraded, try Fixture.command(a, &owner, &index, .{ .inspect_policy = .{ .namespace = namespace, .authority = first.authority } }));
+    var grant: control.Grant = .{ .namespace = namespace, .authority = first.authority, .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 2, .limit = changed.limit };
+    var stale_grant = grant;
+    stale_grant.policy_revision = 1;
+    try std.testing.expectEqual(.consumer_conflict, (try Fixture.command(a, &owner, &index, .{ .enroll = stale_grant })).rejected);
+    const enrolled = (try Fixture.command(a, &owner, &index, .{ .enroll = grant })).applied.consumer.?;
+    try std.testing.expectEqual(@as(u64, 1), enrolled.epoch);
+    try std.testing.expectEqual(@as(u64, 1), enrolled.start);
+    try Fixture.batch(a, &owner, &index, .{ .writes = &.{.{ .key = "row", .value = "{\"v\":2}" }} });
+    var page = try owner.orderedHistoryPage(a, "docs", .{ .reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = enrolled.epoch, .grant = grant.sequence, .definition = grant.definition }, .after = .{ .sequence = 1 }, .now_seconds = 100, .max_bytes = 16 * 1024 * 1024 }, index);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.events.len);
+    try std.testing.expect(std.mem.eql(u8, image, page.events[0].before.?));
+    try std.testing.expectEqualStrings("{\"v\":2}", page.events[0].after.?);
+    _ = try Fixture.command(a, &owner, &index, .{ .retire = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .definition = grant.definition, .grant = 1, .sequence = 2 } });
+    try Fixture.batch(a, &owner, &index, .{ .writes = &.{.{ .key = "row", .value = "{\"v\":3}" }} });
+    grant.sequence = 3;
+    grant.consumer = @splat(4);
+    const reenrolled = (try Fixture.command(a, &owner, &index, .{ .enroll = grant })).applied.consumer.?;
+    try std.testing.expectEqual(@as(u64, 2), reenrolled.epoch);
+    try std.testing.expectEqual(@as(u64, 3), reenrolled.start);
+}

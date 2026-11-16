@@ -69,6 +69,17 @@ pub const Response = struct {
                 .renew => |value| if (result.consumer.?.expires_at_seconds < value.next) return error.InvalidHistoryControlWire,
                 else => {},
             }
+            switch (request.command) {
+                .configure_policy => |value| {
+                    const policy = result.policy orelse return error.InvalidHistoryControlWire;
+                    if (policy.revision != value.revision or policy.limit != value.limit) return error.InvalidHistoryControlWire;
+                },
+                .inspect_policy => {
+                    const policy = result.policy orelse return error.InvalidHistoryControlWire;
+                    if (policy.revision == 0 or policy.limit == 0) return error.InvalidHistoryControlWire;
+                },
+                else => if (result.policy != null) return error.InvalidHistoryControlWire,
+            }
             const maximum: u8 = switch (request.command) {
                 .collect => |value| value.max_frames,
                 .reclaim => |value| value.max_frames,

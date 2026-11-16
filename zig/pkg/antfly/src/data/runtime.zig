@@ -2035,7 +2035,7 @@ const RaftTableApplyStateMachine = struct {
             error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
             else => return err,
         };
-        if (floor < @import("history_control_entry.zig").required_protocol_version) return error.UnsupportedBatchProtocolVersion;
+        if (floor < @import("history_control_entry.zig").requiredProtocol(control.history_control.command)) return error.UnsupportedBatchProtocolVersion;
         const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
         const outcome = owner.applyPreparedOrderedHistoryControlGroupLocalAtRaftEntry(self.alloc, group_id, control.table, control.storage_owner, control.history_control.command, term, index) catch |err| switch (err) {
             error.WriterLocked, error.StorageBusy, error.ResourceBudgetExceeded, error.StorageOwnerAdmissionPending, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
@@ -13724,7 +13724,7 @@ pub const DataServer = struct {
         const context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation };
         const deadline = fence.admission_deadline_ns.?;
         const group = fence.route.group_id;
-        const required = @import("history_control_entry.zig").required_protocol_version;
+        const required = @import("history_control_entry.zig").requiredProtocol(command);
         // Create cache ownership atomically with the hosted-group check, so
         // retirement cannot clean the group just before a stale insertion.
         const activation = blk: {
@@ -13765,7 +13765,7 @@ pub const DataServer = struct {
         defer descriptor.deinit(alloc);
         const expected_identity = fence.route.identity_namespace;
         if (descriptor.identity.table_id != expected_identity.table_id or descriptor.identity.shard_id != expected_identity.shard_id or descriptor.identity.range_id != expected_identity.range_id) return error.HistoryResynchronizationRequired;
-        const control: @import("history_control_entry.zig").Entry = .{ .table = table_name, .storage_owner = descriptor.view(), .history_control = .{ .command = command } };
+        const control: @import("history_control_entry.zig").Entry = .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .history_control = .{ .command = command } };
         const encoded = try @import("history_control_entry.zig").encode(alloc, control, required);
         defer alloc.free(encoded);
         const durable = try self.durableDataRaftBatchProtocolVersion(group);
@@ -44644,6 +44644,14 @@ fn consumerTests() type {
             for ([_]antfly.db.types.SyncLevel{ .propose, .full_text, .enrichments, .full_index }) |level| {
                 try NormalCompletion.run(a, server, "{\"v\":7}", level);
             }
+
+            const policy_limit = @import("antfly_local_sources").storage_committed_history.default_limit;
+            const policy_applied = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .configure_policy = .{ .namespace = namespace, .authority = ref.authority, .previous_revision = 0, .revision = 1, .limit = policy_limit } });
+            try std.testing.expectEqual(@as(u64, 1), policy_applied.outcome.?.applied.policy.?.revision);
+            try std.testing.expect(policy_applied.outcome.?.applied.consumer == null);
+            const policy_observed = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect_policy = .{ .namespace = namespace, .authority = ref.authority } });
+            try std.testing.expectEqualDeep(policy_applied.outcome.?.applied.policy, policy_observed.outcome.?.applied.policy);
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
         }
 
         test "data raft ordered history proposal authority fences term membership and missing owners" {
@@ -44716,7 +44724,7 @@ fn consumerTests() type {
         }
 
         test "data raft ordered history protocol preflight distinguishes incompatible and unavailable peers" {
-            inline for (.{ @import("history_control_entry.zig").required_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version }) |required| {
+            inline for (.{ @import("history_control_entry.zig").required_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version, @import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version }) |required| {
                 const a = std.testing.allocator;
                 const Fake = struct {
                     versions: [3]u16 = .{ required, required - 1, required },

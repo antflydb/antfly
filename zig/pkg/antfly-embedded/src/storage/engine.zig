@@ -576,8 +576,12 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     };
     return &Holder.fields;
 }
+/// Version 49 changes the by-value history command/result contract with root
+/// policy variants and typed policy observations. Older engines must not be
+/// called with the new union tags or enlarged result layout.
+pub const descriptor_version: u32 = 49;
 pub const Descriptor = extern struct {
-    version: u32 = 48,
+    version: u32 = descriptor_version,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -753,7 +757,7 @@ pub fn descriptorForValidation() *const Descriptor {
     return antfly_storage_engine_get_descriptor_v29();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 48 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != descriptor_version or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or

@@ -64,7 +64,7 @@ pub const Record = struct {
     pub fn encode(self: Record) ![encoded_size]u8 {
         if (self.entry.term == 0 or self.entry.index == 0 or std.mem.allEqual(u8, &self.namespace, 0) or std.mem.allEqual(u8, &self.command, 0)) return error.HistoryCorrupt;
         var bytes: [encoded_size]u8 = @splat(0);
-        @memcpy(bytes[0..4], "HCO1");
+        @memcpy(bytes[0..4], if (self.outcome == .applied and self.outcome.applied.policy != null) "HCO2" else "HCO1");
         @memcpy(bytes[8..32], &self.namespace);
         std.mem.writeInt(u64, bytes[32..40], self.entry.term, .little);
         std.mem.writeInt(u64, bytes[40..48], self.entry.index, .little);
@@ -78,6 +78,11 @@ pub const Record = struct {
             .applied => |result| {
                 if (result.reclaimed_frames > 32) return error.HistoryCorrupt;
                 bytes[7] = result.reclaimed_frames;
+                if (result.policy) |policy| {
+                    if (result.consumer != null or result.reclaimed_frames != 0 or policy.revision == 0 or policy.limit == 0) return error.HistoryCorrupt;
+                    std.mem.writeInt(u64, bytes[136..144], policy.revision, .little);
+                    std.mem.writeInt(u64, bytes[144..152], policy.limit, .little);
+                }
                 if (result.consumer) |consumer| {
                     if (std.mem.allEqual(u8, &consumer.id, 0) or consumer.epoch == 0 or consumer.start > consumer.acknowledged or consumer.expires_at_seconds == 0 or consumer.policy_revision == 0) return error.HistoryCorrupt;
                     bytes[6] = 1;
@@ -90,7 +95,10 @@ pub const Record = struct {
         return bytes;
     }
     pub fn decode(bytes: []const u8) !Record {
-        if (bytes.len != encoded_size or !std.mem.eql(u8, bytes[0..4], "HCO1") or !std.mem.allEqual(u8, bytes[136..160], 0)) return error.HistoryCorrupt;
+        if (bytes.len != encoded_size) return error.HistoryCorrupt;
+        const policy_result = std.mem.eql(u8, bytes[0..4], "HCO2");
+        if (!policy_result and !std.mem.eql(u8, bytes[0..4], "HCO1")) return error.HistoryCorrupt;
+        if (!std.mem.allEqual(u8, bytes[if (policy_result) 152 else 136..160], 0)) return error.HistoryCorrupt;
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes[0..160], &digest, .{});
         if (!std.mem.eql(u8, &digest, bytes[160..192])) return error.HistoryCorrupt;
@@ -103,6 +111,7 @@ pub const Record = struct {
             0 => {
                 if (bytes[5] != 0 or bytes[6] > 1) return error.HistoryCorrupt;
                 var result: control.Result = .{ .reclaimed_frames = bytes[7] };
+                if (policy_result) result.policy = .{ .revision = std.mem.readInt(u64, bytes[136..144], .little), .limit = std.mem.readInt(u64, bytes[144..152], .little) };
                 if (bytes[6] == 1) {
                     var consumer: history.Consumer = .{ .id = bytes[80..96].* };
                     inline for (.{ "epoch", "start", "acknowledged", "expires_at_seconds", "policy_revision" }, 0..) |name, i| @field(consumer, name) = std.mem.readInt(u64, bytes[96 + i * 8 ..][0..8], .little);

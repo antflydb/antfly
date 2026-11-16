@@ -87,6 +87,68 @@ pub const Consumer = struct {
     expires_at_seconds: u64 = 0,
     policy_revision: u64 = 0,
 };
+pub const policy_key = "\x00\x00__committed_history__:policy";
+pub const Policy = struct {
+    namespace: frame.Namespace,
+    authority: [32]u8,
+    previous_revision: u64,
+    revision: u64,
+    limit: u64,
+    pub const encoded_size = 116;
+    pub fn validate(self: Policy) !void {
+        if (std.mem.allEqual(u8, &self.namespace, 0) or std.mem.allEqual(u8, &self.authority, 0) or self.revision <= self.previous_revision or self.limit < transaction_overhead + frame.chunk_bytes) return error.InvalidHistoryAdmission;
+    }
+    pub fn encode(self: Policy) ![encoded_size]u8 {
+        try self.validate();
+        var raw: [encoded_size]u8 = @splat(0);
+        @memcpy(raw[0..4], "HCP1");
+        @memcpy(raw[4..28], &self.namespace);
+        @memcpy(raw[28..60], &self.authority);
+        std.mem.writeInt(u64, raw[60..68], self.previous_revision, .little);
+        std.mem.writeInt(u64, raw[68..76], self.revision, .little);
+        std.mem.writeInt(u64, raw[76..84], self.limit, .little);
+        @memcpy(raw[84..116], &frame.digest(raw[0..84]));
+        return raw;
+    }
+    pub fn decode(raw: []const u8) !Policy {
+        if (raw.len != encoded_size or !std.mem.eql(u8, raw[0..4], "HCP1") or !std.mem.eql(u8, raw[84..116], &frame.digest(raw[0..84]))) return error.HistoryCorrupt;
+        const value: Policy = .{ .namespace = raw[4..28].*, .authority = raw[28..60].*, .previous_revision = std.mem.readInt(u64, raw[60..68], .little), .revision = std.mem.readInt(u64, raw[68..76], .little), .limit = std.mem.readInt(u64, raw[76..84], .little) };
+        value.validate() catch return error.HistoryCorrupt;
+        return value;
+    }
+};
+pub fn loadPolicy(txn: anytype) !?Policy {
+    return if (try optional(txn, policy_key)) |raw| try Policy.decode(raw) else null;
+}
+/// Ordered root capture activation does not allocate a consumer or move any
+/// consumer ACK. The fixed policy record itself remains charged after GC.
+pub fn configurePolicy(txn: anytype, value: Policy) !void {
+    const encoded = try value.encode();
+    const previous = try loadPolicy(txn);
+    var state = (try load(txn)) orelse State{ .namespace = value.namespace, .limit = value.limit };
+    try requireNamespace(txn, state, value.namespace);
+    if (previous) |current| {
+        if (!std.mem.eql(u8, &current.namespace, &value.namespace) or !std.mem.eql(u8, &current.authority, &value.authority)) return error.HistoryResynchronizationRequired;
+        if (current.revision == value.revision) {
+            if (!std.mem.eql(u8, &(try current.encode()), &encoded)) return error.HistoryCheckpointConflict;
+            return;
+        }
+        if (current.revision != value.previous_revision) return error.HistoryCheckpointConflict;
+    } else {
+        if (value.previous_revision != 0) return error.HistoryCheckpointConflict;
+        // Existing prepared legacy effects cannot straddle activation. Legacy
+        // BEGIN/PREPARE admission is rejected after this ordered policy exists.
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        if (try cursor.seekAtOrAfter(intents_prefix)) |entry| if (std.mem.startsWith(u8, entry.key, intents_prefix)) return error.HistoryPreparedTransactionsPresent;
+        state.retained_bytes = std.math.add(u64, state.retained_bytes, policy_key.len + Policy.encoded_size) catch return error.HistoryFull;
+    }
+    if (state.retained_bytes > value.limit or state.reserved_bytes > value.limit - state.retained_bytes) return error.HistoryFull;
+    state.limit = value.limit;
+    try save(txn, state);
+    try txn.put(policy_key, &encoded);
+}
+
 pub const State = struct {
     namespace: frame.Namespace,
     latest: u64 = 0,
@@ -184,11 +246,12 @@ pub fn admit(txn: anytype, namespace: frame.Namespace, id: [16]u8, limit: u64, e
     var state = (try load(txn)) orelse State{ .namespace = namespace, .limit = limit };
     try requireNamespace(txn, state, namespace);
     if (state.limit != limit) return error.InvalidHistoryAdmission;
+    if (try loadPolicy(txn)) |policy| if (policy.revision != policy_revision) return error.HistoryConsumerConflict;
     for (state.consumers) |consumer| if (consumer.epoch != 0 and std.mem.eql(u8, &consumer.id, &id)) {
         if (consumer.expires_at_seconds != expires or consumer.policy_revision != policy_revision) return error.HistoryConsumerConflict;
         return consumer;
     };
-    if (!state.active()) {
+    if (!state.active() and try loadPolicy(txn) == null) {
         var cursor = try txn.openCursor();
         defer cursor.close();
         if (try cursor.seekAtOrAfter(intents_prefix)) |entry| if (std.mem.startsWith(u8, entry.key, intents_prefix)) return error.HistoryPreparedTransactionsPresent;
@@ -492,7 +555,7 @@ pub const Capture = struct {
     pub fn touch(self: *Capture, a: A, txn: anytype, key: []const u8, value: ?[]const u8, cache: ?*std.atomic.Value(u8)) !void {
         if (self.staging) return;
         errdefer self.poisoned = true;
-        if (std.mem.eql(u8, key, state_key) or std.mem.eql(u8, key, consumer_authority_key)) {
+        if (std.mem.eql(u8, key, state_key) or std.mem.eql(u8, key, consumer_authority_key) or std.mem.eql(u8, key, policy_key)) {
             if (self.touched_primary or self.rows.count() != 0 or self.reservations.count() != 0 or self.completion_credits.count() != 0) return error.HistoryMixedControl;
             self.control = true;
             if (cache) |known| known.store(2, .release);
@@ -516,7 +579,10 @@ pub const Capture = struct {
                 // Consumer removal cannot discard credits already promised
                 // to a prepared transaction. Finish those resolutions even
                 // when the last public consumer has been released.
-                self.enabled = if (state) |current| current.active() or current.reserved_bytes != 0 or completion_admission or resolution_request else false;
+                const policy = try loadPolicy(txn);
+                if (policy != null and state == null) return error.HistoryCorrupt;
+                self.enabled = if (state) |current| policy != null or current.active() or current.reserved_bytes != 0 or completion_admission or resolution_request else false;
+                if (policy) |configured| if (!std.mem.eql(u8, &configured.namespace, &state.?.namespace) or configured.limit != state.?.limit) return error.HistoryCorrupt;
                 if (state) |current| {
                     try requireNamespace(txn, current, current.namespace);
                     self.namespace = current.namespace;

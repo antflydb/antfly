@@ -261,6 +261,19 @@ pub fn retire(txn: anytype, closed: Retirement) !void {
     try txn.put(key, &state.encode());
 }
 
+pub const PolicySnapshot = struct {
+    revision: u64,
+    limit: u64,
+};
+pub const PolicyScope = struct { namespace: Namespace, authority: Digest };
+pub fn inspectPolicy(txn: anytype, scope: PolicyScope) !PolicySnapshot {
+    if (!nonzero(scope.namespace) or !nonzero(scope.authority)) return error.InvalidHistoryAdmission;
+    _ = try stateFor(txn, scope.namespace, scope.authority);
+    const value = (try history.loadPolicy(txn)) orelse return error.HistoryResynchronizationRequired;
+    if (!same(value.namespace, scope.namespace) or !same(value.authority, scope.authority)) return error.HistoryResynchronizationRequired;
+    return .{ .revision = value.revision, .limit = value.limit };
+}
+
 pub const Command = union(enum) {
     enroll: Grant,
     inspect: Reference,
@@ -271,8 +284,12 @@ pub const Command = union(enum) {
     /// Owner-scoped maintenance remains possible after the final consumer is
     /// released. It never invents an ACK: the shared native floor still rules.
     collect: struct { namespace: Namespace, authority: Digest, max_frames: u8 = 1 },
+    configure_policy: history.Policy,
+    inspect_policy: PolicyScope,
     pub fn namespace(self: Command) Namespace {
         return switch (self) {
+            .configure_policy => |value| value.namespace,
+            .inspect_policy => |value| value.namespace,
             .enroll => |value| value.namespace,
             .inspect => |value| value.namespace,
             .retire => |value| value.namespace,
@@ -283,11 +300,34 @@ pub const Command = union(enum) {
         };
     }
 };
-pub const Result = struct { consumer: ?history.Consumer = null, reclaimed_frames: u8 = 0 };
+pub const Result = struct {
+    consumer: ?history.Consumer = null,
+    reclaimed_frames: u8 = 0,
+    policy: ?PolicySnapshot = null,
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("consumer");
+        try jw.write(self.consumer);
+        try jw.objectField("reclaimed_frames");
+        try jw.write(self.reclaimed_frames);
+        if (self.policy) |value| {
+            try jw.objectField("policy");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
 /// Apply inside the ordered owner's one atomic storage transaction. Errors must
 /// abort that transaction, including errors after staging an admission/release.
 pub fn apply(txn: anytype, command: Command) !Result {
     return switch (command) {
+        .configure_policy => |value| blk: {
+            const state = try stateFor(txn, value.namespace, value.authority);
+            try history.configurePolicy(txn, value);
+            try txn.put(key, &state.encode());
+            break :blk .{ .policy = try inspectPolicy(txn, .{ .namespace = value.namespace, .authority = value.authority }) };
+        },
+        .inspect_policy => |value| .{ .policy = try inspectPolicy(txn, value) },
         .enroll => |value| .{ .consumer = try enroll(txn, value) },
         .inspect => |value| .{ .consumer = try inspect(txn, value) },
         .acknowledge => |value| blk: {

@@ -567,6 +567,7 @@ pub const TxnManager = struct {
 
     fn initCompletionAdmission(self: *TxnManager, admission: completion.Admission, timestamp: u64, created_at: u64, retain_terminal: bool, coordinator: bool, extra: MutationExtraBatch) !void {
         try admission.validate();
+        if (admission.version < 3 and try self.keyExists(@import("committed_history.zig").policy_key)) return error.ChangefeedCapabilityUnsupported;
         const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
         defer self.alloc.free(namespace);
         if (namespace.len != 24 or coordinator != std.mem.eql(u8, namespace, &admission.coordinator_namespace)) return TxnError.DecisionConflict;
@@ -703,6 +704,14 @@ pub const TxnManager = struct {
         retain_terminal: bool,
         extra_batch: MutationExtraBatch,
     ) !void {
+        if (try self.keyExists(@import("committed_history.zig").policy_key)) {
+            const completion_key = makeSidecarKey(completion_admission_prefix, txn_id);
+            var qualified = try self.keyExists(&completion_key);
+            for (extra_batch.writes) |write| if (std.mem.eql(u8, write.key, &completion_key)) {
+                qualified = true;
+            };
+            if (!qualified) return error.ChangefeedCapabilityUnsupported;
+        }
         if (extra_batch.source_purpose) |purpose| if (std.mem.allEqual(u8, &purpose, 0)) return error.SourceTransactionIdentityConflict;
         const key = makeRecordKey(txn_id);
         const existing = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
@@ -815,6 +824,7 @@ pub const TxnManager = struct {
         };
         defer frozen.deinit();
         const plan = frozen.value.admission;
+        if (plan.version < 3 and try self.keyExists(@import("committed_history.zig").policy_key)) return error.ChangefeedCapabilityUnsupported;
         if (plan.version < 2) {
             if (input_digest != null or owner != null) return error.ChangefeedCapabilityUnsupported;
             return null;
@@ -855,6 +865,7 @@ pub const TxnManager = struct {
             const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
             defer self.alloc.free(namespace);
             if (namespace.len != 24) return error.InvalidTxnRecord;
+            if (frozen.value.admission.version < 3 and try self.keyExists(@import("committed_history.zig").policy_key)) return error.ChangefeedCapabilityUnsupported;
             const participant = try frozen.value.admission.member(namespace[0..24].*);
             if (frozen.value.admission.version >= 2) {
                 const supplied = extra_batch.completion_input_digest orelse return error.SourceTransactionIdentityConflict;
@@ -870,7 +881,7 @@ pub const TxnManager = struct {
             var probe = try self.store.beginProbe();
             defer probe.abort();
             try @import("committed_history.zig").requireCompletionReservation(&probe, namespace[0..24].*, frozen.value.admission);
-        } else if (extra_batch.completion_owner != null) return error.SourceTransactionIdentityConflict;
+        } else if (extra_batch.completion_owner != null) return error.SourceTransactionIdentityConflict else if (try self.keyExists(@import("committed_history.zig").policy_key)) return error.ChangefeedCapabilityUnsupported;
         const first_prepare = record.prepared_known and !record.prepared and record.intent_revision == 0;
 
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);

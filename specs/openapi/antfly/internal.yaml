@@ -1077,9 +1077,108 @@ components:
           }
         }
       }
+    NativeHistoryPolicyScope:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "namespace",
+          "authority"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/NativeHistoryNamespace"
+          },
+          "authority": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          }
+        }
+      }
+    NativeHistoryPolicySnapshot:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revision",
+          "limit"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "limit": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        },
+        "description": "Root-scoped retained capture policy, not a consumer lease or source acknowledgement."
+      }
+    NativeHistoryPolicyConfigure:
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "namespace",
+          "authority",
+          "previous_revision",
+          "revision",
+          "limit"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/NativeHistoryNamespace"
+          },
+          "authority": {
+            "$ref": "#/components/schemas/NativeHistoryDigest"
+          },
+          "previous_revision": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "revision": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          },
+          "limit": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1
+          }
+        },
+        "description": "Install or replace root capture policy by exact predecessor revision. Revision must advance; matching exact retries are idempotent. Limit includes retained data and outstanding credits. Initial activation is fenced against prepared legacy effects; it does not enroll a consumer, invent an ACK or establish a bootstrap cut. Requires data-Raft policy protocol activation."
+      }
     NativeHistoryControlCommand:
       {
         "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "configure_policy"
+            ],
+            "properties": {
+              "configure_policy": {
+                "$ref": "#/components/schemas/NativeHistoryPolicyConfigure"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "inspect_policy"
+            ],
+            "properties": {
+              "inspect_policy": {
+                "$ref": "#/components/schemas/NativeHistoryPolicyScope"
+              }
+            }
+          },
           {
             "type": "object",
             "additionalProperties": false,
@@ -1215,6 +1314,7 @@ components:
         "additionalProperties": false,
         "required": [],
         "properties": {
+          "policy": {"$ref": "#/components/schemas/NativeHistoryPolicySnapshot", "nullable": true},
           "consumer": {
             "$ref": "#/components/schemas/NativeHistoryConsumer",
             "nullable": true
