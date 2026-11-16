@@ -3981,3 +3981,52 @@ No public endpoint or capability is advertised by this change. The unchanged
 full goal still includes destination integration, public feeds, coherent
 bootstrap/retention, production pgoutput and an existing CDC client's complete
 snapshot/stream/reconnect qualification. Neither issue is complete.
+
+### Activated frozen-owner source-plan Raft dispatch
+
+Added a dedicated `source_plan` data-Raft envelope at protocol floor 36. Its
+immutable owner includes metadata incarnation/group, table binding, physical
+namespace/generation, group and topology epoch. The staging root fence is that
+owner's canonical digest. The entry also carries the physical open descriptor;
+namespace/generation mismatch, unsupported storage/restore profiles, duplicate
+fields, mixed control envelopes and unknown fields fail closed. Ordinary batch
+decoders reject these entries, including controls without row effects.
+
+Both the raw projection and serving apply machine explicitly dispatch source
+plans before accessing document batches. The projection requires a native
+delegate and the durable activation floor and creates no document mutation or
+split delta. Native apply acquires the descriptor-pinned owner without live
+metadata IO and uses the actual committed entry term/index. The apply machine
+checks the original group and publishes application progress only after native
+completion. Lost native replies retry the exact retained entry outcome; known
+rejections complete their entries without blocking subsequent valid commands.
+Superseded results remain unresolved rather than certifying an operation.
+The existing all-peer protocol preflight now covers floor 36 as well.
+
+Qualification exposed an existing opaque-boundary gap: the native projection's
+`UnsupportedBatchProtocolVersion` rejection was folded into generic kernel
+failure. Added append-only runtime status 939 and exact round-trip coverage.
+No engine layout or opaque JSON header changed (engine descriptor 51, owner ABI
+104). The maximum understood data-Raft protocol is now 36; older source
+completion/history commands retain their own original floors.
+
+`source-plan-raft-qualified-test.log` completes with exit 0 for:
+`zig build source-plan-entry-test source-plan-apply-test history-control-entry-test history-control-apply-test -j2`.
+The final run had local TCP access for the existing real-Raft/ReadIndex test;
+all reported cases passed without skips or leaks. It covers the new codec,
+wrong-group rejection, missing native delegate, older durable floor, first
+upload's lost reply, positive original-entry recovery, early-seal rejection,
+continued chunk/seal progress, exact seal cut, fencing, reclamation and expired
+late admission. All 13 existing native history apply cases and 29 history /
+ordinary batch codec cases pass. `source-plan-raft-error-test.log` passes all 16
+error-registry tests. Formatting and diff checks passed. Initial test-target
+linkage and a compile-time decoder issue were corrected before qualification;
+the sandboxed discovery run's local-bind failure was resolved by the final run
+with local socket access.
+
+Dedicated dispatch does not yet supply the production source-plan proposer,
+route-qualified HTTP read/write ports, native empty-target provisioning, worker
+adapter, or the source-global head/checkpoint participant. These remain required
+alongside destination integration, public feeds, coherent bootstrap/retention,
+production pgoutput and qualification with an existing PostgreSQL CDC client.
+The full goal and both issues remain incomplete.

@@ -1791,6 +1791,37 @@ pub const ProvisionedKernelOwnerSource = struct {
         return parsed.value;
     }
 
+    pub fn applyPreparedOrderedSourcePlanControlGroupLocalAtRaftEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        command: @import("antfly_local_sources").storage_source_plan_wire.Command,
+        raft_term: u64,
+        raft_index: u64,
+    ) !@import("antfly_local_sources").storage_source_plan_control.Outcome {
+        var lease = if (!@import("builtin").is_test or self.apply_control_started.load(.acquire))
+            try self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, false)
+        else blk: {
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+            defer alloc.free(path);
+            break :blk self.acquireDescriptorOnce(group_id, table_name, path, descriptor, .shared, .resident, .{ .historical_raft_apply = true, .prepare_graph_indexes = false }) catch |err| switch (err) {
+                error.StorageKernelOwnerTransitionRequired => return error.StorageBusy,
+                else => return err,
+            };
+        };
+        defer lease.deinit();
+        const json = try std.json.Stringify.valueAlloc(alloc, command, .{});
+        defer alloc.free(json);
+        var response = try lease.owner().orderedSourcePlanControlJson(table_name, json, raft_term, raft_index);
+        defer response.deinit();
+        if (response.bytes().len > 4096) return error.InvalidArgument;
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_source_plan_control.Outcome, alloc, response.bytes(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     const completion_decision = @import("antfly_local_sources").storage_history_decision_wire;
     const HistoryReadKind = enum { page, outcome, grant, resolution, publication, admission, decision };
     fn HistoryReadInput(comptime kind: HistoryReadKind) type {

@@ -36,10 +36,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const target = options.target;
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
+    const source_plan_apply_tests = @import("linked_tests.zig").add(b, .{ .name = "source-plan-apply-tests", .root_module = data_runtime_test_mod, .filters = &.{"data raft source plan"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("source-plan-apply-test", "Verify activated frozen source plan native dispatch and lost-result recovery").dependOn(&source_plan_apply_tests.run(b).step);
     const history_apply_tests = @import("linked_tests.zig").add(b, .{ .name = "ordered-history-apply-tests", .root_module = data_runtime_test_mod, .filters = &.{"data raft ordered history"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("history-control-apply-test", "Verify native retention completion precedes shared Raft applied publication").dependOn(&history_apply_tests.run(b).step);
     const lib_data_runtime_default_filters = [_][]const u8{
         "data raft ordered history",
+        "data raft source plan",
         "data runtime ordered artifact upload handoff",
         "data runtime hosted FK retirement",
         "pure topology control bypasses only ordinary dense repair writer preflight",
@@ -460,7 +463,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // clients through shared runtime tests. Link the same production
         // provider archives as the consumer executable; keeping its physical
         // source selection does not itself satisfy those extern symbols.
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ lib_data_runtime_tests.executable, implementation_tests, history_apply_tests.executable }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ lib_data_runtime_tests.executable, implementation_tests, history_apply_tests.executable, source_plan_apply_tests.executable }) catch @panic("OOM"),
         .run_lib_data_runtime_tests = run_lib_data_runtime_tests,
         .run_lib_data_storage_tests = run_lib_data_storage_tests,
     };

@@ -896,6 +896,7 @@ pub const Status = enum(u32) {
     source_admission_backpressure = 936,
     invalid_txn_record = 937,
     source_outcome_unresolved = 938,
+    unsupported_batch_protocol_version = 939,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

@@ -31,6 +31,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .unsupported_batch_protocol_version, .err = error.UnsupportedBatchProtocolVersion },
     .{ .status = .invalid_source_plan_wire, .err = error.InvalidSourcePlanWire },
     .{ .status = .invalid_source_admission, .err = error.InvalidSourceAdmission },
     .{ .status = .source_admission_corrupt, .err = error.SourceAdmissionCorrupt },
@@ -1302,7 +1303,7 @@ test "descriptor pressure preserves actionable identities across storage owners"
 }
 
 test "source plan failures preserve exact opaque owner identities" {
-    inline for (.{ error.InvalidSourcePlanWire, error.InvalidSourceAdmission, error.SourceAdmissionCorrupt, error.SourceReceiptExpired, error.SourcePendingWork, error.SourcePayloadConflict, error.SourceAdmissionBackpressure, error.InvalidTxnRecord, error.SourceOutcomeUnresolved }) |err| {
+    inline for (.{ error.InvalidSourcePlanWire, error.InvalidSourceAdmission, error.SourceAdmissionCorrupt, error.SourceReceiptExpired, error.SourcePendingWork, error.SourcePayloadConflict, error.SourceAdmissionBackpressure, error.InvalidTxnRecord, error.SourceOutcomeUnresolved, error.UnsupportedBatchProtocolVersion }) |err| {
         const value = statusFromError(err);
         try std.testing.expect(value != .internal);
         try std.testing.expectError(err, statusToError(value));
@@ -1312,4 +1313,5 @@ test "source plan failures preserve exact opaque owner identities" {
     }
     try std.testing.expectEqual(@as(u32, 930), @backingInt(statusFromError(error.InvalidSourcePlanWire)));
     try std.testing.expectEqual(@as(u32, 938), @backingInt(statusFromError(error.SourceOutcomeUnresolved)));
+    try std.testing.expectEqual(@as(u32, 939), @backingInt(statusFromError(error.UnsupportedBatchProtocolVersion)));
 }

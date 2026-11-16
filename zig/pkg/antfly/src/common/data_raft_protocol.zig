@@ -40,7 +40,7 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 35;
+pub const batch_protocol_version: u16 = 36;
 /// Frozen completion BEGIN and owner/input-fenced PREPARE require durable
 /// activation across every applying member before proposal or native apply.
 pub const batch_completion_admission_protocol_version: u16 = 31;
@@ -54,6 +54,8 @@ pub const batch_completion_recovery_protocol_version: u16 = 33;
 pub const batch_history_policy_protocol_version: u16 = 34;
 /// Version 35 retains whole-source purpose without copying root-local heads.
 pub const batch_source_completion_protocol_version: u16 = 35;
+/// Version 36 activates separately dispatched, frozen-owner source-plan staging.
+pub const batch_source_plan_protocol_version: u16 = 36;
 fn completionEnvelopeVersion(a: @import("std").mem.Allocator, bytes: []const u8, comptime certificate: bool) !u16 {
     const std = @import("std");
     if (bytes.len == 0 or bytes.len > 16 * 1024 * 1024) return error.InvalidTxnRecord;
