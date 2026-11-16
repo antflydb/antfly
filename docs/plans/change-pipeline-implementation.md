@@ -3644,3 +3644,24 @@ Final qualification after the shared-writer cache synchronization change:
 passed all 150 cases (13 provisioning/Raft, 137 metadata service), with no skips,
 failures or leaks. The added contention check holds the cache unavailable and
 verifies that provisioning completes through inspection without blocking.
+
+### Atomic snapshot destination admission
+
+Plain PostgreSQL snapshot rows now use `TableWriteSource.commitBatch`, matching
+streamed and routed effects. Missing atomic capability fails closed without a
+raw batch fallback. The existing snapshot-window write sync level is preserved
+to avoid waiting on enrichment while bulk ingest is paused. Both paths reject
+conflicts and all four propagation/visibility debt flags before permitting
+checkpoint progress.
+
+Qualification: `snapshot-retained-admission-regression-test.log`,
+`ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build source-transaction-test -j2`,
+passed all 45 cases (3 source effects, 12 envelope dependencies, 30 snapshot,
+stream and parser regressions), with no skips, failures or leaks. Coverage
+includes real bound destination snapshot writes, exact cutover ownership,
+resumption, round fairness, and explicit rejection of each pending-debt flag
+and missing atomic capability.
+
+This does not yet supply stable snapshot transaction identities or an atomic
+source-global checkpoint/head. A lost outcome can still replay snapshot
+upserts. Those contracts and the remaining full goal remain outstanding.

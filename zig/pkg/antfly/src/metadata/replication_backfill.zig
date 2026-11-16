@@ -999,10 +999,7 @@ pub const SnapshotBackfillRunner = struct {
                 const writes = try rowsToBatchWritesAlloc(self.alloc, result.rows, parsed.key_template);
                 defer freeBatchWritesOwned(self.alloc, writes);
 
-                try applyReplicationBatchRequired(self.alloc, self.write_source, table.name, .{
-                    .writes = writes,
-                    .sync_level = cdc_snapshot_window_sync_level,
-                });
+                try applyReplicationSnapshotRowsRequired(self.alloc, self.write_source, table.name, writes, cdc_snapshot_window_sync_level);
                 try self.checkpointWork();
             }
 
@@ -2372,15 +2369,25 @@ fn rowsToBatchWritesAlloc(
     return writes;
 }
 
-fn applyReplicationBatchRequired(
+/// Snapshot rows use the same atomic destination contract as stream effects.
+/// Hosted writers therefore qualify/provision every root and finish retained
+/// completion before the snapshot cursor can be persisted. Raw batch fallback
+/// would omit that contract, including for a snapshot spanning multiple roots.
+fn applyReplicationSnapshotRowsRequired(
     alloc: Allocator,
     write_source: table_writes_api.TableWriteSource,
     table_name: []const u8,
-    req: db_mod.types.BatchRequest,
+    writes: []const db_mod.types.BatchWrite,
+    sync_level: db_mod.types.SyncLevel,
 ) !void {
-    if ((try write_source.batch(alloc, table_name, req)) == null) {
-        return error.UnsupportedReplicationRoute;
-    }
+    try requireReplicationCommitComplete(try write_source.commitBatch(alloc, &.{.{ .table_name = table_name, .writes = writes }}, sync_level));
+}
+
+fn requireReplicationCommitComplete(outcome: ?transaction_contract.CommitOutcome) !void {
+    const committed = outcome orelse return error.UnsupportedReplicationRoute;
+    if (committed == .conflict) return error.IntentConflict;
+    const result = committed.committed;
+    if (result.propagation_pending or result.visibility_pending or result.visibility_retry_pending or result.visibility_repair_required) return error.SourceOutcomeUnresolved;
 }
 
 fn applyReplicationChange(
@@ -2422,9 +2429,7 @@ fn applyReplicationTransaction(
         .transforms = effect.transforms,
         .deletes = effect.deletes,
     };
-    const outcome = (try write_source.commitBatch(alloc, requests, sync_level)) orelse return error.UnsupportedReplicationRoute;
-    if (outcome == .conflict) return error.IntentConflict;
-    if (outcome.committed.propagation_pending or outcome.committed.visibility_pending) return error.SourceOutcomeUnresolved;
+    try requireReplicationCommitComplete(try write_source.commitBatch(alloc, requests, sync_level));
     return summary;
 }
 
@@ -9382,4 +9387,38 @@ fn execPsqlScalarAlloc(alloc: Allocator, dsn: []const u8, sql_text: []const u8) 
         },
     }
     return result.stdout;
+}
+
+test "metadata replication stream snapshot rows require complete atomic destination admission" {
+    const Fake = struct {
+        calls: usize = 0,
+        pending: @FieldType(transaction_contract.CommitOutcome, "committed") = .{ .participant_count = 2 },
+        fn raw(_: *anyopaque, _: Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnexpectedRawSnapshotFallback;
+        }
+        fn commit(ptr: *anyopaque, _: Allocator, tables: []const transaction_contract.TableCommitRequest, sync_level: db_mod.types.SyncLevel) !?transaction_contract.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(.write, sync_level);
+            try std.testing.expectEqual(@as(usize, 1), tables.len);
+            try std.testing.expectEqualStrings("docs", tables[0].table_name);
+            try std.testing.expectEqual(@as(usize, 2), tables[0].writes.len);
+            try std.testing.expectEqualStrings("one", tables[0].writes[0].key);
+            try std.testing.expectEqualStrings("{\"v\":2}", tables[0].writes[1].value);
+            return .{ .committed = self.pending };
+        }
+    };
+    const a = std.testing.allocator;
+    var fake: Fake = .{};
+    const source: table_writes_api.TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.raw, .commit_batch = Fake.commit } };
+    const writes = [_]db_mod.types.BatchWrite{ .{ .key = "one", .value = "{\"v\":1}" }, .{ .key = "two", .value = "{\"v\":2}" } };
+    try applyReplicationSnapshotRowsRequired(a, source, "docs", &writes, .write);
+    inline for (.{ "propagation_pending", "visibility_pending", "visibility_retry_pending", "visibility_repair_required" }) |field| {
+        fake.pending = .{ .participant_count = 2 };
+        @field(fake.pending, field) = true;
+        try std.testing.expectError(error.SourceOutcomeUnresolved, applyReplicationSnapshotRowsRequired(a, source, "docs", &writes, .write));
+    }
+    const unsupported: table_writes_api.TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.raw } };
+    try std.testing.expectError(error.UnsupportedReplicationRoute, applyReplicationSnapshotRowsRequired(a, unsupported, "docs", &writes, .write));
+    try std.testing.expectEqual(@as(usize, 5), fake.calls);
 }

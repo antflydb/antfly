@@ -389,8 +389,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[7],
         .filters = &.{
             "metadata replication stream",
-            "metadata replication backfill routes matching snapshot rows",
-            "metadata replication backfill applies configured update transforms",
+            "metadata replication backfill",
             "metadata snapshot backfill stops before apply",
             "replication transactions group opaque checkpoints",
             "postgres libpq parser rejects truncate",
