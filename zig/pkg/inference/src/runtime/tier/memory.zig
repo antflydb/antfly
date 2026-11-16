@@ -979,7 +979,15 @@ fn emptyAdmissionAmountsByBackend() [backend_class_count]AdmissionAmounts {
     return .{ .{}, .{} };
 }
 
+/// Optional owner reference for leases that can survive their publisher.
+/// Released only after the controller and external budget finish releasing.
+pub const LeaseLifetime = struct {
+    context: *anyopaque,
+    release: *const fn (*anyopaque) void,
+};
+
 pub const AdmissionLease = struct {
+    lifetime: ?LeaseLifetime = null,
     controller: ?*AdmissionController,
     amounts: AdmissionAmounts,
     amounts_by_backend: [backend_class_count]AdmissionAmounts,
@@ -1035,6 +1043,9 @@ pub const AdmissionLease = struct {
         self.live_reserved_bytes = 0;
         self.live_settled_bytes = 0;
         self.live_settled_epoch = 0;
+        const lifetime = self.lifetime;
+        self.lifetime = null;
+        if (lifetime) |owner| owner.release(owner.context);
     }
 };
 

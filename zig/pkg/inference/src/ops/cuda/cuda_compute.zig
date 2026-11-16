@@ -4176,6 +4176,7 @@ pub const CudaCompute = struct {
     allocator: std.mem.Allocator,
     capability_profile: ?CapabilityProfile = null,
     gemma4_raw_q4_prefill: bool = false,
+    gemma4_ple_host_lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
     gemma4_ple_host_enabled: bool = false,
     gemma4_ple_host: buffer_mod.MappedHostBuffer = .{},
     gemma4_request_replay_capacity: ?usize = null,
@@ -5529,10 +5530,6 @@ pub const CudaCompute = struct {
                 stats.temp_buffer_hits, stats.temp_buffer_misses, stats.temp_buffer_evictions, stats.temp_buffer_cached_bytes, self.temp_buffers.buffers.items.len, stats.deferred_free_forced_drains, physical.live, physical.peak, physical.limit,
             });
         }
-        self.gemma4_ple_host.clear(&self.ctx) catch |err| {
-            // Unknown completion cannot authorize freeing GPU-readable host pages.
-            std.log.err("CUDA host PLE storage could not retire: {s}", .{@errorName(err)});
-        };
         self.audio_plans.clear();
         const retained_cleanup_failed = failed: {
             self.embedding_gemma2_resize.clear(&self.ctx) catch break :failed true;
@@ -5808,6 +5805,11 @@ pub const CudaCompute = struct {
             self.cublaslt = null;
         }
         self.kernels.unload(&self.ctx);
+        // Resident views and graph executables are gone. Keep host ownership
+        // through that boundary, then transfer any uncertain drain/free.
+        self.gemma4_ple_host.retire(&self.ctx);
+        if (self.gemma4_ple_host_lease) |*lease| lease.release();
+        self.gemma4_ple_host_lease = null;
         self.ctx.releaseResources();
         if (self.ocr_retained_cache_lease) |*lease| lease.release();
         self.ocr_retained_cache_lease = null;
@@ -7020,8 +7022,7 @@ pub const CudaCompute = struct {
         const shape = try self.allocator.dupe(i64, storage.shape);
         errdefer self.allocator.free(shape);
         try self.resident_weights.ensureUnusedCapacity(self.allocator, 1);
-        var mapped = try buffer_mod.MappedHostBuffer.alloc(&self.ctx, storage.raw_bytes.len);
-        errdefer mapped.host.free(&self.ctx);
+        const mapped = try buffer_mod.MappedHostBuffer.allocAdmitted(&self.ctx, storage.raw_bytes.len, &self.gemma4_ple_host_lease);
         // Own the original quantized bytes independently of the temporary
         // native session. Existing device-token gathers need no host readback.
         @memcpy(mapped.host.bytes(), storage.raw_bytes);

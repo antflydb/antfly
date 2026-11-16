@@ -24,6 +24,11 @@ pub fn requested() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_PLE_HOST", false);
 }
 
+pub fn eligibleConfig(config: @import("../../models/gpt.zig").Config) bool {
+    return config.usesGemma4Channels() and !config.usesMoe() and !config.gemma4_mtp_assistant and
+        config.hidden_size == 2560 and config.num_hidden_layers == 42 and config.num_key_value_heads == 2;
+}
+
 pub fn eligible(name: []const u8, rows: u64, cols: u64, tensor_type: types.TensorType) bool {
     if (rows == 0 or cols != 10752) return false;
     if (!std.mem.eql(u8, name, "per_layer_token_embd.weight") and
@@ -43,13 +48,13 @@ test "Gemma4 CUDA host PLE placement excludes projections and unrelated tables" 
     try std.testing.expect(!eligible("per_layer_token_embd.weight", 262144, 10752, .{ .known = .Q4_0 }));
 }
 
-/// The load lease covers the extra pinned copy while the native GGUF mapping
-/// is still alive, and retains it after that mapping closes. Parse headers only.
+/// An independent load lease covers the pinned copy while the native GGUF
+/// mapping is alive and through physical retirement. Parse headers only.
 pub fn estimateGgufBytes(allocator: std.mem.Allocator, path: ?[]const u8) !usize {
     return estimateGgufBytesForPolicy(allocator, path, requested());
 }
 
-fn estimateGgufBytesForPolicy(allocator: std.mem.Allocator, path: ?[]const u8, enabled: bool) !usize {
+pub fn estimateGgufBytesForPolicy(allocator: std.mem.Allocator, path: ?[]const u8, enabled: bool) !usize {
     if (!enabled) return 0;
     const file_path = path orelse return 0;
     var mapped = try @import("../../util/c_file.zig").MmapRegion.init(allocator, file_path);
@@ -59,6 +64,11 @@ fn estimateGgufBytesForPolicy(allocator: std.mem.Allocator, path: ?[]const u8, e
     var parsed = try format.parseStructure(allocator, mapped.data);
     defer parsed.deinit(allocator);
     try format.validateTensorDataRanges(&parsed, mapped.data.len);
+    return estimateParsedBytes(&parsed);
+}
+
+/// The caller validates data ranges before using a parsed header for admission.
+pub fn estimateParsedBytes(parsed: *const @import("../../gguf/format.zig").File) !usize {
     var bytes: usize = 0;
     for (parsed.tensors) |tensor| {
         // GGUF orders dimensions from contiguous columns to rows.
@@ -93,4 +103,23 @@ test "Gemma4 CUDA host PLE admission sizes encoded rows and rejects truncation" 
     try std.testing.expectEqual(encoded, try estimateGgufBytesForPolicy(a, path, true));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = bytes[0 .. bytes.len - 1] });
     try std.testing.expectError(error.TruncatedTensorData, estimateGgufBytesForPolicy(a, path, true));
+}
+
+test "Gemma4 CUDA host PLE model policy excludes experts assistant and other geometries" {
+    const Config = @import("../../models/gpt.zig").Config;
+    const dense = Config{ .family = .gemma, .gemma4_channel_protocol = true, .hidden_size = 2560, .num_hidden_layers = 42, .num_key_value_heads = 2 };
+    try std.testing.expect(eligibleConfig(dense));
+    var excluded = dense;
+    excluded.gemma4_mtp_assistant = true;
+    try std.testing.expect(!eligibleConfig(excluded));
+    excluded = dense;
+    excluded.num_local_experts = 8;
+    excluded.num_experts_per_tok = 2;
+    try std.testing.expect(!eligibleConfig(excluded));
+    excluded = dense;
+    excluded.num_hidden_layers = 41;
+    try std.testing.expect(!eligibleConfig(excluded));
+    excluded = dense;
+    excluded.gemma4_channel_protocol = false;
+    try std.testing.expect(!eligibleConfig(excluded));
 }

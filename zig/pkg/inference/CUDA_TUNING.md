@@ -43,8 +43,13 @@ For the qualified E4B artifact the table occupies 2,312,110,080 bytes. Host
 placement removes that device allocation and retains the same number of
 pinned host bytes. This shifts memory between domains; it does not establish
 a reduction in total physical memory. Construction admission covers the
-source mapping and pinned copy simultaneously, then retains the host table
-with the model lease. A host budget that fits the device-only profile may
+source mapping and pinned copy simultaneously. A separate host lease owns
+that table through its physical free, including failed construction or unload.
+Failed waits/frees retain the allocation, accounting domain, driver library and
+exact primary-context reference in a process retirement queue, retried on later
+CUDA initialization or mapped-host allocation. Device construction admission
+excludes the offloaded table using the same model geometry and residency policy
+as upload. A host budget that fits the device-only profile may
 need additional capacity. Missing mapped-host driver support or allocation
 failure rejects the explicit placement rather than bypassing admission.
 
@@ -58,8 +63,13 @@ retain NVML process measurements as well on discrete GPUs.
 bitwise prefill/device-token gathers and captured fused PLE decode. The
 same-binary comparison runner `scripts/gemma4/benchmark_cuda_ple_host.py`
 alternates fresh device/host lifecycles on the portable HTTP fixtures and
-requires identical output text, reasoning and token counts. It refuses GPU
-cotenants unless explicitly requested as a diagnostic. GB10 has unified
+requires identical output text, reasoning and complete usage dictionaries. It
+validates the expected encoded host-table bytes consistently after loading and
+requires zero host-table bytes throughout the device arm. All-device NVML
+compute-process sampling runs throughout each arm at 0.2-second intervals;
+monitoring errors fail validation. Sampling cannot exclude shorter activity.
+It refuses observed GPU cotenants unless explicitly requested as a diagnostic;
+`--allow-cotenant` always prevents an uncontended claim. GB10 has unified
 memory, so its allocation counters and timings cannot qualify L4 VRAM or PCIe
 latency; do not add its PSS and NVML figures into a combined footprint claim.
 

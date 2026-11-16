@@ -53,6 +53,15 @@ test "Gemma4 CUDA host PLE preserves prefill device tokens and captured fused de
     const baseline_bytes = compute.stats.resident_weight_bytes;
     const physical_before = compute.ctx.device_allocations.snapshot().live;
     compute.gemma4_ple_host_enabled = true;
+    // Exercise malformed storage before any host owner exists, rather than
+    // accidentally testing the duplicate-owner guard instead of validation.
+    loaded.quantized_storage.?.raw_bytes = raw[0 .. raw.len - 1];
+    const invalid_key = try a.dupe(u8, key);
+    defer a.free(invalid_key);
+    try std.testing.expectError(error.InvalidShape, compute.insertWeightFromLoaded(invalid_key, &loaded));
+    try std.testing.expect(compute.gemma4_ple_host.owner == null);
+    try std.testing.expectEqual(physical_before, compute.ctx.device_allocations.snapshot().live);
+    loaded.quantized_storage.?.raw_bytes = raw;
     try compute.insertWeightFromLoaded(try a.dupe(u8, key), &loaded);
     try std.testing.expectEqual(physical_before, compute.ctx.device_allocations.snapshot().live);
     try std.testing.expectEqual(baseline_bytes, compute.stats.resident_weight_bytes);
@@ -128,8 +137,7 @@ test "Gemma4 CUDA host PLE preserves prefill device tokens and captured fused de
         defer a.free(expected_values);
         try std.testing.expectEqualSlices(f32, expected_values, values);
     }
-    // Invalid shape must fail before another mapped allocation is created.
-    loaded.quantized_storage.?.raw_bytes = raw[0 .. raw.len - 1];
+    // A second owner is rejected independently of storage validation.
     const duplicate_key = try a.dupe(u8, key);
     defer a.free(duplicate_key);
     try std.testing.expectError(error.InvalidCudaState, compute.insertWeightFromLoaded(duplicate_key, &loaded));

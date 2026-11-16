@@ -204,12 +204,14 @@ pub fn create(ctx: Context) Suite {
 
     const gemma_ple_host_tests = b.addTest(.{
         .root_module = tests.root_module,
-        .filters = &.{"Gemma4 CUDA host PLE"},
+        .filters = &.{ "Gemma4 CUDA host PLE", "admission lease releases transient", "admission resource budget mirrors" },
         .test_runner = runtime_filter_test_runner,
         .max_rss = @as(usize, if (ctx.backend.enable_cuda and ctx.target.result.cpu.arch == .aarch64) 16 else 7) * 1024 * 1024 * 1024,
     });
+    const run_gemma_ple_host_tests = ctx.addRunArtifact(gemma_ple_host_tests);
+    build_test_filters.addRuntimeControls(run_gemma_ple_host_tests, ctx.args orelse &.{});
     ctx.step("test-gemma4-ple-host", "Verify mapped PLE ownership, admission, gathers and CUDA graph replay")
-        .dependOn(&ctx.addRunArtifact(gemma_ple_host_tests).step);
+        .dependOn(&run_gemma_ple_host_tests.step);
 
     const run_tests = ctx.addRunArtifact(tests);
     const evidence_module = b.createModule(.{

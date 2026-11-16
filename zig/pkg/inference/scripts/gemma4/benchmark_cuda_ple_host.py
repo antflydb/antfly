@@ -33,6 +33,7 @@ import socket
 import statistics
 import subprocess
 import time
+import threading
 
 from benchmark_cuda_http_pair import (
     MemorySampler,
@@ -55,6 +56,109 @@ def active_compute():
         )
         .strip()
         .splitlines()
+    )
+
+
+class ContentionMonitor:
+    """Sample all GPU compute PIDs throughout an arm, excluding its process tree.
+
+    NVML polling shares the initialized memory sampler, avoiding repeated
+    nvidia-smi subprocesses during latency measurement. This is sampled evidence,
+    not a guarantee about activity shorter than the 0.2 second polling interval.
+    """
+
+    def __init__(self, query, owns_pid):
+        self.query = query
+        self.owns_pid = owns_pid
+        self.cotenants = set()
+        self.errors = []
+        self.samples = 0
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def sample(self):
+        try:
+            self.cotenants.update(pid for pid in self.query() if not self.owns_pid(pid))
+            self.samples += 1
+        except Exception as error:
+            self.errors.append(repr(error))
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            self.sample()
+            self.stop_event.wait(0.2)
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join()
+        self.sample()  # Final sample while the server and NVML are still alive.
+        return {
+            "valid": self.samples > 0 and not self.errors,
+            "samples": self.samples,
+            "cotenants": sorted(self.cotenants),
+            "errors": self.errors,
+            "method": "all-device NVML compute PIDs and process ancestry; 0.2s polling",
+        }
+
+
+def contention_monitor(process, sampler):
+    import psutil
+
+    def query():
+        return {
+            p.pid
+            for handle in sampler.handles
+            for p in sampler.nvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        }
+
+    def owns_pid(pid):
+        if pid == process.pid:
+            return True
+        try:
+            return any(
+                parent.pid == process.pid for parent in psutil.Process(pid).parents()
+            )
+        except psutil.NoSuchProcess:
+            # A departed process cannot be established as ours: fail closed.
+            return False
+
+    return ContentionMonitor(query, owns_pid)
+
+
+def validate_placement(observations, placement, expected_bytes):
+    if not observations:
+        raise RuntimeError("missing CUDA allocation ledger observations")
+    values = [o["host_ple"] for o in observations]
+    if placement == "device":
+        valid = all(value == 0 for value in values)
+    else:
+        # Startup can precede model loading. After the first populated model
+        # observation, require the expected table on every subsequent request.
+        first = next((i for i, value in enumerate(values) if value != 0), len(values))
+        valid = first < len(values) and all(
+            value == expected_bytes for value in values[first:]
+        )
+    if not valid:
+        raise RuntimeError(
+            f"inconsistent {placement} PLE placement: expected host bytes {expected_bytes if placement == 'host' else 0}, observed {values}"
+        )
+
+
+def output_contract(row):
+    return row["text"], row["reasoning"], json.dumps(row["usage"], sort_keys=True)
+
+
+def uncontended(metadata, allow_cotenant):
+    return (
+        not allow_cotenant
+        and bool(metadata)
+        and all(
+            not m["cotenants_before"]
+            and not m["cotenants_after"]
+            and m["contention"]["valid"]
+            and not m["contention"]["cotenants"]
+            for m in metadata
+        )
     )
 
 
@@ -112,9 +216,12 @@ def run(args, cells, placement, lifecycle):
             start_new_session=True,
         )
         sampler = None
+        monitor = None
         try:
             sampler = MemorySampler(process, args.output / f"{tag}.memory.jsonl")
             sampler.thread.start()
+            monitor = contention_monitor(process, sampler)
+            monitor.thread.start()
             deadline = time.monotonic() + 600
             while True:
                 if process.poll() is not None:
@@ -162,22 +269,26 @@ def run(args, cells, placement, lifecycle):
                 children = psutil.Process(process.pid).children(recursive=True)
             except psutil.NoSuchProcess:
                 children = []
-            if sampler is not None:
-                meta["memory"] = sampler.stop()
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-            _, alive = psutil.wait_procs(children, timeout=15)
-            for child in alive:
-                try:
-                    child.kill()
-                except psutil.NoSuchProcess:
-                    pass
-            psutil.wait_procs(alive, timeout=5)
+            try:
+                if monitor is not None:
+                    meta["contention"] = monitor.stop()
+                if sampler is not None:
+                    meta["memory"] = sampler.stop()
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait()
+                _, alive = psutil.wait_procs(children, timeout=15)
+                for child in alive:
+                    try:
+                        child.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                psutil.wait_procs(alive, timeout=5)
             meta["host_after"] = host_snapshot()
             meta["cotenants_after"] = active_compute()
             observations = re.findall(
@@ -192,11 +303,15 @@ def run(args, cells, placement, lifecycle):
         raise RuntimeError(
             "memory sampler failed; retain diagnostics but do not report a memory result"
         )
-    if not meta["cuda_allocations"]:
-        raise RuntimeError("missing CUDA allocation ledger observations")
-    expected_host = placement == "host"
-    if not any((o["host_ple"] > 0) == expected_host for o in meta["cuda_allocations"]):
-        raise RuntimeError("requested PLE placement was not observed")
+    if not meta.get("contention", {}).get("valid"):
+        raise RuntimeError("contention monitoring failed; retain diagnostics only")
+    if not args.allow_cotenant and not uncontended([meta], False):
+        raise RuntimeError(
+            "GPU cotenancy observed during the arm; retain diagnostics only"
+        )
+    validate_placement(
+        meta["cuda_allocations"], placement, args.expected_host_ple_bytes
+    )
     return rows, meta
 
 
@@ -206,6 +321,12 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--lifecycles", type=int, default=3)
     parser.add_argument("--host-budget-mb", type=int, default=12288)
+    parser.add_argument(
+        "--expected-host-ple-bytes",
+        type=int,
+        default=2312110080,
+        help="Expected encoded table bytes; default is the pinned E4B Q6_K table",
+    )
     parser.add_argument(
         "--calls-per-cell",
         type=int,
@@ -221,6 +342,7 @@ def main():
     if (
         args.lifecycles < 1
         or args.host_budget_mb < 1
+        or args.expected_host_ple_bytes < 1
         or (args.calls_per_cell is not None and args.calls_per_cell < 1)
     ):
         parser.error("lifecycle, host budget and optional call limit must be positive")
@@ -253,7 +375,7 @@ def main():
         "inherited_cuda_env": {
             k: v
             for k, v in os.environ.items()
-            if k.startswith(("ANTFLY_INFERENCE_CUDA_", "ANTFLY_CUDA_"))
+            if k.startswith(("ANTFLY_INFERENCE_CUDA_", "ANTFLY_CUDA_", "TERMITE_CUDA_"))
         },
     }
     media = {
@@ -292,20 +414,13 @@ def main():
     by_input = {}
     for row in rows:
         key = row["cell"], row["index"]
-        contract = (
-            row["text"],
-            row["reasoning"],
-            row["usage"]["prompt_tokens"],
-            row["usage"]["completion_tokens"],
-        )
+        contract = output_contract(row)
         if key in by_input and by_input[key] != contract:
             raise RuntimeError(f"placement/repetition output parity failed: {key}")
         by_input[key] = contract
     report = {
         "exact_output_parity": True,
-        "uncontended": not any(
-            m["cotenants_before"] or m["cotenants_after"] for m in metadata
-        ),
+        "uncontended": uncontended(metadata, args.allow_cotenant),
         "calls_per_placement": len(rows) // 2,
         "cells": [],
         "cuda_allocation_maxima": {},

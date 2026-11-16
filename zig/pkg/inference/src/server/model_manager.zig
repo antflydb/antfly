@@ -5915,6 +5915,15 @@ pub const ModelManager = struct {
             self.domain.release();
         }
 
+        pub fn leaseLifetime(self: @This()) runtime.tier.memory.LeaseLifetime {
+            return .{ .context = self.domain, .release = releaseLeaseLifetime };
+        }
+
+        fn releaseLeaseLifetime(context: *anyopaque) void {
+            const domain: *ResourceDomain = @ptrCast(@alignCast(context));
+            domain.release();
+        }
+
         /// Metadata allocations participate in the same process-wide ledger.
         /// The allocator separately reserves batched physical headroom, so
         /// every byte participates without a kernel probe per parser node.
@@ -7746,6 +7755,10 @@ pub const ModelManager = struct {
 
             var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
             defer if (resource_lease) |*lease| lease.release();
+            var host_weight_lease: ?runtime.tier.memory.AdmissionLease = null;
+            defer if (host_weight_lease) |*lease| lease.release();
+            session_manager.cuda_host_weight_lease = &host_weight_lease;
+            var mapped_host_bytes: usize = 0;
             var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
             var admission_limits = runtime.tier.memory.Limits{};
             if (self.admission_enabled) {
@@ -7781,16 +7794,32 @@ pub const ModelManager = struct {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
+                mapped_host_bytes = admission_plan.mapped_host_weight_bytes;
+                var model_peak = admission_plan.peak;
+                model_peak.host_weight_bytes -= mapped_host_bytes;
                 resource_lease = self.acquireRequestsWithEviction(&.{.{
                     .backend_class = admissionBackendClassForRuntime(backend_runtime),
                     .limits = admission_limits,
-                    .amounts = admission_plan.peak,
+                    .amounts = model_peak,
                     .required_residency = required_residency,
                     .failure = if (control) |active| active.admission_failure else null,
                 }}) catch |err| {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
+                if (mapped_host_bytes != 0) {
+                    host_weight_lease = self.acquireRequestsWithEviction(&.{.{
+                        .backend_class = admissionBackendClassForRuntime(backend_runtime),
+                        .limits = admission_limits,
+                        .amounts = .{ .host_weight_bytes = mapped_host_bytes },
+                        .required_residency = required_residency,
+                        .failure = if (control) |active| active.admission_failure else null,
+                    }}) catch |err| {
+                        rememberPreferredLoadError(&first_err, err);
+                        continue;
+                    };
+                    host_weight_lease.?.lifetime = (try self.retainResourceLifetime()).leaseLifetime();
+                }
             }
 
             var construction = enterSessionConstruction(control, backend_runtime) catch |err| {
@@ -7823,7 +7852,11 @@ pub const ModelManager = struct {
                 resource_lease = null;
                 defer loaded.deinit();
                 if (control) |active| try active.check();
-                if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
+                if (loaded.resource_lease) |*lease| {
+                    var model_resident = resident_amounts;
+                    model_resident.host_weight_bytes -= mapped_host_bytes;
+                    try lease.retain(model_resident);
+                }
                 if (self.admission_enabled) {
                     const session_admission_limits = self.admissionLimitsForSession(
                         backend_runtime,
@@ -11609,6 +11642,8 @@ pub const GenerationAdmissionLease = struct {
 const ModelLoadAdmissionPlan = struct {
     /// Maximum simultaneous bytes while parsing/importing/repacking.
     peak: runtime.tier.memory.AdmissionAmounts,
+    /// Independently leased before construction and moved into mapped storage.
+    mapped_host_weight_bytes: usize = 0,
     /// Bytes retained by the completed backend session.
     resident: runtime.tier.memory.AdmissionAmounts,
     /// Minimum serving envelope justified by the same resolved load plan.
@@ -11929,10 +11964,24 @@ pub fn projectorRunAdmissionAmounts(
 }
 
 fn withNativeAuxiliaryAdmission(man: manifest_mod.ModelManifest, backend: backends.BackendType, base: ModelLoadAdmissionPlan) !ModelLoadAdmissionPlan {
+    return withNativeAuxiliaryAdmissionForPolicy(man, backend, base, @import("../ops/cuda/ple_host.zig").requested());
+}
+
+fn withNativeAuxiliaryAdmissionForPolicy(man: manifest_mod.ModelManifest, backend: backends.BackendType, base: ModelLoadAdmissionPlan, host_ple: bool) !ModelLoadAdmissionPlan {
     var result = base;
-    if (backend == .cuda) {
-        const host_bytes = try @import("../ops/cuda/ple_host.zig").estimateGgufBytes(man.allocator, man.gguf_path);
-        try addResidentHostSource(&result, host_bytes);
+    if (backend == .cuda and host_ple and man.gguf_path != null) {
+        const host_bytes = try session_factory.cudaPleHostBytesForPolicy(man.allocator, man.source_root orelse std.fs.path.dirname(man.gguf_path.?) orelse ".", man, host_ple);
+        if (host_bytes != 0) {
+            const artifact_bytes = try estimateModelArtifactBytes(man);
+            const remaining = std.math.sub(usize, artifact_bytes, host_bytes) catch return error.ResourceLimitExceeded;
+            const before = try session_factory.estimateBackendWeightResidencyBytes(.cuda, artifact_bytes);
+            const after = try session_factory.estimateBackendWeightResidencyBytes(.cuda, remaining);
+            const discount = before - after;
+            result.peak.backend_weight_bytes = std.math.sub(usize, result.peak.backend_weight_bytes, discount) catch return error.ResourceLimitExceeded;
+            result.resident.backend_weight_bytes = std.math.sub(usize, result.resident.backend_weight_bytes, discount) catch return error.ResourceLimitExceeded;
+            try addResidentHostSource(&result, host_bytes);
+            result.mapped_host_weight_bytes = host_bytes;
+        }
     }
     if (!session_factory.usesJinaRetrievalAdapter(man, backend)) return result;
     const adapter = (try man.jinaRetrievalAdapter()) orelse return result;
@@ -12545,6 +12594,10 @@ fn loadSessionForPreferredBackendsWithArtifactsImpl(
         // This attempt owns admission until the successful result explicitly
         // takes it. Includes cancellation, guard-arm failure, and fallback.
         defer if (resource_lease) |*lease| lease.release();
+        var host_weight_lease: ?runtime.tier.memory.AdmissionLease = null;
+        defer if (host_weight_lease) |*lease| lease.release();
+        backend_session_manager.cuda_host_weight_lease = &host_weight_lease;
+        var mapped_host_bytes: usize = 0;
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         var admission_limits = runtime.tier.memory.Limits{};
         var serving_floor: ?runtime.tier.memory.Limits = null;
@@ -12581,10 +12634,13 @@ fn loadSessionForPreferredBackendsWithArtifactsImpl(
                 continue;
             };
             if (control) |active| try active.check();
+            mapped_host_bytes = admission_plan.mapped_host_weight_bytes;
+            var model_peak = admission_plan.peak;
+            model_peak.host_weight_bytes -= mapped_host_bytes;
             resource_lease = manager.acquireRequestsWithEviction(&.{.{
                 .backend_class = admissionBackendClassForRuntime(backend_runtime),
                 .limits = admission_limits,
-                .amounts = admission_plan.peak,
+                .amounts = model_peak,
                 .required_residency = required_residency,
                 .failure = if (control) |active| active.admission_failure else null,
             }}) catch |err| {
@@ -12604,6 +12660,19 @@ fn loadSessionForPreferredBackendsWithArtifactsImpl(
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
+            if (mapped_host_bytes != 0) {
+                host_weight_lease = manager.acquireRequestsWithEviction(&.{.{
+                    .backend_class = admissionBackendClassForRuntime(backend_runtime),
+                    .limits = admission_limits,
+                    .amounts = .{ .host_weight_bytes = mapped_host_bytes },
+                    .required_residency = required_residency,
+                    .failure = if (control) |active| active.admission_failure else null,
+                }}) catch |err| {
+                    rememberPreferredLoadError(&first_err, err);
+                    continue;
+                };
+                host_weight_lease.?.lifetime = (try manager.retainResourceLifetime()).leaseLifetime();
+            }
         }
         var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
             if (err == error.ProcessIsolationRequired) {
@@ -12663,7 +12732,11 @@ fn loadSessionForPreferredBackendsWithArtifactsImpl(
             try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
             try session_factory.prepareLayaResident(loaded.session, control);
             try bound.finish(&proof);
-            if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
+            if (loaded.resource_lease) |*lease| {
+                var model_resident = resident_amounts;
+                model_resident.host_weight_bytes -= mapped_host_bytes;
+                try lease.retain(model_resident);
+            }
             return loaded.take();
         } else |err| {
             std.log.warn("loadModel({s}) backend {s} failed: {s}", .{ model_dir, @tagName(backend), @errorName(err) });
@@ -20772,4 +20845,83 @@ test "Gemma4 CUDA host PLE admission reserves both construction copies and retai
     defer lease.release();
     try lease.retain(plan.resident);
     try std.testing.expectEqual(@as(usize, 256), lease.amounts.host_weight_bytes);
+}
+
+test "Gemma4 CUDA host PLE real load admission discounts device bytes and gates model geometry" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    const writer = @import("../gguf/writer.zig");
+    const types = @import("../gguf/tensor_types.zig");
+    var metadata = [_]@import("../gguf/format.zig").MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "gemma4" } },
+        .{ .key = "gemma4.embedding_length", .value = .{ .u32 = 2560 } },
+        .{ .key = "gemma4.block_count", .value = .{ .u32 = 42 } },
+        .{ .key = "gemma4.attention.head_count", .value = .{ .u32 = 8 } },
+        .{ .key = "gemma4.attention.head_count_kv", .value = .{ .u32 = 2 } },
+    };
+    const tensors = [_]writer.TensorSpec{
+        .{ .name = "per_layer_token_embd.weight", .dimensions = &.{ 10752, 2 }, .tensor_type = .{ .known = .Q6_K } },
+        .{ .name = "token_embd.weight", .dimensions = &.{ 2560, 2 }, .tensor_type = .{ .known = .Q6_K } },
+    };
+    var layout = try writer.buildLayout(a, &metadata, &tensors);
+    defer layout.deinit(a);
+    const encoded: usize = @intCast(types.byteLen(tensors[0].tensor_type, tensors[0].dimensions).?);
+    const header_len = std.mem.alignForward(usize, layout.header_bytes.len, @intCast(layout.alignment));
+    const bytes = try a.alloc(u8, header_len + @as(usize, @intCast(layout.offsets[1])) + encoded);
+    defer a.free(bytes);
+    @memset(bytes, 0);
+    @memcpy(bytes[0..layout.header_bytes.len], layout.header_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = bytes });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "model.gguf", a);
+    defer a.free(path);
+    const man = manifest_mod.ModelManifest{ .allocator = a, .model_type = .generator, .source_root = root, .gguf_path = path };
+    const base = try estimateBaseModelLoadAdmission(root, man, .{ .backend = .cuda }, null, false);
+    const device = try withNativeAuxiliaryAdmissionForPolicy(man, .cuda, base, false);
+    const host = try withNativeAuxiliaryAdmissionForPolicy(man, .cuda, base, true);
+    try std.testing.expectEqual(encoded, host.mapped_host_weight_bytes);
+    try std.testing.expectEqual(base, device);
+    try std.testing.expect(host.peak.backend_weight_bytes < device.peak.backend_weight_bytes);
+    try std.testing.expectEqual(device.peak.host_weight_bytes + encoded, host.peak.host_weight_bytes);
+    try std.testing.expectEqual(encoded, host.resident.host_weight_bytes);
+    // A real controller cap between the two construction plans admits only
+    // host placement, while both copies are still covered by host admission.
+    var controller = runtime.tier.memory.AdmissionController{};
+    const limits: runtime.tier.memory.Limits = .{ .backend_limit_bytes = host.peak.backend_weight_bytes, .host_limit_bytes = host.peak.host_weight_bytes };
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, limits, device.peak, false));
+    var model_peak = host.peak;
+    model_peak.host_weight_bytes -= encoded;
+    var model = try controller.tryAcquire(.gpu, limits, model_peak, false);
+    defer model.release();
+    var pinned = try controller.tryAcquire(.gpu, limits, .{ .host_weight_bytes = encoded }, false);
+    defer pinned.release();
+    try std.testing.expectEqual(host.peak, controller.snapshot());
+    var resident = host.resident;
+    resident.host_weight_bytes -= encoded;
+    try model.retain(resident);
+    try pinned.retain(pinned.amounts);
+    try std.testing.expectEqual(host.resident, controller.snapshot());
+    // Identical table names/types must not discount another model geometry.
+    metadata[2].value = .{ .u32 = 41 };
+    var excluded_layout = try writer.buildLayout(a, &metadata, &tensors);
+    defer excluded_layout.deinit(a);
+    @memcpy(bytes[0..excluded_layout.header_bytes.len], excluded_layout.header_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = bytes });
+    const excluded = try withNativeAuxiliaryAdmissionForPolicy(man, .cuda, base, true);
+    try std.testing.expectEqual(base, excluded);
+}
+
+test "Gemma4 CUDA host PLE admission lifetime survives the model manager" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.native} });
+    try manager.ensureResourceOwnerReady();
+    var pinned = try manager.admissionController().tryAcquire(.gpu, .{}, .{ .host_weight_bytes = 64 }, false);
+    pinned.lifetime = (try manager.retainResourceLifetime()).leaseLifetime();
+    const controller = pinned.controller.?;
+    manager.deinit();
+    try std.testing.expectEqual(@as(usize, 64), controller.snapshot().host_weight_bytes);
+    pinned.release(); // Last domain reference; the testing allocator checks destruction.
+    pinned.release();
 }
