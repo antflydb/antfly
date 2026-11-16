@@ -285,6 +285,54 @@ pub const NativeHistoryDecisionRecord = struct {
     prepared: bool,
     intents_resolved: bool,
     digest: NativeHistoryDigest,
+    /// Optional retained source admission fingerprint. Source-owned pending transactions cannot be expired by ordinary transaction recovery.
+    source_purpose: ?NativeHistoryDigest = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "status", "status", false },
+        .{ "begin_timestamp", "begin_timestamp", false },
+        .{ "created_at_ns", "created_at_ns", false },
+        .{ "commit_version", "commit_version", false },
+        .{ "finalized_at_ns", "finalized_at_ns", false },
+        .{ "prepared", "prepared", false },
+        .{ "intents_resolved", "intents_resolved", false },
+        .{ "digest", "digest", false },
+        .{ "source_purpose", "source_purpose", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("begin_timestamp");
+        try jw.write(self.begin_timestamp);
+        try jw.objectField("created_at_ns");
+        try jw.write(self.created_at_ns);
+        try jw.objectField("commit_version");
+        try jw.write(self.commit_version);
+        try jw.objectField("finalized_at_ns");
+        try jw.write(self.finalized_at_ns);
+        try jw.objectField("prepared");
+        try jw.write(self.prepared);
+        try jw.objectField("intents_resolved");
+        try jw.write(self.intents_resolved);
+        try jw.objectField("digest");
+        try jw.write(self.digest);
+        if (self.source_purpose) |value| {
+            try jw.objectField("source_purpose");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const NativeHistoryDecisionReply = struct {

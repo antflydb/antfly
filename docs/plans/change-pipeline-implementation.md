@@ -3665,3 +3665,33 @@ and missing atomic capability.
 This does not yet supply stable snapshot transaction identities or an atomic
 source-global checkpoint/head. A lost outcome can still replay snapshot
 upserts. Those contracts and the remaining full goal remain outstanding.
+
+### Retained source ownership in coordinator observations
+
+The private decision record now exports its persisted optional source-purpose
+fingerprint. The spec was updated and `make generate` completed before runtime
+wiring. Native record decoding retains this field across reopening; zero
+fingerprints fail validation. Ordinary replies omit the absent field, preserving
+their existing JSON shape. New source-bearing replies fail closed on older
+strict decoders rather than silently losing ownership.
+
+Retained recovery uses the fresh record to exclude source-owned pending
+transactions from ordinary expiry, even if a stale job supplies an expiry cutoff.
+The participant expiry entry point independently rejects source ownership before
+any mutation dispatch. Native storage's existing purpose fence remains in place.
+This is read-side recovery ownership; terminal participant requests still need
+the frozen source admission command and checkpoint-anchor integration.
+
+Qualification: `source-purpose-recovery-test.log` passed all 13 native history
+cases with no skips or leaks, including source-purpose persistence across reopen
+and strict decision reply round trips. Its Raft test fixture initially failed
+compilation because the new request omitted explicit protocol fields; corrected
+before qualification. `source-purpose-recovery-qualified-test.log`,
+`ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build history-control-apply-test -j2`,
+passed all 13 Raft/control/recovery cases without skips, failures or leaks. The
+stateful recovery fixture checks both coordinator suppression and direct expiry
+rejection with unchanged mutation counts. Formatting and diff checks passed.
+
+The full source-global checkpoint and frozen-payload adapter, public feeds,
+bootstrap/retention, production pgoutput, and existing-client qualification
+remain required. Neither issue is complete.

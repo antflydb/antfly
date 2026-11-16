@@ -50,8 +50,21 @@ pub const Record = struct {
     prepared: bool,
     intents_resolved: bool,
     digest: [32]u8,
+    /// Retained source ownership, independent of ordinary expiry/recovery jobs.
+    source_purpose: ?[32]u8 = null,
+    pub fn jsonStringify(self: Record, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(Record).@"struct".field_names) |name| {
+            if (!std.mem.eql(u8, name, "source_purpose") or self.source_purpose != null) {
+                try stream.objectField(name);
+                try stream.write(@field(self, name));
+            }
+        }
+        try stream.endObject();
+    }
     pub fn validate(self: Record) !void {
         if (self.begin_timestamp == 0 or self.created_at_ns == 0 or std.mem.allEqual(u8, &self.digest, 0)) return error.HistoryCorrupt;
+        if (self.source_purpose) |purpose| if (std.mem.allEqual(u8, &purpose, 0)) return error.HistoryCorrupt;
         switch (self.status) {
             .pending => if (self.commit_version != 0 or self.finalized_at_ns != 0 or self.intents_resolved) return error.HistoryCorrupt,
             .committed => if (self.commit_version <= self.begin_timestamp or self.finalized_at_ns == 0 or !self.prepared) return error.HistoryCorrupt,
@@ -122,6 +135,18 @@ test "history decision read binds retained owners record and actual cut with own
     const members = [_]completion.Participant{.{ .namespace = query.owner.namespace, .owner_fence = query.owner.digest(), .input_digest = @splat(4), .roles = completion.Roles.guards | completion.Roles.checkpoint, .locator = "original-checkpoint-owner", .routed_owner = query.owner }};
     const admission: completion.Admission = .{ .version = 3, .transaction_id = query.transaction_id, .admission_digest = @splat(5), .coordinator_namespace = query.owner.namespace, .coordinator_fence = query.owner.digest(), .participants = &members };
     var reply: Reply = .{ .request_digest = query.digest(), .cut = .{ .term = 2, .index = 6 }, .decision = .{ .record = .{ .status = .committed, .begin_timestamp = 10, .created_at_ns = 11, .commit_version = 20, .finalized_at_ns = 20, .prepared = true, .intents_resolved = true, .digest = @splat(6) }, .admission = .{ .admission = admission, .digest = admission.digest() } } };
+    const ordinary = try encodeReply(a, query, reply);
+    defer a.free(ordinary);
+    try std.testing.expect(std.mem.indexOf(u8, ordinary, "source_purpose") == null);
+    reply.decision.?.record.source_purpose = @splat(19);
+    const source_owned = try encodeReply(a, query, reply);
+    defer a.free(source_owned);
+    var source_parsed = try decodeReply(a, source_owned, query);
+    defer source_parsed.deinit();
+    try std.testing.expectEqual(@as([32]u8, @splat(19)), source_parsed.value.decision.?.record.source_purpose.?);
+    reply.decision.?.record.source_purpose = @splat(0);
+    try std.testing.expectError(error.HistoryCorrupt, reply.validate(query));
+    reply.decision.?.record.source_purpose = null;
     const raw = try encodeReply(a, query, reply);
     defer a.free(raw);
     var parsed = try decodeReply(a, raw, query);

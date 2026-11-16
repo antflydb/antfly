@@ -6338,7 +6338,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const committed_history_tests = b.addTest(.{
         .root_module = docstore_test_mod,
-        .filters = &.{ "docstore committed history", "committed history transaction reservations", "committed history completion admission" },
+        .filters = &.{ "docstore committed history", "committed history transaction reservations", "committed history completion admission", "transaction source purpose", "history decision read" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_committed_history_tests = addFilteredTestRunArtifact(b, committed_history_tests);

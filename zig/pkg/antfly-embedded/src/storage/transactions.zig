@@ -3354,6 +3354,7 @@ pub fn completionCoordinatorRecord(raw: []const u8) !@import("history_decision_w
         .prepared = record.prepared,
         .intents_resolved = record.intents_resolved,
         .digest = completion.bytesDigest(raw),
+        .source_purpose = record.source_purpose,
     };
     try result.validate();
     return result;
@@ -4711,6 +4712,7 @@ test "transaction source purpose fences sessions freezes prepared intents and su
     defer a.free(raw);
     try std.testing.expectEqual(@as(usize, txn_record_v8_size), raw.len);
     try std.testing.expectEqual(proof, (try decodeRecord(raw)).source_purpose.?);
+    try std.testing.expectEqual(proof, (try completionCoordinatorRecord(raw)).source_purpose.?);
     const malformed = try a.dupe(u8, raw);
     defer a.free(malformed);
     malformed[54] = 2;
@@ -4729,6 +4731,9 @@ test "transaction source purpose fences sessions freezes prepared intents and su
     store = try DocStore.open(a, path, .{});
     mgr = try TxnManager.init(a, &store);
     try mgr.requireSourcePurpose(txn_id, proof);
+    const reopened_raw = try mgr.getAlloc(a, &makeRecordKey(txn_id));
+    defer a.free(reopened_raw);
+    try std.testing.expectEqual(proof, (try completionCoordinatorRecord(reopened_raw)).source_purpose.?);
     try std.testing.expectError(error.SourceTransactionIdentityConflict, mgr.resolveIntents(txn_id, .committed, 11_000));
     _ = try mgr.resolveIntentsWithExtraBatch(txn_id, .committed, 11_000, .{ .source_purpose = proof });
     const stored_value = try getVisibleDocRuntime(&mgr.store, a, "a");

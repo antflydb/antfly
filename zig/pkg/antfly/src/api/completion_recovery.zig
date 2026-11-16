@@ -77,7 +77,7 @@ pub const Recovery = struct {
         if (job) |expected| {
             const initial = observed.value.decision orelse return .unproven;
             if (!std.mem.eql(u8, &initial.admission.digest, &expected.admission_digest)) return error.SourceTransactionIdentityConflict;
-            if (initial.record.status == .pending and expected.abort_before_ns != 0 and initial.record.created_at_ns < expected.abort_before_ns) {
+            if (initial.record.status == .pending and initial.record.source_purpose == null and expected.abort_before_ns != 0 and initial.record.created_at_ns < expected.abort_before_ns) {
                 try self.checkpoint(context);
                 self.participants.abortExpired(a, request.binding(), observed.value, coordinator_fence, expected.abort_before_ns, expected.resolution_timestamp_ns, context) catch |err| switch (err) {
                     error.DecisionConflict => {},
@@ -371,6 +371,17 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(.pending, try recovery.runRetained(a, retained, .{}));
     try std.testing.expectEqual(@as(usize, 5), fake.resolves);
     retained.abort_before_ns = 20;
+    // A stale or incorrectly classified ordinary job cannot expire a source
+    // transaction. Ownership is read afresh from the native retained record.
+    fake.state.source_purpose = @splat(17);
+    try std.testing.expectEqual(.pending, try recovery.runRetained(a, retained, .{}));
+    try std.testing.expectEqual(@as(usize, 5), fake.resolves);
+    const source_query: decision_ops.Request = .{ .version = 1, .owner = owners[0], .transaction_id = admission.transaction_id, .minimum_applied_index = 1 };
+    var source_observation = try recovery.decisions.read(a, fence, "docs", source_query, .{});
+    defer source_observation.deinit();
+    try std.testing.expectError(error.SourceOutcomeUnresolved, recovery.participants.abortExpired(a, source_query.binding(), source_observation.value, fence, 20, 30, .{}));
+    try std.testing.expectEqual(@as(usize, 5), fake.resolves);
+    fake.state.source_purpose = null;
     try std.testing.expectEqual(.aborted, try recovery.runRetained(a, retained, .{}));
     try std.testing.expectEqual(@as(usize, 8), fake.resolves);
     try std.testing.expectEqual(@as(usize, 4), fake.publishes);
