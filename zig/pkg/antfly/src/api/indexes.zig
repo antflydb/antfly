@@ -2947,6 +2947,15 @@ fn coverageIdentityMatches(item: anytype, expected_generation: u64, expected_con
     return true;
 }
 
+/// Physical checkpoint completion is independent of materialization counts
+/// and producer telemetry. Aggregates carry the conjunction of their shards.
+fn consumerCheckpointComplete(item: anytype) bool {
+    const Item = @TypeOf(item);
+    if (@hasField(Item, "projection_checkpoint_status") and !std.mem.eql(u8, item.projection_checkpoint_status, "clean")) return false;
+    if (@hasField(Item, "scoped_checkpoint_complete") and !item.scoped_checkpoint_complete) return false;
+    return true;
+}
+
 fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
     const kind = aggregate.kind orelse return;
     if (kind != .dense_vector and kind != .sparse_vector) return;
@@ -2957,6 +2966,11 @@ fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
         aggregate.remote_unknown_group_count > 0 or
         aggregate.expected_group_count != aggregate.fresh_group_count) return;
     if (aggregate.load_error != null or aggregate.repair_degraded or aggregate.enrichment_failed) return;
+    if (!consumerCheckpointComplete(aggregate.*)) {
+        aggregate.backfill_active = true;
+        aggregate.backfill_progress = @min(aggregate.backfill_progress, 0.999);
+        return;
+    }
     if (aggregate.dense_vector_projection_pending) return;
     const enrichment_blocked = aggregate.enrichment.enabled and (aggregate.enrichment.retrying or aggregate.enrichment.worker_failed);
     if (enrichment_blocked) return;
@@ -3716,8 +3730,7 @@ fn independentConsumerComplete(item: anytype, observation: IndexReadinessObserva
     const Item = @TypeOf(item);
     if (!@hasField(Item, "coverage_produced_count") or !@hasField(Item, "coverage_skipped_count") or !@hasField(Item, "coverage_terminal_failed_count")) return false;
     if (!observation.completionFencesClear()) return false;
-    if (@hasField(Item, "projection_checkpoint_status") and !std.mem.eql(u8, item.projection_checkpoint_status, "clean")) return false;
-    if (@hasField(Item, "scoped_checkpoint_complete") and !item.scoped_checkpoint_complete) return false;
+    if (!consumerCheckpointComplete(item)) return false;
     if (@hasField(Item, "dense_vector_projection_pending") and item.dense_vector_projection_pending) return false;
     if (aggregateRuntimeCoverageIncomplete(item, generation, config_hash)) return false;
     if (!coverageReplayCurrent(item.replay_applied_sequence, item.replay_target_sequence, item.replay_catch_up_required)) return false;
@@ -3816,6 +3829,10 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
         null;
     var backfill_active = if (embeddings_view) |view| view.backfill_active else item.backfill_active;
     var backfill_progress = if (embeddings_view) |view| view.backfill_progress else item.backfill_progress;
+    if (!consumerCheckpointComplete(public_item)) {
+        backfill_active = true;
+        backfill_progress = @min(backfill_progress, 0.999);
+    }
     // Coverage can be authoritative before the serving incarnation is. Keep
     // that useful coverage visible, but never project the lifecycle as ready
     // while the exact incarnation still lacks a readiness proof.
@@ -4454,9 +4471,9 @@ fn appendIndexReadinessStatus(
         ((terminal_load_failure or repair_failed) and
             (!active_generation_serviceable or repair_blocks_queryable)) or
         (terminal_enrichment_failure and !serving_snapshot_ready);
-    const publication_pending = index_type == .embeddings and incarnation_current and
-        (replay_target_sequence > replay_applied_sequence or artifact_publish_pending or
-            !serving_snapshot_ready);
+    const publication_pending = incarnation_current and
+        (!consumerCheckpointComplete(item) or (index_type == .embeddings and
+            (replay_target_sequence > replay_applied_sequence or artifact_publish_pending or !serving_snapshot_ready)));
     const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and
         !source_coverage_complete;
     const sources_complete = observation.sources_complete;
@@ -7572,16 +7589,32 @@ fn consumerTests() type {
             try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"complete\":false}}", encoded.items);
             item.runtime_target_observation_complete = true;
             item.projection_checkpoint_status = "rebuilding";
-            encoded.clearRetainingCapacity();
-            try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, item, 1, .strict, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true }, null, null, .{}, metadata, true);
-            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"complete\":false}}", encoded.items);
-            var dirty_indexes = [_]db_mod.types.DBIndexStats{item};
-            const dirty_runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{ .group_id = 7, .metadata = metadata, .stats = .{ .source_doc_count = 1, .doc_count = 1, .index_count = 1, .indexes = &dirty_indexes, .async_indexing = worker, .enrichment = .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true } } }};
-            const dirty_aggregate = aggregateIndexStatusIndexed(&dirty_runtimes, "A", &.{7}, 7, 41, null).?;
-            try std.testing.expect(!dirty_aggregate.scoped_checkpoint_complete);
-            encoded.clearRetainingCapacity();
-            try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, dirty_aggregate, 1, .strict, false, 7, 41, worker, dirty_aggregate.enrichment, null, null, .{}, null, true);
-            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"complete\":false}}", encoded.items);
+            const producer_states = [_]?db_mod.types.EnrichmentStats{
+                .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true },
+                .{ .enabled = true, .applied_sequence = 100, .target_sequence = 100 },
+                null,
+            };
+            for (producer_states) |producer| {
+                for ([_]ApiIndexType{ .full_text, .graph }) |kind| {
+                    var projection = item;
+                    projection.kind = if (kind == .full_text) .full_text else .graph;
+                    encoded.clearRetainingCapacity();
+                    try appendSingleIndexRuntimeStatus(a, &encoded, kind, projection, 1, .strict, false, 7, 41, worker, producer, null, null, .{}, metadata, true);
+                    try ant_json.testing.expectSubsetJsonText(a, "{\"rebuilding\":true,\"backfill_active\":true,\"readiness\":{\"complete\":false}}", encoded.items);
+                }
+                for ([_]EmbeddingsCoveragePolicy{ .strict, .external }) |coverage_policy| {
+                    encoded.clearRetainingCapacity();
+                    try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, item, 1, coverage_policy, false, 7, 41, worker, producer, null, null, .{}, metadata, true);
+                    try ant_json.testing.expectSubsetJsonText(a, "{\"rebuilding\":true,\"backfill_active\":true,\"readiness\":{\"queryable\":true,\"complete\":false}}", encoded.items);
+                    var dirty_indexes = [_]db_mod.types.DBIndexStats{item};
+                    const dirty_runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{ .group_id = 7, .metadata = metadata, .stats = .{ .source_doc_count = 1, .doc_count = 1, .index_count = 1, .indexes = &dirty_indexes, .async_indexing = worker, .enrichment = producer orelse .{} } }};
+                    const dirty_aggregate = aggregateIndexStatusIndexed(&dirty_runtimes, "A", &.{7}, 7, 41, null).?;
+                    try std.testing.expect(!dirty_aggregate.scoped_checkpoint_complete);
+                    encoded.clearRetainingCapacity();
+                    try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, dirty_aggregate, 1, coverage_policy, false, 7, 41, worker, producer, null, null, .{}, null, true);
+                    try ant_json.testing.expectSubsetJsonText(a, "{\"rebuilding\":true,\"backfill_active\":true,\"readiness\":{\"queryable\":true,\"complete\":false}}", encoded.items);
+                }
+            }
         }
 
         test "table-wide native vector work does not block an independently ready index" {
