@@ -82,7 +82,7 @@ pub const Port = struct {
     }
     /// Recovery submits only the already durable terminal decision or its full
     /// certificate. It never reconstructs BEGIN/PREPARE from current rows.
-    pub fn submitRetained(self: Port, a: A, lookup: @import("history_decision_operations.zig").wire.Query, observation: @import("history_decision_operations.zig").wire.Reply, index: usize, fence: metadata.CatalogRouteFence, phase: union(enum) { resolve, publish: []const u8 }, original: operation.RequestContext) !void {
+    pub fn submitRetained(self: Port, a: A, lookup: @import("history_decision_operations.zig").wire.Query, observation: @import("history_decision_operations.zig").wire.Reply, index: usize, fence: metadata.CatalogRouteFence, phase: union(enum) { resolve, publish: []const u8, visibility: types.SyncLevel }, original: operation.RequestContext) !void {
         var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
         const context = scope.context();
         try context.ensureActive();
@@ -98,6 +98,17 @@ pub const Port = struct {
         var parsed: ?std.json.Parsed(completion.Envelope) = null;
         defer if (parsed) |*value| value.deinit();
         const request: types.BatchRequest = switch (phase) {
+            .visibility => |level| blk: {
+                if (decision.record.status != .committed) return error.SourceOutcomeUnresolved;
+                switch (level) {
+                    .full_text, .enrichments, .full_index => {},
+                    .propose, .write => return error.InvalidBatchRequest,
+                }
+                // Re-observe the durable terminal mutation through the normal
+                // owner-fenced synchronization boundary. This cannot execute
+                // original effects, create admission, or change the decision.
+                break :blk .{ .sync_level = level, .transaction = .{ .resolve = .{ .completion_owner = owner, .txn_id = admission.transaction_id, .status = .committed, .commit_version = decision.record.commit_version } } };
+            },
             .resolve => .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = owner, .txn_id = admission.transaction_id, .status = if (decision.record.status == .committed) .committed else .aborted, .commit_version = if (decision.record.status == .committed) decision.record.commit_version else decision.record.finalized_at_ns } } },
             .publish => |bytes| blk: {
                 const manifest = try decision.committedManifest();

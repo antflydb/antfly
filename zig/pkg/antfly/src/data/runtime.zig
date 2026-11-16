@@ -43521,6 +43521,8 @@ fn consumerTests() type {
             const Fake = struct {
                 calls: usize = 0,
                 fail: bool = false,
+                expected_sync: ?antfly.db.types.SyncLevel = null,
+                visibility_error: ?anyerror = null,
                 cancel_after: ?*std.atomic.Value(bool) = null,
                 fn write(ptr: *anyopaque, _: std.mem.Allocator, authority: antfly.public_api.internal_group_operations.RoutedBatchAuthority, group: u64, table: []const u8, req: antfly.db.types.BatchRequest, forwarding: antfly.public_api.internal_batch_forwarding.Context, context: antfly.public_api.operation.RequestContext) !?void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -43536,6 +43538,15 @@ fn consumerTests() type {
                         try std.testing.expectEqual(@as(u64, 1000), req.timestamp_ns);
                         try std.testing.expectEqual(@as(u64, 3), req.transaction.?.prepare.completion_owner.?.root_generation);
                         try std.testing.expectEqual(.revision_v1, req.document_version_scheme);
+                    }
+                    if (self.expected_sync) |level| {
+                        try std.testing.expectEqual(level, req.sync_level);
+                        try std.testing.expect(req.transaction.? == .resolve);
+                        try std.testing.expectEqual(.committed, req.transaction.?.resolve.status);
+                        try std.testing.expectEqual(@as(u64, 1002), req.transaction.?.resolve.commit_version);
+                        try std.testing.expectEqual(@as(usize, 0), req.writes.len);
+                        try std.testing.expectEqual(@as(usize, 0), req.transforms.len);
+                        if (self.visibility_error) |err| return err;
                     }
                     if (self.fail) return error.RaftBatchWriteOutcomeUnknown;
                     if (self.cancel_after) |value| value.store(true, .release);
@@ -43565,6 +43576,35 @@ fn consumerTests() type {
             fake.cancel_after = &cancelled;
             try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, port.submit(a, &frozen, 0, scoped, .begin, .{}));
             try std.testing.expectEqual(@as(usize, 4), fake.calls);
+            fake.cancel_after = null;
+            cancelled.store(false, .release);
+            const decisions = @import("../api/history_decision_operations.zig").wire;
+            const lookup: decisions.Query = .{ .owner = binding, .transaction_id = frozen.admission.transaction_id, .minimum_applied_index = 1 };
+            var observation: decisions.Reply = .{ .request_digest = lookup.digest(), .cut = .{ .term = 1, .index = 2 }, .decision = .{
+                .record = .{ .status = .committed, .begin_timestamp = 1000, .created_at_ns = 1001, .commit_version = 1002, .finalized_at_ns = 1002, .prepared = true, .intents_resolved = true, .digest = @splat(7) },
+                .admission = .{ .admission = frozen.admission, .digest = frozen.admission.digest() },
+            } };
+            for ([_]antfly.db.types.SyncLevel{ .full_text, .enrichments, .full_index }) |level| {
+                fake.expected_sync = level;
+                try port.submitRetained(a, lookup, observation, 0, fence, .{ .visibility = level }, .{});
+            }
+            fake.expected_sync = .full_index;
+            fake.visibility_error = error.EnrichmentWorkerFailed;
+            try std.testing.expectError(error.EnrichmentWorkerFailed, port.submitRetained(a, lookup, observation, 0, fence, .{ .visibility = .full_index }, .{}));
+            fake.visibility_error = error.EnrichmentRetryInProgress;
+            try std.testing.expectError(error.EnrichmentRetryInProgress, port.submitRetained(a, lookup, observation, 0, fence, .{ .visibility = .full_index }, .{}));
+            const visibility_calls = fake.calls;
+            try std.testing.expectError(error.InvalidBatchRequest, port.submitRetained(a, lookup, observation, 0, fence, .{ .visibility = .write }, .{}));
+            try std.testing.expectError(error.TopologyChanged, port.submitRetained(a, lookup, observation, 0, wrong, .{ .visibility = .full_index }, .{}));
+            observation.decision.?.record.status = .pending;
+            observation.decision.?.record.commit_version = 0;
+            observation.decision.?.record.finalized_at_ns = 0;
+            observation.decision.?.record.intents_resolved = false;
+            try std.testing.expectError(error.SourceOutcomeUnresolved, port.submitRetained(a, lookup, observation, 0, fence, .{ .visibility = .full_index }, .{}));
+            observation.decision.?.record.status = .aborted;
+            observation.decision.?.record.finalized_at_ns = 1002;
+            try std.testing.expectError(error.SourceOutcomeUnresolved, port.submitRetained(a, lookup, observation, 0, fence, .{ .visibility = .full_index }, .{}));
+            try std.testing.expectEqual(visibility_calls, fake.calls);
         }
 
         test "data raft ordered history frozen plan owns canonical payloads through allocation failures" {
@@ -44535,26 +44575,32 @@ fn consumerTests() type {
             };
             try std.testing.expectEqual(previous_last, recovered_last);
             const NormalCompletion = struct {
-                noinline fn run(alloc: std.mem.Allocator, origin_server: *DataServer, value: []const u8) !void {
+                noinline fn run(alloc: std.mem.Allocator, origin_server: *DataServer, value: []const u8, level: antfly.db.types.SyncLevel) !void {
                     const txn = @import("../api/distributed_txn.zig");
                     var participant_worker = txn.LocalTableWriteParticipantWorker.init(origin_server.write_source.source());
-                    const outcome = try txn.executeMultiTableCommitWithOptions(alloc, origin_server.write_source.catalog, participant_worker.worker(), @splat(114), 2000, 2001, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "normal-completion", .value = value }} }}, .write, null, .{ .completion = .{ .owners = origin_server.historyOwnerPort(), .recovery = origin_server.completionRecovery() } });
+                    const outcome = try txn.executeMultiTableCommitWithOptions(alloc, origin_server.write_source.catalog, participant_worker.worker(), @splat(114), 2000, 2001, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "normal-completion", .value = value }} }}, level, null, .{ .completion = .{ .owners = origin_server.historyOwnerPort(), .recovery = origin_server.completionRecovery() } });
                     try std.testing.expect(outcome == .committed);
                     try std.testing.expect(!outcome.committed.propagation_pending);
+                    try std.testing.expect(!outcome.committed.visibility_pending);
+                    try std.testing.expect(!outcome.committed.visibility_retry_pending);
+                    try std.testing.expect(!outcome.committed.visibility_repair_required);
                 }
             };
-            try NormalCompletion.run(a, server, "{\"v\":7}");
+            try NormalCompletion.run(a, server, "{\"v\":7}", .write);
             const normal_last = blk: {
                 lockAtomic(&server.data_raft_mutex);
                 defer server.data_raft_mutex.unlock();
                 break :blk host.raftStatus(601).?.last_index;
             };
-            try NormalCompletion.run(a, server, "{\"v\":7}");
-            try std.testing.expectError(error.SourceTransactionIdentityConflict, NormalCompletion.run(a, server, "{\"v\":8}"));
+            try NormalCompletion.run(a, server, "{\"v\":7}", .write);
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, NormalCompletion.run(a, server, "{\"v\":8}", .write));
             {
                 lockAtomic(&server.data_raft_mutex);
                 defer server.data_raft_mutex.unlock();
                 try std.testing.expectEqual(normal_last, host.raftStatus(601).?.last_index);
+            }
+            for ([_]antfly.db.types.SyncLevel{ .propose, .full_text, .enrichments, .full_index }) |level| {
+                try NormalCompletion.run(a, server, "{\"v\":7}", level);
             }
         }
 

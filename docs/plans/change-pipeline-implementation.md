@@ -3414,3 +3414,52 @@ index barrier. Hosted metadata writers, standalone/native source admission,
 source-global checkpoint participants, automatic root policy activation, bounded
 parallel admission/recovery and obligation/retention release remain unfinished,
 alongside the previously listed public feed/bootstrap/pgoutput/client scope.
+
+### Completion-aware visibility barriers
+
+The completion coordinator now accepts every existing sync level. BEGIN,
+PREPARE, coordinator COMMIT and complete-certificate publication retain their
+write-durable contract. `propose` receives that stronger durability; `write`
+requires no additional derived barrier. `full_text`, `enrichments` and
+`full_index` require a separate barrier on every original participant after
+completion publication, under the original aggregate request deadline.
+
+A fresh qualified retained COMMIT, matching the frozen admission and commit
+version, authorizes only a terminal-resolution command carrying the requested
+sync level. It cannot recreate BEGIN/PREPARE or replay original row/transform
+inputs. The existing canonical routed batch transport performs the native
+owner's synchronization and preserves retryable visibility and terminal
+worker-failure errors. A barrier retry may append an idempotent terminal Raft
+command; it does not replace the original resolution or completion publication.
+No retention release or source acknowledgement is authorized by this phase.
+
+The normal structured commit result independently preserves propagation debt,
+visibility retry debt and visibility repair debt. Both visibility flags survive
+when different owners require different remedies. Callers requesting errors get
+the existing propagation / visibility-not-satisfied / enrichment-worker-failed
+classes in the same precedence as legacy coordination. Post-COMMIT deadline,
+transport or barrier errors become committed visibility debt, never a new
+ambiguous decision or permission to reapply the transaction.
+
+Qualification: `completion-visibility-qualified-test.log`,
+`ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build history-control-apply-test -j2`
+with loopback networking enabled, passed all 11 cases with no skips or leaks.
+The native Raft fixture retries its committed normal transaction at propose,
+full-text, enrichment and full-index synchronization, with no pending flags.
+Participant tests verify exact requested levels, original owner/terminal version,
+empty effect inputs, preservation of worker-failed/retry-in-progress errors, and
+rejection of pending/aborted decisions, mismatched fences and invalid levels
+before dispatch. The stateful two-owner coordinator fixture preserves concurrent
+repair and retry debt, runs both barriers, and on successful retry does not
+re-resolve original effects or republish completion. Mixed capability and an
+insufficient policy ceiling are rejected before any decision read/mutation;
+all explicitly unsupported owners retain the legacy path. The preliminary
+12-case run also passed; its direct flag-assignment unit was replaced by the
+stronger two-owner coordinator checks above.
+
+The native fixture has no failing derived index; actual index-worker failure,
+cross-node failover and the broader public-feed/source/bootstrap/retention/CDC
+qualification requirements remain unproven. Hosted metadata writers and
+source-global admission are still outstanding. This removes the explicit
+non-write-sync rejection recorded in the preceding admission milestone; it does
+not complete either issue.

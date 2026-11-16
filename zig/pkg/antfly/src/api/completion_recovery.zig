@@ -223,9 +223,21 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         suppress_resolution: bool = false,
         state: decision_ops.wire.Record = .{ .status = .committed, .begin_timestamp = 10, .created_at_ns = 11, .commit_version = 20, .finalized_at_ns = 20, .prepared = true, .intents_resolved = true, .digest = @splat(7) },
         absent: bool = false,
+        unsupported_owners: [2]bool = .{ false, false },
+        retention_limit_bytes: u64 = 1024 * 1024,
+        visibility_errors: [2]?anyerror = .{ null, null },
+        visibility_calls: [2]usize = .{ 0, 0 },
+        decision_reads: usize = 0,
         cancelled: std.atomic.Value(bool) = .init(false),
         cancel_final_read: bool = false,
         follower_reads: usize = 0,
+        fn capture(ptr: *anyopaque, _: A, input_fence: metadata.CatalogRouteFence, _: []const u8, _: @import("history_owner_operations.zig").Request, _: Context) !@import("history_owner_operations.zig").Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const index: usize = @intCast(input_fence.route.group_id - 9);
+            if (self.unsupported_owners[index]) return error.ChangefeedCapabilityUnsupported;
+            const owner = self.admission.participants[index].routed_owner.?;
+            return .{ .owner = owner, .observation = try @import("history_owner_operations.zig").wire.Reply.init(.{ .owner = owner }, .{ .term = 1, .index = 8 }, self.retention_limit_bytes) };
+        }
         fn acquire(ptr: *anyopaque, budget: catalog_api.RoutingBudget, authoritative: bool) !*catalog_api.RoutingGeneration {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try budget.checkpoint();
@@ -238,6 +250,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         }
         fn decision(ptr: *anyopaque, alloc: A, _: metadata.CatalogRouteFence, _: []const u8, input: decision_ops.Request, _: Context) !decision_ops.Reply {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.decision_reads += 1;
             const raw = try decision_ops.wire.encodeReply(alloc, input.binding(), .{ .request_digest = input.binding().digest(), .cut = .{ .term = 1, .index = 8 }, .decision = if (self.absent) null else .{ .record = self.state, .admission = .{ .admission = self.admission, .digest = self.admission.digest() } } });
             defer alloc.free(raw);
             return decision_ops.decodeReply(alloc, raw, input);
@@ -265,7 +278,18 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         fn write(ptr: *anyopaque, alloc: A, _: @import("internal_group_operations.zig").RoutedBatchAuthority, group: u64, _: []const u8, request: local.storage_db_selected_root.db.types.BatchRequest, _: @import("internal_batch_forwarding.zig").Context, _: Context) !?void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const index: usize = @intCast(group - 9);
-            try std.testing.expectEqual(.write, request.sync_level);
+            if (request.sync_level != .write) {
+                try std.testing.expectEqual(.full_index, request.sync_level);
+                try std.testing.expect(self.published[0] and self.published[1]);
+                try std.testing.expect(request.transaction.? == .resolve);
+                try std.testing.expectEqual(.committed, request.transaction.?.resolve.status);
+                try std.testing.expectEqual(@as(usize, 0), request.writes.len);
+                try std.testing.expectEqual(@as(usize, 0), request.transforms.len);
+                self.visibility_calls[index] += 1;
+                if (self.visibility_errors[index]) |err| return err;
+                return {};
+            }
+
             switch (request.transaction.?) {
                 .resolve => |terminal| {
                     try std.testing.expectEqual(@as(local.storage_db_selected_root.db.types.TxnStatus, if (self.state.status == .committed) .committed else .aborted), terminal.status);
@@ -350,4 +374,63 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(.aborted, try recovery.runRetained(a, retained, .{}));
     try std.testing.expectEqual(@as(usize, 8), fake.resolves);
     try std.testing.expectEqual(@as(usize, 4), fake.publishes);
+
+    // The normal coordinator uses the same retained two-owner state. A
+    // visibility-only retry must finish both barriers, preserve simultaneous
+    // repair/retry debt, and never reconstruct a BEGIN or PREPARE.
+    const admission_mod = @import("completion_admission.zig");
+    const plan_mod = @import("completion_plan.zig");
+    const native_types = local.storage_db_selected_root.db.types;
+    var frozen_inputs: [2]plan_mod.Input = undefined;
+    for (&frozen_inputs, owners, locators) |*input, owner, locator| input.* = .{
+        .owner = owner,
+        .locator = locator,
+        .roles = completion.Roles.guards,
+        .prepare = try (native_types.TransactionIntentRequest{ .completion_owner = owner }).completionBatch(admission.transaction_id, 10, owner.topology_epoch),
+    };
+    var frozen = try plan_mod.Plan.freezeDerived(a, admission.transaction_id, owners[0], &frozen_inputs, 11);
+    defer frozen.deinit();
+    fake.admission = frozen.admission;
+    fake.state = .{ .status = .committed, .begin_timestamp = 10, .created_at_ns = 11, .commit_version = 20, .finalized_at_ns = 20, .prepared = true, .intents_resolved = true, .digest = @splat(7) };
+    fake.resolved = .{ true, true };
+    fake.published = .{ false, false };
+    fake.suppress_resolution = false;
+    fake.visibility_errors = .{ error.EnrichmentWorkerFailed, error.EnrichmentRetryInProgress };
+    const coordinator: admission_mod.Coordinator = .{ .owners = .{ .ptr = &fake, .read_fn = Fake.capture }, .recovery = recovery };
+    const normal_inputs = [_]admission_mod.Input{
+        .{ .table_name = "docs", .group_id = 9, .topology_epoch = owners[0].topology_epoch, .intent = .{} },
+        .{ .table_name = "docs", .group_id = 10, .topology_epoch = owners[1].topology_epoch, .intent = .{} },
+    };
+    const writes_before_visibility = fake.resolves;
+    const incomplete_visibility = (try coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{})).?;
+    try std.testing.expect(!incomplete_visibility.propagation_pending);
+    try std.testing.expect(incomplete_visibility.visibility_pending);
+    try std.testing.expect(incomplete_visibility.visibility_retry_pending);
+    try std.testing.expect(incomplete_visibility.visibility_repair_required);
+    try std.testing.expectEqualDeep([_]usize{ 1, 1 }, fake.visibility_calls);
+    try std.testing.expectEqual(writes_before_visibility, fake.resolves);
+    const publications_after_completion = fake.publishes;
+    fake.visibility_errors = .{ null, null };
+    const visible = (try coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{})).?;
+    try std.testing.expect(!visible.propagation_pending);
+    try std.testing.expect(!visible.visibility_pending);
+    try std.testing.expect(!visible.visibility_retry_pending);
+    try std.testing.expect(!visible.visibility_repair_required);
+    try std.testing.expectEqualDeep([_]usize{ 2, 2 }, fake.visibility_calls);
+    try std.testing.expectEqual(publications_after_completion, fake.publishes);
+    try std.testing.expectEqual(writes_before_visibility, fake.resolves);
+
+    // Failed admission never reaches a decision read or participant mutation.
+    const decision_reads_before_rejection = fake.decision_reads;
+    fake.unsupported_owners[1] = true;
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{}));
+    fake.unsupported_owners[0] = true;
+    try std.testing.expectEqual(@as(?admission_mod.Result, null), try coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{}));
+    fake.unsupported_owners = .{ false, false };
+    fake.retention_limit_bytes = 1;
+    try std.testing.expectError(error.HistoryTooLarge, coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{}));
+    try std.testing.expectEqual(decision_reads_before_rejection, fake.decision_reads);
+    try std.testing.expectEqualDeep([_]usize{ 2, 2 }, fake.visibility_calls);
+    try std.testing.expectEqual(publications_after_completion, fake.publishes);
+    try std.testing.expectEqual(writes_before_visibility, fake.resolves);
 }

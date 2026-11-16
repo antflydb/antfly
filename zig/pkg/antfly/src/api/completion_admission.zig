@@ -34,6 +34,14 @@ pub const Result = struct {
     coordinator_group_id: u64,
     coordinator_table_name: []const u8,
     propagation_pending: bool,
+    visibility_pending: bool = false,
+    visibility_retry_pending: bool = false,
+    visibility_repair_required: bool = false,
+
+    fn visibilityFailure(self: *Result, err: anyerror) void {
+        self.visibility_pending = true;
+        if (err == error.EnrichmentWorkerFailed) self.visibility_repair_required = true else self.visibility_retry_pending = true;
+    }
 };
 pub const Coordinator = struct {
     owners: @import("history_owner_operations.zig").Port,
@@ -97,9 +105,6 @@ pub const Coordinator = struct {
         }
         if (unsupported == inputs.len) return null;
         if (unsupported != 0) return error.ChangefeedCapabilityUnsupported;
-        // Visibility levels require their existing derived-index barriers;
-        // never report them satisfied by durable history publication alone.
-        if (sync_level != .write) return error.UnsupportedOperation;
         std.mem.sort(Captured, captured.items, {}, struct {
             fn less(_: void, left: Captured, right: Captured) bool {
                 return std.mem.order(u8, &left.input.owner.namespace, &right.input.owner.namespace) == .lt;
@@ -130,7 +135,38 @@ pub const Coordinator = struct {
             for (captured.items, 0..) |item, index| self.recovery.participants.submit(a, &plan, index, item.fence, .prepare, context) catch return error.CommitDecisionUnknown;
             self.recovery.participants.submit(a, &plan, 0, coordinator.fence, .{ .resolve = .{ .status = .committed, .commit_version = commit_version } }, context) catch return error.CommitDecisionUnknown;
         }
-        const outcome = self.recovery.run(a, coordinator.input.owner, coordinator.fence, coordinator.table_name, transaction_id, context) catch return .{ .coordinator_group_id = coordinator.input.owner.group_id, .coordinator_table_name = coordinator.table_name, .propagation_pending = true };
-        return .{ .coordinator_group_id = coordinator.input.owner.group_id, .coordinator_table_name = coordinator.table_name, .propagation_pending = outcome != .complete };
+        const wants_visibility = switch (sync_level) {
+            .full_text, .enrichments, .full_index => true,
+            .propose, .write => false,
+        };
+        const outcome = self.recovery.run(a, coordinator.input.owner, coordinator.fence, coordinator.table_name, transaction_id, context) catch {
+            return .{ .coordinator_group_id = coordinator.input.owner.group_id, .coordinator_table_name = coordinator.table_name, .propagation_pending = true, .visibility_pending = wants_visibility, .visibility_retry_pending = wants_visibility };
+        };
+        var result: Result = .{ .coordinator_group_id = coordinator.input.owner.group_id, .coordinator_table_name = coordinator.table_name, .propagation_pending = outcome != .complete };
+        if (!wants_visibility) return result;
+        if (outcome != .complete) {
+            result.visibilityFailure(error.CommitPropagationIncomplete);
+            return result;
+        }
+        // Completion and derived visibility are separate obligations. A fresh
+        // retained COMMIT authorizes only an idempotent terminal resolution
+        // carrying the requested barrier; BEGIN/PREPARE are never replayed.
+        var committed = self.recovery.decisions.read(a, coordinator.fence, coordinator.table_name, query, context) catch |err| {
+            result.visibilityFailure(err);
+            return result;
+        };
+        defer committed.deinit();
+        const decision = committed.value.decision orelse {
+            result.visibilityFailure(error.SourceOutcomeUnresolved);
+            return result;
+        };
+        if (decision.record.status != .committed or decision.record.commit_version != commit_version or !std.mem.eql(u8, &decision.admission.digest, &plan.admission.digest())) {
+            result.visibilityFailure(error.SourceTransactionIdentityConflict);
+            return result;
+        }
+        for (captured.items, 0..) |item, index| {
+            self.recovery.participants.submitRetained(a, query.binding(), committed.value, index, item.fence, .{ .visibility = sync_level }, context) catch |err| result.visibilityFailure(err);
+        }
+        return result;
     }
 };
