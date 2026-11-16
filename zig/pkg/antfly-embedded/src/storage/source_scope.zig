@@ -240,6 +240,15 @@ pub const Store = struct {
         } else @compileError("unsupported source scope record type");
         return value;
     }
+    /// Reject fresh legacy source admission once this root enables scoped work.
+    /// A retained old transaction is handled by its own immutable record instead.
+    pub fn requireLegacyAllowed(a: std.mem.Allocator, txn: anytype) !void {
+        const bytes = txn.get(header_key) catch |err| switch (@as(anyerror, err)) {
+            error.NotFound => return,
+            else => return err,
+        };
+        try (try decode(Header, a, bytes)).requireLegacyAllowed();
+    }
     pub fn readHeader(a: std.mem.Allocator, txn: anytype, root: Basis) !Header {
         try root.validate();
         const bytes = txn.get(header_key) catch |err| switch (@as(anyerror, err)) {

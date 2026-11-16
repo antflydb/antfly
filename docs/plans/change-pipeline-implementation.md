@@ -4634,3 +4634,40 @@ This installs retained identity only. Production commands still use the existing
 wire profile; registry slot mutation and physical-root qualification must join
 the same atomic native write batch before scoped commands are enabled. No new
 Raft/API ABI profile is enabled by this record-only change.
+
+### Atomic native scope admission, prepare and resolution
+
+The native transaction write batch now enforces registry state for scoped v9
+records. Before staging replacement transaction/effect bytes it loads the exact
+retained completion admission, verifies v3 original owners and the checkpoint
+coordinator role, derives the local/coordinator physical bases and immutable slot
+identity, and enters or resolves that slot in the same NativeKV batch. First
+PREPARE checks the active slot before making the vote/intents durable; an already
+prepared exact retry keeps its first materialized images. Resolution requires an
+explicit actual apply cut before releasing the slot. A closing checkpoint
+coordinator cannot commit, while abort can atomically drain its original slot.
+
+Fresh legacy source-purpose BEGINs now consult the root's persisted strict policy
+and are rejected after scoped admission is enabled. Retained legacy transactions
+keep their original retry behavior; enabling the policy still requires the
+planned legacy-worker drain/migration. Ordinary application transactions are
+unaffected. Terminal scoped retries do not recreate or touch a reclaimed slot.
+
+Qualification: final `zig build --build-file zig/build.zig docstore-history-test
+-j2` completed with exit zero (`source-scope-atomic-final-test.log`), all 14 native
+regressions passing with zero skips/failures/leaks, plus the committed-frame
+build target dependency. The real-store scoped fixture now uses v3 retained
+owners, a persisted source registry and history reservation. It verifies failed
+unbound/legacy BEGIN leaves no transaction or admission record, retained identity
+across reopen, closing coordinator commit rejection with pending record/intents
+preserved, missing-cut abort rejection, atomic slot drainage on abort, stable
+closure cut/token floor, and closure between BEGIN and first PREPARE leaving no
+vote or intents. Formatting and diff checks passed. Two intermediate test-only
+compile errors (allocator argument and concrete read-transaction method) were
+corrected before this final passing run.
+
+This closes the native batch crash window for registry transitions. Scoped
+commands are not enabled yet: private wire tags/activation floors, API/opaque
+owner plumbing, independently qualified metadata actor/cut capture, control
+endpoints and managed legacy migration remain required. Production source adapter
+and the remaining full issue contracts remain unfinished and active.
