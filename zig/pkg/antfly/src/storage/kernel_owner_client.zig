@@ -631,8 +631,8 @@ pub const Owner = struct {
         return (try wire.decodeReply(alloc, response.bytes(), request)).observation;
     }
 
-    pub fn historyPublication(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, query: @import("antfly_local_sources").storage_committed_history.CompletionPublicationQuery) !@import("antfly_local_sources").storage_committed_history.CompletionPublicationObservation {
-        const history = @import("antfly_local_sources").storage_committed_history;
+    pub fn historyPublication(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, query: @import("antfly_local_sources").storage_history_publication_wire.CompletionPublicationQuery) !@import("antfly_local_sources").storage_history_publication_wire.CompletionPublicationObservation {
+        const history = @import("antfly_local_sources").storage_history_publication_wire;
         try query.validate();
         const json = try std.json.Stringify.valueAlloc(alloc, query, .{});
         defer alloc.free(json);

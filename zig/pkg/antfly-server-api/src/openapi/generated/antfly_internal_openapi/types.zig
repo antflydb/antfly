@@ -389,6 +389,81 @@ pub const NativeHistoryPosition = struct {
     event: u32,
 };
 
+pub const NativeHistoryPublicationCut = struct {
+    term: u64,
+    index: u64,
+};
+
+pub const NativeHistoryPublicationError = struct {
+    version: i64,
+    code: []const u8,
+};
+
+pub const NativeHistoryPublicationEvidenceValue = struct {
+    digest: NativeHistoryDigest,
+    retained_bytes: u64,
+    position: NativeHistoryPublicationCut,
+};
+
+pub const NativeHistoryPublicationEvidence = ?NativeHistoryPublicationEvidenceValue;
+
+pub const NativeHistoryPublicationOwner = struct {
+    version: i64,
+    metadata_group_id: u64,
+    /// Canonical 32-byte nonzero lowercase hexadecimal incarnation encoded as ASCII bytes.
+    metadata_incarnation: NativeHistoryDigest,
+    namespace: NativeHistoryNamespace,
+    table_binding: NativeHistoryDigest,
+    root_generation: u64,
+    group_id: u64,
+    topology_epoch: u64,
+};
+
+pub const NativeHistoryPublicationReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    cut: NativeHistoryPublicationCut,
+    publication: NativeHistoryPublicationEvidence,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "request_digest", "request_digest", false },
+        .{ "cut", "cut", false },
+        .{ "publication", "publication", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("publication");
+        try jw.write(self.publication);
+        try jw.endObject();
+    }
+};
+
+pub const NativeHistoryPublicationRequest = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    transaction_id: NativeHistoryConsumerId,
+    manifest_digest: NativeHistoryDigest,
+    commit_version: u64,
+    minimum_applied_index: u64,
+};
+
 pub const NativeHistoryReceipt = struct {
     term: u64,
     index: u64,

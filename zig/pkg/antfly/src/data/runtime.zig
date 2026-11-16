@@ -7077,6 +7077,7 @@ pub const DataServer = struct {
         api_server_cfg.native_history_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPageOperation } else null;
         api_server_cfg.native_history_grant = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyGrantOperation } else null;
         api_server_cfg.native_history_resolution = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyResolutionOperation } else null;
+        api_server_cfg.native_history_publication = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPublicationOperation } else null;
         api_server_cfg.native_history_roots = if (linked_storage and (self.data_raft != null or self.remote_metadata != null)) self.historyRootsSource() else null;
         api_server_cfg.backend_runtime = self.backend_runtime;
         api_server_cfg.restore_owner = .{ .ptr = self, .execute_fn = restoreOwnerControl };
@@ -13376,13 +13377,18 @@ pub const DataServer = struct {
         return .{ .ptr = self, .read_fn = historyGrantRoutedOperation };
     }
 
-    const HistoryOperation = enum { control, page, grant, resolution };
+    pub fn historyPublicationPort(self: *DataServer) @import("../api/history_publication_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = historyPublicationRoutedOperation };
+    }
+
+    const HistoryOperation = enum { control, page, grant, resolution, publication };
     fn historyRequestType(comptime kind: HistoryOperation) type {
         return switch (kind) {
             .control => @import("../api/history_control_operations.zig").wire.Request,
             .page => @import("../api/history_page_operations.zig").Request,
             .grant => @import("../api/history_grant_operations.zig").Request,
             .resolution => @import("../api/history_resolution_operations.zig").Request,
+            .publication => @import("../api/history_publication_operations.zig").Request,
         };
     }
     fn historyResultType(comptime kind: HistoryOperation) type {
@@ -13391,6 +13397,7 @@ pub const DataServer = struct {
             .page => @import("../api/history_page_operations.zig").pages.Page,
             .grant => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation,
             .resolution => @import("../api/history_resolution_operations.zig").wire.Reply,
+            .publication => @import("../api/history_publication_operations.zig").Reply,
         };
     }
     fn historyControlRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.control), context: antfly.public_api.operation.RequestContext) !historyResultType(.control) {
@@ -13400,6 +13407,10 @@ pub const DataServer = struct {
     fn historyPageRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.page), context: antfly.public_api.operation.RequestContext) !historyResultType(.page) {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         return self.historyRoutedOperation(alloc, fence, table, .page, input, context);
+    }
+    fn historyPublicationRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.publication), context: antfly.public_api.operation.RequestContext) !historyResultType(.publication) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .publication, input, context);
     }
     fn historyResolutionRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.resolution), context: antfly.public_api.operation.RequestContext) !historyResultType(.resolution) {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
@@ -13444,6 +13455,7 @@ pub const DataServer = struct {
             .page => historyPageOperation(self, alloc, fence, table, input, context),
             .grant => historyGrantOperation(self, alloc, fence, table, input, context),
             .resolution => historyResolutionOperation(self, alloc, fence, table, input, context),
+            .publication => historyPublicationOperation(self, alloc, fence, table, input, context),
         };
         // Only a compact, deadline-aware peer capture may discover a remote
         // endpoint. Never use the generic admin-snapshot routing fallback or
@@ -13467,7 +13479,13 @@ pub const DataServer = struct {
             .page => client.fetchGroupHistoryPage(uri, group, table, input, fence, context),
             .grant => client.fetchGroupHistoryGrant(uri, group, table, input, fence, context),
             .resolution => client.fetchGroupHistoryResolution(uri, group, table, input, fence, context),
+            .publication => client.fetchGroupHistoryPublication(uri, group, table, input, fence, context),
         };
+    }
+
+    fn historyPublicationOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.publication), context: antfly.public_api.operation.RequestContext) !historyResultType(.publication) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyLocalRead(alloc, fence, table, .publication, input, context);
     }
 
     fn historyResolutionOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.resolution), context: antfly.public_api.operation.RequestContext) !historyResultType(.resolution) {
@@ -13510,6 +13528,7 @@ pub const DataServer = struct {
                 .page => owner.orderedHistoryPageRouted(alloc, fence, table, input.request),
                 .grant => owner.orderedHistoryGrantRouted(alloc, fence, table, input.identity),
                 .resolution => owner.orderedHistoryResolutionRouted(alloc, fence, table, input.binding()),
+                .publication => owner.orderedHistoryPublicationRouted(alloc, fence, table, input.binding()),
                 .control => unreachable,
             }) catch |err| switch (err) {
                 error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.StorageKernelOwnerTransitionRequired, error.StorageOwnerAdmissionPending, error.ResourceBudgetExceeded => {
@@ -43474,7 +43493,7 @@ fn consumerTests() type {
                 };
                 const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
                 defer a.destroy(api_server);
-                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
                 var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
@@ -43886,11 +43905,16 @@ fn consumerTests() type {
                 try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
                 const retained_history = @import("antfly_local_sources").storage_committed_history;
                 const publication_query: retained_history.CompletionPublicationQuery = .{ .owner = current_owner, .transaction_id = txn_id, .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
-                const observed_publication = try owner.orderedHistoryPublicationRouted(a, route.fence().?, "docs", publication_query);
+                const publication_input: @import("../api/history_publication_operations.zig").Request = .{ .version = 1, .owner = current_owner, .transaction_id = txn_id, .manifest_digest = publication_query.manifest_digest, .commit_version = 1001, .minimum_applied_index = 1 };
+                const observed_publication = try server.historyPublicationPort().read(a, route.fence().?, "docs", publication_input, .{});
                 try observed_publication.validate(publication_query);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const remote_publication = try origin.historyPublicationPort().read(a, route.fence().?, "docs", publication_input, .{});
+                try remote_publication.validate(publication_query);
+                try std.testing.expectEqualDeep(observed_publication.publication, remote_publication.publication);
                 try std.testing.expect(observed_publication.publication != null);
                 try std.testing.expectEqualDeep(checked_certificate.value.digest, observed_publication.publication.?.digest);
-                const retried_publication = try owner.orderedHistoryPublicationRouted(a, route.fence().?, "docs", publication_query);
+                const retried_publication = try server.historyPublicationPort().read(a, route.fence().?, "docs", publication_input, .{});
                 try std.testing.expectEqualDeep(observed_publication.publication, retried_publication.publication);
                 var replaced_publication_query = publication_query;
                 replaced_publication_query.owner.root_generation += 1;
@@ -43941,7 +43965,23 @@ fn consumerTests() type {
                     var late_fence: LatePublicationFence = .{ .inner = original_barrier };
                     _ = owner.withReadSafetyBarrier(late_fence.barrier());
                     defer _ = owner.withReadSafetyBarrier(original_barrier);
-                    try std.testing.expectError(error.NotLeader, owner.orderedHistoryPublicationRouted(a, route.fence().?, "docs", publication_query));
+                    var late_publication_route = route.fence().?;
+                    const late_publication_deadline = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+                    late_publication_route.admission_deadline_ns = late_publication_deadline;
+                    late_publication_route.admission_deadline_io = null;
+                    while (true) {
+                        if (platform_time.monotonicNs() >= late_publication_deadline) return error.Timeout;
+                        late_fence.validations = 0;
+                        _ = owner.orderedHistoryPublicationRouted(a, late_publication_route, "docs", publication_query) catch |err| switch (err) {
+                            error.ReadUnavailable => {
+                                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                                continue;
+                            },
+                            error.NotLeader => break,
+                            else => return err,
+                        };
+                        return error.TestUnexpectedResult;
+                    }
                     try std.testing.expectEqual(@as(usize, 2), late_fence.validations);
                 }
             }

@@ -33,68 +33,14 @@ const completion = frame.completion;
 const completion_credit_prefix = "\x00\x00__committed_history__:completion_credit:";
 pub const completion_certificate_prefix = "\x00\x00__committed_history__:completion_certificate:";
 const completion_retained_prefix = "\x00\x00__committed_history__:completion_retained:";
-pub const CompletionPublicationPosition = struct { term: u64, index: u64 };
-pub const CompletionPublication = struct { digest: completion.Digest, retained_bytes: u64, position: CompletionPublicationPosition };
-pub const CompletionPublicationQuery = struct {
-    version: u8 = 1,
-    owner: completion.RoutedOwner,
-    transaction_id: [16]u8,
-    manifest_digest: completion.Digest,
-    commit_version: u64,
-    minimum_applied_index: u64,
-    pub fn validate(self: CompletionPublicationQuery) !void {
-        try self.owner.validate();
-        if (self.version != 1 or self.commit_version == 0 or self.minimum_applied_index == 0 or std.mem.allEqual(u8, &self.transaction_id, 0) or std.mem.allEqual(u8, &self.manifest_digest, 0)) return error.InvalidHistoryAdmission;
-    }
-    pub fn digest(self: CompletionPublicationQuery) completion.Digest {
-        var sha = std.crypto.hash.sha2.Sha256.init(.{});
-        sha.update("antfly:history-completion-publication-read:v1");
-        sha.update(&.{self.version});
-        sha.update(&self.owner.digest());
-        sha.update(&self.transaction_id);
-        sha.update(&self.manifest_digest);
-        for ([_]u64{ self.commit_version, self.minimum_applied_index }) |value| {
-            var raw: [8]u8 = undefined;
-            std.mem.writeInt(u64, &raw, value, .little);
-            sha.update(&raw);
-        }
-        return sha.finalResult();
-    }
-};
-pub const CompletionPublicationObservation = struct {
-    version: u8 = 1,
-    request_digest: completion.Digest,
-    cut: CompletionPublicationPosition,
-    publication: ?CompletionPublication,
-    pub fn init(query: CompletionPublicationQuery, cut: CompletionPublicationPosition, publication: ?CompletionPublication) !CompletionPublicationObservation {
-        const result: CompletionPublicationObservation = .{ .request_digest = query.digest(), .cut = cut, .publication = publication };
-        try result.validate(query);
-        return result;
-    }
-    pub fn validate(self: CompletionPublicationObservation, query: CompletionPublicationQuery) !void {
-        try query.validate();
-        if (self.version != 1 or !std.mem.eql(u8, &self.request_digest, &query.digest()) or self.cut.term == 0 or self.cut.index < query.minimum_applied_index) return error.HistoryCorrupt;
-        if (self.publication) |publication| {
-            if (std.mem.allEqual(u8, &publication.digest, 0) or publication.retained_bytes == 0 or publication.retained_bytes > 2 * completion.max_bytes + 128 or publication.position.term == 0 or publication.position.index == 0 or publication.position.index > self.cut.index or publication.position.term > self.cut.term or (publication.position.index == self.cut.index and publication.position.term != self.cut.term)) return error.HistoryCorrupt;
-        }
-    }
-};
-
-pub const publication_read_max_bytes: usize = 4096;
-pub fn decodeCompletionPublicationQuery(a: A, raw: []const u8) !CompletionPublicationQuery {
-    if (raw.len == 0 or raw.len > publication_read_max_bytes) return error.InvalidHistoryAdmission;
-    var parsed = std.json.parseFromSlice(CompletionPublicationQuery, a, raw, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidHistoryAdmission;
-    defer parsed.deinit();
-    try parsed.value.validate();
-    return parsed.value;
-}
-pub fn decodeCompletionPublicationObservation(a: A, raw: []const u8, query: CompletionPublicationQuery) !CompletionPublicationObservation {
-    if (raw.len == 0 or raw.len > publication_read_max_bytes) return error.HistoryCorrupt;
-    var parsed = std.json.parseFromSlice(CompletionPublicationObservation, a, raw, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.HistoryCorrupt;
-    defer parsed.deinit();
-    try parsed.value.validate(query);
-    return parsed.value;
-}
+const publication_wire = @import("history_publication_wire.zig");
+pub const CompletionPublicationPosition = publication_wire.CompletionPublicationPosition;
+pub const CompletionPublication = publication_wire.CompletionPublication;
+pub const CompletionPublicationQuery = publication_wire.CompletionPublicationQuery;
+pub const CompletionPublicationObservation = publication_wire.CompletionPublicationObservation;
+pub const publication_read_max_bytes = publication_wire.publication_read_max_bytes;
+pub const decodeCompletionPublicationQuery = publication_wire.decodeCompletionPublicationQuery;
+pub const decodeCompletionPublicationObservation = publication_wire.decodeCompletionPublicationObservation;
 pub const completion_publication_prefix = "\x00\x00__committed_history__:completion_publication:";
 pub fn completionPublicationKey(index: u64) [completion_publication_prefix.len + 8]u8 {
     var key: [completion_publication_prefix.len + 8]u8 = undefined;

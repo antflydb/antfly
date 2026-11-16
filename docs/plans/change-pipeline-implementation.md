@@ -2749,6 +2749,54 @@ marker. Leadership/no-op/idle-root progress must be tested and implemented with
 real durable source authority; a group ReadIndex is not a substitute for a
 native persisted cut. This remains part of the full recovery/bootstrap work.
 
+## In progress: signed HTTP publication recovery
+
+The internal OpenAPI contract now defines the service-only
+`/groups/{group_id}/tables/{table_name}/history/publication-v1` read, including the
+complete original owner, request digest, actual cut, nullable immutable
+publication observation and typed errors. Request/reply limits are 4096 bytes;
+the relative catalog routing budget is required and bounded to five seconds.
+`make generate` completed before handler implementation; generated internal API
+bindings are retained, while unrelated model-explorer inventory churn was removed.
+
+Publication query/reply/codec definitions now live in the pure
+`history_publication_wire.zig` module; the native history implementation keeps
+aliases for its existing entry points. HTTP validation does not import the native
+ledger implementation. Direct wire qualification passed all six tests, including
+request/owner binding, publication/cut bounds, duplicate fields and byte budgets.
+
+The HTTP client signs one bounded attempt, validates scope/cut/version/response
+headers and content type, rejects mutation outcome headers and treats an absent
+endpoint as unsupported. The handler requires a service principal even in legacy
+migration, enforces the shared budget and body limit, and returns no-store
+observations/errors. Runtime routing uses known leader discovery and the existing
+frozen original-owner native reader within one deadline. The real-Raft fixture
+now retrieves its published certificate observation through signed HTTP from a
+caller with no local replica.
+
+The first run in `completion-publication-http-test.log` passed all 17 HTTP
+contracts/authentication cases and reached its successful signed-HTTP publication
+read, but the later direct late-fence fixture hit transient read admission before
+its injected post-read failure. The fixture now uses the production bounded read
+retry path for positive observations and one original deadline with reset
+per-attempt proof counts for its direct late-fence assertion.
+
+Publication port/client calls also own a combined fence/context scope. Both
+original clocks are normalized once; the earlier deadline and both fallible
+cancellation scopes survive forwarding. Identical cancellation tokens are
+checked once per checkpoint. This closes the inherited generic forwarding gap
+where an original route-only budget could be replaced by a fresh context budget.
+`completion-publication-http-recovery-test.log` finished with exit 0 after those
+changes: all 18 HTTP contract/authentication cases, seven history-consumer cases,
+local storage discovery and six actual-Raft cases passed. The signed remote read
+returns the same immutable certificate publication as the qualified local read,
+and the late-fence fixture observes both proof validations on its final attempt. Its tests include unproven absence, positive publication,
+forged request/cut/future publication, missing acknowledgment, wrong content type,
+mutation-only headers, typed errors, unsupported endpoint, connection loss and
+cancellation, plus service-only route mounting during migration. Production
+coordinator integration, idle-root/leadership cut progress, retention/GC and all
+public/source/bootstrap/pgoutput/existing-client requirements remain mandatory.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
