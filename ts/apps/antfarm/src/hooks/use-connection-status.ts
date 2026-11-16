@@ -2,7 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { isProductEnabled } from "@/config/products";
 import { useApiConfig } from "@/hooks/use-api-config";
 
-export type ServerStatus = "connected" | "disconnected" | "checking";
+export type ServerStatus =
+  | "connected"
+  | "disconnected"
+  | "checking"
+  | "unauthorized"
+  | "forbidden"
+  | "unavailable";
 
 export interface ConnectionStatus {
   antfly: ServerStatus;
@@ -12,6 +18,23 @@ export interface ConnectionStatus {
 
 const CHECK_INTERVAL_DISCONNECTED = 30000; // 30 seconds when disconnected
 const CONNECTION_CHECK_TIMEOUT = 5000; // 5 seconds timeout for health checks
+
+function responseStatus(response: Response): ServerStatus {
+  if (response.ok) return "connected";
+  if (response.status === 401) return "unauthorized";
+  if (response.status === 403) return "forbidden";
+  return "unavailable";
+}
+
+function checkSignal(signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(CONNECTION_CHECK_TIMEOUT);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+function shouldRetry(status: ServerStatus): boolean {
+  // Auth failures need sign-in or permission changes, not background polling.
+  return status === "disconnected" || status === "unavailable";
+}
 
 export function useConnectionStatus(): ConnectionStatus {
   const { apiUrl, inferenceApiUrl } = useApiConfig();
@@ -29,13 +52,13 @@ export function useConnectionStatus(): ConnectionStatus {
       try {
         const response = await fetch(`${apiUrl}/status`, {
           method: "GET",
-          signal: signal ?? AbortSignal.timeout(CONNECTION_CHECK_TIMEOUT),
+          signal: checkSignal(signal),
         });
-        if (isMountedRef.current) {
-          setAntflyStatus(response.ok ? "connected" : "disconnected");
+        if (isMountedRef.current && !signal?.aborted) {
+          setAntflyStatus(responseStatus(response));
         }
       } catch {
-        if (isMountedRef.current) {
+        if (isMountedRef.current && !signal?.aborted) {
           setAntflyStatus("disconnected");
         }
       }
@@ -53,13 +76,13 @@ export function useConnectionStatus(): ConnectionStatus {
       try {
         const response = await fetch(`${inferenceApiUrl}/healthz`, {
           method: "GET",
-          signal: signal ?? AbortSignal.timeout(CONNECTION_CHECK_TIMEOUT),
+          signal: checkSignal(signal),
         });
-        if (isMountedRef.current) {
-          setInferenceStatus(response.ok ? "connected" : "disconnected");
+        if (isMountedRef.current && !signal?.aborted) {
+          setInferenceStatus(responseStatus(response));
         }
       } catch {
-        if (isMountedRef.current) {
+        if (isMountedRef.current && !signal?.aborted) {
           setInferenceStatus("disconnected");
         }
       }
@@ -92,17 +115,15 @@ export function useConnectionStatus(): ConnectionStatus {
     };
   }, [checkAntfly, checkInference]);
 
-  // Re-check every 30 seconds if any server is disconnected
+  // Re-check transient failures every 30 seconds.
   useEffect(() => {
-    const shouldRetry = antflyStatus === "disconnected" || inferenceStatus === "disconnected";
-
-    if (!shouldRetry) return;
+    if (!shouldRetry(antflyStatus) && !shouldRetry(inferenceStatus)) return;
 
     const interval = setInterval(() => {
-      if (antflyStatus === "disconnected") {
+      if (shouldRetry(antflyStatus)) {
         checkAntfly();
       }
-      if (inferenceStatus === "disconnected") {
+      if (shouldRetry(inferenceStatus)) {
         checkInference();
       }
     }, CHECK_INTERVAL_DISCONNECTED);
