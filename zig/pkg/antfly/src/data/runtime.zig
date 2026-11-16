@@ -60655,7 +60655,9 @@ const SourcePlanHttpFixture = struct {
         std.mem.writeInt(u64, next_spec.attempt[0..8], 2, .big);
         const transfer: Transfer = .{ .owner = original_owner, .fence = fence, .table = "docs", .spec = next_spec, .controls = origin_server.sourcePlanControlPort(), .observations = origin_server.sourcePlanObservePort(), .chunks = origin_server.sourcePlanChunkPort() };
         var artifact_record: artifact.Record = .{ .reservation = @splat(215), .spec = .{ .namespace = next_spec.namespace, .binding = next_spec.binding, .domain = next_spec.domain, .attempt = next_spec.attempt, .bytes = next_spec.bytes, .checksum = next_spec.checksum, .plan_digest = next_spec.plan_digest } };
-        artifact_record.stamp = try transfer.seal(a2, artifact_record, bytes, .{});
+        const bridge_seal_stamp = try transfer.seal(a2, artifact_record, bytes, .{});
+        try std.testing.expectEqual(bridge_seal_stamp, (try transfer.recoverSeal(a2, artifact_record, .{})).?);
+        artifact_record.stamp = bridge_seal_stamp;
         artifact_record.phase = .sealed;
         const recovered_bytes = try transfer.load(a2, artifact_record, .{});
         defer a2.free(recovered_bytes);

@@ -4522,3 +4522,49 @@ completion/GC ownership, and all remaining public feed/bootstrap/pgoutput/client
 qualification requirements are still outstanding. These private reads are an
 input to that integration, not a replacement for it. Both issues remain open
 and PR #1700 remains draft.
+
+### Provider-independent seal recovery and confirmed retained admission
+
+`SourceDelivery` can now recover a qualified native seal after its reply was
+lost while metadata still records a reserved upload. An adapter's optional
+`recoverArtifact` callback observes the original immutable upload without
+provider bytes. The actor then commits and reloads the metadata seal using the
+same guarded confirmation path as normal upload. Unknown metadata outcomes stop
+the pass before admission, including after a positive native seal observation.
+An absent/unsealed upload keeps the reservation and charge without admission.
+
+Adapters exposing `admitRetained` receive only the original pending authority
+and request context, never provider payload. The delivery path requires a
+matching artifact reservation, sealed metadata phase and non-null stamp before
+invoking it, then rechecks request activity. Frozen artifacts are mandatory for
+that capability at both initial planning and replanning. Recovery resolves the
+original destination outcome first; only a capable adapter with confirmed seal
+authority can resume its original retained admission. Legacy adapters preserve
+their existing behavior. The callback remains responsible for restoring and
+verifying the original frozen plan and resolving ambiguous native phases;
+absence alone never grants replay, changed-manifest or reclamation authority.
+
+`SourcePlan.Transfer.recoverSeal` supplies the actual read-only bridge: it
+validates the reserved journal grant and original native spec, uses the existing
+qualified routed observation, rejects fenced/reclaimed input, and returns only
+an observed immutable seal. It does not upload or propose control commands.
+
+Qualification: `source-control-test source-plan-http-test
+history-control-apply-test -j2` completed with exit zero
+(`source-retained-admission-test.log`). All selected suites (13, 12, 9, 12, 3 and
+9 tests) passed with zero skips/failures/leaks. The source recovery regression
+runs both legacy-artifact and checkpoint-authority profiles with native reply
+loss and metadata reply loss. It verifies no admission while the seal remains
+unobserved, no admission after an uncertain metadata confirmation, recovery by
+a replacement worker without provider rows, one upload/one admission, and quota
+release only after acceptance/retirement. The bridge regression verifies seal
+observation adds no control calls. The actual cross-node native fixture also
+recovers the seal from a still-reserved journal reference before loading and
+restoring the original frozen plan. Formatting and diff checks passed.
+
+This closes the orchestration gap between native seal observation and metadata
+confirmation. It does not claim that the full distributed source adapter,
+checkpoint provisioning/fencing, completion/GC handoff, PostgreSQL worker wiring,
+public feeds/bootstrap/retention, production pgoutput or existing-client
+qualification are complete. The full issue contracts remain active and both
+issues / draft PR #1700 remain open.

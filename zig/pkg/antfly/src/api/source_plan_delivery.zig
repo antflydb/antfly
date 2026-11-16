@@ -66,6 +66,20 @@ pub const Transfer = struct {
     fn command(self: Transfer, action: @FieldType(wire.native.Command, "action")) !wire.native.Command {
         return .{ .version = 1, .root = try wire.entry.rootFor(self.owner), .spec = self.spec, .action = action };
     }
+    /// Recover a lost native seal reply without provider bytes or mutations.
+    /// Only the exact reserved journal grant can be promoted by its actor.
+    pub fn recoverSeal(self: Transfer, a: A, record: ledger.Record, original: Context) !?ledger.Digest {
+        var request_scope = try @import("history_publication_operations.zig").Scope.init(self.fence, original);
+        const context = request_scope.context();
+        try context.ensureActive();
+        try self.authorize(record);
+        if (record.phase != .reserved) return error.SourceControlConflict;
+        const observation = try self.observe(a, context);
+        const status = observation.status orelse return error.SourceOutcomeUnresolved;
+        if (status.fence != null or status.reclamation != null) return error.SourceReceiptExpired;
+        try context.ensureActive();
+        return status.seal;
+    }
     /// Resume by inspecting the exact upload. Each mutation is issued once in
     /// this pass; uncertainty stops the pass before any further mutation.
     /// Native begin/chunk/seal are idempotent for this immutable upload identity.
@@ -202,7 +216,13 @@ test "source plan HTTP delivery resumes lost replies from retained bytes and gat
             .seal => 3,
             else => unreachable,
         }), fake.calls);
+        const before_recovery = fake.calls;
+        const recovered_seal = try transfer.recoverSeal(a, record, .{});
+        try std.testing.expectEqual(before_recovery, fake.calls);
+        try std.testing.expectEqual(lost == .seal, recovered_seal != null);
         const stamp = try transfer.seal(a, record, &fixture.frame, .{});
+        try std.testing.expectEqual(@as(usize, 3), fake.calls);
+        try std.testing.expectEqual(stamp, (try transfer.recoverSeal(a, record, .{})).?);
         try std.testing.expectEqual(@as(usize, 3), fake.calls);
         try std.testing.expectEqual(stamp, try transfer.seal(a, record, &fixture.frame, .{}));
         try std.testing.expectEqual(@as(usize, 3), fake.calls);
