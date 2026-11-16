@@ -2069,6 +2069,48 @@ verification and current-owner validation must be integrated at the native
 prepare ingress before exposing this capability. Public coordinated delivery
 remains disabled until these contracts and failure/recovery checks pass.
 
+## In progress: atomic participant resolution receipts
+
+Planned committed resolutions now stage a private checksummed request binding the
+frozen admission, transaction ID, commit version and exact resolved transaction
+record. The final history capture stage verifies the actual record through the
+shared transaction record codec (prepared, committed and intents resolved),
+checks the saved credit, and consumes the request before physical commit. It
+persists a bounded checksummed local resolution in the same native transaction
+as the final row effects and authenticated descriptor. The effect receipt hashes
+that exact descriptor, which authenticates the tuple chunks and header. Request
+failure rolls back the row, frame, source-position advance and transaction
+decision together.
+
+Zero-effect commits produce a positive resolution at an advanced native source
+position or the actual applying Raft term/index; they do not fabricate an empty
+row frame. Missing applying markers fail the whole resolution. Retry keeps the
+original receipt and commit version even after later applied markers or frames.
+Lookup verifies the physical namespace, not merely that the receipt names some
+member of the manifest. A retained receipt also prevents reusing its transaction
+ID after primary metadata disappearance. The reservation bound now uses worst
+case manifest escaping rather than assuming the future certificate serializer
+matches saved admission formatting.
+
+All 134 docstore/transaction tests and the completion gate passed in
+`completion-resolution-atomic-test.log`. Ten focused history tests plus the
+completion gate passed in `completion-resolution-final-test.log`. Physical
+checks cover effect descriptor binding, zero-effect source positions, reopen,
+retry after superseding markers, full rollback after a staged-frame validation
+failure, missing Raft applying cut, and rejection of a well-formed foreign-member
+receipt. The Raft-cut fixture supplies native apply markers; it is not a real
+networked Raft failover qualification.
+
+The producer and lookup remain trusted storage-owner primitives. There is no
+activated distributed receipt RPC or public coordinated feed capability yet.
+Required next work includes frozen-input/current-owner checks at ingress,
+versioned native/Raft activation, strong routed receipt reads, authenticated
+coordinator collection, complete certificate assembly/publication, retained
+handoff before coordinator/participant GC, and ownership/topology recovery.
+Public projection still rejects coordinated frames until that full integration
+and the required failure/recovery tests pass. The full public feed, bootstrap,
+destination, pgoutput and existing-client requirements remain outstanding.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

@@ -288,6 +288,7 @@ pub const Capture = struct {
     reservation_previous: std.AutoHashMapUnmanaged([16]u8, Reservation) = .empty,
     members: std.StringHashMapUnmanaged(u64) = .empty,
     transaction_id: ?[16]u8 = null,
+    resolution_request: ?completion.ResolutionRequest = null,
     completion_credits: std.AutoHashMapUnmanaged([16]u8, CompletionCreditChange) = .empty,
 
     const CompletionCreditChange = struct { previous: u64, next: u64, digest: completion.Digest };
@@ -322,9 +323,10 @@ pub const Capture = struct {
         }
         const intent = std.mem.startsWith(u8, key, intents_prefix);
         const completion_admission = std.mem.startsWith(u8, key, completion.admission_prefix);
+        const resolution_request = std.mem.startsWith(u8, key, completion.resolution_request_prefix);
         const primary = keys.isStoredDocumentRowKey(key);
         const schema_change = std.mem.eql(u8, key, keys.public_schema_json_key);
-        if (!primary and !intent and !schema_change and !completion_admission) return;
+        if (!primary and !intent and !schema_change and !completion_admission and !resolution_request) return;
         if (primary) self.touched_primary = true;
         if (!self.checked) {
             self.checked = true;
@@ -333,7 +335,7 @@ pub const Capture = struct {
                 // Consumer removal cannot discard credits already promised
                 // to a prepared transaction. Finish those resolutions even
                 // when the last public consumer has been released.
-                self.enabled = if (state) |current| current.active() or current.reserved_bytes != 0 or completion_admission else false;
+                self.enabled = if (state) |current| current.active() or current.reserved_bytes != 0 or completion_admission or resolution_request else false;
                 if (state) |current| {
                     try requireNamespace(txn, current, current.namespace);
                     self.namespace = current.namespace;
@@ -344,8 +346,20 @@ pub const Capture = struct {
                 }
             }
         }
-        if (!self.enabled) return;
+        if (!self.enabled) {
+            if (resolution_request) return error.HistoryAuthorityRequired;
+            return;
+        }
         if (self.control or self.poisoned) return error.HistoryMixedControl;
+        if (resolution_request) {
+            if (key.len != completion.resolution_request_prefix.len + 16 or value == null or self.resolution_request != null) return error.InvalidTxnRecord;
+            const request = try completion.ResolutionRequest.decode(value.?);
+            if (!std.mem.eql(u8, key[completion.resolution_request_prefix.len..], &request.transaction_id)) return error.InvalidTxnRecord;
+            if (self.transaction_id) |id| if (!std.mem.eql(u8, &id, &request.transaction_id)) return error.HistoryMultipleTransactions;
+            self.transaction_id = request.transaction_id;
+            self.resolution_request = request;
+            return;
+        }
         if (completion_admission) return self.touchCompletion(a, txn, key, value);
         if (intent) return self.touchIntent(a, txn, key, value);
         if (!self.schema_checked) {
@@ -442,14 +456,38 @@ pub const Capture = struct {
         if (old_cost != 0 and next_cost == 0) pending.value_ptr.members = std.math.sub(u64, pending.value_ptr.members, 1) catch return error.HistoryCorrupt;
         item.value_ptr.* = next_cost;
     }
+    fn sourcePosition(self: *Capture, txn: anytype) !completion.Digest {
+        var owner = (try authority.load(txn)) orelse return error.HistoryAuthorityRequired;
+        const initial = self.initial_authority orelse return error.HistoryAuthorityRequired;
+        if (owner.kind != initial.kind) return error.HistoryAuthorityRequired;
+        if (owner.kind == .native) {
+            if (owner.sequence == initial.sequence) {
+                owner.sequence = try authority.advance(txn, self.namespace, null);
+            } else if (owner.sequence != initial.sequence +| 1) return error.HistoryAuthorityRequired;
+        }
+        var position: completion.Digest = @splat(0);
+        if (owner.kind == .raft) {
+            const marker = self.raft_marker orelse return error.HistoryAuthorityRequired;
+            @memcpy(position[0..16], &marker);
+            position[31] = 1;
+        } else {
+            std.mem.writeInt(u64, position[0..8], owner.sequence, .little);
+            position[31] = 2;
+        }
+        completion.validatePosition(position) catch return error.HistoryAuthorityRequired;
+        return position;
+    }
+
     pub fn stage(self: *Capture, a: A, txn: anytype) !void {
         if (self.poisoned) return error.HistoryTransactionFailed;
-        if (!self.enabled or (self.rows.count() == 0 and self.reservations.count() == 0 and self.completion_credits.count() == 0)) return;
+        if (!self.enabled or (self.rows.count() == 0 and self.reservations.count() == 0 and self.completion_credits.count() == 0 and self.resolution_request == null)) return;
         errdefer self.poisoned = true;
         self.staging = true;
         defer self.staging = false;
         var state = (try load(txn)) orelse return error.HistoryCorrupt;
         try requireNamespace(txn, state, self.namespace);
+        var produced: ?completion.Effects = null;
+        var produced_position: ?completion.Digest = null;
         var completions = self.completion_credits.iterator();
         while (completions.next()) |entry| {
             const change = entry.value_ptr.*;
@@ -507,24 +545,7 @@ pub const Capture = struct {
                     }
                 }.less);
                 const sequence = std.math.add(u64, state.latest, 1) catch return error.HistoryCorrupt;
-                var owner = (try authority.load(txn)) orelse return error.HistoryAuthorityRequired;
-                const initial = self.initial_authority orelse return error.HistoryAuthorityRequired;
-                if (owner.kind != initial.kind) return error.HistoryAuthorityRequired;
-                if (owner.kind == .native) {
-                    if (owner.sequence == initial.sequence) {
-                        owner.sequence = try authority.advance(txn, state.namespace, null);
-                    } else if (owner.sequence != initial.sequence +| 1) return error.HistoryAuthorityRequired;
-                }
-                var position: [32]u8 = @splat(0);
-                if (owner.kind == .raft) {
-                    const marker = self.raft_marker orelse return error.HistoryAuthorityRequired;
-                    if (std.mem.readInt(u64, marker[0..8], .little) == 0 or std.mem.readInt(u64, marker[8..16], .little) == 0) return error.HistoryAuthorityRequired;
-                    @memcpy(position[0..16], &marker);
-                    position[31] = 1;
-                } else {
-                    std.mem.writeInt(u64, position[0..8], owner.sequence, .little);
-                    position[31] = 2;
-                }
+                const position = try self.sourcePosition(txn);
                 var transaction_id: [16]u8 = undefined;
                 if (self.transaction_id) |id| transaction_id = id else {
                     var identity: [32]u8 = undefined;
@@ -539,9 +560,33 @@ pub const Capture = struct {
                 if (descriptor.storedBytes() > state.limit - state.retained_bytes - state.reserved_bytes) return error.HistoryFull;
                 for (0..descriptor.count) |i| try txn.put(&chunkKey(sequence, @intCast(i)), encoded[i * frame.chunk_bytes .. @min(encoded.len, (i + 1) * frame.chunk_bytes)]);
                 try txn.put(&recordKey(sequence), descriptor_raw);
+                produced = .{ .sequence = sequence, .frame_digest = frame.digest(descriptor_raw) };
+                produced_position = position;
                 state.latest = sequence;
                 state.retained_bytes += descriptor.storedBytes();
             }
+        }
+        if (self.resolution_request) |request| {
+            const plan_key = completion.admission_prefix.* ++ request.transaction_id;
+            const plan_raw = (try optional(txn, &plan_key)) orelse return error.HistoryCorrupt;
+            var plan = try completion.parseAdmission(a, plan_raw);
+            defer plan.deinit();
+            if (!std.mem.eql(u8, &plan.value.digest, &request.admission_digest)) return error.InvalidTxnRecord;
+            try requireCompletionReservation(txn, state.namespace, plan.value.admission);
+            const record_key = completion.record_prefix.* ++ request.transaction_id;
+            const record = (try optional(txn, &record_key)) orelse return error.HistoryCorrupt;
+            if (!std.mem.eql(u8, &completion.bytesDigest(record), &request.record_digest)) return error.InvalidTxnRecord;
+            try @import("transactions.zig").requireCompletionResolvedRecord(record, request.commit_version);
+            const manifest = try plan.value.admission.manifest(request.commit_version);
+            const member = try plan.value.admission.member(state.namespace);
+            const receipt_key = completion.resolutionKey(request.transaction_id);
+            if (try optional(txn, &receipt_key) != null) return error.InvalidTxnRecord;
+            const position = produced_position orelse try self.sourcePosition(txn);
+            const receipt: completion.Resolution = .{ .namespace = state.namespace, .owner_fence = member.owner_fence, .manifest_digest = manifest.digest(), .commit_version = request.commit_version, .source_position = position, .outcome = if (produced) |effects| .{ .effects = effects } else .{ .no_effect = completion.noEffectProof(manifest, state.namespace, position) } };
+            const encoded_receipt = try completion.encodeResolution(a, manifest, receipt);
+            defer a.free(encoded_receipt);
+            try txn.put(&receipt_key, encoded_receipt);
+            try txn.delete(&completion.requestKey(request.transaction_id));
         }
         try save(txn, state);
     }

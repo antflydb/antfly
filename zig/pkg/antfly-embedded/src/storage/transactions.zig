@@ -85,7 +85,7 @@ pub const max_read_guards_per_transaction = 65_536;
 // mutation; resolution retires both. Historical immutable schemas remain
 // usable after a new active epoch is published and after participant restart.
 const schema_leases_prefix = "\x00\x00__txn_schema_leases__:";
-const records_prefix = "\x00\x00__txn_records__:";
+const records_prefix = completion.record_prefix;
 const participants_prefix = "\x00\x00__txn_participants__:";
 const participant_index_prefix = "\x00\x00__txn_participant_index_v1__:";
 const resolved_index_prefix = "\x00\x00__txn_resolved_index_v1__:";
@@ -573,6 +573,7 @@ pub const TxnManager = struct {
             TxnError.TxnNotFound => null,
             else => return err,
         };
+        if (existing_record == null and try self.keyExists(&completion.resolutionKey(admission.transaction_id))) return TxnError.DecisionConflict;
         if (try self.getCompletionAdmission(self.alloc, admission.transaction_id)) |saved| {
             var owned = saved;
             defer owned.deinit();
@@ -617,6 +618,25 @@ pub const TxnManager = struct {
         defer a.free(namespace);
         if (namespace.len != 24 or record.coordinator != std.mem.eql(u8, namespace, &parsed.value.admission.coordinator_namespace)) return TxnError.DecisionConflict;
         _ = try parsed.value.admission.member(namespace[0..24].*);
+        return parsed;
+    }
+
+    pub fn getCompletionResolution(self: *TxnManager, a: Allocator, txn_id: TxnId) !?std.json.Parsed(completion.ResolutionEnvelope) {
+        var plan = (try self.getCompletionAdmission(a, txn_id)) orelse return null;
+        defer plan.deinit();
+        const record = try self.loadTransactionRecord(txn_id);
+        if (record.status != .committed or !record.prepared_known or !record.prepared or !record.intents_resolved_known or !record.intents_resolved) return error.SourceOutcomeUnresolved;
+        const manifest = try plan.value.admission.manifest(record.commit_version);
+        const raw = self.getAlloc(a, &completion.resolutionKey(txn_id)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer a.free(raw);
+        var parsed = try completion.parseResolution(a, manifest, raw);
+        errdefer parsed.deinit();
+        const namespace = try self.getAlloc(a, &internal_keys.identity_namespace_key);
+        defer a.free(namespace);
+        if (!std.mem.eql(u8, namespace, &parsed.value.resolution.namespace)) return error.InvalidTxnRecord;
         return parsed;
     }
 
@@ -1066,6 +1086,8 @@ pub const TxnManager = struct {
         extra_batch: ResolutionExtraBatch,
     ) !ResolutionOutcome {
         const rec_key = makeRecordKey(txn_id);
+        const completion_request_key = completion.requestKey(txn_id);
+        var completion_request: [124]u8 = undefined;
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status == .pending or extra_batch.source_purpose != null) {
@@ -1335,6 +1357,16 @@ pub const TxnManager = struct {
         }
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
         try deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
+
+        if (status == .committed) {
+            if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
+                var plan = saved;
+                defer plan.deinit();
+                const request: completion.ResolutionRequest = .{ .transaction_id = txn_id, .admission_digest = plan.value.digest, .commit_version = record.commit_version, .record_digest = completion.bytesDigest(rec_val) };
+                completion_request = try request.encode();
+                try writes.append(self.alloc, .{ .key = &completion_request_key, .value = &completion_request });
+            }
+        }
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
         try self.applyBatchWithParticipant(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null);
@@ -3241,6 +3273,13 @@ fn sameBytes(left: ?[]const u8, right: ?[]const u8) bool {
     return right == null;
 }
 
+/// Shared with the final history capture stage; it must inspect the staged
+/// record using the actual record codec rather than duplicating byte offsets.
+pub fn requireCompletionResolvedRecord(raw: []const u8, commit_version: u64) !void {
+    const record = try decodeRecord(raw);
+    if (record.status != .committed or record.commit_version != commit_version or !record.prepared_known or !record.prepared or !record.intents_resolved_known or !record.intents_resolved) return error.SourceOutcomeUnresolved;
+}
+
 fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == 0 or raw[0] > @backingInt(TxnStatus.aborted)) return error.InvalidTxnRecord;
     if (raw.len == txn_record_v8_size) {
@@ -3489,6 +3528,7 @@ test "committed history completion admission freezes the coordinator plan with b
     };
     const admission: completion.Admission = .{ .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = @splat(2), .participants = &members };
     const marker_key = "\x00\x00__completion_test_marker";
+    var receipt_digest: completion.Digest = @splat(0);
     {
         var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 });
         defer backend.close();
@@ -3561,6 +3601,15 @@ test "committed history completion admission freezes the coordinator plan with b
         try std.testing.expectError(error.SourceOutcomeUnresolved, manager.resolveIntents(admission.transaction_id, .committed, 20));
         try manager.writeIntents(admission.transaction_id, &.{}, &.{});
         try manager.resolveIntents(admission.transaction_id, .committed, 20);
+        {
+            var receipt = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+            defer receipt.deinit();
+            try std.testing.expectEqual(std.meta.Tag(completion.Outcome).no_effect, std.meta.activeTag(receipt.value.resolution.outcome));
+            try std.testing.expectEqual(@as(u8, 2), receipt.value.resolution.source_position[31]);
+            receipt_digest = receipt.value.digest;
+        }
+        try manager.resolveIntents(admission.transaction_id, .committed, 99);
+        try std.testing.expectError(error.NotFound, manager.getAlloc(a, &completion.requestKey(admission.transaction_id)));
         try manager.markParticipantsResolvedExtraBatch(admission.transaction_id, &.{ "original-writer", "original-guard" }, .{});
         try std.testing.expect(!(try manager.cleanupTransactionMetadataIfEligible(admission.transaction_id, std.math.maxInt(u64), std.math.maxInt(u64))));
         var retained = (try manager.getCompletionAdmission(a, admission.transaction_id)).?;
@@ -3576,6 +3625,18 @@ test "committed history completion admission freezes the coordinator plan with b
         try manager.markParticipantsResolvedExtraBatch(aborted.transaction_id, &.{ "original-writer", "original-guard" }, .{});
         try std.testing.expect(try manager.cleanupTransactionMetadataIfEligible(aborted.transaction_id, std.math.maxInt(u64), std.math.maxInt(u64)));
         try std.testing.expect((try manager.getCompletionAdmission(a, aborted.transaction_id)) == null);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        var receipt = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+        defer receipt.deinit();
+        try std.testing.expectEqual(receipt_digest, receipt.value.digest);
+        try std.testing.expectEqual(@as(u64, 20), receipt.value.resolution.commit_version);
     }
 }
 
@@ -3594,6 +3655,7 @@ test "committed history completion admission credits survive resolution and reje
     const encoded = try completion.encodeAdmission(a, admission);
     defer a.free(encoded);
     const credit = try admission.reservationBytes(encoded.len);
+    var receipt_digest: completion.Digest = @splat(0);
     const State = struct {
         fn read(store: *DocStore) !history.State {
             var txn = try store.beginReadTxn();
@@ -3624,7 +3686,27 @@ test "committed history completion admission credits survive resolution and reje
             try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
             try manager.writeIntents(admission.transaction_id, &.{.{ .key = "row", .value = "after" }}, &.{});
             try std.testing.expect((try State.read(&store)).reserved_bytes > credit);
+            const prepared = try State.read(&store);
+            const record_key = makeRecordKey(admission.transaction_id);
+            try std.testing.expectError(error.InvalidTxnRecord, manager.resolveIntentsWithExtraBatch(admission.transaction_id, .committed, 20, .{ .completion_writes = &.{.{ .key = &record_key, .value = "invalid-staged-record" }} }));
+            try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(admission.transaction_id));
+            try std.testing.expectEqualDeep(prepared, try State.read(&store));
+            const primary = try internal_keys.documentKeyAlloc(a, "row");
+            defer a.free(primary);
+            try std.testing.expectError(error.NotFound, manager.getAlloc(a, primary));
+            try std.testing.expectError(error.NotFound, manager.getAlloc(a, &history.recordKey(1)));
+            try std.testing.expectError(error.NotFound, manager.getAlloc(a, &completion.resolutionKey(admission.transaction_id)));
             try manager.resolveIntents(admission.transaction_id, .committed, 20);
+            {
+                var receipt = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+                defer receipt.deinit();
+                const effects = receipt.value.resolution.outcome.effects;
+                const descriptor = try manager.getAlloc(a, &history.recordKey(effects.sequence));
+                defer a.free(descriptor);
+                try std.testing.expectEqual(completion.bytesDigest(descriptor), effects.frame_digest);
+                try std.testing.expectEqual(@as(u64, 1), effects.sequence);
+                receipt_digest = receipt.value.digest;
+            }
             try std.testing.expectEqual(credit, (try State.read(&store)).reserved_bytes);
             var release = try store.beginWriteTxn();
             errdefer release.abort();
@@ -3674,6 +3756,9 @@ test "committed history completion admission credits survive resolution and reje
             try std.testing.expectError(TxnError.TxnNotFound, manager.loadTransactionRecord(rejected.transaction_id));
             try std.testing.expectError(error.NotFound, manager.getAlloc(a, marker));
             try std.testing.expectEqualDeep(full, try State.read(&store));
+            var receipt = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+            defer receipt.deinit();
+            try std.testing.expectEqual(receipt_digest, receipt.value.digest);
         }
     }
 }
@@ -3740,9 +3825,29 @@ test "committed history completion admission binds guard participant votes and o
             try std.testing.expect(record.prepared and !record.coordinator);
             _ = try manager.recoverTransactions(1000, 2000);
             try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(admission.transaction_id));
+            try manager.resolveIntents(admission.transaction_id, .committed, 20);
+            var receipt = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+            defer receipt.deinit();
+            try std.testing.expectEqual(std.meta.Tag(completion.Outcome).no_effect, std.meta.activeTag(receipt.value.resolution.outcome));
+            try std.testing.expectEqual(namespace, receipt.value.resolution.namespace);
+            try std.testing.expect(std.mem.readInt(u64, receipt.value.resolution.source_position[0..8], .little) > 0);
+            const receipt_key = completion.resolutionKey(admission.transaction_id);
+            const original = try manager.getAlloc(a, &receipt_key);
+            defer a.free(original);
+            const manifest = try admission.manifest(20);
+            var foreign = receipt.value.resolution;
+            foreign.namespace = admission.coordinator_namespace;
+            foreign.owner_fence = admission.coordinator_fence;
+            foreign.outcome = .{ .no_effect = completion.noEffectProof(manifest, foreign.namespace, foreign.source_position) };
+            const encoded_foreign = try completion.encodeResolution(a, manifest, foreign);
+            defer a.free(encoded_foreign);
+            try store.put(&receipt_key, encoded_foreign);
+            try std.testing.expectError(error.InvalidTxnRecord, manager.getCompletionResolution(a, admission.transaction_id));
+            try store.put(&receipt_key, original);
             var read = try store.beginReadTxn();
             defer read.abort();
             try std.testing.expectEqual(credit, (try history.load(&read)).?.reserved_bytes);
+            try std.testing.expectEqual(@as(u64, 0), (try history.load(&read)).?.latest);
         }
     }
     const coordinator_path = try tempTestPath(a, "completion-original-owner");
@@ -3760,6 +3865,55 @@ test "committed history completion admission binds guard participant votes and o
     defer freeParticipantList(a, recovery);
     try std.testing.expectEqualStrings("coordinator", recovery[0]);
     try std.testing.expectEqualStrings("guard", recovery[1]);
+}
+
+test "committed history completion admission raft resolution requires applying cut and preserves original receipt" {
+    const history = @import("committed_history.zig");
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const namespace: completion.Namespace = @splat(33);
+    {
+        var bind = try store.beginWriteTxn();
+        errdefer bind.abort();
+        try bind.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&bind, .raft, namespace);
+        try bind.commit();
+        var enroll = try store.beginWriteTxn();
+        errdefer enroll.abort();
+        _ = try history.admit(&enroll, namespace, @splat(1), 4 * 1024 * 1024, 1000, 1);
+        try enroll.commit();
+    }
+    const members = [_]completion.Participant{.{ .namespace = namespace, .owner_fence = @splat(4), .roles = completion.Roles.guards, .locator = "coordinator" }};
+    const admission: completion.Admission = .{ .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = @splat(4), .participants = &members };
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{});
+    try manager.writeIntents(admission.transaction_id, &.{}, &.{});
+    try std.testing.expectError(error.HistoryAuthorityRequired, manager.resolveIntents(admission.transaction_id, .committed, 20));
+    try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(admission.transaction_id));
+    try std.testing.expectError(error.NotFound, manager.getAlloc(a, &completion.requestKey(admission.transaction_id)));
+    try std.testing.expectError(error.SourceOutcomeUnresolved, manager.getCompletionResolution(a, admission.transaction_id));
+    var marker: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, marker[0..8], 2, .little);
+    std.mem.writeInt(u64, marker[8..16], 3, .little);
+    _ = try manager.resolveIntentsWithExtraBatch(admission.transaction_id, .committed, 20, .{ .writes = &.{.{ .key = &internal_keys.ordered_document_applied_entry_key, .value = &marker }} });
+    var first = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+    defer first.deinit();
+    try std.testing.expectEqual(std.meta.Tag(completion.Outcome).no_effect, std.meta.activeTag(first.value.resolution.outcome));
+    try std.testing.expectEqual(@as(u8, 1), first.value.resolution.source_position[31]);
+    try std.testing.expectEqualSlices(u8, &marker, first.value.resolution.source_position[0..16]);
+    std.mem.writeInt(u64, marker[8..16], 4, .little);
+    _ = try manager.resolveIntentsWithExtraBatch(admission.transaction_id, .committed, 99, .{ .completion_writes = &.{.{ .key = &internal_keys.ordered_document_applied_entry_key, .value = &marker }} });
+    var replayed = (try manager.getCompletionResolution(a, admission.transaction_id)).?;
+    defer replayed.deinit();
+    try std.testing.expectEqual(first.value.digest, replayed.value.digest);
+    const applied = try manager.getAlloc(a, &internal_keys.ordered_document_applied_entry_key);
+    defer a.free(applied);
+    try std.testing.expectEqualSlices(u8, &marker, applied);
+    try std.testing.expectEqual(@as(u64, 20), replayed.value.resolution.commit_version);
 }
 
 test "committed history transaction reservations survive reopen and committed recovery emits one original transaction" {

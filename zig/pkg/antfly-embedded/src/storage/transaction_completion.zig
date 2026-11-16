@@ -28,6 +28,48 @@ pub const max_participants = 1024;
 pub const max_locator_bytes = 1024;
 pub const max_bytes = 16 * 1024 * 1024;
 pub const admission_prefix = "\x00\x00__txn_completion_admission__:";
+pub const record_prefix = "\x00\x00__txn_records__:";
+pub const resolution_request_prefix = "\x00\x00__txn_completion_request__:";
+pub const resolution_prefix = "\x00\x00__txn_completion_resolution__:";
+pub const max_resolution_bytes = 2048;
+pub fn requestKey(id: [16]u8) [resolution_request_prefix.len + 16]u8 {
+    return resolution_request_prefix.* ++ id;
+}
+pub fn resolutionKey(id: [16]u8) [resolution_prefix.len + 16]u8 {
+    return resolution_prefix.* ++ id;
+}
+/// An internal staging instruction, removed before physical commit. The exact
+/// resolved transaction record is bound so unrelated metadata cannot certify it.
+pub const ResolutionRequest = struct {
+    transaction_id: [16]u8,
+    /// Admission.digest(), binding the complete frozen plan; this is distinct
+    /// from the source/input fingerprint stored in Admission.admission_digest.
+    admission_digest: Digest,
+    commit_version: u64,
+    record_digest: Digest,
+    pub fn encode(self: ResolutionRequest) ![124]u8 {
+        if (!nonzero(self.transaction_id) or !nonzero(self.admission_digest) or !nonzero(self.record_digest) or self.commit_version == 0) return error.InvalidTxnRecord;
+        var raw: [124]u8 = undefined;
+        @memcpy(raw[0..4], "CRQ1");
+        @memcpy(raw[4..20], &self.transaction_id);
+        @memcpy(raw[20..52], &self.admission_digest);
+        std.mem.writeInt(u64, raw[52..60], self.commit_version, .little);
+        @memcpy(raw[60..92], &self.record_digest);
+        @memcpy(raw[92..124], &bytesDigest(raw[0..92]));
+        return raw;
+    }
+    pub fn decode(raw: []const u8) !ResolutionRequest {
+        if (raw.len != 124 or !std.mem.eql(u8, raw[0..4], "CRQ1") or !std.mem.eql(u8, raw[92..124], &bytesDigest(raw[0..92]))) return error.InvalidTxnRecord;
+        const result: ResolutionRequest = .{ .transaction_id = raw[4..20].*, .admission_digest = raw[20..52].*, .commit_version = std.mem.readInt(u64, raw[52..60], .little), .record_digest = raw[60..92].* };
+        _ = try result.encode();
+        return result;
+    }
+};
+pub fn bytesDigest(bytes: []const u8) Digest {
+    var digest: Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
 pub const Roles = struct {
     pub const effects: u8 = 1;
     pub const guards: u8 = 2;
@@ -72,7 +114,8 @@ pub const Admission = struct {
     pub fn reservationBytes(self: Admission, encoded_admission_bytes: usize) !u64 {
         try self.validate();
         if (encoded_admission_bytes > max_bytes) return error.HistoryTooLarge;
-        const certificate = std.math.add(u64, 4096 + @as(u64, @intCast(encoded_admission_bytes)), @as(u64, @intCast(self.participants.len)) * 2048) catch return error.HistoryTooLarge;
+        var certificate: u64 = 4096;
+        for (self.participants) |participant| certificate += 512 + 6 * @as(u64, @intCast(participant.locator.len)) + 2048;
         if (certificate > max_bytes) return error.HistoryTooLarge;
         return certificate + encoded_admission_bytes + 128;
     }
@@ -197,6 +240,8 @@ pub fn validatePosition(position: Digest) !void {
     };
     if (!std.mem.allEqual(u8, position[end..31], 0)) return error.InvalidTxnRecord;
 }
+/// frame_digest hashes the exact authenticated committed-frame descriptor,
+/// which in turn authenticates every chunk, event offset and frame header.
 pub const Effects = struct { sequence: u64, frame_digest: Digest };
 pub const Outcome = union(enum) {
     effects: Effects,
@@ -211,6 +256,12 @@ pub const Resolution = struct {
     commit_version: u64,
     source_position: Digest,
     outcome: Outcome,
+    pub fn digest(self: Resolution) Digest {
+        var sha = std.crypto.hash.sha2.Sha256.init(.{});
+        sha.update("antfly:transaction-completion-resolution:v1");
+        self.hashInto(&sha);
+        return sha.finalResult();
+    }
     pub fn validate(self: Resolution, manifest: Manifest) !void {
         try manifest.validate();
         var low: usize = 0;
@@ -252,6 +303,34 @@ pub const Resolution = struct {
         }
     }
 };
+pub const ResolutionEnvelope = struct { resolution: Resolution, digest: Digest };
+pub fn encodeResolution(a: A, manifest: Manifest, resolution: Resolution) ![]u8 {
+    try resolution.validate(manifest);
+    const raw = try std.json.Stringify.valueAlloc(a, ResolutionEnvelope{ .resolution = resolution, .digest = resolution.digest() }, .{});
+    errdefer a.free(raw);
+    if (raw.len > max_resolution_bytes) return error.HistoryTooLarge;
+    return raw;
+}
+pub fn parseResolution(a: A, manifest: Manifest, raw: []const u8) !std.json.Parsed(ResolutionEnvelope) {
+    if (raw.len == 0 or raw.len > max_resolution_bytes) return error.InvalidTxnRecord;
+    var parsed = std.json.parseFromSlice(ResolutionEnvelope, a, raw, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidTxnRecord,
+    };
+    errdefer parsed.deinit();
+    try parsed.value.resolution.validate(manifest);
+    if (!same(parsed.value.digest, parsed.value.resolution.digest())) return error.InvalidTxnRecord;
+    return parsed;
+}
+pub fn noEffectProof(manifest: Manifest, namespace: Namespace, position: Digest) Digest {
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    sha.update("antfly:transaction-completion-zero-effects:v1");
+    sha.update(&manifest.digest());
+    sha.update(&namespace);
+    sha.update(&position);
+    number(&sha, manifest.commit_version);
+    return sha.finalResult();
+}
 pub const Certificate = struct {
     version: u16 = 1,
     manifest: Manifest,
@@ -403,5 +482,5 @@ test "transaction completion reservation covers escaped plans and every particip
     defer a.free(certificate);
     const reserved = try admission.reservationBytes(plan.len);
     try std.testing.expect(plan.len + certificate.len + 128 <= reserved);
-    try std.testing.expectError(error.HistoryTooLarge, admission.reservationBytes(max_bytes));
+    try std.testing.expectError(error.HistoryTooLarge, admission.reservationBytes(max_bytes + 1));
 }
