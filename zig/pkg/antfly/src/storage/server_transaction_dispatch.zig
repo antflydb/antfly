@@ -125,6 +125,7 @@ pub fn applyReplicatedTransactionMutationInternal(
             defer alloc.free(encoded_input);
             const namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(db.core.identity_namespace);
             const intents: db_mod.types.TransactionIntentRequest = .{
+                .completion_owner = prepare.completion_owner,
                 .completion_input_digest = completion.preparedInputDigest(namespace, encoded_input),
                 .document_version_scheme = req.document_version_scheme,
                 .row_policy_principal_proof = req.row_policy_principal_proof,

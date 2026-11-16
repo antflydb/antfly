@@ -221,6 +221,7 @@ pub const TransactionMutation = union(enum) {
     prepare: struct {
         txn_id: TxnId,
         topology_epoch: u64,
+        completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
     },
     resolve: struct {
         txn_id: TxnId,
@@ -1756,6 +1757,7 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
     /// Trusted digest computed from canonical private PREPARE before native
     /// materialization. A frozen v2 plan rejects omission or substitution.
     completion_input_digest: ?[32]u8 = null,

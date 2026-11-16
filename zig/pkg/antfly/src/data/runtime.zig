@@ -12776,7 +12776,7 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
-        if (req.transaction) |mutation| if (mutation == .begin and mutation.begin.completion_admission != null)
+        if (@import("antfly_local_sources").api_internal_batch.requiresCompletionProtocol(req))
             return @import("../common/data_raft_protocol.zig").batch_completion_admission_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
             return @import("../common/data_raft_protocol.zig").batch_dense_artifact_flags_protocol_version;
@@ -43875,6 +43875,11 @@ fn consumerTests() type {
             try std.testing.expectEqual(version.batch_completion_admission_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
             try std.testing.expect(version.batch_completion_admission_protocol_version > version.batch_protocol_version);
             try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, data_raft_batch.encode(std.testing.allocator, "docs", request));
+            const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
+            const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 7, .topology_epoch = 3 };
+            const prepare: antfly.db.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 3, .completion_owner = owner } } };
+            try std.testing.expectEqual(version.batch_completion_admission_protocol_version, DataServer.requiredRaftBatchProtocolVersion(prepare));
+            try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, data_raft_batch.encode(std.testing.allocator, "docs", prepare));
         }
 
         test "data raft ordered history protocol preflight distinguishes incompatible and unavailable peers" {

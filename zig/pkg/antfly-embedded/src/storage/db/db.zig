@@ -26288,9 +26288,15 @@ pub const DB = struct {
                 .already_applied => return,
                 .apply => {},
             };
+            if (req.completion_owner) |owner| {
+                try owner.validate();
+                if (ordered_receipt == null) return error.ChangefeedCapabilityUnsupported;
+                const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+                if (!std.mem.eql(u8, &owner.namespace, &namespace) or owner.root_generation != self.core.root_generation) return error.HistoryResynchronizationRequired;
+            }
             var manager = try self.core.initTxnManager();
             defer manager.deinit();
-            if (try manager.completionPrepareStatus(txn_id, req.completion_input_digest, if (req.source_admission) |command| command.fingerprint() else null)) |prepared| {
+            if (try manager.completionPrepareStatus(txn_id, req.completion_input_digest, if (req.source_admission) |command| command.fingerprint() else null, req.completion_owner)) |prepared| {
                 if (ordered_receipt == null) {
                     var read = try self.core.store.beginReadTxn();
                     defer read.abort();
@@ -26699,10 +26705,11 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .completion_input_digest = req.completion_input_digest, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .completion_owner = req.completion_owner, .completion_input_digest = req.completion_input_digest, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .completion_owner = req.completion_owner,
                 .completion_input_digest = req.completion_input_digest,
                 .source_purpose = if (req.source_admission) |command| command.fingerprint() else null,
                 .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,

@@ -110,7 +110,7 @@ pub fn encodeWithStorageOwnerDescriptor(
     req: db_mod.types.BatchRequest,
     descriptor: ?descriptor_contract.Descriptor,
 ) ![]u8 {
-    if (req.transaction) |mutation| if (mutation == .begin and mutation.begin.completion_admission != null and protocol_version < @import("../common/data_raft_protocol.zig").batch_completion_admission_protocol_version)
+    if (batch_api.requiresCompletionProtocol(req) and protocol_version < @import("../common/data_raft_protocol.zig").batch_completion_admission_protocol_version)
         return error.UnsupportedRaftBatchProtocolVersion;
     const batch_json = try batch_api.encodeBatchRequest(alloc, req);
     defer alloc.free(batch_json);
@@ -211,7 +211,7 @@ fn decodeBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedRepli
     defer alloc.free(batch_json);
     var batch = try batch_api.parseInternalBatchRequest(alloc, batch_json);
     errdefer batch.deinit(alloc);
-    if (batch.req.transaction) |mutation| if (mutation == .begin and mutation.begin.completion_admission != null and protocol_version < @import("../common/data_raft_protocol.zig").batch_completion_admission_protocol_version)
+    if (batch_api.requiresCompletionProtocol(batch.req) and protocol_version < @import("../common/data_raft_protocol.zig").batch_completion_admission_protocol_version)
         return error.UnsupportedRaftBatchProtocolVersion;
 
     var storage_owner_descriptor: ?OwnedStorageOwnerDescriptor = null;

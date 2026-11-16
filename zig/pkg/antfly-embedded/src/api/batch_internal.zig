@@ -1524,7 +1524,8 @@ fn parseBatchRequestWithOptions(
         _ = std.fmt.hexToBytes(&txn_id, txn_value.string) catch return error.InvalidBatchRequest;
         const completion_begin = std.mem.eql(u8, phase_value.string, "begin_completion_v1");
         if (completion_begin != object.contains("completion_admission")) return error.InvalidBatchRequest;
-        if (!completion_begin and object.contains("completion_owner")) return error.InvalidBatchRequest;
+        const completion_prepare = std.mem.eql(u8, phase_value.string, "prepare_completion_v1");
+        if (!completion_begin and !completion_prepare and object.contains("completion_owner")) return error.InvalidBatchRequest;
         var completion_owner: ?@import("../storage/transaction_completion.zig").RoutedOwner = null;
         if (object.get("completion_owner")) |item| {
             var parsed_owner = std.json.parseFromValue(@import("../storage/transaction_completion.zig").RoutedOwner, alloc, item, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBatchRequest;
@@ -1560,11 +1561,17 @@ fn parseBatchRequestWithOptions(
                 .completion_owner = completion_owner,
             } };
         }
-        const guarded_prepare = std.mem.eql(u8, phase_value.string, "prepare_ranges_v1");
+        if (completion_prepare and completion_owner == null) return error.InvalidBatchRequest;
+        if (completion_prepare) {
+            try completion_owner.?.validate();
+            if (completion_owner.?.topology_epoch != try parseInternalU64(object.get("topology_epoch") orelse return error.InvalidBatchRequest)) return error.InvalidBatchRequest;
+        }
+        const guarded_prepare = std.mem.eql(u8, phase_value.string, "prepare_ranges_v1") or (completion_prepare and range_guards != null and range_guards.?.value.len != 0);
         if (guarded_prepare != (range_guards != null and range_guards.?.value.len != 0)) return error.InvalidBatchRequest;
-        if (std.mem.eql(u8, phase_value.string, "prepare") or guarded_prepare) break :transaction .{ .prepare = .{
+        if (std.mem.eql(u8, phase_value.string, "prepare") or guarded_prepare or completion_prepare) break :transaction .{ .prepare = .{
             .txn_id = txn_id,
             .topology_epoch = try parseInternalU64(object.get("topology_epoch") orelse return error.InvalidBatchRequest),
+            .completion_owner = completion_owner,
         } };
         if (std.mem.eql(u8, phase_value.string, "resolve")) {
             const status_value = object.get("status") orelse return error.InvalidBatchRequest;
@@ -2364,8 +2371,13 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
                 }
             },
             .prepare => |prepare| {
+                if (prepare.completion_owner) |owner| {
+                    try owner.validate();
+                    if (owner.topology_epoch != prepare.topology_epoch) return error.InvalidBatchRequest;
+                }
                 const txn_hex = std.fmt.bytesToHex(prepare.txn_id, .lower);
-                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ if (req.range_guards.len != 0) "prepare_ranges_v1" else "prepare", &txn_hex, prepare.topology_epoch });
+                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ if (prepare.completion_owner != null) "prepare_completion_v1" else if (req.range_guards.len != 0) "prepare_ranges_v1" else "prepare", &txn_hex, prepare.topology_epoch });
+                if (prepare.completion_owner) |owner| try writer.print(",\"completion_owner\":{f}", .{std.json.fmt(owner, .{})});
             },
             .resolve => |resolve| {
                 const txn_hex = std.fmt.bytesToHex(resolve.txn_id, .lower);
@@ -3876,4 +3888,41 @@ test "completion begin wire carries matching v2 routed owner and rejects missing
     request.transaction.?.begin.completion_owner = owner;
     request.transaction.?.begin.topology_epoch += 1;
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, request));
+}
+
+/// Completion commands require the reserved all-applying-member floor even
+/// before the feature is advertised; never treat them as legacy row batches.
+pub fn requiresCompletionProtocol(request: db_mod.types.BatchRequest) bool {
+    const mutation = request.transaction orelse return false;
+    return switch (mutation) {
+        .begin => |begin| begin.completion_admission != null or begin.completion_owner != null,
+        .prepare => |prepare| prepare.completion_owner != null,
+        else => false,
+    };
+}
+
+test "completion begin wire prepare owner survives guarded replay and refuses legacy downgrade" {
+    const a = std.testing.allocator;
+    const completion = @import("../storage/transaction_completion.zig");
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 7, .topology_epoch = 3 };
+    var request: db_mod.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 3, .completion_owner = owner } } };
+    for (0..2) |guarded| {
+        request.range_guards = if (guarded == 1) &.{.{ .bucket = 0, .generation = null }} else &.{};
+        const encoded = try completionPrepareInput(a, request);
+        defer a.free(encoded);
+        try std.testing.expect(requiresCompletionProtocol(request));
+        var parsed = try parseInternalBatchRequest(a, encoded);
+        defer parsed.deinit(a);
+        try std.testing.expectEqualDeep(owner, parsed.req.transaction.?.prepare.completion_owner.?);
+        try std.testing.expectEqualDeep(request.range_guards, parsed.req.range_guards);
+        const replay = try completionPrepareInput(a, parsed.req);
+        defer a.free(replay);
+        try std.testing.expectEqualStrings(encoded, replay);
+        const downgraded = try std.mem.replaceOwned(u8, a, encoded, "prepare_completion_v1", "prepare");
+        defer a.free(downgraded);
+        try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, downgraded));
+        try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, encoded));
+    }
+    request.transaction.?.prepare.topology_epoch += 1;
+    try std.testing.expectError(error.InvalidBatchRequest, completionPrepareInput(a, request));
 }

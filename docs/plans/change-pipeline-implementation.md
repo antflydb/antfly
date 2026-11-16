@@ -2404,6 +2404,39 @@ root on every vote/retry; an input digest alone cannot authorize a replacement
 owner after restore or movement. This still needs native/request wiring. All
 remaining full issue requirements remain outstanding.
 
+## In progress: owner-fenced completion PREPARE and retries
+
+Private PREPARE now has a distinct `prepare_completion_v1` encoding carrying
+its routed owner context, including guarded prepares. The codec binds topology
+epoch, preserves the context in canonical input/replay, and rejects legacy
+phase downgrade. Both BEGIN and PREPARE select the reserved protocol 31 floor;
+Raft encoding/decoding remains disabled below it.
+
+Trusted server dispatch carries this owner context to native prepare. Before
+materialization or a prepared-retry shortcut, DB checks the actual physical
+namespace/root generation and requires an ordered applying entry. The transaction
+manager checks that the context names the local member and matches the original
+frozen owner fence along with its input digest, credits and source purpose.
+Ordinary transactions cannot acquire a completion-owner context without a frozen
+plan. Low-level vote admission carries/checks the same owner context. The typed
+engine boundary is descriptor 43.
+
+`completion-begin-wire-test ordered-history-consumer-test docstore-history-test
+history-resolution-owner-test` completed with exit 0 in
+`completion-prepare-owner-test.log`. The seven DB tests, ten lower-level history
+tests, explicit wire cases and compiled-owner descriptor-43 gate all passed.
+They cover owner omission/replacement without applied-cut advance, full prepared
+retry/reopen/commit, lower-level v2 guard votes, canonical guarded replay and
+legacy downgrade rejection. Source catalog generation completed.
+
+The real DataServer Raft test now additionally checks that owner-bearing PREPARE
+selects reserved protocol 31 and cannot encode below that ceiling.
+`history-control-apply-test` passed all six tests with exit 0 in
+`completion-prepare-owner-raft-test.log`, including BEGIN and PREPARE floor
+selection and encoder rejection. Live catalog admission, activation and
+production coordinator wiring remain next;
+all full destination/feed/bootstrap/pgoutput/client requirements remain open.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
