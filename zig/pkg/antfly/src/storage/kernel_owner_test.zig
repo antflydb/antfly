@@ -5280,13 +5280,19 @@ test "compiled ordered history root policy captures without consumers and fences
     live = true;
     try std.testing.expectEqualDeep(upgraded, try owner.orderedHistoryOutcome(a, "docs", .{ .command = .{ .configure_policy = changed }, .entry = .{ .term = 1, .index = upgrade_index }, .minimum_applied_index = upgrade_index }));
     try std.testing.expectEqualDeep(upgraded, try Fixture.command(a, &owner, &index, .{ .inspect_policy = .{ .namespace = namespace, .authority = first.authority } }));
-    var grant: control.Grant = .{ .namespace = namespace, .authority = first.authority, .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 2, .limit = changed.limit };
-    var stale_grant = grant;
-    stale_grant.policy_revision = 1;
-    try std.testing.expectEqual(.consumer_conflict, (try Fixture.command(a, &owner, &index, .{ .enroll = stale_grant })).rejected);
+    var grant: control.Grant = .{ .namespace = namespace, .authority = first.authority, .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 17, .limit = changed.limit };
     const enrolled = (try Fixture.command(a, &owner, &index, .{ .enroll = grant })).applied.consumer.?;
     try std.testing.expectEqual(@as(u64, 1), enrolled.epoch);
     try std.testing.expectEqual(@as(u64, 1), enrolled.start);
+    // Lease authorization generation is independent of the root retention
+    // configuration revision, but remains immutable for this actual lease.
+    try std.testing.expectEqual(@as(u64, 17), enrolled.policy_revision);
+    var changed_authorization = grant;
+    changed_authorization.policy_revision = 18;
+    try std.testing.expectEqual(.consumer_conflict, (try Fixture.command(a, &owner, &index, .{ .enroll = changed_authorization })).rejected);
+    const retained_policy = try Fixture.command(a, &owner, &index, .{ .inspect_policy = .{ .namespace = namespace, .authority = first.authority } });
+    try std.testing.expectEqual(@as(u64, 2), retained_policy.applied.policy.?.revision);
+
     try Fixture.batch(a, &owner, &index, .{ .writes = &.{.{ .key = "row", .value = "{\"v\":2}" }} });
     var page = try owner.orderedHistoryPage(a, "docs", .{ .reference = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = enrolled.epoch, .grant = grant.sequence, .definition = grant.definition }, .after = .{ .sequence = 1 }, .now_seconds = 100, .max_bytes = 16 * 1024 * 1024 }, index);
     defer page.deinit();

@@ -83,6 +83,7 @@ pub const Predicate = struct { field: []const u8, value: std.json.Value };
 pub const Table = struct {
     table_id: u64,
     binding: Digest,
+    /// Authorization/projection generation, independent of root retention configuration.
     policy_revision: u64,
     contract: Contract,
     fields: []const []const u8 = &.{},

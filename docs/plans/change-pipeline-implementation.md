@@ -3559,3 +3559,27 @@ rebuilt producer and consumers using engine descriptor 49. The attempted direct
 engine import in the control-only test was removed rather than weakening its
 compilation boundary. API generation completed, unrelated model-explorer output
 was restored, and format/diff checks passed.
+
+
+### Correct independent authorization and retention revisions
+
+Root retention configuration revisions and feed authorization/projection policy
+revisions have separate owners and meanings. The root policy milestone
+incorrectly required a new lease's authorization revision to equal the root
+retention revision. That check is removed. Native admission still enforces the
+root byte ceiling and preserves the lease's exact authorization revision;
+re-enrollment cannot substitute a different authorization revision into an
+existing lease. Root policy configuration/inspection continues to use its own
+predecessor/revision CAS. The two revision spaces must not be coupled by future
+policy provisioning or feed enrollment.
+
+Qualification: `root-policy-authorization-revision-test.log`,
+`ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build history-resolution-owner-test -Dstorage-owner-test-filter='compiled ordered history root policy' -j2`,
+passed the compiled native case with no skips, failures or leaks. It now enrolls
+a lease at authorization revision 17 while retention configuration is revision
+2, rejects changing that existing lease to authorization revision 18, and
+observes that retention remains revision 2. Existing capture-before-enrollment,
+quota/CAS, reopen and post-retirement capture checks in the same case pass.
+This supersedes the preceding milestone's claim that a grant authorization
+revision must match the configured retention revision. Automatic provisioning
+and the rest of the full issue scope remain outstanding.

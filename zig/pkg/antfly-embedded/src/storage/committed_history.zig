@@ -92,6 +92,7 @@ pub const Policy = struct {
     namespace: frame.Namespace,
     authority: [32]u8,
     previous_revision: u64,
+    /// Root retention configuration generation; not a lease authorization revision.
     revision: u64,
     limit: u64,
     pub const encoded_size = 116;
@@ -246,7 +247,6 @@ pub fn admit(txn: anytype, namespace: frame.Namespace, id: [16]u8, limit: u64, e
     var state = (try load(txn)) orelse State{ .namespace = namespace, .limit = limit };
     try requireNamespace(txn, state, namespace);
     if (state.limit != limit) return error.InvalidHistoryAdmission;
-    if (try loadPolicy(txn)) |policy| if (policy.revision != policy_revision) return error.HistoryConsumerConflict;
     for (state.consumers) |consumer| if (consumer.epoch != 0 and std.mem.eql(u8, &consumer.id, &id)) {
         if (consumer.expires_at_seconds != expires or consumer.policy_revision != policy_revision) return error.HistoryConsumerConflict;
         return consumer;

@@ -40,6 +40,7 @@ pub const Grant = struct {
     consumer: Id,
     definition: Digest,
     expires_at_seconds: u64,
+    /// Authorization/projection generation, independent of root retention revision.
     policy_revision: u64,
     limit: u64 = history.default_limit,
     pub fn validate(self: Grant) !void {
