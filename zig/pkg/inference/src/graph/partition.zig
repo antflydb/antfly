@@ -1136,6 +1136,7 @@ pub fn supportsPjrt(op: OpCode) bool {
         },
         .fused_conv1d => |attrs| attrs.in_channels > 0 and attrs.out_channels > 0 and attrs.kernel_size > 0 and attrs.stride > 0,
         .fused_conv2d => |attrs| attrs.in_channels > 0 and attrs.groups > 0 and attrs.in_channels % attrs.groups == 0 and attrs.out_channels > 0 and attrs.out_channels % attrs.groups == 0 and attrs.kernel_h > 0 and attrs.kernel_w > 0 and attrs.stride_h > 0 and attrs.stride_w > 0,
+        .fused_zero_tensor,
         .parameter,
         .constant,
         .stop_gradient,

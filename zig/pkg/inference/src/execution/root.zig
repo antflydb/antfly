@@ -64,6 +64,7 @@ pub const speculative_activation = @import("speculative_activation.zig");
 test {
     _ = capture;
     _ = captured_forward;
+    _ = @import("forward_kv_reuse.zig");
     _ = @import("pjrt_typed_test.zig");
     _ = @import("captured_primitives_test.zig");
     _ = @import("model_program_e2e_test.zig");

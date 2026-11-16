@@ -391,7 +391,7 @@ pub const PjrtSessionOptions = struct {
     /// Backend-neutral quantities; the optional SDK boundary converts them.
     pub const MemoryPolicy = union(enum) {
         cpu,
-        cuda: struct { capacity_bytes: usize, device_bytes: usize },
+        cuda: struct { capacity_bytes: usize, device_bytes: usize, unified_memory: bool = false },
     };
     task_override: ?TaskOverride = null,
     /// BF16 is explicit opt-in; model/device qualification gates default rollout.
@@ -420,7 +420,7 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
         // Do not publish a compiled target whose production forward has no
         // semantic frontend. Loading may fall back only before publication.
         const selected_task = sessionTaskForModelType(loaded_model.manifest.model_type, override);
-        if ((selected_task != .generic and !(selected_task == .extractor and decisionProgramEncoder(loaded_model.architecture) != null)) or loaded_model.manifest.glide_declared) return error.UnsupportedModelProgram;
+        if ((selected_task != .generic and !(selected_task == .extractor and decisionProgramEncoder(loaded_model.architecture, loaded_model.manifest.gliner_span_encoder_family) != null)) or loaded_model.manifest.glide_declared) return error.UnsupportedModelProgram;
         if (loaded_model.architecture == .modern_bert and loaded_model.architecture.modern_bert.laya != null) return error.UnsupportedModelProgram;
         switch (loaded_model.architecture) {
             .bert, .modern_bert, .nomic_bert, .embedding_gemma2, .whisper, .gpt, .deberta, .gliner, .gliner_modern_bert => {},
@@ -473,6 +473,7 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
             .cuda => |limit| .{ .cuda = .{ .capacity_bytes = limit.capacity_bytes, .device_bytes = limit.device_bytes } },
         } else null;
         impl.backend_data.pjrt.client = try pjrt_lib.pjrt.Client.initFromEnvWithMemoryPolicy(allocator, policy);
+        impl.backend_data.pjrt.parameters = @import("../graph/pjrt_parameters.zig").Store.init(allocator, &impl.backend_data.pjrt.client.?);
     }
     const host_data = switch (preparation.backend) {
         .native => &impl.backend_data.native,
@@ -563,6 +564,25 @@ test "host preparation shares execution and device-upload ownership and unwinds 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = &bytes });
     for ([_]HostSessionOptions{ .{}, .{ .weights = .{ .intent = .device_upload } } }) |preparation|
         try platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{ path, preparation, true });
+}
+
+/// Borrowed immutable operand inventory; the session must outlive its executables.
+pub fn getPjrtParameterStore(session: Session) ?*anyopaque {
+    if (comptime !build_options.enable_pjrt) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .pjrt) return null;
+    if (self.backend_data.pjrt.parameters) |*parameters| return @ptrCast(parameters);
+    return null;
+}
+
+/// Loaded publication policy, independent of the host backend used for tracing.
+pub fn getPjrtPrecision(session: Session) ?PjrtSessionOptions.Precision {
+    if (comptime !build_options.enable_pjrt) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .pjrt) return null;
+    return self.backend_data.pjrt.precision;
 }
 
 /// Return the PJRT client as a type-erased `*anyopaque` pointer, or null if
@@ -2790,6 +2810,7 @@ const GpuHostedData = if (false or build_options.enable_metal) gpu_hosted_store_
 /// PJRT backend data: weights are stored and served via the native backend,
 /// while the PJRT client is used for compiled partition execution.
 const PjrtData = struct {
+    parameters: if (build_options.enable_pjrt) ?@import("../graph/pjrt_parameters.zig").Store else void = if (build_options.enable_pjrt) null else {},
     precision: @import("precision.zig").Policy = .f32,
     /// Native weight store — PJRT uses the native backend for data
     /// conversion (host CTs ↔ PJRT buffers).
@@ -7849,25 +7870,26 @@ fn eagerHostRunObserved(raw: *anyopaque, inputs: []const Tensor, allocator: std.
     return archRunImplWithContext(raw, inputs, allocator, control, context, receipt, preentry);
 }
 
-fn decisionProgramEncoder(config: ArchConfig) ?gliner_encoder.Config {
+fn decisionProgramEncoder(config: ArchConfig, span_encoder_family: manifest_mod.GlinerSpanEncoderFamily) ?gliner_encoder.Config {
     return switch (config) {
         .gliner => |cfg| if (cfg.label_marker_decision_head) .{ .deberta = cfg } else null,
         .gliner_modern_bert => |cfg| .{ .modern_bert = cfg },
+        .modern_bert => |cfg| if (span_encoder_family == .modern_bert) .{ .modern_bert = cfg } else null,
         else => null,
     };
 }
 fn validateDecisionProgram(ptr: *anyopaque, inputs: []const @import("capture.zig").Input) anyerror!void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    _ = try @import("marker_classifier.zig").validate(decisionProgramEncoder(self.arch_config) orelse return error.UnsupportedModelProgram, inputs);
+    _ = try @import("marker_classifier.zig").validate(decisionProgramEncoder(self.arch_config, self.gliner_span_encoder_family) orelse return error.UnsupportedModelProgram, inputs);
 }
 fn forwardDecisionProgram(ptr: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const @import("capture.zig").Input) anyerror![]@import("capture.zig").Output {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    return @import("marker_classifier.zig").run(decisionProgramEncoder(self.arch_config) orelse return error.UnsupportedModelProgram, cb, allocator, inputs);
+    return @import("marker_classifier.zig").run(decisionProgramEncoder(self.arch_config, self.gliner_span_encoder_family) orelse return error.UnsupportedModelProgram, cb, allocator, inputs);
 }
 
 fn resolveArchModelProgram(ptr: *anyopaque, stage: @import("model_frontend.zig").Stage) anyerror!?@import("capture.zig").Forward {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    if (self.task == .extractor and decisionProgramEncoder(self.arch_config) != null) return switch (stage) {
+    if (self.task == .extractor and decisionProgramEncoder(self.arch_config, self.gliner_span_encoder_family) != null) return switch (stage) {
         .forward, .readout => .{ .context = self, .fingerprint = 4, .output_names = &.{"logits"}, .validate = validateDecisionProgram, .run = forwardDecisionProgram },
         else => null,
     };
@@ -8068,7 +8090,7 @@ fn runCapturedProgram(self: *ArchSession, inputs: []const Tensor, allocator: std
         .context = self,
         .create = createProgramFrame,
         .import = importProgramInput,
-        .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = client, .pjrt_precision = forward.precision },
+        .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = client, .pjrt_precision = forward.precision, .pjrt_parameter_store = getPjrtParameterStore(archSessionHandle(self)) },
     }, forward, declared, allocator, control);
 }
 
@@ -9788,6 +9810,7 @@ fn archCloseWithCleanup(ptr: *anyopaque, current: @import("cleanup_context.zig")
         .pjrt => {
             // Deinit the PJRT client (if one was successfully initialized).
             if (build_options.enable_pjrt) {
+                if (self.backend_data.pjrt.parameters) |*parameters| parameters.deinit();
                 if (self.backend_data.pjrt.client) |*client| {
                     client.deinit();
                 }

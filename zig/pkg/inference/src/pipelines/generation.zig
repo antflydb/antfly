@@ -2722,6 +2722,8 @@ pub const NativeGenerationPipeline = struct {
     /// Optional PJRT client for TPU/CPU partition execution. Type-erased
     /// pointer to pjrt.Client; used by the compiled backend registry.
     pjrt_client: ?*anyopaque = null,
+    /// Defaults to the loaded PJRT session policy when a session owns the client.
+    pjrt_precision: ?@import("../execution/precision.zig").Policy = null,
     pjrt_admission: ?*const @import("../graph/pjrt_admission.zig").Context = null,
     pjrt_plugin_path: ?[:0]const u8 = null,
 
@@ -6464,6 +6466,8 @@ pub const NativeGenerationPipeline = struct {
             .model_dir = self.model_dir,
             .artifact_dir = self.artifact_dir,
             .pjrt_client = self.pjrt_client,
+            .pjrt_parameter_store = if (self.session) |session| @import("../architectures/session_factory.zig").getPjrtParameterStore(session) else null,
+            .pjrt_precision = self.pjrt_precision orelse (if (self.session) |session| @import("../architectures/session_factory.zig").getPjrtPrecision(session) else null) orelse .f32,
             .session = self.session,
             .diagnostics_binding = self.diagnostics_binding,
             .kv_dtype = self.kv_dtype,

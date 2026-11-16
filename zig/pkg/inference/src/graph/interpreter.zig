@@ -2956,13 +2956,14 @@ pub fn executeNode(
         .fused_gqa_causal_attention => |attrs| {
             // If an attention context is provided, route through
             // gqaPagedAttention with auto-incremented layer_index.
-            if (state.options.attention) |base_attn| {
-                var attn = base_attn;
+            if (state.options.attention != null or (attrs.sliding_window orelse 0) != 0) {
+                var attn = state.options.attention orelse contracts.AttentionContext{ .total_sequence_len = attrs.seq_len, .query_sequence_len = attrs.seq_len, .kv_sequence_len = if (attrs.kv_seq_len != 0) attrs.kv_seq_len else attrs.seq_len };
                 attn.layer_index = if (attrs.layer_index == std.math.maxInt(u32))
                     state.attention_layer
                 else
                     attrs.layer_index;
                 attn.skip_kv_write = attrs.skip_kv_write;
+                if (attrs.sliding_window) |window| attn.sliding_window = window;
                 state.attention_layer += 1;
                 return cb.gqaPagedAttention(
                     V.get(ins[0]),

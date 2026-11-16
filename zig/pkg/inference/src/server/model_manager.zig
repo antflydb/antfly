@@ -3530,12 +3530,9 @@ pub const ModelManager = struct {
         self: *const ModelManager,
         backend_runtime: backends.BackendRuntime,
     ) runtime.tier.memory.Limits {
-        var limits = backends.defaultMemoryLimits(
-            backend_runtime.backend,
-            self.process_memory_limit_bytes,
-        );
+        var limits = backend_runtime.memoryLimits(self.process_memory_limit_bytes);
         limits = runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
-        return backends.clampPhysicalMemoryLimitsWithProcessPolicy(backend_runtime.backend, limits, self.process_memory_limit_bytes, self.process_memory_limit_provenance);
+        return backend_runtime.clampMemoryLimits(limits, self.process_memory_limit_bytes, self.process_memory_limit_provenance);
     }
 
     /// Apply architecture/artifact residency floors before attaching the hard
@@ -3548,15 +3545,12 @@ pub const ModelManager = struct {
         backend_runtime: backends.BackendRuntime,
         load_plan_floor: runtime.tier.memory.Limits,
     ) !runtime.tier.memory.Limits {
-        var limits = backends.defaultMemoryLimits(
-            backend_runtime.backend,
-            self.process_memory_limit_bytes,
-        );
+        var limits = backend_runtime.memoryLimits(self.process_memory_limit_bytes);
         if (source.kind != .onnx) {
             if (source.manifest) |manifest| limits = try session_factory.widenBudgetLimitsForManifest(self.allocator, source.path, manifest.*, limits, backend_runtime.backend);
         }
         limits = runtime.tier.memory.maxCompositeLimits(limits, load_plan_floor);
-        const resolved = backends.clampPhysicalMemoryLimitsWithProcessPolicy(backend_runtime.backend, runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides), self.process_memory_limit_bytes, self.process_memory_limit_provenance);
+        const resolved = backend_runtime.clampMemoryLimits(runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides), self.process_memory_limit_bytes, self.process_memory_limit_provenance);
         std.log.info("inference memory policy backend={s} requested={any} resolved={any} process_max_bytes={d} cuda_device_bytes={d} unified={} automatic_fallback={}", .{
             @tagName(backend_runtime.backend),                                               self.admission_limit_overrides,                          resolved,
             self.process_memory_limit_bytes,                                                 backends.cudaDeviceMemoryBytes(backend_runtime.backend), backends.cudaUsesUnifiedMemory(),
@@ -3574,11 +3568,8 @@ pub const ModelManager = struct {
         backend_runtime: backends.BackendRuntime,
         session: backends.Session,
     ) !runtime.tier.memory.Limits {
-        const limits = try session_factory.resolveBudgetLimitsForSessions(&.{session}, backends.defaultMemoryLimits(
-            backend_runtime.backend,
-            self.process_memory_limit_bytes,
-        ), self.admission_limit_overrides);
-        return backends.clampPhysicalMemoryLimitsWithProcessPolicy(backend_runtime.backend, limits, self.process_memory_limit_bytes, self.process_memory_limit_provenance);
+        const limits = try session_factory.resolveBudgetLimitsForSessions(&.{session}, backend_runtime.memoryLimits(self.process_memory_limit_bytes), self.admission_limit_overrides);
+        return backend_runtime.clampMemoryLimits(limits, self.process_memory_limit_bytes, self.process_memory_limit_provenance);
     }
 
     /// Lazily loaded composite-model components participate in the same
@@ -16227,3 +16218,21 @@ test "host preflight records policy denials and temporary contention" {
 }
 
 const imagePreprocessingRevision = loaded_runtime.imagePreprocessingRevision;
+
+test "PJRT admission manager reapplies provider capacity after operator overrides" {
+    const a = std.testing.allocator;
+    const sessions = backends.SessionManager{
+        .allocator = a,
+        .preferred_backends = &.{.pjrt},
+        .pjrt_memory_policy = .{ .cuda = .{ .capacity_bytes = 1024, .device_bytes = 4096, .unified_memory = true } },
+    };
+    var manager = ModelManager.init(a, sessions);
+    defer manager.deinit();
+    manager.admission_limit_overrides = .{ .host_limit_bytes = 8192, .backend_limit_bytes = 16384, .combined_limit_bytes = 32768 };
+    const selected = try sessions.resolveBackendRuntime(.pjrt);
+    const limits = manager.admissionLimitsForBackend(selected);
+    try std.testing.expect(limits.backend_limit_bytes <= 4096);
+    // Host and combined operator buckets are distinct even on shared memory.
+    try std.testing.expectEqual(@as(usize, 8192), limits.host_limit_bytes);
+    try std.testing.expect(limits.combined_limit_bytes <= 32768);
+}

@@ -95,6 +95,8 @@ pub const Context = struct {
     model_dir: ?[]const u8 = null,
     artifact_dir: ?[]const u8 = null,
     pjrt_client: ?*anyopaque = null,
+    pjrt_parameter_store: ?*anyopaque = null,
+    pjrt_precision: @import("../execution/precision.zig").Policy = .f32,
     session: ?@import("../backends/session.zig").Session = null,
     /// Borrowed exact outer owner; reader stores it in stable epoch allocation.
     cleanup_epoch: ?*const @import("../execution/retirement_sink.zig").Epoch = null,
@@ -243,6 +245,8 @@ fn compiledBackendAttachContext(
         .model_dir = pipeline.model_dir,
         .artifact_dir = pipeline.artifact_dir,
         .pjrt_client = pipeline.pjrt_client,
+        .pjrt_parameter_store = pipeline.pjrt_parameter_store,
+        .pjrt_precision = pipeline.pjrt_precision,
         .pjrt_admission = if (@hasField(@TypeOf(pipeline.*), "pjrt_admission")) pipeline.pjrt_admission else null,
         .pjrt_plugin_path = if (@hasField(@TypeOf(pipeline.*), "pjrt_plugin_path")) pipeline.pjrt_plugin_path else null,
         .session = pipeline.session,
@@ -497,6 +501,7 @@ fn graphCacheKey(
     const attn_mode = cacheAttentionMode(decode_context);
     return .{
         .config_hash = pipeline.gpt_config.fingerprint(),
+        .pjrt_precision = if (pipeline.compiled_partition_backend == .pjrt) pipeline.pjrt_precision else .f32,
         .batch = @intCast(batch),
         // Key the shape actually traced. Bucketing is safe only when the
         // caller has padded the physical inputs to that bucket first.
@@ -547,6 +552,7 @@ pub fn ensureGraphEntry(
                 .resolve = &Resolver.resolve,
             });
             defer tc.deinit();
+            tc.precision = if (pipeline.compiled_partition_backend == .pjrt) pipeline.pjrt_precision else .f32;
             tc.setRuntimeEmbeddingIds(input_ids);
             var tc_cb = tc.backend();
             var trace_dc = decode_context.*;
@@ -1255,4 +1261,37 @@ test "decoder cleanup borrows current call only and rejects foreign retired outs
     call.dense_ffn_program = null;
     try owner.bindDecoderCleanup(&call);
     try std.testing.expect(call.cleanup.boundary == null);
+}
+
+test "PJRT decoder precision controls traced weight storage and publication" {
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    const fixture = @import("../execution/testing/decoder.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    try fixture.populate(&weights);
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const cfg = fixture.config();
+    var context = Context{ .allocator = a, .cb = &cb, .gpt_config = &cfg, .compiled_partition_backend = .pjrt };
+    var cache = cache_mod.GraphCache.init(a);
+    defer cache.deinit();
+    const decode = gpt_arch.DecodeContext{ .total_sequence_len = 2, .query_sequence_len = 2, .kv_sequence_len = 2 };
+    for ([_]@import("../execution/precision.zig").Policy{ .f32, .bf16 }) |precision| {
+        context.pjrt_precision = precision;
+        const entry = try ensureGraphEntry(&context, &cache, &.{ 0, 1 }, 1, 2, &decode);
+        var parameters: usize = 0;
+        var half_publications: usize = 0;
+        for (0..entry.graph.nodeCount()) |i| {
+            const node = entry.graph.node(@intCast(i));
+            if (node.op == .parameter) {
+                parameters += 1;
+                try std.testing.expectEqual(if (precision == .bf16) @import("ml").graph.DType.bf16 else .f32, node.output_shape.dtype);
+            } else if (node.output_shape.dtype == .bf16) half_publications += 1;
+        }
+        try std.testing.expect(parameters > 0);
+        try std.testing.expect(if (precision == .bf16) half_publications > 0 else half_publications == 0);
+    }
+    try std.testing.expectEqual(@as(usize, 2), cache.count());
 }

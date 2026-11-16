@@ -32,6 +32,7 @@ pub const Forward = struct {
     precision: @import("precision.zig").Policy = .f32,
     /// Public output ABI names retained by the model, independent of cache entries.
     output_names: []const []const u8 = &.{},
+    input_info: []const tensor.TensorInfo = &.{},
     /// Rechecked on every invocation, including cache hits with new values.
     validate: ?*const fn (*anyopaque, []const Input) anyerror!void = null,
     run: *const fn (*anyopaque, *const ops.ComputeBackend, std.mem.Allocator, []const Input) anyerror![]Output,

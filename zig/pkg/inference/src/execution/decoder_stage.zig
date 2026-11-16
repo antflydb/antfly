@@ -141,7 +141,7 @@ pub const Decoder = struct {
                     row.host_outputs = try state.stepOutputs(prefix, dispatch, self.control);
                 } else {
                     var inputs: stages.DecoderInputs = undefined;
-                    try inputs.init(self.allocator, self.session.inputInfo(), prefix, self.encoder_mask, .{ .host = outputs[0] });
+                    try inputs.init(self.allocator, try self.session.inputInfoForStage(.decoder), prefix, self.encoder_mask, .{ .host = outputs[0] });
                     defer inputs.deinit();
                     const host_inputs = try inputs.hostInputs();
                     row.host_outputs = if (comptime @TypeOf(dispatch) == @TypeOf(null))

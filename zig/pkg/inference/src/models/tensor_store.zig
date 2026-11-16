@@ -150,6 +150,58 @@ pub const TensorStore = struct {
         return true;
     }
 
+    pub const Float32Footprint = struct {
+        bytes: usize = 0,
+        largest_tensor_bytes: usize = 0,
+
+        fn addShape(self: *@This(), shape: anytype, encoded: usize) !void {
+            var count: usize = 1;
+            for (shape) |axis| count = std.math.mul(usize, count, std.math.cast(usize, axis) orelse return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
+            const bytes = @max(encoded, std.math.mul(usize, count, 4) catch return error.ResourceLimitExceeded);
+            self.bytes = std.math.add(usize, self.bytes, bytes) catch return error.ResourceLimitExceeded;
+            self.largest_tensor_bytes = @max(self.largest_tensor_bytes, bytes);
+        }
+        fn merge(self: *@This(), other: @This()) !void {
+            self.bytes = std.math.add(usize, self.bytes, other.bytes) catch return error.ResourceLimitExceeded;
+            self.largest_tensor_bytes = @max(self.largest_tensor_bytes, other.largest_tensor_bytes);
+        }
+    };
+
+    /// Representation bounds from the same opened inventory. Reads headers,
+    /// including lazy shard headers, without decoding any tensor payload.
+    pub fn float32Footprint(self: TensorStore, allocator: std.mem.Allocator) anyerror!Float32Footprint {
+        var result = Float32Footprint{};
+        if (self.vtable == &CompositeGlinerStore.vtable) {
+            const owner: *CompositeGlinerStore = @ptrCast(@alignCast(self.ptr));
+            try result.merge(try owner.encoder.tensorStore().float32Footprint(allocator));
+            if (owner.head_safetensors) |head| try result.merge(try head.tensorStore().float32Footprint(allocator));
+            if (owner.head_gguf) |head| try result.merge(try head.tensorStore().float32Footprint(allocator));
+            return result;
+        }
+        if (self.vtable == &CompositeProjectorStore.vtable) {
+            const owner: *CompositeProjectorStore = @ptrCast(@alignCast(self.ptr));
+            try result.merge(try owner.primary.tensorStore().float32Footprint(allocator));
+            try result.merge(try owner.projector.tensorStore().float32Footprint(allocator));
+            return result;
+        }
+        if (self.ggufFile()) |file| {
+            for (file.tensors) |tensor| {
+                const encoded = gguf_mod.tensor_types.byteLen(tensor.tensor_type, tensor.dimensions) orelse return error.UnsupportedTensorType;
+                try result.addShape(tensor.dimensions, std.math.cast(usize, encoded) orelse return error.ResourceLimitExceeded);
+            }
+            return result;
+        }
+        const source = (try self.weightSource()) orelse return error.UnsupportedTensorStore;
+        const names = try source.listNames(allocator);
+        defer allocator.free(names);
+        for (names) |name| {
+            var range = (try self.describeTensorRange(allocator, name)) orelse return error.UnsupportedTensorStore;
+            defer range.deinit(allocator);
+            try result.addShape(range.shape, range.byte_len);
+        }
+        return result;
+    }
+
     pub fn kind(self: TensorStore) StoreKind {
         return self.vtable.kind(self.ptr);
     }
@@ -2015,4 +2067,32 @@ test "Native typed mapped source rejects fused expert alias and copied-table rec
     var copied = SafetensorsStore.vtable;
     const foreign = TensorStore{ .ptr = @ptrFromInt(16), .vtable = &copied };
     try std.testing.expect(try foreign.nativeTypedMappedSource(&.{ .name = "weight" }) == null);
+}
+
+test "PJRT admission measures expanded operands from safetensors metadata" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const json = "{\"w\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8]}}";
+    const padding = (8 - json.len % 8) % 8;
+    const header = std.fmt.comptimePrint("{s}{s}", .{ json, "        "[0..padding] });
+    const length = std.mem.nativeToLittle(u64, header.len);
+    const payload: [8]u8 = @splat(0);
+    var file = try temporary.dir.createFile(io, "weights.safetensors", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, std.mem.asBytes(&length));
+    try file.writeStreamingAll(io, header);
+    try file.writeStreamingAll(io, &payload);
+    const path = try temporary.dir.realPathFileAlloc(io, "weights.safetensors", a);
+    defer a.free(path);
+    const owner = try SafetensorsStore.initAbsolute(a, path);
+    const store = owner.tensorStore();
+    defer store.deinit();
+    const footprint = try store.float32Footprint(a);
+    try std.testing.expectEqual(@as(usize, 16), footprint.bytes);
+    try std.testing.expectEqual(@as(usize, 16), footprint.largest_tensor_bytes);
+    var invalid = TensorStore.Float32Footprint{};
+    try std.testing.expectError(error.ResourceLimitExceeded, invalid.addShape(&[_]i64{-1}, 0));
+    try std.testing.expectError(error.ResourceLimitExceeded, invalid.addShape(&[_]usize{std.math.maxInt(usize)}, 0));
 }

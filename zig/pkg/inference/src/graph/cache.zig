@@ -58,12 +58,14 @@ pub const CompiledAttachmentTarget = enum {
 pub const CacheKey = struct {
     /// Hash of the model configuration (architecture, dims, layer count, etc.).
     config_hash: u64,
+    pjrt_precision: @import("../execution/precision.zig").Policy = .f32,
     batch: u32,
     seq_len: u32,
     attention_mode: AttentionMode,
 
     fn eql(a: CacheKey, b: CacheKey) bool {
         return a.config_hash == b.config_hash and
+            a.pjrt_precision == b.pjrt_precision and
             a.batch == b.batch and
             a.seq_len == b.seq_len and
             a.attention_mode == b.attention_mode;
@@ -245,6 +247,7 @@ pub const GraphCache = struct {
     /// this survives across graph shapes so prefill and decode can share
     /// runtime-owned KV/cache state when a backend supports it.
     compiled_model_runtime_backend: ?contracts.BackendKind = null,
+    compiled_pjrt_precision: ?@import("../execution/precision.zig").Policy = null,
     compiled_model_runtime_attachment_target: ?CompiledAttachmentTarget = null,
     compiled_model_runtime: ?model_runtime.ModelRuntime = null,
     compiled_model_runtime_owner: ?SessionRuntimeOwner = null,
@@ -294,6 +297,15 @@ pub const GraphCache = struct {
         self.compiled_model_runtime_backend = null;
         self.compiled_model_runtime_attachment_target = null;
         self.compiled_model_runtime_owner = null;
+    }
+
+    /// Prefill/decode share a runtime across graph shapes, but never across
+    /// tensor publication policies. Graph entries themselves remain keyed by policy.
+    pub fn selectPjrtPrecision(self: *GraphCache, precision: @import("../execution/precision.zig").Policy) void {
+        if (self.compiled_pjrt_precision) |existing| {
+            if (existing != precision) self.freeSessionCompiledModelRuntime();
+        }
+        self.compiled_pjrt_precision = precision;
     }
 
     pub fn resetSessionCompiledModelRuntime(self: *GraphCache) void {
@@ -1075,4 +1087,30 @@ test "owned session runtimes survive request backend changes and retire on owner
     cache.selectBackend(&second);
     try std.testing.expectEqual(@as(usize, 3), runtime_order);
     try std.testing.expect(cache.compiled_model_runtime == null);
+}
+
+// Reusing an F32 executable for BF16 silently changes every publication boundary.
+test "graph cache separates PJRT publication precision" {
+    const f32_key = CacheKey{ .config_hash = 1, .batch = 1, .seq_len = 4, .attention_mode = .full_recompute };
+    var bf16_key = f32_key;
+    bf16_key.pjrt_precision = .bf16;
+    try std.testing.expect(!CacheKey.eql(f32_key, bf16_key));
+    try std.testing.expect(CacheKey.eql(bf16_key, bf16_key));
+
+    var cache = GraphCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var order: usize = 0;
+    var runtime_retired: usize = 0;
+    var executor_retired: usize = 0;
+    var owner = MockModelRuntimeCtx{ .next_order = &order, .runtime_deinit_order = &runtime_retired, .executor_deinit_order = &executor_retired };
+    cache.selectPjrtPrecision(.f32);
+    cache.putSessionCompiledModelRuntime(.pjrt, .whole_model, .{ .ptr = &owner, .vtable = &MockModelRuntimeCtx.runtime_vtable });
+    cache.selectPjrtPrecision(.f32);
+    try std.testing.expect(cache.getSessionCompiledModelRuntime(.pjrt, .whole_model) != null);
+    try std.testing.expectEqual(@as(usize, 0), runtime_retired);
+    cache.selectPjrtPrecision(.bf16);
+    try std.testing.expect(cache.getSessionCompiledModelRuntime(.pjrt, .whole_model) == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime_retired);
+    cache.selectPjrtPrecision(.bf16);
+    try std.testing.expectEqual(@as(usize, 1), runtime_retired);
 }

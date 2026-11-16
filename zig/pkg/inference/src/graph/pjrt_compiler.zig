@@ -262,6 +262,9 @@ pub fn compilePartitionWithOptions(
         if (try emitPrimitiveNode(allocator, &b, n, node_map, nid, &reducer_comp, &max_reducer_comp, &needs_reducer, &needs_max_reducer)) continue;
 
         switch (n.op) {
+            .fused_zero_tensor => {
+                node_map[nid] = try b.broadcast(try b.constantScalarF32(0), &.{}, graphShapeToHlo(n));
+            },
             .parameter => {
                 const mutable = if (options.mutable_parameters) |flags| blk: {
                     if (flags.len != graph.nodeCount()) return error.InvalidMutableParameterTable;
@@ -1279,8 +1282,8 @@ fn emitStaticGqaAttention(
     });
     const scale = try b.constantScalarF32(1.0 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim))));
     scores = try b.multiply(scores, scale);
-    if (past_k == null) {
-        scores = try b.add(scores, try emitCausalMask(allocator, b, num_heads, q_len));
+    if (past_k == null or (attrs.sliding_window orelse 0) != 0) {
+        scores = try b.add(scores, try emitCausalMask(allocator, b, num_heads, q_len, kv_len, attrs.sliding_window orelse 0));
     }
     if (bias) |bias_id| scores = try b.add(scores, bias_id);
 
@@ -1336,18 +1339,27 @@ fn repeatGqaKvHeads(b: *hlo.Builder, value: hlo.Id, seq_len: i64, num_kv_heads: 
     return b.reshape(expanded, hlo.Shape.init(.f32, &.{ seq_len, num_heads, head_dim }));
 }
 
-fn emitCausalMask(allocator: Allocator, b: *hlo.Builder, heads: i64, rows: i64) !hlo.Id {
-    const positions = try allocator.alloc(i32, std.math.cast(usize, rows) orelse return error.UnsupportedShape);
-    defer allocator.free(positions);
-    for (positions, 0..) |*value, index| value.* = std.math.cast(i32, index) orelse return error.UnsupportedShape;
-    const index = try b.constantS32(hlo.Shape.init(.s32, &.{rows}), positions);
-    const grid = hlo.Shape.init(.s32, &.{ rows, rows });
-    const allowed = try b.compare(try b.broadcast(index, &.{0}, grid), try b.broadcast(index, &.{1}, grid), "GE");
-    const floats = hlo.Shape.init(.f32, &.{ rows, rows });
-    // Preserve the existing finite exclusion value while computing the mask
-    // from O(S) host metadata rather than serializing H*S*S float constants.
+fn emitCausalMask(allocator: Allocator, b: *hlo.Builder, heads: i64, rows: i64, keys: i64, window: u32) !hlo.Id {
+    if (keys < rows or rows <= 0) return error.UnsupportedShape;
+    const queries = try allocator.alloc(i32, std.math.cast(usize, rows) orelse return error.UnsupportedShape);
+    defer allocator.free(queries);
+    const columns = try allocator.alloc(i32, std.math.cast(usize, keys) orelse return error.UnsupportedShape);
+    defer allocator.free(columns);
+    for (queries, 0..) |*value, index| value.* = std.math.cast(i32, keys - rows + @as(i64, @intCast(index))) orelse return error.UnsupportedShape;
+    for (columns, 0..) |*value, index| value.* = std.math.cast(i32, index) orelse return error.UnsupportedShape;
+    const grid = hlo.Shape.init(.s32, &.{ rows, keys });
+    const query = try b.broadcast(try b.constantS32(hlo.Shape.init(.s32, &.{rows}), queries), &.{0}, grid);
+    const key = try b.broadcast(try b.constantS32(hlo.Shape.init(.s32, &.{keys}), columns), &.{1}, grid);
+    var allowed = try b.compare(query, key, "GE");
+    if (window != 0) {
+        const span: i32 = std.math.cast(i32, window - 1) orelse return error.UnsupportedShape;
+        const width = try b.broadcast(try b.constantS32(hlo.Shape.scalar(.s32), &.{span}), &.{}, grid);
+        allowed = try b.logicalAnd(allowed, try b.compare(key, try b.subtract(query, width), "GE"));
+    }
+    const floats = hlo.Shape.init(.f32, &.{ rows, keys });
+    // Keep the finite exclusion value and O(Q+K) host metadata.
     const mask = try b.select(allowed, try b.broadcast(try b.constantScalarF32(0), &.{}, floats), try b.broadcast(try b.constantScalarF32(-1.0e9), &.{}, floats));
-    return b.broadcast(mask, &.{ 1, 2 }, hlo.Shape.init(.f32, &.{ heads, rows, rows }));
+    return b.broadcast(mask, &.{ 1, 2 }, hlo.Shape.init(.f32, &.{ heads, rows, keys }));
 }
 
 fn emitSoftmaxLastDim(

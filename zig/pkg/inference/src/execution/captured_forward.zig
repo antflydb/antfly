@@ -165,7 +165,9 @@ const Entries = @import("specialization_cache.zig").Cache(Key, *Entry, Entry.key
 
 pub const Cache = struct {
     mutex: std.atomic.Mutex = .unlocked,
-    entries: Entries = Entries.init(4),
+    // Use the common bounded shape working set. A four-entry cache evicted
+    // ordinary encoder/decoder prefixes before a repeated task could reuse them.
+    entries: Entries = Entries.init(@import("../graph/cache.zig").max_entries),
     parameters: ?*ParameterStore = null,
     identity: ?Provider = null,
 
@@ -173,7 +175,7 @@ pub const Cache = struct {
         if (a.context != b.context or a.create != b.create or a.import != b.import or (a.compiled_context != null) != (b.compiled_context != null)) return false;
         if (a.compiled_context) |left| {
             const right = b.compiled_context.?;
-            return left.requested_backend == right.requested_backend and left.pjrt_client == right.pjrt_client and left.attachment_target == right.attachment_target and left.pjrt_precision == right.pjrt_precision;
+            return left.requested_backend == right.requested_backend and left.pjrt_client == right.pjrt_client and left.pjrt_parameter_store == right.pjrt_parameter_store and left.attachment_target == right.attachment_target and left.pjrt_precision == right.pjrt_precision;
         }
         return true;
     }
@@ -197,7 +199,7 @@ pub const Cache = struct {
                 return error.ForeignModelProgramProvider;
             }
         } else self.identity = provider;
-        if (resolved_provider.compiled_context) |*context| if (context.requested_backend == .pjrt) {
+        if (resolved_provider.compiled_context) |*context| if (context.requested_backend == .pjrt and context.pjrt_parameter_store == null) {
             if (comptime @import("build_options").enable_pjrt) {
                 const client: *@import("pjrt").pjrt.Client = @ptrCast(@alignCast(context.pjrt_client orelse {
                     self.mutex.unlock();
@@ -665,4 +667,81 @@ test "captured temporal PJRT independent reductions publish BF16 values after F3
     // F32 softmax/value contraction, then one BF16 publication per coordinate.
     const expected = [_]f32{ 0.10009765625, -0.2001953125, 0.30078125, -0.400390625, 0.337890625, 0.333984375, 0.09130859375, -0.0869140625, 0, 0, 0, 0, 0.2001953125, -0.6015625, 0.10009765625, 0.69921875, -0.1572265625, -0.08935546875, 0.21484375, 0.1845703125 };
     try std.testing.expectEqualSlices(f32, &expected, outputs[0].asFloat32());
+}
+
+// One captured graph must use the current donor values, retain them after the
+// producer retires, and preserve its local causal window on every replay.
+test "forward KV reuse captured PJRT preserves donor values and local windows" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var client = try @import("pjrt").pjrt.Client.initFromEnvWithMemoryPolicy(a, .cpu);
+    defer client.deinit();
+    var source = TestProvider{ .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
+    defer source.weights.deinitOwned();
+    const Forward = struct {
+        fn run(_: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const capture.Input) anyerror![]capture.Output {
+            var scope = try @import("forward_kv_reuse.zig").Scope.init(allocator, cb, 1, null);
+            defer scope.deinit();
+            const q = (try cb.zeroTensor(3, 2)) orelse return error.ZeroTensorUnsupported;
+            defer cb.free(q);
+            var attention = ops.AttentionContext{ .total_sequence_len = 3, .query_sequence_len = 3, .kv_sequence_len = 3, .sliding_window = 2, .forward_kv_reuse = scope.context() };
+            {
+                const values = try cb.fromFloat32Shape(inputs[0].tensor.asFloat32(), &.{ 3, 2 });
+                defer cb.free(values);
+                const donor = try cb.gqaPagedAttention(q, q, values, null, attention, 1, 1, 1, 2);
+                cb.free(donor);
+            }
+            attention.skip_kv_write = true;
+            const output = try cb.gqaPagedAttention(q, q, q, null, attention, 1, 1, 1, 2);
+            errdefer cb.free(output);
+            const outputs = try allocator.alloc(capture.Output, 1);
+            outputs[0] = .{ .name = "output", .value = output };
+            return outputs;
+        }
+    };
+    const provider = Provider{ .context = &source, .create = TestProvider.create, .import = TestProvider.import, .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = @ptrCast(&client) } };
+    var cache = Cache{};
+    defer cache.deinit(a);
+    for ([_]f32{ 1, 3 }) |factor| {
+        var values = try Tensor.initFloat32(a, "v", &.{ 3, 2 }, &.{ 2 * factor, 4 * factor, 6 * factor, 8 * factor, 10 * factor, 12 * factor });
+        defer values.deinit();
+        const outputs = try cache.run(a, provider, .{ .context = &source, .fingerprint = 0, .output_names = &.{"output"}, .run = Forward.run }, &.{.{ .tensor = values }}, a, null);
+        defer a.free(outputs);
+        defer for (outputs) |*output| output.deinit();
+        for ([_]f32{ 2, 4, 4, 6, 8, 10 }, outputs[0].asFloat32()) |want, got| try std.testing.expectApproxEqAbs(want * factor, got, 2e-6);
+    }
+    try std.testing.expectEqual(@as(u64, 1), cache.entries.stats.builds);
+}
+
+test "captured prefix working set reuses executables across repeated tasks" {
+    const a = std.testing.allocator;
+    var source = TestProvider{ .weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} } };
+    defer source.weights.deinitOwned();
+    const Forward = struct {
+        fn run(_: *anyopaque, cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, inputs: []const capture.Input) anyerror![]capture.Output {
+            const input = inputs[0].tensor;
+            const value = try cb.fromFloat32Shape(input.asFloat32(), &.{ @intCast(input.shape[0]), 1 });
+            defer cb.free(value);
+            const output = try cb.primNegate(value);
+            errdefer cb.free(output);
+            const outputs = try allocator.alloc(capture.Output, 1);
+            outputs[0] = .{ .name = "output", .value = output };
+            return outputs;
+        }
+    };
+    var cache = Cache{};
+    defer cache.deinit(a);
+    const provider = Provider{ .context = &source, .create = TestProvider.create, .import = TestProvider.import };
+    for (0..2) |_| for (1..14) |rows| {
+        const values: [13]f32 = @splat(2);
+        var input = try Tensor.initFloat32(a, "x", &.{ @intCast(rows), 1 }, values[0..rows]);
+        defer input.deinit();
+        const outputs = try cache.run(a, provider, .{ .context = &source, .fingerprint = 0, .output_names = &.{"output"}, .run = Forward.run }, &.{.{ .tensor = input }}, a, null);
+        defer a.free(outputs);
+        defer for (outputs) |*output| output.deinit();
+        for (outputs[0].asFloat32()) |value| try std.testing.expectEqual(@as(f32, -2), value);
+    };
+    try std.testing.expectEqual(@as(u64, 13), cache.entries.stats.builds);
+    try std.testing.expectEqual(@as(u64, 13), cache.entries.stats.hits);
+    try std.testing.expectEqual(@as(u64, 0), cache.entries.stats.evictions);
 }

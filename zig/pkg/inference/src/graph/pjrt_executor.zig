@@ -1386,6 +1386,10 @@ const PjrtModelRuntime = struct {
                 .graph_node => |node_id| {
                     if (node_id >= values.len) return error.MissingArtifactMetadata;
                     if (values[@intCast(node_id)] != null) continue;
+                    // Immutable operands are already retained by the executor.
+                    // Reopening them here can dequantize an entire checkpoint
+                    // again even though execution never consumes the host CT.
+                    if (phase.executor.retained_parameters.len != 0 and phase.executor.retained_parameters[input_index] != null) continue;
                     const node = self.graph.node(node_id);
                     if (node.op != .parameter) return error.MissingValue;
                     const name = self.graph.parameterName(node);
@@ -1439,7 +1443,20 @@ pub fn createModelExecutor(
     host_backend: *const ComputeBackend,
     client: *pjrt_lib.pjrt.Client,
 ) !*PjrtModelExecutor {
-    const partition_exec = try createExecutor(allocator, graph, part, cb, host_backend, client);
+    return createModelExecutorWithOptions(allocator, graph, part, cb, host_backend, client, .{}, null);
+}
+
+pub fn createModelExecutorWithOptions(
+    allocator: Allocator,
+    graph: *const Graph,
+    part: *const Partition,
+    cb: *const ComputeBackend,
+    host_backend: *const ComputeBackend,
+    client: *pjrt_lib.pjrt.Client,
+    options: compiler.CompileOptions,
+    shared_parameters: ?*@import("pjrt_parameters.zig").Store,
+) !*PjrtModelExecutor {
+    const partition_exec = try createExecutorWithOptions(allocator, graph, part, cb, host_backend, client, options, shared_parameters);
     errdefer partition_exec.partitionExecutor().deinitExecutor();
 
     const exec = try allocator.create(PjrtModelExecutor);
@@ -2526,4 +2543,41 @@ test "PJRT whole-model caches permuted logits mappings and finds sparse decode p
         try std.testing.expectEqual(@as(?usize, 0), phase.logits_index);
     }
     for ([_]usize{ 0, 2, 4, 127, 129 }) |seq_len| try std.testing.expect(runtime.decodePhaseForSeqLen(seq_len) == null);
+}
+
+test "PJRT publication retains device weights without host rematerialization" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const weight = try builder.parameter("absent.host.weight", ml.graph.Shape.init(.f32, &.{ 2, 2 }));
+    const native = @import("../ops/native_compute.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var bindings = [_]compiler.InputBinding{.{ .graph_node = weight }};
+    // Only the optional tag is inspected. These handles are never submitted
+    // or destroyed; attempting host weight acquisition fails on the empty store.
+    var retained = [_]?pjrt_lib.pjrt.Buffer{.{ .api = undefined, .handle = undefined }};
+    var executor: PjrtExecutor = undefined;
+    executor.input_bindings = &bindings;
+    executor.retained_parameters = &retained;
+    var runtime = PjrtModelRuntime{
+        .allocator = a,
+        .graph = &graph,
+        .executor = &executor,
+        .host_backend = &cb,
+        .input_materialization = .host_assisted_graph_inputs,
+        .retained_buffers = PjrtRetainedBufferCache.init(a),
+        .semantic_input_bindings = &.{},
+        .semantic_output_bindings = &.{},
+        .decode_variants = &.{},
+    };
+    defer runtime.retained_buffers.deinit();
+    const values = try a.alloc(?CT, graph.nodeCount());
+    defer a.free(values);
+    @memset(values, null);
+    try runtime.materializeGraphInputs(values, runtime.prefillPhase());
+    try std.testing.expect(values[weight] == null);
 }

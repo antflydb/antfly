@@ -23,6 +23,9 @@ const backend_choice = inference.native_backend_choice;
 const Primitive = enum { norm_backward };
 
 const Options = struct {
+    pjrt: @import("pjrt_options.zig").Options = .{},
+    generate_text: ?[]const u8 = null,
+    generate_tokens: usize = 8,
     primitive: ?Primitive = null,
     embedding_pool: ?inference.pipelines.embedding.PoolingStrategy = null,
     embedding_text: ?[]const u8 = null,
@@ -44,6 +47,8 @@ const Options = struct {
     resident: bool = false,
     incremental_source: bool = false,
     transcribe_audio: []const u8 = "",
+    transcribe_mode: enum { performance, correctness } = .performance,
+    transcribe_max_output_tokens: usize = 0,
     transcribe_timestamps: bool = false,
     transcribe_require_eos: bool = false,
     transcribe_output_format: enum { json, parity_f32 } = .json,
@@ -68,12 +73,30 @@ pub fn main(init: std.process.Init) !void {
     var options = Options{};
     while (args.next()) |arg| {
         const value = args.next() orelse return error.MissingArgument;
+        if (try options.pjrt.parse(arg, value)) continue;
+        if (std.mem.eql(u8, arg, "--transcribe-mode")) {
+            options.transcribe_mode = std.meta.stringToEnum(@FieldType(Options, "transcribe_mode"), value) orelse return error.InvalidArgument;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--transcribe-max-output-tokens")) {
+            options.transcribe_max_output_tokens = try std.fmt.parseInt(usize, value, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--generate-text")) {
+            options.generate_text = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--generate-tokens")) {
+            options.generate_tokens = try std.fmt.parseInt(usize, value, 10);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--embedding-text")) options.embedding_text = value else if (std.mem.eql(u8, arg, "--source-metadata-proof")) options.source_metadata_proof = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--transcribe-require-eos")) options.transcribe_require_eos = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--transcribe-timestamps")) options.transcribe_timestamps = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--transcribe-output-format")) options.transcribe_output_format = if (std.mem.eql(u8, value, "json")) .json else if (std.mem.eql(u8, value, "parity-f32")) .parity_f32 else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--transcribe-audio")) options.transcribe_audio = value else if (std.mem.eql(u8, arg, "--source-trace-constructor")) options.source_trace_constructor = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--source-pipelined-steps")) options.source_pipelined_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--incremental-source")) options.incremental_source = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-model-dir")) options.decoder_model_dir = value else if (std.mem.eql(u8, arg, "--source-attempts")) options.source_attempts = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--source-policy")) options.source_policy = std.meta.stringToEnum(@FieldType(Options, "source_policy"), value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--source-proof")) options.source_proof = std.meta.stringToEnum(@FieldType(Options, "source_proof"), value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--source-fixture-label")) options.source_fixture_label = std.meta.stringToEnum(@FieldType(Options, "source_fixture_label"), value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--admission")) options.admission = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--resident")) options.resident = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--graph-runtime")) options.graph_runtime = inference.graph.runtime.parseStrategy(value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--primitive")) options.primitive = std.meta.stringToEnum(Primitive, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--embedding-pool")) options.embedding_pool = std.meta.stringToEnum(inference.pipelines.embedding.PoolingStrategy, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--embedding-resident")) options.embedding_resident = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--embedding-normalize")) options.embedding_normalize = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--rows")) options.rows = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--dim")) options.dim = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = value else if (std.mem.eql(u8, arg, "--backend")) options.backend = backend_choice.parse(value) orelse return error.InvalidBackend else if (std.mem.eql(u8, arg, "--batch")) options.batch = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--seq-len")) options.seq_len = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--warmup-iters")) options.warmup = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--measure-iters")) options.iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--output")) options.output = value else if (std.mem.eql(u8, arg, "--diagnostics")) options.diagnostics = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-request-contexts")) options.decoder_request_contexts = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-scheduled")) options.decoder_scheduled = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-steps")) options.decoder_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--soak-seconds")) options.soak_seconds = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-pause-ms")) options.soak_pause_ms = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-allocator")) options.soak_allocator = std.meta.stringToEnum(@TypeOf(options.soak_allocator), value) orelse return error.InvalidArgument else return error.InvalidArgument;
     }
+    if (options.generate_text != null and (options.generate_tokens == 0 or options.generate_tokens > 256 or options.batch != 1 or options.embedding_pool != null or options.primitive != null or options.resident or options.incremental_source or options.transcribe_audio.len != 0 or options.decoder_steps != 0 or options.soak_seconds != 0)) return error.InvalidGenerationGeometry;
     if (options.embedding_text != null and options.embedding_pool == null) return error.EmbeddingTextRequiresEmbeddingPool;
     if (options.embedding_text != null and (options.primitive != null or options.resident or options.incremental_source or options.transcribe_audio.len != 0 or options.decoder_steps != 0 or options.decoder_request_contexts or options.decoder_scheduled or options.soak_seconds != 0)) return error.InvalidEmbeddingTextGeometry;
-    if (options.transcribe_audio.len == 0 and (options.transcribe_timestamps or options.transcribe_require_eos or options.transcribe_output_format != .json)) return error.InvalidTranscriptionGeometry;
-    if (options.transcribe_audio.len != 0 and (options.incremental_source or (options.backend != .native and options.backend != .metal and options.backend != .cuda) or options.batch != 1 or options.resident or options.primitive != null or options.embedding_pool != null or options.decoder_steps != 0 or options.decoder_request_contexts or options.decoder_scheduled or options.soak_seconds != 0 or options.source_proof != .off or options.source_trace_constructor or options.source_pipelined_steps != 0 or options.decoder_model_dir.len != 0)) return error.InvalidTranscriptionGeometry;
+    if (options.transcribe_audio.len == 0 and (options.transcribe_timestamps or options.transcribe_require_eos or options.transcribe_output_format != .json or options.transcribe_mode != .performance or options.transcribe_max_output_tokens != 0)) return error.InvalidTranscriptionGeometry;
+    if (options.transcribe_audio.len != 0 and (options.incremental_source or (options.backend != .native and options.backend != .metal and options.backend != .cuda and options.backend != .xla) or options.batch != 1 or options.resident or options.primitive != null or options.embedding_pool != null or options.decoder_steps != 0 or options.decoder_request_contexts or options.decoder_scheduled or options.soak_seconds != 0 or options.source_proof != .off or options.source_trace_constructor or options.source_pipelined_steps != 0 or options.decoder_model_dir.len != 0)) return error.InvalidTranscriptionGeometry;
     if (options.source_metadata_proof and (!options.incremental_source or options.backend != .metal or options.source_policy != .qualified or !options.diagnostics or options.source_proof != .off or options.source_trace_constructor)) return error.InvalidMetadataProof;
     if (options.incremental_source and ((options.backend != .cuda and options.backend != .metal and options.backend != .native) or options.batch != 1 or options.source_attempts == 0 or options.resident or options.primitive != null or options.embedding_pool != null or options.decoder_steps != 0 or options.decoder_request_contexts or options.decoder_scheduled or options.soak_seconds != 0)) return error.InvalidGeometry;
     if (options.source_trace_constructor and (!options.incremental_source or options.backend != .cuda or options.source_proof == .off or !options.diagnostics)) return error.ConstructorTraceRequiresCudaProof;
@@ -104,15 +127,17 @@ pub fn main(init: std.process.Init) !void {
     try backend_choice.validate(options.backend);
     var sessions = inference.backends.SessionManager.initWithIo(a, init.io);
     backend_choice.configureSessionPreference(&sessions, options.backend);
+    if (options.backend == .xla) try options.pjrt.configure(&sessions);
     if (options.graph_runtime) |strategy| sessions.graph_runtime_strategy = strategy;
     var manager = inference.server.model_manager.ModelManager.init(a, sessions);
     defer manager.deinit();
     // The public serving policy installs model/run admission before loading.
     // Keep ordinary offline benchmark defaults unchanged.
-    if (options.resident or options.admission or options.incremental_source or options.transcribe_audio.len != 0) manager.configureServingPolicy(.{ .allow_unknown = true });
+    if (options.backend == .xla or options.resident or options.admission or options.incremental_source or options.transcribe_audio.len != 0) manager.configureServingPolicy(.{ .allow_unknown = true });
     const model = try manager.loadFromDir(options.model_dir);
     const model_loaded = inference.platform.time.awakeNs(init.io);
     const session = model.session;
+    if (options.generate_text != null) return @import("generate_task.zig").run(init, model, a, options);
     if (options.incremental_source) return @import("incremental_source.zig").run(init, model, a, options);
     if (options.transcribe_audio.len != 0) return @import("transcribe_task.zig").run(init, model, a, options);
     if (options.embedding_pool != null) {

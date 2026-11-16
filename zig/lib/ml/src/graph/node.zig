@@ -445,6 +445,8 @@ pub const AttentionAttrs = struct {
     head_dim: u32,
     layer_index: u32 = std.math.maxInt(u32),
     skip_kv_write: bool = false,
+    /// Null inherits a legacy interpreter context; authored zero means global.
+    sliding_window: ?u32 = null,
 };
 
 /// Version-1 training attention with replayable probability dropout. This is

@@ -391,6 +391,7 @@ fn executeModelForwardViaDefinition(
     if (!build_options.enable_pjrt) return null;
     if (context.attachment_target != .whole_model) return null;
 
+    cache.selectPjrtPrecision(context.pjrt_precision);
     entry.selectCompiledModelExecutorBackend(.pjrt, context.attachment_target);
 
     if (cache.getSessionCompiledModelRuntime(.pjrt, context.attachment_target)) |runtime| {
@@ -529,13 +530,23 @@ fn executeModelForwardViaDefinition(
             if (part.backend != .pjrt) continue;
             if (!isPartitionPjrtEligible(graph, part.*)) continue;
 
-            const model_executor_ctx = try pjrt_executor_mod.createModelExecutor(
+            // Dynamic request tensors stay inputs; immutable checkpoint operands
+            // upload once into the session inventory, across prompt shapes.
+            const mutable_parameters = try allocator.alloc(bool, graph.nodeCount());
+            defer allocator.free(mutable_parameters);
+            // Decoder tracing creates parameters only through getWeight;
+            // token IDs use the separate embedding_ids binding. Adapters that
+            // explicitly declare mutable parameters provide their own table.
+            @memset(mutable_parameters, false);
+            const model_executor_ctx = try pjrt_executor_mod.createModelExecutorWithOptions(
                 allocator,
                 graph,
                 part,
                 context.cb,
                 context.cb,
                 client,
+                .{ .precision = context.pjrt_precision, .mutable_parameters = context.mutable_parameters orelse mutable_parameters },
+                if (context.pjrt_parameter_store) |store| @ptrCast(@alignCast(store)) else null,
             );
             entry.compiled_model_executor = .{
                 .ptr = model_executor_ctx,

@@ -274,7 +274,7 @@ pub fn finalVocabularyRow(allocator: std.mem.Allocator, decoder: backends.Sessio
     };
     if (tokens.len == 0 or vocab == 0 or resident.shape[1] != mask.len) return error.InvalidInputShape;
     var inputs: DecoderInputs = undefined;
-    try inputs.init(allocator, decoder.inputInfo(), tokens, mask, .{ .resident = .{ .value = resident.values.outputs[0], .backend = resident.values.backend, .shape = &resident.shape } });
+    try inputs.init(allocator, try decoder.inputInfoForStage(.decoder), tokens, mask, .{ .resident = .{ .value = resident.values.outputs[0], .backend = resident.values.backend, .shape = &resident.shape } });
     defer inputs.deinit();
     var outputs = (try decoder.runStageInputsWithControl(inputs.stageInputs(), allocator, control)) orelse return error.UnexpectedResidentStageDecline;
     defer outputs.deinit();

@@ -163,7 +163,7 @@ fn writeSamples(a: std.mem.Allocator, samples: []const u64) !void {
 pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator, options: anytype) !void {
     const session = model.session;
     const actual_backend = session.backend();
-    if (!std.mem.eql(u8, @tagName(actual_backend), @tagName(options.backend))) return error.TranscriptionBackendSelectionMismatch;
+    if (!std.mem.eql(u8, @tagName(actual_backend), if (options.backend == .xla) "pjrt" else @tagName(options.backend))) return error.TranscriptionBackendSelectionMismatch;
     const config = inference.execution.architecture_session.getWhisperConfig(session) orelse return error.WhisperModelRequired;
     const initial_cuda_policy = try actualCudaPolicy(session);
     const stats_policy: ?bool = if (initial_cuda_policy) |policy| policy.row_selection_stats else null;
@@ -176,7 +176,8 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
     defer watchdog.destroy();
     try watchdog.start(init.io);
     _ = session.configureExecutionDiagnostics(options.diagnostics);
-    const max_output_tokens: usize = config.max_target_positions;
+    const max_output_tokens: usize = if (options.transcribe_max_output_tokens == 0) config.max_target_positions else options.transcribe_max_output_tokens;
+    if (max_output_tokens > config.max_target_positions) return error.InvalidTranscriptionContext;
     if (max_output_tokens == 0) return error.InvalidTranscriptionContext;
     const lifecycle_samples = try allocator.alloc(u64, options.iterations);
     defer allocator.free(lifecycle_samples);
@@ -227,7 +228,7 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
         var result_open = true;
         defer if (result_open) result.deinit();
         const returned = inference.platform.time.monotonicNs();
-        if (!result.timing.kv_cached) return error.ActualIncrementalDecoderRequired;
+        if (options.transcribe_mode == .performance and !result.timing.kv_cached) return error.ActualIncrementalDecoderRequired;
         if (!std.math.isFinite(result.avg_logprob) or !std.math.isFinite(result.no_speech_prob)) return error.InvalidTranscriptionOutput;
         const duration_ms = @as(u64, @intCast(audio_samples)) * 1000 / sample_rate;
         const window_ms = @as(u64, @intCast(pipeline.config.chunk_length_s)) * 1000;
@@ -247,6 +248,10 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
         const record = try std.json.Stringify.valueAlloc(allocator, .{
             .schema_version = 1,
             .task = "public_transcription",
+            .benchmark_mode = @tagName(options.transcribe_mode),
+            .cached_performance_eligible = options.transcribe_mode == .performance and publication.timing.kv_cached,
+            .pjrt_device = if (options.backend == .xla) @tagName(options.pjrt.device) else null,
+            .pjrt_precision = if (options.backend == .xla) @tagName(options.pjrt.precision) else null,
             .requested_backend = @tagName(options.backend),
             .selected_backend = @tagName(actual_backend),
             .encoder_backend = @tagName(actual_backend),

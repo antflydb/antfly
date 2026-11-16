@@ -12,8 +12,8 @@ const Tensor = @import("../backends/tensor.zig").Tensor;
 
 pub fn resolve(config: *whisper.Config, stage: frontend.Stage) ?capture.Forward {
     return switch (stage) {
-        .encoder => .{ .context = config, .fingerprint = 2, .output_names = &.{"last_hidden_state"}, .validate = validateEncoder, .run = encoder },
-        .decoder => .{ .context = config, .fingerprint = 3, .output_names = &.{"logits"}, .validate = validateDecoder, .run = decoder },
+        .encoder => .{ .context = config, .fingerprint = 2, .output_names = &.{"last_hidden_state"}, .input_info = &.{.{ .name = "input_features", .dtype = .f32, .shape = &.{ -1, -1, -1 } }}, .validate = validateEncoder, .run = encoder },
+        .decoder => .{ .context = config, .fingerprint = 3, .output_names = &.{"logits"}, .input_info = &.{ .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } }, .{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{ -1, -1, -1 } }, .{ .name = "encoder_attention_mask", .dtype = .i64, .shape = &.{ -1, -1 } } }, .validate = validateDecoder, .run = decoder },
         else => null,
     };
 }

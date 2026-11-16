@@ -5924,6 +5924,14 @@ pub const ComputeBackend = struct {
     }
 
     pub fn gqaPagedAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, attn_bias: ?CT, attention: AttentionContext, batch: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) !CT {
+        if (attention.forward_kv_reuse) |reuse| {
+            if (attention.mode != .dense_causal) return error.InvalidForwardKvMode;
+            const operands = try reuse.resolve(attention.layer_index, attention.skip_kv_write, K, V);
+            var resolved = attention;
+            resolved.forward_kv_reuse = null;
+            resolved.skip_kv_write = false;
+            return self.vtable.gqaPagedAttention(self.ptr, Q, operands.key, operands.value, attn_bias, resolved, batch, num_heads, num_kv_heads, head_dim);
+        }
         return self.vtable.gqaPagedAttention(self.ptr, Q, K, V, attn_bias, attention, batch, num_heads, num_kv_heads, head_dim);
     }
 
@@ -6889,6 +6897,16 @@ pub const ComputeBackend = struct {
 
     pub fn runAttention(self: *const ComputeBackend, request: *const RunAttentionRequest) !?CT {
         if (self.vtable.runAttention) |op| {
+            if (request.attention.forward_kv_reuse) |reuse| {
+                if (request.attention.mode != .dense_causal) return error.InvalidForwardKvMode;
+                const operands = try reuse.resolve(request.attention.layer_index, request.attention.skip_kv_write, request.k, request.v);
+                var resolved = request.*;
+                resolved.k = operands.key;
+                resolved.v = operands.value;
+                resolved.attention.forward_kv_reuse = null;
+                resolved.attention.skip_kv_write = false;
+                return op(self.ptr, &resolved);
+            }
             return op(self.ptr, request);
         }
         return null;

@@ -984,7 +984,20 @@ pub const DenseAttentionPrefixBinding = struct {
 
 pub const DenseAttentionRowsBinding = struct { mask: ?[]const i64 = null };
 
+/// Lexical same-forward K/V sharing. Resolved at the compute facade before
+/// dispatch; never submitted to a device or retained by a backend runtime.
+pub const ForwardKvReuse = struct {
+    pub const Pair = struct { key: CT, value: CT };
+    ptr: *anyopaque,
+    resolve_fn: *const fn (*anyopaque, usize, bool, CT, CT) anyerror!Pair,
+
+    pub fn resolve(self: @This(), layer: usize, read_only: bool, key: CT, value: CT) !Pair {
+        return self.resolve_fn(self.ptr, layer, read_only, key, value);
+    }
+};
+
 pub const AttentionContext = struct {
+    forward_kv_reuse: ?ForwardKvReuse = null,
     dense_attention_rows: ?DenseAttentionRowsBinding = null,
     dense_attention_prefix: ?DenseAttentionPrefixBinding = null,
     mode: AttentionMode = .dense_causal,

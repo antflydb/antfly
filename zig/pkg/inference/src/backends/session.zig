@@ -3185,6 +3185,15 @@ pub const Session = struct {
         return outputs;
     }
 
+    /// Multi-entry models declare their logical stage ABI alongside the
+    /// semantic forward. Single-entry/imported models keep their static ABI.
+    pub fn inputInfoForStage(self: Session, stage: @import("../execution/model_frontend.zig").Stage) ![]const TensorInfo {
+        if (self.model_programs) |provider| if (try provider.get(stage)) |forward| {
+            if (forward.input_info.len != 0) return forward.input_info;
+        };
+        return self.inputInfo();
+    }
+
     pub fn inputInfo(self: Session) []const TensorInfo {
         return self.vtable.inputInfo(self.ptr);
     }

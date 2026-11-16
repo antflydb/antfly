@@ -363,6 +363,57 @@ pub fn onnxModelLoadAdmission(
     };
 }
 
+/// Provider operands are shared across shape specializations. GPU policy
+/// reserves the whole bounded provider arena, including its internal workspace;
+/// host conversion needs at most one additional largest operand at a time.
+pub fn pjrtModelLoadAdmission(encoded: usize, represented: usize, largest: usize, policy: ?session_factory.PjrtSessionOptions.MemoryPolicy) !ModelLoadAdmissionPlan {
+    const source = std.math.add(usize, encoded, represented) catch return error.ResourceLimitExceeded;
+    var host = source;
+    var backend: usize = 0;
+    if (policy != null and policy.? == .cuda) {
+        const cuda = policy.?.cuda;
+        if (cuda.capacity_bytes == 0 or cuda.capacity_bytes > cuda.device_bytes) return error.InvalidPjrtMemoryPolicy;
+        if (represented > cuda.capacity_bytes) return error.MemoryBudgetExceeded;
+        backend = cuda.capacity_bytes;
+    } else host = std.math.add(usize, host, represented) catch return error.ResourceLimitExceeded;
+    return .{
+        .peak = .{ .host_weight_bytes = std.math.add(usize, host, largest) catch return error.ResourceLimitExceeded, .backend_weight_bytes = backend },
+        .resident = .{ .host_weight_bytes = host, .backend_weight_bytes = backend },
+    };
+}
+
+fn pjrtArtifactLoadAdmission(man: manifest_mod.ModelManifest, policy: ?session_factory.PjrtSessionOptions.MemoryPolicy) !ModelLoadAdmissionPlan {
+    const store = try @import("tensor_store.zig").openFromManifest(man.allocator, man);
+    defer {
+        store.preserveFileCacheOnDeinit();
+        store.deinit();
+    }
+    const footprint = try store.float32Footprint(man.allocator);
+    const Encoded = struct {
+        bytes: usize = 0,
+        fn visit(raw: *anyopaque, bytes: []const u8, class: @import("../execution/storage_inventory.zig").Class) !void {
+            if (class != .mapped_file) return;
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.bytes = std.math.add(usize, self.bytes, bytes.len) catch return error.ResourceLimitExceeded;
+        }
+    };
+    var encoded = Encoded{};
+    if (!try store.visitStorageSpans(.{ .ptr = &encoded, .visit_fn = Encoded.visit })) return error.UnsupportedTensorStore;
+    return pjrtModelLoadAdmission(encoded.bytes, footprint.bytes, footprint.largest_tensor_bytes, policy);
+}
+
+test "PJRT admission charges shared operands once and the bounded CUDA arena" {
+    const cpu = try pjrtModelLoadAdmission(100, 400, 160, .cpu);
+    try std.testing.expectEqual(@as(usize, 900), cpu.resident.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 1060), cpu.peak.host_weight_bytes);
+    const gpu = try pjrtModelLoadAdmission(100, 400, 160, .{ .cuda = .{ .capacity_bytes = 1024, .device_bytes = 4096 } });
+    try std.testing.expectEqual(@as(usize, 500), gpu.resident.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 660), gpu.peak.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 1024), gpu.resident.backend_weight_bytes);
+    try std.testing.expectError(error.MemoryBudgetExceeded, pjrtModelLoadAdmission(100, 1025, 160, .{ .cuda = .{ .capacity_bytes = 1024, .device_bytes = 4096 } }));
+    try std.testing.expectError(error.ResourceLimitExceeded, pjrtModelLoadAdmission(std.math.maxInt(usize), 1, 1, .cpu));
+}
+
 pub fn nativeModelLoadAdmission(
     weights: usize,
     backend: backends.BackendType,
@@ -447,6 +498,23 @@ pub fn admissionBackendClassForRuntime(
     return if (backend_runtime.usesGpuHostedSession()) .gpu else .cpu;
 }
 
+/// CUDA PJRT buffers and temporary allocations live inside the bounded arena
+/// already charged to model residency. Request IO remains separate host storage.
+fn hasReservedPjrtArena(backend_runtime: backends.BackendRuntime, resident: runtime.tier.memory.AdmissionAmounts) bool {
+    if (backend_runtime.backend != .pjrt) return false;
+    const policy = backend_runtime.pjrt_memory_policy orelse return false;
+    return policy == .cuda and policy.cuda.capacity_bytes != 0 and resident.backend_weight_bytes >= policy.cuda.capacity_bytes;
+}
+
+test "PJRT admission credits only a fully reserved CUDA provider arena" {
+    const gpu = backends.BackendRuntime{ .backend = .pjrt, .pjrt_memory_policy = .{ .cuda = .{ .capacity_bytes = 1024, .device_bytes = 4096 } } };
+    try std.testing.expect(hasReservedPjrtArena(gpu, .{ .backend_weight_bytes = 1024 }));
+    try std.testing.expect(!hasReservedPjrtArena(gpu, .{ .backend_weight_bytes = 1023 }));
+    try std.testing.expect(!hasReservedPjrtArena(.{ .backend = .pjrt, .pjrt_memory_policy = .cpu }, .{ .backend_weight_bytes = 1024 }));
+    try std.testing.expect(!hasReservedPjrtArena(.{ .backend = .pjrt }, .{ .backend_weight_bytes = 1024 }));
+    try std.testing.expect(!hasReservedPjrtArena(.{ .backend = .cuda, .pjrt_memory_policy = gpu.pjrt_memory_policy }, .{ .backend_weight_bytes = 1024 }));
+}
+
 pub fn attachSessionRunAdmission(
     allocator: std.mem.Allocator,
     session: *backends.Session,
@@ -481,6 +549,7 @@ pub fn attachSessionRunAdmission(
         .limits = limits,
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
         .static_workspace_kind = .estimate,
+        .backend_workspace_reserved = hasReservedPjrtArena(backend_runtime, resident),
         .required_residency = resident,
         .model_profile = sessionRunAdmissionModelProfile(backend_runtime, man, qwen_cfg),
     };
@@ -640,6 +709,7 @@ pub fn estimateBaseModelLoadAdmission(
 ) !ModelLoadAdmissionPlan {
     const weights = try estimateModelArtifactBytes(man);
     if (!manifestHasNativeAssets(man)) return onnxModelLoadAdmission(weights, backend_runtime);
+    if (backend_runtime.backend == .pjrt) return pjrtArtifactLoadAdmission(man, backend_runtime.pjrt_memory_policy);
     if (backend_runtime.backend == .metal) {
         if (!laya_packed) {
             if (try session_factory.layaResidentLoadAmounts(man, weights)) |resident| {

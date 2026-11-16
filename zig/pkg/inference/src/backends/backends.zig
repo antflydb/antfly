@@ -184,6 +184,7 @@ pub fn clampPhysicalMemoryLimitsWithProcessPolicy(backend: BackendType, limits: 
 /// policy.
 pub const BackendRuntime = struct {
     backend: BackendType,
+    pjrt_memory_policy: ?session_factory.PjrtSessionOptions.MemoryPolicy = null,
 
     pub fn hasUninterruptibleCalls(self: BackendRuntime) bool {
         return self.loadInterruption() == .uninterruptible or
@@ -199,10 +200,27 @@ pub const BackendRuntime = struct {
     }
 
     pub fn usesGpuHostedSession(self: BackendRuntime) bool {
-        return switch (self.backend) {
-            .metal, .cuda => true,
-            else => false,
+        if (self.backend == .pjrt) return if (self.pjrt_memory_policy) |policy| policy == .cuda else false;
+        return self.backend.usesGpuHostedSession();
+    }
+
+    pub fn memoryLimits(self: BackendRuntime, process_limit: usize) memory_policy.Limits {
+        if (self.backend == .pjrt) if (self.pjrt_memory_policy) |policy| if (policy == .cuda) {
+            const defaults = memory_policy.defaultLimitsForBackendWithProcessLimit(.gpu, process_limit);
+            var limits = memory_policy.limitsForDiscreteDevice(defaults, policy.cuda.device_bytes, process_limit);
+            if (policy.cuda.unified_memory) limits = memory_policy.clampUnifiedDeviceLimits(limits, limits.host_limit_bytes);
+            return limits;
         };
+        return defaultMemoryLimits(self.backend, process_limit);
+    }
+
+    pub fn clampMemoryLimits(self: BackendRuntime, limits: memory_policy.Limits, process_limit: usize, provenance: memory_policy.ProcessMemoryLimitProvenance) memory_policy.Limits {
+        if (self.backend == .pjrt) if (self.pjrt_memory_policy) |policy| if (policy == .cuda) {
+            var result = memory_policy.clampDiscreteDeviceLimitsWithProcessPolicy(limits, policy.cuda.device_bytes, process_limit, provenance);
+            if (policy.cuda.unified_memory) result = memory_policy.clampUnifiedDeviceLimits(result, memory_policy.defaultSharedAdmissionLimitsWithProcessPolicy(process_limit, provenance).host_limit_bytes);
+            return result;
+        };
+        return clampPhysicalMemoryLimitsWithProcessPolicy(self.backend, limits, process_limit, provenance);
     }
 
     pub fn executionInterruption(self: BackendRuntime) Interruption {
@@ -693,8 +711,7 @@ pub const SessionManager = struct {
         self: *const SessionManager,
         backend: BackendType,
     ) !BackendRuntime {
-        _ = self;
-        return .{ .backend = backend };
+        return .{ .backend = backend, .pjrt_memory_policy = if (backend == .pjrt) self.pjrt_memory_policy else null };
     }
 };
 
@@ -1385,4 +1402,18 @@ test "backend names parse canonical values aliases and optional auto" {
     try std.testing.expect(try BackendType.parseOptional(null) == null);
     try std.testing.expect(try BackendType.parseOptional("auto") == null);
     try std.testing.expectError(error.InvalidArguments, BackendType.parseOptional("unknown"));
+}
+
+test "PJRT admission runtime retains provider placement and physical device limits" {
+    var manager = SessionManager{ .allocator = std.testing.allocator, .preferred_backends = &.{.pjrt}, .pjrt_memory_policy = .cpu };
+    const cpu = try manager.resolveBackendRuntime(.pjrt);
+    try std.testing.expect(!cpu.usesGpuHostedSession());
+    manager.pjrt_memory_policy = .{ .cuda = .{ .capacity_bytes = 1024, .device_bytes = 4096, .unified_memory = true } };
+    const gpu = try manager.resolveBackendRuntime(.pjrt);
+    try std.testing.expect(gpu.usesGpuHostedSession());
+    try std.testing.expectEqual(@as(usize, 1024), gpu.pjrt_memory_policy.?.cuda.capacity_bytes);
+    const limits = gpu.memoryLimits(0);
+    try std.testing.expect(limits.backend_limit_bytes <= 4096);
+    try std.testing.expect(limits.combined_limit_bytes <= limits.host_limit_bytes);
+    try std.testing.expect(!(try manager.resolveBackendRuntime(.native)).usesGpuHostedSession());
 }

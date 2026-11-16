@@ -660,6 +660,7 @@ pub const DecodeContext = struct {
     /// Set only by a reader whose admission includes retained decode plans.
     prepared_lighton_decode: bool = false,
     dense_ffn_program: ?*@import("../ops/cuda/cuda_compute.zig").CudaCompute.DenseFfnProgram = null,
+    forward_kv_reuse: ?backend_contracts.ForwardKvReuse = null,
     attention_mode: AttentionMode = .full_recompute,
     total_sequence_len: usize,
     query_sequence_len: usize,
@@ -3058,12 +3059,21 @@ fn forwardFinalHiddenWithSharedKvOutput(
     provided_overrides: Layer0DecoderOverrides,
     batch: usize,
     seq_len: usize,
-    decode_context: ?*const DecodeContext,
+    provided_decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
     pre_norm_out: ?*CT,
     trace_sink: ?*ActivationTraceSink,
     output: SharedKvPrefillOutput,
 ) anyerror!HiddenTensorResult {
+    var forward_kv: ?@import("../execution/forward_kv_reuse.zig").Scope = null;
+    defer if (forward_kv) |*scope| scope.deinit();
+    var complete_context = if (provided_decode_context) |context| context.* else DecodeContext{ .total_sequence_len = seq_len, .query_sequence_len = seq_len, .kv_sequence_len = seq_len };
+    if (config.num_kv_shared_layers != 0 and !disableSharedKvDebug() and complete_context.attention_mode == .full_recompute and complete_context.forward_kv_reuse == null) {
+        const ownership = decoderOverridesWithCleanup(provided_overrides, provided_decode_context);
+        forward_kv = try @import("../execution/forward_kv_reuse.zig").Scope.init(allocator, cb, config.num_hidden_layers, ownership.cleanup);
+        complete_context.forward_kv_reuse = forward_kv.?.context();
+    }
+    const decode_context: ?*const DecodeContext = if (forward_kv != null) &complete_context else provided_decode_context;
     const overrides = decoderOverridesWithCleanup(provided_overrides, decode_context);
     try validateDecoderForwardCleanup(cb, overrides.cleanup, decode_context);
     const hidden_size = config.hidden_size;
@@ -6554,7 +6564,7 @@ fn decoderBlockImpl(
     // Shared KV layers read K/V from their donor layer's cache — create placeholder zeros.
     const kv_dim: usize = @as(usize, num_kv_heads) * head_dim;
     const q_dim: usize = @as(usize, num_heads) * head_dim;
-    if (!disableDecoderRuntimeActivationDebug() and !shares_kv and config.family != .gpt2 and
+    if ((decode_context == null or decode_context.?.forward_kv_reuse == null) and !disableDecoderRuntimeActivationDebug() and !shares_kv and config.family != .gpt2 and
         config.family != .qwen3 and config.family != .qwen3_vl and config.family != .qwen3_5 and
         attn_q_slot != null and attn_k_slot != null and attn_v_slot != null and
         attn_out_proj_linear_slot != null and mlp_gate_slot != null and
@@ -6991,7 +7001,7 @@ fn decoderBlockImpl(
         try captureSelectionQueries(cb, decode_context, Q_for_attn, kv_layer_index, layer, num_heads, head_dim);
     debug_timing_stats.attention_qkv_nanos += @intCast(monotonicNowNs() - attn_qkv_started_at);
 
-    if (!disableDecoderRuntimeActivationDebug() and attn_out_proj_linear_slot != null and ffn_norm_slot != null) {
+    if ((decode_context == null or decode_context.?.forward_kv_reuse == null) and !disableDecoderRuntimeActivationDebug() and attn_out_proj_linear_slot != null and ffn_norm_slot != null) {
         switch (config.family) {
             .gpt2 => {
                 if (allowDenseBlockFastPath(decode_context) and mlp_fc1_slot != null and mlp_fc2_slot != null) {
@@ -9971,7 +9981,7 @@ pub fn applyPreparedAttention(
             return runPackedQwenAttention(cb, Q, K, V, attention, .{}, lengths, num_heads, num_kv_heads, head_dim, dc);
         };
     }
-    if (attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
+    if (attention.forward_kv_reuse == null and attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
         const gqa_started_at = monotonicNowNs();
         const result = try cb.gqaCausalAttention(Q, K, V, null, batch, attention.query_sequence_len, num_heads, num_kv_heads, head_dim);
         debug_timing_stats.attention_gqa_nanos += @intCast(monotonicNowNs() - gqa_started_at);
@@ -10047,7 +10057,7 @@ fn runPreparedAttentionWithSinkMetadata(
     num_kv_heads: u32,
     head_dim: u32,
 ) !CT {
-    if (!sink_metadata.hasMetadata() and attention.mode == .dense_causal and
+    if (attention.forward_kv_reuse == null and !sink_metadata.hasMetadata() and attention.mode == .dense_causal and
         attention.sliding_window == 0 and attention.attn_or_mask == null)
     {
         const gqa_started_at = monotonicNowNs();
@@ -10381,7 +10391,7 @@ fn applyAttentionWithSinkWithCleanup(
         try maybeDebugLayerTensor(cb, std.heap.page_allocator, layer, "k_rope", K_rope);
         if (!config.layerUsesSlidingAttention(layer))
             try captureSelectionQueries(cb, decode_context, Q_rope, kv_layer_index, layer, num_heads, head_dim);
-        if (!sink_metadata.hasMetadata() and attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
+        if (attention.forward_kv_reuse == null and !sink_metadata.hasMetadata() and attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
             const gqa_started_at = monotonicNowNs();
             const result = try cb.gqaCausalAttention(Q_rope, K_rope, V, null, batch, attention.query_sequence_len, num_heads, num_kv_heads, head_dim);
             debug_timing_stats.attention_gqa_nanos += @intCast(monotonicNowNs() - gqa_started_at);
@@ -10418,7 +10428,7 @@ fn applyAttentionWithSinkWithCleanup(
         debug_timing_stats.attention_gqa_nanos += @intCast(monotonicNowNs() - gqa_started_at);
         return result;
     }
-    if (!sink_metadata.hasMetadata() and attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
+    if (attention.forward_kv_reuse == null and !sink_metadata.hasMetadata() and attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
         const gqa_started_at = monotonicNowNs();
         const result = try cb.gqaCausalAttention(Q, K, V, null, batch, attention.query_sequence_len, num_heads, num_kv_heads, head_dim);
         debug_timing_stats.attention_gqa_nanos += @intCast(monotonicNowNs() - gqa_started_at);
@@ -10805,6 +10815,7 @@ fn attentionContext(seq_len: usize, decode_context: ?*const DecodeContext) ops.A
     };
 
     return .{
+        .forward_kv_reuse = dc.forward_kv_reuse,
         .mode = switch (dc.attention_mode) {
             .full_recompute => .dense_causal,
             .paged_prefill => .paged_prefill,
