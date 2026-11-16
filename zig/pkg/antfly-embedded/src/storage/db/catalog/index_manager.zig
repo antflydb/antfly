@@ -322,6 +322,10 @@ pub const ReplacementSwapBoundary = enum { before_commit, after_commit };
 pub var test_replacement_swap_boundary: ?*const fn (ReplacementSwapBoundary) void = null;
 pub var test_text_backfill_batch_size: ?usize = null;
 pub var test_abort_text_backfill_after_batches: ?usize = null;
+/// Named (not anonymous) so `IndexManager`'s ABI layout id matches between
+/// the separately compiled storage owner and its clients.
+pub const ContextDrainHook = struct { ptr: *anyopaque, drain_fn: *const fn (*anyopaque) void };
+
 pub var test_text_backfill_invocations: usize = 0;
 pub var test_graph_contributor_migrations: std.atomic.Value(usize) = .init(0);
 pub var test_inject_index_open_error: ?anyerror = null;
@@ -1579,7 +1583,7 @@ pub const IndexManager = struct {
     context_dependency_mutex: std.atomic.Mutex = .unlocked,
     /// Delivers staged context notices after generated records commit
     /// (installed by the owning DB; outside every apply lock when invoked).
-    context_drain: ?struct { ptr: *anyopaque, drain_fn: *const fn (*anyopaque) void } = null,
+    context_drain: ?ContextDrainHook = null,
     /// Replicated (Raft) owners: dependency-store mutations become leader
     /// proposals validated by every replica (installed by the host).
     context_replication: ?@import("../context_dependency_db.zig").Replication = null,
