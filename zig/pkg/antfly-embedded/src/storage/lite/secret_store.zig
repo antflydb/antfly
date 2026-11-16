@@ -29,21 +29,49 @@ pub const Store = struct {
     scope: []u8,
     provider: record.KeyProvider,
     prefix: [namespace.len + 64 + 1]u8,
+    /// §9.7c (ReadView): every catalog read below goes straight through
+    /// `self.docs.file.*CatalogRecordAlloc`, never through a `Txn`, so
+    /// none of the protection `Txn.openReadWithPrefix`'s own
+    /// `store.read_only` short-circuit gives a `ReadView` ever covers this
+    /// adapter. For a read-only `docs` (a frozen snapshot handle, not the
+    /// live writer -- `nativeStore()` already refuses writes on exactly
+    /// this condition) that matters: without a pin, a concurrent
+    /// same-process writer's own background-maintenance fold
+    /// (`checkpointRedoLog`) is free to reclaim an overlay-only version
+    /// this adapter's own open-time snapshot still needs, between `init`
+    /// and whenever a caller actually reads -- a fully committed secret
+    /// revision silently reading back as revision 0 instead of the value
+    /// this handle observed when it opened (confirmed live: "lite secrets
+    /// preserve index commits made during wrapping and reject stale
+    /// read-only snapshots" racing the redo-log fold). Pinned once in
+    /// `init`, for this adapter's whole lifetime, released once in
+    /// `deinit`; `docs` is the caller's own, already-stably-addressed
+    /// pointer (see this struct's own doc comment below), never this
+    /// struct itself, so the pin's internal `*NativeFile` stays valid
+    /// regardless of where this `Store` -- itself returned by value --
+    /// ends up.
+    read_view: ?native.ReadView = null,
 
     /// Both docs and provider must outlive this adapter and its borrowed interfaces.
     /// Keep the adapter at a stable address after obtaining source/nativeStore.
     pub fn init(allocator: Allocator, docs: *docstore.Store, scope: []const u8, provider: record.KeyProvider) !Store {
         try contract.validateName(scope);
-        return .{
+        var result: Store = .{
             .allocator = allocator,
             .docs = docs,
             .scope = try allocator.dupe(u8, scope),
             .provider = provider,
             .prefix = namespace.* ++ digest(scope) ++ "/".*,
         };
+        if (docs.read_only and !docs.file.externally_locked) {
+            errdefer allocator.free(result.scope);
+            result.read_view = try native.ReadView.open(&docs.file, docs.file.runtime());
+        }
+        return result;
     }
 
     pub fn deinit(self: *Store) void {
+        if (self.read_view) |*view| view.release(self.docs.file.runtime());
         self.allocator.free(self.scope);
         self.* = undefined;
     }
