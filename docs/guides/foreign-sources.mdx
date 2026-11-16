@@ -1,0 +1,269 @@
+---
+title: "Query PostgreSQL in Place with Foreign Sources"
+description: "Antfly queries that filter, aggregate, and join live PostgreSQL rows at request time, next to Antfly search results, with nothing copied out of PostgreSQL"
+order: 12
+---
+
+<Questions>
+- How do I query a PostgreSQL table from Antfly without replicating it?
+- How do I join Antfly search results with live PostgreSQL rows?
+- Can Antfly run aggregations over a PostgreSQL table?
+- When should I use foreign sources instead of CDC replication?
+- Which filters and query options work on a PostgreSQL foreign table?
+</Questions>
+
+## The Result
+
+A full-text search over Antfly documents comes back with each hit's customer record attached, fetched from PostgreSQL in the same request. PostgreSQL stays the only copy of the customer data, so the tier and email are whatever they are at query time:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/orders/query \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "full_text_search": {"query": "body:widget"},
+    "fields": ["customer_id", "product"],
+    "join": {
+      "right_table": "pg_customers",
+      "join_type": "left",
+      "on": {"left_field": "customer_id", "right_field": "customer_id", "operator": "eq"},
+      "right_fields": ["name", "email", "tier"]
+    },
+    "foreign_sources": {
+      "pg_customers": {
+        "type": "postgres",
+        "dsn": "${secret:pg_dsn}",
+        "postgres_table": "customers"
+      }
+    }
+  }'
+```
+
+```json
+{
+  "responses": [{
+    "hits": {
+      "hits": [{
+        "_id": "order-001",
+        "_source": {
+          "customer_id": "cust-1",
+          "product": "Widget A",
+          "pg_customers.name": "Alice",
+          "pg_customers.email": "alice@example.com",
+          "pg_customers.tier": "gold"
+        }
+      }]
+    }
+  }]
+}
+```
+
+## Before You Start
+
+Antfly running in standalone mode, and a PostgreSQL database Antfly can reach with a user that can `SELECT` from the tables you want to query. No logical replication, slot, or publication is needed:
+
+```bash
+psql "postgres://antfly_reader:secret@pg-host:5432/shop" -c "SELECT count(*) FROM customers"
+```
+
+The examples use this table:
+
+```sql
+CREATE TABLE customers (
+    customer_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    lifetime_value BIGINT NOT NULL,
+    address_id TEXT NOT NULL
+);
+INSERT INTO customers VALUES
+  ('cust-1', 'Alice',   'alice@example.com',   'gold',   1200, 'addr-1'),
+  ('cust-2', 'Bob',     'bob@example.com',     'silver',  400, 'addr-2'),
+  ('cust-3', 'Charlie', 'charlie@example.com', 'gold',    950, 'addr-3'),
+  ('cust-4', 'Diana',   'diana@example.com',   'bronze',  150, 'addr-2'),
+  ('cust-5', 'Eve',     'eve@example.com',     'silver',  700, 'addr-1');
+```
+
+## Build It
+
+### 1. Store the Connection String as a Secret
+
+```bash
+curl -X PUT http://127.0.0.1:8080/db/v1/secrets/pg_dsn \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" \
+  -H "Content-Type: application/json" \
+  -d '{"value": "postgres://antfly_reader:secret@pg-host:5432/shop?sslmode=require"}'
+```
+
+The `dsn` field accepts a literal connection string, but a `${secret:...}` reference keeps the password out of every request body. Antfly resolves it from the secret store or the environment.
+
+### 2. Query the PostgreSQL Table Directly
+
+A foreign source is declared per request, in the `foreign_sources` map. Its key is the name the request uses for the table, in the URL or in a join's `right_table`. That name does not need to exist in Antfly:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/pg_customers/query \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "filter_query": {"term": "gold", "field": "tier"},
+    "foreign_sources": {
+      "pg_customers": {
+        "type": "postgres",
+        "dsn": "${secret:pg_dsn}",
+        "postgres_table": "customers"
+      }
+    }
+  }'
+```
+
+This returns Alice and Charlie. Without `columns`, Antfly discovers the table's columns and types from the PostgreSQL catalog and caches them for about a minute. To pin the shape, or to expose only some columns, list them:
+
+```json
+"columns": [
+  {"name": "customer_id", "type": "text"},
+  {"name": "name", "type": "text"},
+  {"name": "tier", "type": "text"},
+  {"name": "lifetime_value", "type": "bigint"}
+]
+```
+
+Each hit's `_id` comes from the first id-like column: `id`, then `_id`, then the first column ending in `_id`.
+
+### 3. Filter, Select, Sort, and Page
+
+Filters translate to a parameterized `WHERE` clause that PostgreSQL executes. Term, match, boolean, prefix, wildcard, and range filters work, combined with `conjuncts`, `disjuncts`, and `must_not`, as do query strings:
+
+```json
+{"filter_query": {"conjuncts": [
+  {"field": "lifetime_value", "min": 700},
+  {"term": "gold", "field": "tier"}
+]}}
+```
+
+```json
+{"filter_query": {"prefix": "Ali", "field": "name"}}
+```
+
+```json
+{"filter_query": {"query": "name:Alice OR name:Charlie"}}
+```
+
+`filter_prefix` matches a prefix of the id-like column, so `"filter_prefix": "cust-1"` returns only `cust-1`. `fields`, `order_by`, `limit` (default 10), and `offset` map to the projection, `ORDER BY`, `LIMIT`, and `OFFSET`. This request returns Charlie (950) and Eve (700), the second and third customers by value:
+
+```json
+{
+  "fields": ["customer_id", "name", "lifetime_value"],
+  "order_by": [{"field": "lifetime_value", "desc": true}],
+  "limit": 2,
+  "offset": 1
+}
+```
+
+A filter Antfly cannot translate returns 422 rather than running a wider query.
+
+### 4. Aggregate in PostgreSQL
+
+`stats`, `terms`, `count`, `sum`, `avg`, `min`, and `max` run as SQL aggregates in PostgreSQL, scoped by any `filter_query`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/pg_customers/query \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "aggregations": {
+      "value_stats": {"type": "stats", "field": "lifetime_value"},
+      "tier_terms": {"type": "terms", "field": "tier", "size": 5}
+    },
+    "foreign_sources": {
+      "pg_customers": {"type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers"}
+    }
+  }'
+```
+
+```json
+"aggregations": {
+  "value_stats": {"count": 5, "min": 150, "max": 1200, "sum": 3400, "avg": 680},
+  "tier_terms": {"buckets": [
+    {"key": "gold", "doc_count": 2}, {"key": "silver", "doc_count": 2}, {"key": "bronze", "doc_count": 1}
+  ]}
+}
+```
+
+The single-value types return `{"value": ...}`. Other aggregation types, and sub-aggregations, return 422 `unsupported_query_request`.
+
+### 5. Join with Antfly Results
+
+The Result shows PostgreSQL on the right of an Antfly search. It also works the other way: drive the query from PostgreSQL and attach Antfly documents whose `_id` matches. Here `customer_notes` is an Antfly table keyed by customer ID:
+
+```json
+{
+  "fields": ["customer_id", "name", "tier"],
+  "join": {
+    "right_table": "customer_notes",
+    "join_type": "left",
+    "on": {"left_field": "customer_id", "right_field": "_id", "operator": "eq"},
+    "right_fields": ["note"]
+  },
+  "foreign_sources": {
+    "pg_customers": {"type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers"}
+  }
+}
+```
+
+Send it to `/db/v1/tables/pg_customers/query`. All five customers come back, with `customer_notes.note` on those that have a note. `join_type` takes `inner` (the default), `left`, or `right`; a right join keeps notes whose customer is missing from PostgreSQL.
+
+Both sides can be PostgreSQL, and joins nest. This attaches each customer's city from a second PostgreSQL table; nested fields are prefixed with each table name in turn (`pg_customers.pg_addresses.city`):
+
+```json
+"join": {
+  "right_table": "pg_customers",
+  "join_type": "left",
+  "on": {"left_field": "customer_id", "right_field": "customer_id", "operator": "eq"},
+  "right_fields": ["name", "pg_addresses.city"],
+  "nested_join": {
+    "right_table": "pg_addresses",
+    "join_type": "left",
+    "on": {"left_field": "address_id", "right_field": "id", "operator": "eq"},
+    "right_fields": ["city", "region"]
+  }
+}
+```
+
+Every table named in a join must appear in `foreign_sources` or exist in Antfly. To narrow the right side before matching, add `right_filters` to the join with a `filter_query` or `filter_prefix`; left rows whose match is filtered out keep their own fields and get none from the right:
+
+```json
+"right_filters": {"filter_query": {"query": "name:Alice"}}
+```
+
+### 6. Mix a Mirrored Table with Live Lookups
+
+[CDC replication](/docs/guides/cdc-replication) and foreign sources combine. Mirror the table you search (support tickets, say) into Antfly so it gets full-text and embedding indexes, and leave the table that changes often or carries sensitive fields in PostgreSQL. A search over the mirrored table then joins the live table on each request, the same shape as The Result with `tickets` on the left.
+
+## Tradeoffs
+
+The decision is whether a PostgreSQL table should be queried in place or mirrored into Antfly with CDC.
+
+A foreign source copies nothing. Each request runs its filter, sort, page, or aggregate as SQL in PostgreSQL, so results are as current as the database. It needs only `SELECT`. The cost is that PostgreSQL does the work on every request, with its own indexes deciding the speed, and the foreign table gets none of Antfly's search: `full_text_search`, `semantic_search`, rerankers, graph queries, and `search_after` paging return 422 when the PostgreSQL table drives the query.
+
+CDC moves the cost to write time. Rows land in Antfly, where they can carry full-text, embedding, and graph indexes and enrichments, and queries never touch PostgreSQL. In exchange you run a replication slot and accept a copy that lags by the stream's delay.
+
+In practice, mirror the tables people search and look up the rest in place. Use foreign sources for reference data, live state such as balances or inventory, and fields you do not want stored twice. Use CDC for anything users search by text or meaning.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Search my Antfly orders table and attach each customer's current tier from the customers table in Postgres without replicating it", and use this page to judge the result.
+
+## Next Steps
+
+- [Stream PostgreSQL into Antfly](/docs/guides/cdc-replication): mirror the tables you want indexed and searched
+- [Query Antfly with SQL and psql](/docs/guides/sql-and-psql): reach Antfly tables from PostgreSQL clients and drivers
+- [Search Antfly from Inside PostgreSQL](/docs/guides/postgres-extension): the reverse direction, with search called from PostgreSQL queries
