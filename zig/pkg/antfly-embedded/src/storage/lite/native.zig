@@ -11244,6 +11244,12 @@ pub const NativeFile = struct {
     pub fn retirementReserveBytesWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !u64 {
         if (cancel) |token| try token.check();
         if (!self.header.indexed_reclamation) return 0;
+        // perf/lwa-xproc-retirement: same gap as retirementNeedsServiceCoreWithCancel
+        // had -- this instance's own base can have fallen behind another
+        // same-inode NativeFile's (same process) more recent commits without
+        // beginTransaction/vacuumWithCancel/pageAllocatorFromFreeMapWithProof
+        // ever running on it to catch it up first.
+        try self.refreshIfWriterBaseStale();
         const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), cancel);
         return allocator_v4.retirementReservePages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count()) *| self.header.page_size;
     }
@@ -11280,6 +11286,12 @@ pub const NativeFile = struct {
     pub fn allocatorStatsWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !?AllocatorStats {
         if (cancel) |token| try token.check();
         if (!self.header.indexed_reclamation) return null;
+        // perf/lwa-xproc-retirement: same gap as retirementNeedsServiceCoreWithCancel
+        // had -- reached live via Connection.refresh -> needsReuseAdmission ->
+        // allocatorStats on `self.current`'s own (possibly idle, fallen-behind)
+        // file, surfacing as UnexpectedNativePageKind out of a stale
+        // free_map_root_page reused by a newer same-inode commit.
+        try self.refreshIfWriterBaseStale();
         const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), cancel);
         return .{
             .reusable_pages = state.free_pages,
@@ -11325,6 +11337,26 @@ pub const NativeFile = struct {
     fn retirementNeedsServiceCoreWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken, consider_redo_debt: bool) !bool {
         if (cancel) |token| try token.check();
         if (!self.header.indexed_reclamation or self.read_only) return false;
+        // perf/lwa-xproc-retirement: every other caller that loads the
+        // allocator ledger off `self.activeCheckpoint()` -- `beginTransaction`,
+        // `vacuumWithCancel`, `pageAllocatorFromFreeMapWithProof` -- calls
+        // `refreshIfWriterBaseStale` first, so a `NativeFile` instance whose
+        // own base has fallen behind this inode's registry-known latest
+        // commit catches up (re-reads the header/checkpoint slots and rebinds
+        // via `adoptIndexPublicationHeader`, invalidating the stale cached
+        // ledger) before touching anything keyed on the checkpoint it loads.
+        // This function never did, despite being reachable the exact same
+        // way (`Store.maintainOnceWithCancel` -> here) on a maintenance
+        // turn's own detached snapshot (`Owner.refreshMaintenanceSnapshot`)
+        // -- precisely the instance `refreshIfWriterBaseStale`'s own doc
+        // comment calls out as "most commonly" the one that falls behind.
+        // Reading a stale `free_map_root_page` still numerically valid for
+        // *some* past checkpoint, but since reclaimed and reused for a
+        // different page kind by a newer commit on the same inode, surfaces
+        // here as `UnexpectedNativePageKind`/`InvalidNativeAllocator` out of
+        // `loadLedgerWithCancel` below. Catching up first closes that gap the
+        // same way every sibling entry point already does.
+        try self.refreshIfWriterBaseStale();
         const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), cancel);
         if (state.checkpointDue() or self.budgetedCheckpointDue(state)) return true;
         // §9 (redo retirement signal): under the redo log, a superseded
@@ -33785,6 +33817,115 @@ test "lite redo log cross-process refresh still sees a pinned reader's own write
     const beta = (try reader.getDocumentAlloc(a, "beta")).?;
     defer a.free(beta);
     try std.testing.expectEqualStrings("two", beta);
+}
+
+// perf/lwa-xproc-retirement: `retirementNeedsServiceCoreWithCancel` loaded
+// the allocator ledger off `self.activeCheckpoint()` without first calling
+// `refreshIfWriterBaseStale`, unlike every sibling entry point that touches
+// the ledger -- `beginTransaction`, `vacuumWithCancel`,
+// `pageAllocatorFromFreeMapWithProof` -- which all call it before reading
+// anything keyed on the checkpoint they load. A second in-process handle on
+// the same inode (`.externally_locked = true`, standing in for a
+// maintenance turn's own detached snapshot -- `refreshIfWriterBaseStale`'s
+// own doc comment calls that "most commonly" the one that falls behind)
+// that opens early and then sits idle while the real writer commits more
+// keeps reading its own stale checkpoint through `retirementNeedsService`
+// forever, never catching up the way `beginTransaction` would have on its
+// next ordinary write. On a live file that stale checkpoint's own
+// `free_map_root_page` can by then have been reclaimed and reused for a
+// different page kind, surfacing as `UnexpectedNativePageKind`/
+// `InvalidNativeAllocator` out of the ledger load this function makes;
+// this test proves the staleness directly (no redo log, no second process,
+// two in-process `NativeFile` handles) rather than racing an actual reuse.
+test "lite retirementNeedsService refreshes a stale writer-mode handle's own checkpoint before loading the ledger" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "xproc-retirement-stale-checkpoint.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    try writer.putDocument("w0", "v0");
+    try std.testing.expectEqual(@as(u64, 1), writer.activeCheckpoint().commit_sequence);
+
+    // Opens right after the first commit, while its own view still matches
+    // reality -- the staleness this test exercises is entirely what happens
+    // *after* this open.
+    var second = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true });
+    defer second.close();
+    try std.testing.expectEqual(@as(u64, 1), second.activeCheckpoint().commit_sequence);
+
+    // Five more ordinary commits through `writer` alone -- `second.header`
+    // never changes, but the shared in-process registry does.
+    var key_buf: [16]u8 = undefined;
+    for (0..5) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "w{d}", .{i + 1});
+        try writer.putDocument(key, "v");
+    }
+    try std.testing.expectEqual(@as(u64, 6), writer.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u64, 1), second.activeCheckpoint().commit_sequence);
+
+    const entry = second.inode_lock_ref.load(.acquire).?;
+    try std.testing.expectEqual(@as(u64, 6), inode_lock.committedSequence(entry));
+
+    // The bug: before the fix, `retirementNeedsService` read straight off
+    // `second`'s own stale checkpoint (still commit_sequence == 1, the
+    // value from the moment it opened) without ever consulting the
+    // registry's own, already-correct latest commit. After the fix it
+    // refreshes first, exactly as `beginTransaction` already would.
+    _ = try second.retirementNeedsService();
+    try std.testing.expectEqual(@as(u64, 6), second.activeCheckpoint().commit_sequence);
+}
+
+// perf/lwa-xproc-retirement: `allocatorStatsWithCancel`/`retirementReserveBytesWithCancel`
+// have the exact same gap `retirementNeedsServiceCoreWithCancel` had above --
+// reached live via `Connection.refresh` -> `needsReuseAdmission` ->
+// `allocatorStats` on `self.current`'s own file (capi/lite_connection.zig),
+// confirmed by a bench stack trace surfacing `UnexpectedNativePageKind` out
+// of this exact chain under `scripts/bench/lite_sqlite_comparison.py
+// --workers 8`. Same two-handle staleness proof as the sibling test above.
+test "lite allocatorStats and retirementReserveBytes refresh a stale writer-mode handle's own checkpoint first" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "xproc-retirement-stale-checkpoint-stats.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer writer.close();
+    try writer.putDocument("w0", "v0");
+    try std.testing.expectEqual(@as(u64, 1), writer.activeCheckpoint().commit_sequence);
+
+    var second = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true });
+    defer second.close();
+    try std.testing.expectEqual(@as(u64, 1), second.activeCheckpoint().commit_sequence);
+
+    var key_buf: [16]u8 = undefined;
+    for (0..5) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "w{d}", .{i + 1});
+        try writer.putDocument(key, "v");
+    }
+    try std.testing.expectEqual(@as(u64, 6), writer.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u64, 1), second.activeCheckpoint().commit_sequence);
+
+    // The bug: before the fix, `allocatorStats` read straight off `second`'s
+    // own stale checkpoint. After the fix it refreshes first.
+    _ = try second.allocatorStats();
+    try std.testing.expectEqual(@as(u64, 6), second.activeCheckpoint().commit_sequence);
+
+    // Re-stale it, then prove `retirementReserveBytes` catches up the same way.
+    var third = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true });
+    defer third.close();
+    try std.testing.expectEqual(@as(u64, 6), third.activeCheckpoint().commit_sequence);
+    for (0..5) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "x{d}", .{i});
+        try writer.putDocument(key, "v");
+    }
+    try std.testing.expectEqual(@as(u64, 11), writer.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u64, 6), third.activeCheckpoint().commit_sequence);
+    _ = try third.retirementReserveBytes();
+    try std.testing.expectEqual(@as(u64, 11), third.activeCheckpoint().commit_sequence);
 }
 
 // perf/lwa-stale-base: a second in-process writer-mode handle on the same
