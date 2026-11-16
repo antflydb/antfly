@@ -126,7 +126,7 @@ pub fn capture(db: anytype, output: A, document: []const u8, name: []const u8) !
         .replay_target_sequence = target,
         .current = true,
     };
-    _ = privacy.requirePublishedWithBudget(db, a, .{}, &scan_budget) catch |err| switch (err) {
+    _ = privacy.requireConsumersPublishedWithBudget(db, a, .{}, &.{name}, &scan_budget) catch |err| switch (err) {
         error.IndexRebuilding => {
             snapshot.current = false;
             snapshot.incomplete_reason = "IndexRebuilding";

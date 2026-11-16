@@ -33,6 +33,10 @@ def privacy_provider(request):
     calls = {"embed": [], "extract": [], "paths": [], "batches": [], "embed_models": []}
     behavior = {"deny": False, "embed_gate": Event(), "embed_held": Event()}
     behavior["embed_gate"].set()
+    behavior["model_gate"] = Event()
+    behavior["model_gate"].set()
+    behavior["model_held"] = Event()
+    behavior["hold_model"] = None
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -92,6 +96,12 @@ def privacy_provider(request):
                 if not behavior["embed_gate"].is_set():
                     behavior["embed_held"].set()
                 assert behavior["embed_gate"].wait(timeout=60)
+                # Hold only authored document work, after model admission probes.
+                if body["model"] == behavior["hold_model"] and any(
+                    "Orchard schedule." in text for text in inputs
+                ):
+                    behavior["model_held"].set()
+                    assert behavior["model_gate"].wait(timeout=60)
                 return self.reply(
                     200,
                     {
@@ -151,6 +161,7 @@ def privacy_provider(request):
     try:
         yield endpoint, calls, behavior, native
     finally:
+        behavior["model_gate"].set()
         behavior["embed_gate"].set()
         server.shutdown()
         thread.join(timeout=5)
