@@ -6137,6 +6137,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"local transaction recovery"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const completion_recovery_maintenance_tests = b.addTest(.{
+        .root_module = server_db_test_mod,
+        .filters = &.{ "transaction recovery completion", "transaction recovery never presumes abort", "transaction recovery delegates stale coordinator", "replicated recovery is coordinator-owned" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("completion-recovery-maintenance-test", "Verify retained completion scheduling and preserve legacy maintenance").dependOn(&addFilteredTestRunArtifact(b, completion_recovery_maintenance_tests).step);
     b.step("antfly-local-transaction-recovery-test", "Run local transaction recovery regressions").dependOn(&addFilteredTestRunArtifact(b, local_recovery_tests).step);
     const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery.", "storage.artifact_upload_recovery.", "storage.server_coordinated_ttl.", "storage.server_query_visibility.", "storage.server_document_child_range.", "storage.server_group_metadata." };
     const server_db_tests = b.addTest(.{

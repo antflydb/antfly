@@ -39,6 +39,9 @@ pub const Config = struct {
     /// Replicated DBs route all transaction metadata changes through their
     /// coordinator Raft group. Standalone stores keep the direct local path.
     replicated_metadata: bool = false,
+    /// Copies an original-owner observation into a bounded deferred job. Success
+    /// is scheduling only; it cannot acknowledge participants or release debt.
+    enqueue_completion_fn: ?*const fn (*anyopaque, @import("antfly_local_sources").storage_history_recovery_wire.Request) anyerror!void = null,
     owns_recovery_fn: ?*const fn (ctx: *anyopaque, owner_participant: []const u8) bool = null,
     acknowledge_participant_fn: ?*const fn (
         ctx: *anyopaque,

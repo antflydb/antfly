@@ -484,6 +484,16 @@ pub const StorageOwnerTransactionRecovery = struct {
         ));
     }
 
+    fn enqueueCompletion(ptr: *anyopaque, request: @import("antfly_local_sources").storage_history_recovery_wire.Request) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const callback = self.config.enqueue_completion_fn orelse return error.ChangefeedCapabilityUnsupported;
+        try request.validate();
+        const raw = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(raw);
+        if (raw.len > @import("antfly_local_sources").storage_history_recovery_wire.max_bytes) return error.InvalidTxnRecord;
+        try callbackStatus(callback(self.config.callback_ctx, .fromSlice(raw)));
+    }
+
     pub fn dbConfig(self: *StorageOwnerTransactionRecovery) db_mod.transaction_runtime.Config {
         return @import("../storage/server_transaction_recovery.zig").configFor(StorageOwnerTransactionRecovery, self, serverConfig);
     }
@@ -502,6 +512,7 @@ pub const StorageOwnerTransactionRecovery = struct {
             .acknowledge_participant_fn = if (self.config.replicated_metadata != 0) acknowledgeParticipant else null,
             .acknowledge_participants_fn = if (self.config.replicated_metadata != 0 and self.config.acknowledge_participants_fn != null) acknowledgeParticipants else null,
             .cleanup_transaction_fn = if (self.config.replicated_metadata != 0) cleanupTransaction else null,
+            .enqueue_completion_fn = if (self.config.enqueue_completion_fn != null) enqueueCompletion else null,
         };
     }
 };

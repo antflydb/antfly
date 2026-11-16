@@ -5123,3 +5123,77 @@ test "selected owner readiness compiled projections retain independent query con
         try std.testing.expect(rejected.ptr == null);
     }
 }
+
+test "compiled ordered history completion scheduling crosses the native maintenance callback" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const wire = local.storage_history_recovery_wire;
+    const Frozen = @import("../api/completion_plan.zig");
+    const Recorder = struct {
+        claimed: std.atomic.Value(bool) = .init(false),
+        ready: std.atomic.Value(bool) = .init(false),
+        valid: bool = false,
+        owner: ?@FieldType(wire.Request, "owner") = null,
+        transaction_id: [16]u8 = @splat(0),
+        digest: [32]u8 = @splat(0),
+        fn enqueue(ptr: ?*anyopaque, raw: abi.BorrowedBytes) callconv(.c) abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            if (self.claimed.swap(true, .acq_rel)) return .ok;
+            defer self.ready.store(true, .release);
+            var parsed = wire.decode(std.heap.page_allocator, raw.slice()) catch return .invalid_argument;
+            defer parsed.deinit();
+            self.owner = parsed.value.owner;
+            self.transaction_id = parsed.value.transaction_id;
+            self.digest = parsed.value.admission_digest;
+            self.valid = parsed.value.resolution_timestamp_ns > 0 and std.mem.eql(u8, parsed.value.coordinator_locator, "table2:00000004:docs:7001");
+            return .ok;
+        }
+        fn resolve(_: ?*anyopaque, _: *const abi.TxnId, _: abi.BorrowedBytes, _: abi.TxnStatus, _: u64) callconv(.c) abi.Status {
+            return .invalid_argument;
+        }
+        fn owns(_: ?*anyopaque, _: abi.BorrowedBytes) callconv(.c) u8 {
+            return 1;
+        }
+        fn ack(_: ?*anyopaque, _: *const abi.TxnId, _: abi.BorrowedBytes, _: abi.BorrowedBytes) callconv(.c) abi.Status {
+            return .invalid_argument;
+        }
+        fn cleanup(_: ?*anyopaque, _: *const abi.TxnId, _: abi.BorrowedBytes, _: u64, _: u64) callconv(.c) abi.Status {
+            return .invalid_argument;
+        }
+    };
+    var recorder: Recorder = .{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var owner = try client.Owner.open(.{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 11, .identity_range_id = 13, .schema_json = .fromSlice("{}"), .indexes_json = .fromSlice("{}"), .transaction_recovery = .{ .enabled = 1, .replicated_metadata = 1, .interval_ms = 1, .callback_ctx = &recorder, .owner_id = .fromSlice("completion-native-test"), .resolve_participant_fn = Recorder.resolve, .owns_recovery_fn = Recorder.owns, .acknowledge_participant_fn = Recorder.ack, .cleanup_transaction_fn = Recorder.cleanup, .enqueue_completion_fn = Recorder.enqueue } });
+    defer owner.deinit();
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 11, .big);
+    std.mem.writeInt(u64, namespace[16..24], 13, .big);
+    const control = local.api_local_table_writes.table_write_source.history_consumer;
+    const command: control.Command = .{ .enroll = .{ .namespace = namespace, .authority = @splat(1), .consumer = @splat(2), .definition = @splat(3), .sequence = 1, .expires_at_seconds = 1000, .policy_revision = 1 } };
+    const json = try std.json.Stringify.valueAlloc(a, command, .{});
+    defer a.free(json);
+    var enrolled = try owner.orderedHistoryControlJson("docs", json, 1, 1);
+    enrolled.deinit();
+    const binding: Frozen.completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(4), .root_generation = 0, .group_id = 7001, .topology_epoch = 1 };
+    const id: [16]u8 = @splat(5);
+    var plan = try Frozen.Plan.freeze(a, id, @splat(6), binding, &.{.{ .owner = binding, .locator = "table2:00000004:docs:7001", .roles = Frozen.completion.Roles.guards, .prepare = .{ .timestamp_ns = 1000, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = id, .topology_epoch = 1, .completion_owner = binding } } } }}, 1001);
+    defer plan.deinit();
+    const begin = try local.api_internal_batch.encodeBatchRequest(a, try plan.begin(0));
+    defer a.free(begin);
+    var begun = try owner.replicatedBatchAtRaftEntryJson("docs", begin, 1, 2);
+    begun.deinit();
+    const deadline = @import("antfly_platform").time.monotonicNs() + 6 * std.time.ns_per_s;
+    while (!recorder.ready.load(.acquire)) {
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(recorder.valid);
+    try std.testing.expectEqual(binding, recorder.owner.?);
+    try std.testing.expectEqual(id, recorder.transaction_id);
+    try std.testing.expectEqual(plan.admission.digest(), recorder.digest);
+    try std.testing.expectEqual(abi.TxnStatus.pending, try owner.transactionStatus("docs", id));
+}

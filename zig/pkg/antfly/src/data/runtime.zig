@@ -5702,6 +5702,7 @@ pub const DataServer = struct {
     background_jobs_shutdown: std.atomic.Value(bool) = .init(false),
     // Preparation may own up to 16 MiB per transaction. Bound concurrency as
     // well as queued observation bytes, independent of local shard count.
+    completion_recovery_queue: @import("../api/completion_recovery_queue.zig").Queue = .{},
     relational_ttl_queue: server_coordinated_ttl.Queue = .{ .max_jobs = 4 },
     artifact_publication_queue: artifact_publication_dispatch.Queue = .{},
     relational_ttl_completed: std.atomic.Value(u64) = .init(0),
@@ -6372,6 +6373,7 @@ pub const DataServer = struct {
         _ = owner_source.withNativeMigrationPolicy(self.provisioned_storage.denseNativeMigrationPolicySource());
         _ = owner_source.withGroupVisibleRootGeneration(self.provisioned_storage.groupVisibleRootGenerationSource());
         _ = owner_source.withTransactionRecoverySource(self.write_source.transactionRecoverySource());
+        owner_source.completion_recovery = .{ .ptr = self, .enqueue_fn = enqueueCompletionRecovery };
         _ = owner_source.withRestoreDescriptorRecovery(.{ .ptr = self, .recover_fn = recoverRestoreDescriptor });
         _ = owner_source.withRemoteContent(self.api_server_cfg.remote_content);
         _ = owner_source.withCoordinatedTtl(.{ .ptr = self, .expire_fn = expireRelationalRows });
@@ -7450,6 +7452,79 @@ pub const DataServer = struct {
             self.artifact_publication_queue.release(job.io, job.proposal);
         }
         self.alloc.destroy(job);
+    }
+
+    const CompletionRecoveryJob = struct {
+        server: *DataServer,
+        observation: *@import("../api/completion_recovery_queue.zig").Queue.Job,
+        io: std.Io,
+        term: u64,
+    };
+
+    fn enqueueCompletionRecovery(ptr: *anyopaque, request: @import("antfly_local_sources").storage_history_recovery_wire.Request) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        const runtime = self.backend_runtime orelse return error.ResourceBudgetExceeded;
+        if (runtime.durable_jobs.executesInline()) return error.ResourceBudgetExceeded;
+        const io = runtime.io() orelse return error.ResourceBudgetExceeded;
+        try request.validate();
+        if (self.hotStandbyWriteGate()) |gate| try gate.check();
+        // Native maintenance may hold a DB lease: never wait behind Raft here.
+        if (!self.data_raft_mutex.tryLock()) return error.ReadUnavailable;
+        const term = blk: {
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse return error.NotLeader;
+            const host = raft.host.http_host.host;
+            if (!host.isLocalLeader(request.owner.group_id)) return error.NotLeader;
+            break :blk (host.raftStatus(request.owner.group_id) orelse return error.NotLeader).hard.current_term;
+        };
+        const observation = (try self.completion_recovery_queue.reserve(io, self.alloc, request)) orelse return;
+        errdefer self.completion_recovery_queue.release(io, observation);
+        const job = try self.alloc.create(CompletionRecoveryJob);
+        errdefer self.alloc.destroy(job);
+        job.* = .{ .server = self, .observation = observation, .io = io, .term = term };
+        const owner = try self.dataServerBackgroundOwnerId(runtime);
+        try runtime.durable_jobs.submit(.{ .owner_id = owner, .class = .maintenance, .ptr = job, .run = runCompletionRecoveryJob, .deinit = deinitCompletionRecoveryJob });
+    }
+
+    fn checkCompletionRecoveryLeadership(ptr: *anyopaque, context: antfly.public_api.operation.RequestContext) !void {
+        const job: *CompletionRecoveryJob = @ptrCast(@alignCast(ptr));
+        const self = job.server;
+        try context.ensureActive();
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (self.hotStandbyWriteGate()) |gate| try gate.check();
+        // This check runs on the deferred job, outside every native DB lease
+        // and outside participant transport locks, so bounded waiting is safe.
+        try self.lockHistoryRaftOwner(context);
+        defer self.data_raft_mutex.unlock();
+        const raft = self.data_raft orelse return error.NotLeader;
+        const host = raft.host.http_host.host;
+        const group = job.observation.request.owner.group_id;
+        if (!host.isLocalLeader(group) or (host.raftStatus(group) orelse return error.NotLeader).hard.current_term != job.term) return error.NotLeader;
+    }
+
+    fn runCompletionRecoveryJob(ptr: *anyopaque) !void {
+        const job: *CompletionRecoveryJob = @ptrCast(@alignCast(ptr));
+        const self = job.server;
+        const context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&self.background_jobs_shutdown) };
+        checkCompletionRecoveryLeadership(job, context) catch |err| switch (err) {
+            error.NotLeader, error.Canceled, error.Cancelled => return,
+            else => return err,
+        };
+        var recovery = self.completionRecovery();
+        recovery.guard = .{ .ptr = job, .check_fn = checkCompletionRecoveryLeadership };
+        _ = recovery.runRetained(self.alloc, job.observation.request, context) catch |err| switch (err) {
+            error.NotLeader, error.Canceled, error.Cancelled => return,
+            else => return err,
+        };
+        // Native retained metadata, not queue membership, owns retry/completion
+        // authority. A later maintenance sweep reconciles any unfinished work.
+    }
+
+    fn deinitCompletionRecoveryJob(ptr: *anyopaque) void {
+        const job: *CompletionRecoveryJob = @ptrCast(@alignCast(ptr));
+        job.server.completion_recovery_queue.release(job.io, job.observation);
+        job.server.alloc.destroy(job);
     }
 
     fn expireRelationalRows(ptr: *anyopaque, request: server_coordinated_ttl.Request) !u32 {
@@ -9997,6 +10072,7 @@ pub const DataServer = struct {
         self.write_source.deinit();
         // Owner jobs drained before caches; native callbacks have now stopped
         // too, so no admission can race this final assertion/reclamation.
+        self.completion_recovery_queue.deinit();
         self.relational_ttl_queue.deinit();
         self.artifact_publication_queue.deinit();
         if (self.owned_incoming_graph_route_store) |*store| store.deinit();
@@ -44212,6 +44288,56 @@ fn consumerTests() type {
                 _ = publication_client.withInternalServiceAuth(secret, "history-runtime");
                 var remote_writer: @import("../api/completion_participant.zig").HttpWriter = .{ .client = &publication_client, .base_uri = base };
                 const remote_participant: @import("../api/completion_participant.zig").Port = .{ .writer = remote_writer.writer() };
+                const RecoveryLane = struct {
+                    pending: ?backend_runtime_mod.Job = null,
+                    submissions: usize = 0,
+                    fn submit(ptr: *anyopaque, job: backend_runtime_mod.Job) !void {
+                        const lane: *@This() = @ptrCast(@alignCast(ptr));
+                        if (lane.pending != null) return error.ResourceBudgetExceeded;
+                        lane.pending = job;
+                        lane.submissions += 1;
+                    }
+                    fn drain(ptr: *anyopaque, _: u64) void {
+                        const lane: *@This() = @ptrCast(@alignCast(ptr));
+                        if (lane.pending) |job| {
+                            lane.pending = null;
+                            job.deinit(job.ptr);
+                        }
+                    }
+                    fn poll(_: *anyopaque, _: usize) !usize {
+                        return 0;
+                    }
+                };
+                var recovery_lane: RecoveryLane = .{};
+                const previous_jobs = runtime.ptr().durable_jobs;
+                runtime.ptr().durable_jobs = .{ .ptr = &recovery_lane, .vtable = &.{ .submit = RecoveryLane.submit, .drain_owner = RecoveryLane.drain, .close_owner = RecoveryLane.drain, .poll = RecoveryLane.poll } };
+                defer runtime.ptr().durable_jobs = previous_jobs;
+                defer RecoveryLane.drain(&recovery_lane, 0);
+                const recovery_request: @import("antfly_local_sources").storage_history_recovery_wire.Request = .{ .owner = current_owner, .transaction_id = txn_id, .admission_digest = plan.digest(), .coordinator_locator = frozen.participant_ids[0], .resolution_timestamp_ns = 2000 };
+                const enqueue_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+                while (true) {
+                    DataServer.enqueueCompletionRecovery(server, recovery_request) catch |err| switch (err) {
+                        error.ReadUnavailable => {
+                            if (platform_time.monotonicNs() >= enqueue_deadline) return error.DeadlineExceeded;
+                            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    break;
+                }
+                try std.testing.expectEqual(@as(usize, 1), recovery_lane.submissions);
+                const deferred = recovery_lane.pending orelse return error.TestUnexpectedResult;
+                recovery_lane.pending = null;
+                defer deferred.deinit(deferred.ptr);
+                const scheduled_job: *DataServer.CompletionRecoveryJob = @ptrCast(@alignCast(deferred.ptr));
+                scheduled_job.term += 1;
+                try std.testing.expectError(error.NotLeader, DataServer.checkCompletionRecoveryLeadership(scheduled_job, .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s }));
+                scheduled_job.term -= 1;
+                try deferred.run(deferred.ptr);
+                const scheduled_publication = try server.historyPublicationPort().read(a, route.fence().?, "docs", .{ .version = 1, .owner = current_owner, .transaction_id = txn_id, .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 }, .{});
+                try std.testing.expect(scheduled_publication.publication != null);
+                try std.testing.expectEqual(checked_certificate.value.digest, scheduled_publication.publication.?.digest);
                 var recovery = origin.completionRecovery();
                 recovery.participants = remote_participant;
                 try std.testing.expectEqual(.complete, try recovery.run(a, current_owner, route.fence().?, "docs", txn_id, .{}));

@@ -109,6 +109,24 @@ pub const Port = struct {
         return self.writeRequest(a, fence, owner, locator.table_name, request, context, scope.deadline_ns);
     }
 
+    /// Only the original coordinator can win the first terminal decision.
+    /// A raced COMMIT is a conflict, never permission to propagate an abort.
+    pub fn abortExpired(self: Port, a: A, lookup: @import("history_decision_operations.zig").wire.Query, observation: @import("history_decision_operations.zig").wire.Reply, fence: metadata.CatalogRouteFence, cutoff_ns: u64, timestamp_ns: u64, original: operation.RequestContext) !void {
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
+        try context.ensureActive();
+        try observation.validate(lookup);
+        const decision = observation.decision orelse return error.SourceOutcomeUnresolved;
+        if (cutoff_ns == 0 or timestamp_ns < cutoff_ns or decision.record.status != .pending or decision.record.created_at_ns >= cutoff_ns) return error.SourceOutcomeUnresolved;
+        const admission = decision.admission.admission;
+        const member = try admission.member(admission.coordinator_namespace);
+        const owner = try admission.recoveryOwner(member.namespace);
+        const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+        try validateParticipantFence(owner, locator.group_id, fence);
+        const request: types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = owner, .txn_id = admission.transaction_id, .status = .aborted, .commit_version = timestamp_ns } } };
+        return self.writeRequest(a, fence, owner, locator.table_name, request, context, scope.deadline_ns);
+    }
+
     fn writeRequest(self: Port, a: A, fence: metadata.CatalogRouteFence, owner: completion.RoutedOwner, table: []const u8, request: types.BatchRequest, context: operation.RequestContext, deadline_ns: u64) !void {
         try context.ensureActive();
         const remaining = deadline_ns -| time.monotonicNs();

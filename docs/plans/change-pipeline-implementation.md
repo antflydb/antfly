@@ -3308,3 +3308,62 @@ native signed-HTTP certificate publication. Formatting, license, engine-error
 generation and diff checks passed. The full goal remains incomplete: scheduled
 recovery/admission integration, bounded fanout, destination/source wiring,
 retention/bootstrap, public feeds and actual CDC-client qualification remain.
+
+### Native maintenance to elected deferred recovery
+
+Storage-owner ABI 104 appends an optional completion-enqueue callback to the
+existing transaction-maintenance configuration. The native scan reads the
+retained admission, schedules only its original coordinator, and carries the
+original owner, transaction/admission identities, locator and expiry cutoff.
+Source-purpose reservations carry a zero abort cutoff. Scheduling success is
+not participant acknowledgement, transaction completion or retention release.
+Completion records bypass both legacy replicated resolution and the local
+legacy fallback; unsupported/missing completion hooks keep their debt intact.
+Backpressure resumes from the first unscheduled record instead of repeatedly
+filling the queue with a completed prefix.
+
+The control queue owns copied locators, deduplicates stable owner/transaction/
+admission identities, and bounds active jobs to 32. Inline executors are rejected.
+Native enqueue uses a nonblocking Raft leadership check so it cannot wait behind
+an apply holding the native owner. A deferred runtime maintenance job holds no
+native DB/cache lease. It checks shutdown, hot standby, local coordinator
+leadership and the captured term before recovery actions. The standard callback
+error boundary preserves failure identity across compilation units. Jobs release
+all queue ownership on success, error, leadership loss or shutdown.
+
+The retained recovery entry point validates the scheduled admission digest against
+a fresh qualified decision. An expired ordinary pending coordinator can choose
+an idempotent abort, but propagates it only after rereading the authoritative
+terminal decision; a raced COMMIT is never converted into an abort. Source-owned
+pending work is preserved. The elected job then runs terminal recovery over the
+same original owners and final publication obligations as the foreground driver.
+
+The first qualification run passed all four focused maintenance/legacy cases and
+three compiled storage cases, including a real ABI-104 native background callback
+that observes a retained pending admission without resolving it. Its Raft build
+caught a status-field typo in the term guard, corrected to `hard.current_term`. The
+non-replicated fallback was also explicitly filtered to exclude completion
+records. The final run additionally exercises deferred job execution against
+actual native Raft, owned bounded queue behavior, expiry and admission mismatch.
+Final results are pending. Normal admission, bounded fanout, durable completion
+GC/finalization, destinations and the public-feed/CDC scope remain outstanding.
+
+The focused maintenance suite now also proves that a non-replicated legacy
+fallback cannot auto-abort retained completion work when the new callback is
+absent. Capacity/leadership pressure stops the completion scan at its first
+unscheduled record and preserves the previous continuation rather than skipping
+that record on every sweep. The native/maintenance cases pass; the Raft test
+additionally requires publication by the deferred job itself before any
+foreground fallback and rejects a deliberately stale captured leadership term.
+
+`completion-recovery-scheduling-published-test.log` completed with exit 0:
+three compiled-storage cases, 11 real-Raft/recovery cases and four focused
+maintenance/legacy cases passed, with zero failures, skips or leaks. The native
+ABI-104 maintenance worker actually invokes the new callback with the original
+retained owner/admission while the transaction remains pending. The deferred
+DataServer job itself publishes the native certificate before foreground
+recovery is permitted, and a stale captured term is rejected. Queue ownership,
+deduplication/capacity, scheduled admission mismatch, ordinary expiry abort,
+source-purpose preservation and the filtered local legacy fallback are covered.
+Generation, license, formatting and diff checks passed. Normal application/source
+admission, bounded fanout and the remaining full issue scope are not complete.

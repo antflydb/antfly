@@ -30,24 +30,67 @@ const Context = local.api_operation.RequestContext;
 const A = std.mem.Allocator;
 pub const Outcome = enum { unproven, pending, aborted, incomplete, complete };
 
+pub const Guard = struct { ptr: *anyopaque, check_fn: *const fn (*anyopaque, Context) anyerror!void };
+
 pub const Recovery = struct {
+    guard: ?Guard = null,
     catalog: catalog_api.CatalogSource,
     decisions: decision_ops.Port,
     resolutions: resolution_ops.Port,
     publications: publication_ops.Port,
     participants: participant_ops.Port,
 
+    fn checkpoint(self: Recovery, context: Context) !void {
+        try context.ensureActive();
+        if (self.guard) |guard| try guard.check_fn(guard.ptr, context);
+    }
+
     /// One bounded pass. Unknown mutations return immediately without replay;
     /// a later pass starts again with a fresh authoritative decision read.
     /// Completion is not retention-release authorization or a source ACK.
     pub fn run(self: Recovery, a: A, coordinator: completion.RoutedOwner, coordinator_fence: metadata.CatalogRouteFence, table: []const u8, transaction_id: [16]u8, original: Context) !Outcome {
+        return self.runBound(a, coordinator, coordinator_fence, table, transaction_id, null, original);
+    }
+    pub fn runRetained(self: Recovery, a: A, job: local.storage_history_recovery_wire.Request, original: Context) !Outcome {
+        try job.validate();
+        var context = try original.platformDeadline();
+        context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s);
+        try self.checkpoint(context);
+        var budget = self.catalog.budget(null);
+        budget.deadline_ns = @min(budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }) orelse std.math.maxInt(u64), budget.nowNs() +| 5 * std.time.ns_per_s);
+        budget.cancellation = context.cancellation;
+        var session = try catalog_api.RoutingSession.initWithBudget(a, self.catalog, budget);
+        defer session.deinit();
+        const fence = try route(&session, job.owner, job.coordinator_locator, budget, context);
+        const locator = local.api_local_transaction_contract.parseParticipantRef(job.coordinator_locator) orelse return error.InvalidParticipant;
+        return self.runBound(a, job.owner, fence, locator.table_name, job.transaction_id, job, context);
+    }
+    fn runBound(self: Recovery, a: A, coordinator: completion.RoutedOwner, coordinator_fence: metadata.CatalogRouteFence, table: []const u8, transaction_id: [16]u8, job: ?local.storage_history_recovery_wire.Request, original: Context) !Outcome {
         var scope = try publication_ops.Scope.init(coordinator_fence, original);
         const context = scope.context();
-        try context.ensureActive();
+        try self.checkpoint(context);
         const request: decision_ops.Request = .{ .version = 1, .owner = coordinator, .transaction_id = transaction_id, .minimum_applied_index = 1 };
         var observed = try self.decisions.read(a, coordinator_fence, table, request, context);
         defer observed.deinit();
         try observed.value.validate(request.binding());
+        try self.checkpoint(context);
+        if (job) |expected| {
+            const initial = observed.value.decision orelse return .unproven;
+            if (!std.mem.eql(u8, &initial.admission.digest, &expected.admission_digest)) return error.SourceTransactionIdentityConflict;
+            if (initial.record.status == .pending and expected.abort_before_ns != 0 and initial.record.created_at_ns < expected.abort_before_ns) {
+                try self.checkpoint(context);
+                self.participants.abortExpired(a, request.binding(), observed.value, coordinator_fence, expected.abort_before_ns, expected.resolution_timestamp_ns, context) catch |err| switch (err) {
+                    error.DecisionConflict => {},
+                    else => return err,
+                };
+                try self.checkpoint(context);
+                const refreshed = try self.decisions.read(a, coordinator_fence, table, request, context);
+                observed.deinit();
+                observed = refreshed;
+                try observed.value.validate(request.binding());
+                if (observed.value.decision) |fresh| if (!std.mem.eql(u8, &fresh.admission.digest, &expected.admission_digest)) return error.SourceTransactionIdentityConflict;
+            }
+        }
         const decision = observed.value.decision orelse return .unproven;
         switch (decision.record.status) {
             .pending => return .pending,
@@ -67,17 +110,18 @@ pub const Recovery = struct {
         }
         if (decision.record.status == .aborted) {
             for (fences, 0..) |fence, index| {
-                try context.ensureActive();
+                try self.checkpoint(context);
+                try self.checkpoint(context);
                 try self.participants.submitRetained(a, request.binding(), observed.value, index, fence, .resolve, context);
             }
-            try context.ensureActive();
+            try self.checkpoint(context);
             return .aborted;
         }
         const manifest = try decision.committedManifest();
         var assembly = try resolution_ops.wire.Assembly.init(a, manifest);
         defer assembly.deinit();
         for (admission.participants, fences, 0..) |member, fence, index| {
-            try context.ensureActive();
+            try self.checkpoint(context);
             const owner = try admission.recoveryOwner(member.namespace);
             const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
             const input: resolution_ops.Request = .{ .version = 1, .authority = .raft, .namespace = member.namespace, .transaction_id = transaction_id, .owner_fence = owner.digest(), .manifest_digest = manifest.digest(), .commit_version = manifest.commit_version, .minimum_applied_index = 1 };
@@ -86,12 +130,13 @@ pub const Recovery = struct {
             if (receipt.resolution == null) {
                 // A positive durable coordinator COMMIT, not absence, authorizes
                 // idempotent terminal resolution. BEGIN/PREPARE are forbidden.
+                try self.checkpoint(context);
                 try self.participants.submitRetained(a, request.binding(), observed.value, index, fence, .resolve, context);
                 receipt = try self.resolutions.read(a, fence, locator.table_name, input, context);
             }
             _ = try assembly.add(input.binding(), receipt);
         }
-        try context.ensureActive();
+        try self.checkpoint(context);
         if (assembly.received != admission.participants.len) return .incomplete;
         const bytes = try assembly.encode(a);
         defer a.free(bytes);
@@ -100,13 +145,14 @@ pub const Recovery = struct {
         const digest = parsed.value.digest;
         var complete = true;
         for (admission.participants, fences, 0..) |member, fence, index| {
-            try context.ensureActive();
+            try self.checkpoint(context);
             const owner = try admission.recoveryOwner(member.namespace);
             const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
             const input: publication_ops.Request = .{ .version = 1, .owner = owner, .transaction_id = transaction_id, .manifest_digest = manifest.digest(), .commit_version = manifest.commit_version, .minimum_applied_index = 1 };
             var publication = try self.publications.read(a, fence, locator.table_name, input, context);
             try publication.validate(input.binding());
             if (publication.publication == null) {
+                try self.checkpoint(context);
                 try self.participants.submitRetained(a, request.binding(), observed.value, index, fence, .{ .publish = bytes }, context);
                 publication = try self.publications.read(a, fence, locator.table_name, input, context);
                 try publication.validate(input.binding());
@@ -115,7 +161,7 @@ pub const Recovery = struct {
                 if (!std.mem.eql(u8, &digest, &evidence.digest)) return error.DecisionConflict;
             } else complete = false;
         }
-        try context.ensureActive();
+        try self.checkpoint(context);
         return if (complete) .complete else .incomplete;
     }
 };
@@ -224,6 +270,12 @@ test "data raft ordered history completion recovery retains guard checkpoints an
                 .resolve => |terminal| {
                     try std.testing.expectEqual(@as(local.storage_db_selected_root.db.types.TxnStatus, if (self.state.status == .committed) .committed else .aborted), terminal.status);
                     try std.testing.expectEqual(@as(u64, if (self.state.status == .committed) 20 else 30), terminal.commit_version);
+                    if (self.state.status == .pending and terminal.status == .aborted) {
+                        self.state.status = .aborted;
+                        self.state.commit_version = 0;
+                        self.state.finalized_at_ns = terminal.commit_version;
+                        self.state.intents_resolved = true;
+                    }
                     self.resolves += 1;
                     if (!self.suppress_resolution) self.resolved[index] = true;
                 },
@@ -283,4 +335,19 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(.aborted, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));
     try std.testing.expectEqual(@as(usize, 4), fake.publishes);
     try std.testing.expectEqual(@as(usize, 5), fake.resolves);
+    var retained: local.storage_history_recovery_wire.Request = .{ .owner = owners[0], .transaction_id = admission.transaction_id, .admission_digest = admission.digest(), .coordinator_locator = members[0].locator, .abort_before_ns = 20, .resolution_timestamp_ns = 30 };
+    retained.admission_digest[0] ^= 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, recovery.runRetained(a, retained, .{}));
+    try std.testing.expectEqual(@as(usize, 5), fake.resolves);
+    retained.admission_digest = admission.digest();
+    fake.state.status = .pending;
+    fake.state.finalized_at_ns = 0;
+    fake.state.intents_resolved = false;
+    retained.abort_before_ns = 0;
+    try std.testing.expectEqual(.pending, try recovery.runRetained(a, retained, .{}));
+    try std.testing.expectEqual(@as(usize, 5), fake.resolves);
+    retained.abort_before_ns = 20;
+    try std.testing.expectEqual(.aborted, try recovery.runRetained(a, retained, .{}));
+    try std.testing.expectEqual(@as(usize, 8), fake.resolves);
+    try std.testing.expectEqual(@as(usize, 4), fake.publishes);
 }

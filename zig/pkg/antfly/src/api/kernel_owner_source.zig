@@ -322,6 +322,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     row_policy_authority_issuer: ?[]const u8 = null,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     transaction_recovery_source: ?transaction_recovery_source.Source = null,
+    completion_recovery: ?@import("completion_recovery_queue.zig").Port = null,
     restore_descriptor_recovery: ?RestoreDescriptorRecovery = null,
     document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
     resolution_candidate_source: ?runtime_callbacks.CandidateSource = null,
@@ -3778,6 +3779,17 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .ok;
     }
 
+    fn enqueueCompletionRecovery(ptr: ?*anyopaque, raw: abi.BorrowedBytes) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        const port = self.completion_recovery orelse return .changefeed_capability_unsupported;
+        const wire = @import("antfly_local_sources").storage_history_recovery_wire;
+        if (raw.len > wire.max_bytes or (raw.len != 0 and raw.ptr == null)) return .invalid_argument;
+        var parsed = wire.decode(self.alloc, raw.slice()) catch |err| return transactionRecoveryStatus(err);
+        defer parsed.deinit();
+        port.enqueue(parsed.value) catch |err| return transactionRecoveryStatus(err);
+        return .ok;
+    }
+
     fn transactionRecoveryConfig(self: *ProvisionedKernelOwnerSource) abi.TransactionRecoveryConfig {
         const source = self.transaction_recovery_source orelse return .{};
         const options = source.options();
@@ -3795,6 +3807,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .acknowledge_participant_fn = if (options.replicated_metadata) transactionRecoveryAcknowledge else null,
             .acknowledge_participants_fn = if (options.replicated_metadata) transactionRecoveryAcknowledgeMany else null,
             .cleanup_transaction_fn = if (options.replicated_metadata) transactionRecoveryCleanup else null,
+            .enqueue_completion_fn = if (options.replicated_metadata and self.completion_recovery != null) enqueueCompletionRecovery else null,
         };
     }
 

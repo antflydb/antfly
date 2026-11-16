@@ -28,7 +28,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 94 adds read-only exact retained-history outcome recovery.
 // Version 95 adds request-bound read-only retained grant observations.
 // Version 96 adds cut-bound immutable participant resolution reads.
-pub const abi_version: u32 = 103;
+pub const abi_version: u32 = 104;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -834,6 +834,8 @@ pub const TransactionRecoveryCleanupFn = *const fn (
 
 /// Distributed control callbacks retained by a live owner for transaction
 /// recovery. Callback byte slices are borrowed only for each synchronous call.
+pub const TransactionRecoveryCompletionFn = *const fn (?*anyopaque, BorrowedBytes) callconv(.c) Status;
+
 pub const TransactionRecoveryConfig = extern struct {
     enabled: u8 = 0,
     lease_owned: u8 = 0,
@@ -849,6 +851,7 @@ pub const TransactionRecoveryConfig = extern struct {
     acknowledge_participant_fn: ?TransactionRecoveryAcknowledgeFn = null,
     acknowledge_participants_fn: ?TransactionRecoveryAcknowledgeManyFn = null,
     cleanup_transaction_fn: ?TransactionRecoveryCleanupFn = null,
+    enqueue_completion_fn: ?TransactionRecoveryCompletionFn = null,
 };
 
 /// One candidate entity borrowed for a synchronous resolution callback.
