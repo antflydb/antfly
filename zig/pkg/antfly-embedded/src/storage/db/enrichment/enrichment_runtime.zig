@@ -30279,6 +30279,17 @@ fn embedModelChunkBatch(provider: embedder_mod.DenseEmbedder, runtime: *Enrichme
     return vectors;
 }
 
+// Classify while the captured batch is still owned. Every failure after
+// inference (including metadata validation) spends the same durable budget.
+fn failChunkedDenseBatch(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, texts: *std.ArrayListUnmanaged([]const u8), items: *std.ArrayListUnmanaged(ChunkedDenseWindowItem), owns_texts: bool, scope: *FailureScope, rejected: *std.AutoHashMapUnmanaged(u64, void), err: anyerror) !bool {
+    if (try scope.shouldYield(runtime, err)) return err;
+    recordUniqueChunkedDenseRequestErrors(runtime, window, items.items, err, scope.attemptNumber(runtime)) catch |save_err| return scope.publicationFailure(save_err);
+    for (items.items) |item| try rejected.put(runtime.alloc, requestFailureFingerprint(item.request), {});
+    scope.owner = null;
+    clearChunkedDenseBatch(runtime.alloc, texts, items, owns_texts);
+    return false;
+}
+
 fn flushChunkedDenseItems(
     runtime: *EnrichmentRuntime,
     dense_embedder: embedder_mod.DenseEmbedder,
@@ -30297,23 +30308,19 @@ fn flushChunkedDenseItems(
     const batch_texts = chunk_texts.items;
     const batch_items = chunk_items.items;
     scope.enterOwned(chunkedDenseBatchFailureFingerprint(batch_items), .{ .chunked = batch_items });
+    defer scope.owner = null;
     const batch_stats = textBatchByteStats(batch_texts);
     yieldToInteractiveEmbeds(runtime);
     noteEmbedBatchStartedFor(runtime, scope.fingerprint, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
     const embed_started_ns = runtime.clock.nowRealtimeNs();
     const vectors = embedModelChunkBatch(dense_embedder, runtime, embedding_artifact_name, batch_texts, expected_dims, batch_items) catch |err| {
         noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
-        if (try scope.shouldYield(runtime, err)) return err;
-        try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, err, scope.attemptNumber(runtime));
-        clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
-        return false;
+        return failChunkedDenseBatch(runtime, window, chunk_texts, chunk_items, owns_texts, scope, rejected_requests, err);
     };
     defer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
     if (vectors.len != batch_items.len) {
         noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
-        try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, error.InvalidEmbeddingResponse, scope.attemptNumber(runtime));
-        clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
-        return false;
+        return failChunkedDenseBatch(runtime, window, chunk_texts, chunk_items, owns_texts, scope, rejected_requests, error.InvalidEmbeddingResponse);
     }
     const generation_check: anyerror!void = check: {
         const generation = dense_embedder.captureTextGeneration(runtime.alloc, embedding_artifact_name) catch |err| break :check err;
@@ -30321,10 +30328,13 @@ fn flushChunkedDenseItems(
     };
     generation_check catch |err| {
         noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
-        return err;
+        return failChunkedDenseBatch(runtime, window, chunk_texts, chunk_items, owns_texts, scope, rejected_requests, err);
     };
     noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
     defer finishActivePostprocess(runtime);
+    // Inference and generation validation succeeded. Publication/storage
+    // failures belong to the pipeline, never to a provider retry budget.
+    errdefer scope.publication_failed = true;
 
     var embeddings = try runtime.alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, batch_items.len);
     var initialized_embeddings: usize = 0;
@@ -31154,7 +31164,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                     continue;
                 }
                 const text = item.text orelse continue;
-                if (batch.items.items.len > 0 and (batch.items.items.len >= batch_limits.items or batch.bytes +| text.len > batch_limits.bytes))
+                if (batch.items.items.len > 0 and (batch.items.items.len >= max_items or batch.bytes +| text.len > max_bytes))
                     try batch.flush(runtime, provider, consumers);
                 if (batch.items.items.len > 0) if (runtime.retry_scheduler) |scheduler| {
                     const first = batch.items.items[0];
@@ -31170,7 +31180,7 @@ fn processOrderedChunkVectorWithBatch(runtime: *EnrichmentRuntime, alloc: Alloca
                 // Ownership moved into the bounded cross-document batch.
                 item.failed = true;
                 item.owns_input = false;
-                if (batch.items.items.len >= batch_limits.items or batch.bytes >= batch_limits.bytes)
+                if (batch.items.items.len >= max_items or batch.bytes >= max_bytes)
                     try batch.flush(runtime, provider, consumers);
             }
         }
@@ -31318,6 +31328,7 @@ fn processMaterializedChunkDenseRequestWithBatch(
         if (!try scheduler.sameInputBudget(runtime, chunk_items.items[0].request, null, request, null)) {
             _ = try flushChunkedDenseItems(runtime, pinned_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, chunk_texts, chunk_items, window, true, scope, &batch.rejected);
             batch.bytes = 0;
+            scope.enterRequest(request);
         }
     };
     var cached_items = std.ArrayListUnmanaged(CachedChunkDenseWindowItem).empty;
@@ -31468,9 +31479,15 @@ fn processMaterializedChunkDenseRequestWithBatch(
         try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, assetProviderRequestContext(runtime));
         try processCachedChunkDenseItems(runtime, request, consumer_indexes, window, &cached_items, max_window_items, scope);
         if (shared == null or collect.stopped_for_batch) {
+            const includes_request = for (chunk_items.items) |item| {
+                if (sameRequestFailureIdentity(item.request, request)) break true;
+            } else false;
             const complete = try flushChunkedDenseItems(runtime, pinned_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, chunk_texts, chunk_items, window, true, scope, rejected_requests);
             batch_source_bytes.* = 0;
-            if (!complete) return;
+            // A byte boundary can stop before this document contributes any
+            // input. A failed preceding batch must not suppress its first row.
+            if (!complete and includes_request) return;
+            scope.enterRequest(request);
         }
         if (rejected_requests.contains(requestFailureFingerprint(request))) return;
         try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
@@ -42587,6 +42604,20 @@ test "legacy materialized chunk embeddings batch across documents" {
     try testOrderedChunkVectorCarry(true, .legacy);
 }
 
+test "legacy materialized chunk embeddings retain unattempted documents after byte boundary failure" {
+    try testOrderedChunkVectorCarry(true, .legacy_boundary_terminal);
+}
+
+test "legacy materialized chunk embeddings classify tail metadata failures durably" {
+    try testOrderedChunkVectorCarry(true, .legacy_metadata_retry);
+    try testOrderedChunkVectorCarry(true, .legacy_metadata_terminal);
+}
+
+test "ordered materialized chunk embeddings use bounded parallel provider batches" {
+    try testOrderedChunkVectorCarry(true, .parallel);
+    try testOrderedChunkVectorCarry(true, .parallel_bytes);
+}
+
 test "legacy materialized chunk embeddings separate unequal retry budgets" {
     try testOrderedChunkVectorCarry(true, .legacy_budget);
 }
@@ -42608,7 +42639,7 @@ test "ordered materialized chunk embeddings preserve relational retry budgets" {
     try testOrderedChunkVectorCarry(true, .relational_retry);
 }
 
-const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget };
+const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes };
 
 fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
@@ -42624,19 +42655,43 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         fail_first_batch: bool = false,
         fail_metadata_at: usize = 0,
         retry_first_batch: bool = false,
+        fail_metadata_after_batch: bool = false,
+        terminal_metadata: bool = false,
+        parallel: bool = false,
+        mutex: Io.Mutex = .init,
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
         batches: std.ArrayList(usize) = .empty,
         queued: std.ArrayList([]u8) = .empty,
         fn caps(ptr: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.capability_calls += 1;
-            if (self.capability_calls == self.fail_metadata_at) return error.UnexpectedProviderFailure;
+            if (self.capability_calls == self.fail_metadata_at) return if (self.terminal_metadata) error.UnsupportedEmbeddingProvider else error.UnexpectedProviderFailure;
             return .{ .task = .embed, .input_modalities = .{ .text = true }, .accepted_mime_types = .{ .text_plain = true }, .input_granularity = .chunk, .batch = .{ .mode = .native, .preferred_items = 32, .max_items = 32 }, .output = .embedding, .model_revision = @splat(self.generation) };
         }
         fn planned(ptr: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, _: ?inference_request_context.RequestContext, _: inference_work.CapabilityLease) ![]const []const f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try self.batches.append(std.testing.allocator, texts.len);
-            if (self.retry_first_batch and self.batches.items.len == 1) return error.UnexpectedProviderFailure;
-            if (self.fail_first_batch and self.batches.items.len == 1) return error.UnsupportedEmbeddingProvider;
+            const call = call: {
+                self.mutex.lockUncancelable(std.testing.io);
+                defer self.mutex.unlock(std.testing.io);
+                try self.batches.append(std.testing.allocator, texts.len);
+                break :call self.batches.items.len;
+            };
+            const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            _ = self.peak.fetchMax(active, .acq_rel);
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            if (self.parallel and call <= 2) {
+                // A bounded rendezvous proves overlap without depending on
+                // thread launch timing or sleeping while holding the mutex.
+                for (0..1000) |_| {
+                    if (self.peak.load(.acquire) >= 2) break;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                }
+                try std.testing.expectEqual(@as(usize, 2), self.peak.load(.acquire));
+            }
+            if (self.retry_first_batch and call == 1) return error.UnexpectedProviderFailure;
+            if (self.fail_first_batch and call == 1) return error.UnsupportedEmbeddingProvider;
+            if (self.fail_metadata_after_batch) self.fail_metadata_at = self.capability_calls + 1;
             const rows = try a.alloc([]const f32, texts.len);
             var initialized: usize = 0;
             errdefer {
@@ -42671,6 +42726,8 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         }
         fn embedDense(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.mutex.lockUncancelable(std.testing.io);
+            defer self.mutex.unlock(std.testing.io);
             self.provider_calls += 1;
             return a.dupe(f32, &.{ @floatFromInt(self.provider_calls), 2 });
         }
@@ -42719,9 +42776,9 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
     else
         "{}");
     try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = if (batching == .terminal) 4 else 100 });
-    try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .source_artifact_name = "chunks", .expected_dims = if (dense) 2 else 0, .execution = if (batching == .bytes or batching == .legacy_bytes) .{ .batch_items = 32, .batch_bytes = if (batching == .legacy_bytes) 20 else 22 } else null });
+    try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "body", .source_artifact_name = "chunks", .expected_dims = if (dense) 2 else 0, .execution = if (batching == .bytes or batching == .parallel_bytes or batching == .legacy_bytes or batching == .legacy_boundary_terminal) .{ .batch_items = 32, .batch_bytes = if (batching == .legacy_bytes or batching == .legacy_boundary_terminal) 20 else 22 } else null });
     try db.addIndex(.{ .name = "vector", .kind = if (dense) .dense_vector else .sparse_vector, .config_json = if (dense) "{\"field\":\"dense\",\"dims\":2,\"embedding_name\":\"model\"}" else "{\"field\":\"sparse\",\"embedding_name\":\"model\"}" });
-    if (batching == .legacy or batching == .legacy_bytes or batching == .legacy_budget) {
+    if (batching == .legacy or batching == .legacy_bytes or batching == .legacy_budget or batching == .legacy_boundary_terminal or batching == .legacy_metadata_retry or batching == .legacy_metadata_terminal) {
         const count = 3;
         var keys: [count][]u8 = undefined;
         var initialized: usize = 0;
@@ -42751,6 +42808,46 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         defer freeWorkerChunkCache(runtime.alloc, &cache);
         var window: GeneratedReplayWindow = .{ .alloc = runtime.alloc };
         defer window.deinit();
+        if (batching == .legacy_metadata_retry or batching == .legacy_metadata_terminal) {
+            var scheduler = try ScopedReplay.load(runtime);
+            defer scheduler.deinit(runtime.alloc);
+            runtime.retry_scheduler = &scheduler;
+            defer runtime.retry_scheduler = null;
+            runtime.config.inline_retry_max_attempts = 1;
+            runtime.config.worker_retry_max_attempts = 2;
+            for (&requests) |*request| request.sequence = 10;
+            harness.fail_metadata_after_batch = true;
+            harness.terminal_metadata = batching == .legacy_metadata_terminal;
+            var scope: FailureScope = .{};
+            if (harness.terminal_metadata) {
+                try processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope);
+                try std.testing.expectEqual(@as(usize, 0), scheduler.state.tickets.items.len);
+                try std.testing.expectEqual(@as(u64, count), runtime.fatal_error_count);
+            } else {
+                try std.testing.expectError(error.UnexpectedProviderFailure, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
+                try std.testing.expectEqual(@as(usize, count), scheduler.state.tickets.items.len);
+                for (requests) |request| {
+                    const observed = try ScopedReplay.observeSource(runtime, request.doc_key, null, true);
+                    const budget = try scheduler.state.priorLogical(runtime.alloc, logicalRequestFingerprint(request), observed.logical_digest);
+                    try std.testing.expectEqual(@as(u32, 1), budget.failures);
+                }
+                var recovered = try enrichment_state.loadScopedRetries(alloc, runtime.store);
+                defer recovered.deinit(alloc);
+                try std.testing.expectEqual(@as(usize, count), recovered.tickets.items.len);
+            }
+            try std.testing.expect(scope.owner == null);
+            try std.testing.expectEqualSlices(usize, &.{count}, harness.batches.items);
+            for (keys) |key| {
+                const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, key, "chunks", 0);
+                defer alloc.free(chunk);
+                const output = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk, "model");
+                defer alloc.free(output);
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectError(error.NotFound, read.get(output));
+            }
+            return;
+        }
         if (batching == .legacy_budget) {
             var scheduler = try ScopedReplay.load(runtime);
             defer scheduler.deinit(runtime.alloc);
@@ -42779,17 +42876,22 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             }
             return;
         }
+        harness.fail_first_batch = batching == .legacy_boundary_terminal;
         var scope: FailureScope = .{};
         try processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope);
-        try std.testing.expectEqualSlices(usize, if (batching == .legacy_bytes) &.{ 1, 1, 1 } else &.{3}, harness.batches.items);
-        for (keys) |key| {
+        if (batching == .legacy_boundary_terminal) try std.testing.expectEqual(@as(u64, 1), runtime.fatal_error_count);
+        try std.testing.expectEqualSlices(usize, if (batching == .legacy_bytes or batching == .legacy_boundary_terminal) &.{ 1, 1, 1 } else &.{3}, harness.batches.items);
+        for (keys, 0..) |key, key_index| {
             const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, key, "chunks", 0);
             defer alloc.free(chunk);
             const output = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk, "model");
             defer alloc.free(output);
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
-            _ = try read.get(output);
+            if (batching == .legacy_boundary_terminal and key_index == 0)
+                try std.testing.expectError(error.NotFound, read.get(output))
+            else
+                _ = try read.get(output);
         }
         return;
     }
@@ -42867,7 +42969,8 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             request.* = vector_request;
             request.doc_key = key.*;
         }
-        runtime.config.dense_embedder = .{ .ptr = &harness, .dense_embed_fn = Harness.embedDense, .dense_embed_batch_with_context_fn = Harness.embedDenseBatch, .cache_revision_fn = Harness.revision, .capabilities_fn = Harness.caps, .dense_embed_batch_planned_fn = Harness.planned };
+        harness.parallel = batching == .parallel or batching == .parallel_bytes;
+        runtime.config.dense_embedder = .{ .dense_batch_concurrency = if (harness.parallel) 2 else 1, .ptr = &harness, .dense_embed_fn = Harness.embedDense, .dense_embed_batch_with_context_fn = Harness.embedDenseBatch, .cache_revision_fn = Harness.revision, .capabilities_fn = Harness.caps, .dense_embed_batch_planned_fn = Harness.planned };
         if (batching == .metadata_retry or batching == .metadata_tail_retry or batching == .relational_retry) {
             var scheduler = try ScopedReplay.load(runtime);
             defer scheduler.deinit(runtime.alloc);
@@ -42927,12 +43030,16 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             try std.testing.expectEqual(@as(usize, 162), harness.provider_calls);
             return;
         }
-        if (batching == .bytes) {
+        if (batching == .bytes or batching == .parallel_bytes) {
             try std.testing.expectEqual(@as(usize, 33), harness.batches.items.len);
             for (harness.batches.items[0..32]) |size| try std.testing.expectEqual(@as(usize, 2), size);
             try std.testing.expectEqual(@as(usize, 1), harness.batches.items[32]);
         } else try std.testing.expectEqualSlices(usize, &.{ 32, 32, 1 }, harness.batches.items);
-        try std.testing.expectEqual(harness.batches.items.len + 1, harness.capability_calls - capabilities_before);
+        if (harness.parallel) {
+            try std.testing.expectEqual(@as(usize, 2), harness.peak.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), harness.active.load(.acquire));
+            try std.testing.expectEqual((harness.batches.items.len + 1) / 2 + 1, harness.capability_calls - capabilities_before);
+        } else try std.testing.expectEqual(harness.batches.items.len + 1, harness.capability_calls - capabilities_before);
         try std.testing.expectEqual(@as(usize, count), harness.provider_calls);
         try std.testing.expectEqual(@as(usize, count), harness.queued.items.len - before);
         // Advance one parent before acceptance: only its stale result is refused.
