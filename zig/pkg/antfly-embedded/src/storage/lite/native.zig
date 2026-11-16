@@ -4857,13 +4857,13 @@ const RedoCommitState = struct {
             std.mem.writeInt(u32, &len_buf, @intCast(m.value.len), .little);
             try self.logical_pending.appendSlice(allocator, &len_buf);
             try self.logical_pending.appendSlice(allocator, m.value);
-            // Owned by `std.heap.page_allocator`, not `allocator`: this
+            // Owned by `redo_overlay.owned_allocator`, not `allocator`: this
             // value is about to live in the shared overlay, which may
             // outlive this specific NativeFile instance -- see `shared`'s
             // own doc comment.
-            value = try std.heap.page_allocator.dupe(u8, m.value);
+            value = try redo_overlay.owned_allocator.dupe(u8, m.value);
         }
-        errdefer std.heap.page_allocator.free(value);
+        errdefer redo_overlay.owned_allocator.free(value);
         // perf/lwa-txn-overlay (transaction isolation): reserve everything
         // fallible for undo-tracking *before* pushing the version into
         // `shared` below. Once that call succeeds, this function must not
@@ -4887,9 +4887,9 @@ const RedoCommitState = struct {
         std.mem.writeInt(u32, header[8..12], @intCast(bytes.len), .little);
         try self.pending.appendSlice(allocator, &header);
         try self.pending.appendSlice(allocator, bytes);
-        // Also `std.heap.page_allocator`-owned -- see `appendLogicalMutation`.
-        const owned = try std.heap.page_allocator.dupe(u8, bytes);
-        errdefer std.heap.page_allocator.free(owned);
+        // Also `redo_overlay.owned_allocator`-owned -- see `appendLogicalMutation`.
+        const owned = try redo_overlay.owned_allocator.dupe(u8, bytes);
+        errdefer redo_overlay.owned_allocator.free(owned);
         // perf/lwa-txn-overlay: same undo-tracking discipline as
         // `appendLogicalMutation` above, reserved before the push.
         try self.overlay_undo.ensureUnusedCapacity(allocator, 1);
@@ -8578,7 +8578,7 @@ pub const NativeFile = struct {
         // this codebase already follows.
         const blocking_pin: ?u64 = blk: {
             const region = (self.regionForInode() catch break :blk null) orelse break :blk null;
-            const min_pinned = region.minimumPinnedSequence() orelse break :blk null;
+            const min_pinned = region.minimumUncoveredPinnedSequence(antfly_platform.process.currentId() orelse 0, redo.shared.minimumPin(io)) orelse break :blk null;
             break :blk if (min_pinned < new_checkpoint_sequence) min_pinned else null;
         };
         const pinned_below = blocking_pin != null;
@@ -19755,7 +19755,7 @@ pub const NativeFile = struct {
             if (redo.checkpoint_backoff_min_pinned) |blocking| {
                 const still_blocked = blk: {
                     const region = (self.regionForInode() catch break :blk false) orelse break :blk false;
-                    const min_pinned = region.minimumPinnedSequence() orelse break :blk false;
+                    const min_pinned = region.minimumUncoveredPinnedSequence(antfly_platform.process.currentId() orelse 0, redo.shared.minimumPin(self.runtimeIo())) orelse break :blk false;
                     break :blk min_pinned <= blocking;
                 };
                 if (still_blocked) return;
@@ -20150,6 +20150,7 @@ pub const NativeFile = struct {
                         // non-redo path.
                         if (hooks) |h| h.release(h.context);
                         defer if (hooks) |h| h.reacquire(h.context);
+                        self.applyTestSyncDelay();
                         redo.writer.sync() catch |err| break :blk err;
                         break :blk {};
                     }) catch {
@@ -20368,6 +20369,7 @@ pub const NativeFile = struct {
                     // concurrency.
                     if (hooks) |h| h.release(h.context);
                     defer if (hooks) |h| h.reacquire(h.context);
+                    self.applyTestSyncDelay();
                     redo.writer.sync() catch |err| break :blk err;
                     break :blk {};
                 }) catch {
@@ -20662,6 +20664,20 @@ pub const NativeFile = struct {
         self.durability_policy = policy;
     }
 
+    /// Test-only: sleep for `test_sync_delay_ns` before a durability-barrier
+    /// syscall. Called on every commit fsync path -- the redo log's own
+    /// `redo.writer.sync()` as well as `syncIfRequired` -- so a test that
+    /// slows fsyncs to force group-commit sharing sees the delay no matter
+    /// which durability path the file is on.
+    fn applyTestSyncDelay(self: *NativeFile) void {
+        if (comptime !builtin.is_test) return;
+        const delay_ns = self.test_sync_delay_ns.load(.monotonic);
+        if (delay_ns != 0) _ = std.c.nanosleep(&.{
+            .sec = @intCast(delay_ns / std.time.ns_per_s),
+            .nsec = @intCast(delay_ns % std.time.ns_per_s),
+        }, null);
+    }
+
     fn syncIfRequired(self: *NativeFile, hooks: ?SyncLockHooks) !void {
         if (!self.no_sync and self.transaction_header == null) {
             // WS2: release the caller's lock (if any) for exactly the
@@ -20673,13 +20689,7 @@ pub const NativeFile = struct {
             // parameter, never a shared field: see `SyncLockHooks`.
             if (hooks) |h| h.release(h.context);
             defer if (hooks) |h| h.reacquire(h.context);
-            if (comptime builtin.is_test) {
-                const delay_ns = self.test_sync_delay_ns.load(.monotonic);
-                if (delay_ns != 0) _ = std.c.nanosleep(&.{
-                    .sec = @intCast(delay_ns / std.time.ns_per_s),
-                    .nsec = @intCast(delay_ns % std.time.ns_per_s),
-                }, null);
-            }
+            self.applyTestSyncDelay();
             if (self.durability_policy) |policy|
                 try antfly_platform.filesystem.syncData(self.file.handle, policy)
             else
@@ -33190,7 +33200,7 @@ test "lite redo log multi-page read-ahead window checks the overlay for every pa
         const buf = try a.alloc(u8, file.header.page_size);
         defer a.free(buf);
         try file.readBackingPagesUncached(buf, page_id * file.header.page_size);
-        const owned = try std.heap.page_allocator.dupe(u8, buf);
+        const owned = try redo_overlay.owned_allocator.dupe(u8, buf);
         try file.redo.?.shared.appendPage(std.heap.page_allocator, std.testing.io, page_id, owned);
     }
     try std.testing.expect(!file.redo.?.shared.pagesEmpty(std.testing.io));
@@ -33852,7 +33862,13 @@ test "lite redo log in-process base refresh also resyncs the redo writer's own c
     try std.testing.expectEqualStrings("second-value", confirmed);
 }
 
-test "lite redo log checkpointer defers log reclaim while a cross-process reader is pinned behind it" {
+// A reader in this same process shares the writer's in-memory overlay and
+// never reads the physical log, so its pin must not hold the log's bytes:
+// the fold resets the log anyway, and the reader keeps resolving through the
+// overlay. The cross-process case (a separate process that does replay log
+// bytes) is "checkpointer defers reclaim while a forked child is pinned,
+// reclaims after kill -9".
+test "lite redo log checkpointer defers log reclaim while a reader without an overlay pin is pinned behind it" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -33894,6 +33910,39 @@ test "lite redo log checkpointer defers log reclaim while a cross-process reader
     try writer.commitTransaction();
     try writer.checkpointRedoLog();
     try std.testing.expectEqual(@as(u64, 0), writer.redo.?.writer.tail);
+}
+
+test "lite redo log checkpointer resets the log under a same-process reader whose overlay pin covers it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-covered-reader.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one");
+    try writer.commitTransaction();
+
+    {
+        // A ReadView pins both its lock-region slot and the shared
+        // overlay, so the overlay alone keeps what it reads.
+        var view = try ReadView.open(&writer, std.testing.io);
+        defer view.release(std.testing.io);
+
+        try writer.beginTransaction();
+        try writer.putDocument("alpha", "two");
+        try writer.commitTransaction();
+
+        try std.testing.expect(writer.redo.?.writer.tail > 0);
+        try writer.checkpointRedoLog();
+        try std.testing.expectEqual(@as(u64, 0), writer.redo.?.writer.tail);
+
+        const seen = (try view.getDocumentAlloc(a, "alpha")) orelse return error.TestUnexpectedResult;
+        defer a.free(seen);
+        try std.testing.expectEqualStrings("one", seen);
+    }
 }
 
 test "lite redo log publishRedoLogState never runs when the durable append itself fails -- a torn/failed commit is never visible cross-process" {

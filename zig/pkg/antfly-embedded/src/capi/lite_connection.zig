@@ -1103,6 +1103,11 @@ pub const WriterLane = struct {
     /// `othersWaiting`/fairness check needed) rather than racing a remote
     /// handoff decision against them.
     waiting: usize = 0,
+    /// Bumped (and futex-woken) whenever the lane becomes available:
+    /// `checked_out` cleared or a lease parked. Waiters read it under
+    /// `mutex` before sleeping on it, so a release between their check and
+    /// their sleep cannot be missed.
+    release_epoch: std.atomic.Value(u32) = .init(0),
     /// The root this lane handed out last, so a warm checkout can tell
     /// "nothing has replaced the generation since" by pointer identity
     /// alone -- see `checkout`'s fast path.
@@ -1238,6 +1243,7 @@ pub const WriterLane = struct {
                     self.mutex.lockUncancelable(io);
                     self.checked_out = false;
                     self.mutex.unlock(io);
+                    self.signalReleased(io);
                     return err;
                 };
                 connection.gate.mutex.unlock(io);
@@ -1267,6 +1273,7 @@ pub const WriterLane = struct {
                     self.mutex.lockUncancelable(io);
                     self.checked_out = false;
                     self.mutex.unlock(io);
+                    self.signalReleased(io);
                     return err;
                 };
                 const root = connection.refresh(&lease, intent, true) catch |err| {
@@ -1275,6 +1282,7 @@ pub const WriterLane = struct {
                     self.mutex.lockUncancelable(io);
                     self.checked_out = false;
                     self.mutex.unlock(io);
+                    self.signalReleased(io);
                     return err;
                 };
                 connection.gate.mutex.unlock(io);
@@ -1291,6 +1299,7 @@ pub const WriterLane = struct {
             // `checkin` checks `waiting` fresh every time, so arriving
             // late here is never fatal to getting the fast path.
             self.waiting += 1;
+            const epoch = self.release_epoch.load(.acquire);
             self.mutex.unlock(io);
             const remaining = local_wait_deadline - std.Io.Clock.awake.now(io).nanoseconds;
             if (remaining <= 0) {
@@ -1299,7 +1308,9 @@ pub const WriterLane = struct {
                 self.mutex.unlock(io);
                 return error.FileBusy;
             }
-            io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake) catch {};
+            // Woken by `signalReleased`; the timeout only bounds a path
+            // that frees the lane without signalling.
+            io.futexWaitTimeout(u32, &self.release_epoch.raw, epoch, .{ .duration = .{ .raw = .fromNanoseconds(@intCast(@min(backoff_ns, remaining))), .clock = .awake } }) catch {};
             backoff_ns = @min(backoff_ns * 2, poll_max_ns);
             self.mutex.lockUncancelable(io);
             self.waiting -= 1;
@@ -1425,17 +1436,20 @@ pub const WriterLane = struct {
     }
 
     /// Pairs with `markCheckedOutByMaintenance`; see its own doc comment.
-    /// A waiter here only ever polls `checked_out` with its own bounded
-    /// backoff (`waitParkedForStore`) rather than blocking on a condition
-    /// variable, so no wake is needed -- the next poll simply observes
-    /// `false` and (finding nothing parked, since the maintenance lease
-    /// this guarded was closed, never parked) falls through to its own
-    /// fresh kernel acquisition, which now safely succeeds.
+    /// Wakes waiters in `checkout`/`waitParkedForStore`; finding nothing
+    /// parked (this maintenance lease was closed, not parked), they fall
+    /// through to a fresh kernel acquisition, which now succeeds.
     pub fn clearCheckedOutByMaintenance(self: *WriterLane) void {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         self.checked_out = false;
         self.mutex.unlock(io);
+        self.signalReleased(io);
+    }
+
+    fn signalReleased(self: *WriterLane, io: std.Io) void {
+        _ = self.release_epoch.fetchAdd(1, .release);
+        io.futexWake(u32, &self.release_epoch.raw, std.math.maxInt(u32));
     }
 
     /// Like `takeParkedForStore`, but when nothing is parked *yet* only
@@ -1470,6 +1484,7 @@ pub const WriterLane = struct {
         self.mutex.lockUncancelable(io);
         while (self.checked_out) {
             self.waiting += 1;
+            const epoch = self.release_epoch.load(.acquire);
             self.mutex.unlock(io);
             const remaining = local_wait_deadline - std.Io.Clock.awake.now(io).nanoseconds;
             if (remaining <= 0) {
@@ -1478,7 +1493,9 @@ pub const WriterLane = struct {
                 self.mutex.unlock(io);
                 return null;
             }
-            io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake) catch {};
+            // Woken by `signalReleased`; the timeout only bounds a path
+            // that frees the lane without signalling.
+            io.futexWaitTimeout(u32, &self.release_epoch.raw, epoch, .{ .duration = .{ .raw = .fromNanoseconds(@intCast(@min(backoff_ns, remaining))), .clock = .awake } }) catch {};
             backoff_ns = @min(backoff_ns * 2, poll_max_ns);
             self.mutex.lockUncancelable(io);
             self.waiting -= 1;
@@ -1576,6 +1593,7 @@ pub const WriterLane = struct {
             self.parked_store = store;
             self.checked_out = false;
             self.mutex.unlock(io);
+            self.signalReleased(io);
             // A local waiter takes this immediately (its own poll, not
             // `maintainParkedLease`), so no wake is needed for its sake --
             // but see the doc comment below for why one still happens.
@@ -1590,6 +1608,7 @@ pub const WriterLane = struct {
             self.parked_store = store;
             self.checked_out = false;
             self.mutex.unlock(io);
+            self.signalReleased(io);
             // Bare `self.wake.set(io)` isn't enough: `Owner.maintenanceLoop`
             // may currently be parked indefinitely (no durable consumer
             // registered -- `no_scheduled_wait`), and nothing else ever
@@ -1605,6 +1624,7 @@ pub const WriterLane = struct {
         }
         self.checked_out = false;
         self.mutex.unlock(io);
+        self.signalReleased(io);
         store.sync() catch {};
         lease.close();
     }
@@ -1907,6 +1927,10 @@ pub const Owner = struct {
     /// `test_cumulative_sync_calls + current's own test_sync_calls` is
     /// stable across any number of swaps.
     test_cumulative_sync_calls: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
+    /// The same bridge for the outgoing generation's `Store.test_groups_total`
+    /// and `Store.test_group_members_total` group-commit counters.
+    test_cumulative_groups: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
+    test_cumulative_group_members: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
 
     /// A retiring generation rejects further publication once nothing else
     /// still needs it writable -- except a `WriterLane`-admitted call still
@@ -2000,6 +2024,18 @@ pub const Owner = struct {
     /// a different process's publication. Cursor continuation deliberately
     /// uses its pinned generation without reopening the connection.
     pub fn refresh(self: *Owner) !*h.Handle {
+        return self.refreshOrTurnBusy() catch |err| switch (err) {
+            error.MaintenanceTurnBusy => error.FileBusy,
+            else => err,
+        };
+    }
+
+    /// `refresh`, except that a replacement open which needs the
+    /// cross-process maintenance turn while another writer holds it fails
+    /// with `error.MaintenanceTurnBusy` instead of `error.FileBusy`, so a
+    /// caller holding the writer lease (`Connection.refresh`) can give the
+    /// lease back and wait for the turn instead of failing at once.
+    fn refreshOrTurnBusy(self: *Owner) !*h.Handle {
         wal_trace.recordOp(.serving_runtime_refresh);
         if (comptime h.builtin.is_test) _ = self.test_refresh_count.fetchAdd(1, .release);
         var known_maintenance: ?*h.Handle = null;
@@ -2123,7 +2159,7 @@ pub const Owner = struct {
                 options.allocator_state_donor = &certified.?;
             } else if (certified.?.header.indexed_reclamation and !try self.unindexedRuntimeOpen(&certified.?)) {
                 retained_turn = try self.retainMaintenanceTurnAssumeLocked();
-                if (!retained_turn) return error.FileBusy;
+                if (!retained_turn) return error.MaintenanceTurnBusy;
             }
         }
         const replacement = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, self.current);
@@ -2184,10 +2220,13 @@ pub const Owner = struct {
         // replaced (see `test_cumulative_sync_calls`'s doc comment): this is
         // the one place `self.current` is ever reassigned.
         if (comptime h.builtin.is_test) if (self.current) |outgoing| {
-            _ = self.test_cumulative_sync_calls.fetchAdd(
-                outgoing.owned_lite_backend.?.native_docstore.?.file.test_sync_calls.load(.monotonic),
-                .monotonic,
-            );
+            const outgoing_store = outgoing.owned_lite_backend.?.native_docstore.?;
+            _ = self.test_cumulative_sync_calls.fetchAdd(outgoing_store.file.test_sync_calls.load(.monotonic), .monotonic);
+            _ = self.test_cumulative_groups.fetchAdd(outgoing_store.test_groups_total.load(.acquire), .monotonic);
+            _ = self.test_cumulative_group_members.fetchAdd(outgoing_store.test_group_members_total.load(.acquire), .monotonic);
+            // A test's simulated fsync latency belongs to the path, not to
+            // one generation's file.
+            replacement.owned_lite_backend.?.native_docstore.?.file.test_sync_delay_ns.store(outgoing_store.file.test_sync_delay_ns.load(.monotonic), .monotonic);
         };
         // Marks the new generation subject to the `active_writer` backstop
         // (native.zig's `publishCheckpoint`/inode_lock.zig's own doc
@@ -2778,6 +2817,9 @@ pub const Owner = struct {
         // matching `maintenance_writer_references -> 0` transition.
         self.writer_lane.markCheckedOutByMaintenance();
         errdefer self.writer_lane.clearCheckedOutByMaintenance();
+        const maintenance_store = root.owned_lite_backend.?.native_docstore.?;
+        maintenance_store.writer_held_by_maintenance.store(true, .release);
+        errdefer maintenance_store.writer_held_by_maintenance.store(false, .release);
         // The hold starts here: admission checks and rebases run under it.
         const held_from = nowNs();
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
@@ -2859,6 +2901,7 @@ pub const Owner = struct {
         // call: this lease is fully released (never parked for reuse --
         // maintenance always closes, see `WriterLane.markCheckedOutByMaintenance`'s
         // own doc comment), so the lane is no longer busy on its account.
+        root.owned_lite_backend.?.native_docstore.?.writer_held_by_maintenance.store(false, .release);
         self.writer_lane.clearCheckedOutByMaintenance();
         // Status readers serialize publication_stats under the gate; record
         // before releasing it.
@@ -4314,7 +4357,10 @@ pub const Connection = struct {
     /// test call to this function) passes `false`, preserving the
     /// original wait behavior where it is not self-referential.
     pub fn refresh(self: *Connection, lease: *?native.PathWriterLock, intent: api.StorageIntent, skip_lane_wait: bool) !*h.Handle {
-        var root = try self.owner.refresh();
+        var root = self.owner.refreshOrTurnBusy() catch |err| switch (err) {
+            error.MaintenanceTurnBusy => try self.refreshAfterMaintenanceTurn(lease, skip_lane_wait),
+            else => return err,
+        };
         if (self.options.profile == .native and self.options.open_mode == .writer and
             (usesCapacityAdmission(root) or (intent == .mutation and try self.needsReuseAdmission(root))))
         {
@@ -4364,6 +4410,33 @@ pub const Connection = struct {
         self.current = root;
         self.attach(root);
         return root;
+    }
+
+    /// The replacement open needs the maintenance turn, and a maintenance
+    /// writer holds it. That writer needs the writer lease to finish its
+    /// own commit, so waiting with the lease held only runs out the clock.
+    /// Give the lease back, back off until the turn may be free, reacquire,
+    /// and refresh again, all within this call's busy timeout -- the same
+    /// shape as the allocator-proof wait in `refresh`.
+    fn refreshAfterMaintenanceTurn(self: *Connection, lease: *?native.PathWriterLock, skip_lane_wait: bool) !*h.Handle {
+        const io = h.handleLockIo();
+        const deadline = self.admissionDeadline();
+        var backoff_ns: i96 = 100 * std.time.ns_per_us;
+        while (true) {
+            if (lease.*) |*held| held.close();
+            lease.* = null;
+            self.gate.mutex.unlock(io);
+            const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+            const slept = remaining > 0 and (if (io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake)) |_| true else |_| false);
+            self.gate.mutex.lockUncancelable(io);
+            if (!slept) return error.FileBusy;
+            backoff_ns = @min(backoff_ns * 2, 5 * std.time.ns_per_ms);
+            lease.* = try self.acquirePathLeaseAssumeLocked(skip_lane_wait);
+            return self.owner.refreshOrTurnBusy() catch |err| switch (err) {
+                error.MaintenanceTurnBusy => continue,
+                else => return err,
+            };
+        }
     }
 
     fn needsReuseAdmission(self: *Connection, root: *h.Handle) !bool {
@@ -6157,6 +6230,39 @@ test "capi native allocator proof maintenance capture joins the bounded lease qu
     // `worker_threads` never populates for this bounded-queue admission
     // either, contended or not.
     try std.testing.expectEqual(std.Io.Limit.limited(2), owner.path_lock_io.concurrent_limit);
+}
+
+test "capi native refresh waiting for the maintenance turn hands the lease back and reacquires it" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const io = h.handleLockIo();
+    {
+        var fixture = try AdmissionFollowupFixture.init("refresh-turn-wait", 1000, .batch);
+        defer fixture.deinit();
+        const connection = fixture.connection;
+        var lease: ?native.PathWriterLock = try connection.acquire();
+        defer {
+            if (lease) |*held| held.close();
+            connection.gate.mutex.unlock(io);
+        }
+        const root = try connection.refreshAfterMaintenanceTurn(&lease, false);
+        try std.testing.expect(lease != null);
+        try std.testing.expectEqual(connection.owner.current.?, root);
+    }
+    {
+        // No busy timeout: fail at once, with the lease already given back
+        // and the gate held again, exactly as the caller's own error path
+        // expects.
+        var fixture = try AdmissionFollowupFixture.init("refresh-turn-wait-no-timeout", 0, .batch);
+        defer fixture.deinit();
+        const connection = fixture.connection;
+        var lease: ?native.PathWriterLock = try connection.acquire();
+        defer {
+            if (lease) |*held| held.close();
+            connection.gate.mutex.unlock(io);
+        }
+        try std.testing.expectError(error.FileBusy, connection.refreshAfterMaintenanceTurn(&lease, false));
+        try std.testing.expect(lease == null);
+    }
 }
 
 test "issue1015 issue1431 native background turns coordinate across independent owners" {

@@ -225,6 +225,13 @@ fn orderedLastWithPrefix(start: ?*OrderedNode, prefix: []const u8) ?*OrderedNode
 /// enough relative to reads for this to be a real bottleneck, and
 /// correctness is far easier to reason about with one lock than with a
 /// read/write split here).
+/// The overlay's own keys, values, index nodes and pages live here, not in
+/// whatever allocator a caller passes: they are freed one by one as
+/// versions are reclaimed, and `page_allocator` turned each of those into
+/// its own munmap. Copies handed back to callers still use the caller's
+/// allocator.
+pub const owned_allocator: Allocator = std.heap.smp_allocator;
+
 pub const SharedRedoOverlay = struct {
     mutex: std.Io.Mutex = .init,
     maps: [3]OverlayMap = .{ .empty, .empty, .empty },
@@ -287,7 +294,8 @@ pub const SharedRedoOverlay = struct {
     /// `create` with no syscall either way.
     entry_pool: EntryPool = .empty,
 
-    pub fn deinit(self: *SharedRedoOverlay, allocator: Allocator) void {
+    pub fn deinit(self: *SharedRedoOverlay, _: Allocator) void {
+        const allocator = owned_allocator;
         for (&self.maps, 0..) |*map, root_index| {
             const root: u8 = @intCast(root_index);
             var it = map.iterator();
@@ -315,7 +323,8 @@ pub const SharedRedoOverlay = struct {
     /// in lockstep, but a missing node is harmless to tolerate here).
     /// Callers hold `self.mutex` already (or, from `deinit`, have
     /// exclusive access with nothing left to synchronize against).
-    fn destroyOrderedKey(self: *SharedRedoOverlay, allocator: Allocator, root: u8, key: []const u8) void {
+    fn destroyOrderedKey(self: *SharedRedoOverlay, _: Allocator, root: u8, key: []const u8) void {
+        const allocator = owned_allocator;
         var entry = self.ordered[root].getEntryFor(key);
         if (entry.node) |node| {
             entry.set(null);
@@ -325,7 +334,8 @@ pub const SharedRedoOverlay = struct {
 
     /// Stages (or replaces) a page-shaped write, keyed by page id. Takes
     /// ownership of `bytes`.
-    pub fn appendPage(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, page_id: u64, bytes: []u8) !void {
+    pub fn appendPage(self: *SharedRedoOverlay, _: Allocator, io: std.Io, page_id: u64, bytes: []u8) !void {
+        const allocator = owned_allocator;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (try self.pages.fetchPut(allocator, page_id, bytes)) |old| allocator.free(old.value);
@@ -413,7 +423,8 @@ pub const SharedRedoOverlay = struct {
     /// store's own single-writer exclusion for the whole span between
     /// them, so no other writer can have restaged a page this call is
     /// about to remove with different content in between.
-    pub fn removePages(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, flushed: []const OwnedPage) void {
+    pub fn removePages(self: *SharedRedoOverlay, _: Allocator, io: std.Io, flushed: []const OwnedPage) void {
+        const allocator = owned_allocator;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         for (flushed) |p| {
@@ -434,7 +445,8 @@ pub const SharedRedoOverlay = struct {
     /// risk. A no-op whenever a pin exists; call it after every
     /// checkpoint regardless; it only actually clears once pins drain to
     /// none.
-    pub fn maybeClearPages(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io) void {
+    pub fn maybeClearPages(self: *SharedRedoOverlay, _: Allocator, io: std.Io) void {
+        const allocator = owned_allocator;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.pins.items.len != 0) return;
@@ -451,7 +463,7 @@ pub const SharedRedoOverlay = struct {
     /// only the first time it's seen for this root.
     pub fn appendVersion(
         self: *SharedRedoOverlay,
-        allocator: Allocator,
+        _: Allocator,
         io: std.Io,
         root: u8,
         key: []const u8,
@@ -461,6 +473,7 @@ pub const SharedRedoOverlay = struct {
         external_value_root_page: u64,
         external_value_len: usize,
     ) !void {
+        const allocator = owned_allocator;
         std.debug.assert(root < 3);
         // perf/lwa-fold-churn: the lock now covers `entry_pool.create` too
         // (moved ahead of where it used to run unlocked) -- the pool's own
@@ -513,7 +526,8 @@ pub const SharedRedoOverlay = struct {
     /// transaction is still open, so the current head is always exactly
     /// the node this call means to remove. A no-op if nothing is staged
     /// for `key` (a savepoint opened before this key was ever touched).
-    pub fn removeLastVersion(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, key: []const u8) void {
+    pub fn removeLastVersion(self: *SharedRedoOverlay, _: Allocator, io: std.Io, root: u8, key: []const u8) void {
+        const allocator = owned_allocator;
         std.debug.assert(root < 3);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -537,7 +551,8 @@ pub const SharedRedoOverlay = struct {
     /// never published -- the `pages`-side analogue of `removeLastVersion`,
     /// used for the same abort/savepoint-rollback undo. A no-op if
     /// nothing is staged for `page_id`.
-    pub fn discardPage(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, page_id: u64) void {
+    pub fn discardPage(self: *SharedRedoOverlay, _: Allocator, io: std.Io, page_id: u64) void {
+        const allocator = owned_allocator;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.pages.fetchRemove(page_id)) |kv| allocator.free(kv.value);
@@ -586,7 +601,8 @@ pub const SharedRedoOverlay = struct {
     /// so an uncoordinated reader counts too (this overlay is never
     /// visible cross-process at all, so only the in-process half is
     /// relevant to it in the first place).
-    pub fn pin(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, sequence: u64) !void {
+    pub fn pin(self: *SharedRedoOverlay, _: Allocator, io: std.Io, sequence: u64) !void {
+        const allocator = owned_allocator;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         try self.pins.append(allocator, sequence);
@@ -595,7 +611,8 @@ pub const SharedRedoOverlay = struct {
     /// `pin`, but refuses a mark `reclaim` has already collapsed past:
     /// the check and the pin share one lock, so no reclaim can slip
     /// between them.
-    pub fn pinUnlessReclaimed(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, sequence: u64, checkpoint_sequence: u64) !void {
+    pub fn pinUnlessReclaimed(self: *SharedRedoOverlay, _: Allocator, io: std.Io, sequence: u64, checkpoint_sequence: u64) !void {
+        const allocator = owned_allocator;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         // Versions at or below the reclaim floor were dropped or folded into
@@ -892,6 +909,14 @@ pub const SharedRedoOverlay = struct {
         if (needs_reclaim) self.reclaim(allocator, io, 0);
     }
 
+    /// `minPinLocked`, taking the mutex: the oldest mark any in-process
+    /// reader has pinned, below which reclaim will not go.
+    pub fn minimumPin(self: *SharedRedoOverlay, io: std.Io) ?u64 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.minPinLocked();
+    }
+
     /// The oldest live pin's sequence, or null if there are none (nothing
     /// currently restricts reclaim beyond `durable_checkpoint_sequence`
     /// itself).
@@ -916,7 +941,8 @@ pub const SharedRedoOverlay = struct {
     /// run with no readers. Call this after `checkpointRedoLog` publishes
     /// a new durable checkpoint, and again whenever a pin releases (a
     /// newly-advanced floor may make more versions reclaimable).
-    pub fn reclaim(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, durable_sequence: u64) void {
+    pub fn reclaim(self: *SharedRedoOverlay, _: Allocator, io: std.Io, durable_sequence: u64) void {
+        const allocator = owned_allocator;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.durable_checkpoint_sequence = @max(self.durable_checkpoint_sequence, durable_sequence);
@@ -1044,7 +1070,8 @@ pub const SharedRedoOverlay = struct {
     /// initial population from the log (no concurrent reader can reach
     /// this overlay yet at that point), so it writes the maps directly
     /// rather than through `appendVersion`'s locking.
-    pub fn decodeLogicalMutationsPayload(self: *SharedRedoOverlay, allocator: Allocator, payload: []const u8, sequence: u64) !void {
+    pub fn decodeLogicalMutationsPayload(self: *SharedRedoOverlay, _: Allocator, payload: []const u8, sequence: u64) !void {
+        const allocator = owned_allocator;
         var pos: usize = 0;
         while (pos < payload.len) {
             if (pos + 3 > payload.len) return error.InvalidNativeRedoRecord;
@@ -1109,7 +1136,8 @@ pub const SharedRedoOverlay = struct {
     /// own shape) back into `pages`, replacing (and freeing) any earlier
     /// entry for the same page id. Used only during initial population
     /// from the log, same posture as `decodeLogicalMutationsPayload`.
-    pub fn decodeRedoGroupPayload(self: *SharedRedoOverlay, allocator: Allocator, payload: []const u8) !void {
+    pub fn decodeRedoGroupPayload(self: *SharedRedoOverlay, _: Allocator, payload: []const u8) !void {
+        const allocator = owned_allocator;
         var pos: usize = 0;
         while (pos < payload.len) {
             if (pos + 12 > payload.len) return error.InvalidNativeRedoRecord;
@@ -1130,8 +1158,8 @@ test "redo overlay versioned resolve sees the newest version at or before a pinn
     var overlay: SharedRedoOverlay = .{};
     defer overlay.deinit(a);
 
-    try overlay.appendVersion(a, std.testing.io, 2, "k", 1, try a.dupe(u8, "v1"), false, 0, 0);
-    try overlay.appendVersion(a, std.testing.io, 2, "k", 2, try a.dupe(u8, "v2"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "k", 1, try owned_allocator.dupe(u8, "v1"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "k", 2, try owned_allocator.dupe(u8, "v2"), false, 0, 0);
 
     const at_1 = (try overlay.resolveAlloc(a, std.testing.io, 2, "k", 1)).?;
     defer a.free(at_1.value);
@@ -1151,9 +1179,9 @@ test "redo overlay reclaim keeps versions a live pin still needs and drops the r
     var overlay: SharedRedoOverlay = .{};
     defer overlay.deinit(a);
 
-    try overlay.appendVersion(a, std.testing.io, 2, "k", 1, try a.dupe(u8, "v1"), false, 0, 0);
-    try overlay.appendVersion(a, std.testing.io, 2, "k", 2, try a.dupe(u8, "v2"), false, 0, 0);
-    try overlay.appendVersion(a, std.testing.io, 2, "k", 3, try a.dupe(u8, "v3"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "k", 1, try owned_allocator.dupe(u8, "v1"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "k", 2, try owned_allocator.dupe(u8, "v2"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "k", 3, try owned_allocator.dupe(u8, "v3"), false, 0, 0);
 
     // A reader pinned at sequence 2 must survive a reclaim that already
     // covers everything up to 3: v1 (strictly older than the floor, 2)
@@ -1199,7 +1227,7 @@ test "redo overlay ordered index: keysWithPrefixAlloc returns matches in sorted 
 
     // Inserted out of sorted order on purpose.
     for ([_][]const u8{ "p/charlie", "p/alpha", "other/zz", "p/echo", "p/bravo", "other/aa", "p/delta" }, 1..) |key, seq| {
-        try overlay.appendVersion(a, std.testing.io, 2, key, seq, try a.dupe(u8, "v"), false, 0, 0);
+        try overlay.appendVersion(a, std.testing.io, 2, key, seq, try owned_allocator.dupe(u8, "v"), false, 0, 0);
     }
 
     const keys = try overlay.keysWithPrefixAlloc(a, std.testing.io, 2, "p/");
@@ -1218,7 +1246,7 @@ test "redo overlay ordered index: first/last/seek-at-or-after/seek-at-or-before 
     defer overlay.deinit(a);
 
     for ([_][]const u8{ "m/5", "m/1", "m/9", "m/3", "m/7" }, 1..) |key, seq| {
-        try overlay.appendVersion(a, std.testing.io, 0, key, seq, try a.dupe(u8, "v"), false, 0, 0);
+        try overlay.appendVersion(a, std.testing.io, 0, key, seq, try owned_allocator.dupe(u8, "v"), false, 0, 0);
     }
 
     {
@@ -1274,7 +1302,7 @@ test "redo overlay ordered index: a prefix scan never crosses into a neighboring
     // on either side so a lower/upper-bound walk that forgot to check
     // the prefix at all would wrongly wander into them.
     for ([_][]const u8{ "m/zzz", "n/b", "n/a", "o/aaa" }, 1..) |key, seq| {
-        try overlay.appendVersion(a, std.testing.io, 1, key, seq, try a.dupe(u8, "v"), false, 0, 0);
+        try overlay.appendVersion(a, std.testing.io, 1, key, seq, try owned_allocator.dupe(u8, "v"), false, 0, 0);
     }
 
     const keys = try overlay.keysWithPrefixAlloc(a, std.testing.io, 1, "n/");
@@ -1312,9 +1340,9 @@ test "redo overlay ordered index: removeLastVersion (abort) drops only its own k
     var overlay: SharedRedoOverlay = .{};
     defer overlay.deinit(a);
 
-    try overlay.appendVersion(a, std.testing.io, 2, "d/1", 1, try a.dupe(u8, "v1"), false, 0, 0);
-    try overlay.appendVersion(a, std.testing.io, 2, "d/2", 2, try a.dupe(u8, "v2"), false, 0, 0);
-    try overlay.appendVersion(a, std.testing.io, 2, "d/3", 3, try a.dupe(u8, "v3"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "d/1", 1, try owned_allocator.dupe(u8, "v1"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "d/2", 2, try owned_allocator.dupe(u8, "v2"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "d/3", 3, try owned_allocator.dupe(u8, "v3"), false, 0, 0);
 
     // Undo "d/2"'s own (only) version, as an aborted transaction would.
     overlay.removeLastVersion(a, std.testing.io, 2, "d/2");
@@ -1341,12 +1369,12 @@ test "redo overlay ordered index: reclaim's whole-key drop removes it from the i
     var overlay: SharedRedoOverlay = .{};
     defer overlay.deinit(a);
 
-    try overlay.appendVersion(a, std.testing.io, 2, "r/one", 1, try a.dupe(u8, "v1"), false, 0, 0);
-    try overlay.appendVersion(a, std.testing.io, 2, "r/two", 2, try a.dupe(u8, "v2"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "r/one", 1, try owned_allocator.dupe(u8, "v1"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "r/two", 2, try owned_allocator.dupe(u8, "v2"), false, 0, 0);
     // Overwrite "r/two" so it has a superseded version to collapse, not
     // just a single untouched one -- exercises reclaim's real drop path
     // rather than a no-op.
-    try overlay.appendVersion(a, std.testing.io, 2, "r/two", 3, try a.dupe(u8, "v2-updated"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "r/two", 3, try owned_allocator.dupe(u8, "v2-updated"), false, 0, 0);
 
     // No pin at all: a reclaim covering everything drops "r/one" and
     // "r/two" entirely (nothing could ever need the overlay for them
@@ -1366,7 +1394,7 @@ test "redo overlay ordered index: reclaim's whole-key drop removes it from the i
     // Interleave more inserts after the drop: the index must still be
     // internally consistent (no stale node left behind confusing a
     // later lookup/insert at the same key).
-    try overlay.appendVersion(a, std.testing.io, 2, "r/one", 4, try a.dupe(u8, "v1-again"), false, 0, 0);
+    try overlay.appendVersion(a, std.testing.io, 2, "r/one", 4, try owned_allocator.dupe(u8, "v1-again"), false, 0, 0);
     const resolved = (try overlay.resolveAlloc(a, std.testing.io, 2, "r/one", 4)).?;
     defer a.free(resolved.value);
     try std.testing.expectEqualStrings("v1-again", resolved.value);
@@ -1411,7 +1439,7 @@ test "redo overlay ordered index: a concurrent reader's prefix scans stay well-f
             while (seq <= total) : (seq += 1) {
                 var buf: [16]u8 = undefined;
                 const key = try std.fmt.bufPrint(&buf, "c/{d:0>8}", .{seq});
-                try self.overlay.appendVersion(self.allocator, std.testing.io, 2, key, seq, try self.allocator.dupe(u8, "v"), false, 0, 0);
+                try self.overlay.appendVersion(self.allocator, std.testing.io, 2, key, seq, try owned_allocator.dupe(u8, "v"), false, 0, 0);
                 if (seq % 10 == 0) {
                     // No pin is ever held in this test, so this collapses
                     // every key to its single (never-superseded) live
@@ -1503,7 +1531,7 @@ test "redo overlay microbenchmark: a narrow prefix probe against 10k entries (th
     while (seq <= total) : (seq += 1) {
         var buf: [24]u8 = undefined;
         const key = try std.fmt.bufPrint(&buf, "\x02db/doc/{d:0>10}", .{seq});
-        try overlay.appendVersion(a, std.testing.io, 2, key, seq, try a.dupe(u8, "v"), false, 0, 0);
+        try overlay.appendVersion(a, std.testing.io, 2, key, seq, try owned_allocator.dupe(u8, "v"), false, 0, 0);
     }
 
     const started = std.Io.Clock.awake.now(std.testing.io);

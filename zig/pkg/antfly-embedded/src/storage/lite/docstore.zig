@@ -3176,6 +3176,12 @@ pub const Store = struct {
     /// so callers override it only to test this barrier itself, never to
     /// tune write-amplification numbers for one caller's own benefit.
     ride_along_idle_ns: u64 = 50 * std.time.ns_per_ms,
+    /// Set while this Store's owner has handed its writer lane to a
+    /// maintenance turn. No foreground writer can lead a group then, so a
+    /// ride-along waiter must not sit out `ride_along_idle_ns` hoping one
+    /// will: it drives the group itself straight away (the same barrier
+    /// the idle window would have run, just without the wait).
+    writer_held_by_maintenance: std.atomic.Value(bool) = .init(false),
     /// How long `maybeCheckpointRedoLogOnIdleTurn`'s opportunistic fold
     /// (no byte-capacity pressure, `threshold_due` false) waits for
     /// genuine quiet before running, separate from `ride_along_idle_ns`
@@ -5285,7 +5291,15 @@ pub const Store = struct {
             const io = self.store.file.runtime();
             self.store.commit_mutex.lockUncancelable(io);
             while (!self.request.done) {
-                if (self.request.ride_along) {
+                if (self.request.ride_along and self.store.writer_held_by_maintenance.load(.acquire)) {
+                    self.store.commit_mutex.unlock(io);
+                    {
+                        const flush_scope = wal_trace.scope(.ride_along_flush);
+                        defer flush_scope.end();
+                        self.store.forceDrainDurable();
+                    }
+                    self.store.commit_mutex.lockUncancelable(io);
+                } else if (self.request.ride_along) {
                     // A ride-along ticket never leads its own group (see
                     // `ride_along`'s own doc comment), so its wait must
                     // never depend on anyone *else* existing to eventually
@@ -6805,33 +6819,20 @@ pub const Txn = struct {
         // Lifetime-owned readers already retain an inode fence and preserve
         // admission during commit fsync.
         //
-        // `lockStoreExclusive`, not plain `lockStore`: an externally-locked
-        // read is the one reader that *does* need `self.file`'s own
-        // up-to-date state (unlike an ordinary in-process reader, which
-        // only ever reads `read_generation.checkpoint`'s own `read_mutex`-
-        // protected cache, correctly updated only once a commit's
-        // `notifyPublication` runs at its very end). A commit's own
-        // `commit_in_sync` window (`applyMutationGroup`'s `sync_gate`,
-        // `commitTransactionWithDurability`'s `syncIfRequired`/
-        // `publishCheckpoint` hooks) releases `store.mutex` -- not
-        // `read_mutex` -- for the span of its own log/page fsync, after
-        // the mutation's own content is already eagerly visible in the
-        // shared redo overlay (§9.3a, "readers see committed-but-unchecked
-        // state") but before `self.header`'s own `commit_sequence` is
-        // bumped and `notifyPublication` fires. Plain `lockStore` let this
-        // read's own `beginRead` land inside exactly that window: it
-        // re-pins `store.read_generation.checkpoint` (still the *previous*
-        // commit's value, `observeReadCheckpoint` for this one not having
-        // run yet) while `generation.file`'s own overlay already has this
-        // commit's new version chained on top -- `readMark` then resolves
-        // at the stale pinned sequence and finds the old value, even
-        // though the write it raced had already, irreversibly, started
-        // publishing. `lockStoreExclusive` waits out `commit_in_sync` the
-        // same way vacuum/reclaim/checkpoint-publish already do before
-        // touching `self.file`, so this read can only ever land strictly
-        // before or strictly after the whole commit, never astride it.
+        // Plain `lockStore`, not `lockStoreExclusive`: a read that lands
+        // inside an in-flight commit's `commit_in_sync` window (the store
+        // mutex released for just the redo/page fsync) pins
+        // `read_generation.checkpoint`, still the previous publication,
+        // and resolves the overlay at `committedSequence()` -- for a redo
+        // file `redo.durable_sequence`, which also has not advanced yet.
+        // That is a consistent snapshot strictly before the unacknowledged
+        // commit, never one astride it. Waiting the window out instead
+        // (and raising `exclusive_waiting`, which makes the next group's
+        // leader hold the mutex through its own fsync) serialized every
+        // writer's pre-staging reads behind every fsync, so concurrent
+        // writers could never share a group (WS3).
         const serialized_admission = store.file.externally_locked;
-        if (serialized_admission) lockStoreExclusive(store);
+        if (serialized_admission) lockStore(store);
         defer if (serialized_admission) store.mutex.unlock();
         const pin = try store.readMetadataAllocator().create(ReadPin);
         errdefer store.readMetadataAllocator().destroy(pin);
@@ -9519,15 +9520,19 @@ test "lite externally locked read pins wait for catalog and document publication
         fn read(self: *@This()) !void {
             var txn = try self.store.beginRead();
             defer txn.abort();
-            try std.testing.expectEqualStrings("after", try txn.get("doc"));
+            // The write is unacknowledged while this read runs, so either
+            // consistent snapshot is correct: before it, or after it.
+            const value = try txn.get("doc");
+            if (!std.mem.eql(u8, value, "before") and !std.mem.eql(u8, value, "after")) return error.TestUnexpectedResult;
         }
     };
     var writer = Writer{ .store = &store };
     const writer_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Writer.run, .{&writer});
-    defer {
+    var writer_joined = false;
+    defer if (!writer_joined) {
         writer.release.store(true, .release);
         writer_thread.join();
-    }
+    };
     while (!writer.publishing.load(.acquire)) std.atomic.spinLoopHint();
     if (writer.failure) |err| return err;
     var reader = Reader{ .store = &store };
@@ -9545,6 +9550,14 @@ test "lite externally locked read pins wait for catalog and document publication
     reader_thread.join();
     reader_joined = true;
     if (reader.failure) |err| return err;
+    writer.release.store(true, .release);
+    writer_thread.join();
+    writer_joined = true;
+    if (writer.failure) |err| return err;
+    // Once the write has returned, every new read must see it.
+    var after = try store.beginRead();
+    defer after.abort();
+    try std.testing.expectEqualStrings("after", try after.get("doc"));
 }
 
 test "lite externally locked read pins wait for fork-inherited publication fences" {
