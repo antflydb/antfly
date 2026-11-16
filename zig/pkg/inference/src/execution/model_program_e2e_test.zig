@@ -609,7 +609,7 @@ test "model program real boundary extraction executes compiled task graphs" {
             defer a.free(request_bytes);
             var request = try wire.parseJson(a, request_bytes, .{});
             defer request.deinit();
-            const options = executor.Options{ .control = .{ .native_call_policy = .in_process }, .pipeline = .{ .threshold = 0.1 } };
+            const options = executor.Options{ .identity = try factory.getGlinerBoundaryIdentity(native), .control = .{ .native_call_policy = .in_process }, .pipeline = .{ .threshold = 0.1 } };
             const expected = try executor.execute(&cb, a, &config, tokenizer.tokenizer(), &request, options);
             defer a.free(expected);
             var selected = options;
@@ -621,27 +621,42 @@ test "model program real boundary extraction executes compiled task graphs" {
                 defer left.deinit();
                 var right = try std.json.parseFromSlice(std.json.Value, a, actual, .{});
                 defer right.deinit();
-                try expectTaskJsonParity(left.value, right.value);
+                try expectTaskJsonParity(left.value, right.value, if (precision == .bf16) 2e-2 else 2e-3);
+            }
+            const window_bytes = try std.fmt.allocPrint(a, "{s},\"options\":{{\"long_document\":{{\"mode\":\"window\",\"window_words\":3,\"overlap_words\":1}}}}}}", .{request_bytes[0 .. request_bytes.len - 1]});
+            defer a.free(window_bytes);
+            var window_request = try wire.parseJson(a, window_bytes, .{});
+            defer window_request.deinit();
+            const window_expected = try executor.execute(&cb, a, &config, tokenizer.tokenizer(), &window_request, options);
+            defer a.free(window_expected);
+            var window_reference = try std.json.parseFromSlice(std.json.Value, a, window_expected, .{});
+            defer window_reference.deinit();
+            for (0..2) |_| {
+                const actual = try executor.execute(&cb, a, &config, tokenizer.tokenizer(), &window_request, selected);
+                defer a.free(actual);
+                var window_actual = try std.json.parseFromSlice(std.json.Value, a, actual, .{});
+                defer window_actual.deinit();
+                try expectTaskJsonParity(window_reference.value, window_actual.value, if (precision == .bf16) 2e-2 else 2e-3);
             }
         }
     }
 }
 
-fn expectTaskJsonParity(expected: std.json.Value, actual: std.json.Value) !void {
+fn expectTaskJsonParity(expected: std.json.Value, actual: std.json.Value, tolerance: f64) !void {
     try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
     switch (expected) {
         .object => |object| {
             try std.testing.expectEqual(object.count(), actual.object.count());
             var iterator = object.iterator();
-            while (iterator.next()) |entry| try expectTaskJsonParity(entry.value_ptr.*, actual.object.get(entry.key_ptr.*) orelse return error.MissingTaskOutputKey);
+            while (iterator.next()) |entry| try expectTaskJsonParity(entry.value_ptr.*, actual.object.get(entry.key_ptr.*) orelse return error.MissingTaskOutputKey, tolerance);
         },
         .array => |array| {
             try std.testing.expectEqual(array.items.len, actual.array.items.len);
-            for (array.items, actual.array.items) |left, right| try expectTaskJsonParity(left, right);
+            for (array.items, actual.array.items) |left, right| try expectTaskJsonParity(left, right, tolerance);
         },
         .float => |value| {
             try std.testing.expect(std.math.isFinite(value) and std.math.isFinite(actual.float));
-            try std.testing.expectApproxEqAbs(value, actual.float, 2e-3);
+            try std.testing.expectApproxEqAbs(value, actual.float, tolerance);
         },
         .integer => |value| try std.testing.expectEqual(value, actual.integer),
         .string => |value| try std.testing.expectEqualStrings(value, actual.string),

@@ -186,7 +186,19 @@ fn profile(a: Allocator, config: *const model.Config, item: *const wire.Item, op
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly-gliner-boundary-window-inference/v1\x00");
     hash.update(&options.identity.fingerprint());
-    hash.update(backend);
+    if (options.compiled_session) |session| {
+        if (comptime !@import("build_options").enable_pjrt) return error.PjrtNotEnabled;
+        if (session.backend() != .pjrt) return error.UnsupportedGlinerBoundaryBackend;
+        const factory = @import("../architectures/session_factory.zig");
+        const live = try factory.getGlinerBoundaryIdentity(session);
+        if (!std.mem.eql(u8, &options.identity.fingerprint(), &live.fingerprint())) return error.GlinerBoundaryArtifactMismatch;
+        const client: *@import("pjrt").pjrt.Client = @ptrCast(@alignCast(factory.getPjrtClientPtr(session) orelse return error.MissingPjrtClient));
+        const precision = factory.getPjrtPrecision(session) orelse return error.UnsupportedGlinerBoundaryBackend;
+        hash.update("pjrt\x00");
+        hash.update(try client.platformName());
+        hash.update("\x00");
+        hash.update(@tagName(precision));
+    } else hash.update(backend);
     hash.update("\x00");
     hashOptions(&hash, options.pipeline);
     hash.update("global-joint/native-window-resources-v1\x00");
@@ -917,6 +929,7 @@ pub fn planGeometry(backend: compute.BackendKind, allocator: Allocator, config: 
 }
 
 pub fn executeQualified(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options, gate: *qualification.Admission) !Result {
+    if (supplied.compiled_session != null) return error.UnsupportedGlinerBoundaryRuntime;
     if (cb.kind() != .native and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     if (cb.kind() == .metal and cb.decoderRuntimeHasActiveFrame()) return error.GlinerBoundaryExternalFrame;
     return executeChecked(cb, allocator, config, tokenizer, item, supplied, gate);

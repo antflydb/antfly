@@ -394,7 +394,7 @@ const TestProvider = struct {
             defer for (mixed) |*output| output.deinit();
             try std.testing.expectEqualSlices(f32, &.{ -14, -14, -14, -14, -14, -14 }, mixed[0].asFloat32());
             try std.testing.expectEqual(@as(u64, 3), cache.entries.stats.builds);
-            try std.testing.expectEqual(@as(usize, 1), cache.parameters.?.uploads);
+            try std.testing.expectEqual(@as(usize, 2), cache.parameters.?.uploads);
             try std.testing.expectError(error.ModelProgramPrecisionMismatch, cache.run(a, bf16_provider, frontend, &declared, a, null));
         }
         const entry = cache.entries.entries.items[0];

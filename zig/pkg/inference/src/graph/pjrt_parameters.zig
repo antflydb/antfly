@@ -19,9 +19,10 @@ pub const Store = struct {
     uploads: usize = 0,
 
     const Operand = struct {
-        dtype: ml.graph.DType,
         shape: ml.graph.Shape,
-        buffer: pjrt.Buffer,
+        // A checkpoint operand has one immutable logical shape, with an
+        // uploaded representation for each dtype actually used by a stage.
+        buffers: std.EnumArray(ml.graph.DType, ?pjrt.Buffer) = .initFill(null),
     };
     pub fn init(allocator: std.mem.Allocator, client: *pjrt.Client) Store {
         return .{ .allocator = allocator, .client = client };
@@ -30,41 +31,49 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         var iterator = self.entries.iterator();
         while (iterator.next()) |entry| {
-            entry.value_ptr.buffer.deinit();
+            for (&entry.value_ptr.buffers.values) |*variant| if (variant.*) |*buffer| buffer.deinit();
             self.allocator.free(entry.key_ptr.*);
         }
         self.entries.deinit(self.allocator);
     }
-    fn validate(operand: Operand, dtype: ml.graph.DType, dims: []const i64) !void {
-        if (operand.dtype != dtype or !std.mem.eql(i64, operand.shape.dims[0..operand.shape.rank()], dims)) return error.ImmutableParameterContractChanged;
+    fn validate(operand: Operand, dims: []const i64) !void {
+        if (!std.mem.eql(i64, operand.shape.dims[0..operand.shape.rank()], dims)) return error.ImmutableParameterContractChanged;
     }
     pub fn get(self: *Store, name: []const u8, dtype: ml.graph.DType, dims: []const i64) !?pjrt.Buffer {
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         const operand = self.entries.get(name) orelse return null;
-        try validate(operand, dtype, dims);
-        return operand.buffer;
+        try validate(operand, dims);
+        return operand.buffers.get(dtype);
     }
     /// Upload happens outside the metadata lock. On success consumes candidate,
     /// including duplicate publication. Failure leaves it with the caller.
     pub fn publish(self: *Store, name: []const u8, dtype: ml.graph.DType, dims: []const i64, candidate: pjrt.Buffer) !pjrt.Buffer {
         if (dims.len > 8) return error.UnsupportedShape;
         platform.sync.lockYielding(&self.mutex);
-        if (self.entries.get(name)) |existing| {
-            validate(existing, dtype, dims) catch |err| {
+        if (self.entries.getPtr(name)) |existing| {
+            validate(existing.*, dims) catch |err| {
                 self.mutex.unlock();
                 return err;
             };
+            if (existing.buffers.get(dtype)) |buffer| {
+                self.mutex.unlock();
+                var duplicate = candidate;
+                duplicate.deinit();
+                return buffer;
+            }
+            existing.buffers.set(dtype, candidate);
+            self.uploads += 1;
             self.mutex.unlock();
-            var duplicate = candidate;
-            duplicate.deinit();
-            return existing.buffer;
+            return candidate;
         }
         const owned_name = self.allocator.dupe(u8, name) catch |err| {
             self.mutex.unlock();
             return err;
         };
-        self.entries.put(self.allocator, owned_name, .{ .dtype = dtype, .shape = ml.graph.Shape.init(dtype, dims), .buffer = candidate }) catch |err| {
+        var operand = Operand{ .shape = ml.graph.Shape.init(dtype, dims) };
+        operand.buffers.set(dtype, candidate);
+        self.entries.put(self.allocator, owned_name, operand) catch |err| {
             self.allocator.free(owned_name);
             self.mutex.unlock();
             return err;
