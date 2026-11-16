@@ -38,7 +38,7 @@ pub const policy_version: u32 = 1;
 // more entries. Geometry remains u64 and each row still matches independently.
 const CandidateMask = u128;
 pub const max_entries: usize = @bitSizeOf(CandidateMask);
-pub const Backend = enum { native, metal, cuda };
+pub const Backend = enum { native, metal, cuda, pjrt_cpu_f32, pjrt_cpu_bf16, pjrt_cuda_f32, pjrt_cuda_bf16_vendor, pjrt_cuda_bf16_deterministic };
 
 /// Required features come from the complete compiled request, never from
 /// capability strings supplied by a model or client. A row declares support
@@ -803,7 +803,31 @@ fn metalBatchEntries() [2 + family_profiles.len]Entry {
     for (&entries) |*entry| entry.lengths.request_items = .{ .min = 2, .max = metal_batch_items };
     return entries;
 }
-const production_entries: []const Entry = &(base_production_entries ++ base_overlap_allow_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries() ++ cuda_base_entries ++ cudaMultilingualEntries() ++ cudaBatchEntries() ++ metalBatchEntries());
+// Bounded shared-program cohort: authenticated base capture, all ten task
+// cases on CPU/CUDA; CPU F32/BF16 and CUDA F32. Both CUDA BF16 schedules
+// remain excluded: a later fresh vendor compilation changed a latent record.
+// The deterministic vendor profile passes three independent compilations.
+// Geometry comes from the exact prepared requests, not the native envelope.
+const pjrt_base_entries = entries: {
+    const backends = [_]Backend{ .pjrt_cpu_f32, .pjrt_cpu_bf16, .pjrt_cuda_f32, .pjrt_cuda_bf16_deterministic };
+    var rows: [backends.len]Entry = undefined;
+    for (backends, &rows) |backend, *row| row.* = .{
+        .identity = fastino_gliner25_base_v1,
+        .backend = backend,
+        .features = fastino_gliner25_base_v1_features,
+        .lengths = .{
+            .request_items = .{ .min = 1, .max = 10 },
+            .document_bytes = .{ .min = 26, .max = 60 },
+            .document_words = .{ .min = 5, .max = 14 },
+            .window_count = Range.exact(1),
+            .window_words = .{ .min = 5, .max = 14 },
+            .padded_sequence_tokens = .{ .min = 22, .max = 46 },
+        },
+    };
+    break :entries rows;
+};
+
+const production_entries: []const Entry = &(pjrt_base_entries ++ base_production_entries ++ base_overlap_allow_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries() ++ cuda_base_entries ++ cudaMultilingualEntries() ++ cudaBatchEntries() ++ metalBatchEntries());
 
 comptime {
     // Each entry's five digests are hex-validated one character at a time
@@ -1347,7 +1371,7 @@ test "boundary qualification Transformers wrapper preserves original fp32 profil
         if (original and entry.features.contains(.overlap_allow)) {
             // This separately qualified extension has no wrapper reference.
             // Authenticate its exact grant without broadening wrapper support.
-            try std.testing.expect(entry.backend == .native or entry.backend == .metal or entry.backend == .cuda);
+            try std.testing.expect(entry.backend == .native or entry.backend == .metal or entry.backend == .cuda or std.mem.startsWith(u8, @tagName(entry.backend), "pjrt_"));
             try std.testing.expect(std.meta.eql(entry.features, base_overlap_allow_features));
             try std.testing.expect(std.meta.eql(entry.lengths, fastino_gliner25_base_v1_lengths));
             try require(entry.identity, entry.backend, entry.features, entry.lengths);

@@ -1313,6 +1313,7 @@ pub const NodeConfig = struct {
     /// allocator capacities. F32 remains the default qualification profile.
     pjrt_memory_policy: ?session_factory.PjrtSessionOptions.MemoryPolicy = null,
     pjrt_precision: session_factory.PjrtSessionOptions.Precision = .f32,
+    pjrt_extraction_batch_size: usize = 1,
     pjrt_media_bucket_rows: usize = 0,
     pjrt_gemm: @import("../execution/precision.zig").Gemm = .provider_default,
     audio_readers: []const transcribing_api.NamedConfig = &.{},
@@ -4606,6 +4607,7 @@ pub const Node = struct {
         var config = supplied_config;
         config.chunking_limits = try config.chunking_limits.environment(allocator);
         try config.request_limits.validate();
+        if (config.pjrt_extraction_batch_size == 0 or config.pjrt_extraction_batch_size > 8) return error.InvalidPjrtBatch;
         if (config.pjrt_media_bucket_rows > 256) return error.InvalidPjrtBucket;
         try config.cooperative_execution.validate();
         if (config.http_max_connections == 0 or config.http_max_request_tasks == 0 or config.http_max_body_bytes == 0)
@@ -12945,8 +12947,10 @@ pub const Node = struct {
             defer handle.release();
             const loaded = handle.get();
             const backend = loaded.session.backend();
-            if (backend != .native and backend != .cuda) return error.UnsupportedDecisionBackend;
+            if (backend != .native and backend != .cuda and backend != .pjrt) return error.UnsupportedDecisionBackend;
+            if (backend == .pjrt and session_factory.getPjrtPrecision(loaded.session) != .f32) return error.UnsupportedDecisionBackend;
             var pipeline = createGlinerPipeline(self, scratch, loaded);
+            if (backend == .pjrt) pipeline.batch_dispatch = null;
             return decision_executor.execute(scratch, &pipeline, &request, execution_options.max_response_bytes, model_path_selection_control);
         }
         // Only a declared gliner2 2.x span checkpoint has the upstream
@@ -12971,18 +12975,14 @@ pub const Node = struct {
         defer handle.release();
         const loaded = handle.get();
         const backend = loaded.session.backend();
-        if (backend != .native and backend != .metal and backend != .cuda) return error.UnsupportedExtractionBackend;
+        if (backend != .native and backend != .metal and backend != .cuda and backend != .pjrt) return error.UnsupportedExtractionBackend;
         execution_options.identity = try session_factory.getGlinerBoundaryIdentity(loaded.session);
         if (backend == .metal and session_factory.isGlinerBoundaryResidentReady(loaded.session))
             execution_options.metal_execution_policy = .optimized_v2;
         if (!test_qualification) {
             // Reject exact artifact/backend/features before creating request
             // device state. Geometry is mandatory in executeQualified below.
-            _ = try @import("../extractors/gliner_boundary_qualification.zig").Admission.initResolved(execution_options.identity.?, switch (backend) {
-                .metal => .metal,
-                .cuda => .cuda,
-                else => .native,
-            }, &request, execution_options.pipeline, model_path_selection_control);
+            _ = try @import("../extractors/gliner_boundary_qualification.zig").Admission.initResolved(execution_options.identity.?, try @import("../extractors/gliner_boundary_qualification.zig").backendForSession(loaded.session), &request, execution_options.pipeline, model_path_selection_control);
         }
         if (!test_qualification) {
             if (try self.tryBoundaryRequestMicrobatch(scratch, io, loaded, &request, request_json, execution_options, working_bytes, budget)) |json| return json;
@@ -13171,6 +13171,26 @@ pub const Node = struct {
         const control = execution_options.control;
         const failure = execution_options.failure orelse return error.InvalidExtractionRequest;
         const observer = execution_options.observer;
+        if (backend == .pjrt) {
+            // Session stage admission and provider lanes remain inside the
+            // task controller. Holding the native model gate here would nest
+            // it around Session.run and deadlock.
+            var managed = try session_factory.getManagedComputeBackend(loaded.session, scratch, budget, control);
+            defer managed.deinit();
+            var borrowed = control orelse InferenceExecutionControl{};
+            borrowed.hard_cancellation = null;
+            borrowed.native_call_policy = .in_process;
+            managed.backend.execution_control = borrowed;
+            execution_options.control = borrowed;
+            execution_options.pipeline.control = borrowed;
+            execution_options.compiled_session = loaded.session;
+            execution_options.compiled_batch_size = self.config.pjrt_extraction_batch_size;
+            started.* = true;
+            return if (test_qualification)
+                boundary_executor.execute(&managed.backend, scratch, &config, loaded.getTokenizer(), request, execution_options)
+            else
+                boundary_executor.executeQualified(&managed.backend, scratch, &config, loaded.getTokenizer(), request, execution_options);
+        }
         // This pass uses the held immutable tokenizer and exact prepared items
         // and windows under the existing request heap. Observe its real CPU
         // phase while keeping decoded-item and window counters quiet. No CB or

@@ -516,8 +516,10 @@ test "model program public decoder prefix keeps new embeddings and token tails d
             const values = try reference.toFloat32(oracle[0].value, a);
             defer a.free(values);
             @import("../architectures/gpt.zig").applyFinalLogitSoftcapInPlace(config, values);
+            const shapes_before = factory.getPjrtSpecializationCount(compiled).?;
             const reused = try prepared.run(compiled, next.asInt64(), a, .{ .native_call_policy = .in_process });
             defer a.free(reused);
+            try std.testing.expectEqual(shapes_before, factory.getPjrtSpecializationCount(compiled).?);
             try std.testing.expectEqual(values.len, reused.len);
             for (values, reused) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.002 + @abs(want) * 1e-4);
         }
@@ -624,7 +626,7 @@ test "model program real boundary extraction executes compiled task graphs" {
         defer compiled.close();
         for ([_][]const u8{ "natural", "latent", "anchorless" }) |mode| {
             const request_bytes = try std.fmt.allocPrint(a,
-                \\{{"schema_version":2,"model":"fixture","schema":{{"entities":["person","company"],"entity_attributes":{{"status":{{"labels":["active","inactive"],"applies_to":["person"]}}}},"classifications":[{{"name":"sentiment","labels":["negative","positive"]}}],"structures":{{"employment":{{"mode":"{s}","fields":{{"name":{{"type":"str","cardinality":"required_one"}},"company":{{"type":"str","cardinality":"optional_one"}}}}}}}},"relations":[{{"type":"works_for","source":"person","target":"company"}}]}},"inputs":[{{"content":"Ada works at Antfly in Seattle."}}]}}
+                \\{{"schema_version":2,"model":"fixture","schema":{{"entities":["person","company"],"entity_attributes":{{"status":{{"labels":["active","inactive"],"applies_to":["person"]}}}},"classifications":[{{"name":"sentiment","labels":["negative","positive"]}}],"structures":{{"employment":{{"mode":"{s}","fields":{{"name":{{"type":"str","cardinality":"required_one"}},"company":{{"type":"str","cardinality":"optional_one"}}}}}}}},"relations":[{{"type":"works_for","source":"person","target":"company"}}]}},"inputs":[{{"content":"Ada works at Antfly in Seattle."}},{{"content":"Bob works at Google in London."}}]}}
             , .{mode});
             defer a.free(request_bytes);
             var request = try wire.parseJson(a, request_bytes, .{});
@@ -634,9 +636,15 @@ test "model program real boundary extraction executes compiled task graphs" {
             defer a.free(expected);
             var selected = options;
             selected.compiled_session = compiled;
+            selected.compiled_batch_size = 2;
+            var executions: [2]executor.ItemExecution = @splat(.{});
+            selected.item_executions = &executions;
+            if (precision == .bf16) try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, executor.executeQualified(&cb, a, &config, tokenizer.tokenizer(), &request, selected));
             for (0..2) |_| {
                 const actual = try executor.execute(&cb, a, &config, tokenizer.tokenizer(), &request, selected);
                 defer a.free(actual);
+                try std.testing.expectEqual(@as(usize, 2), executions[0].rows);
+                try std.testing.expectEqual(@as(usize, 2), executions[1].rows);
                 var left = try std.json.parseFromSlice(std.json.Value, a, expected, .{});
                 defer left.deinit();
                 var right = try std.json.parseFromSlice(std.json.Value, a, actual, .{});
@@ -744,4 +752,37 @@ test "model program real companion video stage preserves frame projection and ti
         try std.testing.expectEqual(expected_values.len, actual_values.len);
         for (expected_values, actual_values) |want, got| try std.testing.expectApproxEqAbs(want, got, 5e-4 + @abs(want) * 1e-4);
     }
+}
+
+test "model program qualified extraction binds actual PJRT profile and bounded geometry" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const model = platform.env.getenv("ANTFLY_PJRT_BOUNDARY_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const compiled = try factory.createPjrtSessionWithOptions(a, model, .{ .memory_policy = .cpu });
+    defer compiled.close();
+    var cb = try factory.getComputeBackend(compiled, a);
+    defer cb.deinit();
+    const cfg = try factory.getGlinerBoundaryConfig(compiled);
+    const path = try std.fs.path.join(a, &.{ model, "tokenizer.json" });
+    defer a.free(path);
+    const bytes = try @import("../util/c_file.zig").readFile(a, path);
+    defer a.free(bytes);
+    const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytesWithOptions(a, bytes, .{ .strict_unigram_normalizer = true });
+    defer tok.tokenizer().deinitTokenizer();
+    const wire = @import("../extractors/extraction_v2.zig");
+    const executor = @import("../extractors/gliner_boundary_executor.zig");
+    var request = try wire.parseJson(a,
+        \\{"schema_version":2,"model":"fixture","schema":{"entities":["person","organization"],"classifications":[{"name":"sentiment","labels":["positive","negative"]}],"relations":[{"type":"works_for"}]},"inputs":[{"content":"John works at Apple. Alice works at Google."}]}
+    , .{});
+    defer request.deinit();
+    const opts = executor.Options{ .identity = try factory.getGlinerBoundaryIdentity(compiled), .compiled_session = compiled, .control = .{ .native_call_policy = .in_process } };
+    const expected = try executor.execute(&cb, a, &cfg, tok.tokenizer(), &request, opts);
+    defer a.free(expected);
+    const actual = try executor.executeQualified(&cb, a, &cfg, tok.tokenizer(), &request, opts);
+    defer a.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+    try std.testing.expectEqual(.pjrt_cpu_f32, try @import("../extractors/gliner_boundary_qualification.zig").backendForSession(compiled));
+    const policy = @import("../models/gliner_boundary_qualification.zig");
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, policy.supportsFeatures(opts.identity.?, .pjrt_cpu_f32, policy.Features.initOne(.long_document)));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, policy.supportsFeatures(opts.identity.?, .pjrt_cuda_bf16_vendor, policy.Features.initOne(.entities)));
 }

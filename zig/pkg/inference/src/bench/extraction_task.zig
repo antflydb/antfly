@@ -18,6 +18,9 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     defer cb.deinit();
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, options.extraction_request.?, a, .limited(16 * 1024 * 1024));
     defer a.free(bytes);
+    var geometry_request = try wire.parseJson(a, bytes, .{});
+    defer geometry_request.deinit();
+    const geometry = try executor.measureRequestGeometry(a, &config, model.getTokenizer(), &geometry_request, .{ .compiled_session = if (is_pjrt) model.session else null, .compiled_batch_size = options.pjrt.extraction_batch_size });
     const samples = try a.alloc(u64, options.iterations);
     defer a.free(samples);
     var response: ?[]u8 = null;
@@ -27,7 +30,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         const started = inference.platform.time.awakeNs(init.io);
         var request = try wire.parseJson(a, bytes, .{});
         defer request.deinit();
-        const actual = try executor.execute(&cb, a, &config, model.getTokenizer(), &request, .{ .identity = identity, .compiled_session = if (is_pjrt) model.session else null, .control = .{ .native_call_policy = .in_process } });
+        const actual = try executor.execute(&cb, a, &config, model.getTokenizer(), &request, .{ .identity = identity, .compiled_session = if (is_pjrt) model.session else null, .compiled_batch_size = options.pjrt.extraction_batch_size, .control = .{ .native_call_policy = .in_process } });
         const elapsed = inference.platform.time.awakeNs(init.io) - started;
         if (index == 0) cold_ns = elapsed;
         if (index >= options.warmup) samples[index - options.warmup] = elapsed;
@@ -43,12 +46,15 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .task = "public_extraction",
         .backend = @tagName(model.session.backend()),
         .model_dir = options.model_dir,
+        .pjrt_extraction_batch_size = options.pjrt.extraction_batch_size,
+        .pjrt_execution_profile = factory.getPjrtExecutionProfile(model.session),
         .pjrt_device = if (is_pjrt) @tagName(options.pjrt.device) else null,
         .pjrt_gemm = if (is_pjrt) @tagName(options.pjrt.gemm) else null,
         .pjrt_precision = if (is_pjrt) @tagName(options.pjrt.precision) else null,
         .compiled_stages_required = is_pjrt,
         .model_load_in_timing = false,
         .timing_scope = "request_parse+schema+tokenization+encoder+heads+decode+cleanup",
+        .observed_geometry = geometry,
         .release_serving_qualification = false,
         .cold_request_ns = cold_ns,
         .warmup = options.warmup,

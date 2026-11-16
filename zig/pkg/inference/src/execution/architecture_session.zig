@@ -402,6 +402,13 @@ pub const PjrtSessionOptions = struct {
     memory_policy: ?PjrtSessionOptions.MemoryPolicy = null,
 };
 
+pub const PjrtExecutionProfile = struct {
+    device_kind: []const u8,
+    platform: enum { cpu, cuda, other },
+    precision: @import("precision.zig").Policy,
+    gemm: @import("precision.zig").Gemm,
+};
+
 fn openHostSession(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride, preparation: HostSessionOptions) !Session {
     var loaded_model = try model_definition.LoadedModel.open(allocator, model_path);
     defer loaded_model.deinit();
@@ -463,7 +470,7 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
         .gliner_decision_identity = gliner_decision_identity,
         .backend_data = switch (preparation.backend) {
             .native => .{ .native = prepared.takeWeights() },
-            .pjrt => .{ .pjrt = .{ .native = prepared.takeWeights(), .precision = preparation.pjrt_precision } },
+            .pjrt => .{ .pjrt = .{ .native = prepared.takeWeights(), .precision = preparation.pjrt_precision, .gemm = preparation.pjrt_gemm } },
         },
     };
     glide_head_owned = false;
@@ -481,7 +488,11 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
         impl.backend_data.pjrt.client.?.compile_options.gpu_gemm = switch (preparation.pjrt_gemm) {
             .provider_default => .provider_default,
             .vendor => .vendor,
+            .vendor_deterministic => .vendor_deterministic,
         };
+        impl.backend_data.pjrt.device_kind = impl.backend_data.pjrt.client.?.deviceKind() catch "";
+        const platform_name = try impl.backend_data.pjrt.client.?.platformName();
+        impl.backend_data.pjrt.platform = if (std.ascii.eqlIgnoreCase(platform_name, "cpu") or std.ascii.eqlIgnoreCase(platform_name, "host")) .cpu else if (std.ascii.eqlIgnoreCase(platform_name, "cuda")) .cuda else .other;
         impl.backend_data.pjrt.parameters = @import("../graph/pjrt_parameters.zig").Store.init(allocator, &impl.backend_data.pjrt.client.?);
     }
     const host_data = switch (preparation.backend) {
@@ -583,6 +594,23 @@ pub fn getPjrtParameterStore(session: Session) ?*anyopaque {
     if (self.backend_type != .pjrt) return null;
     if (self.backend_data.pjrt.parameters) |*parameters| return @ptrCast(parameters);
     return null;
+}
+
+pub fn getPjrtExecutionProfile(session: Session) ?PjrtExecutionProfile {
+    if (comptime !build_options.enable_pjrt) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .pjrt) return null;
+    const data = &self.backend_data.pjrt;
+    return .{ .device_kind = data.device_kind, .platform = data.platform, .precision = data.precision, .gemm = data.gemm };
+}
+
+pub fn getPjrtSpecializationCount(session: Session) ?usize {
+    if (comptime !build_options.enable_pjrt) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .pjrt) return null;
+    return self.captured_programs.specializationCount();
 }
 
 /// Loaded publication policy, independent of the host backend used for tracing.
@@ -2820,7 +2848,10 @@ const GpuHostedData = if (false or build_options.enable_metal) gpu_hosted_store_
 /// while the PJRT client is used for compiled partition execution.
 const PjrtData = struct {
     parameters: if (build_options.enable_pjrt) ?@import("../graph/pjrt_parameters.zig").Store else void = if (build_options.enable_pjrt) null else {},
+    device_kind: []const u8 = "",
     precision: @import("precision.zig").Policy = .f32,
+    gemm: @import("precision.zig").Gemm = .provider_default,
+    platform: @FieldType(PjrtExecutionProfile, "platform") = .other,
     /// Native weight store — PJRT uses the native backend for data
     /// conversion (host CTs ↔ PJRT buffers).
     native: NativeData,

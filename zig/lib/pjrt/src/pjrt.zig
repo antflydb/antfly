@@ -41,10 +41,16 @@ const vendor_gemm_compile_options = blk: {
     break :blk strict_compile_options ++ [_]u8{ 0x3a, entry.len } ++ entry;
 };
 
+const deterministic_vendor_compile_options = blk: {
+    const key = "xla_gpu_deterministic_ops";
+    const entry = [_]u8{ 0x0a, key.len } ++ key.* ++ [_]u8{ 0x12, 0x02, 0x10, 0x01 };
+    break :blk vendor_gemm_compile_options ++ [_]u8{ 0x3a, entry.len } ++ entry;
+};
+
 pub const CompileOptions = struct {
     /// BF16 publications can distinguish the F32 accumulation schedules of
     /// Triton and vendor GEMM. Select the qualified source schedule explicitly.
-    gpu_gemm: enum { provider_default, vendor } = .provider_default,
+    gpu_gemm: enum { provider_default, vendor, vendor_deterministic } = .provider_default,
 };
 
 pub const PjrtError = error{
@@ -519,6 +525,19 @@ pub const Client = struct {
     /// Immutable after publication; all shapes use the same selected schedule.
     compile_options: CompileOptions = .{},
 
+    pub fn deviceKind(self: *const Client) PjrtError![]const u8 {
+        if (self.api._fns[c.Api.FN_DEVICE_GET_DESCRIPTION] == null or self.api._fns[c.Api.FN_DEVICE_DESCRIPTION_KIND] == null) return error.UnsupportedPjrtFeature;
+        var description = std.mem.zeroes(c.DeviceGetDescriptionArgs);
+        description.struct_size = @sizeOf(@TypeOf(description));
+        description.device = self.device;
+        try checkError(self.api, self.api.deviceGetDescription(&description));
+        var kind = std.mem.zeroes(c.DeviceDescriptionKindArgs);
+        kind.struct_size = @sizeOf(@TypeOf(kind));
+        kind.device_description = description.device_description orelse return error.PjrtApiError;
+        try checkError(self.api, self.api.deviceDescriptionKind(&kind));
+        return (kind.device_kind orelse return error.PjrtApiError)[0..kind.device_kind_size];
+    }
+
     pub fn platformName(self: *const Client) PjrtError![]const u8 {
         var args = std.mem.zeroes(c.ClientPlatformNameArgs);
         args.struct_size = @sizeOf(@TypeOf(args));
@@ -685,6 +704,7 @@ pub const Client = struct {
         const compile_options: []const u8 = switch (options.gpu_gemm) {
             .provider_default => &strict_compile_options,
             .vendor => &vendor_gemm_compile_options,
+            .vendor_deterministic => &deterministic_vendor_compile_options,
         };
 
         var args = c.ClientCompileArgs{
@@ -1364,13 +1384,14 @@ test "compile and deserialize reject native output arity with balanced ownership
         var executable_destroyed: usize = 0;
         var strict_compiles: usize = 0;
         var vendor_expected = false;
+        var deterministic_expected = false;
         fn checkOptions(bytes: []const u8) !void {
             const wire = @import("protobuf").wire;
             var pos: usize = 0;
             try std.testing.expectEqual(@as(u32, 3), (try wire.readTag(bytes, &pos)).field);
             const build = try wire.readLengthDelimited(bytes, &pos);
             try std.testing.expectEqualSlices(u8, &.{ 0x20, 1, 0x28, 1 }, build);
-            const keys: []const []const u8 = if (vendor_expected) &.{ "xla_allow_excess_precision", "xla_gpu_enable_triton_gemm" } else &.{"xla_allow_excess_precision"};
+            const keys: []const []const u8 = if (deterministic_expected) &.{ "xla_allow_excess_precision", "xla_gpu_enable_triton_gemm", "xla_gpu_deterministic_ops" } else if (vendor_expected) &.{ "xla_allow_excess_precision", "xla_gpu_enable_triton_gemm" } else &.{"xla_allow_excess_precision"};
             for (keys) |key| {
                 try std.testing.expectEqual(@as(u32, 7), (try wire.readTag(bytes, &pos)).field);
                 const entry = try wire.readLengthDelimited(bytes, &pos);
@@ -1382,7 +1403,7 @@ test "compile and deserialize reject native output arity with balanced ownership
                 try std.testing.expectEqual(entry.len, cursor);
                 cursor = 0;
                 try std.testing.expectEqual(@as(u32, 2), (try wire.readTag(value, &cursor)).field);
-                try std.testing.expectEqual(@as(u64, 0), try wire.readVarint(value, &cursor));
+                try std.testing.expectEqual(@as(u64, if (std.mem.eql(u8, key, "xla_gpu_deterministic_ops")) 1 else 0), try wire.readVarint(value, &cursor));
                 try std.testing.expectEqual(value.len, cursor);
             }
             try std.testing.expectEqual(bytes.len, pos);
@@ -1434,10 +1455,13 @@ test "compile and deserialize reject native output arity with balanced ownership
     try std.testing.expectError(error.OutputCountMismatch, client.compileWithOptions("hlo", 2, @ptrFromInt(1), .{ .gpu_gemm = .vendor }));
     client.compile_options = .{ .gpu_gemm = .vendor };
     try std.testing.expectError(error.OutputCountMismatch, client.compile("hlo", 2));
+    Fake.deterministic_expected = true;
+    defer Fake.deterministic_expected = false;
+    try std.testing.expectError(error.OutputCountMismatch, client.compileWithOptions("hlo", 2, client.device, .{ .gpu_gemm = .vendor_deterministic }));
     try std.testing.expectError(error.OutputCountMismatch, client.deserializeExecutable("serialized", 2));
-    try std.testing.expectEqual(@as(usize, 4), Fake.strict_compiles);
-    try std.testing.expectEqual(@as(usize, 5), Fake.loaded_destroyed);
-    try std.testing.expectEqual(@as(usize, 5), Fake.executable_destroyed);
+    try std.testing.expectEqual(@as(usize, 5), Fake.strict_compiles);
+    try std.testing.expectEqual(@as(usize, 6), Fake.loaded_destroyed);
+    try std.testing.expectEqual(@as(usize, 6), Fake.executable_destroyed);
 }
 
 test "float32 downloads use logical host bytes and reject invalid type size and shape" {

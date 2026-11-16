@@ -23,7 +23,7 @@ const backend_choice = inference.native_backend_choice;
 const Primitive = enum { norm_backward };
 
 const Options = struct {
-    pjrt: @import("pjrt_options.zig").Options = .{},
+    pjrt: inference.pjrt_options.Options = .{},
     extraction_request: ?[]const u8 = null,
     generate_text: ?[]const u8 = null,
     generate_image: ?[]const u8 = null,

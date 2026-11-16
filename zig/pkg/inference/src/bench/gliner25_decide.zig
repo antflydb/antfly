@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
     var batch_tokens: usize = 16384;
     var worker = false;
     var precision: factory.GlinerCudaPrecision = .fp32;
-    var pjrt_options = @import("pjrt_options.zig").Options{};
+    var pjrt_options = inference.pjrt_options.Options{};
     while (args.next()) |arg| {
         const value = args.next() orelse return error.MissingArgument;
         if (try pjrt_options.parse(arg, value)) continue;

@@ -1,11 +1,10 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Explicit provider policy shared by public-task benchmarks. GPU allocation
+//! Explicit provider policy shared by serving and public-task qualification. GPU allocation
 //! quantities must describe the chosen device; never infer them from its name.
 const std = @import("std");
-const inference = @import("inference_internal");
-const factory = inference.architectures.session_factory;
+const factory = @import("../architectures/session_factory.zig");
 
 pub const Options = struct {
     device: enum { cpu, cuda } = .cpu,
@@ -13,12 +12,16 @@ pub const Options = struct {
     capacity_bytes: usize = 0,
     device_bytes: usize = 0,
     precision: factory.PjrtSessionOptions.Precision = .f32,
+    extraction_batch_size: usize = 1,
     media_bucket_rows: usize = 0,
     gemm: @FieldType(factory.PjrtSessionOptions, "gemm") = .provider_default,
 
     pub fn parse(self: *Options, arg: []const u8, value: []const u8) !bool {
         if (std.mem.eql(u8, arg, "--pjrt-device")) {
             self.device = std.meta.stringToEnum(@FieldType(Options, "device"), value) orelse return error.InvalidPjrtDevice;
+        } else if (std.mem.eql(u8, arg, "--pjrt-extraction-batch-size")) {
+            self.extraction_batch_size = try std.fmt.parseInt(usize, value, 10);
+            if (self.extraction_batch_size == 0 or self.extraction_batch_size > 8) return error.InvalidPjrtBatch;
         } else if (std.mem.eql(u8, arg, "--pjrt-media-bucket-rows")) {
             self.media_bucket_rows = try std.fmt.parseInt(usize, value, 10);
             if (self.media_bucket_rows > 256) return error.InvalidPjrtBucket;
@@ -50,7 +53,7 @@ pub const Options = struct {
         };
     }
 
-    pub fn configure(self: Options, manager: *inference.backends.SessionManager) !void {
+    pub fn configure(self: Options, manager: *@import("../backends/backends.zig").SessionManager) !void {
         const options = try self.sessionOptions();
         manager.preferred_backends = &.{.pjrt};
         manager.required_backend = .pjrt;
@@ -60,3 +63,20 @@ pub const Options = struct {
         manager.pjrt_gemm = options.gemm;
     }
 };
+
+test "PJRT options require explicit feasible CUDA capacities and preserve selection" {
+    var value: Options = .{};
+    try std.testing.expect(try value.parse("--pjrt-device", "cuda"));
+    try std.testing.expectError(error.InvalidPjrtMemoryPolicy, value.sessionOptions());
+    try std.testing.expect(try value.parse("--pjrt-capacity-bytes", "4096"));
+    try std.testing.expect(try value.parse("--pjrt-device-bytes", "2048"));
+    try std.testing.expectError(error.InvalidPjrtMemoryPolicy, value.sessionOptions());
+    try std.testing.expect(try value.parse("--pjrt-device-bytes", "8192"));
+    try std.testing.expect(try value.parse("--pjrt-gemm", "vendor"));
+    try std.testing.expect(try value.parse("--pjrt-precision", "bf16"));
+    const result = try value.sessionOptions();
+    try std.testing.expectEqual(@as(usize, 4096), result.memory_policy.?.cuda.capacity_bytes);
+    try std.testing.expectEqual(.vendor, result.gemm);
+    try std.testing.expectEqual(.bf16, result.precision);
+    try std.testing.expectError(error.InvalidPjrtBucket, value.parse("--pjrt-media-bucket-rows", "257"));
+}

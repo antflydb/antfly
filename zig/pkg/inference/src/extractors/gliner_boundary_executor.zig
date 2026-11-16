@@ -49,6 +49,7 @@ pub const ItemExecution = struct {
 pub const Options = struct {
     /// A real compiled session owns every encoder/head stage. Native callers
     /// leave this null and retain their qualified eager program.
+    compiled_batch_size: usize = 1,
     compiled_session: ?@import("../backends/session.zig").Session = null,
     /// Synchronous row consumer for independent broker callers. It owns
     /// serialization failures locally; the executor never builds a combined
@@ -175,6 +176,7 @@ pub fn observeSample(observer: ?observation.Observer, sample: pipeline.Sample, t
 /// Runs before acquiring a backend or executing an input, so unsupported
 /// features in later items cannot consume earlier items' model execution.
 pub fn preflight(request: *const wire.Request, options: Options) !void {
+    if (options.compiled_batch_size == 0 or options.compiled_batch_size > 8) return error.ResourceLimitExceeded;
     try progress(options, null, "preflight");
     if (request.items.len == 0 or options.max_response_bytes == 0) return error.InvalidExtractionRequest;
     for (request.items, 0..) |item, index| {
@@ -237,20 +239,23 @@ pub fn execute(cb: *const compute.ComputeBackend, allocator: Allocator, config: 
 /// Serving admission verifies the exact live artifact and complete feature union.
 /// Model/backend geometry and work budgets are planned before learned operations.
 pub fn executeQualified(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) ![]u8 {
-    // Native release rows cannot attest a compiled provider. The offline task
-    // path qualifies its real stages before a separate provider row is added.
-    if (options.compiled_session != null) return error.UnsupportedGlinerBoundaryRuntime;
-
     if (options.control) |control| try control.check();
     try cb.checkExecutionControl();
     if (cb.kind() != .native and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
+    if (options.compiled_session) |session| {
+        const profile = @import("../architectures/session_factory.zig").getPjrtExecutionProfile(session) orelse return error.UnsupportedGlinerBoundaryRuntime;
+        // The BF16 source gate is qualified only for one physical row.
+        // Batching changes reductions even with deterministic compilation.
+        if (profile.precision == .bf16 and options.compiled_batch_size != 1) return error.UnsupportedGlinerBoundaryRuntime;
+    }
     const identity = options.identity orelse return error.UnsupportedGlinerBoundaryRuntime;
     if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
-    var gate = try qualification.Admission.initResolved(identity, switch (cb.kind()) {
+    const qualified_backend: @import("../models/gliner_boundary_qualification.zig").Backend = if (options.compiled_session) |session| try qualification.backendForSession(session) else switch (cb.kind()) {
         .metal => .metal,
         .cuda => .cuda,
         else => .native,
-    }, request, options.pipeline, options.control);
+    };
+    var gate = try qualification.Admission.initResolved(identity, qualified_backend, request, options.pipeline, options.control);
     var local_store = PreparationStore.init(allocator);
     defer local_store.deinit();
     var prepared_options = options;
@@ -389,7 +394,7 @@ pub fn referenceEncoderDeviceBytes(backend: compute.BackendKind, allocator: Allo
 /// Contiguous compatible items share one forward pass without reordering results.
 /// The same preparation/planning routine runs before qualification and execution.
 fn prepareGroup(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, items: []const wire.Item, options: Options) !processor.PreparedBatch {
-    const limit = if (backend == .cuda or backend == .metal) @min(options.processor.max_batch_items, options.engine.limits.max_batch, options.pipeline.head_limits.max_batch, options.pipeline.task_limits.math.max_batch, options.device.head.max_batch) else 1;
+    const limit = if (options.compiled_session != null) @min(options.compiled_batch_size, @min(options.processor.max_batch_items, @min(options.engine.limits.max_batch, options.pipeline.head_limits.max_batch))) else if (backend == .cuda or backend == .metal) @min(options.processor.max_batch_items, options.engine.limits.max_batch, options.pipeline.head_limits.max_batch, options.pipeline.task_limits.math.max_batch, options.device.head.max_batch) else 1;
     if (limit == 0 or items.len == 0) return error.ResourceLimitExceeded;
     var count: usize = 1;
     while (count < @min(limit, items.len) and items[count].options.long_document.mode != .window and std.meta.eql(items[0].options, items[count].options)) : (count += 1) {}
@@ -442,6 +447,32 @@ fn observeGroup(allocator: Allocator, config: *const model.Config, items: []cons
         view.samples = prepared.samples[index..][0..1];
         try gate.observeSingle(allocator, item.text, &view, qualification.singleProcessor(config, item, options.processor, options.engine.limits.max_queries, options.control));
     }
+}
+
+/// Measure the actual tokenizer/window geometry used by this executor.
+/// Qualification callers retain these observations; no range is inferred from
+/// checkpoint metadata or a configured maximum.
+pub fn measureRequestGeometry(allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !@import("../models/gliner_boundary_qualification.zig").LengthContract {
+    const Policy = @import("../models/gliner_boundary_qualification.zig");
+    const Measurement = struct {
+        items: usize,
+        value: ?Policy.LengthContract = null,
+        pub fn observe(self: *@This(), bytes: usize, words: usize, windows: usize, prepared: *const processor.PreparedBatch) !void {
+            const measured = try qualification.lengths(self.items, bytes, words, windows, prepared);
+            if (self.value) |*previous| {
+                inline for (comptime std.meta.fieldNames(Policy.LengthContract)) |name| {
+                    @field(previous, name).min = @min(@field(previous, name).min, @field(measured, name).min);
+                    @field(previous, name).max = @max(@field(previous, name).max, @field(measured, name).max);
+                }
+            } else self.value = measured;
+        }
+        pub fn observeSingle(self: *@This(), a: Allocator, text: []const u8, prepared: *const processor.PreparedBatch, processor_options: processor.Options) !void {
+            try self.observe(text.len, try qualification.sourceWords(a, text, processor_options), 1, prepared);
+        }
+    };
+    var measurement = Measurement{ .items = request.items.len };
+    try planRequestGeometry(.native, allocator, config, tokenizer, request, options, &measurement);
+    return measurement.value orelse error.InvalidExtractionRequest;
 }
 
 fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options, gate: anytype) !void {

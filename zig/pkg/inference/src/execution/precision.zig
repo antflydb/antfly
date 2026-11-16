@@ -7,4 +7,4 @@
 pub const Policy = enum { f32, bf16 };
 
 /// Provider schedule is independent of tensor storage/publication precision.
-pub const Gemm = enum { provider_default, vendor };
+pub const Gemm = enum { provider_default, vendor, vendor_deterministic };

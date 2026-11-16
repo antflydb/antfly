@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const pjrt_options = @import("execution/pjrt_options.zig");
 pub const pull_diagnostics = @import("registry/pull_diagnostics.zig");
 
 const build_options = @import("build_options");

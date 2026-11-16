@@ -171,6 +171,12 @@ pub const Cache = struct {
     parameters: ?*ParameterStore = null,
     identity: ?Provider = null,
 
+    pub fn specializationCount(self: *Cache) usize {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        return self.entries.entries.items.len;
+    }
+
     fn sameProvider(a: Provider, b: Provider) bool {
         if (a.context != b.context or a.create != b.create or a.import != b.import or (a.compiled_context != null) != (b.compiled_context != null)) return false;
         if (a.compiled_context) |left| {
