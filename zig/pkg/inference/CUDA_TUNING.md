@@ -1,8 +1,34 @@
 # CUDA Tuning Profile
 
-Gemma 4 QAT CUDA measurements must use the shared profile in
-`scripts/gemma4/gemma4_qat_cuda_tuning.sh`. The CLI benchmark and server wrapper both
-source it so production route settings stay aligned.
+The shared Gemma 4 QAT CLI/E2B release lane uses the profile in
+`scripts/gemma4/gemma4_qat_cuda_tuning.sh`. Its CLI benchmark and server wrapper
+both source it so production route settings stay aligned. The separately
+qualified E4B native HTTP profile below uses its own explicit settings; do not
+combine the two profiles.
+
+## Gemma 4 E4B QAT native HTTP on L4
+
+The [2026-11-15 L4 report](scripts/gemma4/qualification/e4b-qat-l4-http-20261115.md)
+records three alternating fresh lifecycles, 105 requests per engine, identical
+Q4_0 GGUF artifacts, matched prompt counts and fixed output lengths. With the
+opt-in [E4B L4 profile](scripts/gemma4/gemma4_e4b_qat_l4.env), F16 K/V and a
+4096 MiB scratch admission ceiling, median HTTP latency is 1.004–1.037× faster
+than llama.cpp b12387 across the five text/image/audio workloads. The long-text
+result is near parity. TTFT remains higher on all five workloads, so these
+fixed-output results do not establish a latency win for short early-EOS replies.
+
+Maximum simultaneous process-tree PSS plus NVML usage is 8.540 GB versus
+8.586 GB; maximum VRAM is higher, 7.508 GB versus 4.593 GB. The combined
+footprint excludes unmapped reclaimable OS file-cache pages. The reference uses
+`--image-min-tokens 256 --image-max-tokens 280` to match prepared image grids.
+Repository media substitutes and reconstructed text fixtures make this a local
+comparison, rather than an exact reproduction of the release-page corpus.
+
+The report and accompanying JSON retain settings, hashes, raw timings,
+lifecycle medians, numerical checks and known quality failures. Source the
+profile before starting a dedicated E4B process; the report includes the
+paired runner and strict validation commands. This evidence is scoped to the
+E4B/L4 HTTP configuration and does not replace the E2B or GB10 promotion gates.
 
 ## EmbeddingGemma 2 CUDA image residency
 

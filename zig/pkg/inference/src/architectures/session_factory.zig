@@ -2182,6 +2182,14 @@ fn createCudaSessionWithRequiredProfile(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
+    // The raw Q4 route is qualified for dense Gemma 4 text checkpoints.
+    // Other Gemma generations, expert stores and MTP retain their defaults.
+    const dense_gemma4 = cuda_profile == .gemma4 and native_impl.arch_config == .gpt and native_impl.arch_config.gpt.usesGemma4Channels() and
+        !native_impl.arch_config.gpt.usesMoe() and !native_impl.arch_config.gpt.gemma4_mtp_assistant;
+    try cuda_compute.configureGemma4Dense(dense_gemma4, dense_gemma4 and
+        native_impl.arch_config.gpt.hidden_size == 2560 and native_impl.arch_config.gpt.num_hidden_layers == 42 and
+        native_impl.arch_config.gpt.num_key_value_heads == 2);
+
     // The pinned DeBERTa Decide checkpoint also consists entirely of FP32
     // weights. Admit its short projections to the strict cuBLASLt route;
     // the Q8 artifact keeps its independent quantized dispatch.
@@ -2259,6 +2267,17 @@ fn createCudaSessionWithRequiredProfile(
             if (!model_manifest.glide_declared) allocator.free(owned_key);
             return err;
         };
+        // Every resident upload waits for its host readers before returning.
+        // This temporary native session has no inference consumers. Release
+        // proven mmap spans as we go instead of retaining a second host model
+        // alongside the complete device model until native_session.close().
+        // Exclude expert stores, whose host cache has a separate policy.
+        if (cuda_compute.gemma4_e4b_sm89_qualified and a4b_inference == null) {
+            if (upload.mmap_bytes) |bytes| c_file.MmapRegion.adviseBytesDontNeed(bytes);
+        }
+    }
+    if (cuda_compute.stats.gemma4_mapped_upload_chunks != 0) {
+        std.log.info("inference_model_load backend=cuda phase=mapped_weight_upload chunks={d}", .{cuda_compute.stats.gemma4_mapped_upload_chunks});
     }
     std.log.info("inference_model_load backend=cuda phase=weight_upload weights={d} elapsed_ms={d}", .{ resident_uploads.items.len, (platform.time.monotonicNs() -| dense_upload_start_ns) / std.time.ns_per_ms });
     if (a4b_inference != null) {
