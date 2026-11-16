@@ -746,6 +746,26 @@ pub fn forward(
     seq_len: usize,
     decode_context: ?*const DecodeContext,
 ) ![]f32 {
+    const logits = try forwardLogitsTensor(cb, allocator, config, input_ids, batch, seq_len, decode_context);
+    defer cb.free(logits);
+    const result = try cb.toFloat32(logits, allocator);
+    applyFinalLogitSoftcap(config, result);
+    maybeDebugTopLogits(result, config.vocab_size);
+    return result;
+}
+
+/// Ordinary decoder arithmetic with a resident, pre-transform logit result.
+/// Semantic capture marks this tensor directly instead of observing dummy host
+/// values. The public host wrapper retains its existing F32 output transform.
+pub fn forwardLogitsTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+) !CT {
     const hidden_size = config.hidden_size;
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
@@ -772,7 +792,7 @@ pub fn forward(
         decode_context,
         &deepseek_v4_decode_context_storage,
     );
-    return forwardFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, effective_decode_context, ple_vectors);
+    return (try forwardLogitsTensorFromEmbeddings(cb, allocator, config, hidden, batch, seq_len, effective_decode_context, ple_vectors)).logits;
 }
 
 /// Run embeddings and transformer layers for KV/cache side effects without
@@ -6790,7 +6810,7 @@ fn decoderBlockImpl(
         var q_projected_owned = true;
         defer if (q_projected_owned) freeTensorWithCleanup(cb, q_projected, raw_overrides.cleanup);
         const k: CT, const v_omitted_local: bool, const v_local: CT = if (shares_kv)
-            .{ try createZeroCT(cb, allocator, total * kv_dim), false, try createZeroCT(cb, allocator, total * kv_dim) }
+            .{ try createZeroCT(cb, allocator, total, kv_dim), false, try createZeroCT(cb, allocator, total, kv_dim) }
         else if (attn_k_slot != null and attn_v_slot != null and (config.family == .qwen3 or config.family == .qwen3_vl)) blk_kv: {
             // The dense K/V pair slot path is not Qwen3-correct for Jina v5;
             // individual prepared slots match the dynamic Metal projections.
@@ -7988,13 +8008,22 @@ pub fn maybeAdjustNormWeight(
     return result;
 }
 
+pub const FinalLogitTransform = struct { scale: f32 = 1, softcap: f32 = 0 };
+
+pub fn finalLogitTransform(config: Config) FinalLogitTransform {
+    return .{
+        .scale = if (config.family == .gemma and config.weight_tying and scaleGemma4TiedLogitsDebug()) 1.0 / config.tokenEmbeddingScale() else 1,
+        .softcap = config.final_logit_softcapping,
+    };
+}
+
 fn applyFinalLogitSoftcap(config: Config, logits: []f32) void {
-    if (config.family == .gemma and config.weight_tying and scaleGemma4TiedLogitsDebug()) {
-        const scale = 1.0 / config.tokenEmbeddingScale();
-        for (logits) |*value| value.* *= scale;
-    }
-    if (config.final_logit_softcapping <= 0.0) return;
-    const softcap = config.final_logit_softcapping;
+    const transform = finalLogitTransform(config);
+    if (transform.scale != 1) for (logits) |*value| {
+        value.* *= transform.scale;
+    };
+    if (transform.softcap <= 0.0) return;
+    const softcap = transform.softcap;
     for (logits) |*value| {
         value.* = std.math.tanh(value.* / softcap) * softcap;
     }
@@ -10790,14 +10819,31 @@ fn applyPerItemRope(
     return cb.ropePerItem(input, batch, max_q_len, head_dim, rope_dim, rope_theta, rope_freq_scale, query_lengths, position_offsets, rope_consecutive_pairs);
 }
 
-/// Create a zero-filled compute tensor of the given flat length.
-fn createZeroCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, len: usize) !CT {
-    if (try cb.zeroTensor(1, len)) |ct| return ct;
-    // Fallback for backends without native zeroTensor (e.g. native).
+/// Preserve token rows even for operands supplied by a donor cache. Rotary
+/// capture and physical shape validation must see the same matrix as attention.
+fn createZeroCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, rows: usize, columns: usize) !CT {
+    const shape = [_]i32{ std.math.cast(i32, rows) orelse return error.UnsupportedShape, std.math.cast(i32, columns) orelse return error.UnsupportedShape };
+    const len = try std.math.mul(usize, rows, columns);
+    if (try cb.zeroTensor(rows, columns)) |ct| return ct;
     const zeros = try allocator.alloc(f32, len);
     defer allocator.free(zeros);
     @memset(zeros, 0);
-    return cb.fromFloat32(zeros);
+    return cb.fromFloat32Shape(zeros, &shape);
+}
+
+test "shared KV placeholder rows preserve BF16 rotary capture geometry" {
+    const a = std.testing.allocator;
+    var tracer = @import("../graph/tracing_compute.zig").TracingCompute.init(a);
+    defer tracer.deinit();
+    tracer.precision = .bf16;
+    const cb = tracer.backend();
+    const placeholder = try createZeroCT(&cb, a, 3, 8);
+    defer cb.free(placeholder);
+    const rotated = try cb.rope(placeholder, 3, 4, 4, 10000, 1, 0, false);
+    defer cb.free(rotated);
+    const shape = try cb.tensorShape(rotated, a);
+    defer a.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 3, 8 }, shape);
 }
 
 /// Build an AttentionContext from a DecodeContext. Public for the graph

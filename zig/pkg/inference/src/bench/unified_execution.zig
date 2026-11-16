@@ -49,6 +49,7 @@ const Options = struct {
     transcribe_audio: []const u8 = "",
     transcribe_mode: enum { performance, correctness } = .performance,
     transcribe_max_output_tokens: usize = 0,
+    transcribe_cold_timeout_seconds: u32 = 120,
     transcribe_timestamps: bool = false,
     transcribe_require_eos: bool = false,
     transcribe_output_format: enum { json, parity_f32 } = .json,
@@ -76,6 +77,11 @@ pub fn main(init: std.process.Init) !void {
         if (try options.pjrt.parse(arg, value)) continue;
         if (std.mem.eql(u8, arg, "--transcribe-mode")) {
             options.transcribe_mode = std.meta.stringToEnum(@FieldType(Options, "transcribe_mode"), value) orelse return error.InvalidArgument;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--transcribe-cold-timeout-seconds")) {
+            options.transcribe_cold_timeout_seconds = try std.fmt.parseInt(u32, value, 10);
+            if (options.transcribe_cold_timeout_seconds == 0 or options.transcribe_cold_timeout_seconds > 1800) return error.InvalidArgument;
             continue;
         }
         if (std.mem.eql(u8, arg, "--transcribe-max-output-tokens")) {

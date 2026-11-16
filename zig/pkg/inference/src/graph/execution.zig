@@ -544,22 +544,51 @@ pub fn ensureGraphEntry(
                 const dtype = backend.tensorDType(weight) catch .f32;
                 return @import("ml").graph.Shape.init(backendTensorDTypeToGraphDType(dtype), dims);
             }
+            fn values(raw_context: ?*anyopaque, resolve_allocator: std.mem.Allocator, name: []const u8) anyerror!?[]f32 {
+                const typed_context: *const Context = @ptrCast(@alignCast(raw_context orelse return null));
+                const weight = try typed_context.graphWeight(name);
+                defer typed_context.cb.free(weight);
+                const shape = try typed_context.cb.tensorShape(weight, resolve_allocator);
+                defer resolve_allocator.free(shape);
+                var count: usize = 1;
+                for (shape) |dimension| {
+                    if (dimension < 0 or dimension > 4096) return error.HostReadbackDuringCapture;
+                    count = try std.math.mul(usize, count, @intCast(dimension));
+                }
+                if (count > 4096) return error.HostReadbackDuringCapture;
+                return try typed_context.cb.toFloat32(weight, resolve_allocator);
+            }
         };
 
         var raw_graph = trace: {
             var tc = tracing_compute.TracingCompute.initWithWeightResolver(allocator, .{
                 .context = @ptrCast(@constCast(pipeline)),
                 .resolve = &Resolver.resolve,
+                .values = &Resolver.values,
             });
             defer tc.deinit();
             tc.precision = if (pipeline.compiled_partition_backend == .pjrt) pipeline.pjrt_precision else .f32;
+            // A cached semantic graph must never specialize dummy host math,
+            // including offline artifacts and native graph execution.
+            tc.require_resident_outputs = true;
             tc.setRuntimeEmbeddingIds(input_ids);
             var tc_cb = tc.backend();
             var trace_dc = decode_context.*;
             trace_dc.cleanup = .{}; // tracing records math, never caller authority
             trace_dc.moe_runtime = null;
-            const dummy_logits = try gpt_arch.forward(&tc_cb, allocator, pipeline.gpt_config.*, input_ids, batch, seq_len, &trace_dc);
-            defer allocator.free(dummy_logits);
+            const logits = try gpt_arch.forwardLogitsTensor(&tc_cb, allocator, pipeline.gpt_config.*, input_ids, batch, seq_len, &trace_dc);
+            defer tc_cb.free(logits);
+            var output = try tc.markOutput(logits);
+            const transform = gpt_arch.finalLogitTransform(pipeline.gpt_config.*);
+            var builder = @import("ml").graph.Builder.init(tc.getGraphMut());
+            // These are public F32 logit operations, after tensor publication.
+            // Do not insert extra BF16 boundaries through ComputeBackend here.
+            if (transform.scale != 1) output = try builder.mul(output, try builder.scalarConst(.f32, transform.scale));
+            if (transform.softcap > 0) {
+                const cap = try builder.scalarConst(.f32, transform.softcap);
+                output = try builder.mul(try builder.tanhOp(try builder.div(output, cap)), cap);
+            }
+            tc.getGraphMut().outputs.items[tc.getGraphMut().outputs.items.len - 1] = output;
             break :trace tc.extractGraph();
         };
 
@@ -1294,4 +1323,37 @@ test "PJRT decoder precision controls traced weight storage and publication" {
         try std.testing.expect(if (precision == .bf16) half_publications > 0 else half_publications == 0);
     }
     try std.testing.expectEqual(@as(usize, 2), cache.count());
+}
+
+test "PJRT decoder final softcap stays in the compiled graph across changed tokens" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var client = try @import("pjrt").pjrt.Client.initFromEnvWithMemoryPolicy(a, .cpu);
+    defer client.deinit();
+    const native = @import("../ops/native_compute.zig");
+    const fixture = @import("../execution/testing/decoder.zig");
+    var weights = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    try fixture.populate(&weights);
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var cfg = fixture.config();
+    cfg.final_logit_softcapping = 0.05;
+    const context = Context{ .allocator = a, .cb = &cb, .gpt_config = &cfg, .compiled_partition_backend = .pjrt, .compiled_attachment_target = .whole_model, .pjrt_client = @ptrCast(&client) };
+    var cache = cache_mod.GraphCache.init(a);
+    defer cache.deinitWithBackend(&cb);
+    const decode = gpt_arch.DecodeContext{ .total_sequence_len = 2, .query_sequence_len = 2, .kv_sequence_len = 2 };
+    for ([_][2]i64{ .{ 0, 1 }, .{ 1, 0 } }) |ids| {
+        const want = try gpt_arch.forward(&cb, a, cfg, &ids, 1, ids.len, &decode);
+        defer a.free(want);
+        const got = try graphForwardAll(&context, &cache, &ids, 1, ids.len, &decode);
+        defer a.free(got);
+        try std.testing.expectEqual(want.len, got.len);
+        for (want, got) |expected, actual| {
+            try std.testing.expectApproxEqAbs(expected, actual, 1e-6);
+            try std.testing.expect(@abs(actual) <= cfg.final_logit_softcapping);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
 }

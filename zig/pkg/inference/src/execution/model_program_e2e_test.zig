@@ -421,3 +421,58 @@ test "model program real EG2 public loaders preserve explicit BF16 precision" {
         }
     }
 }
+
+test "model program real hybrid decoder rejects uncaptured host arithmetic" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const model = platform.env.getenv("ANTFLY_PJRT_HYBRID_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const session = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
+    defer session.close();
+    var backend = try factory.getComputeBackend(session, a);
+    defer backend.deinit();
+    const cfg = factory.getGptConfig(session) orelse return error.WrongModelArchitecture;
+    const graph = @import("../graph/root.zig");
+    const context = graph.execution.Context{ .allocator = a, .cb = &backend, .gpt_config = &cfg, .compiled_partition_backend = .pjrt, .compiled_attachment_target = .whole_model, .pjrt_client = factory.getPjrtClientPtr(session) };
+    var cache = graph.cache.GraphCache.init(a);
+    defer cache.deinitWithBackend(&backend);
+    const decode = @import("../architectures/gpt.zig").DecodeContext{ .total_sequence_len = 2, .query_sequence_len = 2, .kv_sequence_len = 2 };
+    try std.testing.expectError(error.HostReadbackDuringCapture, graph.execution.ensureGraphEntry(&context, &cache, &.{ 1, 2 }, 1, 2, &decode));
+    try std.testing.expectEqual(@as(usize, 0), cache.count());
+}
+
+test "model program real shared KV decoder serializes positional tables through PJRT" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const model = platform.env.getenv("ANTFLY_PJRT_GEMMA4_QAT_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const session = try factory.createNativeSessionWithTaskOverride(a, model, .generic);
+    defer session.close();
+    var backend = try factory.getComputeBackend(session, a);
+    defer backend.deinit();
+    const cfg = factory.getGptConfig(session) orelse return error.WrongModelArchitecture;
+    const graph = @import("../graph/root.zig");
+    const context = graph.execution.Context{ .allocator = a, .cb = &backend, .gpt_config = &cfg, .compiled_partition_backend = .pjrt, .compiled_attachment_target = .whole_model, .pjrt_precision = .bf16 };
+    var cache = graph.cache.GraphCache.init(a);
+    defer cache.deinitWithBackend(&backend);
+    const decode = @import("../architectures/gpt.zig").DecodeContext{ .total_sequence_len = 2, .query_sequence_len = 2, .kv_sequence_len = 2 };
+    const entry = graph.execution.ensureGraphEntry(&context, &cache, &.{ 2, 1234 }, 1, 2, &decode) catch |err| {
+        std.debug.print("shared KV real checkpoint capture failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const ids = try a.alloc(@import("ml").graph.NodeId, entry.graph.nodeCount());
+    defer a.free(ids);
+    const mutable = try a.alloc(bool, ids.len);
+    defer a.free(mutable);
+    @memset(mutable, false);
+    for (ids, 0..) |*id, index| {
+        id.* = @intCast(index);
+        try std.testing.expect(graph.partition.supportsPjrt(entry.graph.node(id.*).op));
+    }
+    const partition = graph.partition.Partition{ .backend = .pjrt, .node_ids = ids, .external_inputs = &.{} };
+    // Shape/HLO qualification only: checkpoint operands remain parameters,
+    // so this test neither materializes a provider's copy nor needs a GPU.
+    var compiled = try graph.pjrt_compiler.compilePartitionWithOptions(a, &entry.graph, &partition, &backend, .{ .precision = .bf16, .parameter_inputs = true, .mutable_parameters = mutable });
+    defer compiled.deinit();
+    try std.testing.expect(compiled.hlo_bytes.len > 0);
+    try std.testing.expect(compiled.hlo_bytes.len < 64 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 1), compiled.output_node_ids.len);
+}

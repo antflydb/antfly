@@ -183,7 +183,8 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
     defer allocator.free(lifecycle_samples);
     for (0..options.warmup + options.iterations) |iteration| {
         const lifecycle_start = inference.platform.time.monotonicNs();
-        const control = Control{ .io = init.io, .deadline_ns = inference.platform.time.monotonicNs() + 120 * std.time.ns_per_s, .hard_cancellation = watchdog.boundary(), .native_call_policy = .require_supervision, .cancellation_grace_ns = std.time.ns_per_s };
+        const timeout_seconds: u64 = if (iteration == 0) options.transcribe_cold_timeout_seconds else 120;
+        const control = Control{ .io = init.io, .deadline_ns = inference.platform.time.monotonicNs() + timeout_seconds * std.time.ns_per_s, .hard_cancellation = watchdog.boundary(), .native_call_policy = .require_supervision, .cancellation_grace_ns = std.time.ns_per_s };
         const initial = domain.controller().snapshot();
         var arena = std.heap.ArenaAllocator.init(allocator);
         var arena_open = true;
@@ -249,6 +250,8 @@ pub fn run(init: std.process.Init, model: anytype, allocator: std.mem.Allocator,
             .schema_version = 1,
             .task = "public_transcription",
             .benchmark_mode = @tagName(options.transcribe_mode),
+            .cold_request_timeout_seconds = options.transcribe_cold_timeout_seconds,
+            .warm_request_timeout_seconds = 120,
             .cached_performance_eligible = options.transcribe_mode == .performance and publication.timing.kv_cached,
             .pjrt_device = if (options.backend == .xla) @tagName(options.pjrt.device) else null,
             .pjrt_precision = if (options.backend == .xla) @tagName(options.pjrt.precision) else null,

@@ -255,9 +255,11 @@ pub fn compilePartitionWithOptions(
     var needs_reducer = false;
     var needs_max_reducer = false;
 
+    const log_lowering_errors = @import("antfly_platform").env.getenvBool("TERMITE_PJRT_EXEC_DEBUG");
     for (part.node_ids) |node_id| {
         const nid: usize = @intCast(node_id);
         const n = graph.node(node_id);
+        errdefer if (log_lowering_errors) std.log.warn("PJRT HLO lowering failed: node={d} op={s} shape={any}", .{ node_id, @tagName(n.op), n.output_shape.dims[0..n.output_shape.rank()] });
         const ins = n.getInputs();
         if (try emitPrimitiveNode(allocator, &b, n, node_map, nid, &reducer_comp, &max_reducer_comp, &needs_reducer, &needs_max_reducer)) continue;
 
