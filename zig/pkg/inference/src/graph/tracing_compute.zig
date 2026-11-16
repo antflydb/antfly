@@ -310,6 +310,7 @@ pub const TracingCompute = struct {
         .rope = &ropeOp,
         .ropePerItem = &ropePerItemOp,
         .visionRope = &visionRopeOp,
+        .mrope = &mropeOp,
         .gqaCausalAttention = &gqaCausalAttentionOp,
         .gqaPagedAttention = &gqaPagedAttentionOp,
         .fromFloat32 = &fromFloat32Op,
@@ -1428,6 +1429,11 @@ pub const TracingCompute = struct {
     fn localRelativeOp(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, params: ops.Gemma4AudioLocalAttentionParams) anyerror!?CT {
         const tc = fromCtx(ctx);
         return tc.makeHandle(try @import("temporal_program.zig").localRelative(&tc.graph, nodeIdFromCT(q), nodeIdFromCT(k), nodeIdFromCT(v), nodeIdFromCT(rel), nodeIdFromCT(scales), nodeIdFromCT(valid), params));
+    }
+
+    fn mropeOp(ctx: *anyopaque, input: CT, rows: usize, dim: usize, theta: f32, scale: f32, positions: []const u32, sections: [3]u32) anyerror!?CT {
+        const tc = fromCtx(ctx);
+        return tc.makeHandleExact(try @import("rotary_program.zig").emitMrope(&tc.graph, nodeIdFromCT(input), rows, dim, theta, scale, positions, sections));
     }
 
     fn visionRopeOp(ctx: *anyopaque, input: CT, rows: usize, dim: usize, theta: f32, positions: []const u32) anyerror!?CT {

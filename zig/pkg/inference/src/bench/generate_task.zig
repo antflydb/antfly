@@ -18,6 +18,28 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     cb.execution_control = .{ .native_call_policy = .in_process, .io = init.io };
     var cache = inference.graph.cache.GraphCache.init(a);
     defer cache.deinitWithBackend(&cb);
+    var kv = inference.runtime.kv.manager.KvManager.init(a);
+    defer kv.deinit();
+    var storage: ?inference.runtime.kv.storage_runtime.KvStorageRuntime = null;
+    defer if (storage) |*value| value.deinit();
+    var decode: ?generation.NativeDecodeState = null;
+    defer if (decode) |*state| state.deinit();
+    if (!is_pjrt) {
+        const kind: inference.runtime.kv.pool.BackendKind = switch (model.session.backend()) {
+            .native => .native,
+            .metal => .metal,
+            .cuda => .cuda,
+            else => return error.GenerationBackendSelectionMismatch,
+        };
+        const dtype = factory.recommendedKvDTypeForSession(model.session, kind);
+        const pool_config = generation.kvPoolConfig(kind, dtype, config, false);
+        const pool_id = try kv.addPool(generation.requestKvManagerPoolConfig(pool_config));
+        storage = try inference.runtime.kv.storage_runtime.KvStorageRuntime.init(a, pool_config);
+        try cb.provisionKvDeviceWriteHook(&storage.?);
+        decode = generation.NativeDecodeState.initPaged(a, &kv, pool_id, null);
+        decode.?.kv_storage = &storage.?;
+        decode.?.configureForGptConfig(config);
+    }
     var pipeline = generation.NativeGenerationPipeline{
         .allocator = a,
         .io = init.io,
@@ -25,6 +47,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .execution_control = cb.execution_control,
         .gpt_config = config,
         .session = model.session,
+        .decode_state = if (decode) |*state| state else null,
         .tokenizer = model.getTokenizer(),
         .add_bos_token = model.manifest.add_bos_token,
         .bos_token = model.manifest.bos_token,
@@ -75,8 +98,9 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .pjrt_precision = if (is_pjrt) @tagName(options.pjrt.precision) else null,
         .whole_model_required = is_pjrt,
         .modalities = .{ .image = image_bytes != null, .audio = audio_bytes != null, .video = video_bytes != null },
-        .decode_execution_scope = "offline_full_prefix_recomputation",
+        .decode_execution_scope = if (is_pjrt) "offline_full_prefix_recomputation" else "native_paged_kv",
         .cached_serving_performance_qualified = false,
+        .kv_cached = !is_pjrt,
         .model_load_in_timing = false,
         .model_chat_template = model.chat_tmpl != null,
         .runtime_capabilities = if (cache.compiled_model_runtime) |*runtime| runtime.capabilities() else null,

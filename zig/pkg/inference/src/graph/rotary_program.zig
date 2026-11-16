@@ -16,32 +16,47 @@ pub const Kind = enum { cos, sin };
 /// Axis-major positions, half-head pairing. The caller owns axis reordering;
 /// each token's phase is shared by every head without activation readback.
 pub fn emitVision(g: *Graph, input: Id, rows: usize, dim: usize, theta: f32, positions: []const u32) !Id {
+    return emitAxis(g, input, rows, dim, theta, 1, positions, .{ 0, 0, 0 }, true);
+}
+
+/// Interleaved temporal/height/width positions. Sections count rotary pairs;
+/// partial-head slicing remains owned by ComputeBackend.partialMrope.
+pub fn emitMrope(g: *Graph, input: Id, rows: usize, dim: usize, theta: f32, scale: f32, positions: []const u32, sections: [3]u32) !Id {
+    return emitAxis(g, input, rows, dim, theta, scale, positions, sections, false);
+}
+
+fn emitAxis(g: *Graph, input: Id, rows: usize, dim: usize, theta: f32, scale: f32, positions: []const u32, sections: [3]u32, comptime vision: bool) !Id {
     const source = g.node(input).output_shape;
-    if (rows == 0 or dim == 0 or dim % 4 != 0 or !std.math.isFinite(theta) or theta <= 0 or positions.len != 2 * rows) return error.InvalidRoPEInput;
+    if (rows == 0 or dim == 0 or dim % (if (vision) @as(usize, 4) else 2) != 0 or !std.math.isFinite(theta) or theta <= 0 or !std.math.isFinite(scale) or positions.len != try std.math.mul(usize, rows, if (vision) @as(usize, 2) else 3)) return error.InvalidRoPEInput;
     const elements: usize = @intCast(source.numElements() orelse return error.InvalidRoPEInput);
-    if (elements % (rows * dim) != 0 or elements == 0) return error.InvalidRoPEInput;
-    const heads = elements / rows / dim;
+    const row_width = try std.math.mul(usize, rows, dim);
+    if (elements % row_width != 0 or elements == 0) return error.InvalidRoPEInput;
+    const heads = elements / row_width;
     const half = dim / 2;
-    const cosines = try g.allocator.alloc(f32, rows * half);
+    if (!vision and @as(usize, sections[0]) + sections[1] + sections[2] != half) return error.InvalidRoPEInput;
+    const cosines = try g.allocator.alloc(f32, try std.math.mul(usize, rows, half));
     defer g.allocator.free(cosines);
-    const sines = try g.allocator.alloc(f32, rows * half);
+    const sines = try g.allocator.alloc(f32, cosines.len);
     defer g.allocator.free(sines);
     for (0..rows) |row| for (0..half) |pair| {
-        const axis = pair / (half / 2);
-        const frequency = 1 / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * (pair % (half / 2)))) / @as(f32, @floatFromInt(half)));
-        const angle = @as(f32, @floatFromInt(positions[axis * rows + row])) * frequency;
+        const axis: usize = if (vision) pair / (half / 2) else if (pair % 3 == 1 and pair < @as(usize, sections[1]) * 3) 1 else if (pair % 3 == 2 and pair < @as(usize, sections[2]) * 3) 2 else 0;
+        const local_pair = if (vision) pair % (half / 2) else pair;
+        const frequency_dim = if (vision) half else dim;
+        const frequency = 1 / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * local_pair)) / @as(f32, @floatFromInt(frequency_dim)));
+        const position: f32 = @floatFromInt(positions[axis * rows + row]);
+        const angle = if (vision) position * frequency else position * scale * frequency;
         cosines[row * half + pair] = @cos(angle);
         sines[row * half + pair] = @sin(angle);
     };
     var b = Builder.init(g);
     const coefficient_shape = Shape.init(.f32, &.{ @intCast(rows), 1, @intCast(half) });
     const c = try b.tensorConst(cosines, coefficient_shape);
-    const s = try b.tensorConst(sines, coefficient_shape);
+    const sine = try b.tensorConst(sines, coefficient_shape);
     const x = try b.reshape(input, Shape.init(.f32, &.{ @intCast(rows), @intCast(heads), @intCast(dim) }));
     const left = try slice(g, x, 0, @intCast(half), 1);
     const right = try slice(g, x, @intCast(half), @intCast(dim), 1);
-    const low = try b.sub(try b.mul(left, c), try b.mul(right, s));
-    const high = try b.add(try b.mul(left, s), try b.mul(right, c));
+    const low = try b.sub(try b.mul(left, c), try b.mul(right, sine));
+    const high = try b.add(try b.mul(left, sine), try b.mul(right, c));
     return b.reshape(try b.concat(low, high, 2), source);
 }
 

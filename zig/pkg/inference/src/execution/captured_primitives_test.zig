@@ -5,7 +5,7 @@ const ops = @import("../ops/ops.zig");
 const capture = @import("capture.zig");
 const prepared = @import("captured_forward.zig");
 const Tensor = @import("../backends/tensor.zig").Tensor;
-const Kind = enum { numeric_select, conv1d, conv2d, grid_grouped, grid_depthwise, sdpa_token, sdpa_heads, sdpa_bias, causal, cross, relative, gqa, gqa_or, gqa_or_window, marker_head, interleaved_pairs, segment_grouped, spatial_rotary };
+const Kind = enum { axis_rotary, numeric_select, conv1d, conv2d, grid_grouped, grid_depthwise, sdpa_token, sdpa_heads, sdpa_bias, causal, cross, relative, gqa, gqa_or, gqa_or_window, marker_head, interleaved_pairs, segment_grouped, spatial_rotary };
 const Fixture = struct {
     kind: Kind,
     bf16_probability: bool = false,
@@ -28,7 +28,9 @@ const Fixture = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const x = try tensor(cb, inputs[0].tensor);
         defer cb.free(x);
-        const result = if (self.kind == .numeric_select) selected: {
+        const result = if (self.kind == .axis_rotary)
+            (try cb.partialMrope(x, 3, 2, 8, 160000, 0.75, &.{ 0, 2, 1, 3, 0, 2, 7, 4, 1 }, .{ 1, 1, 1 })) orelse return error.UnsupportedPrimitiveOp
+        else if (self.kind == .numeric_select) selected: {
             const condition = try cb.fromFloat32Shape(&.{ 0, 1, -1, 2, 0, -2 }, &.{ 2, 3 });
             defer cb.free(condition);
             const fallback = try cb.fromFloat32Shape(&.{-7}, &.{});
@@ -157,12 +159,12 @@ fn qualifyProfile(kind: Kind, precision: @import("precision.zig").Policy, bf16_p
         .gqa, .gqa_or, .gqa_or_window => &.{ 3, 8 },
         .marker_head => &.{ 6, 2 },
         .interleaved_pairs => &.{ 2, 4 },
-        .spatial_rotary => &.{ 3, 16 },
+        .spatial_rotary, .axis_rotary => &.{ 3, 16 },
         else => &.{ 6, 4 },
     };
     try inputs.append(a, .{ .tensor = try numbers(a, "x", shape, 0) });
     switch (kind) {
-        .spatial_rotary, .numeric_select => {},
+        .spatial_rotary, .axis_rotary, .numeric_select => {},
         .conv1d => {
             try source.putWeight("weight", &.{ 4, 2, 3 });
             try source.putWeight("bias", &.{4});
@@ -212,8 +214,8 @@ fn qualifyProfile(kind: Kind, precision: @import("precision.zig").Policy, bf16_p
         .relative, .sdpa_heads, .sdpa_token, .sdpa_bias, .cross => true,
         else => false,
     };
-    for (0..if (kind == .marker_head or kind == .spatial_rotary or dynamic_mask) @as(usize, 3) else 1) |iteration| {
-        if (kind == .spatial_rotary) inputs.items[0].tensor.asFloat32Mut()[0] = @as(f32, @floatFromInt(iteration)) / 3;
+    for (0..if (kind == .marker_head or kind == .spatial_rotary or kind == .axis_rotary or dynamic_mask) @as(usize, 3) else 1) |iteration| {
+        if (kind == .spatial_rotary or kind == .axis_rotary) inputs.items[0].tensor.asFloat32Mut()[0] = @as(f32, @floatFromInt(iteration)) / 3;
         if (dynamic_mask and iteration != 0) {
             const input = &inputs.items[if (kind == .relative) @as(usize, 5) else 3].tensor;
             const mask: []i64 = @alignCast(std.mem.bytesAsSlice(i64, input.data));
@@ -311,4 +313,8 @@ test "captured primitive PJRT blockwise grouped attention preserves future visib
 
 test "captured primitive PJRT numeric select broadcasts scalar fallback" {
     try qualify(.numeric_select);
+}
+
+test "captured primitive PJRT partial axis rotary preserves head tails and dynamic values" {
+    try qualify(.axis_rotary);
 }
