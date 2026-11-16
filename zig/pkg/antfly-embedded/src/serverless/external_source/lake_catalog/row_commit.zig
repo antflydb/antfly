@@ -61,6 +61,7 @@ pub fn schema(a: A, metadata: V) !V {
 pub const stable_key = @import("stable_key.zig");
 const Rows = struct { data: []const V, keys: []const V, key_schema: V, ids: V };
 fn normalize(a: A, s: V, batch: Batch, context: types.Context) !Rows {
+    try context.ensureActive();
     batch.validateHeader(parquet.max_rows) catch return error.InvalidLakeChangeBatch;
     var fields = array(a);
     var ids = array(a);
@@ -130,8 +131,10 @@ fn normalize(a: A, s: V, batch: Batch, context: types.Context) !Rows {
         const checked = try parquet.encode(a, s, all_data.array.items, context);
         a.free(checked);
     }
-    const checked_keys = try parquet.encode(a, key_schema, keys.array.items, context);
-    a.free(checked_keys);
+    if (keys.array.items.len != 0) {
+        const checked_keys = try parquet.encode(a, key_schema, keys.array.items, context);
+        a.free(checked_keys);
+    }
     return .{ .data = data.array.items, .keys = unique_keys.array.items, .key_schema = key_schema, .ids = ids };
 }
 pub fn validate(a: A, metadata_json: []const u8, batch: Batch, context: types.Context) !void {
@@ -475,6 +478,62 @@ test "lake native row commit builds real data delete and retained manifests with
     var retained = try iceberg.parseManifestListAlloc(alloc, try read(a, files, try m.str(try m.get(later_snapshots[later_snapshots.len - 1], "manifest-list"))));
     defer retained.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 4), retained.entries.len);
+}
+
+test "lake native row commit checkpoint-only progress preserves rows and catalog guards" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var catalog: @import("managed.zig").Managed = .{ .client = memory.client(), .bucket = "archive", .prefix = "progress", .source_uri = "gs://archive/progress" };
+    var initial = try catalog.create(alloc, "init", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    defer initial.deinit(alloc);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const files: Files = .{ .client = memory.client(), .bucket = "archive", .prefix = "progress", .uri = "gs://archive/progress" };
+    var batch: Batch = .{ .batch_id = "poll-1", .source = "pg", .epoch = "slot-1", .checkpoint = "a", .key_fields = &.{"id"}, .changes = &.{} };
+    try validate(alloc, initial.metadata_json, batch, .{});
+    const first = try prepare(a, initial, files, batch, 1, 2);
+    var progress = try catalog.commit(alloc, .{ .id = "poll-1", .expected_metadata_location = initial.metadata_location, .body = first.body, .timestamp_ms = 2 });
+    defer progress.deinit(alloc);
+    const root = try m.parse(a, progress.metadata_json);
+    const props = try m.get(root, "properties");
+    try std.testing.expectEqualStrings("a", try m.str(try m.get(props, "antfly.cdc.checkpoint")));
+    try std.testing.expectEqualStrings("1", try m.str(try m.get(props, "antfly.wal.coverage")));
+    const snapshots = (try m.get(root, "snapshots")).array.items;
+    var empty = try iceberg.parseManifestListAlloc(alloc, try read(a, files, try m.str(try m.get(snapshots[snapshots.len - 1], "manifest-list"))));
+    defer empty.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), empty.entries.len);
+
+    batch.batch_id = "row";
+    batch.checkpoint = "b";
+    // A checkpoint-only commit still owns the source and exact predecessor.
+    try std.testing.expectError(error.LakeCheckpointConflict, prepare(a, progress, files, batch, 2, 3));
+    batch.expected_checkpoint = "a";
+    const image = try std.json.parseFromSliceLeaky(V, a, "{\"id\":1}", .{});
+    batch.changes = &.{.{ .op = .upsert, .row = image }};
+    const data = try prepare(a, progress, files, batch, 2, 3);
+    var with_row = try catalog.commit(alloc, .{ .id = "row", .expected_metadata_location = progress.metadata_location, .body = data.body, .timestamp_ms = 3 });
+    defer with_row.deinit(alloc);
+    batch.batch_id = "poll-2";
+    batch.expected_checkpoint = "b";
+    batch.checkpoint = "c";
+    batch.changes = &.{};
+    const last = try prepare(a, with_row, files, batch, 3, 4);
+    var advanced = try catalog.commit(alloc, .{ .id = "poll-2", .expected_metadata_location = with_row.metadata_location, .body = last.body, .timestamp_ms = 4 });
+    defer advanced.deinit(alloc);
+    const final_root = try m.parse(a, advanced.metadata_json);
+    const final_snapshots = (try m.get(final_root, "snapshots")).array.items;
+    var retained = try iceberg.parseManifestListAlloc(alloc, try read(a, files, try m.str(try m.get(final_snapshots[final_snapshots.len - 1], "manifest-list"))));
+    defer retained.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), retained.entries.len);
+    for (retained.entries) |entry| try std.testing.expectEqual(@as(?i64, 2), entry.sequence_number);
+    try std.testing.expectEqualStrings("c", try m.str(try m.get(try m.get(final_root, "properties"), "antfly.cdc.checkpoint")));
+    batch.source = "other";
+    try std.testing.expectError(error.LakeSourceConflict, prepare(a, advanced, files, batch, 4, 5));
+    batch.source = "pg";
+    batch.key_fields = &.{"missing"};
+    try std.testing.expectError(error.InvalidLakeChangeBatch, validate(alloc, advanced.metadata_json, batch, .{}));
 }
 
 test "lake catalog manifest merge splits a large eligible pool into bounded outputs" {

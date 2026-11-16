@@ -4376,3 +4376,34 @@ checks but denied local socket binds for eight listener/CopyBoth checks; the
 unchanged target passed when rerun with loopback listener permission. No external
 PostgreSQL CDC client was exercised by this test and production logical
 replication owner integration remains outstanding.
+
+### Checkpoint-only lake source transactions
+
+The provider-neutral complete-transaction envelope now permits zero row changes
+while retaining batch/source/epoch/checkpoint/key-definition validation. Native
+lake row normalization validates the schema/key definition and cancellation even
+for such a transaction, and skips empty Parquet validation. Catalog preparation
+uses the same source-ownership and exact predecessor guards, publishes WAL
+coverage/checkpoint atomically through catalog CAS, and carries prior manifests
+without adding data/delete files. The catalog may publish a new metadata snapshot;
+this does not certify outbound row events or authorize synthetic pgoutput records.
+
+Production filesystem WAL admission/drain now accepts these complete envelopes,
+including exact retries after publication. Grouping has a separate 1,024-record
+ceiling so checkpoint-only polls cannot bypass the row limit; existing payload
+and row bounds still apply. Stable batch identity remains caller-supplied.
+
+Qualification: `source-transaction-test` passed (30 CDC/provider cases, four lake
+module/catalog cases, and shared source/effect checks; zero skips/failures/leaks),
+recorded in `source-empty-lake-test.log`. The catalog regression covers an initial
+empty poll, subsequent real rows, later empty progress, unchanged retained data
+manifests, source conflict, stale predecessor, and an invalid key definition.
+`lake-integration-test -Dtest-filter='external lake WAL grouping'
+-Dtest-filter='external lake filesystem WAL group commit'` passed all three
+selected tests, zero skips/failures/leaks (`source-empty-lake-wal-test.log`).
+The real filesystem WAL fixture verifies contiguous zero-row admission, group
+publication, no additional data/delete manifests, exact original retry LSNs,
+and no remaining drain work. The group-bound fixture leaves the 1,025th empty
+transaction for the next pass with its predecessor intact. Production PostgreSQL
+worker integration with stable durable source identity/checkpoint authority,
+native scope fencing and the remaining full issue contracts are still required.

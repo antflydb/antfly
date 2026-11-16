@@ -25,6 +25,8 @@ pub const Batch = struct {
     checkpoint: []const u8,
     expected_checkpoint: ?[]const u8 = null,
     key_fields: []const []const u8,
+    /// A complete checkpoint-only transaction is valid. Destinations must
+    /// commit its progress under the same ownership and predecessor guards.
     changes: []const Change,
 
     pub const Change = struct { op: enum { upsert, delete }, row: std.json.Value };
@@ -47,7 +49,7 @@ pub const Batch = struct {
             self.epoch.len == 0 or self.epoch.len > 256 or
             self.checkpoint.len == 0 or self.checkpoint.len > 1024 or
             self.key_fields.len == 0 or self.key_fields.len > 32 or
-            self.changes.len == 0 or self.changes.len > max_changes) return error.InvalidSourceTransaction;
+            self.changes.len > max_changes) return error.InvalidSourceTransaction;
         if (self.expected_checkpoint) |previous| {
             if (previous.len == 0 or previous.len > 1024 or std.mem.eql(u8, previous, self.checkpoint)) return error.InvalidSourceTransaction;
         }
@@ -129,4 +131,26 @@ test "source transaction identity preserves existing lake retry namespace" {
     try std.testing.expectEqual(digest, try retry.identity(a));
     retry.epoch = "reseeded";
     try std.testing.expect(!std.mem.eql(u8, &digest, &try retry.identity(a)));
+}
+
+test "source transaction checkpoint-only envelopes retain ownership and predecessor validation" {
+    const batch: Batch = .{ .batch_id = "poll", .source = "pg", .epoch = "slot", .checkpoint = "next", .expected_checkpoint = "previous", .key_fields = &.{"id"}, .changes = &.{} };
+    try batch.validate(0);
+    var previous = batch;
+    previous.checkpoint = "previous";
+    try std.testing.expect(batch.follows(previous));
+    var invalid = batch;
+    invalid.batch_id = "";
+    try std.testing.expectError(error.InvalidSourceTransaction, invalid.validate(0));
+    invalid = batch;
+    invalid.key_fields = &.{};
+    try std.testing.expectError(error.InvalidSourceTransaction, invalid.validate(0));
+    invalid = batch;
+    invalid.expected_checkpoint = "";
+    try std.testing.expectError(error.InvalidSourceTransaction, invalid.validate(0));
+    previous.source = "other";
+    try std.testing.expect(!batch.follows(previous));
+    previous = batch;
+    previous.epoch = "recreated-slot";
+    try std.testing.expect(!batch.follows(previous));
 }

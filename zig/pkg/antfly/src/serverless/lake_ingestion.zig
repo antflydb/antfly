@@ -146,6 +146,8 @@ fn keyFieldsEqual(left: []const []const u8, right: []const []const u8) bool {
 /// transactions; a group never exceeds the Parquet writer's row limit.
 pub const max_group_changes: usize = catalog.parquet_writer.max_rows;
 pub const max_group_payload_bytes: usize = 8 * 1024 * 1024;
+/// Checkpoint-only records consume no row budget; bound their work separately.
+pub const max_group_records: usize = 1024;
 
 /// A contiguous accepted WAL suffix folded into one source transaction.
 pub const Group = struct { batch: Batch, first_lsn: u64, last_lsn: u64, records: usize };
@@ -162,7 +164,7 @@ const GroupBuilder = struct {
     }
     fn full(self: GroupBuilder, max_changes: usize, max_bytes: usize) bool {
         const count = if (self.result.records == 1) self.result.batch.changes.len else self.changes.items.len;
-        return count >= max_changes or self.bytes >= max_bytes;
+        return self.result.records >= max_group_records or count >= max_changes or self.bytes >= max_bytes;
     }
     fn add(self: *GroupBuilder, a: A, record: wal.Record, max_changes: usize, max_bytes: usize) !bool {
         if (self.full(max_changes, max_bytes) or record.lsn != self.result.last_lsn + 1) return false;
@@ -618,6 +620,29 @@ test "external lake filesystem WAL group commit folds pending transactions into 
     try std.testing.expect(!try drain(a, binding, options, .{}));
     // The exact original requests stay receipts after their group publishes.
     try std.testing.expectEqual(@as(u64, 2), try accept(a, binding, options, .{}, payloads[1]));
+    // Empty polls use the same WAL admission and catalog commit path. They
+    // advance coverage without manufacturing data/delete files or losing rows.
+    const polls = [_][]const u8{
+        "{\"batch_id\":\"poll-1\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"5\",\"checkpoint\":\"7\",\"key_fields\":[\"id\"],\"changes\":[]}",
+        "{\"batch_id\":\"poll-2\",\"source\":\"s\",\"epoch\":\"1\",\"expected_checkpoint\":\"7\",\"checkpoint\":\"8\",\"key_fields\":[\"id\"],\"changes\":[]}",
+    };
+    for (polls, 8..) |payload, lsn| try std.testing.expectEqual(@as(u64, lsn), try accept(a, binding, options, .{}, payload));
+    try std.testing.expect(try drain(a, binding, options, .{}));
+    try std.testing.expect(!try drain(a, binding, options, .{}));
+    const polled = try managed.load(a);
+    try std.testing.expectEqual(@as(u64, 9), try coverage(a, polled));
+    const polled_root = try catalog.metadata.parse(a, polled.metadata_json);
+    try std.testing.expectEqualStrings("8", try catalog.metadata.str(try catalog.metadata.get(try catalog.metadata.get(polled_root, "properties"), "antfly.cdc.checkpoint")));
+    const polled_snapshots = (try catalog.metadata.get(polled_root, "snapshots")).array.items;
+    const before_poll = polled_snapshots[polled_snapshots.len - 2];
+    const after_poll = polled_snapshots[polled_snapshots.len - 1];
+    var before_list = try local.serverless_external_source_mod.iceberg_avro.parseManifestListAlloc(alloc, try catalog.row_commit.read(a, files, try catalog.metadata.str(try catalog.metadata.get(before_poll, "manifest-list"))));
+    defer before_list.deinit(alloc);
+    var after_list = try local.serverless_external_source_mod.iceberg_avro.parseManifestListAlloc(alloc, try catalog.row_commit.read(a, files, try catalog.metadata.str(try catalog.metadata.get(after_poll, "manifest-list"))));
+    defer after_list.deinit(alloc);
+    try std.testing.expectEqual(before_list.entries.len, after_list.entries.len);
+    for (before_list.entries, after_list.entries) |before_entry, after_entry| try std.testing.expectEqualStrings(before_entry.manifest_path, after_entry.manifest_path);
+    try std.testing.expectEqual(@as(u64, 8), try accept(a, binding, options, .{}, polls[0]));
 }
 
 test "external lake WAL group reader stops before hydrating a bounded pending suffix" {
@@ -774,4 +799,23 @@ test "external lake WAL group yields an owned prefix on root expiry without swal
     var corrupted = try delay.reader(a, &indexed, 1, .{});
     defer corrupted.deinit();
     try std.testing.expectError(error.ArtifactIntegrityMismatch, readGroup(a, &corrupted, max_group_changes, max_group_payload_bytes));
+}
+
+test "external lake WAL grouping bounds checkpoint-only records independently of rows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const records = try a.alloc(wal.Record, max_group_records + 1);
+    for (records, 0..) |*record, i| {
+        const batch: Batch = .{ .batch_id = try std.fmt.allocPrint(a, "poll-{d}", .{i}), .source = "s", .epoch = "1", .checkpoint = try std.fmt.allocPrint(a, "{d}", .{i + 1}), .expected_checkpoint = if (i == 0) null else try std.fmt.allocPrint(a, "{d}", .{i}), .key_fields = &.{"id"}, .changes = &.{} };
+        record.* = .{ .lsn = i + 1, .operation_id = batch.batch_id, .payload = try std.json.Stringify.valueAlloc(a, batch, .{}) };
+    }
+    const folded = try group(a, records, max_group_changes, max_group_payload_bytes);
+    try std.testing.expectEqual(max_group_records, folded.records);
+    try std.testing.expectEqual(@as(u64, max_group_records), folded.last_lsn);
+    try std.testing.expectEqual(@as(usize, 0), folded.batch.changes.len);
+    try folded.batch.validate(0);
+    const tail = try group(a, records[max_group_records..], max_group_changes, max_group_payload_bytes);
+    try std.testing.expectEqual(@as(usize, 1), tail.records);
+    try std.testing.expect(tail.batch.follows(folded.batch));
 }
