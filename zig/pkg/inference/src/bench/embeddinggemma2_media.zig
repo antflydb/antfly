@@ -107,6 +107,6 @@ pub fn main(init: std.process.Init) !void {
         try results.append(a, .{ .name = case.name, .input_tokens = tokens, .samples_seconds = samples, .vectors = vectors, .stages = stages });
     }
     if (results.items.len == 0) return error.NoCases;
-    const report = try std.json.Stringify.valueAlloc(a, .{ .scope = "local encoded file read, decode, preprocessing, tokenization, media tower, shared encoder, pooling and synchronized vector readback; excludes process/model startup and request cleanup", .backend = "cuda", .warmups = warmups, .iterations = iterations, .stage_scope = "enqueue/host wall observations; asynchronous stage times are not additive device timings", .cases = results.items }, .{ .whitespace = .indent_2 });
+    const report = try std.json.Stringify.valueAlloc(a, .{ .scope = "local encoded file read, decode, preprocessing, tokenization, media tower, shared encoder, pooling and synchronized vector readback; excludes process/model startup and request cleanup", .backend = "cuda", .execution_policy = factory.getEmbeddingGemma2CudaPolicy(session), .warmups = warmups, .iterations = iterations, .stage_scope = "enqueue/host wall observations; asynchronous stage times are not additive device timings", .cases = results.items }, .{ .whitespace = .indent_2 });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output orelse return error.MissingOutput, .data = report });
 }

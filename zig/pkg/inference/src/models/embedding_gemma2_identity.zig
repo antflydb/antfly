@@ -34,6 +34,10 @@ pub fn forBackend(artifact_identity: [64]u8, backend: @import("../backends/backe
 pub fn forCudaPolicy(artifact_identity: [64]u8, policy: @import("../ops/cuda/embedding_gemma2_policy.zig").Policy) [64]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(cuda_recipe);
+    if (policy.automatic_bits != 0) {
+        hash.update("\x00" ++ @import("../ops/cuda/embedding_gemma2_policy.zig").automatic_recipe);
+        hash.update(&.{ @as(u8, @truncate(policy.automatic_bits)), @as(u8, @intCast(policy.automatic_bits >> 8)) });
+    }
     if (policy.arithmeticBits() != 0) {
         hash.update("\x00optimized-v1");
         const bits = policy.arithmeticBits();
@@ -300,6 +304,19 @@ test "embeddinggemma2 precision identities preserve F32 pins and isolate CUDA re
     try std.testing.expect(!std.mem.eql(u8, &artifacts, &cuda));
     try std.testing.expectEqual(cuda, forBackend(artifacts, .cuda));
     try std.testing.expect(!std.mem.eql(u8, &cuda, &forBackend(fromDigests(@splat(@splat(8))), .cuda)));
+}
+
+test "embeddinggemma2 CUDA optimized identities isolate automatic dispatch and overrides" {
+    const policy = @import("../ops/cuda/embedding_gemma2_policy.zig");
+    const artifacts = fromDigests(@splat(@splat(7)));
+    const legacy = forCudaPolicy(artifacts, .{});
+    const automatic = forCudaPolicy(artifacts, policy.automatic(true, .{}));
+    const explicit = forCudaPolicy(artifacts, policy.automatic(false, .{ .extended_flash = true, .global_gemm = true, .packed_projections = true, .graph_replay = true, .fused_backbone = true }));
+    try std.testing.expect(!std.mem.eql(u8, &automatic, &legacy));
+    try std.testing.expect(!std.mem.eql(u8, &automatic, &explicit));
+    try std.testing.expectEqual(legacy, forCudaPolicy(artifacts, policy.automatic(false, .{})));
+    const no_global = forCudaPolicy(artifacts, policy.automatic(true, .{ .global_gemm = false }));
+    try std.testing.expect(!std.mem.eql(u8, &automatic, &no_global));
 }
 
 test "embeddinggemma2 CUDA optimized identities isolate every arithmetic profile" {

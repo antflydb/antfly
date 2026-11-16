@@ -6,11 +6,15 @@ PJRT/XLA is not involved. The default library workspace is zero, matching
 the native executor. The isolated harness can also test an explicit workspace
 with `ANTFLY_GLOBAL_BENCH_WORKSPACE_MB`.
 
-The route is opt-in with
-`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_GLOBAL_GEMM=1`. Dispatch is limited to
-SM89, batch one and sequence lengths 512–8192. Other geometries, insufficient
-workspace admission, and unsupported library algorithms retain the prior
-attention fallback. The default policy is unchanged.
+The [automatic default policy](AUTOMATIC_DEFAULTS.md) selects this route on
+qualified NVIDIA L4 singleton requests. Global GEMM dispatch remains limited to
+512–8192 encoder tokens. Other hardware/geometries, insufficient workspace
+admission, and unsupported library algorithms retain the prior fallback.
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_GLOBAL_GEMM=0` disables this route;
+`=1` retains the explicit profile. Set
+`ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_AUTOMATIC=0` to disable automatic
+promotion while preserving explicit settings. The tables below retain the
+original explicit-profile campaign and its measured identities.
 
 ## Execution and ownership
 

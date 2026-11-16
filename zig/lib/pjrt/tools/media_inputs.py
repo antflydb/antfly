@@ -54,6 +54,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--include-text",
+        action="store_true",
+        help="Add exact-length promotion text cases",
+    )
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     for name, height, width, kind in [
@@ -104,6 +109,23 @@ def main():
         for seconds in (1, 12, 30)
     ]
     proc = processor(args.model)
+    if args.include_text:
+        text_cases = []
+        for length in (128, 512, 2048, 8192):
+            text = " ".join(["river"] * (length - 8))
+            prompt = "title: none | text: " + text
+            if len(proc.tokenizer.encode(prompt)) != length:
+                raise ValueError(
+                    "Tokenizer does not match the promotion fixture recipe"
+                )
+            text_cases.append(
+                {
+                    "name": f"text_{length}",
+                    "parts": [{"kind": "text", "text": text}],
+                    "processor_prompt": prompt,
+                }
+            )
+        cases = text_cases + cases
     for case in cases:
         inputs = prepare(proc, case, args.out)
         case["token_ids"] = inputs["input_ids"][0].tolist()

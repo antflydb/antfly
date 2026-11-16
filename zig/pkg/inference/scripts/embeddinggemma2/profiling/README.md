@@ -2,6 +2,9 @@
 
 Follow-up: [bounded native global attention implementation and results](GLOBAL_ATTENTION.md).
 
+Current rollout: [automatic L4 defaults, overrides and validation](AUTOMATIC_DEFAULTS.md).
+The profiles and measurements below retain the earlier explicit configurations.
+
 Captured 2026-11-16 on NVIDIA L4 SM89, driver 580.159.03, Nsight Systems
 2025.6.3. Both paths receive identical prepared IDs/masks and return normalized
 768-float vectors. Python does not participate in either timed forward.

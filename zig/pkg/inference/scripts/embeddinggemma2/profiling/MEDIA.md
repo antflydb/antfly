@@ -147,7 +147,8 @@ also occurs in the control, whose vector is bitwise identical to the candidate.
 The results are consistent with arithmetic precision differences; this campaign
 does not isolate their complete numerical cause. The original BF16 gates stay
 failed, and the campaign exits nonzero. **Full BF16 media qualification is not
-claimed.** No default CUDA policy was enabled by this measurement work.
+claimed.** This campaign used explicit flags; [automatic default selection](AUTOMATIC_DEFAULTS.md)
+is characterized separately.
 
 ## Dispatch traces
 
