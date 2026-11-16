@@ -4609,3 +4609,28 @@ source drain/migration, scoped BEGIN/PREPARE/resolve fields and transaction-reco
 persistence still need wiring. No protocol/ABI floor was advanced prematurely.
 The full outstanding distributed adapter, public feed/bootstrap/retention,
 production pgoutput and existing-client qualification requirements remain active.
+
+### Retained source-scope transaction identity
+
+Native transaction records now have a v9 encoding retaining the full fixed
+88-byte scope reference alongside the original source purpose. Legacy v6/v7/v8
+encodings remain unchanged. Scoped records require retained terminal decisions;
+strict decoding rejects invalid reference fields, flags and unretained records.
+BEGIN retries and intent writes require the exact retained reference. Resolution
+requires it even on terminal retries, preventing a stale or ordinary worker from
+adopting a scoped transaction ID. The scoped first-materialization observation
+checks the same identity, and paged transaction summaries preserve it for
+recovery. The existing unscoped observation remains a compatibility wrapper.
+
+Qualification: `zig build docstore-history-test -j2` completed with exit zero
+(`source-scoped-record-test.log`), including all 14 native history/transaction
+regressions and the committed-frame suite. The new real-store regression reopens
+a prepared scoped transaction, verifies retained reference bytes, rejects altered
+tokens/generations and omitted references on begin/prepare/resolve, then verifies
+that abort retains the original reference. Malformed v9 flags, zero identity and
+missing retention are rejected. Formatting and diff checks passed.
+
+This installs retained identity only. Production commands still use the existing
+wire profile; registry slot mutation and physical-root qualification must join
+the same atomic native write batch before scoped commands are enabled. No new
+Raft/API ABI profile is enabled by this record-only change.
