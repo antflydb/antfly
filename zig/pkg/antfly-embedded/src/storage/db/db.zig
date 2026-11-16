@@ -28706,6 +28706,7 @@ pub const DB = struct {
         for (command.mutations) |effect| {
             if (effect.value) |value| try writes.append(self.alloc, .{ .key = effect.key, .value = value }) else try deletes.append(self.alloc, effect.key);
         }
+        try appendArtifactSourceRevisionWritesFromReplay(self.alloc, replay, sequence, &writes, deletes.items, &owned_keys, &owned_values);
         try appendDenseArtifactCounterMutations(self.alloc, self.core.store, self.core.index_manager, &writes, deletes.items, &owned_keys, &owned_values);
         var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         try writes.append(self.alloc, orderedApplyReceiptWrite(entry, &marker_buf));
@@ -54488,6 +54489,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
+    try appendArtifactSourceRevisionWritesFromReplay(ctx.alloc, replay_payload, sequence, &store_writes, delete_keys.items, &owned_store_keys, &owned_store_values);
     var primary_replication = try PrimaryReplicationEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
     defer primary_replication.deinit(ctx.alloc);
     try primary_replication.stage(ctx, &store_writes);
@@ -56985,7 +56987,21 @@ fn appendResolutionRecordWithProjection(
     defer batch_ctx.alloc.free(payload);
     var backlog_admission = try batch_ctx.executor.admitBacklogBytes(@intCast(payload.len));
     defer backlog_admission.cancel();
-    try batch_ctx.store.putBatchWithReplay(batch_ctx.io, store_writes, store_deletes.items, .{
+    var revision_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+    defer revision_writes.deinit(batch_ctx.alloc);
+    try revision_writes.appendSlice(batch_ctx.alloc, store_writes);
+    var revision_keys: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (revision_keys.items) |key| batch_ctx.alloc.free(key);
+        revision_keys.deinit(batch_ctx.alloc);
+    }
+    var revision_values: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (revision_values.items) |value| batch_ctx.alloc.free(value);
+        revision_values.deinit(batch_ctx.alloc);
+    }
+    try appendArtifactSourceRevisionWritesFromReplay(batch_ctx.alloc, payload, sequence, &revision_writes, store_deletes.items, &revision_keys, &revision_values);
+    try batch_ctx.store.putBatchWithReplay(batch_ctx.io, revision_writes.items, store_deletes.items, .{
         .sequence = sequence,
         .payload = payload,
     });
@@ -57529,6 +57545,7 @@ fn appendGeneratedBatchFromEnrichment(
         for (owned_counter_values.items) |value| batch_ctx.alloc.free(value);
         owned_counter_values.deinit(batch_ctx.alloc);
     }
+    try appendArtifactSourceRevisionWritesFromReplay(batch_ctx.alloc, payload, sequence, &store_writes, store_delete_keys.items, &owned_counter_keys, &owned_counter_values);
     try DB.appendDenseArtifactCounterMutationsWithPromotions(
         batch_ctx.alloc,
         batch_ctx.store,

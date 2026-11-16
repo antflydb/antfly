@@ -1082,14 +1082,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (artifact_names.items) |name| alloc.free(name);
                 artifact_names.deinit(alloc);
             }
-            for (decoded.record.changed_artifact_keys) |artifact_key| {
-                if (try internal_keys.artifactNameView(artifact_key)) |artifact_name| {
-                    try appendUniqueOwnedKey(alloc, &artifact_names, artifact_name);
-                    continue;
+            inline for (.{ decoded.record.changed_artifact_keys, decoded.record.deleted_doc_keys }) |artifact_keys| {
+                for (artifact_keys) |artifact_key| {
+                    if (try internal_keys.artifactNameView(artifact_key)) |artifact_name| {
+                        try appendUniqueOwnedKey(alloc, &artifact_names, artifact_name);
+                        continue;
+                    }
+                    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
+                    defer artifact_ref.deinit(alloc);
+                    try appendUniqueOwnedKey(alloc, &artifact_names, artifact_ref.name);
                 }
-                var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
-                defer artifact_ref.deinit(alloc);
-                try appendUniqueOwnedKey(alloc, &artifact_names, artifact_ref.name);
             }
             std.mem.sortUnstable([]u8, artifact_names.items, {}, struct {
                 fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
