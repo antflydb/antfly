@@ -8146,9 +8146,22 @@ pub const NativeFile = struct {
         // from an `allocateFresh` page whose own retain never ran) and
         // fails with `error.InvalidNativeAllocator`.
         if (staged_pages.len != 0 and self.header.indexed_reclamation) {
-            const pending = try self.allocator.alloc(u64, staged_pages.len);
-            for (staged_pages, pending) |p, *out| out.* = p.page_id;
-            self.redo_fold_retain_pending = pending;
+            // `installCommitForFold` (called by a caller that is about to
+            // invoke this same fold, both call sites) can already have
+            // populated this with pages *it* flushed ahead of us for the
+            // same reason -- merge rather than overwrite, or that earlier
+            // batch silently loses its only retain tracking.
+            if (self.redo_fold_retain_pending) |existing| {
+                const merged = try self.allocator.alloc(u64, existing.len + staged_pages.len);
+                @memcpy(merged[0..existing.len], existing);
+                for (staged_pages, merged[existing.len..]) |p, *out| out.* = p.page_id;
+                self.allocator.free(existing);
+                self.redo_fold_retain_pending = merged;
+            } else {
+                const pending = try self.allocator.alloc(u64, staged_pages.len);
+                for (staged_pages, pending) |p, *out| out.* = p.page_id;
+                self.redo_fold_retain_pending = pending;
+            }
         }
         // §9 (redo, re-fold guard): the sequence boundary this fold is
         // building on top of -- `redo.checkpoint_sequence` is not
@@ -19850,6 +19863,45 @@ pub const NativeFile = struct {
             try self.file.writePositionalAll(self.runtimeIo(), p.bytes, p.page_id * @as(u64, self.header.page_size));
         }
         redo.shared.removePages(std.heap.page_allocator, self.runtimeIo(), pages);
+        // §9 (redo + indexed reclamation): this call always runs
+        // immediately before `checkpointRedoLogNested`'s own fold (both
+        // call sites), so the pages just flushed above are exactly the
+        // ones that fold's own `snapshotAllPagesAlloc`
+        // (`checkpointRedoLogWithDurability`'s own `staged_pages`) would
+        // otherwise have found and handed to `self.redo_fold_retain_pending`
+        // for it. Removing them here first (to install this commit's own
+        // roots before the fold starts) empties `redo.shared.pages`
+        // before that later snapshot ever runs, so without this, that
+        // snapshot sees nothing: a multi-page external value chain whose
+        // record the fold is about to build gets its *root* retained as
+        // usual (`retainRecord`, reached through the fold's own
+        // `writePage`), but every *continuation* page beyond the root --
+        // written raw by the original diverting commit, never through a
+        // ledger -- is left permanently uncounted. That page then reads
+        // as `count() == 0` forever, indistinguishable from "never
+        // retained," until some later commit supersedes the record and
+        // retires the chain: `releaseDeferred` finds a page it was never
+        // told was live and fails closed with `error.InvalidNativeAllocator`
+        // (confirmed via "capi resolver curation indexed static profiles
+        // exclude seventeen thousand unrelated aliases after projection
+        // and reopen" -- a document value chain's own continuation page,
+        // flushed here ahead of a ride-along fold, never reached by
+        // `checkpointRedoLogWithDurability`'s own tracking because
+        // nothing was left for it to find). Record them the same way that
+        // later tracking does, so the fold still picks them up.
+        if (pages.len != 0 and self.header.indexed_reclamation) {
+            if (self.redo_fold_retain_pending) |existing| {
+                const merged = try self.allocator.alloc(u64, existing.len + pages.len);
+                @memcpy(merged[0..existing.len], existing);
+                for (pages, merged[existing.len..]) |p, *out| out.* = p.page_id;
+                self.allocator.free(existing);
+                self.redo_fold_retain_pending = merged;
+            } else {
+                const pending = try self.allocator.alloc(u64, pages.len);
+                for (pages, pending) |p, *out| out.* = p.page_id;
+                self.redo_fold_retain_pending = pending;
+            }
+        }
         var base = checkpoint;
         base.commit_sequence = self.activeCheckpoint().commit_sequence;
         self.header.checkpoints[self.header.active_checkpoint] = base;
