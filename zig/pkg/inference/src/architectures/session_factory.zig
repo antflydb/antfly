@@ -1024,6 +1024,26 @@ pub fn inspectGgufModelForListing(
     return @as(?GgufInspectionReport, try buildGgufInspectionReportFromFile(allocator, arch_config, &file, requiresModernBertSpanClassifier(mf)));
 }
 
+/// Admission and upload resolve identical architecture geometry before any
+/// device-weight discount. An unrelated table name is never enough to offload.
+pub fn cudaPleHostBytes(allocator: std.mem.Allocator, model_path: []const u8, manifest: manifest_mod.ModelManifest) !usize {
+    return cudaPleHostBytesForPolicy(allocator, model_path, manifest, @import("../ops/cuda/ple_host.zig").requested());
+}
+
+pub fn cudaPleHostBytesForPolicy(allocator: std.mem.Allocator, model_path: []const u8, manifest: manifest_mod.ModelManifest, enabled: bool) !usize {
+    const ple = @import("../ops/cuda/ple_host.zig");
+    if (!enabled or !manifest.usesGgufWeights()) return 0;
+    var mapped = try c_file.MmapRegion.init(allocator, manifest.gguf_path.?);
+    mapped.preserveFileCacheOnDeinit();
+    defer mapped.deinit();
+    var file = try gguf_mod.format.parseStructure(allocator, mapped.data);
+    defer file.deinit(allocator);
+    try gguf_mod.format.validateTensorDataRanges(&file, mapped.data.len);
+    const arch = try detectArchitectureWithGgufFile(allocator, model_path, manifest, &file);
+    if (arch != .gpt or !ple.eligibleConfig(arch.gpt)) return 0;
+    return ple.estimateParsedBytes(&file);
+}
+
 /// Whether a Laya checkpoint serves its linear weights as Q8_0 (LAYA.md 1d).
 fn layaQuantizesWeights(arch_config: ArchConfig) !bool {
     if (arch_config != .modern_bert) return false;
@@ -1058,6 +1078,21 @@ pub fn createSessionFromManifest(
     precision: ?GlinerCudaPrecision,
     allow_unqualified_precision: bool,
 ) !Session {
+    return createSessionFromManifestWithHostLease(allocator, model_path, manifest, backend, jit, load_context, a4b, precision, allow_unqualified_precision, null);
+}
+
+pub fn createSessionFromManifestWithHostLease(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    manifest: *const manifest_mod.ModelManifest,
+    backend: BackendType,
+    jit: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+    a4b: ?backend_contracts.A4bInferenceRequest,
+    precision: ?GlinerCudaPrecision,
+    allow_unqualified_precision: bool,
+    host_lease: ?*?@import("../runtime/tier/memory.zig").AdmissionLease,
+) !Session {
     return switch (backend) {
         .native => createNativeSessionForCudaUpload(allocator, model_path, null, false, manifest),
         .metal => createGpuHostedSessionWithTaskOverride(allocator, model_path, null, .metal, jit, load_context, a4b, manifest),
@@ -1066,7 +1101,7 @@ pub fn createSessionFromManifest(
                 try requireQualifiedGlinerCudaPrecision(value, allow_unqualified_precision);
                 try requireGlinerCudaPrecisionManifest(manifest);
             }
-            break :blk createCudaSessionWithRequiredProfile(allocator, model_path, null, jit, load_context, a4b, null, precision orelse .fp32, manifest);
+            break :blk createCudaSessionWithRequiredProfileAndHostLease(allocator, model_path, null, jit, load_context, a4b, null, precision orelse .fp32, manifest, host_lease);
         },
         else => error.UnsupportedBackend,
     };
@@ -2051,6 +2086,21 @@ fn createCudaSessionWithRequiredProfile(
     gliner_precision: GlinerCudaPrecision,
     borrowed_manifest: ?*const manifest_mod.ModelManifest,
 ) !Session {
+    return createCudaSessionWithRequiredProfileAndHostLease(allocator, requested_model_path, override, config, load_context, a4b_request, required_profile_override, gliner_precision, borrowed_manifest, null);
+}
+
+fn createCudaSessionWithRequiredProfileAndHostLease(
+    allocator: std.mem.Allocator,
+    requested_model_path: []const u8,
+    override: ?TaskOverride,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+    required_profile_override: ?CudaCapabilityProfile,
+    gliner_precision: GlinerCudaPrecision,
+    borrowed_manifest: ?*const manifest_mod.ModelManifest,
+    host_lease: ?*?@import("../runtime/tier/memory.zig").AdmissionLease,
+) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
     const load_started_ns = platform.time.monotonicNs();
     defer std.log.info("inference_model_load backend=cuda phase=total elapsed_ms={d}", .{(platform.time.monotonicNs() -| load_started_ns) / std.time.ns_per_ms});
@@ -2177,6 +2227,10 @@ fn createCudaSessionWithRequiredProfile(
         load_context,
     );
     errdefer cuda_compute.deinit();
+    if (host_lease) |slot| {
+        cuda_compute.gemma4_ple_host_lease = slot.*;
+        slot.* = null;
+    }
     std.log.info("inference_model_load backend=cuda phase=device_init elapsed_ms={d}", .{(platform.time.monotonicNs() -| device_init_started_ns) / std.time.ns_per_ms});
     if (debug_cuda_session) std.log.info("cuda-session: init cuda compute done path={s}", .{model_path});
 
@@ -2187,8 +2241,9 @@ fn createCudaSessionWithRequiredProfile(
     const dense_gemma4 = cuda_profile == .gemma4 and native_impl.arch_config == .gpt and native_impl.arch_config.gpt.usesGemma4Channels() and
         !native_impl.arch_config.gpt.usesMoe() and !native_impl.arch_config.gpt.gemma4_mtp_assistant;
     try cuda_compute.configureGemma4Dense(dense_gemma4, dense_gemma4 and
-        native_impl.arch_config.gpt.hidden_size == 2560 and native_impl.arch_config.gpt.num_hidden_layers == 42 and
-        native_impl.arch_config.gpt.num_key_value_heads == 2);
+        @import("../ops/cuda/ple_host.zig").eligibleConfig(native_impl.arch_config.gpt));
+    if (cuda_compute.gemma4_ple_host_lease != null and !cuda_compute.gemma4_ple_host_enabled)
+        return error.InvalidCudaState;
 
     // The pinned DeBERTa Decide checkpoint also consists entirely of FP32
     // weights. Admit its short projections to the strict cuBLASLt route;
@@ -2276,6 +2331,7 @@ fn createCudaSessionWithRequiredProfile(
             if (upload.mmap_bytes) |bytes| c_file.MmapRegion.adviseBytesDontNeed(bytes);
         }
     }
+    if (cuda_compute.gemma4_ple_host_lease != null) return error.InvalidCudaState;
     if (cuda_compute.stats.gemma4_mapped_upload_chunks != 0) {
         std.log.info("inference_model_load backend=cuda phase=mapped_weight_upload chunks={d}", .{cuda_compute.stats.gemma4_mapped_upload_chunks});
     }

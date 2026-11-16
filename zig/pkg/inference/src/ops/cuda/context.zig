@@ -107,6 +107,7 @@ pub const CudaContext = struct {
     debug_graph_capture_tensor_trace_count: usize = 0,
 
     pub fn initDefault() driver_mod.Error!CudaContext {
+        @import("host_retirement.zig").process.retry();
         var driver = try CudaDriver.open();
         errdefer driver.deinit();
 
