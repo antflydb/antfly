@@ -37,48 +37,14 @@ extern "C" __global__ void antfly_gemma4_e4b_head_prefetch_l2(
     const unsigned int cols = 8u;
     unsigned int global_tile = blockIdx.x;
     unsigned int col_tile = global_tile * cols;
-    unsigned int tid = threadIdx.x;
-    unsigned int lane = tid & 31u;
-    unsigned int warp = tid >> 5;
-    __shared__ float warp_partial[8][5];
-    float acc[8];
-    #pragma unroll
-    for (unsigned int c = 0; c < 8u; ++c) acc[c] = 0.0f;
-
-    if (tid < 160u) {
-        unsigned int block = tid >> 4u;
-        unsigned int sub = tid & 15u;
-        unsigned int q8_sub_block = sub >> 1u;
-        unsigned int q8_lane_base = (sub & 1u) * 16u;
-        const unsigned char* q8_bp = input_q8_1 + (block * 8u + q8_sub_block) * 36u;
-        unsigned short q8_d_h = (unsigned short)q8_bp[0] | ((unsigned short)q8_bp[1] << 8);
-        float q8_d = termite_half_to_float(q8_d_h);
-        const signed char* q8_values = (const signed char*)(q8_bp + 4u);
-        int q8_pack0 = termite_load_i8x4_aligned(q8_values + q8_lane_base + 0u);
-        int q8_pack1 = termite_load_i8x4_aligned(q8_values + q8_lane_base + 4u);
-        int q8_pack2 = termite_load_i8x4_aligned(q8_values + q8_lane_base + 8u);
-        int q8_pack3 = termite_load_i8x4_aligned(q8_values + q8_lane_base + 12u);
-        #pragma unroll
-        for (unsigned int c = 0; c < 8u; ++c) {
-            if (c + 1u < cols && sub == 0u) {
-                const unsigned char* future = weight + ((col_tile + c + 1u) * row_blocks + block) * 210u;
-                antfly_quant_rows_prefetch_l2(future);
-                antfly_quant_rows_prefetch_l2(future + 128u);
-            }
-            const unsigned char* bp = weight + ((col_tile + c) * row_blocks + block) * 210u;
-            int sumi = 0;
-            sumi = __dp4a(termite_pack_q6k_i8x4_sub(bp, sub, 0u), q8_pack0, sumi);
-            sumi = __dp4a(termite_pack_q6k_i8x4_sub(bp, sub, 4u), q8_pack1, sumi);
-            sumi = __dp4a(termite_pack_q6k_i8x4_sub(bp, sub, 8u), q8_pack2, sumi);
-            sumi = __dp4a(termite_pack_q6k_i8x4_sub(bp, sub, 12u), q8_pack3, sumi);
-            acc[c] = (q8_d * termite_q6k_sub_scale_f32(bp, sub)) * (float)sumi;
-        }
+#define ANTFLY_Q6_Q8_TILE8_PREFETCH() \
+    if (c + 1u < cols && sub == 0u) { \
+        const unsigned char* future = weight + ((col_tile + c + 1u) * row_blocks + block) * 210u; \
+        antfly_quant_rows_prefetch_l2(future); \
+        antfly_quant_rows_prefetch_l2(future + 128u); \
     }
-    #pragma unroll
-    for (unsigned int c = 0; c < 8u; ++c) {
-        float sum = termite_warp_reduce_sum(acc[c]);
-        if (lane == 0u) warp_partial[c][warp] = sum;
-    }
+#include "q6_q8_tile8_partials.cuh"
+#undef ANTFLY_Q6_Q8_TILE8_PREFETCH
     __syncthreads();
     if (tid == 0u) {
         float best_value = -3.402823466e+38f;
@@ -128,15 +94,7 @@ extern "C" __global__ void antfly_gemma4_e4b_pair_prefetch_l2(
     unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
         const unsigned char* q8_bp = q8_input + block * 36u;
-        unsigned short q8_d_h = (unsigned short)q8_bp[0] | ((unsigned short)q8_bp[1] << 8);
-        float q8_d = termite_half_to_float(q8_d_h);
-        const signed char* q8_values = (const signed char*)(q8_bp + 4u);
-        unsigned int q8_base0 = iqs * 4u;
-        unsigned int q8_base1 = q8_base0 + 4u;
-        int q8_low0 = termite_load_i8x4_aligned(q8_values + q8_base0);
-        int q8_high0 = termite_load_i8x4_aligned(q8_values + q8_base0 + 16u);
-        int q8_low1 = termite_load_i8x4_aligned(q8_values + q8_base1);
-        int q8_high1 = termite_load_i8x4_aligned(q8_values + q8_base1 + 16u);
+#include "q4_q8_half_block_load.cuh"
 
         #pragma unroll
         for (unsigned int c = 0u; c < cols; ++c) {
@@ -196,15 +154,7 @@ extern "C" __global__ void antfly_gemma4_e4b_down_prefetch_l2(
     unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
         const unsigned char* q8_bp = q8_input + block * 36u;
-        unsigned short q8_d_h = (unsigned short)q8_bp[0] | ((unsigned short)q8_bp[1] << 8);
-        float q8_d = termite_half_to_float(q8_d_h);
-        const signed char* q8_values = (const signed char*)(q8_bp + 4u);
-        unsigned int q8_base0 = iqs * 4u;
-        unsigned int q8_base1 = q8_base0 + 4u;
-        int q8_low0 = termite_load_i8x4_aligned(q8_values + q8_base0);
-        int q8_high0 = termite_load_i8x4_aligned(q8_values + q8_base0 + 16u);
-        int q8_low1 = termite_load_i8x4_aligned(q8_values + q8_base1);
-        int q8_high1 = termite_load_i8x4_aligned(q8_values + q8_base1 + 16u);
+#include "q4_q8_half_block_load.cuh"
 
         #pragma unroll
         for (unsigned int c = 0u; c < cols; ++c) {

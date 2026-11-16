@@ -153,7 +153,7 @@ const fixed_row_program =
     \\    unsigned int iqs = (tid & 1u) * 2u;
     \\    for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
     \\        const unsigned char* q8_bp = q8_input + block * 36u;
-    \\#include "../kernels/q4_a4b_q8_acquire.cuh"
+    \\#include "../kernels/q4_q8_half_block_load.cuh"
     \\
     \\        #pragma unroll
     \\        for (unsigned int c = 0u; c < cols; ++c) {

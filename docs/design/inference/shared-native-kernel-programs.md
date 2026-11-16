@@ -408,3 +408,37 @@ identical compiler tokens across the complete 49-file CUDA input closure.
 These identity checks preserve instruction/resource/performance parity; this
 consolidation does not claim a binary-size reduction or a new speedup. The
 isolated CUDA qualification checkout/cache and local probe binary are removed.
+
+### Quantized acquisition and prefetch follow-up
+
+The Q6×Q8 five-warp, eight-column partial tile now serves ordinary and L2
+prefetch callers. Its optional compile-time prefetch phase preserves the same
+addresses and issue points; dot order, registers, partials and barriers retain
+their native schedule. The paired/down prefetch paths reuse the existing Q8
+half-block scale/word acquisition. Their local bindings are read-only.
+
+The existing Q4×Q8 source factory also owns the byte-pair variant's four DP4A
+contributions, alongside centered aligned words and GGML unsigned correction.
+Its original helper declaration point, packing dependencies, arithmetic order
+and compatibility symbol are retained. This adds one generated region under
+the existing quantization owner, with no new source file or compiler. Helper
+relocation and generated copies earn no source-size reduction credit.
+
+The maintained prefetch program plus both shared acquisition/tile headers fall
+from 12,673 to 9,839 bytes (22.4%), and from 288 to 241 lines. These counts include
+all three owners and exclude their generated copies. This is a family-specific
+reduction, not a whole-codebase percentage. Reused headers are named for Q4/Q8
+half-block loads and Q6/Q8 tile partials; the JIT dependency manifest and cache
+identity tests use those paths. Historical model-prefixed device exports remain
+ABI adapters for their existing production launchers.
+
+Qualification: both generators pass freshness checks; ownership verification
+accepts 858 emitted items across 64 canonical native files. The 52 unchanged
+core tests remain cached/passing, seven ownership tests pass, and the production
+cache-construction fixture passes its enabled Metal/CUDA identity checks
+with the renamed headers. CUDA 13.2 `--check --all` on Glowworm produces the
+same portable PTX, seven-architecture fatbin and SM89 cubin bytes as the frozen
+baseline. Consequently kernel instructions/resources remain unchanged; no new
+speedup or whole-codebase reduction is claimed. CPU/Metal numerical programs
+are unchanged in this follow-up. The private CUDA checkout/cache is removed,
+and the cache fixture removes its temporary build tree.

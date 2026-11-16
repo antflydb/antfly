@@ -64,7 +64,7 @@ static __device__ __forceinline__ unsigned int antfly_q4_0_word_u16(const unsign
 }
 
 static __device__ __forceinline__ float antfly_q4_0_q8_dot16(
-    const unsigned char *q4_bp,
+    const unsigned char* q4_bp,
     float q8_d,
     unsigned int iqs,
     int q8_low0,

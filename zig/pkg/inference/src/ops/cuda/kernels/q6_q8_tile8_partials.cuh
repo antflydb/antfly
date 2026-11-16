@@ -25,6 +25,9 @@
         int q8_pack3 = termite_load_i8x4_aligned(q8_values + q8_lane_base + 12u);
         #pragma unroll
         for (unsigned int c = 0; c < 8u; ++c) {
+#ifdef ANTFLY_Q6_Q8_TILE8_PREFETCH
+            ANTFLY_Q6_Q8_TILE8_PREFETCH()
+#endif
             const unsigned char* bp = weight + ((col_tile + c) * row_blocks + block) * 210u;
             int sumi = 0;
             sumi = __dp4a(termite_pack_q6k_i8x4_sub(bp, sub, 0u), q8_pack0, sumi);

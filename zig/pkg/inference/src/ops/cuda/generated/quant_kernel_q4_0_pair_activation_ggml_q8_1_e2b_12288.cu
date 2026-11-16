@@ -69,7 +69,7 @@ static __device__ __forceinline__ unsigned int antfly_q4_0_word_u16(const unsign
 // nibbles unsigned removes four packed-byte centering instructions; each
 // contribution applies half of the block-wide -8*sum correction.
 static __device__ __forceinline__ float antfly_q4_0_ggml_q8_1_dot16(
-    const unsigned char *q4_bp,
+    const unsigned char* q4_bp,
     float q8_d,
     float q8_sum,
     unsigned int iqs,

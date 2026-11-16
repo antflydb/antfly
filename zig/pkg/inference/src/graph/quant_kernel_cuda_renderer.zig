@@ -2538,14 +2538,41 @@ const helper_q4_0_word_u16 = SourceFragment{
     ,
 };
 
-// One four-DP4A traversal, statically specialized for signed centering or
-// unsigned GGML half-block correction. Keep the correction association exact.
-fn q4Q8DotSource(comptime ggml: bool) []const u8 {
+// One four-DP4A traversal. Acquisition and scale correction are static
+// profiles: aligned centered words, aligned GGML words, or legacy byte pairs.
+const Q4Q8Dot = enum { centered_words, ggml_words, centered_pairs };
+fn q4Q8DotSource(comptime profile: Q4Q8Dot) []const u8 {
+    const ggml = profile == .ggml_words;
+    const pairs = profile == .centered_pairs;
+    const program = @import("../tile/native_program.zig");
+    const loads = if (pairs)
+        \\    unsigned short q4_d_h = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
+        \\    float q4_d = termite_half_to_float(q4_d_h);
+        \\    unsigned int base0 = iqs * 4u;
+        \\    unsigned int base1 = base0 + 4u;
+        \\    termite_q4_0_centered_i8x4_pair packed0 = termite_pack_q4_0_low_high_centered_i8x4(bp, base0);
+        \\    termite_q4_0_centered_i8x4_pair packed1 = termite_pack_q4_0_low_high_centered_i8x4(bp, base1);
+    else
+        program.render(
+            \\    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
+            \\    const unsigned int base0 = iqs * 4u;
+            \\    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
+            \\    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
+            \\    const unsigned int low0 = {{low0}};
+            \\    const unsigned int high0 = {{high0}};
+            \\    const unsigned int low1 = {{low1}};
+            \\    const unsigned int high1 = {{high1}};
+        , .{
+            .low0 = if (ggml) "word0 & 0x0f0f0f0fu" else "__vadd4(word0 & 0x0f0f0f0fu, 0xf8f8f8f8u)",
+            .high0 = if (ggml) "(word0 >> 4) & 0x0f0f0f0fu" else "__vadd4((word0 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u)",
+            .low1 = if (ggml) "word1 & 0x0f0f0f0fu" else "__vadd4(word1 & 0x0f0f0f0fu, 0xf8f8f8f8u)",
+            .high1 = if (ggml) "(word1 >> 4) & 0x0f0f0f0fu" else "__vadd4((word1 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u)",
+        });
     return (if (ggml) "// One of two 16-value contributions for a Q4_0/Q8_1 block. Keeping Q4\n" ++
         "// nibbles unsigned removes four packed-byte centering instructions; each\n" ++
-        "// contribution applies half of the block-wide -8*sum correction.\n" else "") ++ @import("../tile/native_program.zig").render(
-        \\static __device__ __forceinline__ float {{name}}(
-        \\    const unsigned char *q4_bp,
+        "// contribution applies half of the block-wide -8*sum correction.\n" else "") ++ program.render(
+        \\{{qualifier}}__device__ __forceinline__ float {{name}}(
+        \\    const unsigned char* {{pointer}},
         \\    float q8_d,{{sum_parameter}}
         \\    unsigned int iqs,
         \\    int q8_low0,
@@ -2553,32 +2580,33 @@ fn q4Q8DotSource(comptime ggml: bool) []const u8 {
         \\    int q8_low1,
         \\    int q8_high1
         \\) {
-        \\    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
-        \\    const unsigned int base0 = iqs * 4u;
-        \\    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
-        \\    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
-        \\    const unsigned int low0 = {{low0}};
-        \\    const unsigned int high0 = {{high0}};
-        \\    const unsigned int low1 = {{low1}};
-        \\    const unsigned int high1 = {{high1}};
-        \\    int sumi = __dp4a((int)low0, q8_low0, 0);
-        \\    sumi = __dp4a((int)high0, q8_high0, sumi);
-        \\    sumi = __dp4a((int)low1, q8_low1, sumi);
-        \\    sumi = __dp4a((int)high1, q8_high1, sumi);
+        \\{{loads}}
+        \\    int sumi = __dp4a({{low0}}, q8_low0, 0);
+        \\    sumi = __dp4a({{high0}}, q8_high0, sumi);
+        \\    sumi = __dp4a({{low1}}, q8_low1, sumi);
+        \\    sumi = __dp4a({{high1}}, q8_high1, sumi);
         \\    return {{result}};
         \\}
     , .{
-        .name = if (ggml) "antfly_q4_0_ggml_q8_1_dot16" else "antfly_q4_0_q8_dot16",
+        .qualifier = if (pairs) "" else "static ",
+        .name = if (pairs) "termite_q4_0_q8_1_partial_mmvq2" else if (ggml) "antfly_q4_0_ggml_q8_1_dot16" else "antfly_q4_0_q8_dot16",
+        .pointer = if (pairs) "bp" else "q4_bp",
         .sum_parameter = if (ggml) "\n    float q8_sum," else "",
-        .low0 = if (ggml) "word0 & 0x0f0f0f0fu" else "__vadd4(word0 & 0x0f0f0f0fu, 0xf8f8f8f8u)",
-        .high0 = if (ggml) "(word0 >> 4) & 0x0f0f0f0fu" else "__vadd4((word0 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u)",
-        .low1 = if (ggml) "word1 & 0x0f0f0f0fu" else "__vadd4(word1 & 0x0f0f0f0fu, 0xf8f8f8f8u)",
-        .high1 = if (ggml) "(word1 >> 4) & 0x0f0f0f0fu" else "__vadd4((word1 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u)",
+        .loads = loads,
+        .low0 = if (pairs) "packed0.low" else "(int)low0",
+        .high0 = if (pairs) "packed0.high" else "(int)high0",
+        .low1 = if (pairs) "packed1.low" else "(int)low1",
+        .high1 = if (pairs) "packed1.high" else "(int)high1",
         .result = if (ggml) "q4_d * (q8_d * (float)sumi - 4.0f * q8_sum)" else "q4_d * q8_d * (float)sumi",
     });
 }
-const helper_q4_0_q8_dot16 = SourceFragment{ .name = "antfly_q4_0_q8_dot16", .source = q4Q8DotSource(false) };
-pub const helper_q4_0_ggml_q8_1_dot16 = SourceFragment{ .name = "antfly_q4_0_ggml_q8_1_dot16", .source = q4Q8DotSource(true) };
+const helper_q4_0_q8_dot16 = SourceFragment{ .name = "antfly_q4_0_q8_dot16", .source = q4Q8DotSource(.centered_words) };
+pub const helper_q4_0_ggml_q8_1_dot16 = SourceFragment{ .name = "antfly_q4_0_ggml_q8_1_dot16", .source = q4Q8DotSource(.ggml_words) };
+
+pub fn renderQ4Q8PackedPairHelper(allocator: std.mem.Allocator) ![]u8 {
+    const source = comptime q4Q8DotSource(.centered_pairs);
+    return allocator.dupe(u8, source ++ "\n");
+}
 
 const q8_legacy_policy = SourceFragment{
     .name = "antfly_q8_legacy",

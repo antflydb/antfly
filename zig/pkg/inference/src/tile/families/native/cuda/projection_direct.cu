@@ -423,7 +423,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile8(AN
     unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
         const unsigned char* q8_bp = q8_input + (row * row_blocks + block) * 36u;
-#include "../kernels/q4_a4b_q8_acquire.cuh"
+#include "../kernels/q4_q8_half_block_load.cuh"
 
         #pragma unroll
         for (unsigned int c = 0u; c < 8u; ++c) {
@@ -615,7 +615,7 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b
     const unsigned int cols = 8u;
     unsigned int global_tile = blockIdx.x;
     unsigned int col_tile = global_tile * cols;
-#include "../kernels/q6_e4b_tile8_partials.cuh"
+#include "../kernels/q6_q8_tile8_partials.cuh"
     __syncthreads();
     if (tid == 0u) {
         float best_value = -3.402823466e+38f;
@@ -650,7 +650,7 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_f32_tile8_e4b(
     unsigned int global_tile = blockIdx.x;
     unsigned int col_tile = global_tile * cols;
     if (col_tile >= out_dim) return;
-#include "../kernels/q6_e4b_tile8_partials.cuh"
+#include "../kernels/q6_q8_tile8_partials.cuh"
     __syncthreads();
     if (tid < 8u) {
         unsigned int col = col_tile + tid;

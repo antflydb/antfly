@@ -383,7 +383,7 @@ static __device__ __forceinline__ unsigned int antfly_q4_0_word_u16(const unsign
 }
 
 static __device__ __forceinline__ float antfly_q4_0_q8_dot16(
-    const unsigned char *q4_bp,
+    const unsigned char* q4_bp,
     float q8_d,
     unsigned int iqs,
     int q8_low0,
@@ -8385,6 +8385,7 @@ __device__ __forceinline__ termite_q4_0_centered_i8x4_pair termite_pack_q4_0_low
     return packed;
 }
 
+// quant-kernel-codegen:begin Q4 Q8 packed-pair dot (do not edit; run: zig build quant-kernel-codegen -- --write)
 __device__ __forceinline__ float termite_q4_0_q8_1_partial_mmvq2(
     const unsigned char* bp,
     float q8_d,
@@ -8406,6 +8407,7 @@ __device__ __forceinline__ float termite_q4_0_q8_1_partial_mmvq2(
     sumi = __dp4a(packed1.high, q8_high1, sumi);
     return q4_d * q8_d * (float)sumi;
 }
+// quant-kernel-codegen:end Q4 Q8 packed-pair dot
 
 template<bool Gated>
 __device__ __forceinline__ void termite_quantize_q8_1_rows_impl(
@@ -8698,7 +8700,7 @@ __device__ __forceinline__ void termite_q4_0_q8_1_cols_partial(
     unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
         const unsigned char* q8_bp = q8_input + (row * row_blocks + block) * 36u;
-#include "../kernels/q4_a4b_q8_acquire.cuh"
+#include "../kernels/q4_q8_half_block_load.cuh"
 
         if (full_tile) {
             #pragma unroll
@@ -10257,7 +10259,7 @@ __device__ __forceinline__ void termite_q4_0_pair_q8_1_tile4_impl(
     unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
         const unsigned char* q8_bp = q8_input + (row * row_blocks + block) * 36u;
-#include "../kernels/q4_a4b_q8_acquire.cuh"
+#include "../kernels/q4_q8_half_block_load.cuh"
 
         if (full_tile) {
             #pragma unroll
@@ -10315,7 +10317,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_nobias_q8_1_f32_tile8(ANTFLY
     unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
         const unsigned char* q8_bp = q8_input + (row * row_blocks + block) * 36u;
-#include "../kernels/q4_a4b_q8_acquire.cuh"
+#include "../kernels/q4_q8_half_block_load.cuh"
 
         #pragma unroll
         for (unsigned int c = 0u; c < cols; ++c) {
@@ -10444,7 +10446,7 @@ __device__ __forceinline__ void termite_q4_0_pair_activation_q8_1_tile4_impl(
     unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
         const unsigned char* q8_bp = q8_input + (row * row_blocks + block) * 36u;
-#include "../kernels/q4_a4b_q8_acquire.cuh"
+#include "../kernels/q4_q8_half_block_load.cuh"
 
         if (full_tile) {
             #pragma unroll
@@ -10626,7 +10628,7 @@ extern "C" __global__ void termite_gemma4_a4b_q4_0_gate_up_rows_q8_1_f32(ANTFLY_
     const unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
         const unsigned char* q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
-#include "../kernels/q4_a4b_q8_acquire.cuh"
+#include "../kernels/q4_q8_half_block_load.cuh"
 #pragma unroll
         for (unsigned int c = 0u; c < cols; ++c) {
             const unsigned int col = col_tile + c;
@@ -10685,7 +10687,7 @@ extern "C" __global__ void termite_gemma4_a4b_q4_0_down_rows_q8_1_f32(ANTFLY_CUD
     const unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
         const unsigned char* q8_bp = q8_activated + ((size_t)route * row_blocks + block) * 36u;
-#include "../kernels/q4_a4b_q8_acquire.cuh"
+#include "../kernels/q4_q8_half_block_load.cuh"
 #pragma unroll
         for (unsigned int c = 0u; c < cols; ++c) {
             const unsigned int col = col_tile + c;
@@ -10720,7 +10722,7 @@ extern "C" __global__ void termite_gemma4_a4b_q4_0_down_rows_q8_1_f32_compact(AN
     const unsigned int block = tid >> 1u;
     if (block < 22u) {
         const unsigned char* q8_bp = q8_activated + ((size_t)route * 22u + block) * 36u;
-#include "../kernels/q4_a4b_q8_acquire.cuh"
+#include "../kernels/q4_q8_half_block_load.cuh"
 #pragma unroll
         for (unsigned int c = 0u; c < cols; ++c) {
             const unsigned char* bp = weight + ((size_t)(col_tile + c) * 22u + block) * 18u;
@@ -10790,7 +10792,7 @@ __device__ __forceinline__ void termite_e4b_ffn_pair_impl(float* dst,
     unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
         const unsigned char* q8_bp = q8_input + block * 36u;
-#include "../kernels/q4_a4b_q8_acquire.cuh"
+#include "../kernels/q4_q8_half_block_load.cuh"
 
         #pragma unroll
         for (unsigned int c = 0u; c < cols; ++c) {
@@ -11461,7 +11463,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile8(AN
     unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
         const unsigned char* q8_bp = q8_input + (row * row_blocks + block) * 36u;
-#include "../kernels/q4_a4b_q8_acquire.cuh"
+#include "../kernels/q4_q8_half_block_load.cuh"
 
         #pragma unroll
         for (unsigned int c = 0u; c < 8u; ++c) {
@@ -11984,7 +11986,7 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b
     const unsigned int cols = 8u;
     unsigned int global_tile = blockIdx.x;
     unsigned int col_tile = global_tile * cols;
-#include "../kernels/q6_e4b_tile8_partials.cuh"
+#include "../kernels/q6_q8_tile8_partials.cuh"
     __syncthreads();
     if (tid == 0u) {
         float best_value = -3.402823466e+38f;
@@ -12021,7 +12023,7 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_f32_tile8_e4b(
     unsigned int global_tile = blockIdx.x;
     unsigned int col_tile = global_tile * cols;
     if (col_tile >= out_dim) return;
-#include "../kernels/q6_e4b_tile8_partials.cuh"
+#include "../kernels/q6_q8_tile8_partials.cuh"
     __syncthreads();
     if (tid < 8u) {
         unsigned int col = col_tile + tid;
@@ -12321,7 +12323,7 @@ __device__ __forceinline__ void termite_packed_qkv_projection_impl(    float* ds
     unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
         const unsigned char* q8_bp = q8_input + (row * row_blocks + block) * 36u;
-#include "../kernels/q4_a4b_q8_acquire.cuh"
+#include "../kernels/q4_q8_half_block_load.cuh"
 
         if (Columns == 8u && full_tile) {
             #pragma unroll
@@ -12536,7 +12538,7 @@ extern "C" __global__ void termite_linear_q4_0_qkv_nobias_q8_1_f32_tile8_w8(ANTF
     unsigned int iqs = (tid & 1u) * 2u;
     for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
         const unsigned char* q8_bp = q8_input + (row * row_blocks + block) * 36u;
-#include "../kernels/q4_a4b_q8_acquire.cuh"
+#include "../kernels/q4_q8_half_block_load.cuh"
 
         #pragma unroll
         for (unsigned int c = 0u; c < cols; ++c) {
@@ -14171,7 +14173,7 @@ extern "C" __global__ void termite_source_clamp_bf16_values_f32(
 // nibbles unsigned removes four packed-byte centering instructions; each
 // contribution applies half of the block-wide -8*sum correction.
 static __device__ __forceinline__ float antfly_q4_0_ggml_q8_1_dot16(
-    const unsigned char *q4_bp,
+    const unsigned char* q4_bp,
     float q8_d,
     float q8_sum,
     unsigned int iqs,

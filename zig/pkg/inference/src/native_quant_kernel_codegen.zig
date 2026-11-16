@@ -206,6 +206,7 @@ fn validateCudaDevMatmulHelpers(_: std.mem.Allocator, split: SourceRegion) !void
 }
 const cuda_runtime_source_owners = nativeSourceOwners(cuda_ffn_renderer.owners) ++ [_]NativeSourceOwner{
     nativeSourceOwner(cuda_shared_helpers_begin, cuda_shared_helpers_end, cuda_renderer.renderRuntimeSharedHelpers),
+    nativeSourceOwner("// quant-kernel-codegen:begin Q4 Q8 packed-pair dot (do not edit; run: zig build quant-kernel-codegen -- --write)", "// quant-kernel-codegen:end Q4 Q8 packed-pair dot", cuda_renderer.renderQ4Q8PackedPairHelper),
     nativeSourceOwner(cuda_production_matmul_begin, cuda_production_matmul_end, quant_kernel_compiler.renderCudaRuntimeProductionMatmulRegion),
     .{ .begin = cuda_runtime_attention_region_begin_marker, .render = quant_kernel_compiler.renderCudaRuntimeAttentionRegion, .split = splitCudaRuntimeAttentionRegion, .validate = validateCudaAttentionHelpers },
     .{ .begin = cuda_runtime_dev_matmul_region_begin_marker, .render = quant_kernel_compiler.renderCudaRuntimeDevMatmulRegion, .split = splitCudaRuntimeDevMatmulRegion, .validate = validateCudaDevMatmulHelpers },
