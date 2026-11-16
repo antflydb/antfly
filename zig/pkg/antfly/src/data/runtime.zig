@@ -43315,6 +43315,75 @@ fn consumerTests() type {
             }
         }
 
+        test "data raft ordered history frozen plan owns canonical payloads through allocation failures" {
+            const Frozen = @import("../api/completion_plan.zig");
+            const Fixture = struct {
+                fn owner(group: u64) Frozen.completion.RoutedOwner {
+                    var namespace: [24]u8 = undefined;
+                    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+                    std.mem.writeInt(u64, namespace[8..16], group, .big);
+                    std.mem.writeInt(u64, namespace[16..24], group, .big);
+                    return .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(2), .root_generation = 3, .group_id = group, .topology_epoch = 4 };
+                }
+                fn input(binding: Frozen.completion.RoutedOwner, roles: u8) Frozen.Input {
+                    return .{ .owner = binding, .locator = if (binding.group_id == 601) "table2:00000004:docs:601" else "table2:00000004:docs:602", .roles = roles, .prepare = .{ .timestamp_ns = 1000, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = @splat(5), .topology_epoch = binding.topology_epoch, .completion_owner = binding } } } };
+                }
+                fn run(a: std.mem.Allocator) !void {
+                    const row = try a.dupe(u8, "{\"n\":1}");
+                    defer a.free(row);
+                    // Deliberately reverse route enumeration. A guard/checkpoint
+                    // participant remains present even though it emits no rows.
+                    var effect = input(owner(601), Frozen.completion.Roles.effects);
+                    const writes = [_]antfly.db.types.TransactionWrite{.{ .key = "row", .value = row }};
+                    effect.prepare.writes = &writes;
+                    var plan = try Frozen.Plan.freeze(a, @splat(5), @splat(6), owner(602), &.{ input(owner(602), Frozen.completion.Roles.guards | Frozen.completion.Roles.checkpoint), effect }, 1001);
+                    var plan_live = true;
+                    defer if (plan_live) plan.deinit();
+                    try std.testing.expectEqual(@as(u64, 601), plan.participants[0].owner.group_id);
+                    try std.testing.expectEqual(@as(u64, 602), plan.participants[1].owner.group_id);
+                    row[5] = '9';
+                    var retry = try plan.prepare(a, 0);
+                    defer retry.deinit(a);
+                    try std.testing.expectEqualStrings("{\"n\":1}", retry.req.writes[0].value);
+                    const encoded = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(a, retry.req);
+                    defer a.free(encoded);
+                    try plan.admission.requirePreparedInput(owner(601).namespace, encoded);
+                    const begin = try plan.begin(1);
+                    try std.testing.expectEqual(@as(usize, 2), begin.transaction.?.begin.participants.len);
+                    try std.testing.expectEqualStrings("table2:00000004:docs:602", begin.transaction.?.begin.participants[0]);
+                    try std.testing.expectEqual(@as(u64, 1001), begin.transaction.?.begin.created_at_ns);
+                    const begin_bytes = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(a, begin);
+                    defer a.free(begin_bytes);
+                    try std.testing.expectEqualDeep(owner(602), begin.transaction.?.begin.completion_owner.?);
+                    try std.testing.expectEqual(@as(u64, 1000), begin.transaction.?.begin.begin_timestamp);
+                    var no_effect = try plan.prepare(a, 1);
+                    defer no_effect.deinit(a);
+                    try std.testing.expectEqual(@as(usize, 0), no_effect.req.writes.len);
+                    plan.deinit();
+                    plan_live = false;
+                    // Decoded retries own every slice independently of the plan.
+                    try std.testing.expectEqualStrings("row", retry.req.writes[0].key);
+                    try std.testing.expectEqualStrings("{\"n\":1}", retry.req.writes[0].value);
+                }
+            };
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+            const a = std.testing.allocator;
+            const good = Fixture.input(Fixture.owner(601), Frozen.completion.Roles.effects);
+            try std.testing.expectError(error.InvalidParticipant, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{ good, good }, 1001));
+            var wrong = good;
+            wrong.prepare.transaction.?.prepare.completion_owner.?.root_generation += 1;
+            try std.testing.expectError(error.TopologyChanged, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{wrong}, 1001));
+            wrong = good;
+            wrong.locator = "table2:00000004:docs:602";
+            try std.testing.expectError(error.InvalidParticipant, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{wrong}, 1001));
+            wrong = good;
+            wrong.prepare.timestamp_ns = 0;
+            try std.testing.expectError(error.InvalidBatchRequest, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{wrong}, 1001));
+            wrong = good;
+            wrong.prepare.document_version_scheme = .legacy;
+            try std.testing.expectError(error.InvalidBatchRequest, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{wrong}, 1001));
+        }
+
         test "data raft ordered history local submission confirms through real Raft and ReadIndex" {
             if (comptime !linked_storage) return error.SkipZigTest;
             const a = std.testing.allocator;
@@ -43861,23 +43930,38 @@ fn consumerTests() type {
                 // Qualify actual protocol-31 admission, native apply and a
                 // positive immutable completion receipt over signed HTTP.
                 const completion_contract = resolution_operations.wire.completion;
-                var completion_descriptor = try owner.loadCompletionDescriptor(a, 601, "docs", .{});
-                defer completion_descriptor.deinit(a);
-                const current_owner = try @import("../api/completion_owner_admission.zig").capture(a, catalog, "docs", route.fence().?, completion_descriptor.view(), .{});
-                const txn_id: [16]u8 = @splat(95);
-                const prepare: antfly.db.types.BatchRequest = .{ .timestamp_ns = 1000, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = current_owner.topology_epoch, .completion_owner = current_owner } }, .writes = &.{.{ .key = "completion-row", .value = "{\"done\":true}" }} };
-                const prepare_bytes = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(a, prepare);
-                defer a.free(prepare_bytes);
-                const locator = try @import("antfly_local_sources").api_local_transaction_contract.participantIdForGroupScoped(a, "docs", 601, null, null);
-                defer a.free(locator);
-                const participants = [_]completion_contract.Participant{.{ .namespace = namespace, .owner_fence = current_owner.digest(), .roles = completion_contract.Roles.effects, .locator = locator, .input_digest = completion_contract.preparedInputDigest(namespace, prepare_bytes) }};
-                const plan: completion_contract.Admission = .{ .version = 2, .transaction_id = txn_id, .admission_digest = @splat(96), .coordinator_namespace = namespace, .coordinator_fence = current_owner.digest(), .participants = &participants };
-                const encoded_plan = try completion_contract.encodeAdmission(a, plan);
-                defer a.free(encoded_plan);
-                const begin: antfly.db.types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .begin = .{ .txn_id = txn_id, .begin_timestamp = 1000, .created_at_ns = platform_time.realtimeNs(), .topology_epoch = current_owner.topology_epoch, .retain_terminal = true, .participants = &.{locator}, .completion_admission = encoded_plan, .completion_owner = current_owner } } };
-                for ([_]antfly.db.types.BatchRequest{ begin, prepare, .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = current_owner, .txn_id = txn_id, .status = .committed, .commit_version = 1001 } } } }) |command| {
-                    try server.proposeRaftBatchGroupWithLeaderWait(a, 601, "docs", command, .{ .discovery = .cached, .write_route_fence = route.fence(), .admission_deadline_ns = server.dataRaftMonotonicNs() + 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
-                }
+                const CompletionAdmissionFixture = struct {
+                    // Keep the large private batch temporaries off the parent
+                    // HTTP/Raft fixture's already large stack frame.
+                    noinline fn run(fixture_alloc: std.mem.Allocator, fixture_server: *DataServer, fixture_owner: *antfly.public_api.ProvisionedKernelOwnerSource, fixture_catalog: antfly.public_api.table_catalog.CatalogSource, fence: antfly.metadata_api.CatalogRouteFence, fixture_namespace: [24]u8) !@import("../api/completion_plan.zig").Plan {
+                        const fixture_completion = @import("../api/completion_plan.zig").completion;
+                        var completion_descriptor = try fixture_owner.loadCompletionDescriptor(fixture_alloc, 601, "docs", .{});
+                        defer completion_descriptor.deinit(fixture_alloc);
+                        const current_owner = try @import("../api/completion_owner_admission.zig").capture(fixture_alloc, fixture_catalog, "docs", fence, completion_descriptor.view(), .{});
+                        const txn_id: [16]u8 = @splat(95);
+                        const prepare: antfly.db.types.BatchRequest = .{ .timestamp_ns = 1000, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = current_owner.topology_epoch, .completion_owner = current_owner } }, .writes = &.{.{ .key = "completion-row", .value = "{\"done\":true}" }} };
+                        const prepare_bytes = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(fixture_alloc, prepare);
+                        defer fixture_alloc.free(prepare_bytes);
+                        const locator = try @import("antfly_local_sources").api_local_transaction_contract.participantIdForGroupScoped(fixture_alloc, "docs", 601, null, null);
+                        defer fixture_alloc.free(locator);
+                        var frozen = try @import("../api/completion_plan.zig").Plan.freeze(fixture_alloc, txn_id, @splat(96), current_owner, &.{.{ .owner = current_owner, .locator = locator, .roles = fixture_completion.Roles.effects, .prepare = prepare }}, platform_time.realtimeNs());
+                        errdefer frozen.deinit();
+                        const plan = frozen.admission;
+                        const begin = try frozen.begin(0);
+                        var frozen_prepare = try frozen.prepare(fixture_alloc, 0);
+                        defer frozen_prepare.deinit(fixture_alloc);
+                        try plan.requirePreparedInput(fixture_namespace, prepare_bytes);
+                        for ([_]antfly.db.types.BatchRequest{ begin, frozen_prepare.req, .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = current_owner, .txn_id = txn_id, .status = .committed, .commit_version = 1001 } } } }) |command| {
+                            try fixture_server.proposeRaftBatchGroupWithLeaderWait(fixture_alloc, 601, "docs", command, .{ .discovery = .cached, .write_route_fence = fence, .admission_deadline_ns = fixture_server.dataRaftMonotonicNs() + 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
+                        }
+                        return frozen;
+                    }
+                };
+                var frozen = try CompletionAdmissionFixture.run(a, server, &owner, catalog, route.fence().?, namespace);
+                defer frozen.deinit();
+                const plan = frozen.admission;
+                const current_owner = frozen.participants[0].owner;
+                const txn_id = plan.transaction_id;
                 try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_admission_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
                 const positive_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = txn_id, .owner_fence = current_owner.digest(), .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();

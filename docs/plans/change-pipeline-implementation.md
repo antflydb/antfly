@@ -2887,3 +2887,54 @@ real-Raft cases passed, including the expanded signed-HTTP page/grant checks.
 Formatting and diff checks passed. Restart, snapshot and leader-election
 recovery qualification remain required. Full production coordinator,
 retention, bootstrap, public feeds and existing-client qualification remain open.
+
+## In progress: owned coordinator input freeze
+
+`api/completion_plan.zig` freezes the complete canonical private PREPARE payloads
+before the first BEGIN. The plan owns payload and locator bytes, full original
+routed owners, a v2 admission with per-participant input digests, the common
+begin timestamp and the original BEGIN creation timestamp. It preserves
+non-emitting guard/checkpoint members, enforces declared effects/guard roles,
+checks owner/transaction/topology binding, rejects duplicate locators and
+namespaces, and bounds payloads to 16 MiB per participant and 64 MiB total.
+These limits bound this coordinator plan; they do not advertise large streaming
+transaction support or replace destination retention admission.
+
+Admission members use canonical namespace order. Durable recovery locators use
+coordinator-first order followed by canonical followers, as required by the
+existing completion BEGIN validator and transaction manager. PREPARE retries
+parse the frozen bytes into independently owned requests; they do not borrow
+caller input buffers or the plan's arena. Owner capture and table activity
+leases remain the invoking coordinator's responsibility; constructing a plan
+provides no new authority.
+
+The real-Raft certificate publication fixture now takes its BEGIN and PREPARE
+from this builder. An allocation-failure qualification mutates the caller's row
+buffer after freezing, checks the original retry payload, validates a
+coordinator which sorts last, and keeps decoded retries alive after destroying
+the plan. Negative cases cover duplicate participants, changed physical owners,
+wrong recovery groups, missing timestamps and legacy document versions.
+The allocation-failure case passed in `completion-frozen-plan-final-test.log`;
+normal-stack integration validation is recorded below.
+
+This is the input-freeze portion of coordinator integration. Normal destination
+routing still uses the legacy participant RPCs and has not been switched to
+completion v2. Routed source admission remains rejected until its global
+checkpoint anchor, durable recovery, all-owner completion publication and
+retention obligations are integrated. No destination capability is expanded by
+this builder alone.
+
+The first compiled run passed the allocation-failure case, then exhausted the
+large existing integration fixture's macOS stack during HTTP-server setup.
+Running the identical binary with a 32 MiB diagnostic stack passed all seven
+cases (`completion-frozen-plan-stack-diagnostic.log`). The fixture's large
+admission temporaries are now isolated in a non-inlined helper; normal-stack
+validation is running in `completion-frozen-plan-normal-stack-test.log`. The
+build/test default stack has not been enlarged.
+
+`completion-frozen-plan-split-fixture-test.log` completed with exit 0: all seven
+real-Raft cases passed with the default stack, zero skipped/failed/leaked. This
+includes the complete signed HTTP recovery path and the owned-plan allocation
+failure test. Source/control catalog generation, formatting and diff checks
+also passed. The normal-stack fixture setup compile initially found parameter
+shadowing; the corrected helper passed this final run.
