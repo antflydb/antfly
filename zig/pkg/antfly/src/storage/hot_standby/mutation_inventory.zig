@@ -46,6 +46,7 @@ pub const Surface = enum {
     table_catalog,
     table_schema,
     table_index,
+    index_alias,
     index_maintenance,
     artifact_enrichment,
     extension_catalog,
@@ -111,6 +112,7 @@ pub const entries = [_]Entry{
     .{ .surface = .secret, .disposition = .reject, .path_pattern = "/secrets/{key}", .methods = put_delete, .reason = "the node-local secret store is not part of the HA seed or continuous stream" },
     .{ .surface = .table_catalog, .disposition = .reject, .path_pattern = "/tables/{table}", .methods = post_delete, .reason = "table-scoped streams reject catalog changes; whole-instance catalog replication admits table creation only" },
     .{ .surface = .table_schema, .disposition = .reject, .path_pattern = "/tables/{table}/schema", .methods = &.{.PUT}, .reason = "schema catalog generations are not continuously replicated" },
+    .{ .surface = .index_alias, .disposition = .reject, .path_pattern = "/tables/{table}/index-aliases/{alias} | /databases/{database}/namespaces/{namespace}/tables/{table}/index-aliases/{alias}", .methods = put_delete, .reason = "table-scoped streams reject aliases; whole-instance RemoteApply replicates catalog replacements" },
     .{ .surface = .table_index, .disposition = .reject, .path_pattern = "/tables/{table}/indexes/{index}", .methods = post_delete, .reason = "index definitions live in the non-replicated standalone catalog" },
     .{ .surface = .artifact_enrichment, .disposition = .reject, .path_pattern = "/tables/{table}/artifacts/{artifact}/enrichment", .methods = put_delete, .reason = "enrichment definitions live in the non-replicated standalone catalog" },
     .{ .surface = .extension_catalog, .disposition = .reject, .path_pattern = "/extensions/v1/installed/{extension}[/{action}]", .methods = post_put_delete, .reason = "extension lifecycle and configuration state are not continuously replicated" },
@@ -147,6 +149,42 @@ pub const Classification = struct {
     surface: Surface,
     disposition: Disposition,
 };
+
+fn isIndexAliasPath(path: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, path, '/');
+    if (!std.mem.eql(u8, parts.next() orelse return false, "")) return false;
+    const kind = parts.next() orelse return false;
+    if (std.mem.eql(u8, kind, "databases")) {
+        if ((parts.next() orelse return false).len == 0) return false;
+        if (!std.mem.eql(u8, parts.next() orelse return false, "namespaces")) return false;
+        if ((parts.next() orelse return false).len == 0) return false;
+        if (!std.mem.eql(u8, parts.next() orelse return false, "tables")) return false;
+    } else if (!std.mem.eql(u8, kind, "tables")) return false;
+    if ((parts.next() orelse return false).len == 0) return false;
+    if (!std.mem.eql(u8, parts.next() orelse return false, "index-aliases")) return false;
+    if ((parts.next() orelse return false).len == 0) return false;
+    return parts.next() == null;
+}
+
+/// Catalog replacements require the whole-instance synchronous metadata stream.
+/// Table-scoped streams never admit alias state that they cannot replay.
+pub fn admitsCatalogMutation(whole_instance: bool, remote_apply: bool, method: http_common.Method, mutation: Classification) bool {
+    return whole_instance and remote_apply and
+        (mutation.surface == .table_catalog and method == .POST or
+            mutation.surface == .index_alias and (method == .PUT or method == .DELETE));
+}
+
+test "index alias HA admission requires whole-instance RemoteApply" {
+    for ([_]bool{ false, true }) |whole_instance| {
+        for ([_]bool{ false, true }) |remote_apply| {
+            for ([_]http_common.Method{ .PUT, .DELETE }) |method| {
+                const mutation = classify(method, "/tables/docs/index-aliases/live").?;
+                try std.testing.expectEqual(whole_instance and remote_apply, admitsCatalogMutation(whole_instance, remote_apply, method, mutation));
+            }
+            try std.testing.expect(!admitsCatalogMutation(whole_instance, remote_apply, .POST, classify(.POST, "/tables/docs/indexes/new").?));
+        }
+    }
+}
 
 /// Returns null for read-only and local operational requests. Every public
 /// logical mutation supported by standalone HA must classify explicitly.
@@ -225,6 +263,7 @@ pub fn classify(method: http_common.Method, path: []const u8) ?Classification {
 
     if (routes.Routes.matchTableArtifactEnrichment(path) != null) return rejected(.artifact_enrichment);
     if (routes.Routes.matchTableSchema(path) != null) return rejected(.table_schema);
+    if ((method == .PUT or method == .DELETE) and isIndexAliasPath(path)) return rejected(.index_alias);
     if (routes.Routes.matchTableIndex(path) != null) return rejected(.table_index);
     if (method == .POST and routes.Routes.matchTableIndexMaintenance(path) != null) return classified(.index_maintenance, .remote_apply);
     if (routes.Routes.matchTablePath(path) != null) return rejected(.table_catalog);
@@ -403,6 +442,16 @@ test "hot-standby public non-GET route matrix has an explicit durability disposi
         .{ .method = .PUT, .path = "/secrets/inference.api-key", .surface = .secret, .disposition = .reject },
         .{ .method = .DELETE, .path = "/secrets/inference.api-key", .surface = .secret, .disposition = .reject },
 
+        .{ .method = .PUT, .path = "/tables/docs/index-aliases/live", .surface = .index_alias, .disposition = .reject },
+        .{ .method = .PUT, .path = "/databases/d/namespaces/n/tables/t/index-aliases/live", .surface = .index_alias, .disposition = .reject },
+        .{ .method = .DELETE, .path = "/databases/d%2Fb/namespaces/n%20s/tables/t/index-aliases/live", .surface = .index_alias, .disposition = .reject },
+        .{ .method = .PUT, .path = "/databases//namespaces/n/tables/t/index-aliases/live", .surface = .unclassified_non_get, .disposition = .reject },
+        .{ .method = .PUT, .path = "/databases/d/namespaces//tables/t/index-aliases/live", .surface = .unclassified_non_get, .disposition = .reject },
+        .{ .method = .DELETE, .path = "/tables/ns%3Adocs/index-aliases/live", .surface = .index_alias, .disposition = .reject },
+        .{ .method = .PUT, .path = "/tables/docs/index-aliases/live/extra", .surface = .unclassified_non_get, .disposition = .reject },
+        .{ .method = .PUT, .path = "/tables//index-aliases/live", .surface = .unclassified_non_get, .disposition = .reject },
+        .{ .method = .DELETE, .path = "/tables/docs/index-aliases/", .surface = .unclassified_non_get, .disposition = .reject },
+        .{ .method = .POST, .path = "/tables/docs/index-aliases/live", .surface = .unclassified_non_get, .disposition = .reject },
         // Catalog, extension, and restore state.
         .{ .method = .POST, .path = "/tables/docs", .surface = .table_catalog, .disposition = .reject },
         .{ .method = .DELETE, .path = "/tables/docs", .surface = .table_catalog, .disposition = .reject },

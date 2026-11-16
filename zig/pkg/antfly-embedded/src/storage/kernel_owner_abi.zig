@@ -489,6 +489,8 @@ pub const MetadataProjectionKind = enum(u32) {
     job_owner_count = 74,
     /// Compact lake authority, including an explicit unowned-source record.
     lake_source_owner = 75,
+    /// Nonwaiting observation/reconciliation of the shared durable HA outbox.
+    poll_ha_outbox = 76,
     /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
     secret_collection = 42,
 };

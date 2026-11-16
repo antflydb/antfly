@@ -229,6 +229,53 @@ pub fn isDefaultMatchAll(query: types.Query) bool {
     };
 }
 
+/// Whether execution fuses multiple retrieval lanes after normalization.
+pub fn searchRequestRequiresComposedSearch(req: types.SearchRequest) bool {
+    if (req.full_text_queries.len > 0 or req.dense_queries.len > 0 or req.sparse_queries.len > 0) return true;
+
+    var base_result_sets: u32 = 0;
+    if (req.full_text != null) base_result_sets += 1;
+    if (req.dense != null) base_result_sets += 1;
+    if (req.sparse != null) base_result_sets += 1;
+    switch (req.query) {
+        .dense_knn => base_result_sets += 1,
+        .sparse_knn => base_result_sets += 1,
+        else => {},
+    }
+    return base_result_sets > 1;
+}
+
+/// Canonical single-vector execution shape, shared by admission and execution.
+/// A match-all text sentinel contributes no retrieval lane in this shape.
+pub fn directSingleVectorRequest(req: types.SearchRequest) ?types.SearchRequest {
+    if (req.merge_config != null or req.reranker != null or req.pruner != null) return null;
+    if (req.full_text_queries.len != 0) return null;
+    if (req.full_text) |text| switch (text) {
+        .match_all => {},
+        else => return null,
+    };
+    if (!isDefaultMatchAll(req.query)) return null;
+    if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.expand_strategy != null) return null;
+    if (req.dense != null or req.sparse != null) return null;
+    if (req.dense_queries.len == 1 and req.sparse_queries.len == 0) {
+        var next = req;
+        next.index_name = req.dense_queries[0].index_name;
+        next.full_text = null;
+        next.dense = req.dense_queries[0].query;
+        next.dense_queries = &.{};
+        return next;
+    }
+    if (req.sparse_queries.len == 1 and req.dense_queries.len == 0) {
+        var next = req;
+        next.index_name = req.sparse_queries[0].index_name;
+        next.full_text = null;
+        next.sparse = req.sparse_queries[0].query;
+        next.sparse_queries = &.{};
+        return next;
+    }
+    return null;
+}
+
 pub fn requestBindsRootTextIndex(req: types.SearchRequest) bool {
     return req.full_text != null or
         req.filter_query_json.len > 0 or

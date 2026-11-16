@@ -42,14 +42,14 @@ own policies.
 Pull a model, then embed a sentence through the running engine:
 
 ```bash
-antfly inference pull antflydb/clipclap:gguf:Q4_K
+antfly inference pull hf:google/embeddinggemma-2:bf16-safetensors-bundle-v1
 
 curl -X POST http://127.0.0.1:8080/ai/v1/embed \
   -H "Content-Type: application/json" \
-  -d '{"model":"antflydb/clipclap","input":["a photograph of a lighthouse"]}'
+  -d '{"model":"google/embeddinggemma-2:bf16-safetensors-bundle-v1","input":["a photograph of a lighthouse"]}'
 ```
 
-The response is a 512-dimension vector in the OpenAI embeddings shape (`{"object":"list","data":[{"embedding":[...]}]}`).
+The response is a 768-dimension vector in the OpenAI embeddings shape (`{"object":"list","data":[{"embedding":[...]}]}`).
 
 ## Where It Listens
 
@@ -107,8 +107,7 @@ Verified starting points, one per job:
 
 | Job | Model |
 |-----|-------|
-| Text and image embedding | [`google/embeddinggemma-2:bf16-safetensors-bundle-v1`](/docs/guides/models/embeddinggemma2) |
-| Multimodal embedding (text, image, audio) | `antflydb/clipclap` |
+| Embedding (text, image, audio, video) | [`google/embeddinggemma-2:bf16-safetensors-bundle-v1`](/docs/guides/models/embeddinggemma2) |
 | Reranking | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0` |
 | Generation | `ggml-org/gemma-4-E4B-it-GGUF` |
 | Transcription | `openai/whisper-tiny` |
@@ -307,7 +306,7 @@ Then prompt it with the outcome, for example "Set up local embeddings and rerank
 
 - [Local Model Compatibility](/docs/guides/supported-models): which artifacts load, which are rejected, and why
 - [Inference Components and Providers](/docs/guides/inference-providers): every component and the hosted providers that can serve it
-- [Multimodal Embeddings](/docs/guides/multimodal): the ClipClap embedder on an image index
+- [Multimodal Embeddings](/docs/guides/multimodal): the EmbeddingGemma 2 embedder on an image index
 - [Tune Hybrid Search](/docs/guides/hybrid-search): the reranker in a query pipeline
 - [Inference API reference](/inference/api): the HTTP surface
 - [Typed Decisions](../reference/decisions.md): named choice, ordinal score, and Boolean questions

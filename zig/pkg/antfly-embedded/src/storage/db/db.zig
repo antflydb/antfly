@@ -4459,6 +4459,11 @@ pub const DB = struct {
                 const replay_started_ns = monotonicTimeNs();
                 replayPendingDerivedBatches(&db, null, null, .{}) catch |err| switch (err) {
                     error.ArtifactRepairRequired => {},
+                    // Producer replies may still be pending after a crash. Keep
+                    // the journal/checkpoints intact and let the worker resume
+                    // after the owner opens and generated work can run again.
+                    // Workerless callers retain the synchronous drain contract.
+                    error.ReplayDocumentNotVisible => if (!db.start_index_workers) return err,
                     else => return err,
                 };
                 profile.replay_pending_derived_ns = elapsedSince(replay_started_ns);
@@ -10554,12 +10559,52 @@ pub const DB = struct {
         try self.maybeFinalizePendingRowPolicyPublication();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
+        var primary_capture: ?snapshot_admission_mod.SnapshotAdmission.CaptureLease = null;
+        defer if (primary_capture) |*lease| lease.release();
+        var replay_capture: ?snapshot_admission_mod.SnapshotAdmission.CaptureLease = null;
+        defer if (replay_capture) |*lease| lease.release();
+        var apply_locked = true;
         lockApplyShared(self);
-        defer self.core.unlockApplyShared();
-
+        defer if (apply_locked) self.core.unlockApplyShared();
         const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
         defer alloc.free(manifest_key);
-        const manifest = try self.core.getStoreValue(alloc, manifest_key) orelse return null;
+        var stored_manifest = try self.core.getStoreValue(alloc, manifest_key);
+        const configured_asset = blk: {
+            self.core.index_manager.catalog_mutex.lockShared();
+            defer self.core.index_manager.catalog_mutex.unlockShared();
+            break :blk self.core.index_manager.getEnrichment(.asset, artifact_name) != null;
+        };
+        if (stored_manifest == null and !configured_asset and self.core.index_manager.denseIndex(artifact_name) != null) {
+            // Mutation admission precedes apply ownership throughout native
+            // publication. Never wait for capture while retaining apply.
+            self.core.unlockApplyShared();
+            apply_locked = false;
+            primary_capture = self.core.snapshot_admission.tryAcquireCapture() orelse return error.StorageReadTemporarilyUnavailable;
+            replay_capture = self.core.snapshot_replay_admission.tryAcquireCapture() orelse return error.StorageReadTemporarilyUnavailable;
+            lockApplyShared(self);
+            apply_locked = true;
+            // A catalog/asset may have appeared while apply ownership was
+            // released. Preserve precedence at the admitted cut too.
+            stored_manifest = try self.core.getStoreValue(alloc, manifest_key);
+        }
+
+        const manifest = stored_manifest orelse {
+            var captured = (@import("dense_index_inspection.zig").capture(self, alloc, doc_key, artifact_name) catch |err| {
+                if (@import("privacy_read.zig").pending(err) or err == error.IndexRebuilding or err == error.DeadlineExceeded) return error.StorageReadTemporarilyUnavailable;
+                return err;
+            }) orelse return null;
+            defer captured.deinit();
+            self.core.unlockApplyShared();
+            apply_locked = false;
+            if (replay_capture) |*lease| lease.release();
+            if (primary_capture) |*lease| lease.release();
+            var inspection = try captured.render(alloc);
+            errdefer inspection.deinit(alloc);
+            try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            return inspection;
+        };
+        if (replay_capture) |*lease| lease.release();
+        if (primary_capture) |*lease| lease.release();
         var manifest_owned = true;
         errdefer if (manifest_owned) alloc.free(manifest);
 
@@ -33427,7 +33472,7 @@ pub const DB = struct {
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
-        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{});
+        _ = try @import("privacy_read.zig").requireConsumersPublishedWithBudget(self, alloc, .{}, &.{index_name}, null);
 
         const entry = self.core.textIndexEntry(index_name) orelse return error.IndexNotFound;
         entry.lockAnalysisShared();
@@ -34207,7 +34252,7 @@ pub const DB = struct {
                 .cancellation = options.cancellation,
             });
         }
-        self.executor.notifySequence(sequence);
+        self.executor.requestSequence(sequence);
         if (!options.follow_new_targets) return;
         if (options.no_progress_timeout_ns != 0) {
             // The threaded executor's waitForAll has no deadline, and the
@@ -34282,7 +34327,7 @@ pub const DB = struct {
             try wait.check();
             return;
         }
-        self.executor.notifySequence(sequence);
+        self.executor.requestSequence(sequence);
         try self.executor.waitForAllWithVisibilityWait(sequence, wait);
     }
 
@@ -34314,7 +34359,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("runDerivedUntilTargets", .{ self, sequence, index_names });
         if (sequence == 0 or index_names.len == 0) return;
         if (!self.executor.hasWorkers()) return;
-        self.executor.notifyIndexes(sequence, index_names);
+        self.executor.requestIndexes(sequence, index_names);
         try self.executor.waitForIndexes(sequence, index_names);
     }
 
@@ -34327,7 +34372,7 @@ pub const DB = struct {
         if (sequence == 0 or index_names.len == 0) return;
         try wait.check();
         if (!self.executor.hasWorkers()) return;
-        self.executor.notifyIndexes(sequence, index_names);
+        self.executor.requestIndexes(sequence, index_names);
         try self.executor.waitForIndexesWithVisibilityWait(sequence, index_names, wait);
     }
 
@@ -39216,6 +39261,11 @@ pub const DB = struct {
 
     /// Same-cut standalone producer counters; never usable by ordered owners.
     pub fn privacyLocalIndexSourcesComplete(self: *DB, alloc: Allocator, read: *docstore_mod.DocStore.Txn, index: []const u8, kind: @FieldType(types.IndexConfig, "kind"), plan: *const index_manager_mod.IndexManager.WritePlanSnapshot) !bool {
+        return self.privacyLocalIndexSourcesCompleteWithBudget(alloc, read, index, kind, plan, null);
+    }
+
+    pub fn privacyLocalIndexSourcesCompleteWithBudget(self: *DB, alloc: Allocator, read: *docstore_mod.DocStore.Txn, index: []const u8, kind: @FieldType(types.IndexConfig, "kind"), plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, budget: ?*@import("artifact_scan_budget.zig").Budget) !bool {
+        if (budget) |b| try b.check();
         if (try @import("../source_authority.zig").maintenanceMode(read) != .local) return false;
         const generation = self.core.index_manager.coverageGenerationForIndex(index) orelse return false;
         const sources = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index);
@@ -39223,14 +39273,20 @@ pub const DB = struct {
             for (sources) |source| alloc.free(source);
             alloc.free(sources);
         }
-        for (sources) |source| {
-            const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index, source, plan);
-            defer alloc.free(scope);
-            const counts = try DerivedCoverageCounters.load(alloc, read, if (kind == .dense_vector or kind == .sparse_vector) index else scope, generation);
+        const vector = kind == .dense_vector or kind == .sparse_vector;
+        // Vector coverage is certified once for the whole index generation.
+        // Its counter key never depends on a per-source dependency scope.
+        const checks = if (vector) @min(sources.len, 1) else sources.len;
+        for (sources[0..checks]) |source| {
+            if (budget) |b| try b.consume(source.len);
+            const scope: ?[]u8 = if (vector) null else try @import("artifact_producer_readiness.zig").localScopeAllocWithBudget(alloc, index, source, plan, budget);
+            defer if (scope) |value| alloc.free(value);
+            const counts = try DerivedCoverageCounters.load(alloc, read, scope orelse index, generation);
             const total = counts.source_total orelse (try range_cardinality.loadOrProveEmptyFromTxn(read)) orelse return false;
             if (total == 0) continue;
             if (counts.produced == null or counts.skipped == null or counts.terminal_failed != 0 or counts.produced.? +| counts.skipped.? != total) return false;
         }
+        if (budget) |b| try b.check();
         return true;
     }
 
@@ -39985,11 +40041,19 @@ pub const DB = struct {
         }
     }
 
+    /// Shared worker telemetry does not identify a physical consumer. Only
+    /// that consumer's checkpoint and replay debt can make it rebuilding.
+    fn denseCatchUpAffectsIndex(item: types.DBIndexStats, progress: types.DenseCatchUpStats) bool {
+        return item.kind == .dense_vector and progress.active and
+            (item.replay_applied_sequence < item.replay_target_sequence or
+                !std.mem.eql(u8, item.projection_checkpoint_status, "clean"));
+    }
+
     /// Apply lifecycle facts only when the caller also owns a consistent
     /// artifact/coverage refresh boundary.
     fn overlayRuntimeStatusLifecycleFromSnapshot(self: *DB, runtime_stats: *types.DBStats) void {
         for (runtime_stats.indexes) |*item| {
-            const dense_catch_up = item.kind == .dense_vector and runtime_stats.async_indexing.dense_catch_up.active;
+            const dense_catch_up = denseCatchUpAffectsIndex(item.*, runtime_stats.async_indexing.dense_catch_up);
             // This overlay can run over a cached materialization snapshot.
             // Read the live immutable HBC generation's cardinality for the
             // exact-vector certificate instead of pairing a current replay
@@ -40011,26 +40075,10 @@ pub const DB = struct {
             item.catch_up_active = dense_catch_up;
             if (item.kind == .dense_vector) {
                 const progress = runtime_stats.async_indexing.dense_catch_up;
-                if (dense_catch_up) {
-                    if (progress.current_sequence != 0) {
-                        item.replay_applied_sequence = if (item.replay_applied_sequence == 0)
-                            progress.current_sequence
-                        else
-                            @min(item.replay_applied_sequence, progress.current_sequence);
-                        item.catch_up_applied_sequence = progress.current_sequence;
-                    } else {
-                        item.catch_up_applied_sequence = item.replay_applied_sequence;
-                    }
-                    item.catch_up_target_sequence = @max(item.replay_target_sequence, progress.current_target_sequence);
-                    item.replay_target_sequence = item.catch_up_target_sequence;
-                    item.replay_catch_up_required = true;
-                    item.backfill_active = true;
-                } else {
-                    item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
-                    item.catch_up_applied_sequence = item.replay_applied_sequence;
-                    item.catch_up_target_sequence = item.replay_target_sequence;
-                }
-                item.catch_up_phase = progress.phase;
+                item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
+                item.catch_up_applied_sequence = item.replay_applied_sequence;
+                item.catch_up_target_sequence = item.replay_target_sequence;
+                item.catch_up_phase = if (dense_catch_up) progress.phase else .idle;
             } else {
                 item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
                 item.catch_up_applied_sequence = item.replay_applied_sequence;
@@ -42294,11 +42342,11 @@ pub const DB = struct {
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
                     }
                     try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
-                    if (async_indexing.dense_catch_up.active) {
+                    if (denseCatchUpAffectsIndex(item, async_indexing.dense_catch_up)) {
                         item.catch_up_active = true;
                         item.backfill_active = true;
                     }
-                    item.catch_up_phase = async_indexing.dense_catch_up.phase;
+                    item.catch_up_phase = if (item.catch_up_active) async_indexing.dense_catch_up.phase else .idle;
                     if (self.core.index_manager.vectorBlockProjectionRequiredForDenseIndex(cfg.name) and
                         !self.core.index_manager.vectorBlockReadyForDenseIndexAtSequence(
                             cfg.name,
@@ -42550,7 +42598,7 @@ pub const DB = struct {
                         item.hbc_posting = dbHbcPostingStats(try entry.index.postingBacklogStats(), entry.index.getWriteProfile());
                         item.hbc_posting.refresh_pending = entry.index.postingRefreshPending();
                         try self.markDenseCoverageRegressionIfNeeded(alloc, cfg.name, &item);
-                        if (async_indexing.dense_catch_up.active) {
+                        if (denseCatchUpAffectsIndex(item, async_indexing.dense_catch_up)) {
                             item.catch_up_active = true;
                             item.backfill_active = true;
                         }
@@ -43889,7 +43937,7 @@ pub const DB = struct {
         lockApplyShared(self);
         var apply_shared_held = true;
         errdefer if (apply_shared_held) self.core.unlockApplyShared();
-        const privacy_status_published = if (opts.privacy_status) privacy.requirePublished(self, alloc, .{}) catch |err| switch (err) {
+        const privacy_status_published = if (opts.privacy_status) privacy.requireConsumersPublishedWithBudget(self, alloc, .{}, &.{}, null) catch |err| switch (err) {
             error.IndexRebuilding => false,
             else => return err,
         } else false;
@@ -45994,49 +46042,9 @@ pub const DB = struct {
         return out;
     }
 
-    fn searchRequestRequiresComposedSearch(req: types.SearchRequest) bool {
-        if (req.full_text_queries.len > 0 or req.dense_queries.len > 0 or req.sparse_queries.len > 0) return true;
+    const searchRequestRequiresComposedSearch = @import("query/control_contract.zig").searchRequestRequiresComposedSearch;
 
-        var base_result_sets: u32 = 0;
-        if (req.full_text != null) base_result_sets += 1;
-        if (req.dense != null) base_result_sets += 1;
-        if (req.sparse != null) base_result_sets += 1;
-        switch (req.query) {
-            .dense_knn => base_result_sets += 1,
-            .sparse_knn => base_result_sets += 1,
-            else => {},
-        }
-        return base_result_sets > 1;
-    }
-
-    fn directSingleVectorRequest(req: types.SearchRequest) ?types.SearchRequest {
-        if (req.merge_config != null or req.reranker != null or req.pruner != null) return null;
-        if (req.full_text_queries.len != 0) return null;
-        if (req.full_text) |text| switch (text) {
-            .match_all => {},
-            else => return null,
-        };
-        if (!db_query_search.isDefaultMatchAll(req.query)) return null;
-        if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.expand_strategy != null) return null;
-        if (req.dense != null or req.sparse != null) return null;
-        if (req.dense_queries.len == 1 and req.sparse_queries.len == 0) {
-            var next = req;
-            next.index_name = req.dense_queries[0].index_name;
-            next.full_text = null;
-            next.dense = req.dense_queries[0].query;
-            next.dense_queries = &.{};
-            return next;
-        }
-        if (req.sparse_queries.len == 1 and req.dense_queries.len == 0) {
-            var next = req;
-            next.index_name = req.sparse_queries[0].index_name;
-            next.full_text = null;
-            next.sparse = req.sparse_queries[0].query;
-            next.sparse_queries = &.{};
-            return next;
-        }
-        return null;
-    }
+    const directSingleVectorRequest = @import("query/control_contract.zig").directSingleVectorRequest;
 
     fn searchComposed(
         self: *DB,
@@ -46709,7 +46717,8 @@ pub const DB = struct {
         return entry.config.name;
     }
 
-    pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+    pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, input: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        const req = directSingleVectorRequest(input) orelse input;
         if (comptime storage_engine.enabled) return storage_engine.call("collectSearchRequestTextStats", .{ self, alloc, req });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
@@ -46766,10 +46775,11 @@ pub const DB = struct {
     fn collectPlanningStatsLocked(
         self: *DB,
         alloc: Allocator,
-        req: types.SearchRequest,
+        input: types.SearchRequest,
         max_work: u32,
         exec_ctx: types.ExecutionContext,
     ) !planning_stats_mod.PlanningStatsSummary {
+        const req = directSingleVectorRequest(input) orelse input;
         _ = exec_ctx;
         try planning_bindings_mod.validateSearchRequestBindings(self.core, self.alloc, req);
         return try planning_adapter_mod.collectSearchRequestStatsAlloc(
@@ -46814,7 +46824,14 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{ .privacy_policy_version = privacy_policy_version });
+        var consumer_arena = std.heap.ArenaAllocator.init(alloc);
+        defer consumer_arena.deinit();
+        var consumers: std.ArrayList([]const u8) = .empty;
+        for (requests) |request| {
+            const entry = self.core.textIndexEntry(request.index_name) orelse return error.IndexNotFound;
+            try consumers.append(consumer_arena.allocator(), entry.config.name);
+        }
+        _ = try @import("privacy_read.zig").requireConsumersPublishedWithBudget(self, alloc, .{ .privacy_policy_version = privacy_policy_version }, consumers.items, null);
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -46840,7 +46857,14 @@ pub const DB = struct {
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
-        _ = try @import("privacy_read.zig").requirePublished(self, alloc, .{ .privacy_policy_version = privacy_policy_version });
+        var consumer_arena = std.heap.ArenaAllocator.init(alloc);
+        defer consumer_arena.deinit();
+        var consumers: std.ArrayList([]const u8) = .empty;
+        for (requests) |request| {
+            const entry = self.core.textIndexEntry(request.index_name) orelse return error.IndexNotFound;
+            try consumers.append(consumer_arena.allocator(), entry.config.name);
+        }
+        _ = try @import("privacy_read.zig").requireConsumersPublishedWithBudget(self, alloc, .{ .privacy_policy_version = privacy_policy_version }, consumers.items, null);
         return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -109017,7 +109041,7 @@ test "db run_until_idle does not hang on an edges-only row when a generated enri
     try std.testing.expect(std.mem.indexOf(u8, b_value, "hello") != null);
 }
 
-test "collectTextDocumentWritesForIndex tolerates a missing document only when told to give up" {
+test "collectTextDocumentWritesForIndex requires durable evidence before retiring a missing document" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -109029,13 +109053,8 @@ test "collectTextDocumentWritesForIndex tolerates a missing document only when t
     defer db.close();
     try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
 
-    // "doc:never" is targeted for full-text replay but was never written --
-    // the same shape a thin-replay-reconstructed synthetic upsert has for an
-    // `_edges`-only document (issue #938): no primary row will ever appear
-    // for it. Without tolerate_missing_replay_documents this is the ordinary
-    // "not visible yet, retry" signal; with it (set only after bounded
-    // retries on this exact window have been exhausted) it must be a no-op
-    // skip instead.
+    // Absence alone cannot distinguish a legitimate pending producer from
+    // a damaged source row. Both retain debt until evidence or repair arrives.
     const documents = [_]derived_types.DerivedDocument{.{
         .key = "doc:never",
         .targets = &.{.{ .kind = .full_text, .index_name = "ft_v1" }},
@@ -109066,18 +109085,16 @@ test "collectTextDocumentWritesForIndex tolerates a missing document only when t
             "ft_v1",
             false,
             db.core.index_manager.byte_range,
-            .{ .tolerate_missing_replay_documents = true },
+            .{},
         );
         defer collected.deinit();
-        try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+        try std.testing.expectEqual(@as(usize, 1), collected.missing_required);
         try std.testing.expectEqual(@as(usize, 0), collected.docs.items.len);
     }
 
-    // A skipped document is not silently lost: it is counted per owner and
-    // index, both directly and through the same status listDerivedReplayDebt
-    // surfaces.
+    // Retrying never records a successful skip or manufactures coverage.
     try std.testing.expectEqual(
-        @as(u64, 1),
+        @as(u64, 0),
         db.core.index_manager.resource_manager.?.replayDocumentNotVisibleSkippedTotal(
             resource_manager_mod.replayOwnerIdFromPtr(db.core.index_manager),
             "ft_v1",
@@ -109091,7 +109108,7 @@ test "collectTextDocumentWritesForIndex tolerates a missing document only when t
     var saw_ft_v1 = false;
     for (debt) |status| {
         if (!std.mem.eql(u8, status.index_name, "ft_v1")) continue;
-        try std.testing.expectEqual(@as(u64, 1), status.replay_document_not_visible_skipped);
+        try std.testing.expectEqual(@as(u64, 0), status.replay_document_not_visible_skipped);
         saw_ft_v1 = true;
     }
     try std.testing.expect(saw_ft_v1);
@@ -156408,4 +156425,422 @@ test "db commit requirements coverage candidates share pinned configuration acro
         try std.testing.expectEqual(config.ptr, candidate.request.source_template.ptr);
         try std.testing.expect(candidate.request.consumer_indexes.ptr != consumers[0..].ptr);
     }
+}
+
+test "db pending producer replay opens without claiming completion and resumes after input arrives" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
+    var sequence: u64 = 0;
+    {
+        var db = try DB.open(alloc, path, .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+        defer db.close();
+        try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+        const batch = derived_types.DerivedBatch{
+            .documents = &.{.{ .key = "pending", .targets = &.{.{ .kind = .dense_vector, .index_name = "dense" }} }},
+        };
+        sequence = db.core.store.reserveNextReplaySequence(1);
+        var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, sequence);
+        defer change_journal_mod.deinitRecord(alloc, &record);
+        const encoded = try change_journal_mod.encodeRecord(alloc, record);
+        defer alloc.free(encoded);
+        try replay_stream_mod.appendOpaque(alloc, db.core.store, sequence, encoded);
+    }
+    // The synchronous contract still exposes the exact pending dependency.
+    try std.testing.expectError(error.ReplayDocumentNotVisible, DB.open(alloc, path, .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } }));
+    var db = try DB.open(alloc, path, .{ .start_index_workers = true, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    {
+        const debt = try db.listDerivedReplayDebt(alloc);
+        defer {
+            for (debt) |*item| item.deinit(alloc);
+            alloc.free(debt);
+        }
+        var found = false;
+        for (debt) |item| if (std.mem.eql(u8, item.index_name, "dense")) {
+            found = true;
+            try std.testing.expect(item.catch_up_required);
+            try std.testing.expect(item.applied_sequence < sequence);
+        };
+        try std.testing.expect(found);
+    }
+    const stored = try internal_keys.documentKeyAlloc(alloc, "pending");
+    defer alloc.free(stored);
+    try db.core.store.putBatch(&.{.{ .key = stored, .value = "{\"embedding\":[1,0]}" }}, &.{});
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "pending", "dense");
+    defer alloc.free(artifact_key);
+    try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+    // This fixture writes below the normal commit notifier. Publish availability
+    // explicitly; a visibility wait alone must not invalidate dependency waits.
+    db.executor.notifySequence(sequence);
+    try db.runDerivedUntil(sequence);
+    const debt = try db.listDerivedReplayDebt(alloc);
+    defer {
+        for (debt) |*item| item.deinit(alloc);
+        alloc.free(debt);
+    }
+    for (debt) |item| if (std.mem.eql(u8, item.index_name, "dense")) {
+        try std.testing.expect(!item.catch_up_required);
+        try std.testing.expectEqual(sequence, item.applied_sequence);
+    };
+}
+
+test "db replay retires deleted parent chunks without resurrecting inline afterimages" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "parent", .value = "{\"body\":\"old\"}" }}, .sync_level = .full_index });
+    try db.batch(.{ .deletes = &.{"parent"}, .sync_level = .full_index });
+    const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "parent", "chunks", 0);
+    defer alloc.free(chunk);
+    const documents = [_]derived_types.DerivedDocument{ .{ .key = chunk }, .{ .key = chunk, .cleaned_value = "{\"text\":\"old\"}" } };
+    var collected = try collectDocumentWritesProfiled(alloc, db.core.store, db.core.index_manager, &documents, db.core.index_manager.byte_range, .{}, null);
+    defer collected.deinit();
+    try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+    try std.testing.expectEqual(@as(usize, 0), collected.items.len);
+}
+
+test "db replay retires deleted parent or certified chunk tail but rejects missing live members" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    const generations = @import("artifact_chunk_generation.zig");
+    const manifests = @import("artifact_chunk_manifest.zig");
+    const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "parent", "chunks", 0);
+    defer alloc.free(chunk);
+    const tail = try internal_keys.chunkArtifactKeyAlloc(alloc, "parent", "chunks", 1);
+    defer alloc.free(tail);
+    const scope = (try manifests.keyForMemberAlloc(alloc, chunk)).?;
+    defer alloc.free(scope);
+    var builder = manifests.Builder.init();
+    try builder.append(0, "accepted");
+    const spec = try generations.Spec.init(.{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) }, scope, @splat(3), builder.finish(), 1);
+    var plan = try generations.Plan.init(alloc, scope, spec);
+    defer plan.deinit();
+    const encoded = spec.encode();
+    try db.core.store.putBatch(&.{.{ .key = plan.head_key, .value = &encoded }}, &.{});
+    var collected = try collectDocumentWritesProfiled(alloc, db.core.store, db.core.index_manager, &.{.{ .key = tail }}, db.core.index_manager.byte_range, .{}, null);
+    defer collected.deinit();
+    try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+    try std.testing.expectEqual(@as(usize, 0), collected.items.len);
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, collectDocumentWritesProfiled(alloc, db.core.store, db.core.index_manager, &.{.{ .key = chunk }}, db.core.index_manager.byte_range, .{}, null));
+}
+
+test "db pending producer replay never ages missing full text input into completed coverage" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(path_tmp.path().ptr), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const sequence = db.core.store.reserveNextReplaySequence(1);
+    const batch = derived_types.DerivedBatch{ .documents = &.{.{ .key = "pending", .targets = &.{.{ .kind = .full_text, .index_name = "text" }} }} };
+    var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, sequence);
+    defer change_journal_mod.deinitRecord(alloc, &record);
+    const encoded = try change_journal_mod.encodeRecord(alloc, record);
+    defer alloc.free(encoded);
+    try replay_stream_mod.appendOpaque(alloc, db.core.store, sequence, encoded);
+    // Cross the old retry threshold without sleeping or running a worker.
+    const manager = db.core.index_manager.resource_manager.?;
+    const owner = resource_manager_mod.replayOwnerIdFromPtr(db.core.index_manager);
+    var attempts: usize = 0;
+    while (!manager.shouldEscalateReplayDocumentNotVisible(owner, "text", sequence)) : (attempts += 1) {
+        try std.testing.expect(attempts < 100_000);
+    }
+    try std.testing.expectError(error.ReplayDocumentNotVisible, db.runDerivedUntil(sequence));
+    try std.testing.expectEqual(@as(u64, 0), try db.core.loadAppliedSequence(alloc, "text"));
+    try std.testing.expectEqual(@as(u64, 0), manager.replayDocumentNotVisibleSkippedTotal(owner, "text"));
+    const stored = try internal_keys.documentKeyAlloc(alloc, "pending");
+    defer alloc.free(stored);
+    try db.core.store.putBatch(&.{.{ .key = stored, .value = "{\"body\":\"arrived\"}" }}, &.{});
+    try db.runDerivedUntil(sequence);
+    try std.testing.expectEqual(sequence, try db.core.loadAppliedSequence(alloc, "text"));
+}
+
+test "db dense index inspection does not expose unprotected or missing artifacts" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("dense-index-inspection");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+    try std.testing.expect((try db.getDocumentArtifactManifest(a, "missing", "dense")) == null);
+    try std.testing.expect((try db.getDocumentArtifactManifest(a, "missing", "absent")) == null);
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "dense");
+    defer a.free(asset_key);
+    try db.core.store.putBatch(&.{.{ .key = asset_key, .value = "{\"manifest_version\":2}" }}, &.{});
+    var busy = db.core.snapshot_replay_admission.acquireMutation();
+    defer busy.release();
+    var asset = (try db.getDocumentArtifactManifest(a, "doc", "dense")) orelse return error.TestUnexpectedResult;
+    defer asset.deinit(a);
+    try std.testing.expectEqualStrings("{\"manifest_version\":2}", asset.manifest_json);
+    var primary = db.core.snapshot_admission.tryAcquireCapture() orelse return error.TestUnexpectedResult;
+    primary.release();
+}
+
+test "db dense index inspection never certifies a missing protected vector" {
+    const a = std.testing.allocator;
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var directory = try TestDirectory.init("dense-index-inspection-pending");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface() } });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+    try addPrivacyAbsentFieldProducer(a, &db, "inspection");
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"safe\",\"version\":5}" }}, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    var result = (try db.getDocumentArtifactManifest(a, "doc", "dense")) orelse return error.TestUnexpectedResult;
+    defer result.deinit(a);
+    const parsed = try std.json.parseFromSlice(struct { current: bool, vectors: []const std.json.Value, document_json: []const u8 }, a, result.manifest_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.current);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.vectors.len);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.document_json, "safe") != null);
+}
+
+test "db dense index inspection binds current chunk vectors and never invokes inference" {
+    const a = std.testing.allocator;
+    const catalog = @import("../../privacy/catalog.zig");
+    const document = @import("../../privacy/document.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const policy = document.contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"absent"}, .category_groups = &.{}, .categories = &.{.{ .name = "email", .description = "inspection" }} };
+    const version = try policy.identity(scratch);
+    const root = try document.protectedArtifactName(scratch, version);
+    const embedding = try catalog.managedName(scratch, version, "dense");
+    const chunks = try std.fmt.allocPrint(scratch, "{s}_chunks", .{embedding});
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var embedder: CountingDenseEmbedder = .{};
+    var directory = try TestDirectory.init("dense-index-inspection-current");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface(), .dense_embedder = embedder.interface() } });
+    defer db.close();
+    try addPrivacyAbsentFieldProducer(a, &db, "inspection");
+    try db.addEnrichment(.{ .name = chunks, .kind = .chunk, .field = "body", .source_artifact_name = root, .chunk_size = 1024 });
+    try db.addEnrichment(.{ .name = embedding, .kind = .embedding, .field = "text", .source_artifact_name = chunks, .expected_dims = 3, .producer_json = "{\"provider\":\"antfly\",\"model\":\"model-B\"}" });
+    const config = try std.fmt.allocPrint(scratch, "{{\"field\":\"embedding\",\"dims\":3,\"sources\":[{{\"artifact\":\"{s}\"}}]}}", .{embedding});
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = config, .coverage_generation = 7 });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"Orchard guidance.\",\"version\":5}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    const inspection_budget = @import("artifact_scan_budget.zig");
+    var preflight_limited: inspection_budget.Budget = .{ .max_visits = 1, .max_bytes = 2 * 1024 * 1024 };
+    try std.testing.expectError(error.ResourceBudgetExceeded, @import("privacy_read.zig").requirePublishedWithBudget(&db, a, .{}, &preflight_limited));
+    var preflight_expired: inspection_budget.Budget = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.DeadlineExceeded, @import("privacy_read.zig").requirePublishedWithBudget(&db, a, .{}, &preflight_expired));
+    var policy_limited: inspection_budget.Budget = .{ .max_bytes = 1 };
+    try std.testing.expectError(error.ResourceBudgetExceeded, @import("privacy_read.zig").captureWithBudget(&db, a, &policy_limited));
+    // Vector coverage has no source-scope dependency. A plan without a
+    // completion graph and a single counter-read budget must suffice.
+    {
+        var coverage_read = try db.core.store.beginReadTxn();
+        defer coverage_read.abort();
+        var no_graph: index_manager_mod.IndexManager.WritePlanSnapshot = .{ .alloc = a, .generation = 1, .dense_fields = &.{}, .sparse_fields = &.{}, .graph_fields = &.{}, .generated_templates = &.{}, .chunk_dependents = &.{} };
+        var vector_budget: inspection_budget.Budget = .{ .max_visits = 2, .max_bytes = 4096 };
+        try std.testing.expect(try db.privacyLocalIndexSourcesCompleteWithBudget(a, &coverage_read, "dense", .dense_vector, &no_graph, &vector_budget));
+        try std.testing.expectEqual(@as(usize, 1), vector_budget.visits);
+    }
+    var replay_busy = db.core.snapshot_replay_admission.acquireMutation();
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.getDocumentArtifactManifest(a, "doc", "dense"));
+    replay_busy.release();
+    var released_primary = db.core.snapshot_admission.tryAcquireCapture() orelse return error.TestUnexpectedResult;
+    released_primary.release();
+    const Probe = struct {
+        db: *DB,
+        output_arena: *std.heap.ArenaAllocator,
+        captured: bool = false,
+        rendered: bool = false,
+        fn captureHook(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expect(!self.db.core.snapshot_admission.lock.tryLockShared());
+            try std.testing.expect(!self.db.core.snapshot_replay_admission.lock.tryLockShared());
+            self.captured = true;
+        }
+        fn renderHook(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try std.testing.expect(self.db.core.snapshot_admission.lock.tryLockShared());
+            self.db.core.snapshot_admission.lock.unlockShared();
+            try std.testing.expect(self.db.core.snapshot_replay_admission.lock.tryLockShared());
+            self.db.core.snapshot_replay_admission.lock.unlockShared();
+            // Only the outer manifest lookup key belongs to the output arena;
+            // capture payload and per-producer temporaries must be reclaimable.
+            try std.testing.expect(self.output_arena.queryCapacity() < 4096);
+            self.rendered = true;
+        }
+    };
+    var output_arena = std.heap.ArenaAllocator.init(a);
+    defer output_arena.deinit();
+    var probe: Probe = .{ .db = &db, .output_arena = &output_arena };
+    const inspection = @import("dense_index_inspection.zig");
+    inspection.test_after_open = .{ .context = &probe, .run = Probe.captureHook };
+    inspection.test_before_render = .{ .context = &probe, .run = Probe.renderHook };
+    defer {
+        inspection.test_after_open = null;
+        inspection.test_before_render = null;
+    }
+    var arena_result = (try db.getDocumentArtifactManifest(output_arena.allocator(), "doc", "dense")) orelse return error.TestUnexpectedResult;
+    arena_result.deinit(output_arena.allocator());
+    try std.testing.expect(probe.captured and probe.rendered);
+    inspection.test_after_open = null;
+    inspection.test_before_render = null;
+    const calls_before_inspection = embedder.calls;
+    var result = (try db.getDocumentArtifactManifest(a, "doc", "dense")) orelse return error.TestUnexpectedResult;
+    defer result.deinit(a);
+    const View = struct { current: bool, index_generation: u64, vectors: []const struct { model: []const u8, source_text: []const u8, values: []const f32 } };
+    const parsed = try std.json.parseFromSlice(View, a, result.manifest_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.current);
+    try std.testing.expectEqual(@as(u64, 7), parsed.value.index_generation);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.vectors.len);
+    try std.testing.expectEqualStrings("model-B", parsed.value.vectors[0].model);
+    try std.testing.expectEqualStrings("Orchard guidance.", parsed.value.vectors[0].source_text);
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.vectors[0].values.len);
+    try std.testing.expectEqual(calls_before_inspection, embedder.calls);
+    const expected = try embedder_mod.DeterministicDenseEmbedder.embedDense(&embedder.deterministic, a, embedding, "Orchard guidance.", 3);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(f32, expected, parsed.value.vectors[0].values);
+    // Empty unit heads produce no output, but still consume cursor work. One
+    // shared visit budget must stop them before an unbounded manifest walk.
+    const manifests = @import("artifact_chunk_manifest.zig");
+    const generations = @import("artifact_chunk_generation.zig");
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        for (0..1024) |i| {
+            var unit_buf: [32]u8 = undefined;
+            const unit = try std.fmt.bufPrint(&unit_buf, "empty-{d:0>4}", .{i});
+            const scope = try manifests.scopedKeyAlloc(a, "doc", chunks, unit);
+            defer a.free(scope);
+            const spec = try generations.Spec.init(.{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) }, scope, @splat(3), manifests.Builder.init().finish(), 1);
+            var plan = try generations.Plan.init(a, scope, spec);
+            defer plan.deinit();
+            const encoded = spec.encode();
+            try txn.put(plan.head_key, &encoded);
+        }
+        try txn.commit();
+    }
+    try std.testing.expectError(error.ResourceBudgetExceeded, db.getDocumentArtifactManifest(a, "doc", "dense"));
+    try db.batch(.{ .deletes = &.{"doc"}, .sync_level = .write });
+    try std.testing.expect((try db.getDocumentArtifactManifest(a, "doc", "dense")) == null);
+}
+
+test "privacy scoped readiness serves A while sibling B backfills" {
+    const a = std.testing.allocator;
+    const catalog = @import("../../privacy/catalog.zig");
+    const document = @import("../../privacy/document.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const policy = document.contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"absent"}, .category_groups = &.{}, .categories = &.{.{ .name = "email", .description = "scoped" }} };
+    const version = try policy.identity(scratch);
+    const root = try document.protectedArtifactName(scratch, version);
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var embedder: CountingDenseEmbedder = .{};
+    var directory = try TestDirectory.init("privacy-scoped-readiness");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface(), .dense_embedder = embedder.interface() } });
+    defer db.close();
+    try addPrivacyAbsentFieldProducer(a, &db, "scoped");
+    const embeddings = [_][]const u8{ try catalog.managedName(scratch, version, "A"), try catalog.managedName(scratch, version, "B") };
+    for ([_][]const u8{ "A", "B" }, embeddings, 0..) |name, embedding, i| {
+        const chunks = try std.fmt.allocPrint(scratch, "{s}_chunks", .{embedding});
+        try db.addEnrichment(.{ .name = chunks, .kind = .chunk, .field = "body", .source_artifact_name = root, .chunk_size = 1024 });
+        try db.addEnrichment(.{ .name = embedding, .kind = .embedding, .field = "text", .source_artifact_name = chunks, .expected_dims = 3, .producer_json = "{\"provider\":\"antfly\",\"model\":\"fixture\"}" });
+        const config = try std.fmt.allocPrint(scratch, "{{\"field\":\"embedding\",\"dims\":3,\"sources\":[{{\"artifact\":\"{s}\"}}]}}", .{embedding});
+        try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config, .coverage_generation = i + 1 });
+        const text_name = if (i == 0) "text-A" else "text-B";
+        const text_config = try std.fmt.allocPrint(scratch, "{{\"sources\":[{{\"artifact\":\"{s}\",\"field\":\"text\"}}]}}", .{chunks});
+        // Keep a populated primary text index as A's independent match-all
+        // lane, and an unfinished artifact-backed text B for filter fencing.
+        try db.addIndex(.{ .name = text_name, .kind = .full_text, .config_json = if (i == 0) "{}" else text_config });
+        if (i == 0) {
+            try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"Orchard guidance.\"}" }}, .sync_level = .write });
+            try db.runUntilIdle();
+            var baseline_text = try db.search(a, .{ .index_name = "text-A" });
+            defer baseline_text.deinit();
+            try std.testing.expectEqual(@as(usize, 1), baseline_text.hits.len);
+        }
+    }
+    const vector = try embedder_mod.DeterministicDenseEmbedder.embedDense(&embedder.deterministic, scratch, embeddings[0], "Orchard guidance.", 3);
+    const req: types.SearchRequest = .{ .index_name = "A", .dense = .{ .vector = vector, .k = 1 }, .include_stored = true };
+    const calls = embedder.calls;
+    var result = try db.search(a, req);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc", result.hits[0].id);
+    try std.testing.expectEqual(calls, embedder.calls);
+    var pending = req;
+    pending.index_name = "B";
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, pending));
+    var direct = req;
+    direct.dense = null;
+    direct.query = .{ .dense_knn = req.dense.? };
+    var direct_result = try db.search(a, direct);
+    defer direct_result.deinit();
+    var named = req;
+    named.dense = null;
+    named.index_name = null;
+    named.dense_queries = &.{.{ .name = "ready", .index_name = "A", .query = req.dense.? }};
+    var named_result = try db.search(a, named);
+    defer named_result.deinit();
+    // Execution removes this text sentinel; admission must remove it too.
+    var sentinel = named;
+    sentinel.index_name = "text-B";
+    sentinel.full_text = .{ .match_all = {} };
+    var sentinel_result = try db.search(a, sentinel);
+    defer sentinel_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), sentinel_result.hits.len);
+    const stats = try db.collectSearchRequestTextStats(a, sentinel);
+    try std.testing.expectEqual(@as(usize, 0), stats.len);
+    // Real text filters remain dependencies even on the optimized vector lane.
+    sentinel.primary_text_index_name = "text-B";
+    sentinel.filter_text = .{ .match_all = {} };
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, sentinel));
+    // Default match-all is a text read, not an all-index status observation.
+    var text_result = try db.search(a, .{ .index_name = "text-A" });
+    defer text_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), text_result.hits.len);
+    named.dense_queries = &.{ .{ .name = "ready", .index_name = "A", .query = req.dense.? }, .{ .name = "pending", .index_name = "B", .query = req.dense.? } };
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, named));
+    var stale = req;
+    stale.privacy_policy_version = @splat('0');
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, stale));
+    const checkpoint = try db.core.loadProjectionCheckpoint(a, "A");
+    var dirty = checkpoint;
+    dirty.status = .rebuilding;
+    try db.core.saveProjectionCheckpoint("A", dirty);
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, req));
+    try db.core.saveProjectionCheckpoint("A", checkpoint);
+    var manifest = (try db.getDocumentArtifactManifest(a, "doc", "A")).?;
+    defer manifest.deinit(a);
+    const inspected = try std.json.parseFromSlice(struct { current: bool }, a, manifest.manifest_json, .{ .ignore_unknown_fields = true });
+    defer inspected.deinit();
+    try std.testing.expect(inspected.value.current);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"Changed orchard.\"}" }}, .sync_level = .write });
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, req));
+    try db.runUntilIdle();
+    var ready_a = try db.search(a, req);
+    defer ready_a.deinit();
+    var ready_b = try db.search(a, pending);
+    defer ready_b.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ready_a.hits.len);
+    try std.testing.expectEqual(@as(usize, 1), ready_b.hits.len);
+}
+
+test "privacy scoped readiness status isolates shared catch-up telemetry" {
+    const a: types.DBIndexStats = .{ .name = "A", .kind = .dense_vector, .replay_applied_sequence = 10, .replay_target_sequence = 10, .projection_checkpoint_status = "clean" };
+    const progress: types.DenseCatchUpStats = .{ .active = true, .phase = .replay, .current_sequence = 2, .current_target_sequence = 500 };
+    try std.testing.expect(!DB.denseCatchUpAffectsIndex(a, progress));
+    var pending = a;
+    pending.replay_target_sequence = 11;
+    try std.testing.expect(DB.denseCatchUpAffectsIndex(pending, progress));
+    pending = a;
+    pending.projection_checkpoint_status = "rebuilding";
+    try std.testing.expect(DB.denseCatchUpAffectsIndex(pending, progress));
+    try std.testing.expect(!DB.denseCatchUpAffectsIndex(pending, .{}));
 }

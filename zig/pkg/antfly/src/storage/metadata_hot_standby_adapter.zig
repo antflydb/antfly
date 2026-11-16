@@ -48,7 +48,7 @@ pub const Adapter = struct {
         const mirror = cast(ptr).mirror orelse return error.MetadataHAOutboxPending;
         return .{ .next_lsn = mirror.publisher.nextLsn(), .timeline_id = mirror.publisher.identity().timeline_id, .epoch = mirror.publisher.identity().epoch };
     }
-    fn publishAndLock(ptr: *anyopaque, raw: []const u8) !void {
+    fn publishAndLock(ptr: *anyopaque, raw: []const u8, wait_for_apply: bool) !void {
         const self = cast(ptr);
         const mirror = self.mirror orelse return error.MetadataHAOutboxPending;
         if (raw.len < 24) return error.InvalidMetadataHAEffect;
@@ -80,7 +80,7 @@ pub const Adapter = struct {
         unlock(ptr);
         locked = false;
         if (hot_standby_publisher_adapter.options(mirror).sync_policy.mode != .async) {
-            if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| try wait(hot_standby_publisher_adapter.options(mirror).sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
+            if (wait_for_apply) if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| try wait(hot_standby_publisher_adapter.options(mirror).sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
             const decision = try @import("hot_standby/commit_gate.zig").evaluate(try hot_standby_publisher_adapter.runtimePrimary(mirror), lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
             if (!decision.shouldAcknowledge()) return error.HASyncCommitWouldBlock;
         }

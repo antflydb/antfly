@@ -7621,6 +7621,14 @@ pub const DataServer = struct {
     /// visible catalog record is already in this log frontier. Reuse the normal
     /// RemoteApply wait rather than treating a primary-local lookup as proof.
     pub fn acknowledgeHotStandbyExistingCatalog(self: *DataServer) !void {
+        return self.observeHotStandbyExistingCatalog(true);
+    }
+
+    pub fn pollHotStandbyExistingCatalog(self: *DataServer) !void {
+        return self.observeHotStandbyExistingCatalog(false);
+    }
+
+    fn observeHotStandbyExistingCatalog(self: *DataServer, wait_for_apply: bool) !void {
         const commit: HotStandbyCatalogCommit = blk: {
             platform_sync.lockYielding(&self.hot_standby_state_mutex);
             defer self.hot_standby_state_mutex.unlock();
@@ -7631,18 +7639,22 @@ pub const DataServer = struct {
                 return error.HACatalogRequiresWholeInstance;
             break :blk .{ .mirror = mirror, .generation = generation, .lsn = (try hot_standby_publisher_adapter.runtimePrimary(mirror)).lastLsn() };
         };
-        try self.acknowledgeHotStandbyCatalogCreate(commit);
+        try self.observeHotStandbyCatalogCreate(commit, wait_for_apply);
     }
 
     /// Local catalog publication has completed. A remote timeout leaves an
     /// uncertain client outcome, but must not undo committed catalog state or
     /// require a process restart when the standby becomes available again.
     pub fn acknowledgeHotStandbyCatalogCreate(self: *DataServer, commit: HotStandbyCatalogCommit) !void {
+        return self.observeHotStandbyCatalogCreate(commit, true);
+    }
+
+    fn observeHotStandbyCatalogCreate(self: *DataServer, commit: HotStandbyCatalogCommit, wait_for_apply: bool) !void {
         const mirror = commit.mirror;
         // Do not hold the transition mutex while waiting for receiver acks.
-        if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| {
+        if (wait_for_apply) if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| {
             try wait(hot_standby_publisher_adapter.options(mirror).sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, commit.lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
-        }
+        };
         platform_sync.lockYielding(&self.hot_standby_state_mutex);
         defer self.hot_standby_state_mutex.unlock();
         try self.hot_standby_public_gate_state.checkWrite(commit.generation);

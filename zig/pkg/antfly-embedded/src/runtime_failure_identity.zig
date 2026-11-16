@@ -31,6 +31,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .replay_document_not_visible, .err = error.ReplayDocumentNotVisible },
     .{ .status = .storage_descriptor_pressure, .err = error.StorageDescriptorPressure },
     .{ .status = .process_fd_quota_exceeded, .err = error.ProcessFdQuotaExceeded },
     .{ .status = .system_fd_quota_exceeded, .err = error.SystemFdQuotaExceeded },

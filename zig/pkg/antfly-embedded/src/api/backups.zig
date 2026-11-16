@@ -2615,7 +2615,13 @@ pub fn localArtifactStatsEqual(
 
 pub fn createTableRequestFromManifest(alloc: std.mem.Allocator, manifest: *const TableBackupManifest) !tables_api.CreateTableRequest {
     if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
-    const indexes = try @import("../privacy/catalog.zig").prepareRestore(alloc, manifest.indexes_json);
+    const privacy_indexes = try @import("../privacy/catalog.zig").prepareRestore(alloc, manifest.indexes_json);
+    defer alloc.free(privacy_indexes);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var nonce: [32]u8 = undefined;
+    try @import("antfly_platform").entropy.fill(io_impl.io(), &nonce);
+    const indexes = try @import("index_aliases.zig").renewRestoreEpoch(alloc, privacy_indexes, &std.fmt.bytesToHex(nonce, .lower));
     errdefer alloc.free(indexes);
     try tables_api.validateStoredIndexesJson(alloc, indexes);
     return .{

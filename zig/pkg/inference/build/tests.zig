@@ -191,6 +191,28 @@ pub fn create(ctx: Context) Suite {
         run_cli_tests.addArgs(&.{ "--test-filter", filter });
     }
     build_test_filters.addRuntimeControls(run_cli_tests, ctx.args orelse &.{});
+    // Keep the Gemma CUDA upload/dispatch regression loop independent of
+    // unrelated library suites, while retaining the normal runtime imports.
+    const gemma_cuda_tests = b.addTest(.{
+        .root_module = tests.root_module,
+        .filters = &.{ "Gemma4 CUDA", "embeddinggemma2 CUDA model constants", "embeddinggemma2 CUDA constant snapshots", "generated CUDA tiled64", "generated CUDA score prework", "generated CUDA paged score prework", "E4B shared KV prefill", "detect clip gemma4", "warm generator admission metadata", "explicit load policy placement", "model selection resident sessions and load flights", "compatibility signature", "compatibility backend candidates", "CUDA greedy graph output", "CUDA suppressed argmax", "CUDA graph", "clearing CUDA graph capture", "CUDA persistent buffer reallocation", "split-K replay rejection", "uncompressed CUDA KV capacity", "CUDA capture defaults", "CUDA temp arena" },
+        .test_runner = runtime_filter_test_runner,
+        .max_rss = 7 * 1024 * 1024 * 1024,
+    });
+    ctx.step("test-gemma4-cuda", "Verify Gemma CUDA raw weights, compact projector and attention dispatch")
+        .dependOn(&ctx.addRunArtifact(gemma_cuda_tests).step);
+
+    const gemma_ple_host_tests = b.addTest(.{
+        .root_module = tests.root_module,
+        .filters = &.{ "Gemma4 CUDA host PLE", "admission lease releases transient", "admission resource budget mirrors", "embeddinggemma2 stage supplements", "embeddinggemma2 stage admission reduces", "reader admitted owner caches domain" },
+        .test_runner = runtime_filter_test_runner,
+        .max_rss = @as(usize, if (ctx.backend.enable_cuda and ctx.target.result.cpu.arch == .aarch64) 16 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_gemma_ple_host_tests = ctx.addRunArtifact(gemma_ple_host_tests);
+    build_test_filters.addRuntimeControls(run_gemma_ple_host_tests, ctx.args orelse &.{});
+    ctx.step("test-gemma4-ple-host", "Verify mapped PLE ownership, admission, gathers and CUDA graph replay")
+        .dependOn(&run_gemma_ple_host_tests.step);
+
     const run_tests = ctx.addRunArtifact(tests);
     const evidence_module = b.createModule(.{
         .root_source_file = ctx.path("src/pipelines/grammar.zig"),
@@ -426,7 +448,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
         .name = "gliner25-decide-cuda-serving-tests",
         .max_rss = 11 * 1024 * 1024 * 1024,
         .root_module = suite.tests.root_module,
-        .filters = &.{ "Decide CUDA serving required artifact", "GLiNER production CUDA distinct input batches Decide", "qualified FP32 attention policy", "Decide Q8 CUDA qualification binds", "Decide CUDA legacy geometry", "Decide Q8 projection mirrors", "Decide Q8 mirror admission", "GLiNER Decide CUDA Q8 half staging", "GLiNER Decide CUDA Q8 execution mirror" },
+        .filters = &.{ "Decide CUDA serving required artifact", "Decide CUDA execution batches", "model listing reports an unreadable model", "executor contract failures preserve", "gliner span configuration diagnostics", "span GLiNER native config", "always-download files pull the GLiNER2.5 boundary encoder", "GLiNER production CUDA distinct input batches Decide", "qualified FP32 attention policy", "Decide Q8 CUDA qualification binds", "Decide CUDA legacy geometry", "Decide Q8 projection mirrors", "Decide Q8 mirror admission", "GLiNER Decide CUDA Q8 half staging", "GLiNER Decide CUDA Q8 execution mirror" },
         .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
     });
     ctx.step("gliner25-decide-cuda-serving-test-build", "Build focused original Decide CUDA batch and cancellation tests").dependOn(&b.addInstallArtifact(decide_serving_tests, .{}).step);

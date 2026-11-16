@@ -1,8 +1,89 @@
 # CUDA Tuning Profile
 
-Gemma 4 QAT CUDA measurements must use the shared profile in
-`scripts/gemma4/gemma4_qat_cuda_tuning.sh`. The CLI benchmark and server wrapper both
-source it so production route settings stay aligned.
+The shared Gemma 4 QAT CLI/E2B release lane uses the profile in
+`scripts/gemma4/gemma4_qat_cuda_tuning.sh`. Its CLI benchmark and server wrapper
+both source it so production route settings stay aligned. The separately
+qualified E4B native HTTP profile below uses its own explicit settings; do not
+combine the two profiles.
+
+## Gemma 4 E4B QAT native HTTP on L4
+
+The [2026-11-15 L4 report](scripts/gemma4/qualification/e4b-qat-l4-http-20261115.md)
+records three alternating fresh lifecycles, 105 requests per engine, identical
+Q4_0 GGUF artifacts, matched prompt counts and fixed output lengths. With the
+opt-in [E4B L4 profile](scripts/gemma4/gemma4_e4b_qat_l4.env), F16 K/V and a
+4096 MiB scratch admission ceiling, median HTTP latency is 1.004–1.037× faster
+than llama.cpp b12387 across the five text/image/audio workloads. The long-text
+result is near parity. TTFT remains higher on all five workloads, so these
+fixed-output results do not establish a latency win for short early-EOS replies.
+
+Maximum simultaneous process-tree PSS plus NVML usage is 8.540 GB versus
+8.586 GB; maximum VRAM is higher, 7.508 GB versus 4.593 GB. The combined
+footprint excludes unmapped reclaimable OS file-cache pages. The reference uses
+`--image-min-tokens 256 --image-max-tokens 280` to match prepared image grids.
+Repository media substitutes and reconstructed text fixtures make this a local
+comparison, rather than an exact reproduction of the release-page corpus.
+
+The report and accompanying JSON retain settings, hashes, raw timings,
+lifecycle medians, numerical checks and known quality failures. Source the
+profile before starting a dedicated E4B process; the report includes the
+paired runner and strict validation commands. This evidence is scoped to the
+E4B/L4 HTTP configuration and does not replace the E2B or GB10 promotion gates.
+
+## Optional E4B PLE host placement
+
+`ANTFLY_INFERENCE_CUDA_GEMMA4_PLE_HOST=1` keeps the dense E4B Q6_K
+per-layer token-embedding table in mapped, pinned host memory. Existing CUDA
+prefill and device-token decode gathers read the original quantized bytes;
+no CPU token readback or new quantization is introduced. Other weights and
+Metal placement retain their existing policy. The default is off pending
+latency qualification on a discrete GPU.
+
+For the qualified E4B artifact the table occupies 2,312,110,080 bytes. Host
+placement removes that device allocation and retains the same number of
+pinned host bytes. This shifts memory between domains; it does not establish
+a reduction in total physical memory. Construction admission covers the
+source mapping and pinned copy simultaneously in one atomic reservation, then
+splits out an independently owned host lease without acquiring capacity again.
+External process budgets see the full peak once and retain one receipt through
+both owners. That host lease owns the table through its physical free, including
+failed construction or unload.
+Failed waits/frees retain the allocation, accounting domain, driver library and
+exact primary-context reference in a process retirement queue. Host-pressure
+admission reclaims that queue before evicting useful models, under protected
+native cleanup or the embedded host's explicit in-process policy. CUDA
+initialization and mapped-host allocation also retry it. Driver waits and budget
+callbacks run outside the queue metadata lock; an empty queue has an atomic
+fast path. Device construction admission
+excludes the offloaded table using the same model geometry and residency policy
+as upload. A host budget that fits the device-only profile may
+need additional capacity. Missing mapped-host driver support or allocation
+failure rejects the explicit placement rather than bypassing admission.
+
+Use `ANTFLY_INFERENCE_CUDA_GEMMA4_MEMORY_STATS=1` to log device allocation
+live/peak bytes, resident device weights, host PLE bytes, projector cache,
+idle temporaries, pinned temporaries and deferred frees at request boundaries.
+These managed allocation counters exclude CUDA/vendor-internal allocations;
+retain NVML process measurements as well on discrete GPUs.
+
+`test-gemma4-ple-host` checks host-buffer retirement, GGUF/admission accounting,
+bitwise prefill/device-token gathers and captured fused PLE decode. The
+same-binary comparison runner `scripts/gemma4/benchmark_cuda_ple_host.py`
+alternates fresh device/host lifecycles on the portable HTTP fixtures and
+requires identical output text, reasoning and complete usage dictionaries. It
+validates the expected encoded host-table bytes consistently after loading and
+requires zero host-table bytes throughout the device arm. All-device NVML
+compute-process sampling runs throughout each arm at 0.2-second intervals;
+monitoring errors fail validation. Sampling cannot exclude shorter activity.
+It refuses observed GPU cotenants unless explicitly requested as a diagnostic;
+`--allow-cotenant` always prevents an uncontended claim. GB10 has unified
+memory, so its allocation counters and timings cannot qualify L4 VRAM or PCIe
+latency; do not add its PSS and NVML figures into a combined footprint claim.
+
+The [GB10 validation report](scripts/gemma4/qualification/e4b-ple-host-gb10-20261115.md)
+records 60 exact-match HTTP responses and a 2,312,110,080-byte reduction in
+managed CUDA peak allocations. Its latency measurements were contended and
+do not qualify L4 performance; host placement remains opt-in.
 
 ## EmbeddingGemma 2 CUDA image residency
 

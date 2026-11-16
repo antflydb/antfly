@@ -12,6 +12,10 @@ and decoding retain the shared bounded host stages and transfer diagnostics.
 
 The pinned original DeBERTa FP32 and split Q8_0 artifacts accept up to 32
 classification inputs, executed in physical batches of at most eight rows.
+The authenticated execution policy applies to HTTP, `LoadedModel.glinerPipeline`,
+and the loaded-model benchmark. Benchmark `--microbatch` values above eight are
+clamped; smaller explicit limits remain available. Each physical CUDA batch is
+also bounded to 4,096 padded tokens (eight rows at the qualified 512-token limit).
 Both retain FP32 attention, including the 128–256-token region where generic
 DeBERTa execution can select FP16 attention. The FP32 artifact uses FP32 cuBLAS
 projections. The Q8 artifact retains its quantized tensors and adds bounded,
@@ -33,7 +37,8 @@ ANTFLY_GLINER_DECIDE_Q8_MODEL=/path/to/published-q8 \
 ```
 
 The focused gate requires both real artifacts and checks mixed-schema order,
-physical batch bounds, rejection at 33, and queued cancellation without CUDA
+physical batch bounds, a loaded-model batch-32 check requiring four physical
+forwards for both FP32 and Q8, rejection at 33, and queued cancellation without CUDA
 launches or leaked admission leases. It excludes the unrelated base/multi-model
 serving closure. For the FP32 attention boundary regression on SM89, run:
 
@@ -43,6 +48,21 @@ python zig/pkg/inference/scripts/gliner25/verify_decide_lengths_cuda.py \
   --native zig-out/bin/antfly-inference-gliner25-decide-bench \
   --http zig-out/bin/antfly-inference-http-server --out /path/to/new-length-results
 ```
+
+To inspect the direct benchmark's batch policy on the 32-input short fixture:
+
+```sh
+zig-out/bin/antfly-inference-gliner25-decide-bench \
+  --model-dir /path/to/original-fp32 --backend cuda \
+  --cases zig/pkg/inference/scripts/gliner25/fixtures/decide_metal_workloads.json \
+  --case 2 --microbatch 64 --warmup 1 --reps 3
+```
+
+The fixture format is shared across backends. For either pinned FP32 or Q8,
+`physical_batch_limit` must be 8, `physical_batch_token_limit` must be 4,096,
+and `cuda_transfers.downloads` must be 16: four physical forwards for each of
+one warmup and three measured calls. Omitting `--microbatch` has the same
+limits; `--microbatch 4` retains the smaller limit and produces 32 downloads.
 
 `benchmark_decide_hotel_cuda.py` compares warm HTTP or loaded-model latency to
 upstream Python, with fresh alternating processes and process-attributed PSS +

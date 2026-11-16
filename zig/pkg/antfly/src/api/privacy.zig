@@ -147,6 +147,7 @@ fn availabilityResponse(a: A, code: []const u8, message: []const u8) !Response {
 // authored-policy CAS failures must retain their distinct retry semantics.
 fn failureResponse(a: A, err: anyerror) !Response {
     return switch (err) {
+        error.IndexReferencedByAlias, error.IndexAliasGraphConflict => failure(a, 409, @errorName(err), "The policy changes an aliased consumer generation. Remove or move its index alias before replacing the policy, then wait for protected index completeness before rebinding."),
         error.PrivacyPreconditionRequired => failure(a, 428, "privacy_precondition_required", "Replacing a policy requires its exact If-Match ETag."),
         error.PrivacyPreconditionFailed => failure(a, 412, "privacy_precondition_failed", "The policy changed; reload it before saving."),
         error.PrivacyCheckpointCapacityExceeded => failure(a, 422, "privacy_checkpoint_capacity_exceeded", "This table has reached its checkpoint byte budget; allow cleanup to finish and use fewer or smaller concurrent range scans before retrying."),

@@ -27747,3 +27747,9 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attent
 // Keep additional Gemma4 entry points after the existing bundle to preserve kernel numbering.
 #include "../kernels/rms_q8_1_2560.cuh"
 #include "../kernels/gemma4_e4b_prefetch.cuh"
+
+#include "../kernels/gemma4_q4_prefill.cuh"
+
+#include "../kernels/gemma4_vision_norm_rope.cuh"
+
+#include "../kernels/gemma4_vision_attention.cuh"

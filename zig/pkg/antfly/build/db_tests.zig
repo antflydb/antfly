@@ -16,6 +16,7 @@
 const std = @import("std");
 const addRuntimeTestFilters = @import("../../../build_support/antfly/test_support.zig").addRuntimeTestFilters;
 const compileFiltersWithAnchors = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors;
+const addFilteredTestRunArtifactWithRuntimeFilters = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters;
 const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifact;
 const addCuratedTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact;
 const selectTestFilters = @import("../../../build_support/antfly/test_support.zig").selectTestFilters;
@@ -889,6 +890,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_db_result_shape_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{
+            "externalizeSearchResultArtifactIds",
             "native asset members hydrate source authority and revision identity",
             "native unit ancestry uses its configured producer name",
             "native member logical filters use parent values and shared verification budgets",
@@ -942,6 +944,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_lib_db_result_shape_tests = addFilteredTestRunArtifact(b, lib_db_result_shape_tests);
     lib_db_query_step.dependOn(&run_lib_db_result_shape_tests.step);
+    const alias_provenance_run = addFilteredTestRunArtifactWithRuntimeFilters(b, lib_db_result_shape_tests, &.{"externalizeSearchResultArtifactIds"});
+    b.step("antfly-index-alias-provenance-test", "Verify repeated member identity conversion and allocation cleanup")
+        .dependOn(&alias_provenance_run.step);
 
     const lib_db_reopen_tests = b.addTest(.{
         .root_module = antfly_test_mod,

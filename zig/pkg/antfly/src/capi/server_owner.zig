@@ -1940,6 +1940,10 @@ pub fn metadataApplyStoreProjection(
             };
             break :blk metadataProjectionJson(alloc, out_json, result);
         },
+        .poll_ha_outbox => blk: {
+            handle.store.pollHotStandbyOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
         .flush_ha_outbox => blk: {
             handle.store.flushHotStandbyOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
@@ -2266,6 +2270,24 @@ pub fn metadataApplyStoreProjection(
                 .sql_policy_begin_command => |input| {
                     const value = handle.store.sqlPolicyBeginCommandJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .has_index_aliases => {
+                    const value = handle.store.hasIndexAliases(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .has_index_alias_lifecycle_state => {
+                    const value = handle.store.hasIndexAliasLifecycleState(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .validate_table_index_mutation => |input| {
+                    const Validation = @import("../metadata/storage/raft_apply_contract.zig").TableIndexMutationValidation;
+                    const result: Validation = result: {
+                        handle.store.validateTableIndexMutation(group_id, input.before, input.after) catch |err| {
+                            break :result Validation.fromError(err) orelse break :blk storageOwnerStatusFromError(err);
+                        };
+                        break :result .valid;
+                    };
+                    break :blk metadataProjectionJson(alloc, out_json, result);
                 },
                 .require_policy_index_mutation_allowed => |input| {
                     handle.store.requirePolicyIndexMutationAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);

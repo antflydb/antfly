@@ -76,6 +76,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const privacy_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{ "privacy", "artifact publication upload", "ordered artifact inventory publication queue", "snappy", "lsm.table_file", "vector replay coalescing cancels and revives" } });
     const privacy_step = b.step("antfly-privacy-test", "Run privacy scan, evidence and transport fence contracts");
     privacy_step.dependOn(&b.addRunArtifact(privacy_tests).step);
+    const privacy_transition_tests = b.addTest(.{
+        .root_module = privacy_mod,
+        .filters = &.{ "privacy API and transport contracts", "privacy policy replacement", "privacy new index migration", "privacy model migration", "index alias legacy incarnation", "index alias conditional deletion", "alias deletion rejects validators" },
+    });
+    b.step("antfly-privacy-transition-test", "Verify policy generation replacement and protected model migration")
+        .dependOn(&b.addRunArtifact(privacy_transition_tests).step);
+
     const owner_readiness_transport_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{"privacy compact owner readiness transport"} });
     b.step("cypher-owner-readiness-transport-test", "Verify compact selected-owner HTTP transport budgets and namespaces")
         .dependOn(&b.addRunArtifact(owner_readiness_transport_tests).step);
@@ -474,10 +481,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const alias_http_tests = b.addTest(.{
         .name = "index-alias-http-tests",
         .root_module = options.api_http_runtime_test_mod,
-        .filters = &.{"index alias"},
+        .filters = &.{ "index alias", "typed internal HTTP errors preserve conflict semantics", "hot-standby mutation inventory JSON", "hot-standby public non-GET route matrix" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
-    const run_alias_http_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, alias_http_tests, &.{"index alias"});
+    const run_alias_http_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, alias_http_tests, &.{ "index alias", "typed internal HTTP errors preserve conflict semantics", "hot-standby mutation inventory JSON", "hot-standby public non-GET route matrix" });
     b.step("antfly-index-alias-http-test", "Verify alias routes, table permissions and readiness over HTTP").dependOn(&run_alias_http_tests.step);
     lib_api_auth_test_step.dependOn(&run_alias_http_tests.step);
 
@@ -1757,6 +1764,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-table-write-implementation-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const alias_hierarchy_run = b.addRunArtifact(write_implementation_tests);
+    @import("../../../build_support/antfly/test_support.zig").configureTestRun(alias_hierarchy_run);
+    alias_hierarchy_run.addArgs(&.{ "--test-filter", "hosted distributed grouped hierarchy expands the globally selected shard page" });
+    b.step("antfly-index-alias-hierarchy-test", "Verify grouped member provenance across shard and coordinator shaping")
+        .dependOn(&alias_hierarchy_run.step);
     const evaluation_graph_step = b.step("inference-evaluation-graph-test", "Verify final-ranked graph starts in public and cross-range queries");
     const evaluation_public_graph = b.addRunArtifact(if (focused_public_api_compile) public_api_parity_tests else public_api_integration.executable);
     evaluation_public_graph.addArgs(&.{ "--test-filter", "public api integration supports hybrid query pruner and reranker" });

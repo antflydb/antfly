@@ -34,7 +34,52 @@ pub fn uses(a: A, bytes: []const u8) A.Error!bool {
         else => return true,
     };
     defer parsed.deinit();
-    return parsed.value == .object and (parsed.value.object.contains(key) or parsed.value.object.contains(receipts_key));
+    return parsed.value == .object and (parsed.value.object.contains(key) or parsed.value.object.contains(receipts_key) or parsed.value.object.contains("_index_alias_epoch"));
+}
+
+/// Minimum store capability for the actual persisted alias representation.
+/// Legacy bindings/receipts are readable by v3; only lifecycle state needs v4.
+pub fn requiredStoreProtocol(a: A, bytes: []const u8) A.Error!u16 {
+    if (std.mem.indexOfScalar(u8, bytes, '\\') == null and std.mem.indexOf(u8, bytes, "_index_alias") == null) return 0;
+    var parsed = std.json.parseFromSlice(V, a, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return 4,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return 0;
+    if (parsed.value.object.contains("_index_alias_epoch")) return 4;
+    return if (parsed.value.object.contains(key) or parsed.value.object.contains(receipts_key)) 3 else 0;
+}
+
+pub fn requiredEnvelopeStoreProtocol(a: A, bytes: []const u8) A.Error!u16 {
+    var parsed = std.json.parseFromSlice(V, a, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return 4,
+    };
+    defer parsed.deinit();
+    return envelopeProtocol(a, parsed.value);
+}
+fn envelopeProtocol(a: A, value: V) A.Error!u16 {
+    var required: u16 = 0;
+    switch (value) {
+        .object => |object| {
+            if (object.contains("_index_alias_epoch")) return 4;
+            if (object.contains(key) or object.contains(receipts_key)) required = 3;
+            var entries = object.iterator();
+            while (entries.next()) |entry| {
+                const next = if (std.mem.eql(u8, entry.key_ptr.*, "indexes_json") and entry.value_ptr.* == .string)
+                    try requiredStoreProtocol(a, entry.value_ptr.string)
+                else
+                    try envelopeProtocol(a, entry.value_ptr.*);
+                required = @max(required, next);
+            }
+        },
+        .array => |items| for (items.items) |item| {
+            required = @max(required, try envelopeProtocol(a, item));
+        },
+        else => {},
+    }
+    return required;
 }
 
 /// Transition envelopes contain TableRecord.indexes_json as an escaped string.
@@ -50,7 +95,7 @@ pub fn usesEnvelope(a: A, bytes: []const u8) A.Error!bool {
 fn envelopeValue(a: A, value: V) A.Error!bool {
     switch (value) {
         .object => |object| {
-            if (object.contains(key) or object.contains(receipts_key)) return true;
+            if (object.contains(key) or object.contains(receipts_key) or object.contains("_index_alias_epoch")) return true;
             var entries = object.iterator();
             while (entries.next()) |entry| {
                 if (std.mem.eql(u8, entry.key_ptr.*, "indexes_json") and entry.value_ptr.* == .string) {
@@ -76,7 +121,8 @@ pub fn physicalProjectionIfNeeded(out: A, bytes: []const u8) !?[]u8 {
     if (root != .object) return error.InvalidTableIndexMetadata;
     const removed_aliases = root.object.orderedRemove(key);
     const removed_receipts = root.object.orderedRemove(receipts_key);
-    if (!removed_aliases and !removed_receipts) return null;
+    const removed_epoch = root.object.orderedRemove("_index_alias_epoch");
+    if (!removed_aliases and !removed_receipts and !removed_epoch) return null;
     return try std.json.Stringify.valueAlloc(out, root, .{});
 }
 pub fn physicalProjection(out: A, bytes: []const u8) ![]u8 {
@@ -91,7 +137,8 @@ pub fn queryProjectionIfNeeded(out: A, bytes: []const u8) !?[]u8 {
     const a = arena.allocator();
     var root = try std.json.parseFromSliceLeaky(V, a, bytes, .{});
     if (root != .object) return error.InvalidTableIndexMetadata;
-    if (!root.object.contains(key) and !root.object.contains(receipts_key)) return null;
+    if (!root.object.contains(key) and !root.object.contains(receipts_key) and !root.object.contains("_index_alias_epoch")) return null;
+    _ = root.object.orderedRemove("_index_alias_epoch");
     _ = root.object.orderedRemove(receipts_key);
     if (root.object.getPtr(key)) |declarations| {
         if (declarations.* != .object) return error.InvalidTableIndexMetadata;
@@ -145,6 +192,50 @@ pub fn replay(a: A, root: V, name: []const u8, request: Request) !?Resource {
         return receipt.response;
     }
     return null;
+}
+
+/// Strong resource validator for conditional deletion, including ABA recreation.
+/// The JSON is the same persisted alias representation returned by GET.
+pub fn resourceEtag(a: A, bytes: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.allocPrint(a, "\"alias-{s}\"", .{std.fmt.bytesToHex(digest, .lower)});
+}
+
+// Scope validators to the restored catalog without changing public resources
+// or the original idempotency receipts.
+pub fn catalogResourceEtag(a: A, root: V, resource: V) ![]u8 {
+    const bytes = try std.json.Stringify.valueAlloc(a, resource, .{});
+    defer a.free(bytes);
+    const epoch = root.object.get("_index_alias_epoch") orelse return resourceEtag(a, bytes);
+    const scoped = try std.json.Stringify.valueAlloc(a, .{ epoch, resource }, .{});
+    defer a.free(scoped);
+    return resourceEtag(a, scoped);
+}
+
+pub fn renewRestoreEpoch(a: A, bytes: []const u8, nonce: []const u8) ![]u8 {
+    var parsed = try parse(a, bytes);
+    defer parsed.deinit();
+    if (parsed.value.object.get(key) == null) return a.dupe(u8, bytes);
+    try parsed.value.object.put(parsed.arena.allocator(), "_index_alias_epoch", .{ .string = nonce });
+    return std.json.Stringify.valueAlloc(a, parsed.value, .{});
+}
+
+pub fn remove(a: A, bytes: []const u8, name: []const u8, if_match: ?[]const u8) ![]u8 {
+    if (!validName(name)) return error.InvalidIndexAliasRequest;
+    const supplied = if_match orelse return error.IndexAliasPreconditionRequired;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var parsed = try parse(scratch, bytes);
+    const bindings = parsed.value.object.getPtr(key) orelse return error.IndexAliasNotFound;
+    const resource = bindings.object.get(name) orelse return error.IndexAliasNotFound;
+    const tag = try catalogResourceEtag(scratch, parsed.value, resource);
+    if (!std.mem.eql(u8, supplied, tag)) return error.IndexAliasPreconditionFailed;
+    _ = bindings.object.orderedRemove(name);
+    // Retain PUT receipts: an old retry must reconcile its original result,
+    // never recreate a deleted binding or act on a later same-name alias.
+    return std.json.Stringify.valueAlloc(a, parsed.value, .{});
 }
 
 fn validName(name: []const u8) bool {
@@ -206,8 +297,10 @@ pub fn configurationEqual(a: A, left: []const u8, right: []const u8) !bool {
     var r = parse(s, right) catch |err| return if (err == error.OutOfMemory) err else false;
     _ = l.value.object.orderedRemove(key);
     _ = l.value.object.orderedRemove(receipts_key);
+    _ = l.value.object.orderedRemove("_index_alias_epoch");
     _ = r.value.object.orderedRemove(key);
     _ = r.value.object.orderedRemove(receipts_key);
+    _ = r.value.object.orderedRemove("_index_alias_epoch");
     return std.mem.eql(u8, try std.json.Stringify.valueAlloc(s, l.value, .{}), try std.json.Stringify.valueAlloc(s, r.value, .{}));
 }
 
@@ -231,7 +324,7 @@ pub fn validateDependencyMutation(out: A, before: []const u8, after: []const u8)
             if (!std.mem.eql(u8, target, try resolve(next.value, alias))) continue;
             const l = old.value.object.get(target) orelse return error.IndexReferencedByAlias;
             const r = next.value.object.get(target) orelse return error.IndexReferencedByAlias;
-            if (!ownerRecipeEqual(l, r) or !optionalRecipeEqual(l.object.get("_index_incarnation"), r.object.get("_index_incarnation"))) return error.IndexReferencedByAlias;
+            if (!ownerRecipeEqual(l, r) or @import("index_incarnation.zig").get(l) != @import("index_incarnation.zig").get(r)) return error.IndexReferencedByAlias;
         }
     };
     const prior = try ArtifactRecipes.init(a, old.value);
@@ -244,9 +337,12 @@ pub fn validateDependencyMutation(out: A, before: []const u8, after: []const u8)
         if (config != .object or config.object.get("type") == null) continue;
         const surviving = next.value.object.get(name) orelse continue;
         if (surviving != .object) continue;
-        const old_inc = config.object.get("_index_incarnation");
-        const new_inc = surviving.object.get("_index_incarnation");
-        if (old_inc != null and new_inc != null and !recipeEqual(old_inc.?, new_inc.?)) continue;
+        const old_inc = @import("index_incarnation.zig").get(config);
+        const new_inc = @import("index_incarnation.zig").get(surviving);
+        // A legacy incarnation is implicit. Assigning an explicit fresh one
+        // also replaces it; captured legacy alias fences (zero) fail against
+        // the new positive generation. Active aliases remain fenced above.
+        if (new_inc != null and old_inc != new_inc) continue;
         // An aliased owner also needs protection when only inline enrichment
         // declarations change (these are absent from its runtime config hash).
         try prior.checkSources(a, replacement, config, &checked);
@@ -741,4 +837,94 @@ test "index alias classification propagates allocation failures without changing
     try std.testing.expect(!try uses(failing.allocator(), "{\"a\":{\"type\":\"full_text\"}}"));
     try std.testing.expectError(error.OutOfMemory, uses(failing.allocator(), plain));
     try std.testing.expectError(error.OutOfMemory, usesEnvelope(failing.allocator(), encoded));
+}
+
+test "index alias legacy incarnation canonicalization retains fences and explicit replacement retires implicit generations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const before = "{\"P\":{\"type\":\"embeddings\",\"_index_incarnation\":1,\"embedder\":{\"model\":\"A\"},\"enrichments\":[{\"name\":\"X\",\"kind\":\"embedding\",\"field\":\"body\"}]},\"C\":{\"type\":\"embeddings\",\"sources\":[{\"artifact\":\"X\"}]}}";
+    var root = (try std.json.parseFromSlice(V, a, before, .{})).value;
+    try root.object.getPtr("P").?.object.put(a, "embedder", (try std.json.parseFromSlice(V, a, "{\"model\":\"B\"}", .{})).value);
+    try root.object.getPtr("P").?.object.put(a, "_index_incarnation", .{ .integer = 3 });
+    try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(a, root, .{})));
+    try root.object.getPtr("C").?.object.put(a, "_index_incarnation", .{ .integer = 4 });
+    try validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(a, root, .{}));
+    const legacy = "{\"C\":{\"type\":\"embeddings\",\"_coverage_incarnation\":42},\"_index_aliases\":{\"search\":{\"index\":\"C\"}}}";
+    root = (try std.json.parseFromSlice(V, a, legacy, .{})).value;
+    _ = root.object.getPtr("C").?.object.swapRemove("_coverage_incarnation");
+    try root.object.getPtr("C").?.object.put(a, "_index_incarnation", .{ .integer = 42 });
+    try validateDependencyMutation(a, legacy, try std.json.Stringify.valueAlloc(a, root, .{}));
+    try root.object.getPtr("C").?.object.put(a, "_index_incarnation", .{ .integer = 43 });
+    try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(a, legacy, try std.json.Stringify.valueAlloc(a, root, .{})));
+}
+
+test "index alias conditional deletion preserves receipts and rejects stale ABA validators" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ready = (try std.json.parseFromSlice(V, a, "{\"complete\":true}", .{})).value;
+    const request: Request = .{ .index = "a", .idempotency_key = "first" };
+    const initial = try put(a, "{\"a\":{\"type\":\"full_text\",\"_index_incarnation\":1}}", "search", request, ready, 1);
+    const root = (try parse(a, initial)).value;
+    const tag = try resourceEtag(a, try std.json.Stringify.valueAlloc(a, root.object.get(key).?.object.get("search").?, .{}));
+    try std.testing.expectError(error.IndexAliasPreconditionRequired, remove(a, initial, "search", null));
+    try std.testing.expectError(error.IndexAliasPreconditionFailed, remove(a, initial, "search", "*"));
+    const removed = try remove(a, initial, "search", tag);
+    try validateDependencyMutation(a, initial, removed);
+    const deleted = (try parse(a, removed)).value;
+    try std.testing.expect(deleted.object.contains("a"));
+    try std.testing.expect(!deleted.object.get(key).?.object.contains("search"));
+    try std.testing.expect(try replay(a, deleted, "search", request) != null);
+    try std.testing.expectEqualStrings(removed, try put(a, removed, "search", request, ready, 2));
+    try std.testing.expectError(error.IndexAliasNotFound, remove(a, removed, "search", tag));
+    const recreated = try put(a, removed, "search", .{ .index = "a", .idempotency_key = "second" }, ready, 3);
+    try std.testing.expectError(error.IndexAliasPreconditionFailed, remove(a, recreated, "search", tag));
+}
+
+test "alias deletion rejects validators from every prior restore while retaining receipts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ready = try std.json.parseFromSliceLeaky(V, a, "{\"complete\":true}", .{});
+    const original = try put(a, "{\"text\":{\"type\":\"full_text\"}}", "live", .{ .index = "text", .idempotency_key = "1" }, ready, 1);
+    const old = try std.json.parseFromSliceLeaky(V, a, original, .{});
+    const old_tag = try catalogResourceEtag(a, old, old.object.get(key).?.object.get("live").?);
+    const restored = try renewRestoreEpoch(a, original, "first-restore");
+    try std.testing.expectError(error.IndexAliasPreconditionFailed, remove(a, restored, "live", old_tag));
+    const root = try std.json.parseFromSliceLeaky(V, a, restored, .{});
+    const tag = try catalogResourceEtag(a, root, root.object.get(key).?.object.get("live").?);
+    const second = try renewRestoreEpoch(a, restored, "second-restore");
+    try std.testing.expectError(error.IndexAliasPreconditionFailed, remove(a, second, "live", tag));
+    _ = try remove(a, restored, "live", tag);
+    const receipt = (try replay(a, root, "live", .{ .index = "text", .idempotency_key = "1" })).?;
+    try std.testing.expectEqual(@as(u64, 1), receipt.swapped_at_ms);
+}
+
+test "index alias lifecycle controls never change physical or query projections" {
+    const a = std.testing.allocator;
+    const legacy = "{\"text\":{\"type\":\"full_text\"},\"_index_aliases\":{\"live\":{\"index\":\"text\"}}}";
+    const scoped = try renewRestoreEpoch(a, legacy, "one");
+    defer a.free(scoped);
+    const left = try physicalProjection(a, legacy);
+    defer a.free(left);
+    const right = try physicalProjection(a, scoped);
+    defer a.free(right);
+    try std.testing.expectEqualStrings(left, right);
+    const old_query = try queryProjection(a, legacy);
+    defer a.free(old_query);
+    const new_query = try queryProjection(a, scoped);
+    defer a.free(new_query);
+    try std.testing.expectEqualStrings(old_query, new_query);
+    try std.testing.expectEqual(@as(u16, 3), try requiredStoreProtocol(a, legacy));
+    try std.testing.expectEqual(@as(u16, 4), try requiredStoreProtocol(a, scoped));
+}
+
+test "index alias physical configuration equality ignores lifecycle epochs" {
+    const a = std.testing.allocator;
+    const physical = "{\"a\":{\"type\":\"full_text\"}}";
+    const aliased = "{\"a\":{\"type\":\"full_text\"},\"_index_aliases\":{\"live\":{\"index\":\"a\"}},\"_index_alias_receipts\":{},\"_index_alias_epoch\":\"fresh\"}";
+    try std.testing.expect(try configurationEqual(a, physical, aliased));
+    try std.testing.expect(try configurationEqual(a, aliased, physical));
+    try std.testing.expect(!try configurationEqual(a, aliased, "{\"b\":{\"type\":\"full_text\"}}"));
 }

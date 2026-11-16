@@ -2944,7 +2944,7 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
-        if (err == error.IndexReferencedByAlias or err == error.IndexAliasGraphConflict) {
+        if (err == error.IndexReferencedByAlias or err == error.IndexAliasGraphConflict or err == error.PrivacyManagedGraph or err == error.PrivacyUnknownArtifactSource) {
             try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
             return ctx.status(409).text(@errorName(err));
         }

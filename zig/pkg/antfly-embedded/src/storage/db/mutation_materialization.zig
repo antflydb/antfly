@@ -4386,24 +4386,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var publication_context = try ctx.index_manager.acquireTextPublicationContext(ctx.alloc, index_ref.name);
                 defer publication_context.deinit();
                 if (!ctx.projection_only) try invalidateLocalArtifactProducerCoverage(ctx, batch, index_ref);
-                // A document that can never gain visible content (issue #938: an
-                // `_edges`-only document reconstructed by replay as a synthetic
-                // full-text candidate) would otherwise make this exact window retry
-                // error.ReplayDocumentNotVisible forever. Past a bounded number of
-                // consecutive failures here, give up on the still-missing documents
-                // in this window instead of blocking the worker -- and anything
-                // waiting on it to drain, like Lite's run_until_idle() -- forever.
-                // Keyed by this owner's IndexManager address (PR #957 review on the
-                // #938 escalation commit): the ResourceManager below is shared
-                // process-wide across every storage owner, and same-named indexes
-                // (the default `full_text_index_v0` is the common case) or
-                // coincidentally equal sequence numbers across owners must not
-                // combine or reset each other's retry counts.
-                const replay_owner = resource_manager_mod.replayOwnerIdFromPtr(ctx.index_manager);
-                const tolerate_missing_replay_documents = if (ctx.index_manager.resource_manager) |manager|
-                    manager.shouldEscalateReplayDocumentNotVisible(replay_owner, index_ref.name, batch.sequence)
-                else
-                    false;
+                // Only durable identity/generation evidence can retire input.
+                // Retry counts cannot prove absence: a producer can legitimately
+                // remain pending longer than any retry budget. Keep the journal
+                // window pinned until input arrives or explicit repair resolves it.
                 var collected = try collectTextDocumentWritesForIndex(
                     ctx.alloc,
                     ctx.store,
@@ -4415,13 +4401,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .{
                         .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
                         .relational_base_rows = ctx.relational_base_rows,
-                        .tolerate_missing_replay_documents = tolerate_missing_replay_documents,
                     },
                 );
                 defer collected.deinit();
                 if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
-                if (ctx.index_manager.resource_manager) |manager|
-                    manager.clearReplayDocumentNotVisibleEscalation(replay_owner, index_ref.name, batch.sequence);
 
                 const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
                 var write_start: usize = 0;

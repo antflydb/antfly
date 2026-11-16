@@ -721,6 +721,14 @@ pub fn parsePutNamespaceTableIndexAliasBody(allocator: std.mem.Allocator, body: 
     return std.json.parseFromSlice(antfly_indexes_openapi.IndexAliasRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Conditionally delete an index alias
+pub const DeleteNamespaceTableIndexAliasPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    alias_name: []const u8,
+};
+
 /// List indexes for an explicit namespace table
 pub const ListNamespaceTableIndexesPathParams = struct {
     /// Database name
@@ -1766,6 +1774,12 @@ pub fn parsePutTableIndexAliasBody(allocator: std.mem.Allocator, body: []const u
     return std.json.parseFromSlice(antfly_indexes_openapi.IndexAliasRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Conditionally delete an index alias
+pub const DeleteTableIndexAliasPathParams = struct {
+    table_name: []const u8,
+    alias_name: []const u8,
+};
+
 /// List all indexes for a table
 pub const ListIndexesPathParams = struct {
     /// Name of the table
@@ -2480,6 +2494,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unsuppress", .operation_id = "namespaceUnsuppressEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "getNamespaceTableIndexAlias", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "putNamespaceTableIndexAlias", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "deleteNamespaceTableIndexAlias", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes", .operation_id = "listNamespaceTableIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "getNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex", .request_body = .buffered, .streaming_response = false },
@@ -2589,6 +2604,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:unsuppress", .operation_id = "unsuppressEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "getTableIndexAlias", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "putTableIndexAlias", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "deleteTableIndexAlias", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
@@ -2738,6 +2754,7 @@ pub const routes = [_]Route{
 //   fn namespaceUnsuppressEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn getNamespaceTableIndexAlias(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8) !httpx.Response
 //   fn putNamespaceTableIndexAlias(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8) !httpx.Response
+//   fn deleteNamespaceTableIndexAlias(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8) !httpx.Response
 //   fn listNamespaceTableIndexes(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn getNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
@@ -2847,6 +2864,7 @@ pub const routes = [_]Route{
 //   fn unsuppressEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn getTableIndexAlias(self: *Impl, ctx: *httpx.Context, table_name: []const u8, alias_name: []const u8) !httpx.Response
 //   fn putTableIndexAlias(self: *Impl, ctx: *httpx.Context, table_name: []const u8, alias_name: []const u8) !httpx.Response
+//   fn deleteTableIndexAlias(self: *Impl, ctx: *httpx.Context, table_name: []const u8, alias_name: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
