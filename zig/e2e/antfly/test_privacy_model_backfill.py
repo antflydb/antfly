@@ -23,6 +23,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+import test_auth
 from helpers import wait_until
 from test_auth import AUTH_BOOTSTRAP_PASSWORD, _basic_auth
 from test_privacy_indexed_activation import policy
@@ -37,6 +38,18 @@ def migration_api(monkeypatch, request):
     monkeypatch.setenv("ANTFLY_ENRICHMENT_EMBED_PARALLEL_BATCHES", "2")
     monkeypatch.setenv("ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS", "64")
     monkeypatch.setenv("ANTFLY_ENRICHMENT_WINDOW_ITEMS", "64")
+    # Match RuntimeCadence.default_control_tick_ms. The shared auth harness
+    # uses 5ms stress ticks, which repeatedly cancel/reopen producer runtimes
+    # while this larger workload is publishing. This test qualifies backfill
+    # and recovery at the production cadence, not control-plane saturation.
+    original_command = test_auth._standalone_stateful_command
+
+    def migration_command(*args, **kwargs):
+        command = original_command(*args, **kwargs)
+        command[command.index("--control-tick-ms") + 1] = "100"
+        return command
+
+    monkeypatch.setattr(test_auth, "_standalone_stateful_command", migration_command)
     return request.getfixturevalue("auth_api")
 
 
@@ -61,7 +74,12 @@ def test_protected_model_backfill_batches(
         row["body"].replace("person@example.invalid", "[EMAIL]")
         for row in docs.values()
     }
-    report = {"documents": document_count, "batch_items": BATCH_ITEMS, "phase": "setup"}
+    report = {
+        "documents": document_count,
+        "batch_items": BATCH_ITEMS,
+        "control_tick_ms": 100,
+        "phase": "setup",
+    }
     log_start = 0
     started = time.monotonic()
     status_seconds = 0.0
