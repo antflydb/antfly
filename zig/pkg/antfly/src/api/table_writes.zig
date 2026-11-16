@@ -40395,6 +40395,89 @@ fn implementationTests() type {
             try @import("antfly_local_sources").api_local_table_writes.table_write_source.history_page_wire.test_support.malformedPages();
         }
 
+        test "ordered history consumer completion BEGIN atomically retains plan and applied cut" {
+            const a = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/completion-begin", .{tmp.sub_path});
+            defer a.free(path);
+            const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 }, .online_source_authority = .raft, .start_optional_runtimes = false, .start_index_workers = false, .start_resolver_workers = false };
+            var db = try db_mod.DB.open(a, path, options);
+            var opened = true;
+            defer if (opened) db.close();
+            const source = @import("antfly_local_sources").api_local_table_writes.table_write_source;
+            const completion = source.history_resolution_wire.completion;
+            var namespace: [24]u8 = @splat(0);
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 1, .big);
+            std.mem.writeInt(u64, namespace[16..24], 1, .big);
+            const members = [_]completion.Participant{.{ .namespace = namespace, .owner_fence = @splat(2), .roles = completion.Roles.guards, .locator = "table2:4:docs:group:1" }};
+            var admission: completion.Admission = .{ .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = members[0].owner_fence, .participants = &members };
+            const raw = try completion.encodeAdmission(a, admission);
+            defer a.free(raw);
+            const entry: db_mod.OrderedApplyReceipt = .{ .term = 1, .index = 2 };
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.beginReplicatedCompletionTransaction(raw, 10, 11, true, entry));
+            try std.testing.expect((try db.orderedApplyReceipt()) == null);
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(admission.transaction_id));
+            const grant: source.history_consumer.Grant = .{ .namespace = namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1, .limit = 4 * 1024 * 1024 };
+            _ = try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 1 }, false);
+            try std.testing.expectEqualDeep(admission.transaction_id, try db.beginReplicatedCompletionTransaction(raw, 10, 11, true, entry));
+            try std.testing.expectEqualDeep(entry, (try db.orderedApplyReceipt()).?);
+            try std.testing.expectEqual(.pending, try db.getTransactionStatus(admission.transaction_id));
+            const key = try std.fmt.allocPrint(a, "{s}{s}", .{ completion.admission_prefix, &admission.transaction_id });
+            defer a.free(key);
+            const stored = try db.core.store.get(a, key);
+            defer a.free(stored);
+            try std.testing.expectEqualStrings(raw, stored);
+            admission.admission_digest[0] ^= 1;
+            const changed = try completion.encodeAdmission(a, admission);
+            defer a.free(changed);
+            try std.testing.expectError(error.DecisionConflict, db.beginReplicatedCompletionTransaction(changed, 10, 11, true, entry));
+            try std.testing.expectError(error.DecisionConflict, db.beginReplicatedCompletionTransaction(changed, 10, 11, true, .{ .term = 1, .index = 3 }));
+            try std.testing.expectEqualDeep(entry, (try db.orderedApplyReceipt()).?);
+            opened = false;
+            db.close();
+            db = try db_mod.DB.open(a, path, options);
+            opened = true;
+            try std.testing.expectEqualDeep(admission.transaction_id, try db.beginReplicatedCompletionTransaction(raw, 10, 11, true, entry));
+            try std.testing.expectEqual(.pending, try db.getTransactionStatus(admission.transaction_id));
+            const reopened = try db.core.store.get(a, key);
+            defer a.free(reopened);
+            try std.testing.expectEqualStrings(raw, reopened);
+            // A complete participant certificate is reserved before BEGIN.
+            // A large frozen plan cannot consume beyond this root's budget.
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const many = try scratch.alloc(completion.Participant, 512);
+            many[0] = members[0];
+            const padding: [900]u8 = @splat('x');
+            for (many[1..], 1..) |*member, index| {
+                var member_namespace: [24]u8 = @splat(0);
+                member_namespace[0] = 1;
+                std.mem.writeInt(u64, member_namespace[16..24], index, .big);
+                member.* = .{ .namespace = member_namespace, .owner_fence = @splat(7), .roles = completion.Roles.guards, .locator = try std.fmt.allocPrint(scratch, "{d}:{s}", .{ index, &padding }) };
+            }
+            var full_plan = admission;
+            full_plan.transaction_id = @splat(8);
+            full_plan.participants = many;
+            const full_raw = try completion.encodeAdmission(a, full_plan);
+            defer a.free(full_raw);
+            try std.testing.expect(try full_plan.reservationBytes(full_raw.len) > grant.limit);
+            const retained_history = @import("antfly_local_sources").storage_committed_history;
+            const before_full = try db.core.store.get(a, retained_history.state_key);
+            defer a.free(before_full);
+            try std.testing.expectError(error.HistoryFull, db.beginReplicatedCompletionTransaction(full_raw, 20, 21, true, .{ .term = 1, .index = 3 }));
+            try std.testing.expectEqualDeep(entry, (try db.orderedApplyReceipt()).?);
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(full_plan.transaction_id));
+            const full_key = try std.fmt.allocPrint(a, "{s}{s}", .{ completion.admission_prefix, &full_plan.transaction_id });
+            defer a.free(full_key);
+            try std.testing.expectError(error.NotFound, db.core.store.get(a, full_key));
+            const after_full = try db.core.store.get(a, retained_history.state_key);
+            defer a.free(after_full);
+            try std.testing.expectEqualStrings(before_full, after_full);
+        }
+
         test "ordered history consumer grant wire contracts" {
             try @import("antfly_local_sources").api_local_table_writes.table_write_source.history_grant_wire.test_support.contracts();
         }

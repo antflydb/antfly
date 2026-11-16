@@ -25683,6 +25683,53 @@ pub const DB = struct {
         return self.beginReplicatedTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, null);
     }
 
+    /// Private applying path. The caller supplies the actual ordinary Raft
+    /// entry, after protocol/route admission; this method establishes no leader
+    /// authority on its own. Plan, BEGIN, completion credits and applied marker
+    /// are committed in the same native transaction.
+    pub fn beginReplicatedCompletionTransaction(self: *DB, encoded_plan: []const u8, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedCompletionTransaction", .{ self, encoded_plan, timestamp_ns, created_at_ns, retain_terminal, identity });
+        const completion = @import("../transaction_completion.zig");
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var parsed = try completion.parseAdmission(self.alloc, encoded_plan);
+        defer parsed.deinit();
+        const plan = parsed.value.admission;
+        lockApply(self);
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        _ = try plan.member(namespace);
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const persisted = (try doc_identity.loadNamespaceTxn(&read)) orelse return error.HistoryResynchronizationRequired;
+            if (!persisted.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+            _ = try @import("../source_authority.zig").require(&read, .raft, namespace);
+            _ = (try @import("../committed_history.zig").load(&read)) orelse return error.HistoryResynchronizationRequired;
+        }
+        var manager = try self.core.initTxnManager();
+        defer manager.deinit();
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
+            .already_applied => {
+                var saved = (try manager.getCompletionAdmission(self.alloc, plan.transaction_id)) orelse return error.InvalidTxnRecord;
+                defer saved.deinit();
+                if (!std.mem.eql(u8, &saved.value.digest, &parsed.value.digest)) return error.DecisionConflict;
+                return plan.transaction_id;
+            },
+            .apply => {},
+        }
+        var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(identity, &value_buf);
+        const extra: transactions_mod.MutationExtraBatch = .{ .writes = &.{marker} };
+        if (std.mem.eql(u8, &namespace, &plan.coordinator_namespace))
+            try manager.initTransactionWithCompletionAdmission(plan, timestamp_ns, created_at_ns, retain_terminal, extra)
+        else
+            try manager.initParticipantWithCompletionAdmission(plan, timestamp_ns, created_at_ns, retain_terminal, extra);
+        return plan.transaction_id;
+    }
+
     pub fn beginReplicatedTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope });
         lockApply(self);

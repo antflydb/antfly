@@ -1122,6 +1122,10 @@ fn beginTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, 
     return .{ .value = self.beginTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn beginReplicatedCompletionTransaction(self: *DB, encoded_plan: []const u8, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: db.OrderedApplyReceipt) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginReplicatedCompletionTransaction(encoded_plan, timestamp_ns, created_at_ns, retain_terminal, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn beginReplicatedTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8) engine.Outcome(@import("transactions.zig").TxnId) {
     return .{ .value = self.beginReplicatedTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

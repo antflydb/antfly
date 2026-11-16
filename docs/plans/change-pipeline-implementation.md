@@ -2242,6 +2242,38 @@ reordering/omission and transaction substitution. Durable native DB dispatch,
 current owner/input fences, Raft capability activation, production coordinator
 wiring and positive network receipts remain outstanding.
 
+## In progress: native replicated completion BEGIN admission
+
+`DB.beginReplicatedCompletionTransaction` now parses the frozen plan, validates
+physical and persisted namespace plus Raft source authority, requires initialized
+retained history and enters the native apply lock. It invokes coordinator or
+participant completion admission with the actual applied marker in the same
+native batch. Same-cut replay additionally checks the durable plan digest;
+changed plans cannot obtain confirmation merely by supplying an old applied cut.
+The engine descriptor is now 40 for this private applying capability.
+
+This method does not establish leader, catalog route or input admission itself.
+The versioned batch form remains rejected by the legacy server dispatcher until
+its full mutation-side fencing and applying-member protocol activation are wired.
+Restore/hidden scopes remain unsupported on this method until their lifecycle is
+qualified. Production coordinators do not yet invoke the method.
+
+The source `ordered-history-consumer-test` suite passed all seven selected
+tests in `completion-begin-native-test.log`, including the new DB test for
+initialization failure without marker/BEGIN, original envelope persistence,
+changed-plan refusal at old and fresh cuts, and exact retry after physical
+reopen. The same command's `history-resolution-owner-test` passed with exit 0
+against engine descriptor 40, including its compiled owner scope/reopen checks.
+Source catalog generation completed.
+
+The DB admission test now additionally submits a valid 512-member frozen plan
+whose required reservation exceeds a four-MiB root limit. It checks HistoryFull,
+unchanged applied cut and byte-identical retained-history state, and absence of
+both BEGIN record and plan. This extension passed under
+`ordered-history-consumer-test` with exit 0 in `completion-begin-quota-test.log`
+(all seven selected tests passed). Positive receipt network recovery, production
+activation and the full issue requirements remain.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
