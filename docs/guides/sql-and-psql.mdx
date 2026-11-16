@@ -1,0 +1,282 @@
+---
+title: "Query Antfly with SQL and psql"
+description: "psql, PostgreSQL drivers, and typed query builders connected to Antfly over the PostgreSQL wire protocol, with the same SQL available over HTTP and the CLI"
+order: 11
+---
+
+<Questions>
+- Can I connect to Antfly with psql or a PostgreSQL driver?
+- How do I enable the PostgreSQL wire protocol listener in Antfly?
+- What SQL does Antfly support (joins, CTEs, window functions, transactions)?
+- How do I run SQL against Antfly over HTTP or from the CLI?
+- Can I use Kysely or SQLx with Antfly?
+</Questions>
+
+## The Result
+
+`psql`, `pgx`, `node-postgres`, `psycopg`, `asyncpg`, and SQLx connect to Antfly the way they connect to PostgreSQL, and run joins, CTEs, window functions, upserts, and transactions against Antfly tables:
+
+```bash
+psql "postgres://admin:${ANTFLY_ADMIN_PASSWORD}@127.0.0.1:5432/default?sslmode=disable"
+```
+
+```sql
+default=> SELECT customer, id, total,
+            rank() OVER (PARTITION BY customer ORDER BY total DESC) AS rank
+          FROM orders
+          ORDER BY customer, rank;
+ customer |  id  | total | rank
+----------+------+-------+------
+ acme     | o-2  |  4200 |    1
+ acme     | o-1  |  1200 |    2
+ globex   | o-3  |   900 |    1
+(3 rows)
+```
+
+The database in the URL is an Antfly database (`default` unless you created another), and Antfly namespaces are PostgreSQL schemas (`public` by default).
+
+## Before You Start
+
+The `antfly` binary installed (see the [Quickstart](/docs/guides/quickstart)), `psql` from any recent PostgreSQL client package, and a strong administrator password in your shell:
+
+```bash
+export ANTFLY_ADMIN_PASSWORD="$(openssl rand -base64 24)"
+psql --version
+```
+
+## Build It
+
+### 1. Enable the Listener
+
+The PostgreSQL listener is off by default and requires authentication. Write `antfly.json` to turn on both:
+
+```json
+{
+  "enable_auth": true,
+  "pgwire": {
+    "enabled": true,
+    "bind_host": "127.0.0.1",
+    "bind_port": 5432,
+    "max_connections": 32
+  }
+}
+```
+
+Start standalone with it. The first start with auth needs `ANTFLY_BOOTSTRAP_ADMIN_PASSWORD` (12 to 72 bytes), which becomes the password for the `admin` user:
+
+```bash
+ANTFLY_BOOTSTRAP_ADMIN_PASSWORD="$ANTFLY_ADMIN_PASSWORD" antfly standalone --config antfly.json
+```
+
+Startup fails if the port is taken, if auth is not configured, or if `bind_host` is not a loopback address and the config lacks `"externally_protected_transport": true`. The listener has no native TLS, so that flag is your statement that a TLS proxy or an authenticated private network sits in front of it. Setting it does not add TLS. When running several nodes on one host, give each its own `bind_port`.
+
+### 2. Connect and Create a Table
+
+Connect with `psql`. Use `sslmode=disable`: the listener answers TLS negotiation with "no", so `sslmode=require` fails.
+
+```bash
+psql "postgres://admin:${ANTFLY_ADMIN_PASSWORD}@127.0.0.1:5432/default?sslmode=disable"
+```
+
+```sql
+CREATE TABLE orders (id TEXT PRIMARY KEY, customer TEXT, total BIGINT);
+
+INSERT INTO orders (id, customer, total) VALUES
+  ('o-1', 'acme', 1200), ('o-2', 'acme', 4200), ('o-3', 'globex', 900);
+
+INSERT INTO orders (id, customer, total) VALUES ('o-1', 'acme', 1500)
+  ON CONFLICT (id) DO UPDATE SET total = excluded.total
+  RETURNING id, total;
+```
+
+Run the window query from [The Result](#the-result) to see the ranks. psql backslash commands such as `\d` query PostgreSQL system catalogs that Antfly does not serve; use `antfly schema --table orders` to inspect a table.
+
+### 3. Use Transactions and Prepared Statements
+
+Explicit transactions, savepoints, and SQL-level prepared statements work on a pgwire connection:
+
+```sql
+BEGIN;
+UPDATE orders SET total = total + 100 WHERE customer = 'acme';
+SAVEPOINT before_globex;
+DELETE FROM orders WHERE customer = 'globex';
+ROLLBACK TO SAVEPOINT before_globex;
+COMMIT;
+
+PREPARE by_customer (TEXT) AS SELECT id, total FROM orders WHERE customer = $1;
+EXECUTE by_customer ('acme');
+DEALLOCATE by_customer;
+```
+
+DDL is rejected inside an explicit transaction, so run `CREATE`, `ALTER`, and `DROP` on their own. Session settings `statement_timeout`, `application_name`, and `search_path` (up to eight existing namespaces) follow PostgreSQL's `SET`, `SHOW`, and `RESET` rules, including rollback with the transaction.
+
+### 4. Connect from a Driver
+
+Drivers take the same URL. The CI conformance suite (`scripts/test_pgwire_drivers.py`) runs `pgx` (Go, including `database/sql`), `node-postgres`, `psycopg`, `asyncpg`, and SQLx 0.9 against a real authenticated server, covering connection setup, typed bound parameters, `SHOW`, and a transaction:
+
+```python
+import psycopg
+
+url = "postgres://admin:PASSWORD@127.0.0.1:5432/default?sslmode=disable"
+with psycopg.connect(url, autocommit=True) as conn:
+    row = conn.execute(
+        "SELECT id, total FROM orders WHERE customer = %s ORDER BY total DESC",
+        ("acme",),
+    ).fetchone()
+    print(row)
+```
+
+The session time zone is fixed to UTC and the date style to ISO, MDY. A client that asks for anything else at startup (a JDBC JVM in a non-UTC zone, for instance) is rejected with SQLSTATE `0A000` naming the parameter, so set such clients to UTC. Startup `options`, `role`, and `search_path` parameters are also rejected; set `search_path` with `SET` after connecting.
+
+### 5. Run SQL over HTTP and the CLI
+
+The same dialect runs over `POST /db/v1/sql`, one statement per request, with positional parameters bound separately from the text:
+
+<Tabs defaultValue="cli">
+  <TabsList>
+    <TabsTrigger value="cli">CLI</TabsTrigger>
+    <TabsTrigger value="curl">cURL</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="cli">
+```bash
+export ANTFLY_USERNAME=admin ANTFLY_PASSWORD="$ANTFLY_ADMIN_PASSWORD"
+antfly sql --statement 'SELECT id, total FROM orders WHERE customer = $1' \
+  --parameters '["acme"]'
+```
+  </TabsContent>
+
+  <TabsContent value="curl">
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/sql \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "statement": "SELECT id, total FROM orders WHERE customer = $1",
+    "parameters": ["acme"]
+  }'
+```
+  </TabsContent>
+
+</Tabs>
+
+```json
+{
+  "columns": [{"name": "id", "type": "string"}, {"name": "total", "type": "integer"}],
+  "rows": [["o-1", "1600"], ["o-2", "4300"]],
+  "rows_affected": 0,
+  "command_tag": "SELECT 2"
+}
+```
+
+Rows are ordinal arrays, and integers arrive as decimal strings so no client loses precision. `limit` (default 128, maximum 4096) is an admission cap, not an implicit SQL `LIMIT`: a result larger than it fails instead of being truncated. `database` and `namespace` fields set the scope; the CLI reads `--database`, `--namespace`, or `ANTFLY_DATABASE` and `ANTFLY_NAMESPACE`.
+
+`BEGIN` over HTTP returns a `session_id`; send it with each statement until `COMMIT` or `ROLLBACK`. For statements you run repeatedly, create a prepared resource and execute it by ID:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/sql/prepared \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" -H "Content-Type: application/json" \
+  -d '{"statement": "SELECT id, total FROM orders WHERE customer = $1"}'
+# => {"prepared_id": "<32 hex chars>", ...}
+
+curl -X POST http://127.0.0.1:8080/db/v1/sql/prepared/PREPARED_ID/execute \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" -H "Content-Type: application/json" \
+  -d '{"parameters": ["globex"]}'
+```
+
+Prepared resources belong to the principal that created them, expire after an hour, and are released with `DELETE /db/v1/sql/prepared/PREPARED_ID`.
+
+`antfly sql --interactive` opens a line-at-a-time REPL over HTTP that carries the session across statements and rolls back an open transaction on `\q`. `--explain`, `--estimate`, and `--analyze` wrap a statement in `EXPLAIN`; `--analyze` runs a read-only `SELECT` once and reports measured time, rows, and peak memory.
+
+### What the Dialect Covers
+
+The compiler admits a bounded, explicit subset of PostgreSQL. Anything outside it fails with a SQLSTATE; nothing is silently rewritten or truncated. Inside it:
+
+- Inner and outer joins, derived tables, CTEs (including linear `WITH RECURSIVE` and `MATERIALIZED` hints), `GROUP BY` with `HAVING`, `FILTER`, and `DISTINCT` aggregates.
+- Window functions with `PARTITION BY`, `ORDER BY`, `ROWS`, `RANGE`, and `GROUPS` frames, and named `WINDOW` clauses.
+- `EXISTS`, `IN`, scalar, and `ANY`/`ALL` subqueries, decorrelated into hash joins. `UNION`, `INTERSECT`, and `EXCEPT`, with and without `ALL`.
+- `INSERT ... VALUES` and `INSERT ... SELECT`, `ON CONFLICT DO NOTHING | DO UPDATE`, `UPDATE ... FROM`, `DELETE ... USING`, `RETURNING`, and `MERGE`.
+- `CREATE` and `DROP` for tables, indexes, schemas, and databases, `ALTER TABLE` column and default changes, deferrable `UNIQUE`, and `TRUNCATE`.
+- `EXPLAIN` with `FORMAT JSON`, `VERBOSE`, `COSTS`, and read-only `ANALYZE`.
+- On pgwire: `DECLARE` cursors (including `SCROLL` and `WITH HOLD`), `FETCH`, `MOVE`, `CLOSE`, and `PREPARE`/`EXECUTE`.
+
+Tables resolve as `table`, `namespace.table`, or `database.namespace.table`. The full boundary, including what is deliberately excluded, is in [COMPILER_SUPPORT.md](https://github.com/antflydb/antfly/blob/main/zig/pkg/antfly-embedded/src/sql/COMPILER_SUPPORT.md).
+
+### Typed SQL from TypeScript and Rust
+
+`@antfly/sdk/kysely` wires Kysely to the pgwire listener with Antfly's catalog for introspection, exact `BIGINT` and `NUMERIC` handling, type generation, and migrations guarded by a persistent lock:
+
+```ts
+import pg from "pg";
+import { AntflyClient } from "@antfly/sdk";
+import { createAntflyPostgres } from "@antfly/sdk/kysely";
+
+// Database is the interface written by antfly.generateTypes().
+const antfly = createAntflyPostgres<Database>({
+  pg,
+  pool: { connectionString: process.env.ANTFLY_PGWIRE_URL! },
+  client: new AntflyClient({ baseUrl: process.env.ANTFLY_HTTP_URL! }),
+});
+const rows = await antfly.db.selectFrom("orders").selectAll().execute();
+```
+
+The [Kysely reference](https://github.com/antflydb/antfly/blob/main/ts/packages/sdk/docs/kysely.md) covers the embedded dialect, search path, and migration recovery.
+
+For an [Antfly Lite](/docs/guides/lite) file in Rust, the `antfly-embedded` crate's `sqlx` feature (with `libantfly`) provides a SQLx 0.9 driver with pools, transactions, savepoints, and streaming:
+
+```rust
+use antfly_embedded::sqlx::{Antfly, AntflyConnectOptions};
+use sqlx::ConnectOptions;
+
+let mut conn = AntflyConnectOptions::new("app.aflite").connect().await?;
+let rows = sqlx::query::<Antfly>("SELECT id, total FROM orders WHERE customer = $1")
+    .bind("acme").fetch_all(&mut conn).await?;
+```
+
+### Search as a SQL Relation in Lite
+
+Embedded databases (Lite, and the Go, Python, Rust, and TypeScript embedded bindings) expose search as a table function, so ranked hits join, filter, and sort like any other relation:
+
+```sql
+SELECT t.id, s._id, s.score
+FROM antfly_search('history_items', $1, 50) s
+JOIN threads t ON t.id = s.thread_id
+WHERE t.project_id = $2 AND NOT t.archived
+ORDER BY s.score DESC, s._id
+LIMIT 20;
+```
+
+The first argument is a literal table name. The second is query-string text or the JSON body of a search request (full-text, vector, or hybrid). The third caps the candidate window (1 to 10,000) before the outer filters run, so a selective `WHERE` can return fewer rows than `LIMIT`. The relation carries the table's columns plus `_id`, `score`, and `_highlights`.
+
+Server SQL, over pgwire and HTTP, rejects `antfly_search` with SQLSTATE `0A000` today. On a server, run search through the [query API](/docs/guides/hybrid-search) and use SQL for the relational side.
+
+### Antfly Cloud
+
+Antfly Cloud runs the listener behind a TLS endpoint that authenticates the connection before it reaches your instance. Connection strings and credentials are in [PostgreSQL connections](/docs/cloud/postgres-connections).
+
+## Tradeoffs
+
+The decision is which transport carries your SQL: a pgwire connection or the HTTP endpoint.
+
+Pgwire is a stateful connection. It streams large reads page by page with backpressure from the network, holds transactions and cursors for the life of the connection, and fits every tool that already speaks PostgreSQL. In exchange it is a long-lived socket you have to secure: there is no native TLS, so anything beyond loopback needs a TLS proxy or a private network, and each connection counts against `max_connections`.
+
+HTTP is a request per statement. It rides the same port, auth, and TLS termination as the rest of the API, and is the easier choice from serverless functions, scripts, and agents. It materializes each result up to the 4,096-row admission cap, and a transaction is a `session_id` you carry between requests.
+
+Either way, the wire protocol is not a promise of full PostgreSQL compatibility. Tools that depend on `pg_catalog`, advisory locks, extensions, or transactional DDL need the Antfly-specific path (the Kysely dialect replaces catalog introspection and migration locking for this reason). An ambiguous commit returns SQLSTATE `40003` with a transaction receipt and `retryable: false`; reconcile it by transaction ID instead of replaying the write.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Enable Antfly's PostgreSQL listener on 5432 with auth, create an orders table over psql, and query it from psycopg", and use this page to judge the result.
+
+## Next Steps
+
+- [Query PostgreSQL in Place with Foreign Sources](/docs/guides/foreign-sources): join live PostgreSQL rows into Antfly queries without copying them
+- [Stream PostgreSQL into Antfly](/docs/guides/cdc-replication): mirror a PostgreSQL table so it can be indexed, embedded, and searched
+- [Antfly Lite](/docs/guides/lite): the embedded engine where `antfly_search` composes with SQL
