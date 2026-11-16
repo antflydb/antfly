@@ -820,6 +820,266 @@ pub const NativeHistoryRetirement = struct {
     grant: u64,
 };
 
+pub const NativeSourcePlanChunkQuery = struct {
+    root: NativeSourcePlanRoot,
+    spec: NativeSourcePlanSpec,
+    minimum_applied_index: u64,
+    minimum_native_sequence: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "root", "root", false },
+        .{ "spec", "spec", false },
+        .{ "minimum_applied_index", "minimum_applied_index", false },
+        .{ "minimum_native_sequence", "minimum_native_sequence", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("root");
+        try jw.write(self.root);
+        try jw.objectField("spec");
+        try jw.write(self.spec);
+        try jw.objectField("minimum_applied_index");
+        try jw.write(self.minimum_applied_index);
+        if (self.minimum_native_sequence) |value| {
+            try jw.objectField("minimum_native_sequence");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// At most 2 MiB JSON and 1 MiB decoded binary. Validate exact request digest, root/cut, live seal, decoded size, canonical base64 and ordinal chunk hash before using bytes.
+pub const NativeSourcePlanChunkReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    observation: NativeSourcePlanObservation,
+    chunk_base64: []const u8,
+};
+
+pub const NativeSourcePlanChunkRequest = struct {
+    version: i64,
+    source_owner: NativeHistoryPublicationOwner,
+    request: NativeSourcePlanRead,
+};
+
+/// Chunk uses exactly the spec ordinal length and canonical base64, at most 1 MiB decoded. Other actions require ordinal zero and an empty chunk. Only reclaim may change max_chunks from eight. Seal authenticates bytes; semantic frozen-plan restoration remains mandatory before admission.
+pub const NativeSourcePlanCommand = struct {
+    version: i64,
+    root: NativeSourcePlanRoot,
+    spec: NativeSourcePlanSpec,
+    action: []const u8,
+    ordinal: ?i64 = null,
+    chunk_base64: ?[]const u8 = null,
+    max_chunks: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "root", "root", false },
+        .{ "spec", "spec", false },
+        .{ "action", "action", false },
+        .{ "ordinal", "ordinal", true },
+        .{ "chunk_base64", "chunk_base64", true },
+        .{ "max_chunks", "max_chunks", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("root");
+        try jw.write(self.root);
+        try jw.objectField("spec");
+        try jw.write(self.spec);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        if (self.ordinal) |value| {
+            try jw.objectField("ordinal");
+            try jw.write(value);
+        }
+        if (self.chunk_base64) |value| {
+            try jw.objectField("chunk_base64");
+            try jw.write(value);
+        }
+        if (self.max_chunks) |value| {
+            try jw.objectField("max_chunks");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// At most 4096 bytes. Outcome requires a positive exact receipt. Null or superseded outcome is unconfirmed; a known rejection is not success. Recovery echoes the original receipt. A lost response or malformed reply must not cause automatic re-proposal.
+pub const NativeSourcePlanControlReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    receipt: ?NativeHistoryReceipt = null,
+    outcome: ?NativeSourcePlanOutcome = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "request_digest", "request_digest", false },
+        .{ "receipt", "receipt", true },
+        .{ "outcome", "outcome", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        if (self.receipt) |value| {
+            try jw.objectField("receipt");
+            try jw.write(value);
+        }
+        if (self.outcome) |value| {
+            try jw.objectField("outcome");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeSourcePlanControlRequest = std.json.Value;
+
+/// One native snapshot after serving-owner ReadIndex qualification. Cut is the actual sparse native Raft apply position, not a fabricated quorum watermark. Status is null only when no spec was queried.
+pub const NativeSourcePlanObservation = struct {
+    root: NativeSourcePlanRoot,
+    cut: NativeHistoryDigest,
+    quota: NativeSourcePlanQuota,
+    status: NativeSourcePlanStatus,
+};
+
+/// At most 4096 bytes. Query digest binds unsealed presence and bitmap status as well as sealed evidence to the exact request.
+pub const NativeSourcePlanObservationReply = struct {
+    version: i64,
+    query_digest: NativeHistoryDigest,
+    observation: NativeSourcePlanObservation,
+};
+
+pub const NativeSourcePlanObserveRequest = struct {
+    version: i64,
+    source_owner: NativeHistoryPublicationOwner,
+    query: NativeSourcePlanQuery,
+};
+
+pub const NativeSourcePlanOutcome = std.json.Value;
+
+/// Route-qualified Raft-root query. Optional spec requests upload status; omission requests root quota only. All response evidence must be at or beyond the minimum applied index.
+pub const NativeSourcePlanQuery = struct {
+    root: NativeSourcePlanRoot,
+    spec: ?NativeSourcePlanSpec = null,
+    minimum_applied_index: u64,
+    minimum_native_sequence: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "root", "root", false },
+        .{ "spec", "spec", true },
+        .{ "minimum_applied_index", "minimum_applied_index", false },
+        .{ "minimum_native_sequence", "minimum_native_sequence", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("root");
+        try jw.write(self.root);
+        if (self.spec) |value| {
+            try jw.objectField("spec");
+            try jw.write(value);
+        }
+        try jw.objectField("minimum_applied_index");
+        try jw.write(self.minimum_applied_index);
+        if (self.minimum_native_sequence) |value| {
+            try jw.objectField("minimum_native_sequence");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Root-wide bounded staging accounting. Charge remains held through accepted work and partial reclamation. Explicit fencing advances epoch; absent old grants cannot restart.
+pub const NativeSourcePlanQuota = struct {
+    epoch: u64,
+    active: i64,
+    reserved: u64,
+};
+
+/// Read one sealed chunk. Fenced, missing or reclaimed work cannot be read as owned input. Result bytes must match the spec ordinal hash and the expected seal.
+pub const NativeSourcePlanRead = struct {
+    query: NativeSourcePlanChunkQuery,
+    seal: NativeHistoryDigest,
+    ordinal: i64,
+};
+
+/// Exact physical root. Fence is the canonical digest of the original routed source_owner; a supplied digest establishes no authority by itself. Generation zero is valid.
+pub const NativeSourcePlanRoot = struct {
+    authority: []const u8,
+    namespace: NativeHistoryNamespace,
+    generation: u64,
+    fence: NativeHistoryDigest,
+};
+
+/// Immutable native upload grant. Namespace binds root and storage epoch; domain binds the source binding. Attempt contains a positive big-endian upload token and nonzero nonce. Storage epoch must be less than maximum uint64. Whole-object checksum, frozen-plan digest and ordered chunk hashes are distinct authenticated identities. No age expiry is implied.
+pub const NativeSourcePlanSpec = struct {
+    namespace: NativeHistoryDigest,
+    storage_epoch: u64,
+    binding: NativeHistoryDigest,
+    domain: NativeHistoryDigest,
+    attempt: NativeHistoryConsumerId,
+    bytes: u64,
+    checksum: NativeHistoryDigest,
+    plan_digest: NativeHistoryDigest,
+    chunk_hashes: []const NativeHistoryDigest,
+};
+
+/// Snapshot status for exactly one immutable spec. Received is a 128-bit chunk bitmap with unused bits zero. Proof/position pairs, original seal/fence cuts and reclamation epoch must validate; absent or unsealed work never proves input ownership.
+pub const NativeSourcePlanStatus = struct {
+    present: bool,
+    received: NativeHistoryConsumerId,
+    sealed_position: NativeHistoryDigest,
+    fenced_position: NativeHistoryDigest,
+    seal: NativeHistoryDigest,
+    fence: NativeHistoryDigest,
+    reclamation: NativeHistoryDigest,
+};
+
 pub const StandbyCreateReplicationSlotRequest = struct {
     slot_name: StandbySlotName,
     /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.

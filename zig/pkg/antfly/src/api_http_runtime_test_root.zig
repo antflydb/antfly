@@ -176,3 +176,8 @@ test "completion begin wire executes retained owner validation across the privat
     try std.testing.expectError(error.InvalidBatchRequest, batch.validateCompletionBegin(a, raw, admission.transaction_id, &.{"substituted"}, owner, owner.topology_epoch));
     try std.testing.expectError(error.InvalidBatchRequest, batch.validateCompletionBegin(a, raw, admission.transaction_id, &.{members[0].locator}, owner, owner.topology_epoch + 1));
 }
+
+test "source plan HTTP discovery" {
+    _ = @import("api/source_plan_operations.zig");
+    _ = @import("data/source_plan_http_wire.zig");
+}

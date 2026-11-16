@@ -88,6 +88,39 @@ pub fn parseReadNativeTransactionCompletionResolutionBody(allocator: std.mem.All
     return std.json.parseFromSlice(types.NativeHistoryResolutionRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Read one authenticated sealed source-plan chunk
+pub const ReadNativeSourcePlanChunkPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for readNativeSourcePlanChunk.
+pub fn parseReadNativeSourcePlanChunkBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourcePlanChunkRequest) {
+    return std.json.parseFromSlice(types.NativeSourcePlanChunkRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Stage or retire a frozen source plan
+pub const ControlNativeSourcePlanPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for controlNativeSourcePlan.
+pub fn parseControlNativeSourcePlanBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourcePlanControlRequest) {
+    return std.json.parseFromSlice(types.NativeSourcePlanControlRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Observe root quota and frozen upload status
+pub const ObserveNativeSourcePlanPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for observeNativeSourcePlan.
+pub fn parseObserveNativeSourcePlanBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourcePlanObserveRequest) {
+    return std.json.parseFromSlice(types.NativeSourcePlanObserveRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for createHAReplicationStreamingSlot.
 pub fn parseCreateHAReplicationStreamingSlotBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyCreateReplicationSlotRequest) {
     return std.json.parseFromSlice(types.StandbyCreateReplicationSlotRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -123,6 +156,9 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/page-v1", .operation_id = "readNativeRetainedHistoryPage", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/publication-v1", .operation_id = "readNativeTransactionCompletionPublication", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/resolution-v1", .operation_id = "readNativeTransactionCompletionResolution", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/chunk-v1", .operation_id = "readNativeSourcePlanChunk", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/control-v1", .operation_id = "controlNativeSourcePlan", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/observe-v1", .operation_id = "observeNativeSourcePlan", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/standby/replication/identify", .operation_id = "identifyHAReplicationSystem", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/standby/replication/slots", .operation_id = "createHAReplicationStreamingSlot", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/standby/replication/start", .operation_id = "startHAReplication", .request_body = .buffered, .streaming_response = false },
@@ -148,6 +184,9 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "readNativeRetainedHistoryPage")) @compileError("ServerRouter: Impl missing required method 'readNativeRetainedHistoryPage'");
         if (!@hasDecl(Impl, "readNativeTransactionCompletionPublication")) @compileError("ServerRouter: Impl missing required method 'readNativeTransactionCompletionPublication'");
         if (!@hasDecl(Impl, "readNativeTransactionCompletionResolution")) @compileError("ServerRouter: Impl missing required method 'readNativeTransactionCompletionResolution'");
+        if (!@hasDecl(Impl, "readNativeSourcePlanChunk")) @compileError("ServerRouter: Impl missing required method 'readNativeSourcePlanChunk'");
+        if (!@hasDecl(Impl, "controlNativeSourcePlan")) @compileError("ServerRouter: Impl missing required method 'controlNativeSourcePlan'");
+        if (!@hasDecl(Impl, "observeNativeSourcePlan")) @compileError("ServerRouter: Impl missing required method 'observeNativeSourcePlan'");
         if (!@hasDecl(Impl, "identifyHAReplicationSystem")) @compileError("ServerRouter: Impl missing required method 'identifyHAReplicationSystem'");
         if (!@hasDecl(Impl, "createHAReplicationStreamingSlot")) @compileError("ServerRouter: Impl missing required method 'createHAReplicationStreamingSlot'");
         if (!@hasDecl(Impl, "startHAReplication")) @compileError("ServerRouter: Impl missing required method 'startHAReplication'");
@@ -171,6 +210,9 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/groups/:group_id/tables/:table_name/history/page-v1", httpx.Handler.bind(self.impl, readNativeRetainedHistoryPage));
             try server.post("/groups/:group_id/tables/:table_name/history/publication-v1", httpx.Handler.bind(self.impl, readNativeTransactionCompletionPublication));
             try server.post("/groups/:group_id/tables/:table_name/history/resolution-v1", httpx.Handler.bind(self.impl, readNativeTransactionCompletionResolution));
+            try server.post("/groups/:group_id/tables/:table_name/source-plan/chunk-v1", httpx.Handler.bind(self.impl, readNativeSourcePlanChunk));
+            try server.post("/groups/:group_id/tables/:table_name/source-plan/control-v1", httpx.Handler.bind(self.impl, controlNativeSourcePlan));
+            try server.post("/groups/:group_id/tables/:table_name/source-plan/observe-v1", httpx.Handler.bind(self.impl, observeNativeSourcePlan));
             try server.get("/standby/replication/identify", httpx.Handler.bind(self.impl, identifyHAReplicationSystem));
             try server.post("/standby/replication/slots", httpx.Handler.bind(self.impl, createHAReplicationStreamingSlot));
             try server.post("/standby/replication/start", httpx.Handler.bind(self.impl, startHAReplication));
@@ -239,6 +281,30 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.readNativeTransactionCompletionResolution(ctx, group_id, table_name);
         }
 
+        /// Read one authenticated sealed source-plan chunk
+        /// POST /groups/{group_id}/tables/{table_name}/source-plan/chunk-v1
+        fn readNativeSourcePlanChunk(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.readNativeSourcePlanChunk(ctx, group_id, table_name);
+        }
+
+        /// Stage or retire a frozen source plan
+        /// POST /groups/{group_id}/tables/{table_name}/source-plan/control-v1
+        fn controlNativeSourcePlan(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.controlNativeSourcePlan(ctx, group_id, table_name);
+        }
+
+        /// Observe root quota and frozen upload status
+        /// POST /groups/{group_id}/tables/{table_name}/source-plan/observe-v1
+        fn observeNativeSourcePlan(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.observeNativeSourcePlan(ctx, group_id, table_name);
+        }
+
         /// Identify this primary replication system
         /// GET /standby/replication/identify
         fn identifyHAReplicationSystem(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -275,6 +341,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn readNativeRetainedHistoryPage(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn readNativeTransactionCompletionPublication(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn readNativeTransactionCompletionResolution(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn readNativeSourcePlanChunk(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn controlNativeSourcePlan(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn observeNativeSourcePlan(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn identifyHAReplicationSystem(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createHAReplicationStreamingSlot(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn startHAReplication(self: *Impl, ctx: *httpx.Context) !httpx.Response

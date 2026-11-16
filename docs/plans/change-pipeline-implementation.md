@@ -4078,3 +4078,50 @@ need. Native empty-target provisioning, the source-global head/checkpoint,
 destination integrations, public feeds, coherent bootstrap/retention, production
 pgoutput and existing-client qualification remain required. Neither issue nor
 the full goal is complete.
+
+### Authenticated source-plan staging through native Raft
+
+The internal OpenAPI now defines bounded version-1 control, observation and
+chunk routes under each physical group/table. Generated bindings accompany the
+specification. All three require an internal service principal and an immutable
+catalog route fence. Operations check the physical namespace, metadata
+incarnation, topology epoch and full source completion owner before accessing
+storage. The API-kernel callback configuration ABI is 25; engine descriptor 51,
+opaque owner header 104 and data-Raft protocol 36 remain unchanged.
+
+Control submissions use the existing local-leader lifecycle, including term and
+membership capture, all-peer protocol preflight and write admission. A dedicated
+source-plan entry supplies the storage command. Once accepted, failures preserve
+the exact term/index receipt with an unknown outcome. Recovery reads only that
+receipt through a fresh ReadIndex and native outcome lookup; it never reproposes
+a command or protocol barrier. Replies bind the original typed request digest.
+Known rejections remain distinguishable from uncertain outcomes. Observation and
+chunk reads revalidate owner, route and frozen read barrier after storage access.
+Chunk responses own their bytes and validate the expected seal and ordinal hash.
+Cancellation is checked before parsing untrusted bodies; ordinal bounds are
+checked before indexing evidence bitmaps.
+
+Qualification: `source-plan-http-native-test.log` completes with exit 0 for
+`source-plan-http-test history-control-apply-test source-plan-wire-test`.
+All six HTTP contract tests and all 13 native Raft tests pass without skips or
+leaks. The actual signed HTTP/native/Raft fixture exercises an accepted reply
+loss, recovery without advancing the log, incomplete-seal rejection, chunk
+upload, stable repeated seal, owned chunk retrieval and restoration of the exact
+AFP1 plan and source purpose. It also rejects a substituted table binding and
+verifies fence/reclaim makes the old chunk unreadable. The wire/storage target
+also succeeds. Fixture compilation errors were corrected before this final run.
+
+These DataServer callbacks serve local leaders. Remote client routing and the
+source delivery worker adapter remain outstanding. Trusted internal callers
+must durably reserve the exact input in source metadata before beginning an
+upload; these storage routes do not independently look up a metadata source
+grant. Native empty-target authority provisioning, the distributed source-global
+head/checkpoint, destination integrations, public feeds, coherent bootstrap and
+retention, production pgoutput and existing-client qualification also remain
+required. Neither issue nor the full goal is complete.
+
+The broader `history-serving-capability-test` also passes all 29 cases without
+skips or leaks in `source-plan-http-capability-test.log` (exit 0). Its first
+sandboxed run failed only at the two local TCP binds; the final run granted local
+socket access. Source-catalog validation, `zig fmt --check` on every changed Zig
+file, and `git diff --check` pass.

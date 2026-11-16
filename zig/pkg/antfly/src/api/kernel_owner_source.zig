@@ -1822,6 +1822,78 @@ pub const ProvisionedKernelOwnerSource = struct {
         return parsed.value;
     }
 
+    const source_plan_http = @import("../data/source_plan_http_wire.zig");
+    const SourcePlanReadKind = enum { observation, chunk, outcome };
+    fn SourcePlanReadInput(comptime kind: SourcePlanReadKind) type {
+        return switch (kind) {
+            .observation => source_plan_http.ObserveRequest,
+            .chunk => source_plan_http.ChunkRequest,
+            .outcome => source_plan_http.ControlRequest,
+        };
+    }
+    fn SourcePlanReadResult(comptime kind: SourcePlanReadKind) type {
+        return switch (kind) {
+            .observation => source_plan_http.control.Observation,
+            .chunk => source_plan_http.control.Read,
+            .outcome => source_plan_http.control.Outcome,
+        };
+    }
+    pub fn sourcePlanObservationRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: source_plan_http.ObserveRequest) !source_plan_http.control.Observation {
+        return self.sourcePlanReadRouted(a, fence, table, .observation, request);
+    }
+    pub fn sourcePlanChunkRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: source_plan_http.ChunkRequest) !source_plan_http.control.Read {
+        return self.sourcePlanReadRouted(a, fence, table, .chunk, request);
+    }
+    pub fn sourcePlanOutcomeRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: source_plan_http.ControlRequest) !source_plan_http.control.Outcome {
+        return self.sourcePlanReadRouted(a, fence, table, .outcome, request);
+    }
+    fn sourcePlanReadRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, comptime kind: SourcePlanReadKind, request: SourcePlanReadInput(kind)) !SourcePlanReadResult(kind) {
+        if (self.online_source_authority != .raft) return error.ChangefeedCapabilityUnsupported;
+        if (comptime kind == .outcome) {
+            try request.validate(a);
+            if (request.operation != .recover) return error.InvalidSourcePlanWire;
+        } else try request.validate();
+        const expected = request.source_owner;
+        const group = fence.route.group_id;
+        if (expected.group_id != group) return error.TopologyChanged;
+        const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
+        try context.ensureActive();
+        try self.validateRoutedRead(a, fence, group, table);
+        var descriptor = try self.loadCompletionDescriptor(a, group, table, context);
+        defer descriptor.deinit(a);
+        try @import("completion_owner_admission.zig").require(a, self.catalog, table, fence, descriptor.view(), expected, context);
+        const barrier = self.read_safety_barrier;
+        const capture = barrier.vtable.capture_frozen orelse return error.ChangefeedCapabilityUnsupported;
+        const validate = barrier.vtable.validate_frozen orelse return error.ChangefeedCapabilityUnsupported;
+        const opts: db_types.ScanOptions = .{ .execution_deadline_ns = context.deadline_ns, .cancellation = fence.admission_cancellation };
+        try self.prepareRetainedScanRead(group, "", "", opts, .read_index);
+        const proof = try capture(barrier.ptr, group);
+        if (proof.incarnation == 0 or proof.term == 0 or proof.applied_index == 0) return error.ReadUnavailable;
+        const minimum = switch (kind) {
+            .observation => request.query.minimum_applied_index,
+            .chunk => request.request.query.minimum_applied_index,
+            .outcome => request.receipt.?.index,
+        };
+        if (proof.applied_index < minimum) return error.StorageReadTemporarilyUnavailable;
+        try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
+        var lease = try self.acquireWithControls(group, table, .from(opts));
+        defer lease.deinit();
+        const identity = fence.route.identity_namespace;
+        if (lease.entry.identity.table_id != identity.table_id or lease.entry.identity.shard_id != identity.shard_id or lease.entry.identity.range_id != identity.range_id) return error.HistoryResynchronizationRequired;
+        try self.validateRoutedRead(a, fence, group, table);
+        const result = switch (kind) {
+            .observation => try lease.owner().sourcePlanObservation(a, table, request.query),
+            .chunk => try lease.owner().sourcePlanChunk(a, table, request.request),
+            .outcome => try lease.owner().sourcePlanOutcome(a, table, .{ .command = request.command, .entry = request.receipt.?, .minimum_applied_index = minimum }),
+        };
+        errdefer if (comptime kind == .chunk) a.free(result.bytes);
+        try @import("completion_owner_admission.zig").require(a, self.catalog, table, fence, descriptor.view(), expected, context);
+        try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
+        try self.validateRoutedRead(a, fence, group, table);
+        try context.ensureActive();
+        return result;
+    }
+
     const completion_decision = @import("antfly_local_sources").storage_history_decision_wire;
     const HistoryReadKind = enum { page, outcome, grant, resolution, publication, admission, decision };
     fn HistoryReadInput(comptime kind: HistoryReadKind) type {

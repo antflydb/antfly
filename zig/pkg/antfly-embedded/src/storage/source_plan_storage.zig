@@ -296,20 +296,18 @@ pub const Status = struct {
     seal: ?Digest = null,
     fence: ?Digest = null,
     reclamation: ?Digest = null,
-    pub fn validate(self: Status, root: Root, spec: Spec, quota: Quota, cut: Digest) !void {
+    /// Validate command evidence against its actual committed entry. Root-wide
+    /// quota and epoch evidence additionally require validate() on a snapshot.
+    pub fn validateEvidence(self: Status, root: Root, spec: Spec, cut: Digest) !void {
         try spec.validate(root);
-        try quota.validate();
-        try validateCut(root, cut, !self.present and quota.active == 0 and quota.epoch == 1);
+        try validateCut(root, cut, !self.present and self.reclamation == null);
         if ((self.seal == null) != (self.sealed_position == null) or (self.fence == null) != (self.fenced_position == null)) return error.SourceAdmissionCorrupt;
         if (!self.present) {
             if (!std.mem.allEqual(u8, &self.received, 0) or self.seal != null or self.fence != null) return error.SourceAdmissionCorrupt;
-            if (quota.epoch > spec.storage_epoch) {
-                const proof = self.reclamation orelse return error.SourceAdmissionCorrupt;
-                if (!same(proof, valueDigest("antfly:native-source-plan-reclaimed:v1", spec.id()))) return error.SourceAdmissionCorrupt;
-            } else if (self.reclamation != null) return error.SourceAdmissionCorrupt;
+            if (self.reclamation) |proof| if (!same(proof, valueDigest("antfly:native-source-plan-reclaimed:v1", spec.id()))) return error.SourceAdmissionCorrupt;
             return;
         }
-        if (self.reclamation != null or quota.active == 0 or quota.reserved < spec.reservationBytes() or quota.epoch < spec.storage_epoch or std.mem.readInt(u64, cut[0..8], .little) == 0) return error.SourceAdmissionCorrupt;
+        if (self.reclamation != null) return error.SourceAdmissionCorrupt;
         for (0..128) |ordinal| {
             const present = self.received[ordinal / 8] & (@as(u8, 1) << @as(u3, @intCast(ordinal % 8))) != 0;
             if (ordinal >= spec.chunk_hashes.len and present) return error.SourceAdmissionCorrupt;
@@ -323,9 +321,17 @@ pub const Status = struct {
         if (self.fenced_position) |position| {
             try validatePosition(root, position);
             try requireAtOrBefore(root, position, cut);
-            if (quota.epoch <= spec.storage_epoch or !same(self.fence.?, fenceProof(spec))) return error.SourceAdmissionCorrupt;
+            if (!same(self.fence.?, fenceProof(spec))) return error.SourceAdmissionCorrupt;
             if (self.sealed_position) |sealed| try requireAtOrBefore(root, sealed, position);
         }
+    }
+    pub fn validate(self: Status, root: Root, spec: Spec, quota: Quota, cut: Digest) !void {
+        try quota.validate();
+        try validateCut(root, cut, !self.present and quota.active == 0 and quota.epoch == 1);
+        try self.validateEvidence(root, spec, cut);
+        if (self.present) {
+            if (quota.active == 0 or quota.reserved < spec.reservationBytes() or quota.epoch < spec.storage_epoch or (self.fence != null and quota.epoch <= spec.storage_epoch)) return error.SourceAdmissionCorrupt;
+        } else if ((quota.epoch > spec.storage_epoch) != (self.reclamation != null)) return error.SourceAdmissionCorrupt;
     }
 };
 /// A snapshot observation, not authority by itself. The serving facade binds

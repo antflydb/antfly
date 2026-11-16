@@ -20,6 +20,7 @@ pub const sql_max_request_body_bytes: usize = 4 << 20;
 /// Transport admission shared by native and linked-kernel registrars. Resolve
 /// before buffering so a SQL request cannot consume the much larger batch cap.
 pub fn publicPostBodyLimit(path: []const u8) ?usize {
+    if (isInternalSourcePlanPath(path)) return 2 * 1024 * 1024;
     if (isInternalHistoryControlPath(path) or isInternalHistoryPagePath(path) or isInternalHistoryGrantPath(path) or isInternalHistoryResolutionPath(path) or isInternalHistoryPublicationPath(path) or isInternalHistoryOwnerPath(path) or isInternalHistoryDecisionPath(path)) return 4096;
     if (isInternalDocumentReadPath(path)) return @import("antfly_public_limits").max_document_read_body_bytes;
     if (isPrivacyFindingsPath(path)) return @import("antfly_public_limits").max_privacy_findings_body_bytes;
@@ -69,6 +70,18 @@ pub const DocumentReadRequest = struct {
         return decoded;
     }
 };
+pub fn isInternalSourcePlanPath(path: []const u8) bool {
+    const prefix = "/internal/v1/groups/";
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    var pieces = std.mem.splitScalar(u8, path[prefix.len..], '/');
+    if ((pieces.next() orelse return false).len == 0) return false;
+    if (!std.mem.eql(u8, pieces.next() orelse return false, "tables")) return false;
+    if ((pieces.next() orelse return false).len == 0) return false;
+    if (!std.mem.eql(u8, pieces.next() orelse return false, "source-plan")) return false;
+    const leaf = pieces.next() orelse return false;
+    return (std.mem.eql(u8, leaf, "control-v1") or std.mem.eql(u8, leaf, "observe-v1") or std.mem.eql(u8, leaf, "chunk-v1")) and pieces.next() == null;
+}
+
 pub fn isInternalHistoryControlPath(path: []const u8) bool {
     return isInternalHistoryPath(path, "control-v1");
 }
@@ -231,6 +244,9 @@ pub const Routes = struct {
     pub const internal_capabilities = "/internal/v1/capabilities";
     pub const batch_suffix = "/batch";
     pub const routed_batch_suffix = "/batch-routed-v1";
+    pub const source_plan_control_suffix = "/source-plan/control-v1";
+    pub const source_plan_observe_suffix = "/source-plan/observe-v1";
+    pub const source_plan_chunk_suffix = "/source-plan/chunk-v1";
     pub const history_control_suffix = "/history/control-v1";
     pub const history_page_suffix = "/history/page-v1";
     pub const history_grant_suffix = "/history/grant-v1";

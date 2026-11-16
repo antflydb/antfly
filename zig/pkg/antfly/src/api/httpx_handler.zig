@@ -467,6 +467,99 @@ test "history control ingress HTTP preserves recovery receipts and unknown failu
     try std.testing.expectEqual(@as(usize, 4), fake.calls);
 }
 
+test "source plan HTTP preserves authentication recovery and unknown outcomes" {
+    const a = std.testing.allocator;
+    const operations = @import("source_plan_operations.zig");
+    const Fake = struct {
+        const Mode = enum { rejected, unknown, malformed, busy };
+        mode: Mode = .rejected,
+        calls: usize = 0,
+        fn run(ptr: *anyopaque, allocator: std.mem.Allocator, _: metadata_api.CatalogRouteFence, _: []const u8, input: operations.wire.ControlRequest, _: @import("antfly_local_sources").api_operation.RequestContext) !operations.wire.ControlReply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return switch (self.mode) {
+                .rejected => .{ .request_digest = try input.digest(allocator), .receipt = input.receipt orelse .{ .term = 2, .index = 3 }, .outcome = .{ .rejected = .conflict } },
+                .unknown => error.RaftBatchWriteOutcomeUnknown,
+                .malformed => .{ .request_digest = @splat(0), .outcome = .superseded },
+                .busy => error.StorageBusy,
+            };
+        }
+    };
+    var fake: Fake = .{};
+    var source: AuthStatusSource = .{};
+    const secret = "source-plan-service-secret-long-enough";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "history-test", .internal_service_accept_legacy_unauthenticated = true, .native_source_plan_control = .{ .ptr = &fake, .execute_fn = Fake.run } }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    const path = "/internal/v1/groups/17/tables/docs/source-plan/control-v1";
+    try std.testing.expect(requiresInternalServicePrincipal(path));
+    try std.testing.expectEqual(@as(?usize, operations.wire.max_bytes), @import("http_routes.zig").publicPostBodyLimit(path));
+    try std.testing.expect(@import("http_routes.zig").publicPostBodyLimit(path ++ "/extra") == null);
+    var fixture = try operations.wire.test_support.Fixture.init();
+    const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = fixture.source_owner.metadata_incarnation, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    const encoded_fence = try std.json.Stringify.valueAlloc(a, fence, .{});
+    defer a.free(encoded_fence);
+    var input = try fixture.begin();
+    input.operation = .recover;
+    input.receipt = .{ .term = 2, .index = 3 };
+    const body = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(body);
+    const params = [_]httpx.RouteParam{ .{ .name = "group_id", .value = "17" }, .{ .name = "table_name", .value = "docs" } };
+    {
+        var request = try httpx.Request.init(a, .POST, path);
+        defer request.deinit();
+        request.body = body;
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        context.params = &params;
+        var response = try handler.internalSourcePlanControl(&context);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    }
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    for ([_]Fake.Mode{ .rejected, .unknown, .malformed, .busy }) |mode| {
+        fake.mode = mode;
+        var request = try httpx.Request.init(a, .POST, path);
+        defer request.deinit();
+        request.body = body;
+        try request.setHeader(metadata_api.catalog_route_fence_header, encoded_fence);
+        try request.setHeader(internal_service_auth.header_name, token);
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        context.params = &params;
+        var response = try handler.internalSourcePlanControl(&context);
+        defer response.deinit();
+        const expected: u16 = switch (mode) {
+            .rejected, .unknown => 200,
+            .malformed => 500,
+            .busy => 503,
+        };
+        try std.testing.expectEqual(expected, response.status.code);
+        if (mode == .rejected) {
+            var parsed = try std.json.parseFromSlice(operations.wire.ControlReply, a, response.body.?, .{ .ignore_unknown_fields = false });
+            defer parsed.deinit();
+            const decoded = parsed.value;
+            try decoded.validate(input, try input.digest(a));
+            try std.testing.expect(decoded.confirmed());
+            try std.testing.expectEqual(.conflict, decoded.outcome.?.rejected);
+            try std.testing.expect(response.header(internal_batch_forwarding.outcome_header) == null);
+        } else {
+            try std.testing.expectEqualStrings(internal_batch_forwarding.outcome_unknown_v1, response.header(internal_batch_forwarding.outcome_header).?);
+            if (mode == .unknown) {
+                var parsed = try std.json.parseFromSlice(operations.wire.ControlReply, a, response.body.?, .{ .ignore_unknown_fields = false });
+                defer parsed.deinit();
+                const decoded = parsed.value;
+                try decoded.validate(input, try input.digest(a));
+                try std.testing.expectEqualDeep(input.receipt, decoded.receipt);
+                try std.testing.expect(!decoded.confirmed());
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+}
+
 test "history control ingress mounted route rejects unsigned migration traffic" {
     const a = std.testing.allocator;
     var source: AuthStatusSource = .{};
@@ -1811,6 +1904,16 @@ pub const AntflyApiHandler = struct {
         const group_prefix = routes.internal_groups_prefix ++ ":group_id";
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
+        inline for (.{
+            .{ routes.source_plan_control_suffix, internalSourcePlanControl },
+            .{ routes.source_plan_observe_suffix, internalSourcePlanObserve },
+            .{ routes.source_plan_chunk_suffix, internalSourcePlanChunk },
+        }) |route| {
+            if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit"))
+                try server.postWithBodyLimit(table_prefix ++ route[0], @import("source_plan_operations.zig").wire.max_bytes, httpx.Handler.bind(self, route[1]))
+            else
+                try server.post(table_prefix ++ route[0], httpx.Handler.bind(self, route[1]));
+        }
         try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
         if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
             try server.postWithBodyLimit(table_prefix ++ routes.history_control_suffix, @import("history_control_operations.zig").wire.max_bytes, httpx.Handler.bind(self, internalHistoryControl));
@@ -4090,6 +4193,51 @@ pub const AntflyApiHandler = struct {
         };
         if (!result.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
         return ctx.json(result);
+    }
+
+    fn sourcePlanError(ctx: *httpx.Context, err: anyerror, mutation: bool) !httpx.Response {
+        if (mutation) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const status: u16 = switch (err) {
+            error.ChangefeedCapabilityUnsupported => 501,
+            error.TopologyChanged, error.HistoryResynchronizationRequired, error.SourceReceiptExpired, error.SourcePayloadConflict, error.ConflictingOrderedApplyReceipt => 409,
+            error.GroupLeaderUnavailable, error.LeaderUnavailable, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ReadUnavailable, error.ResourceBudgetExceeded, error.Canceled, error.Cancelled, error.DeadlineExceeded, error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout => 503,
+            error.InvalidCatalogRouteFence, error.InvalidSourcePlanWire, error.InvalidSourceAdmission, error.InvalidTxnRecord, error.InvalidCatalogRouteFenceProtocol, error.UnsupportedCatalogRouteFence, error.MissingField, error.UnknownField, error.DuplicateField, error.UnexpectedToken, error.SyntaxError, error.Overflow => 400,
+            else => 500,
+        };
+        return textResponse(ctx, status, "source plan operation unavailable");
+    }
+    fn internalSourcePlanControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .control);
+    }
+    fn internalSourcePlanObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .observe);
+    }
+    fn internalSourcePlanChunk(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .chunk);
+    }
+    fn internalSourcePlan(self: *AntflyApiHandler, ctx: *httpx.Context, comptime kind: enum { control, observe, chunk }) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid source plan path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_plan_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing source plan request");
+        if (body.len > operations.wire.max_bytes) return textResponse(ctx, 413, "source plan request exceeds byte limit");
+        switch (kind) {
+            .control => {
+                const result = operations.executeControl(self.api_server.cfg.native_source_plan_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, true);
+                if (!result.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+                return ctx.json(result);
+            },
+            .observe => return ctx.json(operations.executeObserve(self.api_server.cfg.native_source_plan_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
+            .chunk => {
+                const result = operations.executeChunk(self.api_server.cfg.native_source_plan_chunk, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false);
+                defer ctx.allocator.free(result.chunk_base64);
+                return ctx.json(result);
+            },
+        }
     }
 
     fn internalCapabilities(_: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

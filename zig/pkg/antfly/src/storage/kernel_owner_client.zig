@@ -620,6 +620,17 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn sourcePlanOutcome(self: *Owner, a: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").storage_source_plan_wire.Recovery) !@import("antfly_local_sources").storage_source_plan_control.Outcome {
+        const json = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(json);
+        var response = try self.sourcePlanJson(.outcome, table_name, json);
+        defer response.deinit();
+        if (response.bytes().len > 4096) return error.InvalidSourcePlanWire;
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_source_plan_control.Outcome, a, response.bytes(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     pub fn sourcePlanObservation(self: *Owner, a: std.mem.Allocator, table_name: []const u8, query: @import("antfly_local_sources").storage_source_plan_control.Query) !@import("antfly_local_sources").storage_source_plan_control.Observation {
         const wire = @import("antfly_local_sources").storage_source_plan_wire;
         try query.validate();
