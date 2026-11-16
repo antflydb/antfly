@@ -204,6 +204,70 @@ pub fn projectArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, rea
     return a.dupe(u8, raw);
 }
 
+// Resolve exactly the physical consumers used by retrieval and text filters.
+// A read with no resolvable consumer retains the stronger global fence.
+// Explicit status observations bypass this resolver and request all consumers.
+// Names are pinned by the caller's apply cut.
+fn requestedConsumers(db: anytype, a: A, input: @import("types.zig").SearchRequest) !std.StringHashMapUnmanaged(void) {
+    var selected: std.StringHashMapUnmanaged(void) = .empty;
+    const manager = db.core.index_manager;
+    const control = @import("query/control_contract.zig");
+    const req = control.directSingleVectorRequest(input) orelse input;
+    const composed = control.searchRequestRequiresComposedSearch(req);
+    if (req.dense_queries.len != 0) {
+        for (req.dense_queries) |query| {
+            const entry = manager.denseIndex(query.index_name) orelse return error.IndexNotFound;
+            try selected.put(a, entry.config.name, {});
+        }
+    } else if (req.dense != null) {
+        const entry = manager.denseIndex(req.index_name) orelse return error.IndexNotFound;
+        try selected.put(a, entry.config.name, {});
+    }
+    if (req.sparse_queries.len != 0) {
+        for (req.sparse_queries) |query| {
+            const entry = manager.sparseIndex(query.index_name) orelse return error.IndexNotFound;
+            try selected.put(a, entry.config.name, {});
+        }
+    } else if (req.sparse != null) {
+        const entry = manager.sparseIndex(req.index_name) orelse return error.IndexNotFound;
+        try selected.put(a, entry.config.name, {});
+    }
+    if (!composed and req.full_text == null and req.dense == null and req.sparse == null and req.query == .dense_knn) {
+        const entry = manager.denseIndex(req.index_name) orelse return error.IndexNotFound;
+        try selected.put(a, entry.config.name, {});
+    }
+    if (!composed and req.full_text == null and req.dense == null and req.sparse == null and req.query == .sparse_knn) {
+        const entry = manager.sparseIndex(req.index_name) orelse return error.IndexNotFound;
+        try selected.put(a, entry.config.name, {});
+    }
+    if (req.full_text_queries.len != 0) {
+        for (req.full_text_queries) |query| {
+            const entry = manager.textIndexEntry(query.index_name) orelse return error.IndexNotFound;
+            try selected.put(a, entry.config.name, {});
+        }
+    } else if (req.full_text != null or
+        (control.isTextQuery(req.query) and (if (composed) !control.isDefaultMatchAll(req.query) else req.dense == null and req.sparse == null)))
+    {
+        if (manager.textIndexEntry(req.index_name)) |entry| try selected.put(a, entry.config.name, {});
+    }
+    if (control.requestBindsFilterTextIndex(req) or req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0) {
+        const entry = (if (req.primary_text_index_name) |name| manager.textIndexEntry(name) else null) orelse
+            (if (req.index_name) |name| manager.textIndexEntry(name) else null) orelse manager.textIndexEntry(null);
+        if (entry) |value| try selected.put(a, value.config.name, {});
+        // Each composed component inherits the filters, with its own root name.
+        inline for (.{ "full_text_queries", "dense_queries", "sparse_queries" }) |field| {
+            for (@field(req, field)) |query| {
+                const child = (if (req.primary_text_index_name) |name| manager.textIndexEntry(name) else null) orelse manager.textIndexEntry(query.index_name) orelse manager.textIndexEntry(null);
+                if (child) |value| try selected.put(a, value.config.name, {});
+            }
+        }
+    }
+    // Graph execution has its own producer/edge proof. Preserve the global
+    // privacy fence until that proof is represented as a consumer dependency.
+    if (req.query == .graph or req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.graph_metric_rerank != null) selected.clearRetainingCapacity();
+    return selected;
+}
+
 /// Ranking uses receiver-owned producer summaries, not a corpus scan or an
 /// artifact's self-reported receipt. Primary/dependency writes enroll pending
 /// requirements in their own transaction; only verified native witnesses can
@@ -214,8 +278,14 @@ pub fn requirePublished(db: anytype, a: A, req: @import("types.zig").SearchReque
 }
 
 pub fn requirePublishedWithBudget(db: anytype, a: A, req: @import("types.zig").SearchRequest, budget: ?*@import("artifact_scan_budget.zig").Budget) !bool {
+    return requireConsumersPublishedWithBudget(db, a, req, null, budget);
+}
+
+/// Explicit physical consumers for internal statistics and inspection reads.
+/// Null retains request resolution; an empty list requests global readiness.
+pub fn requireConsumersPublishedWithBudget(db: anytype, a: A, req: @import("types.zig").SearchRequest, indexes: ?[]const []const u8, budget: ?*@import("artifact_scan_budget.zig").Budget) !bool {
     if (budget) |b| try b.check();
-    var arena = std.heap.ArenaAllocator.init(a);
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
     defer arena.deinit();
     const scratch = arena.allocator();
     const captured = try captureWithBudget(db, scratch, budget);
@@ -239,7 +309,13 @@ pub fn requirePublishedWithBudget(db: anytype, a: A, req: @import("types.zig").S
         const count = try @import("range_cardinality.zig").loadOrProveEmptyFromTxn(&read);
         break :blk count != null and count.? == 0;
     };
-    if (!local and !try @import("artifact_producer_readiness.zig").allSourcesComplete(scratch, &read, plan.plan(), db.root_incarnation, inputs_empty, budget)) return error.IndexRebuilding;
+    var selected: std.StringHashMapUnmanaged(void) = .empty;
+    if (indexes) |names| {
+        for (names) |name| try selected.put(scratch, name, {});
+    } else selected = try requestedConsumers(db, scratch, req);
+    var sources: std.ArrayList([]const u8) = .empty;
+    try sources.append(scratch, policy.artifact_name);
+    const readiness = @import("artifact_producer_readiness.zig");
     var root_found = false;
     for (requirements.nodes) |node| {
         if (budget) |b| try b.consume(node.artifact.len +| node.embedding.len +| @sizeOf(@TypeOf(node)));
@@ -247,10 +323,18 @@ pub fn requirePublishedWithBudget(db: anytype, a: A, req: @import("types.zig").S
         if (std.mem.eql(u8, node.artifact, policy.artifact_name)) root_found = true;
     }
     if (!root_found) return error.IndexRebuilding;
+    var found_consumers: usize = 0;
     inline for (.{ "text_indexes", "dense_indexes", "sparse_indexes" }) |collection| {
         for (@field(db.core.index_manager, collection).items) |*entry| {
             const name = entry.config.name;
-            if (budget) |b| try b.consume(name.len +| entry.config.config_json.len);
+            if (budget) |b| try b.consume(name.len);
+            if (selected.count() != 0 and !selected.contains(name)) continue;
+            found_consumers += 1;
+            if (budget) |b| try b.consume(entry.config.config_json.len);
+            if (!local and selected.count() != 0) {
+                const names = try db.core.index_manager.artifactSourceNamesForIndexAlloc(scratch, name);
+                try sources.appendSlice(scratch, names);
+            }
             if (local and !try db.privacyLocalIndexSourcesCompleteWithBudget(scratch, &read, name, entry.config.kind, plan.plan(), budget)) return error.IndexRebuilding;
             if (db.core.index_manager.loadFailure(name) != null) return error.IndexRebuilding;
             var applied = try db.core.loadAppliedSequence(scratch, name);
@@ -261,6 +345,51 @@ pub fn requirePublishedWithBudget(db: anytype, a: A, req: @import("types.zig").S
             if (checkpoint.status != .clean or checkpoint.config_hash != @import("types.zig").indexConfigHash(entry.config)) return error.IndexRebuilding;
         }
     }
+    if (selected.count() != 0 and found_consumers != selected.count()) return error.IndexNotFound;
+    if (!local) {
+        const complete = if (selected.count() == 0)
+            try readiness.allSourcesComplete(scratch, &read, plan.plan(), db.root_incarnation, inputs_empty, budget)
+        else
+            try readiness.sourcesComplete(scratch, &read, plan.plan(), db.root_incarnation, sources.items, inputs_empty, budget);
+        if (!complete) return error.IndexRebuilding;
+    }
     if (budget) |b| try b.check();
     return true;
+}
+
+test "privacy scoped readiness selects named sparse text and inherited filters" {
+    const Entry = struct { config: struct { name: []const u8 } };
+    const Manager = struct {
+        text: Entry = .{ .config = .{ .name = "text" } },
+        dense: Entry = .{ .config = .{ .name = "dense" } },
+        sparse: Entry = .{ .config = .{ .name = "sparse" } },
+        pub fn textIndexEntry(self: *@This(), name: ?[]const u8) ?*Entry {
+            return if (name == null or std.mem.eql(u8, name.?, "text")) &self.text else null;
+        }
+        pub fn denseIndex(self: *@This(), name: ?[]const u8) ?*Entry {
+            return if (name == null or std.mem.eql(u8, name.?, "dense")) &self.dense else null;
+        }
+        pub fn sparseIndex(self: *@This(), name: ?[]const u8) ?*Entry {
+            return if (name == null or std.mem.eql(u8, name.?, "sparse")) &self.sparse else null;
+        }
+    };
+    var manager: Manager = .{};
+    const core = .{ .index_manager = &manager };
+    const db = .{ .core = &core };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const types = @import("types.zig");
+    var req: types.SearchRequest = .{ .sparse_queries = &.{.{ .name = "s", .index_name = "sparse", .query = .{ .indices = &.{1}, .values = &.{1} } }} };
+    var selected = try requestedConsumers(&db, a, req);
+    try std.testing.expect(selected.count() == 1 and selected.contains("sparse"));
+    req.filter_text = .{ .match_all = {} };
+    selected = try requestedConsumers(&db, a, req);
+    try std.testing.expect(selected.count() == 2 and selected.contains("text"));
+    req.full_text_queries = &.{.{ .name = "t", .index_name = "text", .query = .{ .match_all = {} } }};
+    req.dense_queries = &.{.{ .name = "d", .index_name = "dense", .query = .{ .vector = &.{1}, .k = 1 } }};
+    selected = try requestedConsumers(&db, a, req);
+    try std.testing.expectEqual(@as(u32, 3), selected.count());
+    req.sparse_queries = &.{.{ .name = "bad", .index_name = "absent", .query = .{ .indices = &.{1}, .values = &.{1} } }};
+    try std.testing.expectError(error.IndexNotFound, requestedConsumers(&db, a, req));
 }
