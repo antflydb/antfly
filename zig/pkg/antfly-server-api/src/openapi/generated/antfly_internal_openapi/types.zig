@@ -1223,6 +1223,40 @@ pub const NativeSourcePlanStatus = struct {
     reclamation: NativeHistoryDigest,
 };
 
+/// Immutable physical owner basis; schema/topology leases are qualified separately. All metadata indices in a registry share this metadata group/incarnation.
+pub const NativeSourceScopeBasis = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: []const i64,
+    namespace: NativeHistoryNamespace,
+    root_generation: u64,
+    group_id: u64,
+};
+
+/// Qualified metadata actor/configuration cut, not a caller-supplied lease. The trusted control owner must independently capture active/closing/retired actor state at this same cut. Native monotonic floors reject stale bind after cleanup.
+pub const NativeSourceScopeMetadataCut = struct {
+    group_id: u64,
+    incarnation: []const i64,
+    index: u64,
+};
+
+/// Frozen protocol-39 BEGIN/PREPARE reference. Token is the positive source upload/attempt token; sequence is the logical source sequence. Native local retirement floors prevent delayed BEGIN after transaction metadata GC. A reference alone grants no authority.
+pub const NativeSourceScopeReference = struct {
+    domain: NativeHistoryDigest,
+    binding: NativeHistoryDigest,
+    generation: u64,
+    token: u64,
+    sequence: u64,
+};
+
+/// Private protocol-39 source scope registration. Domain derives from actor_table_id/source_id and stays stable across generations. Binding authenticates one immutable source configuration. A source may target roots different from its actor table or checkpoint authority.
+pub const NativeSourceScopeSpec = struct {
+    actor_table_id: u64,
+    source_id: NativeHistoryDigest,
+    generation: u64,
+    binding: NativeHistoryDigest,
+    checkpoint_owner: NativeSourceScopeBasis,
+};
+
 pub const StandbyCreateReplicationSlotRequest = struct {
     slot_name: StandbySlotName,
     /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.

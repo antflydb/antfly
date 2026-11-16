@@ -4568,3 +4568,44 @@ checkpoint provisioning/fencing, completion/GC handoff, PostgreSQL worker wiring
 public feeds/bootstrap/retention, production pgoutput or existing-client
 qualification are complete. The full issue contracts remain active and both
 issues / draft PR #1700 remain open.
+
+### Native source-scope registry reducers and persisted bounded state
+
+Added the internal source-scope basis/spec/reference/metadata-cut schemas and
+regenerated their API types. `storage/source_scope.zig` provides the native
+registry reducers and NativeKV store operations: immutable physical-root basis,
+stable actor/source domain, generation/binding identity, an 88-byte frozen attempt
+reference, one active transaction slot, checkpoint-owner sequence admission,
+closed attempt-token floors, active/closing/closed phases, and stable first
+closure cuts. Coordinator commit is rejected during closure; a follower can
+finish a previously authenticated retained positive coordinator decision.
+
+Each root has a fixed 1024-domain budget and a monotonic metadata floor. Qualified
+retirement deletes the closed domain and returns its budget charge in the same
+transaction as advancing that floor; an earlier active-actor bind cannot recreate
+it afterward. Once enabled, the header's strict policy survives deleting the last
+domain. Missing records never grant BEGIN. Replacement generations require the
+old generation to be closed and a later metadata cut. Existing global checkpoint
+heads seed sequence admission when binding the checkpoint authority.
+
+Header and domain records use bounded, checksummed, domain-separated envelopes
+with strict JSON decoding and invariant checks. Store operations require the
+caller to abort the enclosing transaction on any failure and atomically persist
+registry changes with transaction/effect changes. A metadata cut is explicitly
+not self-authenticating: control integration must capture qualified actor state
+at that cut before invoking these reducers.
+
+Qualification: direct `zig test` of `storage/source_scope.zig` completed with
+exit zero (`source-scope-unit-test.log`): six scope regressions and two imported
+checkpoint regressions, zero skips/failures/leaks. Tests cover persistent reload,
+close/drain/drop, late admission/bind rejection, immutable closure cuts, follower
+commit drainage, generation replacement, domain budget, reference round-trip,
+and checksum/type corruption. API generation and source-catalog generation
+completed; unrelated generated model-explorer data was restored.
+
+This is registry infrastructure, not completed source fencing: the private
+control endpoints, independently qualified metadata state/cut capture, legacy
+source drain/migration, scoped BEGIN/PREPARE/resolve fields and transaction-record
+persistence still need wiring. No protocol/ABI floor was advanced prematurely.
+The full outstanding distributed adapter, public feed/bootstrap/retention,
+production pgoutput and existing-client qualification requirements remain active.
