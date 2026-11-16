@@ -31,14 +31,23 @@ pytest_plugins = ("test_auth", "test_privacy_indexed_activation")
 BATCH_ITEMS = 32
 
 
+@pytest.fixture
+def migration_api(monkeypatch, request):
+    # Keep the physical wave and planning quantum explicit for the crash gate.
+    monkeypatch.setenv("ANTFLY_ENRICHMENT_EMBED_PARALLEL_BATCHES", "2")
+    monkeypatch.setenv("ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS", "64")
+    monkeypatch.setenv("ANTFLY_ENRICHMENT_WINDOW_ITEMS", "64")
+    return request.getfixturevalue("auth_api")
+
+
 @pytest.mark.parametrize(
     "document_count,crash_during_backfill", [(64, False), (1024, False), (1024, True)]
 )
 @pytest.mark.parametrize("privacy_provider", ["backfill"], indirect=True)
 def test_protected_model_backfill_batches(
-    auth_api, privacy_provider, document_count, crash_during_backfill, tmp_path
+    migration_api, privacy_provider, document_count, crash_during_backfill, tmp_path
 ):
-    api = auth_api
+    api = migration_api
     endpoint, calls, behavior, _ = privacy_provider
     api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     table = "protected_batch_" + uuid4().hex[:8]
@@ -183,7 +192,7 @@ def test_protected_model_backfill_batches(
         report["phase"] = "backfill"
         behavior["hold_model"] = "fixture-v2"
         behavior["model_gate"].clear()
-        behavior["hold_after_document_calls"] = 1 if crash_during_backfill else 0
+        behavior["hold_after_document_calls"] = 2 if crash_during_backfill else 0
         pre_crash_work = []
         add_index("b", "fixture-v2")
         report["index_create_seconds"] = time.monotonic() - began
@@ -191,6 +200,18 @@ def test_protected_model_backfill_batches(
             "B document work was never attempted"
         )
         if crash_during_backfill:
+
+            def partially_published():
+                coverage = api.get(f"/tables/{table}/indexes/b")["status"]["coverage"]
+                produced = coverage["produced"]
+                if coverage["observation_complete"] and 0 < produced < document_count:
+                    report["durably_produced_before_crash"] = produced
+                    return True
+                return False
+
+            assert wait_until(partially_published, timeout_s=30, interval_s=0.02), (
+                report
+            )
             pre_crash_work = [
                 r for r in calls["snapshot"]()[before_requests:] if document_request(r)
             ]
@@ -269,7 +290,8 @@ def test_protected_model_backfill_batches(
             assert actual == Counter(protected), actual
         assert len(calls["extract"]) == before_extractions
         report["document_embedding_calls"] = len(work)
-        report["embedded_documents"] = sum(actual.values())
+        report["completed_embedding_inputs"] = sum(actual.values())
+        report["distinct_embedded_documents"] = len(actual)
         report["phase"] = "restart-verification"
         before_restart = len(calls["snapshot"]())
         api._server.restart()

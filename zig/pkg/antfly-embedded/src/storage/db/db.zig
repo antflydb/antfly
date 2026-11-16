@@ -155213,21 +155213,22 @@ test "privacy protected model migration multi chunk output" {
 // ordered standalone path, holds B while querying A, and crashes/reopens both.
 fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_size: u32) !void {
     const a = std.testing.allocator;
+    const workers = document_count >= 4095;
     const privacy = @import("../../privacy/document.zig");
     const catalog = @import("../../privacy/catalog.zig");
     const Probe = struct {
         deterministic: embedder_mod.DeterministicDenseEmbedder = .{},
-        batches: usize = 0,
+        batches: std.atomic.Value(usize) = .init(0),
         items: std.atomic.Value(usize) = .init(0),
-        largest_batch: usize = 0,
-        privacy_calls: usize = 0,
+        largest_batch: std.atomic.Value(usize) = .init(0),
+        privacy_calls: std.atomic.Value(usize) = .init(0),
         fn check(_: *anyopaque) !void {}
         fn detect(_: *anyopaque, out: Allocator, _: privacy.contract.Producer, _: []const u8) ![]u8 {
             return out.dupe(u8, "{\"entities\":{\"email\":[{\"start\":0,\"end\":6,\"text\":\"a@b.co\",\"confidence\":0.9}]},\"long_document\":{\"window_count\":1}}");
         }
         fn produce(ptr: *anyopaque, out: Allocator, request: asset_producer_mod.Request) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.privacy_calls += 1;
+            _ = self.privacy_calls.fetchAdd(1, .monotonic);
             return privacy.produce(out, request.config_json, request.source_text, .{ .ptr = ptr, .produce = detect, .check = check });
         }
         fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
@@ -155235,8 +155236,8 @@ fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_siz
         }
         fn batch(ptr: *anyopaque, out: Allocator, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.batches += 1;
-            self.largest_batch = @max(self.largest_batch, texts.len);
+            _ = self.batches.fetchAdd(1, .monotonic);
+            _ = self.largest_batch.fetchMax(texts.len, .monotonic);
             const vectors = try out.alloc([]const f32, texts.len);
             var initialized: usize = 0;
             errdefer {
@@ -155264,8 +155265,8 @@ fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_siz
     var directory = try TestDirectory.init("protected-backfill-batching");
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{
-        .start_index_workers = false,
-        .start_optional_runtime_workers = false,
+        .start_index_workers = workers,
+        .start_optional_runtime_workers = workers,
         .enrichment = .{
             .asset_producer = .{ .ptr = &probe, .vtable = &.{ .produce = Probe.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } },
             .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_batch_fn = Probe.batch },
@@ -155286,9 +155287,9 @@ fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_siz
     var verified_b_items: usize = 0;
     for ([_][]const u8{ "A", "B" }, 0..) |name, i| {
         const started = monotonicTimeNs();
-        const calls_before = probe.batches;
+        const calls_before = probe.batches.load(.acquire);
         const items_before = probe.items.load(.acquire);
-        const privacy_before = probe.privacy_calls;
+        const privacy_before = probe.privacy_calls.load(.acquire);
         const native_before = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire);
         const snapshots_before = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire);
 
@@ -155299,16 +155300,18 @@ fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_siz
         const config = try std.fmt.allocPrint(scratch, "{{\"field\":\"embedding\",\"dims\":{d},\"sources\":[{{\"artifact\":\"{s}\"}}]}}", .{ dimensions, embedding });
         try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config, .coverage_generation = i + 1 });
         if (i == 0) try db.batch(.{ .writes = writes, .sync_level = .write });
-        try db.runUntilIdle();
-        std.debug.print("\nPROTECTED-BACKFILL docs={d} index={s} wall_ms={d} batches={d} completed_items={d} primary_scans={d} native_merges={d}\n", .{ document_count, name, (monotonicTimeNs() -| started) / std.time.ns_per_ms, probe.batches - calls_before, probe.items.load(.acquire) - items_before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before, index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before });
+        if (workers) {
+            try waitForProtectedBackfillWithoutDrain(a, &db, name, writes[0].key, document_count, i != 0);
+        } else try db.runUntilIdle();
+        std.debug.print("\nPROTECTED-BACKFILL docs={d} index={s} wall_ms={d} batches={d} completed_items={d} primary_scans={d} native_merges={d}\n", .{ document_count, name, (monotonicTimeNs() -| started) / std.time.ns_per_ms, probe.batches.load(.acquire) - calls_before, probe.items.load(.acquire) - items_before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before, index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before });
         const verified = try verifyProtectedBackfillOutput(a, &db, name, embedding, writes, dimensions, chunk_size < 1024, &probe.deterministic);
         if (i == 1) {
-            migration_calls = probe.batches - calls_before;
+            migration_calls = probe.batches.load(.acquire) - calls_before;
             migration_items = probe.items.load(.acquire) - items_before;
             verified_b_items = verified;
             migration_native_merges = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before;
             migration_snapshot_builds = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before;
-            try std.testing.expectEqual(privacy_before, probe.privacy_calls);
+            try std.testing.expectEqual(privacy_before, probe.privacy_calls.load(.acquire));
         }
     }
     try std.testing.expectEqual(verified_b_items, migration_items);
@@ -155316,25 +155319,67 @@ fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_siz
     try std.testing.expect(migration_snapshot_builds + migration_native_merges <= 4);
     try std.testing.expect(migration_calls <= (migration_items + 31) / 32);
     const completed_before_reopen = probe.items.load(.acquire);
-    const privacy_before_reopen = probe.privacy_calls;
+    const privacy_before_reopen = probe.privacy_calls.load(.acquire);
     db.close();
     db_open = false;
     db = try DB.open(a, directory.path(), .{
-        .start_index_workers = false,
-        .start_optional_runtime_workers = false,
+        .start_index_workers = workers,
+        .start_optional_runtime_workers = workers,
         .enrichment = .{
             .asset_producer = .{ .ptr = &probe, .vtable = &.{ .produce = Probe.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } },
             .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_batch_fn = Probe.batch },
         },
     });
     db_open = true;
-    try db.runUntilIdle();
+    if (!workers) try db.runUntilIdle();
     for ([_][]const u8{ "A", "B" }) |name| {
+        if (workers) try waitForProtectedBackfillWithoutDrain(a, &db, name, writes[0].key, document_count, false);
         const embedding = try catalog.managedName(scratch, version, name);
         _ = try verifyProtectedBackfillOutput(a, &db, name, embedding, writes, dimensions, chunk_size < 1024, &probe.deterministic);
     }
     try std.testing.expectEqual(completed_before_reopen, probe.items.load(.acquire));
-    try std.testing.expectEqual(privacy_before_reopen, probe.privacy_calls);
+    try std.testing.expectEqual(privacy_before_reopen, probe.privacy_calls.load(.acquire));
+}
+
+// Status/inspection/search only: no explicit replay or maintenance driver may
+// make this owner complete. This exercises the real bootstrap/debounce policy.
+fn waitForProtectedBackfillWithoutDrain(a: Allocator, db: *DB, name: []const u8, document: []const u8, count: usize, keep_a_serving: bool) !void {
+    const deadline = monotonicTimeNs() + 120 * std.time.ns_per_s;
+    while (true) {
+        var covered = false;
+        const stats = try db.stats(a);
+        defer types.freeDBStats(a, stats);
+        for (stats.indexes) |index| if (std.mem.eql(u8, index.name, name)) {
+            covered = index.doc_count == count and index.coverage_produced_count == count and index.coverage_terminal_failed_count == 0;
+        };
+        db.core.index_manager.catalog_mutex.lockShared();
+        const native_ready = db.core.index_manager.vectorBlockReadyForDenseIndex(name);
+        db.core.index_manager.catalog_mutex.unlockShared();
+        if (covered and native_ready) {
+            if (db.getDocumentArtifactManifest(a, document, name) catch |err| switch (err) {
+                error.StorageReadTemporarilyUnavailable => null,
+                else => return err,
+            }) |found| {
+                var manifest = found;
+                defer manifest.deinit(a);
+                const parsed = try std.json.parseFromSlice(struct { current: bool }, a, manifest.manifest_json, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                if (parsed.value.current) {
+                    var result = try db.search(a, .{ .index_name = name, .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });
+                    defer result.deinit();
+                    try std.testing.expect(result.hits.len != 0);
+                    return;
+                }
+            }
+        }
+        if (keep_a_serving) {
+            var result = try db.search(a, .{ .index_name = "A", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });
+            defer result.deinit();
+            try std.testing.expect(result.hits.len != 0);
+        }
+        try std.testing.expect(monotonicTimeNs() < deadline);
+        sleepNs(10 * std.time.ns_per_ms);
+    }
 }
 
 fn verifyProtectedBackfillOutput(a: Allocator, db: *DB, name: []const u8, embedding: []const u8, writes: []const types.BatchWrite, dimensions: u32, multi_chunk: bool, deterministic: *embedder_mod.DeterministicDenseEmbedder) !usize {
