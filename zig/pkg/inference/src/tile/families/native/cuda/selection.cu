@@ -167,19 +167,7 @@ extern "C" __global__ void termite_gemma4_mtp_reduce_token_scores_f32(
     block_values[tid] = best_score;
     block_indices[tid] = best_token;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            float rhs_score = block_values[tid + stride];
-            unsigned int rhs_token = block_indices[tid + stride];
-            float lhs_score = block_values[tid];
-            unsigned int lhs_token = block_indices[tid];
-            if (rhs_score > lhs_score || (rhs_score == lhs_score && rhs_token < lhs_token)) {
-                block_values[tid] = rhs_score;
-                block_indices[tid] = rhs_token;
-            }
-        }
-        __syncthreads();
-    }
+{{selection_index_maximum}}
     if (tid == 0u) dst[0] = block_indices[0];
 }
 // native-program:entry termite_gemma4_mtp_masked_argmax_f32

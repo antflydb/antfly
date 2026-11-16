@@ -56,6 +56,8 @@ pub const regions = r.regions(&.{
     r.nativeFamily("src/ops/cuda/kernels/quant_rows_prefetch_l2.cuh", "", "quant_cuda.rows_prefetch_l2", @import("native/cuda_quant_rows_prefetch_l2.zig")),
     r.metalFamily("layer_norm", @import("native/metal_layer_norm.zig")),
     r.cudaFamily("layer_norm", @import("native/cuda_layer_norm.zig")),
+    r.shared(r.metalFamily("selection.indexed_maximum", row_statistics.metal_indexed_maximum), &.{.{ .operation = "selection.indexed_maximum", .source = "../../lib/tile/src/native_statistics.zig", .scope = .phase, .precision = "F32 unordered comparison; exact ties choose lower U32 index; caller-owned seeds and suppression", .schedule = "halving shared tree; original rhs/lhs loads and stage barriers" }}),
+    r.shared(r.nativeFamily("src/ops/cuda/kernels/scalar_argmax_fold.cuh", "", "selection.indexed_maximum", row_statistics.cuda_indexed_maximum), &.{.{ .operation = "selection.indexed_maximum", .source = "../../lib/tile/src/native_statistics.zig", .scope = .phase, .precision = "F32 unordered comparison; exact ties choose lower U32 index; caller-owned seeds and suppression", .schedule = "halving shared tree; original rhs/lhs loads and stage barriers" }}),
     r.metalFamily("argmax", @import("native/metal_argmax.zig")),
     r.cudaFamily("argmax", @import("native/cuda_argmax.zig")),
     r.metalFamily("reduce.embedding_lookup", @import("native/metal_reduce_embedding_lookup.zig")),
@@ -177,9 +179,9 @@ pub const regions = r.regions(&.{
     r.cudaFamily("selection.direct.4", struct {
         pub const source_0 = cuda_selection_sources[4];
     }),
-    r.cudaFamily("selection.direct.5", struct {
+    r.shared(r.cudaFamily("selection.direct.5", struct {
         pub const source_0 = cuda_selection_sources[5];
-    }),
+    }), &.{.{ .operation = "selection.indexed_maximum", .source = "../../lib/tile/src/native_statistics.zig", .scope = .phase, .precision = "F32 unordered comparison; exact ties choose lower U32 index; caller-owned seeds and suppression", .schedule = "halving shared tree; original rhs/lhs loads and stage barriers" }}),
     r.cudaFamily("selection.direct.7", struct {
         pub const source_0 = cuda_selection_sources[6];
     }),

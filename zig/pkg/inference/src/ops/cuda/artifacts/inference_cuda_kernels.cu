@@ -1099,6 +1099,7 @@ extern "C" __global__ void termite_gemma4_mtp_reduce_token_scores_f32(
         }
         __syncthreads();
     }
+
     if (tid == 0u) dst[0] = block_indices[0];
 }
 // tile-codegen:end selection.direct.5 family

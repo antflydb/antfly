@@ -16,6 +16,35 @@ pub const Tree = struct {
         offset: ?[]const u8 = null,
         when: ?[]const u8 = null,
     };
+    /// Coupled maximum over a value/index pair. Scan seeds, suppression and
+    /// invalid-index admission belong to callers; this tree uses unordered
+    /// F32 comparisons and breaks exact ties by the lowest U32 index.
+    pub const Indexed = struct {
+        indices: []const u8,
+        rhs_value: []const u8,
+        rhs_index: []const u8,
+        lhs_value: ?[]const u8 = null,
+        lhs_index: ?[]const u8 = null,
+        guard_lane: ?[]const u8 = null,
+        neighbor_lane: ?[]const u8 = null,
+        initial_shift: []const u8 = "1",
+        compact_update: bool = false,
+
+        fn update(comptime self: Indexed, comptime n: Native, comptime values: []const u8) []const u8 {
+            const fmt = std.fmt.comptimePrint;
+            if ((self.lhs_value == null) != (self.lhs_index == null)) @compileError("indexed tree must load both lhs fields together");
+            const next = fmt("{s} + stride", .{self.neighbor_lane orelse n.lane});
+            const lhs_value = self.lhs_value orelse fmt("{s}[{s}]", .{ values, n.lane });
+            const lhs_index = self.lhs_index orelse fmt("{s}[{s}]", .{ self.indices, n.lane });
+            const loads = fmt("            float {s} = {s}[{s}];\n            {s} {s} = {s}[{s}];\n", .{ self.rhs_value, values, next, n.integer, self.rhs_index, self.indices, next }) ++
+                (if (self.lhs_value) |v| fmt("            float {s} = {s}[{s}];\n            {s} {s} = {s}[{s}];\n", .{ v, values, n.lane, n.integer, self.lhs_index.?, self.indices, n.lane }) else "");
+            const condition = fmt("{s} > {s} || ({s} == {s} && {s} < {s})", .{ self.rhs_value, lhs_value, self.rhs_value, lhs_value, self.rhs_index, lhs_index });
+            return loads ++ if (self.compact_update)
+                fmt("            if ({s}) {{ {s}[{s}] = {s}; {s}[{s}] = {s}; }}\n", .{ condition, values, n.lane, self.rhs_value, self.indices, n.lane, self.rhs_index })
+            else
+                fmt("            if ({s}) {{\n                {s}[{s}] = {s};\n                {s}[{s}] = {s};\n            }}\n", .{ condition, values, n.lane, self.rhs_value, self.indices, n.lane, self.rhs_index });
+        }
+    };
     pub const Native = struct {
         integer: []const u8,
         lane: []const u8,
@@ -33,6 +62,7 @@ pub const Tree = struct {
         /// The post-read barrier orders every read before the next publication.
         broadcast: ?[]const u8 = null,
         operation: Operation = .sum,
+        indexed: ?Indexed = null,
         maximum: []const u8 = "max",
         add: ?[]const u8 = null,
         // Preserve the historical bounded Metal layer-norm tree admission.
@@ -43,6 +73,10 @@ pub const Tree = struct {
         const fmt = std.fmt.comptimePrint;
         if (n.initialize and !n.publication_barrier) @compileError("tree scratch publication requires its barrier");
         if (n.planes.len == 0 or (n.plane_count != null and n.planes.len != 1)) @compileError("tree needs fixed planes or one indexed plane binding");
+        if (n.indexed != null and (n.operation != .maximum or n.initialize or n.planes.len != 1 or
+            n.plane_count != null or n.axes.len != 0 or n.planes[0].offset != null or n.planes[0].when != null or
+            n.maximum_when != null or n.capacity != null or n.broadcast != null))
+            @compileError("indexed maximum requires one caller-published value/index plane");
         var init: []const u8 = "";
         var update: []const u8 = "";
         for (n.planes) |p| {
@@ -50,7 +84,7 @@ pub const Tree = struct {
             const next = fmt("{s} + stride", .{lane});
             const publish = fmt("    {s}[{s}] = {s};\n", .{ p.partial, lane, p.value });
             const sum = if (n.add) |add| fmt("            {s}[{s}] = {s}({s}[{s}], {s}[{s}]);\n", .{ p.partial, lane, add, p.partial, lane, p.partial, next }) else fmt("            {s}[{s}] += {s}[{s}];\n", .{ p.partial, lane, p.partial, next });
-            const maximum = fmt("            {s}[{s}] = {s}({s}[{s}], {s}[{s}]);\n", .{ p.partial, lane, n.maximum, p.partial, lane, p.partial, next });
+            const maximum = if (n.indexed) |indexed| indexed.update(n, p.partial) else fmt("            {s}[{s}] = {s}({s}[{s}], {s}[{s}]);\n", .{ p.partial, lane, n.maximum, p.partial, lane, p.partial, next });
             const combine = if (n.maximum_when) |condition|
                 fmt("            if ({s}) {{\n{s}            }} else {{\n{s}            }}\n", .{ condition, maximum, sum })
             else if (n.operation == .sum) sum else maximum;
@@ -69,7 +103,10 @@ pub const Tree = struct {
             update = (if (a.unroll) "            #pragma unroll\n" else "") ++ fmt("            for ({s} {s} = 0; {s} < {s}; ++{s}) {{\n{s}            }}\n", .{ n.integer, a.name, a.name, a.extent, a.name, update });
         }
         const guard = if (n.capacity) |capacity| fmt(" && {s} + stride < {d}u", .{ n.lane, capacity }) else "";
-        const stages = (if (n.initialize) init else "") ++ (if (n.publication_barrier) "    " ++ n.barrier ++ "\n" else "") ++ fmt("    for ({s} stride = {s} >> 1; stride > 0u; stride >>= 1) {{\n        if ({s} < stride{s}) {{\n{s}        }}\n        {s}\n    }}\n", .{ n.integer, n.threads, n.lane, guard, update, n.barrier });
+        const initial_shift = if (n.indexed) |indexed| indexed.initial_shift else "1";
+        const step = if (n.indexed != null) "1u" else "1";
+        const guard_lane = if (n.indexed) |indexed| indexed.guard_lane orelse n.lane else n.lane;
+        const stages = (if (n.initialize) init else "") ++ (if (n.publication_barrier) "    " ++ n.barrier ++ "\n" else "") ++ fmt("    for ({s} stride = {s} >> {s}; stride > 0u; stride >>= {s}) {{\n        if ({s} < stride{s}) {{\n{s}        }}\n        {s}\n    }}\n", .{ n.integer, n.threads, initial_shift, step, guard_lane, guard, update, n.barrier });
         const name = n.broadcast orelse return stages;
         if (n.planes.len != 1 or n.plane_count != null or n.axes.len != 0 or n.planes[0].when != null)
             @compileError("broadcast requires one unconditional scratch plane");
@@ -81,6 +118,25 @@ pub const Tree = struct {
     /// any lane may reuse that slot. Keep the post-read barrier in the owner.
     pub fn broadcast(comptime value: []const u8, comptime name: []const u8, comptime barrier: []const u8) []const u8 {
         return std.fmt.comptimePrint("    const float {s} = {s};\n    {s}\n", .{ name, value, barrier });
+    }
+
+    pub fn indexedBetter(value: f32, index: u32, other: f32, other_index: u32) bool {
+        return value > other or (value == other and index < other_index);
+    }
+
+    /// Execute the paired tree over caller-owned partials. NaNs do not acquire
+    /// an invented total ordering; exact equal values retain the lower index.
+    pub fn reduceIndexed(values: []f32, indices: []u32) error{InvalidLayout}!void {
+        if (values.len == 0 or !std.math.isPowerOfTwo(values.len) or values.len != indices.len) return error.InvalidLayout;
+        var stride = values.len >> 1;
+        while (stride != 0) : (stride >>= 1) {
+            for (0..stride) |lane| {
+                if (indexedBetter(values[lane + stride], indices[lane + stride], values[lane], indices[lane])) {
+                    values[lane] = values[lane + stride];
+                    indices[lane] = indices[lane + stride];
+                }
+            }
+        }
     }
 
     /// Execute exactly the native addition tree for already accumulated lane

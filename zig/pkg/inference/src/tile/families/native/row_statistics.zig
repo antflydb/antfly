@@ -90,7 +90,46 @@ pub const native_stages = .{
     .cross_row_sum = Tree.native(.{ .integer = "unsigned int", .lane = "tid", .threads = "blockDim.x", .barrier = "__syncthreads();", .initialize = false, .publication_barrier = false, .operation = .sum, .planes = &.{.{ .partial = "scratch", .value = "" }} }),
 };
 
-pub const cuda_selection = .{ .selection_score_sum = native_stages.selection_score_sum };
+pub const cuda_selection = .{
+    .selection_score_sum = native_stages.selection_score_sum,
+    .selection_index_maximum = Tree.native(.{
+        .integer = "unsigned int",
+        .lane = "tid",
+        .threads = "blockDim.x",
+        .barrier = "__syncthreads();",
+        .initialize = false,
+        .publication_barrier = false,
+        .operation = .maximum,
+        .planes = &.{.{ .partial = "block_values", .value = "" }},
+        .indexed = .{ .indices = "block_indices", .rhs_value = "rhs_score", .rhs_index = "rhs_token", .lhs_value = "lhs_score", .lhs_index = "lhs_token" },
+    }),
+};
+pub const cuda_indexed_maximum = struct {
+    pub const source_0 = Tree.native(.{
+        .integer = "unsigned int",
+        .lane = "tid",
+        .threads = "blockDim.x",
+        .barrier = "__syncthreads();",
+        .initialize = false,
+        .publication_barrier = false,
+        .operation = .maximum,
+        .planes = &.{.{ .partial = "best_values", .value = "" }},
+        .indexed = .{ .indices = "best_indices", .rhs_value = "other_value", .rhs_index = "other_index" },
+    });
+};
+pub const metal_indexed_maximum = struct {
+    pub const source_0 = @import("../../native_program.zig").metal(Tree.native(.{
+        .integer = "uint",
+        .lane = "tid",
+        .threads = "uint(tg_size)",
+        .barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        .initialize = false,
+        .publication_barrier = false,
+        .operation = .maximum,
+        .planes = &.{.{ .partial = "sh_vals", .value = "" }},
+        .indexed = .{ .indices = "sh_ids", .rhs_value = "other", .rhs_index = "other_idx", .guard_lane = "uint(tid)", .neighbor_lane = "uint(tid)", .initial_shift = "1u", .compact_update = true },
+    }));
+};
 
 pub const bf16_narrow_exports = struct {
     pub const source_0 =

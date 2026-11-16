@@ -133,6 +133,54 @@ test "shared native tree preserves cancellation association and interleaved plan
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, &invalid);
 }
 
+test "paired native tree chooses global finite maximum then lowest index" {
+    const Tree = core.native_statistics.Tree;
+    for ([_]usize{ 1, 2, 8, 32, 64, 256 }) |width| {
+        var values: [256]f32 = undefined;
+        var indices: [256]u32 = undefined;
+        var expected_value: f32 = -std.math.inf(f32);
+        var expected_index: u32 = std.math.maxInt(u32);
+        for (0..width) |lane| {
+            values[lane] = @as(f32, @floatFromInt(@as(i32, @intCast((lane * 17) % 31)) - 15));
+            indices[lane] = @intCast(width - lane);
+            // Independent serial selection versus the halving native tree.
+            if (values[lane] > expected_value or (values[lane] == expected_value and indices[lane] < expected_index)) {
+                expected_value = values[lane];
+                expected_index = indices[lane];
+            }
+        }
+        try Tree.reduceIndexed(values[0..width], indices[0..width]);
+        try std.testing.expectEqual(expected_value, values[0]);
+        try std.testing.expectEqual(expected_index, indices[0]);
+    }
+}
+
+test "paired native tree preserves unordered NaNs infinities and signed-zero identity" {
+    const nan: f32 = @bitCast(@as(u32, 0x7fc01234));
+    const inf = std.math.inf(f32);
+    const cases = [_]struct { values: [2]f32, ids: [2]u32, winner: usize }{
+        .{ .values = .{ nan, 4 }, .ids = .{ 9, 1 }, .winner = 0 },
+        .{ .values = .{ 4, nan }, .ids = .{ 9, 1 }, .winner = 0 },
+        .{ .values = .{ -inf, -inf }, .ids = .{ 9, 1 }, .winner = 1 },
+        .{ .values = .{ inf, inf }, .ids = .{ 9, 1 }, .winner = 1 },
+        .{ .values = .{ -0.0, 0.0 }, .ids = .{ 9, 1 }, .winner = 1 },
+        .{ .values = .{ -0.0, 0.0 }, .ids = .{ 1, 1 }, .winner = 0 },
+    };
+    for (cases) |c| {
+        var values = c.values;
+        var ids = c.ids;
+        try core.native_statistics.Tree.reduceIndexed(&values, &ids);
+        try std.testing.expectEqual(@as(u32, @bitCast(c.values[c.winner])), @as(u32, @bitCast(values[0])));
+        try std.testing.expectEqual(c.ids[c.winner], ids[0]);
+    }
+    var invalid = [_]f32{ 1, 2, 3 };
+    var ids = [_]u32{ 3, 2, 1 };
+    try std.testing.expectError(error.InvalidLayout, core.native_statistics.Tree.reduceIndexed(&invalid, &ids));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, &invalid);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 2, 1 }, &ids);
+    try std.testing.expectError(error.InvalidLayout, core.native_statistics.Tree.reduceIndexed(invalid[0..2], ids[0..1]));
+}
+
 test "ordered suppression retains ties, first allowed NaN, infinities and empty identity" {
     const nan = std.math.nan(f32);
     const inf = std.math.inf(f32);

@@ -12008,6 +12008,7 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            // tile-codegen:end argmax.0 family
            "inline void termite_argmax_partial_tree(threadgroup float *sh_vals, threadgroup uint *sh_ids, uint tid, uint tg_size) {\n"
+           // tile-codegen:begin selection.indexed_maximum family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "    for (uint stride = uint(tg_size) >> 1u; stride > 0u; stride >>= 1u) {\n"
            "        if (uint(tid) < stride) {\n"
            "            float other = sh_vals[uint(tid) + stride];\n"
@@ -12016,6 +12017,7 @@ static NSString *termite_metal_shader_source(void) {
            "        }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
+           // tile-codegen:end selection.indexed_maximum family
            "}\n"
            // tile-codegen:begin argmax.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
            "kernel void termite_argmax_logits_partials(device const float *logits [[buffer(0)]], device float *partial_values [[buffer(1)]], device uint *partial_ids [[buffer(2)]], constant uint &out_dim [[buffer(3)]], threadgroup float *sh_vals [[threadgroup(0)]], threadgroup uint *sh_ids [[threadgroup(1)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]], uint block [[threadgroup_position_in_grid]]) {\n"

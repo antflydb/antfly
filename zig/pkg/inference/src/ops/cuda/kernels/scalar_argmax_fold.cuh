@@ -24,6 +24,7 @@
     best_values[tid] = best_value;
     best_indices[tid] = best_index;
     __syncthreads();
+// tile-codegen:begin selection.indexed_maximum family (do not edit; run: zig build tile-kernel-codegen -- --write)
     for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
         if (tid < stride) {
             float other_value = best_values[tid + stride];
@@ -35,5 +36,6 @@
         }
         __syncthreads();
     }
+// tile-codegen:end selection.indexed_maximum family
 
 #undef TERMITE_ARGMAX_SUPPRESS

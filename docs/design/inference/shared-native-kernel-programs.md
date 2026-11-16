@@ -316,6 +316,25 @@ removing ownership marker comments. The sole batched argmax change replaces a
 loop with an existing helper whose loop body is byte-identical; its separate
 hardware/reference/timing matrix qualifies that call.
 
+The paired value/index maximum now extends the existing shared-tree owner.
+CUDA scalar/suppressed argmax, the MTP token-score reducer and the Metal argmax
+helper select the same operation with static load/spelling bindings. The scan
+seed, suppression, invalid-index guards and final publication remain caller
+policies. In particular, a NaN is not assigned a new total ordering and exact
+ties retain the smaller U32 index. Caller scratch publication and every stage
+barrier retain their native placement; explicit MTP lhs snapshots remain.
+
+The 51 common-program tests include independent finite selection and explicit
+NaN/infinity/signed-zero cases. The complete Metal source and CUDA scalar fold
+are byte-identical after removing ownership markers. The generated CUDA module
+differs only by a blank line; its C/C++ token stream, including string literals,
+is identical. Local Metal passes 40 correctness cases and 120 timing gates in
+fast/safe math. This phase establishes common algorithm ownership; generated
+copies and source relocation earn no source-size reduction or speedup credit.
+An isolated Glowworm checkout passes CUDA 13.2 `--check --all`: PTX, compressed
+fatbin and SM89 cubin hashes match the committed artifacts exactly. The temporary
+checkout and its build cache are removed after saving the receipts.
+
 ### Retained schedules and migration boundary
 
 The common algorithms listed in the six batches now have production consumers,
@@ -335,7 +354,7 @@ shared source owners, admission/precision contracts and affected-path evidence:
   guards and removal of the replaced template/CPU helpers and duplicate bodies.
 
 This closes the listed common-program migration, not the existence of native
-code. Warp/SIMD/Welford schedules, coupled index/top-k and radix reductions,
+code. Warp/SIMD/Welford schedules, warp-index/top-k and radix reductions,
 format-specific SIMD/DP4A/MMA traversal, tensor-core fragments, vendor GEMM/FFT,
 and distinct training replay/rounding algorithms remain native specializations.
 Some already shared one implementation before this work. Their retained source
