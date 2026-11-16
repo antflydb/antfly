@@ -22,8 +22,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     defer kv.deinit();
     var storage: ?inference.runtime.kv.storage_runtime.KvStorageRuntime = null;
     defer if (storage) |*value| value.deinit();
-    var decode: ?generation.NativeDecodeState = null;
-    defer if (decode) |*state| state.deinit();
+    var request_pool: ?inference.runtime.kv.block.KvPoolId = null;
     if (!is_pjrt) {
         const kind: inference.runtime.kv.pool.BackendKind = switch (model.session.backend()) {
             .native => .native,
@@ -36,9 +35,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         const pool_id = try kv.addPool(generation.requestKvManagerPoolConfig(pool_config));
         storage = try inference.runtime.kv.storage_runtime.KvStorageRuntime.init(a, pool_config);
         try cb.provisionKvDeviceWriteHook(&storage.?);
-        decode = generation.NativeDecodeState.initPaged(a, &kv, pool_id, null);
-        decode.?.kv_storage = &storage.?;
-        decode.?.configureForGptConfig(config);
+        request_pool = pool_id;
     }
     var pipeline = generation.NativeGenerationPipeline{
         .allocator = a,
@@ -47,7 +44,6 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .execution_control = cb.execution_control,
         .gpt_config = config,
         .session = model.session,
-        .decode_state = if (decode) |*state| state else null,
         .tokenizer = model.getTokenizer(),
         .add_bos_token = model.manifest.add_bos_token,
         .bos_token = model.manifest.bos_token,
@@ -77,7 +73,17 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     var cold_ns: u64 = 0;
     for (0..options.warmup + options.iterations) |i| {
         const start = inference.platform.time.awakeNs(init.io);
-        var result = try pipeline.generate(&messages, .{ .max_tokens = @intCast(options.generate_tokens), .temperature = 0, .enable_thinking = false });
+        var result = request: {
+            var decode: ?generation.NativeDecodeState = if (request_pool) |pool| generation.NativeDecodeState.initPaged(a, &kv, pool, null) else null;
+            defer if (decode) |*state| state.deinit();
+            if (decode) |*state| {
+                state.kv_storage = &storage.?;
+                state.configureForGptConfig(config);
+                pipeline.decode_state = state;
+            }
+            defer pipeline.decode_state = null;
+            break :request try pipeline.generate(&messages, .{ .max_tokens = @intCast(options.generate_tokens), .temperature = 0, .enable_thinking = false });
+        };
         const elapsed = inference.platform.time.awakeNs(init.io) - start;
         if (i == 0) cold_ns = elapsed;
         if (i >= options.warmup) samples[i - options.warmup] = elapsed;

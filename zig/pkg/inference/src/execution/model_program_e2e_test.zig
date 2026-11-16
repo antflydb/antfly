@@ -588,8 +588,6 @@ test "model program real boundary extraction executes compiled task graphs" {
     const a = std.testing.allocator;
     const native = try factory.createNativeSessionWithTaskOverride(a, model, .generic);
     defer native.close();
-    const compiled = try factory.createPjrtSessionWithOptions(a, model, .{ .memory_policy = .cpu });
-    defer compiled.close();
     var cb = try factory.getComputeBackend(native, a);
     defer cb.deinit();
     const config = try factory.getGlinerBoundaryConfig(native);
@@ -601,26 +599,30 @@ test "model program real boundary extraction executes compiled task graphs" {
     defer tokenizer.tokenizer().deinitTokenizer();
     const executor = @import("../extractors/gliner_boundary_executor.zig");
     const wire = @import("../extractors/extraction_v2.zig");
-    for ([_][]const u8{ "natural", "latent", "anchorless" }) |mode| {
-        const request_bytes = try std.fmt.allocPrint(a,
-            \\{{"schema_version":2,"model":"fixture","schema":{{"entities":["person","company"],"entity_attributes":{{"status":{{"labels":["active","inactive"],"applies_to":["person"]}}}},"classifications":[{{"name":"sentiment","labels":["negative","positive"]}}],"structures":{{"employment":{{"mode":"{s}","fields":{{"name":{{"type":"str","cardinality":"required_one"}},"company":{{"type":"str","cardinality":"optional_one"}}}}}}}},"relations":[{{"type":"works_for","source":"person","target":"company"}}]}},"inputs":[{{"content":"Ada works at Antfly in Seattle."}}]}}
-        , .{mode});
-        defer a.free(request_bytes);
-        var request = try wire.parseJson(a, request_bytes, .{});
-        defer request.deinit();
-        const options = executor.Options{ .control = .{ .native_call_policy = .in_process }, .pipeline = .{ .threshold = 0.1 } };
-        const expected = try executor.execute(&cb, a, &config, tokenizer.tokenizer(), &request, options);
-        defer a.free(expected);
-        var selected = options;
-        selected.compiled_session = compiled;
-        for (0..2) |_| {
-            const actual = try executor.execute(&cb, a, &config, tokenizer.tokenizer(), &request, selected);
-            defer a.free(actual);
-            var left = try std.json.parseFromSlice(std.json.Value, a, expected, .{});
-            defer left.deinit();
-            var right = try std.json.parseFromSlice(std.json.Value, a, actual, .{});
-            defer right.deinit();
-            try expectTaskJsonParity(left.value, right.value);
+    for ([_]factory.PjrtSessionOptions.Precision{ .f32, .bf16 }) |precision| {
+        const compiled = try factory.createPjrtSessionWithOptions(a, model, .{ .memory_policy = .cpu, .precision = precision });
+        defer compiled.close();
+        for ([_][]const u8{ "natural", "latent", "anchorless" }) |mode| {
+            const request_bytes = try std.fmt.allocPrint(a,
+                \\{{"schema_version":2,"model":"fixture","schema":{{"entities":["person","company"],"entity_attributes":{{"status":{{"labels":["active","inactive"],"applies_to":["person"]}}}},"classifications":[{{"name":"sentiment","labels":["negative","positive"]}}],"structures":{{"employment":{{"mode":"{s}","fields":{{"name":{{"type":"str","cardinality":"required_one"}},"company":{{"type":"str","cardinality":"optional_one"}}}}}}}},"relations":[{{"type":"works_for","source":"person","target":"company"}}]}},"inputs":[{{"content":"Ada works at Antfly in Seattle."}}]}}
+            , .{mode});
+            defer a.free(request_bytes);
+            var request = try wire.parseJson(a, request_bytes, .{});
+            defer request.deinit();
+            const options = executor.Options{ .control = .{ .native_call_policy = .in_process }, .pipeline = .{ .threshold = 0.1 } };
+            const expected = try executor.execute(&cb, a, &config, tokenizer.tokenizer(), &request, options);
+            defer a.free(expected);
+            var selected = options;
+            selected.compiled_session = compiled;
+            for (0..2) |_| {
+                const actual = try executor.execute(&cb, a, &config, tokenizer.tokenizer(), &request, selected);
+                defer a.free(actual);
+                var left = try std.json.parseFromSlice(std.json.Value, a, expected, .{});
+                defer left.deinit();
+                var right = try std.json.parseFromSlice(std.json.Value, a, actual, .{});
+                defer right.deinit();
+                try expectTaskJsonParity(left.value, right.value);
+            }
         }
     }
 }

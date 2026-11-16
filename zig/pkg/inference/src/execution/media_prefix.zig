@@ -10,6 +10,7 @@ const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const Prefix = struct {
     embeddings: Tensor,
+    retained: ?@import("../backends/session.zig").RunPermit = null,
     ple_ids: ?[]i64 = null,
     axis_positions: ?[]u32 = null,
     position_delta: i64 = 0,
@@ -20,6 +21,7 @@ pub const Prefix = struct {
         if (self.ple_ids) |ids| a.free(ids);
         if (self.axis_positions) |positions| a.free(positions);
         if (self.visibility) |mask| a.free(mask);
+        if (self.retained) |*permit| permit.deinit();
         self.* = undefined;
     }
 

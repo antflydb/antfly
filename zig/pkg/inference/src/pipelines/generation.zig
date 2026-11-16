@@ -7957,6 +7957,15 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn compileMediaPrefix(self: *NativeGenerationPipeline, tensor: ops.CT, rows: usize, ple: ?[]const i64, positions: ?[]const u32, delta: i64, mask: ?[]const u8) !@import("../execution/media_prefix.zig").Prefix {
+        const session = self.session orelse return error.InvalidModelForGeneration;
+        var bytes = try std.math.mul(usize, try std.math.mul(usize, rows, self.gpt_config.hidden_size), @sizeOf(f32));
+        if (ple) |ids| bytes = try std.math.add(usize, bytes, try std.math.mul(usize, ids.len, @sizeOf(i64)));
+        if (positions) |ids| bytes = try std.math.add(usize, bytes, try std.math.mul(usize, ids.len, @sizeOf(u32)));
+        if (mask) |bits| bytes = try std.math.add(usize, bytes, bits.len);
+        // The prefix outlives each individual stage invocation. Admit its
+        // owned host copy before allocation and outside any provider lane.
+        var retained: ?@import("../backends/session.zig").RunPermit = try session.withAdmissionControl(self.execution_control).admitRetainedMedia(bytes, 0);
+        errdefer if (retained) |*permit| permit.deinit();
         var scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
         defer if (scope) |*held| held.deinit();
         const values = try self.cb.toFloat32(tensor, self.allocator);
@@ -7964,6 +7973,8 @@ pub const NativeGenerationPipeline = struct {
         errdefer if (values_owned) self.allocator.free(values);
         var prefix = @import("../execution/media_prefix.zig").Prefix{ .embeddings = try backends.Tensor.initFloat32Owned(self.allocator, "input_embeddings", &.{ 1, @intCast(rows), self.gpt_config.hidden_size }, values), .position_delta = delta };
         values_owned = false;
+        prefix.retained = retained;
+        retained = null;
         errdefer prefix.deinit(self.allocator);
         if (ple) |ids| prefix.ple_ids = try self.allocator.dupe(i64, ids);
         if (positions) |ids| prefix.axis_positions = try self.allocator.dupe(u32, ids);

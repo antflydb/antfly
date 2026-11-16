@@ -175,7 +175,7 @@ pub const Cache = struct {
         if (a.context != b.context or a.create != b.create or a.import != b.import or (a.compiled_context != null) != (b.compiled_context != null)) return false;
         if (a.compiled_context) |left| {
             const right = b.compiled_context.?;
-            return left.requested_backend == right.requested_backend and left.pjrt_client == right.pjrt_client and left.pjrt_parameter_store == right.pjrt_parameter_store and left.attachment_target == right.attachment_target and left.pjrt_precision == right.pjrt_precision;
+            return left.requested_backend == right.requested_backend and left.pjrt_client == right.pjrt_client and left.pjrt_parameter_store == right.pjrt_parameter_store and left.attachment_target == right.attachment_target;
         }
         return true;
     }
@@ -190,6 +190,9 @@ pub const Cache = struct {
         };
     }
     fn acquire(self: *Cache, allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input) !*Entry {
+        // Precision belongs to the program specialization, not model/provider
+        // identity: F32 task heads can follow a BF16 encoder on one client.
+        if (provider.compiled_context) |context| if (context.requested_backend == .pjrt and context.pjrt_precision != forward.precision) return error.ModelProgramPrecisionMismatch;
         const key = try capture.specializationKey(forward, inputs);
         var resolved_provider = provider;
         platform.sync.lockYielding(&self.mutex);
@@ -382,6 +385,17 @@ const TestProvider = struct {
             defer for (outputs) |*output| output.deinit();
             try std.testing.expectEqual(@as(u64, 2), cache.entries.stats.builds);
             try std.testing.expectEqual(@as(usize, 1), cache.parameters.?.uploads);
+            var bf16_forward = frontend;
+            bf16_forward.precision = .bf16;
+            var bf16_provider = provider;
+            bf16_provider.compiled_context.?.pjrt_precision = .bf16;
+            const mixed = try cache.run(a, bf16_provider, bf16_forward, &declared, a, null);
+            defer a.free(mixed);
+            defer for (mixed) |*output| output.deinit();
+            try std.testing.expectEqualSlices(f32, &.{ -14, -14, -14, -14, -14, -14 }, mixed[0].asFloat32());
+            try std.testing.expectEqual(@as(u64, 3), cache.entries.stats.builds);
+            try std.testing.expectEqual(@as(usize, 1), cache.parameters.?.uploads);
+            try std.testing.expectError(error.ModelProgramPrecisionMismatch, cache.run(a, bf16_provider, frontend, &declared, a, null));
         }
         const entry = cache.entries.entries.items[0];
         const first = try entry.acquireFrame();
