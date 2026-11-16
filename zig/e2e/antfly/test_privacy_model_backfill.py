@@ -32,6 +32,31 @@ pytest_plugins = ("test_auth", "test_privacy_indexed_activation")
 BATCH_ITEMS = 32
 
 
+def assert_recovered_inputs_not_requested(records, accepted_inputs):
+    repeated = [
+        row
+        for row in records
+        if row["model"] == "fixture-v2" and accepted_inputs.intersection(row["inputs"])
+    ]
+    assert not repeated, ("durable inputs must not be requested again", repeated)
+
+
+@pytest.mark.parametrize("status", [None, 200, 502])
+def test_recovered_inputs_reject_every_inference_attempt(status):
+    with pytest.raises(AssertionError, match="durable inputs"):
+        assert_recovered_inputs_not_requested(
+            [{"model": "fixture-v2", "inputs": ["accepted"], "status": status}],
+            {"accepted"},
+        )
+
+
+def test_recovered_inputs_allow_only_unaccepted_work():
+    assert_recovered_inputs_not_requested(
+        [{"model": "fixture-v2", "inputs": ["pending"], "status": None}],
+        {"accepted"},
+    )
+
+
 @pytest.fixture
 def migration_api(monkeypatch, request):
     # Keep the physical wave and planning quantum explicit for the crash gate.
@@ -243,6 +268,7 @@ def test_protected_model_backfill_batches(
         behavior["hold_after_document_calls"] = 2 if crash_during_backfill else 0
         pre_crash_work = []
         persisted_before_crash = set()
+        recovery_request_start = None
         add_index("b", "fixture-v2")
         report["index_create_seconds"] = time.monotonic() - began
         assert behavior["model_held"].wait(timeout=20), (
@@ -295,6 +321,7 @@ def test_protected_model_backfill_batches(
             behavior["hold_after_document_calls"] = 0
             behavior["model_gate"].clear()
             behavior["model_held"].clear()
+            recovery_request_start = len(calls["snapshot"]())
             api._server.restart()
             cpu_before = cpu_seconds()
             report["server_cpu_scope"] = "post-restart"
@@ -320,6 +347,9 @@ def test_protected_model_backfill_batches(
                 if row["model"] == "fixture-v2"
                 and row["started"] > pre_crash_work[-1]["started"]
             ), "recovery must precede newly completed inference"
+            assert_recovered_inputs_not_requested(
+                calls["snapshot"]()[recovery_request_start:], persisted_before_crash
+            )
             report["crashed_during_backfill"] = True
         held_since = time.monotonic()
         assert not complete("b")
@@ -357,6 +387,11 @@ def test_protected_model_backfill_batches(
             document_records
         )
         assert work and all(r["completed"] is not None for r in work), work
+        if recovery_request_start is not None:
+            assert_recovered_inputs_not_requested(
+                calls["snapshot"]()[recovery_request_start:], persisted_before_crash
+            )
+            report["recovered_prefix_embedding_attempts"] = 0
         successful = [r for r in work if r["status"] == 200]
         abandoned = [r for r in work if r["status"] != 200]
         # Foreground reads may cancel a background invocation while the fake

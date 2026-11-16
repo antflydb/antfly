@@ -36415,39 +36415,32 @@ pub const DB = struct {
         session_lock.unlock();
         if (!claimed) return .{ .busy = true };
         defer finishDenseProjectionFinalization(self.async_context);
+        if (options.cancel_check) |check| if (check.requested()) return .{ .deferred = true };
         const allow_primary_snapshot = options.allow_primary_snapshot and
             try denseCorpusCoverageAllowsPrimarySnapshot(self.async_context);
         var published: usize = 0;
         var deferred = false;
-        for (self.core.index_manager.dense_indexes.items) |entry| {
-            if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
-            if (entry.index.leann != null or self.core.index_manager.repairUnavailable(entry.config.name)) continue;
-            var index_options = options;
-            index_options.only_index = entry.config.name;
-            index_options.allow_primary_snapshot = allow_primary_snapshot;
-            const result = try self.core.index_manager.publishVectorBlockBasesOnlineReported(index_options);
-            published += result.published;
-            deferred = deferred or result.deferred;
-        }
-        // Fail-closed reconstruction cannot depend on its own clean marker
-        // to enter acceleration maintenance. Permit only candidates whose
-        // durable terminal outcomes already cover the current source corpus.
-        // Nothing here activates the repair or certifies a stale generation.
-        for (self.core.index_manager.dense_indexes.items) |entry| {
+        for (self.core.index_manager.dense_indexes.items) |*entry| {
+            if (options.cancel_check) |check| if (check.requested()) return .{ .published = published, .deferred = true };
             if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
             if (entry.index.leann != null) continue;
-            if (!self.core.index_manager.repairUnavailable(entry.config.name)) continue;
-            const checkpoint = self.core.index_manager.denseProjectionCheckpointMetadata(entry.config.name) orelse continue;
-            if (checkpoint.status != .rebuilding) continue;
-            const expected = (try denseTargetCountForIndexContext(self.async_context, entry.config.name)) orelse continue;
-            if (entry.index.stats().active_count != expected) continue;
-            var repair_options = options;
-            repair_options.covered_rebuilding_index = entry.config.name;
-            repair_options.only_index = entry.config.name;
-            repair_options.allow_primary_snapshot = allow_primary_snapshot;
-            const repair = try self.core.index_manager.publishVectorBlockBasesOnlineReported(repair_options);
-            published += repair.published;
-            deferred = deferred or repair.deferred;
+            var index_options = options;
+            // A complete rebuilding index may repair its missing generation
+            // once even while a sibling producer is paused. Healthy recurring
+            // maintenance still requires whole-corpus completion before a scan.
+            const checkpoint = self.core.index_manager.denseProjectionCheckpointMetadata(entry.config.name);
+            const rebuilding = checkpoint != null and checkpoint.?.status == .rebuilding;
+            if (self.core.index_manager.repairUnavailable(entry.config.name)) {
+                if (!rebuilding) continue;
+                const expected = (try denseTargetCountForIndexContext(self.async_context, entry.config.name)) orelse continue;
+                if (entry.index.stats().active_count != expected) continue;
+                index_options.covered_rebuilding_index = entry.config.name;
+            }
+            index_options.allow_primary_snapshot = options.allow_primary_snapshot and
+                (allow_primary_snapshot or (rebuilding and try denseIndexSourceCoverageComplete(self.async_context, entry.config)));
+            const result = try self.core.index_manager.publishVectorBlockBaseForEntryOnlineReported(entry, index_options);
+            published += result.published;
+            deferred = deferred or result.deferred;
         }
         return .{ .published = published, .deferred = deferred };
     }
@@ -62755,11 +62748,12 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
 // The exact-vector store is shared: repairing A scans B's artifacts too.
 // One complete sibling must not repeatedly rebuild the corpus while another
 // producer is still publishing small batches. Native-only maintenance remains
-// eligible independently of this whole-corpus scan admission.
+// eligible independently of this whole-corpus scan admission. Source-complete
+// rebuilding indexes also have a one-time repair exception at their caller.
 fn denseCorpusCoverageAllowsPrimarySnapshot(ctx: *AsyncContext) !bool {
     for (ctx.index_manager.dense_indexes.items) |entry| {
         if (entry.index.leann != null) continue;
-        if (!try denseIndexSourceCoverageComplete(ctx, entry.config.name)) return false;
+        if (!try denseIndexSourceCoverageComplete(ctx, entry.config)) return false;
     }
     return true;
 }
@@ -62768,9 +62762,9 @@ fn denseCorpusCoverageAllowsPrimarySnapshot(ctx: *AsyncContext) !bool {
 // may emit many chunks, and a provider can pause between small output batches.
 // Use the current incarnation's terminal source outcomes to admit expensive
 // primary scans, independently of native WAL/query eligibility.
-fn denseIndexSourceCoverageComplete(ctx: *AsyncContext, index_name: []const u8) !bool {
-    const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return false;
-    const counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
+fn denseIndexSourceCoverageComplete(ctx: *AsyncContext, config: types.IndexConfig) !bool {
+    const generation = internal_keys.derivedCoverageGenerationForConfig(config.coverage_generation, config.config_json);
+    const counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, config.name, generation, ctx.index_manager.byte_range, ctx);
     const present: u2 = @as(u2, @intFromBool(counts.produced != null)) +
         @as(u2, @intFromBool(counts.skipped != null)) +
         @as(u2, @intFromBool(counts.terminal_failed != null));
@@ -63892,7 +63886,7 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
     defer finishDenseProjectionFinalization(ctx);
     const allow_primary_snapshot = try denseCorpusCoverageAllowsPrimarySnapshot(ctx);
     var pending = false;
-    for (manager.dense_indexes.items) |entry| {
+    for (manager.dense_indexes.items) |*entry| {
         if (ctx.background_closing.load(.acquire)) return false;
         const checkpoint = manager.denseProjectionCheckpointMetadata(entry.config.name) orelse continue;
         if (checkpoint.status != .rebuilding and checkpoint.status != .clean) continue;
@@ -63903,17 +63897,18 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
         )) orelse continue;
         if (entry.index.stats().active_count != expected) continue;
         const sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
-        if (manager.vectorBlockReadyForDenseIndexAtSequence(entry.config.name, sequence, expected) and
+        if (manager.vectorBlockReadyForDenseEntryAtSequence(entry, sequence, expected) and
             checkpoint.status == .clean) continue;
-        _ = try manager.publishVectorBlockBasesOnline(.{
+        _ = try manager.publishVectorBlockBaseForEntryOnlineReported(entry, .{
             // Ordinary finite loads wait for a stable tip instead of building
             // a new corpus projection after each small foreground batch.
             .require_quiescence = checkpoint.status == .clean,
             .covered_rebuilding_index = entry.config.name,
             .only_index = entry.config.name,
-            .allow_primary_snapshot = allow_primary_snapshot,
+            .allow_primary_snapshot = allow_primary_snapshot or
+                (checkpoint.status == .rebuilding and try denseIndexSourceCoverageComplete(ctx, entry.config)),
         });
-        if (!manager.vectorBlockReadyForDenseIndexAtSequence(entry.config.name, sequence, expected)) {
+        if (!manager.vectorBlockReadyForDenseEntryAtSequence(entry, sequence, expected)) {
             pending = true;
             continue;
         }
@@ -118992,6 +118987,98 @@ test "db last external dense bulk lease finalizes covered rebuilding generations
     } else return error.TestUnexpectedResult;
     try std.testing.expect(stats.async_indexing.dense_projection_finalizing);
     try std.testing.expect(!dense_stats.dense_vector_projection_pending);
+}
+
+test "db online vector publication visits each catalog entry once" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("online-vector-linear-catalog");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    for (0..8) |i| {
+        const name = try std.fmt.allocPrint(a, "external-{d}", .{i});
+        defer a.free(name);
+        try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
+    }
+    try db.runUntilIdle();
+    const catalogs = index_manager_mod.test_vector_publication_catalog_visits.load(.acquire);
+    const entries = index_manager_mod.test_vector_publication_entry_visits.load(.acquire);
+    _ = try db.publishVectorBlockBasesOnlineReported(.{});
+    // DB dispatches its pinned entries directly; no name-filtered nested walk.
+    try std.testing.expectEqual(catalogs, index_manager_mod.test_vector_publication_catalog_visits.load(.acquire));
+    try std.testing.expectEqual(entries + 8, index_manager_mod.test_vector_publication_entry_visits.load(.acquire));
+    _ = try db.core.index_manager.publishVectorBlockBasesOnlineReported(.{});
+    try std.testing.expectEqual(catalogs + 8, index_manager_mod.test_vector_publication_catalog_visits.load(.acquire));
+    try std.testing.expectEqual(entries + 16, index_manager_mod.test_vector_publication_entry_visits.load(.acquire));
+}
+
+test "db online vector repair completes independently of partial sibling coverage" {
+    for ([_]bool{ false, true }) |native_round| {
+        const a = std.testing.allocator;
+        var directory = try TestDirectory.init("online-vector-independent-repair");
+        defer directory.cleanup();
+        var storage = lsm_backend_mod.MemoryStorage.init(a);
+        defer storage.deinit();
+        var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .ttl_cleanup = .{ .enabled = false } });
+        defer db.close();
+        for ([_][]const u8{ "A", "B" }, 0..) |name, i| try db.addIndex(.{ .name = name, .kind = .dense_vector, .coverage_generation = i + 1, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
+        try db.batch(.{ .writes = &.{
+            .{ .key = "one", .value = "{\"_embeddings\":{\"A\":[1,0,0]}}" },
+            .{ .key = "two", .value = "{\"_embeddings\":{\"A\":[0,1,0]}}" },
+        }, .sync_level = .full_index });
+        try db.runUntilIdle();
+        // Durable producer state: A has both outputs; B has settled one
+        // skipped input and cannot finish its remaining provider work.
+        for ([_][]const u8{ "A", "B" }, 0..) |name, i| {
+            for ([_][]const u8{ "produced", "skipped", "terminal_failed" }, 0..) |tag, j| {
+                const key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(a, name, i + 1, tag);
+                defer a.free(key);
+                var value: [8]u8 = undefined;
+                const count: u64 = if (i == 0 and j == 0) 2 else if (i == 1 and j == 1) 1 else 0;
+                try db.core.store.put(key, internal_keys.encodeDerivedCoverageOutcomeCount(&value, count));
+            }
+        }
+        try std.testing.expect(!try denseCorpusCoverageAllowsPrimarySnapshot(db.async_context));
+        const manager = db.core.index_manager;
+        manager.clearVectorBlockGenerationForTest();
+        manager.setVectorBlockStorage(storage.storage());
+        const before = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire);
+        // A healthy recurring pass must still suppress this corpus scan.
+        _ = try db.publishVectorBlockBasesOnlineReported(.{ .only_index = "A" });
+        try std.testing.expectEqual(before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+        var checkpoint = try db.core.loadProjectionCheckpoint(a, "A");
+        checkpoint.status = .rebuilding;
+        try db.core.saveProjectionCheckpoint("A", checkpoint);
+        _ = try db.publishVectorBlockBasesOnlineReported(.{ .only_index = "A", .allow_primary_snapshot = false });
+        try std.testing.expectEqual(before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+        const produced_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(a, "A", 1, "produced");
+        defer a.free(produced_key);
+        var produced_value: [8]u8 = undefined;
+        try db.core.store.put(produced_key, internal_keys.encodeDerivedCoverageOutcomeCount(&produced_value, 1));
+        if (native_round) {
+            _ = try nativeProjectionMaintenanceRound(db.async_context);
+        } else {
+            _ = try db.publishVectorBlockBasesOnlineReported(.{ .only_index = "A" });
+        }
+        try std.testing.expectEqual(before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+        try db.core.store.put(produced_key, internal_keys.encodeDerivedCoverageOutcomeCount(&produced_value, 2));
+        if (native_round) {
+            _ = try nativeProjectionMaintenanceRound(db.async_context);
+        } else {
+            _ = try db.publishVectorBlockBasesOnlineReported(.{ .only_index = "A" });
+        }
+        try std.testing.expectEqual(before + 1, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+        try std.testing.expect(manager.vectorBlockReadyForDenseIndex("A"));
+        try std.testing.expect(!try denseCorpusCoverageAllowsPrimarySnapshot(db.async_context));
+        // A's repair completes without another scan or any change to B.
+        _ = try nativeProjectionMaintenanceRound(db.async_context);
+        const repaired = try db.core.loadProjectionCheckpoint(a, "A");
+        try std.testing.expect(repaired.status == .clean);
+        try std.testing.expectEqual(before + 1, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+        var result = try db.search(a, .{ .index_name = "A", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });
+        defer result.deinit();
+        try std.testing.expectEqualStrings("one", result.hits[0].id);
+    }
 }
 
 test "db online vector publication leaves foreground and posting mutation admission open" {

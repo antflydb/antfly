@@ -327,6 +327,8 @@ pub var test_inject_index_open_error: ?anyerror = null;
 pub var test_inject_index_removal_cleanup_error: ?anyerror = null;
 pub var test_inject_generated_artifact_cleanup_error: ?anyerror = null;
 pub var test_generated_artifact_cleanup_failures_remaining: std.atomic.Value(u32) = .init(0);
+pub var test_vector_publication_catalog_visits: std.atomic.Value(usize) = .init(0);
+pub var test_vector_publication_entry_visits: std.atomic.Value(usize) = .init(0);
 pub var test_vector_block_primary_snapshot_builds: std.atomic.Value(usize) = .init(0);
 pub const test_vector_block_native_merge_builds = &vector_block_store_mod.test_native_base_build_attempts;
 pub var test_before_vector_block_primary_snapshot_build: ?struct {
@@ -4533,9 +4535,13 @@ pub const IndexManager = struct {
     }
 
     pub fn vectorBlockReadyForDenseIndex(self: *IndexManager, name: []const u8) bool {
-        if (self.denseIndex(name)) |leann_entry| if (!denseIndexUsesVectorBlocks(leann_entry)) return true;
-        if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         const entry = self.denseIndex(name) orelse return false;
+        return self.vectorBlockReadyForDenseEntry(entry);
+    }
+
+    pub fn vectorBlockReadyForDenseEntry(self: *IndexManager, entry: *DenseIndex) bool {
+        if (!denseIndexUsesVectorBlocks(entry)) return true;
+        if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         if (self.vectorBlockStableTipFinalizingEntry(entry)) return false;
         if (entry.native_physical_v2 and entry.index.stats().active_count != 0 and
             !entry.index.nativePostingBaseHasVectors()) return false;
@@ -4584,9 +4590,13 @@ pub const IndexManager = struct {
         source_sequence: u64,
         expected_count: u64,
     ) bool {
-        if (self.denseIndex(name)) |leann_entry| if (!denseIndexUsesVectorBlocks(leann_entry)) return true;
-        if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         const entry = self.denseIndex(name) orelse return false;
+        return self.vectorBlockReadyForDenseEntryAtSequence(entry, source_sequence, expected_count);
+    }
+
+    pub fn vectorBlockReadyForDenseEntryAtSequence(self: *IndexManager, entry: *DenseIndex, source_sequence: u64, expected_count: u64) bool {
+        if (!denseIndexUsesVectorBlocks(entry)) return true;
+        if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         if (self.vectorBlockStableTipFinalizingEntry(entry)) return false;
         if (entry.native_physical_v2 and expected_count != 0 and
             !entry.index.nativePostingBaseHasVectors()) return false;
@@ -12192,87 +12202,106 @@ pub const IndexManager = struct {
         self: *IndexManager,
         options: OnlineVectorBlockPublicationOptions,
     ) !OnlineVectorBlockPublicationResult {
+        if (self.vector_block_storage == null or self.primary_store == null) return .{};
+        var combined: OnlineVectorBlockPublicationResult = .{};
+        for (self.dense_indexes.items) |*entry| {
+            if (builtin.is_test) _ = test_vector_publication_catalog_visits.fetchAdd(1, .monotonic);
+            if (options.cancel_check) |check| if (check.requested()) return .{ .published = combined.published, .deferred = true };
+            const result = try self.publishVectorBlockBaseForEntryOnlineReported(entry, options);
+            combined.published += result.published;
+            combined.deferred = combined.deferred or result.deferred;
+        }
+        return combined;
+    }
+
+    /// Caller pins this entry's catalog lifetime and owns DB projection
+    /// finalization. Entry-based dispatch avoids rescanning the catalog when
+    /// the DB applies different primary-repair admission to each index.
+    pub fn publishVectorBlockBaseForEntryOnlineReported(
+        self: *IndexManager,
+        entry: *DenseIndex,
+        options: OnlineVectorBlockPublicationOptions,
+    ) !OnlineVectorBlockPublicationResult {
         if (self.vector_block_storage == null) return .{};
         const primary = self.primary_store orelse return .{};
+        if (builtin.is_test) _ = test_vector_publication_entry_visits.fetchAdd(1, .monotonic);
         var published: usize = 0;
         var deferred = false;
-        for (self.dense_indexes.items) |*entry| {
-            if (options.cancel_check) |check| if (check.requested()) return .{ .published = published, .deferred = true };
-            if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
-            if (!denseIndexUsesVectorBlocks(entry)) continue;
-            if (self.repairUnavailable(entry.config.name) and
-                !(options.covered_rebuilding_index != null and std.mem.eql(u8, options.covered_rebuilding_index.?, entry.config.name))) continue;
-            const healthy = self.vectorBlockReadyForDenseIndex(entry.config.name);
-            if (healthy and !entry.index.nativePostingAccelerationPending() and
-                (!options.require_storage_encoding or self.vectorBlockUsesDesiredEncoding())) continue;
-            const sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
-            if (sequence != primary.lastReplaySequence(0)) {
-                deferred = true;
-                continue;
-            }
-            if (options.require_quiescence and entry.index.stats().active_count > vector_block_immediate_bootstrap_max_vectors) {
-                const now = platform_time.monotonicNs();
-                if (self.vector_block_candidate_sequence.load(.acquire) != sequence) {
-                    self.vector_block_candidate_sequence.store(sequence, .release);
-                    self.vector_block_candidate_since_ns.store(now, .release);
-                    deferred = true;
-                    continue;
-                }
-                const since = self.vector_block_candidate_since_ns.load(.acquire);
-                if (since == 0 or now -| since < vector_block_quiescence_ns) {
-                    deferred = true;
-                    continue;
-                }
-            }
-            // Healthy replacements are serialized by the DB projection owner
-            // and base-staging reservation. They do not close serving admission.
-            if (!healthy) {
-                if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
-                    return .{ .published = published, .deferred = true };
-                self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
-                self.vector_block_stable_tip_sequence.store(sequence, .release);
-            }
-            defer if (!healthy) {
-                self.vector_block_stable_tip_sequence.store(0, .release);
-                self.vector_block_stable_tip_index.store(0, .release);
-                self.vector_block_stable_tip_finalizing.store(false, .release);
-            };
-            self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(entry.config.name, sequence, options.require_storage_encoding, options.allow_primary_snapshot) catch |err| switch (err) {
-                error.PostingCheckpointSequenceMismatch,
-                error.VectorBlockSnapshotAdvancedWithoutWal,
-                error.VectorBlockGenerationReservationLost,
-                error.VectorBlockSourceCoveragePending,
-                => {
-                    deferred = true;
-                    continue;
-                },
-                else => return err,
-            };
-            // Vector files alone do not establish the posting-local scan
-            // plane. Schedule its first full base without joining the builder
-            // under any apply fence. Later WAL/delta consolidation is optional
-            // and must not make readiness flap on every source mutation.
-            if (entry.native_physical_v2 and
-                (!entry.index.nativePostingBaseHasVectors() or entry.index.nativePostingAccelerationPending()))
-            {
-                if (!entry.apply_mutex.tryLock()) {
-                    deferred = true;
-                    continue;
-                }
-                defer entry.apply_mutex.unlock();
-                if (try entry.index.publishReadyExperimentalPostingCheckpointForRecovery()) published += 1;
-                if (try entry.index.requestNativePostingAcceleration()) published += 1;
-                // Backoff means waiting for projection inputs, not ready.
-                // Keep the scheduler/lifecycle obligation alive even when
-                // there is intentionally no worker or publication in flight.
-                if (entry.index.experimentalPostingCheckpointBuildPresent() or
-                    entry.index.nativePostingAccelerationPending()) deferred = true;
-                continue;
-            }
-            if (entry.index.experimentalPostingDurableAppliedSequence() == sequence and
-                self.vectorBlockReadyAtSequenceAndCount(sequence, entry, entry.index.stats().active_count))
-                published += 1;
+        if (options.cancel_check) |check| if (check.requested()) return .{ .published = published, .deferred = true };
+        if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) return .{ .published = published, .deferred = deferred };
+        if (!denseIndexUsesVectorBlocks(entry)) return .{ .published = published, .deferred = deferred };
+        if (self.repairUnavailable(entry.config.name) and
+            !(options.covered_rebuilding_index != null and std.mem.eql(u8, options.covered_rebuilding_index.?, entry.config.name))) return .{ .published = published, .deferred = deferred };
+        const healthy = self.vectorBlockReadyForDenseEntry(entry);
+        if (healthy and !entry.index.nativePostingAccelerationPending() and
+            (!options.require_storage_encoding or self.vectorBlockUsesDesiredEncoding())) return .{ .published = published, .deferred = deferred };
+        const sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse return .{ .published = published, .deferred = deferred };
+        if (sequence != primary.lastReplaySequence(0)) {
+            deferred = true;
+            return .{ .published = published, .deferred = deferred };
         }
+        if (options.require_quiescence and entry.index.stats().active_count > vector_block_immediate_bootstrap_max_vectors) {
+            const now = platform_time.monotonicNs();
+            if (self.vector_block_candidate_sequence.load(.acquire) != sequence) {
+                self.vector_block_candidate_sequence.store(sequence, .release);
+                self.vector_block_candidate_since_ns.store(now, .release);
+                deferred = true;
+                return .{ .published = published, .deferred = deferred };
+            }
+            const since = self.vector_block_candidate_since_ns.load(.acquire);
+            if (since == 0 or now -| since < vector_block_quiescence_ns) {
+                deferred = true;
+                return .{ .published = published, .deferred = deferred };
+            }
+        }
+        // Healthy replacements are serialized by the DB projection owner
+        // and base-staging reservation. They do not close serving admission.
+        if (!healthy) {
+            if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+                return .{ .published = published, .deferred = true };
+            self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
+            self.vector_block_stable_tip_sequence.store(sequence, .release);
+        }
+        defer if (!healthy) {
+            self.vector_block_stable_tip_sequence.store(0, .release);
+            self.vector_block_stable_tip_index.store(0, .release);
+            self.vector_block_stable_tip_finalizing.store(false, .release);
+        };
+        self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(entry.config.name, sequence, options.require_storage_encoding, options.allow_primary_snapshot) catch |err| switch (err) {
+            error.PostingCheckpointSequenceMismatch,
+            error.VectorBlockSnapshotAdvancedWithoutWal,
+            error.VectorBlockGenerationReservationLost,
+            error.VectorBlockSourceCoveragePending,
+            => {
+                deferred = true;
+                return .{ .published = published, .deferred = deferred };
+            },
+            else => return err,
+        };
+        // Vector files alone do not establish the posting-local scan
+        // plane. Schedule its first full base without joining the builder
+        // under any apply fence. Later WAL/delta consolidation is optional
+        // and must not make readiness flap on every source mutation.
+        if (entry.native_physical_v2 and
+            (!entry.index.nativePostingBaseHasVectors() or entry.index.nativePostingAccelerationPending()))
+        {
+            if (!entry.apply_mutex.tryLock()) {
+                deferred = true;
+                return .{ .published = published, .deferred = deferred };
+            }
+            defer entry.apply_mutex.unlock();
+            if (try entry.index.publishReadyExperimentalPostingCheckpointForRecovery()) published += 1;
+            if (try entry.index.requestNativePostingAcceleration()) published += 1;
+            // Backoff means waiting for projection inputs, not ready.
+            // Keep the scheduler/lifecycle obligation alive even when
+            // there is intentionally no worker or publication in flight.
+            if (entry.index.experimentalPostingCheckpointBuildPresent() or
+                entry.index.nativePostingAccelerationPending()) deferred = true;
+            return .{ .published = published, .deferred = deferred };
+        }
+        if (entry.index.experimentalPostingDurableAppliedSequence() == sequence and
+            self.vectorBlockReadyAtSequenceAndCount(sequence, entry, entry.index.stats().active_count))
+            published += 1;
         return .{ .published = published, .deferred = deferred };
     }
 
