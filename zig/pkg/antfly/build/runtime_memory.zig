@@ -196,7 +196,8 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
             // 8,626,855,936 bytes, over the old 8 GiB claim. Peak + 10%.
             .storage_kernel => 10,
             .enrichment_compute => 2,
-            .serverless => 4,
+            // Same build: serverless peaked at 4,377,563,136 bytes. Peak + 10%.
+            .serverless => 5,
             .inference => 8,
             // Zig 0.17.0 cold build of origin/main 1e032ed8 peaked at
             // 2,149,195,776 bytes, just over the old 2 GiB claim.
