@@ -152,8 +152,18 @@ def privacy_provider(request):
                     behavior["embed_held"].set()
                 assert behavior["embed_gate"].wait(timeout=60)
                 # Hold only authored document work, after model admission probes.
-                if body["model"] == behavior["hold_model"] and any(
-                    "Orchard schedule." in text for text in inputs
+                document_work = any("Orchard schedule." in text for text in inputs)
+                with records_lock:
+                    completed_work = sum(
+                        r["model"] == body["model"]
+                        and r["status"] == 200
+                        and any("Orchard schedule." in text for text in r["inputs"])
+                        for r in records
+                    )
+                if (
+                    body["model"] == behavior["hold_model"]
+                    and document_work
+                    and completed_work >= behavior.get("hold_after_document_calls", 0)
                 ):
                     behavior["model_held"].set()
                     assert behavior["model_gate"].wait(timeout=60)
@@ -172,12 +182,25 @@ def privacy_provider(request):
                                     "object": "embedding",
                                     "index": i,
                                     "embedding": (
-                                        [0.0, 1.0]
+                                        [
+                                            -1.0
+                                            if body["model"] == "fixture-v2"
+                                            else 1.0,
+                                            (int(match.group(1)) + 1) / 2048
+                                            if (
+                                                match := re.search(
+                                                    r"Document (\d+)\.", text
+                                                )
+                                            )
+                                            else 0.0,
+                                        ]
+                                        if backfill
+                                        else [0.0, 1.0]
                                         if body["model"] == "fixture-v2"
                                         else [1.0, 0.0]
                                     ),
                                 }
-                                for i in range(len(inputs))
+                                for i, text in enumerate(inputs)
                             ],
                         },
                         headers=(("X-Antfly-Model-Revision", revision),)

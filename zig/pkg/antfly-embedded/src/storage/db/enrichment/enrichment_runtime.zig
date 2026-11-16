@@ -42783,12 +42783,13 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             errdefer a.free(indices);
             return .{ .indices = indices, .values = try a.dupe(f32, &.{@floatFromInt(self.provider_calls)}) };
         }
-        fn embedDense(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+        fn embedDense(ptr: *anyopaque, a: Allocator, _: []const u8, text: []const u8, _: u32) ![]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.mutex.lockUncancelable(std.testing.io);
             defer self.mutex.unlock(std.testing.io);
             self.provider_calls += 1;
-            return a.dupe(f32, &.{ @floatFromInt(self.provider_calls), 2 });
+            const value: f32 = if (text.len == 11 and std.mem.startsWith(u8, text, "hello ")) @floatFromInt((std.fmt.parseUnsigned(usize, text[6..], 10) catch return a.dupe(f32, &.{ @floatFromInt(self.provider_calls), 2 })) + 1000) else @floatFromInt(self.provider_calls);
+            return a.dupe(f32, &.{ value, 2 });
         }
         fn embedDenseBatch(ptr: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext) ![]const []const f32 {
             try context.check();
@@ -43037,7 +43038,9 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         for (&requests, &keys, 0..) |*request, *key, i| {
             key.* = try std.fmt.allocPrint(alloc, "batch-doc-{d}", .{i});
             initialized += 1;
-            try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = key.*, .value = "{\"body\":\"hello world\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = index });
+            const body = try std.fmt.allocPrint(alloc, "{{\"body\":\"hello {d:0>5}\"}}", .{i});
+            defer alloc.free(body);
+            try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = key.*, .value = body }}, .timestamp_ns = 100 }, .{ .term = 1, .index = index });
             index += 1;
             var chunks = chunk_request;
             chunks.doc_key = key.*;
@@ -43150,7 +43153,13 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             if (i == 0) {
                 try std.testing.expectError(error.NotFound, read.get(decoded.command.mutations[0].key));
             } else {
-                _ = try read.get(decoded.command.mutations[0].key);
+                const raw = try read.get(decoded.command.mutations[0].key);
+                const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, raw);
+                defer alloc.free(vector);
+                try std.testing.expectEqualSlices(f32, &.{ @floatFromInt(i + 1000), 2 }, vector);
+                const text = try std.fmt.allocPrint(alloc, "hello {d:0>5}", .{i});
+                defer alloc.free(text);
+                try std.testing.expectEqual(retainedTextEmbeddingHashAtRevision(requests[i], text, @splat(1)), (try enrichment_artifact_codec.sourceHash(raw)).?);
             }
         }
         return;

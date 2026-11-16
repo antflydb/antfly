@@ -100854,27 +100854,28 @@ fn testSequentialManagedDenseBackfills(workers: bool) !void {
         initialized += 1;
     }
     try db.batch(.{ .writes = &writes, .sync_level = .write });
-    const previous = index_manager_mod.test_vector_block_primary_snapshot_builds;
-    defer index_manager_mod.test_vector_block_primary_snapshot_builds = previous;
     for ([_][]const u8{ "A", "B" }) |name| {
         const config = try std.fmt.allocPrint(a, "{{\"field\":\"embedding\",\"dims\":3,\"execution\":{{\"embedding\":{{\"batch_items\":1}}}},\"generator\":{{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"{s}\"}}}}", .{name});
         defer a.free(config);
-        index_manager_mod.test_vector_block_primary_snapshot_builds = 0;
+        const primary_before = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire);
+        const native_before = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire);
         try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config });
         try db.runUntilIdle();
         // One genuine missing-generation repair is permitted at the idle
         // boundary; a small replay batch must never trigger another scan.
-        try std.testing.expect(index_manager_mod.test_vector_block_primary_snapshot_builds <= 1);
+        try std.testing.expect(index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - primary_before + index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before <= 1);
         try std.testing.expectEqual(@as(u64, count), db.core.index_manager.denseIndex(name).?.index.stats().active_count);
     }
     try std.testing.expectEqual(@as(usize, count * 2), probe.calls.load(.acquire));
     for (0..2) |restart| {
         if (restart != 0) {
-            index_manager_mod.test_vector_block_primary_snapshot_builds = 0;
+            const primary_before = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire);
+            const native_before = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire);
             db.close();
             db = try DB.open(a, directory.path(), options);
             try db.runUntilIdle();
-            try std.testing.expectEqual(@as(usize, 0), index_manager_mod.test_vector_block_primary_snapshot_builds);
+            try std.testing.expectEqual(primary_before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+            try std.testing.expectEqual(native_before, index_manager_mod.test_vector_block_native_merge_builds.load(.acquire));
             try std.testing.expectEqual(@as(usize, count * 2), probe.calls.load(.acquire));
         }
         for ([_][]const u8{ "A", "B" }) |name| {
@@ -155200,6 +155201,10 @@ test "privacy protected model migration 1024 document diagnostic" {
     try protectedModelBackfillProbe(1024, 384, 1024);
 }
 
+test "privacy protected model migration spans vector bootstrap boundary" {
+    for ([_]usize{ 4095, 4096, 4097 }) |count| try protectedModelBackfillProbe(count, 3, 1024);
+}
+
 test "privacy protected model migration multi chunk output" {
     try protectedModelBackfillProbe(16, 3, 8);
 }
@@ -155284,8 +155289,8 @@ fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_siz
         const calls_before = probe.batches;
         const items_before = probe.items.load(.acquire);
         const privacy_before = probe.privacy_calls;
-        const native_before = index_manager_mod.test_vector_block_native_merge_builds;
-        const snapshots_before = index_manager_mod.test_vector_block_primary_snapshot_builds;
+        const native_before = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire);
+        const snapshots_before = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire);
 
         const embedding = try catalog.managedName(scratch, version, name);
         const chunks = try std.fmt.allocPrint(scratch, "{s}_chunks", .{embedding});
@@ -155295,14 +155300,14 @@ fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_siz
         try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config, .coverage_generation = i + 1 });
         if (i == 0) try db.batch(.{ .writes = writes, .sync_level = .write });
         try db.runUntilIdle();
-        std.debug.print("\nPROTECTED-BACKFILL docs={d} index={s} wall_ms={d} batches={d} completed_items={d} primary_scans={d} native_merges={d}\n", .{ document_count, name, (monotonicTimeNs() -| started) / std.time.ns_per_ms, probe.batches - calls_before, probe.items.load(.acquire) - items_before, index_manager_mod.test_vector_block_primary_snapshot_builds - snapshots_before, index_manager_mod.test_vector_block_native_merge_builds - native_before });
+        std.debug.print("\nPROTECTED-BACKFILL docs={d} index={s} wall_ms={d} batches={d} completed_items={d} primary_scans={d} native_merges={d}\n", .{ document_count, name, (monotonicTimeNs() -| started) / std.time.ns_per_ms, probe.batches - calls_before, probe.items.load(.acquire) - items_before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before, index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before });
         const verified = try verifyProtectedBackfillOutput(a, &db, name, embedding, writes, dimensions, chunk_size < 1024, &probe.deterministic);
         if (i == 1) {
             migration_calls = probe.batches - calls_before;
             migration_items = probe.items.load(.acquire) - items_before;
             verified_b_items = verified;
-            migration_native_merges = index_manager_mod.test_vector_block_native_merge_builds - native_before;
-            migration_snapshot_builds = index_manager_mod.test_vector_block_primary_snapshot_builds - snapshots_before;
+            migration_native_merges = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before;
+            migration_snapshot_builds = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before;
             try std.testing.expectEqual(privacy_before, probe.privacy_calls);
         }
     }

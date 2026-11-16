@@ -31,10 +31,12 @@ pytest_plugins = ("test_auth", "test_privacy_indexed_activation")
 BATCH_ITEMS = 32
 
 
-@pytest.mark.parametrize("document_count", [64, 1024])
+@pytest.mark.parametrize(
+    "document_count,crash_during_backfill", [(64, False), (1024, False), (1024, True)]
+)
 @pytest.mark.parametrize("privacy_provider", ["backfill"], indirect=True)
 def test_protected_model_backfill_batches(
-    auth_api, privacy_provider, document_count, tmp_path
+    auth_api, privacy_provider, document_count, crash_during_backfill, tmp_path
 ):
     api = auth_api
     endpoint, calls, behavior, _ = privacy_provider
@@ -94,9 +96,15 @@ def test_protected_model_backfill_batches(
             and coverage["source_total"] == coverage["produced"] == document_count
         )
 
+    def expected_vector(name, identity):
+        return [1.0 if name == "a" else -1.0, (int(identity[1:]) + 1) / 2048]
+
+    def document_request(row):
+        return any("Orchard schedule." in text for text in row["inputs"])
+
     def verify_outputs(names):
         before = calls["snapshot"]()
-        for name, expected in names:
+        for name in names:
             assert complete(name)
             for identity in docs:
                 manifest = api.get(
@@ -106,7 +114,11 @@ def test_protected_model_backfill_batches(
                 assert stored["current"], (identity, name, stored)
                 assert len(stored["vectors"]) == 1, (identity, name, stored)
                 vector = stored["vectors"][0]
-                assert vector["values"] == expected, (identity, name, vector)
+                assert vector["values"] == expected_vector(name, identity), (
+                    identity,
+                    name,
+                    vector,
+                )
                 assert vector["source_text"] == docs[identity]["body"].replace(
                     "person@example.invalid", "[EMAIL]"
                 )
@@ -129,6 +141,21 @@ def test_protected_model_backfill_batches(
             timeout=15,
         )
 
+    def verify_searches():
+        for name in ("a", "b"):
+            for identity in (
+                "d0000",
+                f"d{document_count // 2:04}",
+                f"d{document_count - 1:04}",
+            ):
+                response = tenant_query(name, expected_vector(name, identity))
+                assert response.status_code == 200, response.text
+                result = response.json()["responses"][0]
+                assert result["status"] == 200, result
+                hits = result["hits"]["hits"]
+                assert hits and hits[0]["_id"] == identity, result
+                assert all("@" not in hit["body"] for hit in hits), hits
+
     try:
         api.create_table(table)
         add_index("a", "fixture")
@@ -136,7 +163,7 @@ def test_protected_model_backfill_batches(
         api.batch_write(table, {"inserts": docs, "sync_level": "write"})
         report["phase"] = "initial-publication"
         assert wait_until(lambda: complete("a"), timeout_s=180, interval_s=0.02)
-        verify_outputs((("a", [1.0, 0.0]),))
+        verify_outputs(("a",))
         api.post(
             "/auth/v1/users/reader",
             {
@@ -156,19 +183,48 @@ def test_protected_model_backfill_batches(
         report["phase"] = "backfill"
         behavior["hold_model"] = "fixture-v2"
         behavior["model_gate"].clear()
+        behavior["hold_after_document_calls"] = 1 if crash_during_backfill else 0
+        pre_crash_work = []
         add_index("b", "fixture-v2")
         report["index_create_seconds"] = time.monotonic() - began
         assert behavior["model_held"].wait(timeout=20), (
             "B document work was never attempted"
         )
+        if crash_during_backfill:
+            pre_crash_work = [
+                r for r in calls["snapshot"]()[before_requests:] if document_request(r)
+            ]
+            assert any(r["status"] == 200 for r in pre_crash_work), pre_crash_work
+            assert not complete("b")
+            cpu_at_crash = cpu_seconds()
+            report["pre_crash_server_cpu_seconds"] = (
+                None
+                if cpu_before is None or cpu_at_crash is None
+                else cpu_at_crash - cpu_before
+            )
+            api._server.proc.kill()
+            api._server.proc.wait(timeout=10)
+            behavior["model_gate"].set()
+            assert wait_until(
+                lambda: all(r["completed"] is not None for r in calls["snapshot"]()),
+                timeout_s=10,
+            )
+            behavior["hold_after_document_calls"] = 0
+            behavior["model_gate"].clear()
+            behavior["model_held"].clear()
+            api._server.restart()
+            cpu_before = cpu_seconds()
+            report["server_cpu_scope"] = "post-restart"
+            assert behavior["model_held"].wait(timeout=20)
+            report["crashed_during_backfill"] = True
         held_since = time.monotonic()
         assert not complete("b")
-        a = tenant_query("a", [1.0, 0.0])
+        a = tenant_query("a", expected_vector("a", "d0000"))
         assert a.status_code == 200, a.text
         a = a.json()["responses"][0]
         assert a["status"] == 200 and a["hits"]["hits"], a
         assert all("@" not in hit["body"] for hit in a["hits"]["hits"])
-        b = tenant_query("b", [0.0, 1.0])
+        b = tenant_query("b", expected_vector("b", "d0000"))
         assert b.status_code == 503 or (
             b.status_code == 200 and b.json()["responses"][0]["status"] == 503
         ), b.text
@@ -186,19 +242,31 @@ def test_protected_model_backfill_batches(
         report["status_poll_calls"] = status_calls
         report["status_poll_seconds"] = status_seconds
         report["phase"] = "output-verification"
-        verify_outputs((("a", [1.0, 0.0]), ("b", [0.0, 1.0])))
+        verify_outputs(("a", "b"))
+        verify_searches()
         records = calls["snapshot"]()[before_requests:]
         work = [
-            r
-            for r in records
-            if r["model"] == "fixture-v2" and any(x in protected for x in r["inputs"])
+            r for r in records if r["model"] == "fixture-v2" and document_request(r)
         ]
-        assert work and all(
-            r["status"] == 200 and r["completed"] is not None for r in work
-        ), work
-        actual = Counter(text for r in work for text in r["inputs"])
-        assert actual == Counter(protected), actual
-        assert all("@" not in text for r in work for text in r["inputs"])
+        document_records = [r for r in calls["snapshot"]() if document_request(r)]
+        assert all("@" not in text for r in document_records for text in r["inputs"]), (
+            document_records
+        )
+        assert work and all(r["completed"] is not None for r in work), work
+        successful = [r for r in work if r["status"] == 200]
+        actual = Counter(text for r in successful for text in r["inputs"])
+        if crash_during_backfill:
+            assert set(actual) == protected and all(
+                actual[x] >= 1 for x in protected
+            ), actual
+            attempted_before_crash = {x for r in pre_crash_work for x in r["inputs"]}
+            assert all(
+                count == 1 or text in attempted_before_crash
+                for text, count in actual.items()
+            ), actual
+        else:
+            assert len(successful) == len(work), work
+            assert actual == Counter(protected), actual
         assert len(calls["extract"]) == before_extractions
         report["document_embedding_calls"] = len(work)
         report["embedded_documents"] = sum(actual.values())
@@ -208,13 +276,17 @@ def test_protected_model_backfill_batches(
         assert wait_until(
             lambda: complete("a") and complete("b"), timeout_s=60, interval_s=0.02
         )
-        verify_outputs((("a", [1.0, 0.0]), ("b", [0.0, 1.0])))
+        verify_outputs(("a", "b"))
+        verify_searches()
         restart_requests = calls["snapshot"]()[before_restart:]
-        assert not any(
-            text in protected for row in restart_requests for text in row["inputs"]
-        ), ("restart must reuse published document vectors", restart_requests)
+        assert not any(document_request(row) for row in restart_requests), (
+            "restart must reuse published document vectors",
+            restart_requests,
+        )
         report["restart_admission_probe_calls"] = len(restart_requests)
-        assert len(work) <= (document_count + BATCH_ITEMS - 1) // BATCH_ITEMS, report
+        assert len(work) <= (document_count + BATCH_ITEMS - 1) // BATCH_ITEMS + len(
+            pre_crash_work
+        ), report
         report["phase"] = "completed"
     except BaseException as exc:
         report["failure"] = {"type": type(exc).__name__, "message": str(exc)[:4000]}
