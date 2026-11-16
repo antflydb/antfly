@@ -74,6 +74,9 @@ pub fn applyReplicatedTransactionMutationInternal(
     if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
     switch (mutation) {
         .begin => |begin| {
+            // Never discard a frozen plan through the legacy BEGIN handler.
+            // Durable completion admission is activated separately.
+            if (begin.completion_admission != null) return error.ChangefeedCapabilityUnsupported;
             const local_participant = try local_transaction_contract.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
             defer alloc.free(local_participant);
             if (begin.participants.len == 0) return error.InvalidBatchRequest;

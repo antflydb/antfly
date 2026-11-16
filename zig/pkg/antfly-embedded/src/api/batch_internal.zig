@@ -536,6 +536,7 @@ pub const OwnedBatchRequest = struct {
     leann_record_bytes: ?[]u8 = null,
     merge_proof_adoption: ?std.json.Parsed(@import("../storage/db/merge_proof_adoption.zig").Command) = null,
     transaction_participants: [][]const u8 = &.{},
+    transaction_completion_admission: ?[]u8 = null,
     split_checkpoint_range_start: ?[]u8 = null,
     split_checkpoint_range_end: ?[]u8 = null,
     split_transition_key: ?[]u8 = null,
@@ -598,6 +599,7 @@ pub const OwnedBatchRequest = struct {
         freeGraphDeletes(alloc, self.graph_deletes);
         for (self.predicates) |predicate| alloc.free(@constCast(predicate.key));
         if (self.predicates.len > 0) alloc.free(self.predicates);
+        if (self.transaction_completion_admission) |raw| alloc.free(raw);
         for (self.transaction_participants) |participant| alloc.free(participant);
         if (self.transaction_participants.len > 0) alloc.free(self.transaction_participants);
         if (self.split_checkpoint_range_start) |value| alloc.free(value);
@@ -1503,6 +1505,8 @@ fn parseBatchRequestWithOptions(
         };
     };
 
+    var transaction_completion_admission: ?[]u8 = null;
+    errdefer if (transaction_completion_admission) |raw| alloc.free(raw);
     var transaction_participants: [][]const u8 = &.{};
     var transaction_participants_initialized: usize = 0;
     errdefer {
@@ -1518,7 +1522,9 @@ fn parseBatchRequestWithOptions(
         if (phase_value != .string or txn_value != .string or txn_value.string.len != 32) return error.InvalidBatchRequest;
         var txn_id: db_mod.types.TxnId = undefined;
         _ = std.fmt.hexToBytes(&txn_id, txn_value.string) catch return error.InvalidBatchRequest;
-        if (std.mem.eql(u8, phase_value.string, "begin")) {
+        const completion_begin = std.mem.eql(u8, phase_value.string, "begin_completion_v1");
+        if (completion_begin != object.contains("completion_admission")) return error.InvalidBatchRequest;
+        if (std.mem.eql(u8, phase_value.string, "begin") or completion_begin) {
             const participants_value = object.get("participants") orelse return error.InvalidBatchRequest;
             if (participants_value != .array or participants_value.array.items.len == 0) return error.InvalidBatchRequest;
             transaction_participants = try alloc.alloc([]const u8, participants_value.array.items.len);
@@ -1526,6 +1532,12 @@ fn parseBatchRequestWithOptions(
                 if (participant != .string or participant.string.len == 0) return error.InvalidBatchRequest;
                 transaction_participants[i] = try alloc.dupe(u8, participant.string);
                 transaction_participants_initialized += 1;
+            }
+            if (completion_begin) {
+                const raw = object.get("completion_admission").?;
+                if (raw != .string) return error.InvalidBatchRequest;
+                try validateCompletionBegin(alloc, raw.string, txn_id, transaction_participants);
+                transaction_completion_admission = try alloc.dupe(u8, raw.string);
             }
             break :transaction .{ .begin = .{
                 .txn_id = txn_id,
@@ -1537,6 +1549,7 @@ fn parseBatchRequestWithOptions(
                     else => return error.InvalidBatchRequest,
                 } else false,
                 .participants = transaction_participants,
+                .completion_admission = transaction_completion_admission,
             } };
         }
         const guarded_prepare = std.mem.eql(u8, phase_value.string, "prepare_ranges_v1");
@@ -1682,6 +1695,7 @@ fn parseBatchRequestWithOptions(
         .leann_record_bytes = leann_record_bytes,
         .merge_proof_adoption = merge_proof_adoption,
         .transaction_participants = transaction_participants,
+        .transaction_completion_admission = transaction_completion_admission,
         .split_checkpoint_range_start = checkpoint_start,
         .split_checkpoint_range_end = checkpoint_end,
         .split_transition_key = transition_key,
@@ -2326,14 +2340,18 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         switch (mutation) {
             .begin => |begin| {
                 const txn_hex = std.fmt.bytesToHex(begin.txn_id, .lower);
-                try writer.print("\"phase\":\"begin\",\"txn_id\":\"{s}\",\"begin_timestamp\":\"{d}\",\"created_at_ns\":\"{d}\",\"topology_epoch\":\"{d}\",\"retain_terminal\":{},\"participants\":[", .{
-                    &txn_hex, begin.begin_timestamp, begin.created_at_ns, begin.topology_epoch, begin.retain_terminal,
+                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"begin_timestamp\":\"{d}\",\"created_at_ns\":\"{d}\",\"topology_epoch\":\"{d}\",\"retain_terminal\":{},\"participants\":[", .{
+                    if (begin.completion_admission != null) "begin_completion_v1" else "begin", &txn_hex, begin.begin_timestamp, begin.created_at_ns, begin.topology_epoch, begin.retain_terminal,
                 });
                 for (begin.participants, 0..) |participant, i| {
                     if (i != 0) try writer.writeByte(',');
                     try writer.print("{f}", .{std.json.fmt(participant, .{})});
                 }
                 try writer.writeByte(']');
+                if (begin.completion_admission) |raw| {
+                    try validateCompletionBegin(alloc, raw, begin.txn_id, begin.participants);
+                    try writer.print(",\"completion_admission\":{f}", .{std.json.fmt(raw, .{})});
+                }
             },
             .prepare => |prepare| {
                 const txn_hex = std.fmt.bytesToHex(prepare.txn_id, .lower);
@@ -3717,4 +3735,53 @@ test "distributed txn private control wire keeps document revision metadata inde
         const mixed_error = if (versioned.artifact_catalog != null) error.InvalidArtifactCatalogCommand else if (versioned.group_source != null) error.InvalidGroupedSourceCommand else if (versioned.resolver_review != null) error.InvalidResolverCurationRequest else error.InvalidBatchRequest;
         try std.testing.expectError(mixed_error, encodeBatchRequest(a, versioned));
     };
+}
+
+/// A completion BEGIN freezes the same complete participant set at every root.
+/// Recovery order is coordinator first, then canonical namespace order excluding
+/// the coordinator. Unknown phases cannot downgrade to legacy admission.
+fn validateCompletionBegin(a: std.mem.Allocator, raw: []const u8, id: [16]u8, participants: []const []const u8) !void {
+    const completion = @import("../storage/transaction_completion.zig");
+    var plan = completion.parseAdmission(a, raw) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBatchRequest;
+    defer plan.deinit();
+    const admission = plan.value.admission;
+    if (!std.mem.eql(u8, &admission.transaction_id, &id) or participants.len != admission.participants.len) return error.InvalidBatchRequest;
+    const coordinator = try admission.member(admission.coordinator_namespace);
+    if (!std.mem.eql(u8, participants[0], coordinator.locator)) return error.InvalidBatchRequest;
+    var index: usize = 1;
+    for (admission.participants) |member| {
+        if (std.mem.eql(u8, &member.namespace, &admission.coordinator_namespace)) continue;
+        if (!std.mem.eql(u8, participants[index], member.locator)) return error.InvalidBatchRequest;
+        index += 1;
+    }
+}
+
+test "completion begin wire preserves frozen envelope and rejects downgrade and participant substitution" {
+    const a = std.testing.allocator;
+    const completion = @import("../storage/transaction_completion.zig");
+    const members = [_]completion.Participant{
+        .{ .namespace = @splat(1), .owner_fence = @splat(2), .roles = completion.Roles.effects, .locator = "table2:4:docs:group:7" },
+        .{ .namespace = @splat(3), .owner_fence = @splat(4), .roles = completion.Roles.guards, .locator = "table2:4:docs:group:9" },
+    };
+    const admission: completion.Admission = .{ .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = members[1].namespace, .coordinator_fence = members[1].owner_fence, .participants = &members };
+    const raw = try completion.encodeAdmission(a, admission);
+    defer a.free(raw);
+    var request: db_mod.types.BatchRequest = .{ .transaction = .{ .begin = .{ .txn_id = admission.transaction_id, .begin_timestamp = 10, .created_at_ns = 11, .topology_epoch = 12, .participants = &.{ members[1].locator, members[0].locator }, .completion_admission = raw } } };
+    const encoded = try encodeBatchRequest(a, request);
+    defer a.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "begin_completion_v1") != null);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, encoded));
+    var decoded = try parseInternalBatchRequest(a, encoded);
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings(raw, decoded.req.transaction.?.begin.completion_admission.?);
+    const downgraded = try std.mem.replaceOwned(u8, a, encoded, "begin_completion_v1", "begin");
+    defer a.free(downgraded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, downgraded));
+    request.transaction.?.begin.participants = &.{ members[0].locator, members[1].locator };
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, request));
+    request.transaction.?.begin.participants = &.{members[1].locator};
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, request));
+    request.transaction.?.begin.participants = &.{ members[1].locator, members[0].locator };
+    request.transaction.?.begin.txn_id[0] ^= 1;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, request));
 }

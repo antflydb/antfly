@@ -140,3 +140,7 @@ test "httpx inference gateway source discovery" {
 test "linear merge discovery" {
     _ = @import("api/linear_merge.zig");
 }
+
+test "completion begin wire discovery" {
+    _ = @import("antfly_local_sources").api_internal_batch;
+}

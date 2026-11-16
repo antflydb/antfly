@@ -214,6 +214,8 @@ pub const TransactionMutation = union(enum) {
         /// use the shorter ordinary recovery retention.
         retain_terminal: bool = false,
         participants: []const []const u8,
+        /// Exact checksummed frozen plan; encoded only as begin_completion_v1.
+        completion_admission: ?[]const u8 = null,
     },
     prepare: struct {
         txn_id: TxnId,

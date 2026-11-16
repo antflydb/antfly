@@ -2221,6 +2221,27 @@ Positive durable native network receipts, mutation-side plan/input activation,
 certificate collection/publication and the broader full issue requirements
 still require implementation and qualification.
 
+## In progress: frozen completion BEGIN encoding
+
+The private native batch BEGIN now has an optional exact checksummed completion
+admission envelope. It is encoded only with a distinct `begin_completion_v1`
+phase. Parsing requires the phase and envelope together, validates the stored
+plan checksum and transaction ID, and binds the complete participant list in
+coordinator-first recovery order. Parsed envelope bytes have explicit ownership
+and cleanup; re-encoding preserves the original string. Public batch ingress
+rejects the command. A downgraded legacy BEGIN carrying the envelope is rejected.
+
+The existing storage dispatch explicitly rejects this new form until its durable
+completion admission path is implemented, preventing an old BEGIN from silently
+ignoring the plan. This is a wire contract stage, not protocol activation.
+`completion-begin-wire-test` completed with exit 0 in
+`completion-begin-wire-test.log`, including the declared completion BEGIN test
+and filtered root discovery; source catalog generation completed. Tests
+cover exact envelope preservation, public injection, downgrade, participant
+reordering/omission and transaction substitution. Durable native DB dispatch,
+current owner/input fences, Raft capability activation, production coordinator
+wiring and positive network receipts remain outstanding.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
