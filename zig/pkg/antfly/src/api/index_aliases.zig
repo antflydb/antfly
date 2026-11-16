@@ -39,8 +39,13 @@ pub fn executeObserved(server: anytype, a: A, table: []const u8, name: []const u
         return response;
     }
     const request = std.json.parseFromSliceLeaky(catalog.Request, scratch, body.?, .{ .allocate = .alloc_always }) catch return error.InvalidIndexAliasRequest;
-    if (try catalog.replay(scratch, root, name, request)) |committed|
-        return std.json.Stringify.valueAlloc(a, committed, .{});
+    if (try catalog.replay(scratch, root, name, request)) |committed| {
+        const response = try std.json.Stringify.valueAlloc(a, committed, .{});
+        errdefer a.free(response);
+        if (comptime @hasDecl(@TypeOf(server.*), "acknowledgeIndexAliasReplay"))
+            try server.acknowledgeIndexAliasReplay(context);
+        return response;
+    }
     if (comptime @hasDecl(@TypeOf(server.*), "ensureIndexAliasAdmission")) try server.ensureIndexAliasAdmission(context);
     const relational = @import("relational_index_mutation.zig");
     if (try relational.contains(scratch, before.schema_json, name)) return error.IndexAliasNameConflict;

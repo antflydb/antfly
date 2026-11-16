@@ -249,6 +249,9 @@ pub const RaftApplyStore = struct {
         }
         self.hot_standby_adapter = next;
     }
+    pub fn pollHotStandbyOutbox(self: *RaftApplyStore) !void {
+        _ = try self.projection(bool, .{ .kind = .poll_ha_outbox });
+    }
     pub fn flushHotStandbyOutbox(self: *RaftApplyStore) !void {
         _ = try self.projection(bool, .{ .kind = .flush_ha_outbox });
     }

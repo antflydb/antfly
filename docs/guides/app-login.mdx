@@ -151,7 +151,7 @@ with `prepareWorkersAuth`; `createWorkersAuth` installs the structured adapter.
 Enable `nodejs_compat`, keep the auth actor private, and derive application
 mailbox/content ownership from verified sessions rather than tenant headers.
 
-The [Cloudflare mail example](https://github.com/antflydb/antfly/blob/feat/cloudflare-mail-auth/examples/cloudflare-serverless/MAIL.md)
+The [Cloudflare mail example](https://github.com/antflydb/antfly/blob/main/examples/cloudflare-serverless/MAIL.md)
 implements the native R2 host and tests actual workerd login, ownership and
 persisted reopen. It is a separate recipe from `remoteDatabase`, which retains
 its stable SQL API-owner requirement. Shared mailbox memberships and account

@@ -10178,9 +10178,16 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
             }
         };
         var context: u8 = 0;
-        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait }));
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .remote_apply, .standby_names = &.{"replica"} }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait }));
         try std.testing.expectError(error.InjectedAfterMetadataHAAppend, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = logical_key, .value = importing } }));
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+        // Poll must not invoke the injected wait hook or append the effect twice.
+        try std.testing.expectError(error.HASyncCommitWouldBlock, source.pollHotStandbyOutbox());
+        try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+        source.apply_mutex.lockUncancelable(source.io_impl.io());
+        const busy = source.pollHotStandbyOutbox();
+        source.apply_mutex.unlock(source.io_impl.io());
+        try std.testing.expectError(error.MetadataHAOutboxPending, busy);
         try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHotStandbyCheckpoint(io, checkpoint));
     }
     {
@@ -10695,7 +10702,7 @@ pub const RaftApplyStore = struct {
 
     /// Caller retains the outer mutation lease. apply_mutex serializes the
     /// single durable outbox; transition lock covers only authority + append.
-    fn flushHotStandbyOutboxLocked(self: *RaftApplyStore) !void {
+    fn flushHotStandbyOutboxLocked(self: *RaftApplyStore, wait_for_apply: bool) !void {
         const raw = self.store.get(self.alloc, metadata_hot_standby.outbox_key) catch |err| switch (err) {
             error.NotFound => return,
             else => return err,
@@ -10704,7 +10711,7 @@ pub const RaftApplyStore = struct {
         if (raw.len < 24) return error.InvalidMetadataHAEffect;
         if (self.hot_standby_port) |port| {
             _ = try metadata_hot_standby.Decoder.init(raw[24..]);
-            try port.publishAndLock(raw);
+            try port.publishAndLock(raw, wait_for_apply);
             defer port.unlock();
             var txn = try self.store.beginWriteTxn();
             var committed = false;
@@ -10745,7 +10752,7 @@ pub const RaftApplyStore = struct {
         self.unlockHotStandbyTransition();
         transition_locked = false;
         if (hot_standby_publisher_adapter.options(mirror).sync_policy.mode != .async) {
-            if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| try wait(hot_standby_publisher_adapter.options(mirror).sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
+            if (wait_for_apply) if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| try wait(hot_standby_publisher_adapter.options(mirror).sync_wait_ctx orelse return error.HASyncCommitWaitMissingContext, mirror.publisher.ptr, lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
             const decision = try @import("../../storage/hot_standby/commit_gate.zig").evaluate(try hot_standby_publisher_adapter.runtimePrimary(mirror), lsn, hot_standby_publisher_adapter.options(mirror).sync_policy);
             if (!decision.shouldAcknowledge()) return error.HASyncCommitWouldBlock;
         }
@@ -10763,10 +10770,19 @@ pub const RaftApplyStore = struct {
         try self.store.sync(true);
     }
 
+    /// Receipt reconciliation never waits behind another apply or for network
+    /// progress. The durable outbox is the shared publication state; a pending
+    /// observation leaves it intact for replication and later retries.
+    pub fn pollHotStandbyOutbox(self: *RaftApplyStore) !void {
+        if (!self.apply_mutex.tryLock()) return error.MetadataHAOutboxPending;
+        defer self.apply_mutex.unlock(self.io_impl.io());
+        try self.flushHotStandbyOutboxLocked(false);
+    }
+
     pub fn flushHotStandbyOutbox(self: *RaftApplyStore) !void {
         self.apply_mutex.lockUncancelable(self.io_impl.io());
         defer self.apply_mutex.unlock(self.io_impl.io());
-        try self.flushHotStandbyOutboxLocked();
+        try self.flushHotStandbyOutboxLocked(true);
     }
 
     pub fn applyHotStandbyRecord(self: *RaftApplyStore, record: @import("antfly_local_sources").storage_db_replication_record.RecordView) !void {
@@ -11433,7 +11449,7 @@ pub const RaftApplyStore = struct {
         std.debug.assert(self.active_relation_publication == null);
         self.active_relation_publication = if (publication) |*value| value else null;
         defer self.active_relation_publication = null;
-        try self.flushHotStandbyOutboxLocked();
+        try self.flushHotStandbyOutboxLocked(true);
         try self.lockHotStandbyTransition();
         var transition_locked = true;
         defer if (transition_locked) self.unlockHotStandbyTransition();
@@ -11460,7 +11476,7 @@ pub const RaftApplyStore = struct {
         try self.commitStandaloneTxn(&txn, &outcome, &committed);
         self.unlockHotStandbyTransition();
         transition_locked = false;
-        try self.flushHotStandbyOutboxLocked();
+        try self.flushHotStandbyOutboxLocked(true);
     }
 
     pub fn replaceStandaloneCatalog(self: *RaftApplyStore, group_id: u64, expected_revision: u64, tables: []const metadata.TableRecord, ranges: []const metadata.RangeRecord, auxiliary_json: []const u8) !void {
@@ -11473,7 +11489,7 @@ pub const RaftApplyStore = struct {
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
-        try self.flushHotStandbyOutboxLocked();
+        try self.flushHotStandbyOutboxLocked(true);
         try self.lockHotStandbyTransition();
         var transition_locked = true;
         defer if (transition_locked) self.unlockHotStandbyTransition();
@@ -11675,7 +11691,7 @@ pub const RaftApplyStore = struct {
         // Local commit and sync succeeded. Failure to publish/acknowledge its
         // outbox must preserve the committed catalog without poisoning local
         // durability or admitting a subsequent mutation past that outbox.
-        self.flushHotStandbyOutboxLocked() catch return error.MetadataReplicationPending;
+        self.flushHotStandbyOutboxLocked(true) catch return error.MetadataReplicationPending;
     }
 
     fn commitStandaloneTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, outcome: *CommittedApplyOutcome, committed: *bool) !void {

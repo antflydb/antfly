@@ -2115,7 +2115,7 @@ pub fn tableGroupDescriptorProjectionControlled(
                 metadata_table_manager.rangeDocIdentityShardId(range),
                 metadata_table_manager.rangeDocIdentityRangeId(range),
                 table.schema_json,
-                table.indexes_json,
+                if (table.query_indexes_json.len != 0) table.query_indexes_json else table.indexes_json,
                 table.storage,
                 .{ .start = range.start_key, .end = range.end_key orelse "" },
                 restoreIdentityFromRange(range),
@@ -2182,7 +2182,7 @@ fn descriptorProjectionFromRoutingSnapshot(
             metadata_table_manager.rangeDocIdentityShardId(range),
             metadata_table_manager.rangeDocIdentityRangeId(range),
             table.schema_json,
-            table.indexes_json,
+            if (table.query_indexes_json.len != 0) table.query_indexes_json else table.indexes_json,
             table.storage,
             .{ .start = range.start_key, .end = range.end_key orelse "" },
             restoreIdentityFromRange(range),
@@ -2216,6 +2216,20 @@ test "owner descriptor projection retains the catalog observation with the physi
     try std.testing.expectEqualStrings(tables[0].indexes_json, projection.indexes_json);
 }
 
+test "index alias owner descriptors exclude query pointers and receipt history" {
+    const a = std.testing.allocator;
+    const tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "docs",
+        .indexes_json = "unparsed receipt history",
+        .query_indexes_json = "{\"model_a\":{\"type\":\"embeddings\"},\"_index_aliases\":{\"live\":{\"index\":\"model_a\"}}}",
+    }};
+    const ranges = [_]metadata_table_manager.RangeRecord{.{ .table_id = 7, .group_id = 7001, .range_id = 1, .start_key = "" }};
+    var projection = (try descriptorProjectionFromRoutingSnapshot(a, .{ .tables = @constCast(&tables), .ranges = @constCast(&ranges) }, "docs", 7001)).?;
+    defer projection.deinit(a);
+    try std.testing.expectEqualStrings("{\"model_a\":{\"type\":\"embeddings\"}}", projection.indexes_json);
+}
+
 fn descriptorProjectionFromValues(
     alloc: std.mem.Allocator,
     table_id: u64,
@@ -2231,7 +2245,7 @@ fn descriptorProjectionFromValues(
     errdefer alloc.free(owned_schema_json);
     const owned_initial_range = try @import("../storage/kernel_owner_descriptor.zig").cloneInitialRange(alloc, initial_range);
     errdefer @import("../storage/kernel_owner_descriptor.zig").freeInitialRange(alloc, owned_initial_range);
-    const owned_indexes_json = try alloc.dupe(u8, indexes_json);
+    const owned_indexes_json = try @import("antfly_local_sources").api_index_metadata.aliases.physicalProjection(alloc, indexes_json);
     errdefer alloc.free(owned_indexes_json);
     return .{
         .table_id = table_id,
