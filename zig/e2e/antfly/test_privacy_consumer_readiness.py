@@ -83,7 +83,7 @@ def test_protected_tenant_serves_a_during_held_b_and_rolls_back(
         assert not complete("b")
         status = api.get(f"/tables/{table}/indexes/a0")["status"]
         assert status["readiness"]["queryable"], status
-        assert not status["rebuilding"], status
+        assert not status["rebuilding"], json.dumps(status, sort_keys=True)
         api.s.headers["Authorization"] = tenant
         for name in ("a0", "search"):
             assert redacted(api, table, docs, name)

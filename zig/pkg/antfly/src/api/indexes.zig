@@ -2065,31 +2065,12 @@ fn publicShardIndexRuntimeView(
     // this after aggregation can erase unrelated live catch-up on a sibling.
     if (publicIndexRepairState(item) != null and repairActiveGenerationServiceable(item)) return view;
 
+    // Worker progress has no index identity. It may annotate an already
+    // active consumer's phase, but cannot create debt or rewrite watermarks.
     const dense_catch_up = async_indexing.dense_catch_up;
-    if (!dense_catch_up.active) return view;
-    view.catch_up_active = true;
-    view.catch_up_phase = dense_catch_up.phase;
-    view.catch_up_applied_sequence = @max(view.catch_up_applied_sequence, dense_catch_up.current_sequence);
-    view.catch_up_target_sequence = @max(view.catch_up_target_sequence, dense_catch_up.current_target_sequence);
+    if (view.catch_up_active and view.catch_up_phase == .idle and dense_catch_up.active)
+        view.catch_up_phase = dense_catch_up.phase;
 
-    // The DB-wide snapshot can lead the per-index overlay briefly. Only use it
-    // as a replay-watermark fallback when the index has published no replay
-    // facts of its own; explicit per-index watermarks remain authoritative.
-    const index_replay_present = view.replay_applied_sequence != 0 or
-        view.replay_target_sequence != 0 or view.replay_catch_up_required;
-    if (!index_replay_present) {
-        view.replay_catch_up_required = true;
-        view.backfill_active = true;
-        view.replay_target_sequence = dense_catch_up.current_target_sequence;
-        view.replay_applied_sequence = dense_catch_up.current_sequence;
-        if (view.replay_target_sequence > 0) {
-            view.backfill_progress = @min(
-                0.999,
-                @as(f64, @floatFromInt(view.replay_applied_sequence)) /
-                    @as(f64, @floatFromInt(view.replay_target_sequence)),
-            );
-        }
-    }
     return view;
 }
 
@@ -3723,6 +3704,20 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
     try out.append(alloc, '}');
 }
 
+/// A fresh, complete physical consumer proof supersedes shard-wide producer
+/// telemetry for readiness. Missing/stale topology, source debt and publication
+/// debt keep the conservative producer fence; diagnostics remain unmodified.
+fn independentConsumerComplete(item: anytype, observation: IndexReadinessObservation, table_doc_count: u64, sparse: bool, generation: u64, config_hash: u64) bool {
+    const Item = @TypeOf(item);
+    if (!@hasField(Item, "coverage_produced_count") or !@hasField(Item, "coverage_skipped_count") or !@hasField(Item, "coverage_terminal_failed_count")) return false;
+    if (!observation.completionFencesClear()) return false;
+    if (aggregateRuntimeCoverageIncomplete(item, generation, config_hash)) return false;
+    if (!coverageReplayCurrent(item.replay_applied_sequence, item.replay_target_sequence, item.replay_catch_up_required)) return false;
+    if (item.coverage_terminal_failed_count != 0) return false;
+    if (!coverageAllSourcesTerminal(table_doc_count, item.coverage_produced_count, item.coverage_skipped_count, item.coverage_terminal_failed_count)) return false;
+    return embeddingsArtifactPublishComplete(item, sparse, item.coverage_produced_count);
+}
+
 fn appendSingleIndexRuntimeStatus(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -3803,11 +3798,13 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     const visible_edge_count = if (embeddings_materialization_current) item.edge_count else 0;
     const visible_node_count = if (embeddings_materialization_current) item.node_count else 0;
     const visible_root_node = if (embeddings_materialization_current) item.root_node else 0;
+    const readiness_observation = indexReadinessObservation(item, authority, coverage_generation);
+    const visible_enrichment = if (embeddings_materialization_current) enrichment else null;
+    const readiness_enrichment = if (index_type == .embeddings and independentConsumerComplete(public_item, readiness_observation, table_doc_count, embeddings_sparse, coverage_generation, coverage_config_hash)) null else visible_enrichment;
     const embeddings_view = if (index_type == .embeddings)
-        embeddingsRuntimeView(public_item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, enrichment, coverage_runtime_present)
+        embeddingsRuntimeView(public_item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, readiness_enrichment, coverage_runtime_present)
     else
         null;
-    const visible_enrichment = if (embeddings_materialization_current) enrichment else null;
     var backfill_active = if (embeddings_view) |view| view.backfill_active else item.backfill_active;
     var backfill_progress = if (embeddings_view) |view| view.backfill_progress else item.backfill_progress;
     // Coverage can be authoritative before the serving incarnation is. Keep
@@ -3845,26 +3842,10 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     const dense_catch_up = async_indexing.dense_catch_up;
     var catch_up_active = if (embeddings_materialization_current) public_item.catch_up_active else false;
     var catch_up_phase = if (embeddings_materialization_current) public_item.catch_up_phase else .idle;
-    var catch_up_applied_sequence = if (embeddings_materialization_current) public_item.catch_up_applied_sequence else 0;
-    var catch_up_target_sequence = if (embeddings_materialization_current) public_item.catch_up_target_sequence else 0;
-    if (index_type == .embeddings) {
-        if (embeddings_materialization_current and dense_catch_up.active and
-            !active_generation_serviceable and
-            (dense_catch_up.current_target_sequence > dense_catch_up.current_sequence or
-                embeddings_view == null or embeddings_view.?.backfill_active))
-        {
-            catch_up_active = true;
-            catch_up_phase = dense_catch_up.phase;
-            catch_up_applied_sequence = @max(catch_up_applied_sequence, dense_catch_up.current_sequence);
-            catch_up_target_sequence = @max(catch_up_target_sequence, dense_catch_up.current_target_sequence);
-        } else if (embeddings_view) |view| {
-            if (!view.backfill_active) {
-                catch_up_active = false;
-                catch_up_phase = .idle;
-                catch_up_applied_sequence = @max(catch_up_applied_sequence, catch_up_target_sequence);
-            }
-        }
-    }
+    const catch_up_applied_sequence = if (embeddings_materialization_current) public_item.catch_up_applied_sequence else 0;
+    const catch_up_target_sequence = if (embeddings_materialization_current) public_item.catch_up_target_sequence else 0;
+    if (index_type == .embeddings and catch_up_active and catch_up_phase == .idle and dense_catch_up.active)
+        catch_up_phase = dense_catch_up.phase;
     const catch_up_pending = catch_up_active or catch_up_target_sequence > catch_up_applied_sequence;
     if (catch_up_pending) {
         replay_catch_up_required = true;
@@ -3952,7 +3933,7 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     const index_activity_pending = index_type == .embeddings and
         item.embedding_activity.epoch != 0 and
         item.embedding_activity.effectivePhase() != .idle;
-    const supervised_coverage_pending = if (visible_enrichment) |stats|
+    const supervised_coverage_pending = if (readiness_enrichment) |stats|
         stats.enabled and !stats.worker_failed and
             (if (embeddings_view) |view| view.coverage_pending else false)
     else
@@ -3971,9 +3952,8 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     const enrichment_degraded = index_type == .embeddings and
         ((embeddings_materialization_current and item.enrichment_failed and !enrichment_work_pending) or coverage_degraded);
     const terminal_enrichment_failure = enrichment_degraded or
-        (if (visible_enrichment) |stats| stats.worker_failed else false);
+        (if (readiness_enrichment) |stats| stats.worker_failed else false);
     const terminal_load_failure = load_error != null and raw_load_error_matches_desired_incarnation;
-    const readiness_observation = indexReadinessObservation(item, authority, coverage_generation);
     // Progress is a completion fraction, not merely a pulse from an active
     // worker. Full-text runtime snapshots can legitimately retain their last
     // cursor value after the worker settles; once the exact incarnation is
@@ -4037,7 +4017,7 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     } else if (repair_blocks_readiness and repair_state != null and std.mem.eql(u8, repair_state.?, "waiting")) {
         try appendJsonString(alloc, out, "retrying");
     } else {
-        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, enrichment_degraded, replay_applied_sequence, replay_target_sequence, visible_enrichment));
+        try appendJsonString(alloc, out, backfillState(index_type, backfill_active, enrichment_degraded, replay_applied_sequence, replay_target_sequence, readiness_enrichment));
     }
     if (load_error) |err_name| {
         const msg = try std.fmt.allocPrint(alloc, "load failed: {s}", .{err_name});
@@ -4383,7 +4363,7 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
         backfill_active,
         terminal_load_failure,
         terminal_enrichment_failure,
-        (if (visible_enrichment) |stats| stats.worker_failed else false),
+        (if (readiness_enrichment) |stats| stats.worker_failed else false),
         repair_state,
         repair_action_required,
         repair_lifecycle.blocks_queryable,
@@ -6917,6 +6897,12 @@ fn consumerTests() type {
                 .coverage_config_hash = 99,
                 .coverage_identity_ready = true,
                 .coverage_summary_ready = true,
+                .replay_applied_sequence = 7,
+                .replay_target_sequence = 11,
+                .replay_catch_up_required = true,
+                .catch_up_active = true,
+                .catch_up_applied_sequence = 7,
+                .catch_up_target_sequence = 11,
                 .projection_checkpoint_status = "clean",
                 .projection_checkpoint_applied_sequence = 7,
                 .projection_checkpoint_generation = 42,
@@ -6930,9 +6916,8 @@ fn consumerTests() type {
                     .doc_count = 1,
                     .index_count = 1,
                     .indexes = indexes[0..],
-                    // The table-level worker snapshot can lead the per-index replay
-                    // overlay briefly. The already-published physical generation
-                    // remains queryable while the later revision catches up.
+                    // This index owns replay debt; the published prefix remains
+                    // queryable while its later revision catches up.
                     .async_indexing = .{ .dense_catch_up = .{
                         .active = true,
                         .phase = .replay,
@@ -6979,7 +6964,7 @@ fn consumerTests() type {
             );
         }
 
-        test "serviceable repair preserves sibling shard dense catch-up fallback" {
+        test "serviceable repair preserves sibling shard dense catch-up" {
             var repair_indexes = [_]db_mod.types.DBIndexStats{.{
                 .name = "thumbnail",
                 .kind = .dense_vector,
@@ -7013,6 +6998,12 @@ fn consumerTests() type {
                 .coverage_config_hash = 99,
                 .coverage_identity_ready = true,
                 .coverage_summary_ready = true,
+                .replay_applied_sequence = 7,
+                .replay_target_sequence = 11,
+                .replay_catch_up_required = true,
+                .catch_up_active = true,
+                .catch_up_applied_sequence = 7,
+                .catch_up_target_sequence = 11,
             }};
             const runtimes = [_]runtime_status.LocalTableRuntimeStatus{
                 .{
@@ -7041,8 +7032,7 @@ fn consumerTests() type {
                         .doc_count = 1,
                         .index_count = 1,
                         .indexes = live_indexes[0..],
-                        // This shard's table-level snapshot leads its per-index
-                        // overlay and remains authoritative public readiness debt.
+                        // This shard owns explicit per-index replay debt.
                         .async_indexing = .{ .dense_catch_up = .{
                             .active = true,
                             .phase = .replay,
@@ -7063,7 +7053,7 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("rebuilding", aggregate.repair_state.?);
             try std.testing.expect(aggregate.repair_active_generation_serviceable);
             // The repair shard contributes its active-generation 2 -> 2 boundary;
-            // the sibling contributes the live 7 -> 11 fallback.
+            // the sibling contributes the live 7 -> 11 index ledger.
             try std.testing.expectEqual(@as(u64, 9), aggregate.replay_applied_sequence);
             try std.testing.expectEqual(@as(u64, 13), aggregate.replay_target_sequence);
             try std.testing.expect(aggregate.replay_catch_up_required);
@@ -7498,6 +7488,64 @@ fn consumerTests() type {
             normalizeReadyEmbeddingsAggregate(&aggregate);
             try std.testing.expect(aggregate.backfill_active);
             try std.testing.expect(aggregate.dense_vector_projection_pending);
+        }
+
+        test "protected consumer public status ignores unrelated worker debt and preserves source fences" {
+            const a = std.testing.allocator;
+            var sources = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "A", .published_sequence = 9, .target_sequence = 9, .producer_complete = true, .repair_summary_ready = true, .observation_count = 1 }};
+            var item: db_mod.types.DBIndexStats = .{
+                .name = "A",
+                .kind = .dense_vector,
+                .doc_count = 1,
+                .node_count = 1,
+                .root_node = 1,
+                .serving_snapshot_ready = true,
+                .publication_target_ready = true,
+                .publication_target_count = 1,
+                .coverage_produced_count = 1,
+                .coverage_generation = 7,
+                .coverage_config_hash = 41,
+                .coverage_identity_ready = true,
+                .coverage_summary_ready = true,
+                .backfill_progress = 1,
+                .replay_applied_sequence = 9,
+                .replay_target_sequence = 9,
+                .catch_up_applied_sequence = 9,
+                .catch_up_target_sequence = 9,
+                .projection_checkpoint_status = "clean",
+                .projection_checkpoint_applied_sequence = 9,
+                .projection_checkpoint_generation = 7,
+                .projection_checkpoint_config_hash = 41,
+                .source_replay = &sources,
+            };
+            const worker: db_mod.types.AsyncIndexingStats = .{ .dense_catch_up = .{ .active = true, .phase = .replay, .current_sequence = 2, .current_target_sequence = 100 } };
+            const metadata: runtime_status.RuntimeStatusMetadata = .{ .source = .live_writer_publish, .freshness = .fresh };
+            const view = publicShardIndexRuntimeView(item, worker);
+            try std.testing.expect(!view.catch_up_active);
+            try std.testing.expectEqual(@as(u64, 9), view.catch_up_target_sequence);
+            var encoded: std.ArrayListUnmanaged(u8) = .empty;
+            defer encoded.deinit(a);
+            for ([_]bool{ false, true }) |failed| {
+                encoded.clearRetainingCapacity();
+                try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, view, 1, .strict, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = !failed, .worker_failed = failed }, null, null, .{}, metadata, true);
+                try ant_json.testing.expectSubsetJsonText(a, "{\"rebuilding\":false,\"backfill_active\":false,\"dense_replay_applied_sequence\":9,\"dense_replay_target_sequence\":9,\"readiness\":{\"state\":\"ready\",\"queryable\":true,\"complete\":true}}", encoded.items);
+            }
+            // The same worker diagnostics cannot discharge A's own source debt.
+            sources[0].producer_complete = false;
+            item.source_replay = &sources;
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, item, 1, .strict, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true }, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"complete\":false}}", encoded.items);
+            sources[0].producer_complete = true;
+            item.runtime_observation_stale = true;
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, item, 1, .strict, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true }, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"complete\":false}}", encoded.items);
+            item.runtime_observation_stale = false;
+            item.runtime_target_observation_complete = false;
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, item, 1, .strict, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true }, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"complete\":false}}", encoded.items);
         }
 
         test "table-wide native vector work does not block an independently ready index" {
