@@ -1165,6 +1165,9 @@ fn publishReplicatedCompletionCertificate(self: *DB, raw: []const u8, owner: @im
     return .{ .value = self.publishReplicatedCompletionCertificate(raw, owner, entry) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn historyCompletionDecision(self: *DB, allocator: std.mem.Allocator, query: @import("history_decision_wire.zig").Query) engine.Outcome([]u8) {
+    return .{ .value = self.historyCompletionDecision(allocator, query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn historyAdmission(self: *DB, query: @import("history_admission_wire.zig").Query) engine.Outcome(@import("history_admission_wire.zig").Reply) {
     return .{ .value = self.historyAdmission(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

@@ -3159,3 +3159,48 @@ The group activates protocol 33 before admission and retains it through the idle
 barrier/read qualification. The all-member preflight suite covers incompatible
 and unavailable peers at protocol 33 as well as the older retained-history
 floors. Source/control catalog generation, formatting and diff checks passed.
+
+### Coherent retained coordinator decision observation
+
+Coordinator recovery needs the authoritative decision and its original admission
+from the same native snapshot. The private decision query binds the complete
+original coordinator owner, stable transaction ID and positive minimum native
+applied index. Its reply binds the request digest, actual persisted cut, canonical
+record digest, decision metadata and retained admission v3 with all original
+participant owners. Missing admission is unproven absence and cannot authorize
+replay, presume-abort, checkpoint progress or retention release.
+
+The native DB validates writable Raft history authority, physical namespace and
+root generation, persisted identity and history policy before reading both keys
+in one read transaction. The transaction-record decoder supplies the canonical
+status, original begin/creation times, commit version, finalization time and
+prepared/resolved flags. Aborts retain commit version zero; finalization time is
+a separate field. Only a committed, prepared record can yield a committed
+manifest. Pending and aborted decisions never yield a complete transaction.
+
+The request is capped at 4096 bytes; the owned reply is capped at the admission
+limit plus 4096 bytes. Strict decoding owns all variable data beyond snapshot and
+C-response teardown. Native engine descriptor 48 and storage owner ABI 103 add
+this read. The source wrapper establishes ReadIndex, checks the original
+catalog/physical owner before and after the snapshot, preserves sparse native
+cuts, and destroys owned replies if a final fence fails. It never submits writes.
+
+The real-Raft fixture now assembles its complete certificate from the retained
+native decision/admission instead of the in-memory caller plan. Compiled-owner
+negative tests cover absent admission, a lagging required cut and wrong root
+generation. The transaction-manager reopen test checks pending and aborted
+record decoding. Pure query/reply and ownership tests in
+`completion-decision-wire-test.log` pass all eight cases, including allocation
+failure injection. Native/Raft qualification is pending.
+
+Remote signed decision transport, normal coordinator execution/recovery hooks,
+all-owner certificate propagation/retention release, source destination wiring
+and the remaining public-feed/bootstrap/pgoutput/client work are still required.
+
+`completion-decision-native-test.log` completed with exit 0: all 11 committed
+history storage cases, nine real-Raft cases and the compiled ABI-103 owner case
+passed, with no failures, skips or leaks. The native decision read returns the
+original prepared/resolved committed record and v3 owner identities. The fixture
+assembles and publishes its complete certificate from that persisted admission.
+Sparse-cut, physical owner and minimum-index checks remain qualified. The eight
+pure wire/contract cases also pass. Formatting, license and diff checks passed.

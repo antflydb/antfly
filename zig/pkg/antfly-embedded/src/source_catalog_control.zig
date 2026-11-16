@@ -241,6 +241,7 @@ pub const storage_backup_codec = @import("storage/backup_codec.zig");
 pub const storage_backup_restore = @import("storage/backup_restore.zig");
 pub const storage_byte_range = @import("storage/byte_range.zig");
 pub const storage_committed_history = @import("storage/committed_history.zig");
+pub const storage_history_decision_wire = @import("storage/history_decision_wire.zig");
 pub const storage_history_admission_wire = @import("storage/history_admission_wire.zig");
 pub const storage_history_publication_wire = @import("storage/history_publication_wire.zig");
 pub const storage_coordinated_ttl = @import("storage/coordinated_ttl.zig");

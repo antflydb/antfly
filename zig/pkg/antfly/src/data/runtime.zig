@@ -44152,7 +44152,34 @@ fn consumerTests() type {
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const positive_retry = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
                 try std.testing.expectEqualDeep(positive.resolution, positive_retry.resolution);
-                var certificate = try resolution_operations.wire.Assembly.init(a, try plan.manifest(1001));
+                const decision_wire = @import("antfly_local_sources").storage_history_decision_wire;
+                const decision_query: decision_wire.Query = .{ .owner = current_owner, .transaction_id = txn_id };
+                var recovered_decision = blk: {
+                    var decision_fence = route.fence().?;
+                    decision_fence.admission_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+                    while (true) {
+                        break :blk owner.orderedHistoryDecisionRouted(a, decision_fence, "docs", decision_query) catch |err| switch (err) {
+                            error.ReadUnavailable, error.StorageReadTemporarilyUnavailable => {
+                                if (platform_time.monotonicNs() >= decision_fence.admission_deadline_ns.?) return error.DeadlineExceeded;
+                                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                                continue;
+                            },
+                            else => return err,
+                        };
+                    }
+                };
+                defer recovered_decision.deinit();
+                try recovered_decision.value.validate(decision_query);
+                const committed = recovered_decision.value.decision orelse return error.TestExpectedRetainedDecision;
+                try std.testing.expectEqual(.committed, committed.record.status);
+                try std.testing.expectEqual(@as(u64, 1000), committed.record.begin_timestamp);
+                try std.testing.expectEqual(@as(u64, 1001), committed.record.commit_version);
+                try std.testing.expect(committed.record.prepared and committed.record.intents_resolved);
+                try std.testing.expectEqual(plan.digest(), committed.admission.digest);
+                try std.testing.expectEqual(current_owner, try committed.admission.admission.recoveryOwner(namespace));
+                // Assemble from the retained native decision/admission, rather
+                // than deriving restart input from the in-memory write plan.
+                var certificate = try resolution_operations.wire.Assembly.init(a, try committed.committedManifest());
                 defer certificate.deinit();
                 try std.testing.expectError(error.SourceOutcomeUnresolved, certificate.encode(a));
                 try std.testing.expect(try certificate.add(positive_input.binding(), positive));

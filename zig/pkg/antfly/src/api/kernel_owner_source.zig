@@ -1790,7 +1790,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         return parsed.value;
     }
 
-    const HistoryReadKind = enum { page, outcome, grant, resolution, publication, admission };
+    const completion_decision = @import("antfly_local_sources").storage_history_decision_wire;
+    const HistoryReadKind = enum { page, outcome, grant, resolution, publication, admission, decision };
     fn HistoryReadInput(comptime kind: HistoryReadKind) type {
         return switch (kind) {
             .page => table_write_source.history_page.Request,
@@ -1799,6 +1800,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .resolution => table_write_source.history_resolution_wire.Request,
             .publication => completion_history.CompletionPublicationQuery,
             .admission => completion_admission.Query,
+            .decision => completion_decision.Query,
         };
     }
     fn HistoryReadResult(comptime kind: HistoryReadKind) type {
@@ -1809,6 +1811,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .resolution => table_write_source.history_resolution_wire.Reply,
             .publication => completion_history.CompletionPublicationObservation,
             .admission => completion_admission.Reply,
+            .decision => completion_decision.OwnedReply,
         };
     }
 
@@ -1838,6 +1841,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         bounded.admission_deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), platform_time.monotonicNs() +| 5 * std.time.ns_per_s);
         bounded.admission_deadline_io = null;
         return self.historyReadRouted(alloc, bounded, table_name, .publication, query);
+    }
+
+    /// Original-owner coordinator decision and retained admission from one
+    /// native snapshot under the same final quorum/catalog fences as receipts.
+    pub fn orderedHistoryDecisionRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, query: completion_decision.Query) !completion_decision.OwnedReply {
+        try query.validate();
+        if (query.owner.group_id != fence.route.group_id) return error.TopologyChanged;
+        const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
+        var bounded = fence;
+        bounded.admission_deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), platform_time.monotonicNs() +| 5 * std.time.ns_per_s);
+        bounded.admission_deadline_io = null;
+        return self.historyReadRouted(alloc, bounded, table_name, .decision, query);
     }
 
     pub const CapturedCompletionOwner = struct {
@@ -1884,7 +1899,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .outcome => request.command.namespace(),
             .grant => request.namespace,
             .resolution => request.namespace,
-            .publication, .admission => request.owner.namespace,
+            .publication, .admission, .decision => request.owner.namespace,
         };
         if (comptime kind == .grant) try request.validate();
         if (comptime kind == .resolution) {
@@ -1894,9 +1909,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!std.mem.eql(u8, &namespace, &requested_namespace)) return error.HistoryResynchronizationRequired;
         const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
         const opts: db_types.ScanOptions = .{ .execution_deadline_ns = context.deadline_ns, .cancellation = fence.admission_cancellation };
-        var publication_descriptor: ?LoadedDescriptor = if (comptime kind == .publication or kind == .admission) try self.loadCompletionDescriptor(alloc, group, table_name, context) else null;
+        var publication_descriptor: ?LoadedDescriptor = if (comptime kind == .publication or kind == .admission or kind == .decision) try self.loadCompletionDescriptor(alloc, group, table_name, context) else null;
         defer if (publication_descriptor) |*owned| owned.deinit(alloc);
-        if (comptime kind == .publication or kind == .admission) {
+        if (comptime kind == .publication or kind == .admission or kind == .decision) {
             try request.validate();
             try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), request.owner, context);
         }
@@ -1908,7 +1923,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (request.minimum_applied_index < request.entry.index) return error.InvalidHistoryAdmission;
             if (proof.applied_index < request.minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
         }
-        if (comptime kind == .resolution or kind == .publication or kind == .admission) if (proof.applied_index < request.minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
+        if (comptime kind == .resolution or kind == .publication or kind == .admission or kind == .decision) if (proof.applied_index < request.minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
         var lease = try self.acquireWithControls(group, table_name, .from(opts));
         defer lease.deinit();
@@ -1930,9 +1945,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .resolution => try lease.owner().historyResolution(alloc, table_name, request),
             .publication => try lease.owner().historyPublication(alloc, table_name, request),
             .admission => try lease.owner().historyAdmission(alloc, table_name, request),
+            .decision => try lease.owner().historyDecision(alloc, table_name, request),
         };
-        errdefer if (comptime kind == .page) result.deinit();
-        if (comptime kind == .publication or kind == .admission) try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), request.owner, context);
+        errdefer if (comptime kind == .page or kind == .decision) result.deinit();
+        if (comptime kind == .publication or kind == .admission or kind == .decision) try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), request.owner, context);
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
         try self.validateRoutedRead(alloc, fence, group, table_name);
         // Preserve the actual persisted native cut. Quorum progress is a

@@ -26049,6 +26049,42 @@ pub const DB = struct {
         return @import("../history_admission_wire.zig").Reply.init(query, .{ .term = cut.term, .index = cut.index }, state.limit);
     }
 
+    /// Owned bounded JSON. Decision record, original admission and actual cut
+    /// come from one native snapshot opened after the caller's quorum barrier.
+    pub fn historyCompletionDecision(self: *DB, allocator: std.mem.Allocator, query: @import("../history_decision_wire.zig").Query) ![]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("historyCompletionDecision", .{ self, allocator, query });
+        const wire = @import("../history_decision_wire.zig");
+        const completion = wire.completion;
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (self.local_execution.replication_async_batch_mirror != null) return error.HistoryAuthorityRequired;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
+        try query.validate();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &query.owner.namespace) or query.owner.root_generation != self.core.root_generation) return error.HistoryResynchronizationRequired;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const state = (try @import("../committed_history.zig").load(&txn)) orelse return error.ChangefeedCapabilityUnsupported;
+        if (!std.mem.eql(u8, &namespace, &state.namespace)) return error.HistoryResynchronizationRequired;
+        const persisted = (try doc_identity.loadNamespaceTxn(&txn)) orelse return error.HistoryResynchronizationRequired;
+        if (!persisted.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        _ = try @import("../source_authority.zig").require(&txn, .raft, namespace);
+        const cut = try orderedHistoryReadCut(&txn, query.minimum_applied_index);
+        var reply: wire.Reply = .{ .request_digest = query.digest(), .cut = .{ .term = cut.term, .index = cut.index }, .decision = null };
+        const admission_key = completion.admission_prefix.* ++ query.transaction_id;
+        const admission_raw = txn.get(&admission_key) catch |err| switch (err) {
+            error.NotFound => return wire.encodeReply(allocator, query, reply),
+            else => return err,
+        };
+        var admission = try completion.parseAdmission(allocator, admission_raw);
+        defer admission.deinit();
+        const record_key = completion.record_prefix.* ++ query.transaction_id;
+        const record_raw = txn.get(&record_key) catch |err| return if (err == error.NotFound) error.HistoryCorrupt else err;
+        reply.decision = .{ .record = try transactions_mod.completionCoordinatorRecord(record_raw), .admission = admission.value };
+        return wire.encodeReply(allocator, query, reply);
+    }
+
     /// ReadIndex must already be established by the serving owner. Publication,
     /// ledger, local receipt and actual cut are verified in one read snapshot.
     pub fn historyCompletionPublication(self: *DB, allocator: std.mem.Allocator, query: @import("../committed_history.zig").CompletionPublicationQuery) !@import("../committed_history.zig").CompletionPublicationObservation {

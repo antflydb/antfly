@@ -176,6 +176,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerOrderedHistoryOutcome, "antfly_storage_owner_ordered_history_outcome");
     exportInternal(&storage_kernel_exports.storageOwnerHistoryGrant, "antfly_storage_owner_history_grant");
     exportInternal(&storage_kernel_exports.storageOwnerHistoryResolution, "antfly_storage_owner_history_resolution");
+    exportInternal(&storage_kernel_exports.storageOwnerHistoryDecision, "antfly_storage_owner_history_decision");
     exportInternal(&storage_kernel_exports.storageOwnerHistoryAdmission, "antfly_storage_owner_history_admission");
     exportInternal(&storage_kernel_exports.storageOwnerHistoryPublication, "antfly_storage_owner_history_publication");
     exportInternal(&storage_kernel_exports.storageOwnerNativeInitialChildControlJson, "antfly_storage_owner_native_initial_child_control_json");

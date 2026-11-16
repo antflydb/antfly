@@ -3325,6 +3325,29 @@ pub fn requireCompletionResolvedRecord(raw: []const u8, commit_version: u64) !vo
     if (record.status != .committed or record.commit_version != commit_version or !record.prepared_known or !record.prepared or !record.intents_resolved_known or !record.intents_resolved) return error.SourceOutcomeUnresolved;
 }
 
+/// Decode the coordinator record with its canonical codec. Only retained,
+/// explicitly owned completion records qualify for restart decision recovery.
+pub fn completionCoordinatorRecord(raw: []const u8) !@import("history_decision_wire.zig").Record {
+    const record = try decodeRecord(raw);
+    if (!record.coordinator_known or !record.coordinator or !record.retain_terminal_known or !record.retain_terminal or !record.prepared_known or (record.status != .pending and !record.intents_resolved_known)) return error.InvalidTxnRecord;
+    const result: @import("history_decision_wire.zig").Record = .{
+        .status = switch (record.status) {
+            .pending => .pending,
+            .committed => .committed,
+            .aborted => .aborted,
+        },
+        .begin_timestamp = record.begin_timestamp,
+        .created_at_ns = record.created_at,
+        .commit_version = record.commit_version,
+        .finalized_at_ns = record.finalized_at,
+        .prepared = record.prepared,
+        .intents_resolved = record.intents_resolved,
+        .digest = completion.bytesDigest(raw),
+    };
+    try result.validate();
+    return result;
+}
+
 fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == 0 or raw[0] > @backingInt(TxnStatus.aborted)) return error.InvalidTxnRecord;
     if (raw.len == txn_record_v8_size) {
@@ -6102,4 +6125,19 @@ test "committed history completion admission v3 durably retains every original r
     follower.root_generation += 1;
     try std.testing.expectError(error.TopologyChanged, saved.value.admission.requireRoutedOwner(follower));
     try std.testing.expectEqual(TxnStatus.pending, try reopened.getTransactionStatus(admission.transaction_id));
+    const key = completion.record_prefix.* ++ admission.transaction_id;
+    const pending_raw = try reopened.getAlloc(a, &key);
+    defer a.free(pending_raw);
+    const pending = try completionCoordinatorRecord(pending_raw);
+    try std.testing.expectEqual(.pending, pending.status);
+    try std.testing.expect(!pending.prepared and !pending.intents_resolved);
+    try std.testing.expectEqual(@as(u64, 0), pending.commit_version);
+    _ = try reopened.resolveIntentsWithExtraBatch(admission.transaction_id, .aborted, 30, .{});
+    const aborted_raw = try reopened.getAlloc(a, &key);
+    defer a.free(aborted_raw);
+    const aborted = try completionCoordinatorRecord(aborted_raw);
+    try std.testing.expectEqual(.aborted, aborted.status);
+    try std.testing.expectEqual(@as(u64, 0), aborted.commit_version);
+    try std.testing.expectEqual(@as(u64, 30), aborted.finalized_at_ns);
+    try std.testing.expect(aborted.intents_resolved);
 }

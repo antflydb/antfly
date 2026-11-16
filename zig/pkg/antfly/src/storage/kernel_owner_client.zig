@@ -631,6 +631,18 @@ pub const Owner = struct {
         return (try wire.decodeReply(alloc, response.bytes(), request)).observation;
     }
 
+    pub fn historyDecision(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, query: @import("antfly_local_sources").storage_history_decision_wire.Query) !@import("antfly_local_sources").storage_history_decision_wire.OwnedReply {
+        const wire = @import("antfly_local_sources").storage_history_decision_wire;
+        try query.validate();
+        const json = try std.json.Stringify.valueAlloc(alloc, query, .{});
+        defer alloc.free(json);
+        if (json.len > wire.max_request_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_history_decision(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        return wire.decodeReply(alloc, response.bytes(), query);
+    }
+
     pub fn historyAdmission(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, query: @import("antfly_local_sources").storage_history_admission_wire.Query) !@import("antfly_local_sources").storage_history_admission_wire.Reply {
         const wire = @import("antfly_local_sources").storage_history_admission_wire;
         try query.validate();

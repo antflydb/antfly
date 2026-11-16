@@ -59,6 +59,18 @@ test "compiled ordered history grant observations preserve scope and survive reo
     var enrolled = try owner.orderedHistoryControlJson("docs", enrollment, 1, 2);
     enrolled.deinit();
     const active = try owner.orderedHistoryGrant(a, "docs", identity, 2);
+    const decision_wire = @import("antfly_local_sources").storage_history_decision_wire;
+    const decision_query: decision_wire.Query = .{ .owner = admission_query.owner, .transaction_id = @splat(89), .minimum_applied_index = 2 };
+    var absent_decision = try owner.historyDecision(a, "docs", decision_query);
+    defer absent_decision.deinit();
+    try std.testing.expect(absent_decision.value.decision == null);
+    try std.testing.expectEqual(@as(u64, 2), absent_decision.value.cut.index);
+    var lagged_decision = decision_query;
+    lagged_decision.minimum_applied_index = 3;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.historyDecision(a, "docs", lagged_decision));
+    lagged_decision = decision_query;
+    lagged_decision.owner.root_generation += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, owner.historyDecision(a, "docs", lagged_decision));
     const qualified_admission = try owner.historyAdmission(a, "docs", admission_query);
     try qualified_admission.validate(admission_query);
     try std.testing.expectEqual(@as(u64, 1), qualified_admission.cut.term);
