@@ -155104,6 +155104,138 @@ test "db dense index inspection binds current chunk vectors and never invokes in
     try std.testing.expect((try db.getDocumentArtifactManifest(a, "doc", "dense")) == null);
 }
 
+test "privacy protected model migration batches across documents" {
+    try protectedModelBackfillProbe(64, false);
+}
+
+test "privacy protected model migration 1024 document diagnostic" {
+    try protectedModelBackfillProbe(1024, false);
+}
+
+test "privacy protected model migration deferred snapshot control" {
+    try protectedModelBackfillProbe(1024, true);
+}
+
+fn protectedModelBackfillProbe(document_count: usize, defer_snapshots: bool) !void {
+    const a = std.testing.allocator;
+    const privacy = @import("../../privacy/document.zig");
+    const catalog = @import("../../privacy/catalog.zig");
+    const Probe = struct {
+        deterministic: embedder_mod.DeterministicDenseEmbedder = .{},
+        batches: usize = 0,
+        items: std.atomic.Value(usize) = .init(0),
+        largest_batch: usize = 0,
+        privacy_calls: usize = 0,
+        snapshot_barrier: std.atomic.Value(usize) = .init(0),
+        deferred_snapshots: std.atomic.Value(usize) = .init(0),
+        fn beforeSnapshot(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const barrier = self.snapshot_barrier.load(.acquire);
+            if (barrier != 0 and self.items.load(.acquire) < barrier) {
+                _ = self.deferred_snapshots.fetchAdd(1, .monotonic);
+                // Controlled refusal of optional acceleration only. The final
+                // idle barrier still builds and publishes the complete base.
+                return error.ResourceBudgetExceeded;
+            }
+        }
+        fn check(_: *anyopaque) !void {}
+        fn detect(_: *anyopaque, out: Allocator, _: privacy.contract.Producer, _: []const u8) ![]u8 {
+            return out.dupe(u8, "{\"entities\":{\"email\":[{\"start\":0,\"end\":6,\"text\":\"a@b.co\",\"confidence\":0.9}]},\"long_document\":{\"window_count\":1}}");
+        }
+        fn produce(ptr: *anyopaque, out: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.privacy_calls += 1;
+            return privacy.produce(out, request.config_json, request.source_text, .{ .ptr = ptr, .produce = detect, .check = check });
+        }
+        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedUnbatchedInference;
+        }
+        fn batch(ptr: *anyopaque, out: Allocator, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batches += 1;
+            _ = self.items.fetchAdd(texts.len, .release);
+            self.largest_batch = @max(self.largest_batch, texts.len);
+            const vectors = try out.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (vectors[0..initialized]) |vector| out.free(@constCast(vector));
+                out.free(vectors);
+            }
+            for (texts, vectors) |text, *vector| {
+                try std.testing.expect(std.mem.indexOf(u8, text, "a@b.co") == null);
+                vector.* = try embedder_mod.DeterministicDenseEmbedder.embedDense(&self.deterministic, out, name, text, dims);
+                initialized += 1;
+            }
+            return vectors;
+        }
+    };
+    var probe: Probe = .{};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const policy = privacy.contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"body"}, .category_groups = &.{}, .categories = &.{.{ .name = "email", .description = "migration batching" }} };
+    const version = try policy.identity(scratch);
+    const root = try privacy.protectedArtifactName(scratch, version);
+    const resolved = try privacy.resolve(scratch, policy, true);
+    const producer_json = try std.json.Stringify.valueAlloc(scratch, .{ .type = "extractor", .config = resolved.config }, .{});
+    var directory = try TestDirectory.init("protected-backfill-batching");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .asset_producer = .{ .ptr = &probe, .vtable = &.{ .produce = Probe.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } },
+            .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_batch_fn = Probe.batch },
+        },
+    });
+    defer db.close();
+    const previous_snapshot_hook = index_manager_mod.test_before_vector_block_primary_snapshot_build;
+    defer index_manager_mod.test_before_vector_block_primary_snapshot_build = previous_snapshot_hook;
+    if (defer_snapshots) index_manager_mod.test_before_vector_block_primary_snapshot_build = .{ .ctx = &probe, .call = Probe.beforeSnapshot };
+    try db.addEnrichment(.{ .name = root, .kind = .asset, .field = privacy.source_field, .content_type = "application/json", .producer_json = producer_json });
+    const writes = try scratch.alloc(types.BatchWrite, document_count);
+    for (writes, 0..) |*write, i| write.* = .{
+        .key = try std.fmt.allocPrint(scratch, "doc-{d:0>4}", .{i}),
+        .value = try std.fmt.allocPrint(scratch, "{{\"body\":\"a@b.co Orchard guidance {d}.\"}}", .{i}),
+    };
+    var migration_calls: usize = 0;
+    var migration_items: usize = 0;
+    var migration_snapshot_builds: usize = 0;
+    for ([_][]const u8{ "A", "B" }, 0..) |name, i| {
+        if (defer_snapshots and i == 1) probe.snapshot_barrier.store(probe.items.load(.acquire) + document_count, .release);
+        const started = monotonicTimeNs();
+        const embedding = try catalog.managedName(scratch, version, name);
+        const chunks = try std.fmt.allocPrint(scratch, "{s}_chunks", .{embedding});
+        try db.addEnrichment(.{ .name = chunks, .kind = .chunk, .field = "body", .source_artifact_name = root, .chunk_size = 1024 });
+        try db.addEnrichment(.{ .name = embedding, .kind = .embedding, .field = "text", .source_artifact_name = chunks, .expected_dims = 3, .producer_json = if (i == 0) "{\"provider\":\"antfly\",\"model\":\"model-A\"}" else "{\"provider\":\"antfly\",\"model\":\"model-B\"}" });
+        const config = try std.fmt.allocPrint(scratch, "{{\"field\":\"embedding\",\"dims\":3,\"sources\":[{{\"artifact\":\"{s}\"}}]}}", .{embedding});
+        try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config, .coverage_generation = i + 1 });
+        if (i == 0) try db.batch(.{ .writes = writes, .sync_level = .write });
+        const calls_before = probe.batches;
+        const items_before = probe.items.load(.acquire);
+        const privacy_before = probe.privacy_calls;
+        const sequence_before = db.core.nextEnrichmentSequence();
+        const snapshots_before = index_manager_mod.test_vector_block_primary_snapshot_builds;
+        try db.runUntilIdle();
+        std.debug.print("\nPROTECTED-BACKFILL docs={d} index={s} defer_snapshots={} wall_ms={d} batches={d} items={d} largest_batch={d} privacy_calls={d} sequence_delta={d} primary_snapshot_builds={d} deferred_snapshots={d}\n", .{ document_count, name, defer_snapshots, (monotonicTimeNs() -| started) / std.time.ns_per_ms, probe.batches - calls_before, probe.items.load(.acquire) - items_before, probe.largest_batch, probe.privacy_calls - privacy_before, db.core.nextEnrichmentSequence() -| sequence_before, index_manager_mod.test_vector_block_primary_snapshot_builds - snapshots_before, probe.deferred_snapshots.load(.acquire) });
+        if (i == 1) {
+            migration_calls = probe.batches - calls_before;
+            migration_items = probe.items.load(.acquire) - items_before;
+            migration_snapshot_builds = index_manager_mod.test_vector_block_primary_snapshot_builds - snapshots_before;
+            try std.testing.expectEqual(privacy_before, probe.privacy_calls);
+        }
+    }
+    try std.testing.expectEqual(document_count, migration_items);
+    if (defer_snapshots) {
+        try std.testing.expect(probe.deferred_snapshots.load(.acquire) > 0);
+        try std.testing.expect(migration_snapshot_builds <= 4);
+        return;
+    }
+    if (document_count > 64) try std.testing.expect(migration_snapshot_builds <= 4);
+    // A one-chunk document must not force a provider call per document.
+    try std.testing.expect(migration_calls <= (document_count + 31) / 32);
+}
+
 test "privacy scoped readiness serves A while sibling B backfills" {
     const a = std.testing.allocator;
     const catalog = @import("../../privacy/catalog.zig");
