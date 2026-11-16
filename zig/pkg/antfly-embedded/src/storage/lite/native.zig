@@ -8466,7 +8466,7 @@ pub const NativeFile = struct {
         // this codebase already follows.
         const blocking_pin: ?u64 = blk: {
             const region = (self.regionForInode() catch break :blk null) orelse break :blk null;
-            const min_pinned = region.minimumForeignPinnedSequence(antfly_platform.process.currentId() orelse 0) orelse break :blk null;
+            const min_pinned = region.minimumUncoveredPinnedSequence(antfly_platform.process.currentId() orelse 0, redo.shared.minimumPin(io)) orelse break :blk null;
             break :blk if (min_pinned < new_checkpoint_sequence) min_pinned else null;
         };
         const pinned_below = blocking_pin != null;
@@ -19612,7 +19612,7 @@ pub const NativeFile = struct {
             if (redo.checkpoint_backoff_min_pinned) |blocking| {
                 const still_blocked = blk: {
                     const region = (self.regionForInode() catch break :blk false) orelse break :blk false;
-                    const min_pinned = region.minimumForeignPinnedSequence(antfly_platform.process.currentId() orelse 0) orelse break :blk false;
+                    const min_pinned = region.minimumUncoveredPinnedSequence(antfly_platform.process.currentId() orelse 0, redo.shared.minimumPin(self.runtimeIo())) orelse break :blk false;
                     break :blk min_pinned <= blocking;
                 };
                 if (still_blocked) return;
@@ -33725,7 +33725,7 @@ test "lite redo log in-process base refresh also resyncs the redo writer's own c
 // overlay. The cross-process case (a separate process that does replay log
 // bytes) is "checkpointer defers reclaim while a forked child is pinned,
 // reclaims after kill -9".
-test "lite redo log checkpointer resets the log despite a same-process reader pinned behind it" {
+test "lite redo log checkpointer defers log reclaim while a reader without an overlay pin is pinned behind it" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -33747,18 +33747,19 @@ test "lite redo log checkpointer resets the log despite a same-process reader pi
         try writer.putDocument("beta", "two");
         try writer.commitTransaction();
 
-        try std.testing.expect(writer.redo.?.writer.tail > 0);
+        const tail_before = writer.redo.?.writer.tail;
+        try std.testing.expect(tail_before > 0);
         try writer.checkpointRedoLog();
-        // Not deferred: the only pin is this process's own.
-        try std.testing.expectEqual(@as(u64, 0), writer.redo.?.writer.tail);
+        // Deferred: the reader's pin is still behind this checkpoint, so
+        // the log's stale prefix must not have been physically reclaimed.
+        try std.testing.expectEqual(tail_before, writer.redo.?.writer.tail);
+        // But the real checkpoint itself still landed (durable, not
+        // deferred).
         const alpha_after_checkpoint = (try writer.getDocumentAlloc(a, "alpha")).?;
         a.free(alpha_after_checkpoint);
 
-        // The reader still resolves the newer commit through the overlay.
+        // Caught up; `reader.close()` below (deferred) releases the pin.
         try reader.refreshCrossProcessRedoOverlay();
-        const beta = (try reader.getDocumentAlloc(a, "beta")) orelse return error.TestUnexpectedResult;
-        defer a.free(beta);
-        try std.testing.expectEqualStrings("two", beta);
     }
 
     try writer.beginTransaction();
@@ -33766,6 +33767,39 @@ test "lite redo log checkpointer resets the log despite a same-process reader pi
     try writer.commitTransaction();
     try writer.checkpointRedoLog();
     try std.testing.expectEqual(@as(u64, 0), writer.redo.?.writer.tail);
+}
+
+test "lite redo log checkpointer resets the log under a same-process reader whose overlay pin covers it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-covered-reader.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one");
+    try writer.commitTransaction();
+
+    {
+        // A ReadView pins both its lock-region slot and the shared
+        // overlay, so the overlay alone keeps what it reads.
+        var view = try ReadView.open(&writer, std.testing.io);
+        defer view.release(std.testing.io);
+
+        try writer.beginTransaction();
+        try writer.putDocument("alpha", "two");
+        try writer.commitTransaction();
+
+        try std.testing.expect(writer.redo.?.writer.tail > 0);
+        try writer.checkpointRedoLog();
+        try std.testing.expectEqual(@as(u64, 0), writer.redo.?.writer.tail);
+
+        const seen = (try view.getDocumentAlloc(a, "alpha")) orelse return error.TestUnexpectedResult;
+        defer a.free(seen);
+        try std.testing.expectEqualStrings("one", seen);
+    }
 }
 
 test "lite redo log publishRedoLogState never runs when the durable append itself fails -- a torn/failed commit is never visible cross-process" {

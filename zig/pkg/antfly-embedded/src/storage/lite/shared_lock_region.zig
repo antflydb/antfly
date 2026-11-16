@@ -2148,19 +2148,23 @@ pub const Region = struct {
     /// caller (page reclamation here, log-record retention elsewhere) --
     /// keep both stable.
     /// `minimumPinnedSequence`, counting only readers in other processes.
-    /// The physical redo log is read back only by a reader in another
-    /// process catching its own overlay up; a reader in this process
-    /// resolves through the shared in-memory overlay, whose own pins keep
-    /// what it needs, so it must not hold the log's bytes hostage. Page
-    /// reuse still uses `minimumPinnedSequence`: every reader reads pages.
-    pub fn minimumForeignPinnedSequence(self: *Region, own_pid: u32) ?u64 {
+    /// The oldest pin the redo fold must respect before resetting the log.
+    /// A reader in another process catches its overlay up from the log's
+    /// bytes, so its pin always counts. A reader in this process resolves
+    /// through the shared in-memory overlay instead, and the overlay keeps
+    /// every version visible at or above its own oldest pin
+    /// (`overlay_floor`); such a reader's slot is skipped only when that
+    /// floor covers it. A same-process reader that pinned only its slot
+    /// (a frozen read-only handle, say) still counts. Page reuse still uses
+    /// `minimumPinnedSequence`: every reader reads pages.
+    pub fn minimumUncoveredPinnedSequence(self: *Region, own_pid: u32, overlay_floor: ?u64) ?u64 {
         var min: ?u64 = null;
         for (self.readerSlots()) |*slot| {
             if (slot.owner.load(.acquire) == 0) continue;
-            if (holderPid(slot.generation) == own_pid) continue;
             if (self.isReferenceDead(holderLivenessSlot(slot.generation), holderClaimGeneration(slot.generation))) continue;
             const seq = slot.pinned_sequence.load(.acquire);
             if (seq == 0) continue;
+            if (holderPid(slot.generation) == own_pid) if (overlay_floor) |floor| if (floor <= seq) continue;
             if (min == null or seq < min.?) min = seq;
         }
         return min;

@@ -870,6 +870,14 @@ pub const SharedRedoOverlay = struct {
         }
     }
 
+    /// `minPinLocked`, taking the mutex: the oldest mark any in-process
+    /// reader has pinned, below which reclaim will not go.
+    pub fn minimumPin(self: *SharedRedoOverlay, io: std.Io) ?u64 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.minPinLocked();
+    }
+
     /// The oldest live pin's sequence, or null if there are none (nothing
     /// currently restricts reclaim beyond `durable_checkpoint_sequence`
     /// itself).
