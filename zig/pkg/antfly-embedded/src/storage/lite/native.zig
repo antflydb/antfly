@@ -9594,7 +9594,25 @@ pub const NativeFile = struct {
         if (cancel) |token| try token.check();
         const reader = try self.allocator.create(NativeFile);
         errdefer self.allocator.destroy(reader);
-        reader.* = try NativeFile.openWithIo(self.allocator, self.runtime(), self.path, .{ .read_only = true, .pin_read_checkpoint = true, .resource_manager = self.page_cache.resource_manager });
+        // perf/lwa-xproc-pagekind: `pin_read_checkpoint` only ever pins
+        // `inode_lock.Entry.reader_pins` -- in-process, invisible to a
+        // different OS process's own reclaim frontier
+        // (`shared_lock_region.Region.minimumPinnedSequence`). This
+        // reader's whole reason to exist is to walk the allocator/
+        // ownership graph *after* `verifyAllocatorAssumeLocked` has
+        // already released the writer lease (its own "keep it outside
+        // both publication locks" comment), so a foreign process can
+        // already be reclaiming while this walk is in flight. Passing
+        // `self.reader_coordinator` through makes this open a real
+        // `plain_reader` (`openWithRuntime`'s own gate: `read_only` and
+        // neither `internal_reader` nor `externally_locked`, both unset
+        // here), which claims and pins a shared-region reader-table slot
+        // (§8.3) at open time -- the same primitive `captureFullReadSnapshot`
+        // right below already engages via its own `coordinated` flag.
+        // `openWithRuntime`'s own fallback (no coordinator, no region, or
+        // the region's slot table exhausted) degrades to exactly today's
+        // inode-only fence, never a reason to fail this open.
+        reader.* = try NativeFile.openWithIo(self.allocator, self.runtime(), self.path, .{ .read_only = true, .pin_read_checkpoint = true, .reader_coordinator = self.reader_coordinator, .resource_manager = self.page_cache.resource_manager });
         errdefer reader.close();
         reader.page_cache_policy = .metadata_only;
         reader.allocator_cancel_token = cancel;
