@@ -155504,8 +155504,11 @@ fn waitForProtectedBackfillWithoutDrain(a: Allocator, db: *DB, name: []const u8,
             defer result.deinit();
             try std.testing.expect(result.hits.len != 0);
             availability_queries += 1;
-            availability_query_ns +|= monotonicTimeNs() -| query_started_ns;
-            next_a_check_ns = monotonicTimeNs() + std.time.ns_per_s;
+            const query_ns = monotonicTimeNs() -| query_started_ns;
+            availability_query_ns +|= query_ns;
+            // Bound observation to 10% of wall time even when exact fallback
+            // searches are slow under the checked Debug allocator.
+            next_a_check_ns = monotonicTimeNs() +| @max(std.time.ns_per_s, query_ns *| 9);
         }
         if (monotonicTimeNs() >= deadline) {
             const diagnostic = try std.json.Stringify.valueAlloc(a, .{ .indexes = stats.indexes, .enrichment = stats.enrichment }, .{});
