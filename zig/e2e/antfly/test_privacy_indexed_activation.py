@@ -18,7 +18,8 @@
 import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Event
+from threading import Event, Lock
+import time
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
@@ -30,7 +31,16 @@ from requests.exceptions import ReadTimeout
 @pytest.fixture
 def privacy_provider(request):
     native = request.param if hasattr(request, "param") else False
+    backfill = native == "backfill"
     calls = {"embed": [], "extract": [], "paths": [], "batches": [], "embed_models": []}
+    records = []
+    records_lock = Lock()
+
+    def snapshot():
+        with records_lock:
+            return [dict(row) for row in records]
+
+    calls["snapshot"] = snapshot
     behavior = {"deny": False, "embed_gate": Event(), "embed_held": Event()}
     behavior["embed_gate"].set()
     behavior["model_gate"] = Event()
@@ -42,16 +52,51 @@ def privacy_provider(request):
         def log_message(self, *_):
             pass
 
-        def reply(self, status, value):
+        def reply(self, status, value, headers=()):
             raw = json.dumps(value).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
+            for name, value in headers:
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(raw)
 
         def do_GET(self):
             route = urlparse(self.path)
+            if (
+                backfill
+                and route.path == "/ai/v1/models"
+                and parse_qs(route.query).get("task") == ["embed"]
+            ):
+                return self.reply(
+                    200,
+                    {
+                        "embedders": {
+                            model: {
+                                "inputs": ["text"],
+                                "model_revision": revision,
+                                "model_revision_pinning": True,
+                                "inference_capabilities": {
+                                    "task": "embed",
+                                    "batch": {
+                                        "mode": "native",
+                                        "preferred_items": 32,
+                                        "max_items": 32,
+                                        "max_encoded_bytes": 0,
+                                        "max_decoded_pixels": 0,
+                                        "max_media_parts_per_item": 0,
+                                        "per_item_failures": False,
+                                    },
+                                },
+                            }
+                            for model, revision in (
+                                ("fixture", "11" * 32),
+                                ("fixture-v2", "22" * 32),
+                            )
+                        }
+                    },
+                )
             if (
                 native
                 and route.path == "/ai/v1/models"
@@ -91,6 +136,16 @@ def privacy_provider(request):
                 inputs = body["input"]
                 if isinstance(inputs, str):
                     inputs = [inputs]
+                row = {
+                    "task": "embed",
+                    "model": body["model"],
+                    "inputs": tuple(inputs),
+                    "started": time.monotonic(),
+                    "completed": None,
+                    "status": None,
+                }
+                with records_lock:
+                    records.append(row)
                 calls["embed"].extend(inputs)
                 calls["embed_models"].append(body["model"])
                 if not behavior["embed_gate"].is_set():
@@ -102,24 +157,41 @@ def privacy_provider(request):
                 ):
                     behavior["model_held"].set()
                     assert behavior["model_gate"].wait(timeout=60)
-                return self.reply(
-                    200,
-                    {
-                        "object": "list",
-                        "data": [
-                            {
-                                "object": "embedding",
-                                "index": i,
-                                "embedding": (
-                                    [0.0, 1.0]
-                                    if body["model"] == "fixture-v2"
-                                    else [1.0, 0.0]
-                                ),
-                            }
-                            for i in range(len(inputs))
-                        ],
-                    },
-                )
+                revision = ("22" if body["model"] == "fixture-v2" else "11") * 32
+                if backfill and body.get("model_revision") != revision:
+                    with records_lock:
+                        row.update(completed=time.monotonic(), status=412)
+                    return self.reply(412, {"error": "model revision mismatch"})
+                try:
+                    self.reply(
+                        200,
+                        {
+                            "object": "list",
+                            "data": [
+                                {
+                                    "object": "embedding",
+                                    "index": i,
+                                    "embedding": (
+                                        [0.0, 1.0]
+                                        if body["model"] == "fixture-v2"
+                                        else [1.0, 0.0]
+                                    ),
+                                }
+                                for i in range(len(inputs))
+                            ],
+                        },
+                        headers=(("X-Antfly-Model-Revision", revision),)
+                        if backfill
+                        else (),
+                    )
+                except OSError:
+                    with records_lock:
+                        row.update(completed=time.monotonic(), status=502)
+                    raise
+                else:
+                    with records_lock:
+                        row.update(completed=time.monotonic(), status=200)
+                return
             calls["batches"].append(len(body["inputs"]))
             data = []
             for item in body["inputs"]:

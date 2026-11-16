@@ -16812,11 +16812,12 @@ const AssetExecutionLane = struct {
         if (runtimeShuttingDown(self.runtime)) return error.EnrichmentRetryAborted;
         var deferred_retry_error: ?anyerror = null;
         if (self.requests.len > 0) {
-            processDeferredAssets(self.runtime, self.requests, &self.window, &self.scope, self.prepared_sources) catch |err| {
+            _ = processDeferredAssets(self.runtime, self.requests, &self.window, &self.scope, self.prepared_sources) catch |err| blk: {
                 if (self.scope.publication_failed) return err;
                 if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                     return err;
                 deferred_retry_error = err;
+                break :blk true;
             };
         }
         try self.scope.publish(self.runtime, &self.window, true);
@@ -17266,9 +17267,13 @@ fn dispatchDeferredGeneratedWork(
 /// Prepare policy roots across the bounded replay page before traversing
 /// their consumers. A per-document dependency must not force serial detector
 /// calls or let a missing upstream settle a downstream vector as skipped.
-fn flushPrimedPrivacyRoots(runtime: *EnrichmentRuntime, roots: []const enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow) !void {
+fn flushPrimedPrivacyRoots(runtime: *EnrichmentRuntime, roots: []const enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow) !bool {
     var scope = FailureScope{};
-    const failure: ?anyerror = if (processDeferredAssets(runtime, roots, window, &scope, null)) |_| null else |err| err;
+    var materialized = false;
+    const failure: ?anyerror = if (processDeferredAssets(runtime, roots, window, &scope, null)) |worked| blk: {
+        materialized = worked;
+        break :blk null;
+    } else |err| err;
     try scope.publish(runtime, window, failure == null);
     if (failure) |err| {
         // A durably parked provider failure must not hold successful roots or
@@ -17276,9 +17281,10 @@ fn flushPrimedPrivacyRoots(runtime: *EnrichmentRuntime, roots: []const enrichmen
         // tickets after priming and skips precisely the delayed dependency.
         if (runtime.retry_scheduler != null and scope.first_scheduled_fingerprint != 0 and
             !scope.publication_failed and !isEnrichmentControlError(err) and
-            enrichmentErrorDisposition(err) == .retryable_request) return;
+            enrichmentErrorDisposition(err) == .retryable_request) return true;
         return scope.scannerFailure(runtime, err);
     }
+    return materialized;
 }
 
 fn primePrivacyRoots(runtime: *EnrichmentRuntime, pending: []const enrichment_worker.PendingDocumentGroup, plans: *std.ArrayListUnmanaged(RequestPlanCacheEntry), guard: ForegroundCatchUpGuard) !bool {
@@ -17286,6 +17292,9 @@ fn primePrivacyRoots(runtime: *EnrichmentRuntime, pending: []const enrichment_wo
     defer roots.deinit(runtime.alloc);
     var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
     defer window.deinit();
+    // New detector work retains the cohort publication barrier. Reusing
+    // accepted roots must not shrink a sibling model's configured batches
+    // to the detector's eight-document priming cohort.
     var primed = false;
     for (pending) |group| {
         try guard.check();
@@ -17296,21 +17305,21 @@ fn primePrivacyRoots(runtime: *EnrichmentRuntime, pending: []const enrichment_wo
             // replay checkpoints. Priming them would repeatedly traverse the
             // entire replay window before that lane can advance its cursor.
             if (!assetHasConsumer(root_template, requests[request_index + 1 ..])) continue;
-            primed = true;
             var request = root_template;
             request.sequence = group.sequence;
             if (runtime.retry_scheduler) |scheduler| if (try scheduler.rootDelayed(runtime, group, requests, request)) continue;
             if (try skipPersistedRequestFailure(runtime, &window, request)) continue;
             try roots.append(runtime.alloc, request);
             if (roots.items.len == 8) {
-                try flushPrimedPrivacyRoots(runtime, roots.items, &window);
+                const materialized = try flushPrimedPrivacyRoots(runtime, roots.items, &window);
+                primed = primed or materialized;
                 roots.clearRetainingCapacity();
             }
         }
     }
     if (roots.items.len == 0) return primed;
-    try flushPrimedPrivacyRoots(runtime, roots.items, &window);
-    return primed;
+    const materialized = try flushPrimedPrivacyRoots(runtime, roots.items, &window);
+    return primed or materialized;
 }
 
 test "privacy independent roots preserve the bounded asset replay lane" {
@@ -17976,6 +17985,8 @@ fn appendNeighborContextTextPartAlloc(alloc: Allocator, parts_json: []const u8, 
 // A single oversized source is dispatched alone; it cannot accumulate with
 // the next source. Retryable failures are remembered while sibling work runs.
 const PreparedAssetBatch = struct {
+    // Cumulative across flushes: accepted/reused outputs never append an item.
+    materialized: bool = false,
     items: std.ArrayListUnmanaged(AssetProducerBatchItem) = .empty,
     retained_bytes: usize = 0,
     retry_error: ?anyerror = null,
@@ -18012,6 +18023,7 @@ const PreparedAssetBatch = struct {
                 addUsizeSaturating(self.retained_bytes, item_bytes) > policy.max_bytes))
             try self.flush(runtime, window, scope);
         try self.items.append(runtime.alloc, item);
+        self.materialized = true;
         self.retained_bytes = addUsizeSaturating(self.retained_bytes, item_bytes);
     }
 
@@ -18095,7 +18107,7 @@ fn processDeferredAssets(
     window: *GeneratedReplayWindow,
     scope: *FailureScope,
     shared_sources: ?*PreparedDocumentSourceCache,
-) !void {
+) !bool {
     var batch = PreparedAssetBatch{};
     defer batch.deinit(runtime.alloc);
     var local_sources: ?PreparedDocumentSourceCache = if (shared_sources == null) PreparedDocumentSourceCache.init(runtime) else null;
@@ -18122,6 +18134,7 @@ fn processDeferredAssets(
         scope.deferRetryFor(err, batch.retry_fingerprint);
         return err;
     }
+    return batch.materialized;
 }
 
 /// Partition the bounded planning quantum using borrowed configuration only.

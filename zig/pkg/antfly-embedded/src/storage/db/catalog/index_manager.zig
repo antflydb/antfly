@@ -328,6 +328,7 @@ pub var test_inject_index_removal_cleanup_error: ?anyerror = null;
 pub var test_inject_generated_artifact_cleanup_error: ?anyerror = null;
 pub var test_generated_artifact_cleanup_failures_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_vector_block_primary_snapshot_builds: usize = 0;
+pub var test_vector_block_native_merge_builds: usize = 0;
 pub var test_before_vector_block_primary_snapshot_build: ?struct {
     ctx: *anyopaque,
     call: *const fn (*anyopaque) anyerror!void,
@@ -4983,6 +4984,7 @@ pub const IndexManager = struct {
             (vector_block_store_mod.BaseBuildOptions{}).shard_count,
             (vector_block_store_mod.BaseBuildOptions{}).spool_buffer_bytes,
         )) orelse return false;
+        if (builtin.is_test) test_vector_block_native_merge_builds += 1;
         defer build.deinit();
 
         // Reuse the staged corpus across bounded optimistic retries. Only the
