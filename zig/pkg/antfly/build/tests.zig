@@ -7099,7 +7099,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, producer_recovery_tests).step);
     const protected_backfill_tests = b.addTest(.{
         .name = "protected-backfill-tests",
-        .root_module = db_test_mod,
+        // These are physical DB regressions, not HTTP integration tests.
+        // Reuse the focused storage root to avoid compiling unrelated API owners.
+        .root_module = batch_contract_mod,
         .filters = selectTestFilters(b, &.{"privacy protected model migration"}),
         .max_rss = 12 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
