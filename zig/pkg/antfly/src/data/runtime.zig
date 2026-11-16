@@ -12759,6 +12759,11 @@ pub const DataServer = struct {
     }
 
     fn raftBatchRequestForActiveProtocol(req: antfly.db.types.BatchRequest, active_protocol_version: u16, realtime_ns: u64) !antfly.db.types.BatchRequest {
+        if (req.transaction) |mutation| if (mutation == .prepare and mutation.prepare.completion_owner != null) {
+            // These inputs were frozen before BEGIN. Proposal admission must
+            // not choose a new timestamp or document-version interpretation.
+            if (req.timestamp_ns == 0 or req.document_version_scheme != .revision_v1) return error.InvalidBatchRequest;
+        };
         // Old v27 decoders reinterpret the neutral cleanup scheme as legacy
         // and reject it. Never prepare such a proposal before its all-member
         // barrier; matching document-revision support is insufficient.
@@ -43896,9 +43901,21 @@ fn consumerTests() type {
             try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, data_raft_batch.encode(std.testing.allocator, "docs", request));
             const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
             const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 7, .topology_epoch = 3 };
-            const prepare: antfly.db.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 3, .completion_owner = owner } } };
+            const prepare: antfly.db.types.BatchRequest = .{ .timestamp_ns = 10, .document_version_scheme = .revision_v1, .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 3, .completion_owner = owner } } };
             try std.testing.expectEqual(version.batch_completion_admission_protocol_version, DataServer.requiredRaftBatchProtocolVersion(prepare));
             try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, data_raft_batch.encode(std.testing.allocator, "docs", prepare));
+            const raw = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(std.testing.allocator, prepare);
+            defer std.testing.allocator.free(raw);
+            const normalized = try DataServer.raftBatchRequestForActiveProtocol(prepare, version.batch_completion_admission_protocol_version, 9999);
+            const normalized_raw = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(std.testing.allocator, normalized);
+            defer std.testing.allocator.free(normalized_raw);
+            try std.testing.expectEqualStrings(raw, normalized_raw);
+            var unfrozen = prepare;
+            unfrozen.timestamp_ns = 0;
+            try std.testing.expectError(error.InvalidBatchRequest, DataServer.raftBatchRequestForActiveProtocol(unfrozen, version.batch_completion_admission_protocol_version, 9999));
+            unfrozen = prepare;
+            unfrozen.document_version_scheme = .admit_current;
+            try std.testing.expectError(error.InvalidBatchRequest, DataServer.raftBatchRequestForActiveProtocol(unfrozen, version.batch_completion_admission_protocol_version, 9999));
         }
 
         test "data raft ordered history protocol preflight distinguishes incompatible and unavailable peers" {

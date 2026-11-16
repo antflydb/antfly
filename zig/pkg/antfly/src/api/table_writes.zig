@@ -40479,7 +40479,7 @@ fn implementationTests() type {
             const batch_wire = @import("antfly_local_sources").api_internal_batch;
             const v2_id: [16]u8 = @splat(9);
             const routed_owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(2), .root_generation = db.core.root_generation, .group_id = 1, .topology_epoch = 1 };
-            const prepare: db_mod.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = v2_id, .topology_epoch = 1, .completion_owner = routed_owner } }, .writes = &.{.{ .key = "v2-row", .value = "{\"v\":1}" }} };
+            const prepare: db_mod.types.BatchRequest = .{ .timestamp_ns = 30, .document_version_scheme = .revision_v1, .transaction = .{ .prepare = .{ .txn_id = v2_id, .topology_epoch = 1, .completion_owner = routed_owner } }, .writes = &.{.{ .key = "v2-row", .value = "{\"v\":1}" }} };
             const prepare_bytes = try batch_wire.completionPrepareInput(a, prepare);
             defer a.free(prepare_bytes);
             const input_digest = completion.preparedInputDigest(namespace, prepare_bytes);
@@ -40501,7 +40501,7 @@ fn implementationTests() type {
             try std.testing.expectError(error.HistoryResynchronizationRequired, db.beginReplicatedCompletionTransaction(replacement_bytes, replacement_owner, 30, 31, true, .{ .term = 1, .index = 3 }));
             try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
             _ = try db.beginReplicatedCompletionTransaction(v2_bytes, routed_owner, 30, 31, true, .{ .term = 1, .index = 3 });
-            var intent_request: db_mod.types.TransactionIntentRequest = .{ .completion_owner = routed_owner, .writes = &.{.{ .key = "v2-row", .value = "{\"v\":1}" }} };
+            var intent_request: db_mod.types.TransactionIntentRequest = .{ .document_version_scheme = .revision_v1, .completion_owner = routed_owner, .writes = &.{.{ .key = "v2-row", .value = "{\"v\":1}" }} };
             try std.testing.expectError(error.SourceTransactionIdentityConflict, db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 4 }));
             intent_request.completion_input_digest = @splat(7);
             try std.testing.expectError(error.SourceTransactionIdentityConflict, db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 4 }));

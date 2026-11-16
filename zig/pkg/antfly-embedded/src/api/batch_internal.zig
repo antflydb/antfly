@@ -1563,6 +1563,7 @@ fn parseBatchRequestWithOptions(
         }
         if (completion_prepare and completion_owner == null) return error.InvalidBatchRequest;
         if (completion_prepare) {
+            if (timestamp_ns == 0 or document_version_scheme != .revision_v1) return error.InvalidBatchRequest;
             try completion_owner.?.validate();
             if (completion_owner.?.topology_epoch != try parseInternalU64(object.get("topology_epoch") orelse return error.InvalidBatchRequest)) return error.InvalidBatchRequest;
         }
@@ -2372,6 +2373,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
             },
             .prepare => |prepare| {
                 if (prepare.completion_owner) |owner| {
+                    if (req.timestamp_ns == 0 or req.document_version_scheme != .revision_v1) return error.InvalidBatchRequest;
                     try owner.validate();
                     if (owner.topology_epoch != prepare.topology_epoch) return error.InvalidBatchRequest;
                 }
@@ -3905,7 +3907,7 @@ test "completion begin wire prepare owner survives guarded replay and refuses le
     const a = std.testing.allocator;
     const completion = @import("../storage/transaction_completion.zig");
     const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 7, .topology_epoch = 3 };
-    var request: db_mod.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 3, .completion_owner = owner } } };
+    var request: db_mod.types.BatchRequest = .{ .timestamp_ns = 10, .document_version_scheme = .revision_v1, .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 3, .completion_owner = owner } } };
     for (0..2) |guarded| {
         request.range_guards = if (guarded == 1) &.{.{ .bucket = 0, .generation = null }} else &.{};
         const encoded = try completionPrepareInput(a, request);
@@ -3923,6 +3925,12 @@ test "completion begin wire prepare owner survives guarded replay and refuses le
         try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, downgraded));
         try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, encoded));
     }
+    request.timestamp_ns = 0;
+    try std.testing.expectError(error.InvalidBatchRequest, completionPrepareInput(a, request));
+    request.timestamp_ns = 10;
+    request.document_version_scheme = .admit_current;
+    try std.testing.expectError(error.InvalidBatchRequest, completionPrepareInput(a, request));
+    request.document_version_scheme = .revision_v1;
     request.transaction.?.prepare.topology_epoch += 1;
     try std.testing.expectError(error.InvalidBatchRequest, completionPrepareInput(a, request));
 }

@@ -2483,6 +2483,26 @@ generation completed. The existing Raft tests do not yet qualify an admitted
 protocol-31 completion transaction. Activation/coordinator integration, positive
 network receipts/certificates and every broader full issue requirement remain.
 
+## In progress: keep frozen PREPARE stable through proposal normalization
+
+Before enabling actual completion proposals, review found that the ordinary
+Raft admission path materializes a missing timestamp and selects revision
+semantics. Doing so after freezing a participant input would change its digest.
+Owner-bearing completion PREPARE now requires a positive original timestamp and
+explicit `revision_v1` semantics in both its encoder/decoder and proposal
+normalizer. These values must be chosen before BEGIN; admission cannot silently
+recompile them later. Ordinary legacy transaction behavior is unchanged.
+
+`completion-begin-wire-test ordered-history-consumer-test
+history-control-apply-test` completed with exit 0 in
+`completion-prepare-stability-test.log`: all six real Raft tests, seven DB tests
+and the explicit wire cases passed. Tests cover missing timestamp or deferred
+revision rejection and byte-identical
+canonical input before/after proposal normalization with a different wall clock,
+as well as native prepare/retry/reopen/commit. Protocol 31 remains reserved and
+BEGIN dispatch disabled until actual activation/native/network qualification.
+All full issue acceptance requirements remain in scope.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
