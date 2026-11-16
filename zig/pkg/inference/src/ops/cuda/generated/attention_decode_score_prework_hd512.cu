@@ -67,9 +67,9 @@ __device__ __forceinline__ unsigned int termite_tq_physical_token(
 ) {
     unsigned long long physical = (unsigned long long)logical_token;
     if (block_table != 0 && block_count != 0u && page_size_tokens != 0u) {
-        unsigned int block_index = logical_token / page_size_tokens;
-        if (block_index >= block_count) return 0xffffffffu;
-        unsigned int token_offset = logical_token - block_index * page_size_tokens;
+    unsigned int block_index = logical_token / page_size_tokens;
+    if (block_index >= block_count) return 0xffffffffu;
+    unsigned int token_offset = logical_token - block_index * page_size_tokens;
         const unsigned long long physical_block = (unsigned long long)block_table[block_index];
         physical = physical_block * (unsigned long long)page_size_tokens +
             (unsigned long long)token_offset;
@@ -77,6 +77,7 @@ __device__ __forceinline__ unsigned int termite_tq_physical_token(
     if (physical > 0xffffffffull ||
         physical >= (unsigned long long)physical_token_capacity) return 0xffffffffu;
     return (unsigned int)physical;
+
 }
 
 __device__ __forceinline__ float termite_tq_f16_value(const unsigned char* row, unsigned int value_index) {

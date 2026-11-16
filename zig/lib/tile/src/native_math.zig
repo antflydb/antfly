@@ -141,6 +141,46 @@ pub fn rms(comptime order: RmsOrder) f.FExpr {
 }
 pub const layer_affine = f.acc.times(.gate).times(.bias).plus(.residual);
 
+/// A GRU cell's three numerical stages. Layout and fused residual publication
+/// belong to the native schedule, not a model-specific numerical owner.
+pub const Gru = struct {
+    pub const gate = activation(.sigmoid, .left_associated).expr;
+    pub const candidate = f.operand("input").plus(f.operand("reset").times(f.operand("hidden"))).tanhOf();
+    pub const blend = f.lit(1).minus(f.operand("update")).times(f.operand("candidate")).plus(f.operand("update").times(f.operand("previous")));
+    pub inline fn cell(gi: [3]f32, gh: [3]f32, previous: f32) f32 {
+        const reset = evaluate(.{ .expr = gate }, ScalarMath, gi[0] + gh[0]);
+        const update = evaluate(.{ .expr = gate }, ScalarMath, gi[1] + gh[1]);
+        const n = candidate.evaluate(ScalarMath, .{ .value = gi[2], .input = gi[2], .reset = reset, .hidden = gh[2] });
+        return blend.evaluate(ScalarMath, .{ .value = previous, .update = update, .candidate = n, .previous = previous });
+    }
+    pub fn native(comptime source: Source, comptime integer: []const u8, comptime index: []const u8, comptime rows: []const u8, comptime dim: []const u8, comptime output: []const u8, comptime residual: []const u8) []const u8 {
+        return @import("source_template.zig").render(
+            \\    {{u}} count = {{rows}} * {{dim}};
+            \\    if ({{index}} >= count) return;
+            \\    {{u}} row = {{index}} / {{dim}}, col = {{index}} - row * {{dim}};
+            \\    {{u}} gate_base = row * {{dim}} * 3u + col;
+            \\    float r = {{reset}};
+            \\    float z = {{update}};
+            \\    float n = {{candidate}};
+            \\    float h0 = label_embeddings[{{index}}];
+            \\    float h1 = {{blend}};
+            \\    {{output}}[{{index}}] = {{residual}} ? h1 + h0 : h1;
+            \\
+        , .{
+            .u = integer,
+            .index = index,
+            .rows = rows,
+            .dim = dim,
+            .output = output,
+            .residual = residual,
+            .reset = gate.renderNative(source, .{ .value = "(gi[gate_base] + gh[gate_base])" }, null),
+            .update = gate.renderNative(source, .{ .value = "(gi[gate_base + " ++ dim ++ "] + gh[gate_base + " ++ dim ++ "])" }, null),
+            .candidate = candidate.renderNative(source, .{ .input = "gi[gate_base + " ++ dim ++ " * 2u]", .reset = "r", .hidden = "gh[gate_base + " ++ dim ++ " * 2u]" }, null),
+            .blend = blend.renderNative(source, .{ .update = "z", .candidate = "n", .previous = "h0" }, null),
+        });
+    }
+};
+
 pub fn cudaExpression(comptime expr: f.FExpr, comptime value: []const u8, comptime bias: []const u8, comptime gate: []const u8, comptime residual: []const u8) f.Emission {
     return .{ .expr = expr, .source = cuda, .inputs = .{ .value = value, .bias = bias, .gate = gate, .residual = residual } };
 }

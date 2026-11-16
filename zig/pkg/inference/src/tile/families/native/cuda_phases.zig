@@ -16,9 +16,46 @@
 //! Exact numerical and ownership phases shared before CUDA compilation.
 
 const program = @import("../../native_program.zig");
+const Dot = @import("antfly_tile").native_projection.Dot;
+const CausalWindow = @import("antfly_tile").native_attention.CausalWindow;
 const row_schedules = @import("../../q4_q8_schedule.zig");
 
 pub const attention = .{
+    .attention_sum_separate = @import("row_statistics.zig").native_stages.attention_sum_separate,
+    .channel_row_maximum = @import("row_statistics.zig").native_stages.channel_row_maximum,
+    .cross_row_maximum = @import("row_statistics.zig").native_stages.cross_row_maximum,
+    .channel_row_sum = @import("row_statistics.zig").native_stages.channel_row_sum,
+    .cross_row_sum = @import("row_statistics.zig").native_stages.cross_row_sum,
+    .relative_maximum = @import("antfly_tile").native_statistics.Tree.native(.{
+        .integer = "unsigned int",
+        .lane = "tid",
+        .threads = "kThreads",
+        .barrier = "__syncthreads();",
+        .operation = .maximum,
+        .maximum = "fmaxf",
+        .broadcast = "max_score",
+        .planes = &.{.{ .partial = "reductions", .value = "local_max" }},
+    }),
+    .relative_denominator = @import("antfly_tile").native_statistics.Tree.native(.{
+        .integer = "unsigned int",
+        .lane = "tid",
+        .threads = "kThreads",
+        .barrier = "__syncthreads();",
+        .planes = &.{.{ .partial = "reductions", .value = "local_sum" }},
+    }),
+    .relative_queries = @import("std").fmt.comptimePrint("{d}", .{@import("antfly_tile").native_attention.RelativeRow64.queries_per_group}),
+    .relative_head_dim = @import("std").fmt.comptimePrint("{d}", .{@import("antfly_tile").native_attention.RelativeRow64.head_dim}),
+    .relative_max_sequence = @import("std").fmt.comptimePrint("{d}", .{@import("antfly_tile").native_attention.RelativeRow64.max_sequence}),
+    .relative_threads = @import("std").fmt.comptimePrint("{d}", .{@import("antfly_tile").native_attention.RelativeRow64.threads}),
+
+    .relative_products = @import("antfly_tile").native_projection.accumulate(&.{
+        .{ .left = "q_value", .right = "k_value" },           .{ .left = "q_value", .right = "k_r[rel_base + j]" },
+        .{ .left = "q_r[rel_base + j]", .right = "k_value" },
+    }, .termwise, "partial"),
+    .relative_products_pair = @import("antfly_tile").native_projection.accumulate(&.{
+        .{ .left = "q0", .right = "k0" }, .{ .left = "q0", .right = "kr0" }, .{ .left = "qr0", .right = "k0" },
+        .{ .left = "q1", .right = "k1" }, .{ .left = "q1", .right = "kr1" }, .{ .left = "qr1", .right = "k1" },
+    }, .termwise, "score"),
     .relative_softmax = relativeSoftmax(false),
     .qk_mma_dot_single = program.render(qk_mma_dot, .{ .indent = "        " }),
     .qk_mma_dot_grouped = program.render(qk_mma_dot, .{ .indent = "            " }),
@@ -47,14 +84,10 @@ pub const attention = .{
     ,
     .paged_key_visibility =
     \\        unsigned int key_pos = kv_position_offset + ki;
-    \\        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
-    \\        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
-    \\        bool future_blocked = key_pos > query_pos && !future_allowed;
-    \\        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
-    \\        bool valid = !(future_blocked || past_blocked);
-    \\        unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
-    \\        if (physical_token == 0xffffffffu) valid = false;
-    \\        const unsigned char* k_row = valid ? k + physical_token * key_row_bytes : k;
+    ++ "        bool valid = " ++ CausalWindow.native("query_pos", "key_pos", "sliding_window") ++ ";\n" ++
+        \\        unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
+        \\        if (physical_token == 0xffffffffu) valid = false;
+        \\        const unsigned char* k_row = valid ? k + physical_token * key_row_bytes : k;
     ,
     .online_softmax_shared_half = "            ANTFLY_CUDA_ATTENTION_ONLINE_ROW64(__expf, probabilities[row * N + lane + j * 32u] = __float2half_rn(p);)",
     .online_softmax_register_f32 = "            ANTFLY_CUDA_ATTENTION_ONLINE_ROW64(__expf, staged_probabilities[g][j] = p;)",
@@ -103,10 +136,8 @@ pub const attention = .{
     \\        if (mask != nullptr && mask[b * enc_seq + ki] == 0ll) continue;
     \\        unsigned int k_base = (b * enc_seq + ki) * hidden + head * head_dim;
     \\        float score = 0.0f;
-    \\        for (unsigned int j = 0; j < head_dim; ++j) {
-    \\            score += q[q_base + j] * k[k_base + j];
-    \\        }
-    \\        score *= scale;
+    ++ (Dot{ .integer = "unsigned int", .index = "j", .end = "head_dim", .left = "q[q_base + j]", .right = "k[k_base + j]", .accumulator = "score", .indent = "        " }).native() ++
+        \\        score *= scale;
     ,
     .self_scores =
     \\        if (causal && ki > qi) continue;
@@ -114,31 +145,28 @@ pub const attention = .{
     \\        float score = 0.0f;
     \\        unsigned int q_base = head_major ? ((b * num_heads + head) * seq_len + qi) * head_dim : (b * seq_len + qi) * hidden + head * head_dim;
     \\        unsigned int k_base = head_major ? ((b * num_heads + head) * seq_len + ki) * head_dim : (b * seq_len + ki) * hidden + head * head_dim;
-    \\        for (unsigned int j = 0; j < head_dim; ++j) score += q[q_base + j] * k[k_base + j];
-    \\        score *= scale;
-    \\        if (bias_mode == 1u) score += bias[(head * seq_len + qi) * seq_len + ki];
-    \\        if (bias_mode == 2u) score += bias[((b * num_heads + head) * seq_len + qi) * seq_len + ki];
+    ++ (Dot{ .integer = "unsigned int", .index = "j", .end = "head_dim", .left = "q[q_base + j]", .right = "k[k_base + j]", .accumulator = "score", .indent = "        " }).native() ++
+        \\        score *= scale;
+        \\        if (bias_mode == 1u) score += bias[(head * seq_len + qi) * seq_len + ki];
+        \\        if (bias_mode == 2u) score += bias[((b * num_heads + head) * seq_len + qi) * seq_len + ki];
     ,
     .masked_cross_scores =
     \\        unsigned int key_pos = kv_position_offset + ki;
-    \\        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
-    \\        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
-    \\        bool future_blocked = key_pos > query_pos && !future_allowed;
-    \\        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
-    \\        bool valid = !(future_blocked || past_blocked);
-    \\        if (!valid) continue;
-    \\
-    \\        unsigned int q_base = (b * q_seq_len + qi) * q_hidden + head * head_dim;
-    \\        unsigned int k_base = (b * kv_seq_len + ki) * kv_hidden + kv_head * head_dim;
-    \\        float score = 0.0f;
-    \\        for (unsigned int j = 0; j < head_dim; ++j) score += q[q_base + j] * k[k_base + j];
-    \\        score *= scale;
-    \\        if (bias_mode == 1u) score += bias[(head * q_seq_len + qi) * kv_seq_len + ki];
-    \\        if (bias_mode == 2u) score += bias[((b * num_heads + head) * q_seq_len + qi) * kv_seq_len + ki];
+    ++ "        bool valid = " ++ CausalWindow.native("query_pos", "key_pos", "sliding_window") ++ ";\n" ++
+        \\        if (!valid) continue;
+        \\
+        \\        unsigned int q_base = (b * q_seq_len + qi) * q_hidden + head * head_dim;
+        \\        unsigned int k_base = (b * kv_seq_len + ki) * kv_hidden + kv_head * head_dim;
+        \\        float score = 0.0f;
+    ++ (Dot{ .integer = "unsigned int", .index = "j", .end = "head_dim", .left = "q[q_base + j]", .right = "k[k_base + j]", .accumulator = "score", .indent = "        " }).native() ++
+        \\        score *= scale;
+        \\        if (bias_mode == 1u) score += bias[(head * q_seq_len + qi) * kv_seq_len + ki];
+        \\        if (bias_mode == 2u) score += bias[((b * num_heads + head) * q_seq_len + qi) * kv_seq_len + ki];
     ,
 };
 
 pub const projection = .{
+    .projection_tile_sum = @import("row_statistics.zig").native_stages.projection_tile_sum,
     .q4q8_linear2_entry = row_schedules.linear2.entry(),
     .q4q8_linear2_abi = row_schedules.linear2.cppAbi(),
     .q4q8_linear2_rows = @import("std").fmt.comptimePrint("{d}", .{row_schedules.linear2.rows}),
@@ -385,9 +413,30 @@ const q4q8_rows =
 
 const tile = @import("antfly_tile");
 pub const elementwise = .{
+    .relative_maximum = attention.relative_maximum,
+    .relative_denominator = attention.relative_denominator,
+    .selected_maximum = @import("antfly_tile").native_statistics.Tree.native(.{
+        .integer = "unsigned int",
+        .lane = "threadIdx.x",
+        .threads = "blockDim.x",
+        .barrier = "__syncthreads();",
+        .operation = .maximum,
+        .maximum = "fmaxf",
+        .broadcast = "row_max",
+        .planes = &.{.{ .partial = "reduction", .value = "local_max" }},
+    }),
+    .selected_denominator = @import("antfly_tile").native_statistics.Tree.native(.{
+        .integer = "unsigned int",
+        .lane = "threadIdx.x",
+        .threads = "blockDim.x",
+        .barrier = "__syncthreads();",
+        .planes = &.{.{ .partial = "reduction", .value = "local_sum" }},
+    }),
     .gelu_derivative_x = tile.native_math.geluDerivative(tile.fexpr.lit(1).minus(tile.fexpr.operand("t").times(tile.fexpr.operand("t")))).renderNative(tile.native_math.cuda, .{ .value = "x", .t = "t", .x2 = "x2" }, null),
 };
 pub const training = .{
+    .training_tensor_sum = @import("row_statistics.zig").native_stages.training_tensor_sum,
+    .relative_probability_vjp_sum = @import("row_statistics.zig").native_stages.relative_probability_vjp_sum,
     .relative_softmax = relativeSoftmax(true),
 };
 
@@ -426,10 +475,10 @@ const qk_mma_dot =
 const relative_softmax =
     \\    float local_max = -3.402823466e+38f;
     \\    for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-    \\        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
+    \\        if (antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
     \\            float score = {{score_function}}(q, k, q_r, k_r, b, qi, ki, head, seq_len, num_heads, head_dim);
     \\            scores[ki] = score;
-    \\{{#training}}            d_probability[ki] = termite_deberta_training_dp(v, d_out, b, qi, ki, head, seq_len, num_heads, head_dim);
+    \\{{#training}}            d_probability[ki] = antfly_attention_probability_vjp_dot_f32(v, d_out, b, qi, ki, head, seq_len, num_heads, head_dim);
     \\{{/training}}
     \\            local_max = fmaxf(local_max, score);
     \\        } else {
@@ -438,22 +487,10 @@ const relative_softmax =
     \\{{/training}}
     \\        }
     \\    }
-    \\    reduction[tid] = local_max;
-    \\    __syncthreads();
-    \\    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-    \\        if (tid < stride) reduction[tid] = fmaxf(reduction[tid], reduction[tid + stride]);
-    \\        __syncthreads();
-    \\    }
-    \\    float row_max = reduction[0];
-    \\    // Every warp must consume reduction[0] before thread 0 can reuse that
-    \\    // shared-memory location for the denominator reduction below. Without
-    \\    // this barrier, long attention rows race after the first reduction and
-    \\    // produce nondeterministic forward activations.
-    \\    __syncthreads();
-    \\
+    \\{{maximum_tree}}
     \\    float local_sum = 0.0f;
     \\    for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-    \\        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
+    \\        if (antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
     \\            float e = expf(scores[ki] - row_max);
     \\            scores[ki] = e;
     \\            local_sum += e;
@@ -461,16 +498,26 @@ const relative_softmax =
     \\            scores[ki] = 0.0f;
     \\        }{{/training}}
     \\    }
-    \\    reduction[tid] = local_sum;
-    \\    __syncthreads();
-    \\    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-    \\        if (tid < stride) reduction[tid] += reduction[tid + stride];
-    \\        __syncthreads();
-    \\    }
+    \\{{sum_tree}}
     \\    float {{denominator}} = reduction[0];
     \\    __syncthreads();
 ;
 
 fn relativeSoftmax(comptime training_mode: bool) []const u8 {
-    return program.render(relative_softmax, .{ .training = training_mode, .score_function = if (training_mode) "termite_deberta_training_score" else "termite_deberta_attention_score_f32", .denominator = if (training_mode) "denominator" else "denom" });
+    return program.render(relative_softmax, .{ .maximum_tree = @import("antfly_tile").native_statistics.Tree.native(.{
+        .integer = "unsigned int",
+        .lane = "tid",
+        .threads = "blockDim.x",
+        .barrier = "__syncthreads();",
+        .maximum = "fmaxf",
+        .operation = .maximum,
+        .broadcast = "row_max",
+        .planes = &.{.{ .partial = "reduction", .value = "local_max" }},
+    }), .sum_tree = @import("antfly_tile").native_statistics.Tree.native(.{
+        .integer = "unsigned int",
+        .lane = "tid",
+        .threads = "blockDim.x",
+        .barrier = "__syncthreads();",
+        .planes = &.{.{ .partial = "reduction", .value = "local_sum" }},
+    }), .training = training_mode, .score_function = "antfly_relative_attention_score_f32", .denominator = if (training_mode) "denominator" else "denom" });
 }

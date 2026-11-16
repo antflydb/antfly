@@ -62,10 +62,9 @@ kernel void termite_nomic_pool_normalize(device const float *hidden [[buffer(0)]
     const uint threads = 256u; const uint token_base = b * p.seq_len;
     if (tid == 0u) { float count = 0.0f; for (uint t = 0u; t < p.seq_len; ++t) count += mask[token_base + t] != 0u ? 1.0f : 0.0f; shmem[0] = count; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float count = shmem[0]; const float inv_count = count > 0.0f ? 1.0f / count : 0.0f; float local_sq = 0.0f;
+{{pool_count}} const float inv_count = count > 0.0f ? 1.0f / count : 0.0f; float local_sq = 0.0f;
     for (uint d = tid; d < p.hidden_size; d += threads) { float unused_count = 0.0f; float sum = antfly_masked_column_sum<false,false,false>(hidden, mask, token_base, token_base + p.seq_len, p.hidden_size, d, 1.0f, unused_count); const float mean = sum * inv_count; output[b * p.hidden_size + d] = mean; local_sq += mean * mean; }
-    shmem[tid] = local_sq; threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) shmem[tid] += shmem[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+{{pool_squares}}
     const float scale = (p.normalize != 0u && shmem[0] > 0.0f) ? rsqrt(shmem[0]) : 1.0f;
     for (uint d = tid; d < p.hidden_size; d += threads) output[b * p.hidden_size + d] *= scale;
 }
@@ -96,12 +95,7 @@ kernel void termite_normalize_embedding(device float *values [[buffer(0)]], cons
         float value = values[d];
         peak = isfinite(value) ? max(peak, abs(value)) : INFINITY;
     }
-    scratch[t] = peak;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = n / 2; stride > 0; stride /= 2) {
-        if (t < stride) scratch[t] = max(scratch[t], scratch[t + stride]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+{{embedding_peak}}
     peak = scratch[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float sum = 0.0f;
@@ -111,12 +105,7 @@ kernel void termite_normalize_embedding(device float *values [[buffer(0)]], cons
             sum += scaled * scaled;
         }
     }
-    scratch[t] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = n / 2; stride > 0; stride /= 2) {
-        if (t < stride) scratch[t] += scratch[t + stride];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+{{embedding_sum}}
     sum = scratch[0];
     // All lanes finish reading the original vector before any in-place write.
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);

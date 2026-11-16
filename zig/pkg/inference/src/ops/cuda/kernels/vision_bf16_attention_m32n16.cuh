@@ -109,8 +109,10 @@
             tile_max = __shfl_sync(group_mask, tile_max, leader);
             const float old_max = running_max[m];
             const float next_max = fmaxf(old_max, tile_max);
-            const float alpha = old_max > kNegInf * 0.5f ? expf(old_max - next_max) : 0.0f;
-            const float beta = score > kNegInf * 0.5f ? expf(score - next_max) : 0.0f;
+            // tile-codegen:begin attention.vision_online.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+const float alpha = old_max > kNegInf * 0.5f ? expf(old_max - next_max) : 0.0f;
+const float beta = score > kNegInf * 0.5f ? expf(score - next_max) : 0.0f;
+// tile-codegen:end attention.vision_online.0 family
             float tile_sum = beta;
             #pragma unroll
             for (unsigned int offset = 8u; offset > 0u; offset >>= 1u) {
@@ -120,7 +122,9 @@
             probabilities[m * kKeyTile + key_lane] = __float2bfloat16_rn(beta);
             if (key_lane == 0u) {
                 running_max[m] = next_max;
-                running_sum[m] = running_sum[m] * alpha + tile_sum;
+                // tile-codegen:begin attention.vision_online.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+running_sum[m] = running_sum[m] * alpha + tile_sum;
+// tile-codegen:end attention.vision_online.1 family
                 row_alpha[m] = alpha;
             }
         }

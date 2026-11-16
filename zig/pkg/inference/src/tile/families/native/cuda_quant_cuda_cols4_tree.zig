@@ -59,21 +59,7 @@ pub const source_1 =
         \\        #pragma unroll
         \\        for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] = acc[c];
         \\    }
-        \\    __syncthreads();
-        \\    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
-        \\        if (tid < stride) {
-        \\            #pragma unroll
-        \\            for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] += partial[c][tid + stride];
-        \\        }
-        \\        __syncthreads();
-        \\    }
-        \\    if (tid == 0u) {
-        \\        #pragma unroll
-        \\        for (unsigned int c = 0; c < 4u; ++c) {
-        \\            unsigned int col = col_tile + c;
-        \\            if (col < out_dim) dst[row * out_dim + col] = partial[c][0];
-        \\        }
-        \\    }
+        \\#include "../kernels/quant_tile4_publish.cuh"
         \\}
         \\
         \\extern "C" __global__ void termite_linear_q8_0_argmax_stage1_tile4(ANTFLY_CUDA_QUANT_ARGMAX_PARAMS) {

@@ -195,6 +195,10 @@ pub const FExpr = union(enum) {
     /// GPU schedules supply their qualified activation and rounding helpers.
     /// The expression tree never chooses a GEMM or transcendental schedule.
     pub const Source = struct {
+        add: ?[]const u8 = null,
+        sub: ?[]const u8 = null,
+        mul: ?[]const u8 = null,
+        div: ?[]const u8 = null,
         fma: []const u8 = "fma",
         exp: []const u8 = "exp",
         tanh: []const u8 = "tanh",
@@ -240,6 +244,8 @@ pub const FExpr = union(enum) {
             .residual => inputs.residual,
             .lit => |v| if (source.native_syntax) nativeLiteral(v) else std.fmt.comptimePrint("{e}f", .{v}),
             .add, .sub, .mul, .div => |x| blk: {
+                const function = if (e == .add) source.add else if (e == .sub) source.sub else if (e == .mul) source.mul else source.div;
+                if (function) |name| break :blk name ++ "(" ++ x[0].renderAt(source, inputs, null, false, sub) ++ ", " ++ x[1].renderAt(source, inputs, null, false, sub) ++ ")";
                 const body = x[0].renderAt(source, inputs, e, false, sub) ++ (if (source.compact) (if (e == .add) "+" else if (e == .sub) "-" else if (e == .mul) "*" else "/") else (if (e == .add) " + " else if (e == .sub) " - " else if (e == .mul) " * " else " / ")) ++ x[1].renderAt(source, inputs, e, true, sub);
                 break :blk if (source.native_syntax) body else "(" ++ body ++ ")";
             },

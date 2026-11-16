@@ -293,7 +293,7 @@ extern "C" __global__ void termite_embedding_gemma2_training_rms_norm_input_vjp_
     if constexpr (!Backward) { if (!valid) return; } \
     float angle; \
     if constexpr (Training) \
-        angle = __fmul_rn((float)pos / rope_scale, eg2_training_rope_inverse_frequency(theta, dim, pair)); \
+        angle = __fmul_rn((float)pos / rope_scale, antfly_source_rotary_inverse_frequency_f32(theta, dim, pair)); \
     else angle = ((float)pos / rope_scale) * powf(theta, -(2.0f * pair) / (float)dim); \
     ANTFLY_ROPE_COEFFICIENTS_##Training \
     size_t qi = (((size_t)b * seq + pos) * q_heads + head) * dim + pair; \
@@ -867,6 +867,22 @@ extern "C" __global__ void termite_embedding_gemma2_attention_softmax_bf16(
         probs, scores, mask, sequence, query_base, rows, batch_index, tile_capacity, sequence);
 }
 
+// tile-codegen:begin statistics.score_bf16_warp256 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void antfly_score_softmax_rows_keys_legacy_bf16_warp256(
+    __nv_bfloat16* probs, const float* scores, const long long* mask,
+    unsigned sequence, unsigned query_base, unsigned rows,
+    unsigned batch_index, unsigned tile_capacity) {
+    antfly_score_softmax_bf16<AntflyScoreMask::rows_and_keys, AntflyProbabilityPublication::legacy_beta_bf16, true>(
+        probs, scores, mask, sequence, query_base, rows, batch_index, tile_capacity, sequence);
+}
+extern "C" __global__ void antfly_score_softmax_prefix_bf16_warp256(
+    __nv_bfloat16* probs, const float* scores, unsigned sequence,
+    unsigned valid_keys, unsigned rows, unsigned tile_capacity) {
+    antfly_score_softmax_bf16<AntflyScoreMask::prefix_keys, AntflyProbabilityPublication::normalized_bf16, true>(
+        probs, scores, nullptr, sequence, 0u, rows, 0u, tile_capacity, valid_keys);
+}
+// tile-codegen:end statistics.score_bf16_warp256 family
+
 extern "C" __global__ void termite_embedding_gemma2_matmul_bf16(
     __nv_bfloat16* out, const __nv_bfloat16* input, const __nv_bfloat16* weight,
     unsigned int rows, unsigned int in_dim, unsigned int out_dim) {
@@ -1261,7 +1277,7 @@ extern "C" __global__ void termite_embedding_gemma2_unpack_bhsd_f32_bf16(
 
 // Retain the mean and normalization division boundaries used by the training
 // graph. Frozen inference continues to use its separately qualified kernel.
-__device__ __forceinline__ float eg2_training_masked_mean(
+__device__ __forceinline__ float antfly_masked_mean_four_accumulators_bf16(
     const __nv_bfloat16* projected, const long long* mask, unsigned int b,
     unsigned int sequence, unsigned int width, unsigned int d,
     unsigned int count) {
@@ -1289,7 +1305,7 @@ __device__ __forceinline__ float eg2_training_masked_mean(
     return __fdiv_rn(sum, (float)(count ? count : 1));
 }
 
-__device__ __forceinline__ float eg2_training_mean_norm(
+__device__ __forceinline__ float antfly_masked_mean_norm_four_lane_bf16(
     const __nv_bfloat16* projected, const long long* mask, unsigned int b,
     unsigned int sequence, unsigned int width, unsigned int count, unsigned int batch) {
     const unsigned int lanes = antfly_four_lane_reduction_width(width, batch);
@@ -1300,7 +1316,7 @@ __device__ __forceinline__ float eg2_training_mean_norm(
             for (unsigned int i = 0; i < 4; ++i) {
                 unsigned int d = vector * 4 + i;
                 if (d < width) {
-                    float mean = eg2_training_masked_mean(projected, mask, b, sequence, width, d, count);
+                    float mean = antfly_masked_mean_four_accumulators_bf16(projected, mask, b, sequence, width, d, count);
                     values[i] = __fmaf_rn(mean, mean, values[i]);
                 }
             }
@@ -1317,9 +1333,9 @@ extern "C" __global__ void termite_embedding_gemma2_training_mean_l2_f32(
     unsigned int count = 0;
     for (unsigned int s = 0; s < seq; ++s)
         if (!mask || mask[(size_t)b * seq + s]) ++count;
-    float norm = fmaxf(eg2_training_mean_norm(projected, mask, b, seq, width, count, batch), 1.0e-12f);
+    float norm = fmaxf(antfly_masked_mean_norm_four_lane_bf16(projected, mask, b, seq, width, count, batch), 1.0e-12f);
     for (unsigned int d = threadIdx.x; d < width; d += blockDim.x) {
-        float mean = eg2_training_masked_mean(projected, mask, b, seq, width, d, count);
+        float mean = antfly_masked_mean_four_accumulators_bf16(projected, mask, b, seq, width, d, count);
         out[(size_t)b * width + d] = __fdiv_rn(mean, norm);
     }
 }
@@ -1332,7 +1348,7 @@ extern "C" __global__ void termite_embedding_gemma2_mean_l2_vjp_f32(
     unsigned int count = 0;
     for (unsigned int s = 0; s < seq; ++s)
         if (!mask || mask[(size_t)b * seq + s]) ++count;
-    float raw_norm = eg2_training_mean_norm(projected, mask, b, seq, width, count, batch);
+    float raw_norm = antfly_masked_mean_norm_four_lane_bf16(projected, mask, b, seq, width, count, batch);
     float norm = fmaxf(raw_norm, 1.0e-12f);
     const unsigned int lanes = antfly_four_lane_reduction_width(width, batch);
     float values[4] = {0, 0, 0, 0};
@@ -1342,7 +1358,7 @@ extern "C" __global__ void termite_embedding_gemma2_mean_l2_vjp_f32(
             for (unsigned int i = 0; i < 4; ++i) {
                 unsigned int d = vector * 4 + i;
                 if (d < width) {
-                    float mean = eg2_training_masked_mean(projected, mask, b, seq, width, d, count);
+                    float mean = antfly_masked_mean_four_accumulators_bf16(projected, mask, b, seq, width, d, count);
                     float ratio = __fdiv_rn(__fdiv_rn(mean, norm), norm);
                     float product = __fmul_rn(dembedding[(size_t)b * width + d], ratio);
                     values[i] = __fadd_rn(values[i], __fsub_rn(0.0f, product));
@@ -1353,7 +1369,7 @@ extern "C" __global__ void termite_embedding_gemma2_mean_l2_vjp_f32(
     float norm_gradient = antfly_four_lane_reduce(values, lanes);
     if (raw_norm < 1.0e-12f) norm_gradient = 0.0f;
     for (unsigned int d = threadIdx.x; d < width; d += blockDim.x) {
-        float mean = eg2_training_masked_mean(projected, mask, b, seq, width, d, count);
+        float mean = antfly_masked_mean_four_accumulators_bf16(projected, mask, b, seq, width, d, count);
         float direct = __fdiv_rn(dembedding[(size_t)b * width + d], norm);
         float ratio = raw_norm > 0.0f ? __fdiv_rn(mean, raw_norm) : 0.0f;
         float gradient = __fadd_rn(direct, __fmul_rn(norm_gradient, ratio));
@@ -1462,76 +1478,82 @@ extern "C" __global__ void termite_causal_depthwise_f32(
     out[i]=antfly_causal_depthwise<false,false,false,true>(input,weight,input,size_t(time),channel,dim,kernel_size,0u);
 }
 
-extern "C" __global__ void antfly_audio_frontend_f32(const float *input, const float *aux, float *out, unsigned mode, unsigned rows, unsigned width, unsigned hop, float floor, unsigned batch) {
-    unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
-    unsigned long long total=(unsigned long long)rows*width*(mode==4 ? hop : 1)*batch;
-    if ((unsigned long long)i >= total) return;
-    if (mode == 0) out[i]=__fmul_rn(input[(i/width)*hop+i%width],aux[i%width]);
-    else if (mode == 1) { float re=input[2*i], im=input[2*i+1]; out[i]=sqrtf(__fadd_rn(__fmul_rn(re,re),__fmul_rn(im,im))); }
-    else if (mode == 2) out[i]=__fmul_rn(logf(__fadd_rn(input[i],floor)),aux[i/width]);
-    else if (mode == 3) {
-        if (i>=(unsigned long long)rows*batch) return;
-        unsigned b=i/rows, pos=i%rows;
-        input += (size_t)b*rows*width; out += (size_t)b*rows*width;
-        i=pos;
-        float mean=0.f;
-        for (unsigned c=0;c<width;c++) mean=__fadd_rn(mean,input[c*rows+i]);
-        mean=__fdiv_rn(mean,(float)width);
-        float var=0.f;
-        for (unsigned c=0;c<width;c++) { float d=__fsub_rn(input[c*rows+i],mean); var=__fadd_rn(var,__fmul_rn(d,d)); }
-        var=__fdiv_rn(var,(float)width);
-        float scale=__fdiv_rn(1.f,sqrtf(__fadd_rn(var,floor)));
-        for (unsigned c=0;c<width;c++) out[c*rows+i]=fmaxf(0.f,__fmul_rn(__fmul_rn(__fsub_rn(input[c*rows+i],mean),scale),aux[c]));
-    } else {
-        unsigned per=rows*width*hop, b=i/per, j=i%per;
-        out[i]=input[(size_t)b*per+((j%hop)*rows+j/(width*hop))*width+(j/hop)%width];
-    }
+// tile-codegen:begin audio.frontend family (do not edit; run: zig build tile-kernel-codegen -- --write)
+__device__ __forceinline__ void antfly_channel_norm_relu_f32(const float *input,const float *weight,float *output,size_t base,unsigned stride,unsigned width,float eps) {
+float mean=0.0f;
+for(unsigned c=0;c<width;c++) mean=__fadd_rn(mean, input[base+c*stride]);
+mean=__fdiv_rn(mean, (float)width);
+float variance=0.0f;
+for(unsigned c=0;c<width;c++) { float d=__fsub_rn(input[base+c*stride], mean);variance=__fadd_rn(variance, __fmul_rn(d, d)); }
+variance=__fdiv_rn(variance, (float)width);
+float scale=__fdiv_rn(1.0f, sqrtf(__fadd_rn(variance, eps)));
+for(unsigned c=0;c<width;c++) { size_t i=base+c*stride;output[i]=fmaxf(0.0f,__fmul_rn(__fmul_rn(__fsub_rn(input[i], mean), scale), weight[c])); }
 }
+extern "C" __global__ void antfly_audio_frontend_f32(const float *input, const float *aux, float *out, unsigned mode, unsigned rows, unsigned width, unsigned hop, float floor, unsigned batch) {
+unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+size_t total=(size_t)rows*width*(mode==4 ? hop : 1)*batch;
+if((size_t)i>=total) return;
+if(mode==0) out[i]=__fmul_rn(input[(i/width)*hop+i%width], aux[i%width]);
+else if(mode==1) { float re=input[2*i],im=input[2*i+1];out[i]=sqrtf(__fadd_rn(__fmul_rn(re, re), __fmul_rn(im, im))); }
+else if(mode==2) out[i]=__fmul_rn(logf(__fadd_rn(input[i], floor)), aux[i/width]);
+else if(mode==3) {
+    if((size_t)i>=(size_t)rows*batch) return;
+    unsigned b=i/rows,pos=i%rows;
+    size_t base=(size_t)b*rows*width;
+    antfly_channel_norm_relu_f32(input,aux,out,base+pos,rows,width,floor);
+} else {
+    unsigned per=rows*width*hop,b=i/per,j=i%per;
+    out[i]=input[(size_t)b*per+((j%hop)*rows+j/(width*hop))*width+(j/hop)%width];
+}
+}
+// tile-codegen:end audio.frontend family
 
 // One 512-point transform per CTA, fixed shared scratch and immutable twiddles.
+// tile-codegen:begin audio.fixed512.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void antfly_audio_fft512_f32(const float *input, const float *tw, float *out) {
     __shared__ float2 values[512];
     unsigned t=threadIdx.x, frame=blockIdx.x;
     for (unsigned i=t;i<512;i+=256) values[__brev(i)>>23]=make_float2(i<320 ? input[(size_t)frame*320+i] : 0.f,0.f);
     __syncthreads();
-    for (unsigned len=2;len<=512;len*=2) {
-        unsigned half=len/2, j=t%half, a=(t/half)*len+j, b=a+half, w=j*(512/len);
-        float2 x=values[a], y=values[b];
-        float re=__fsub_rn(__fmul_rn(y.x,tw[2*w]),__fmul_rn(y.y,tw[2*w+1]));
-        float im=__fadd_rn(__fmul_rn(y.x,tw[2*w+1]),__fmul_rn(y.y,tw[2*w]));
-        values[a]=make_float2(__fadd_rn(x.x,re),__fadd_rn(x.y,im));
-        values[b]=make_float2(__fsub_rn(x.x,re),__fsub_rn(x.y,im));
-        __syncthreads();
-    }
-    for (unsigned i=t;i<257;i+=256) { float2 x=values[i]; out[(size_t)frame*257+i]=sqrtf(__fadd_rn(__fmul_rn(x.x,x.x),__fmul_rn(x.y,x.y))); }
+for(unsigned len=2;len<=512;len*=2) { unsigned half=len/2,j=t%half,a=(t/half)*len+j,b=a+half,w=j*(512/len);float2 x=values[a],y=values[b];float re=__fsub_rn(__fmul_rn(y.x, tw[2*w]), __fmul_rn(y.y, tw[2*w+1]));float im=__fadd_rn(__fmul_rn(y.x, tw[2*w+1]), __fmul_rn(y.y, tw[2*w]));values[a]=make_float2(__fadd_rn(x.x, re),__fadd_rn(x.y, im));values[b]=make_float2(__fsub_rn(x.x, re),__fsub_rn(x.y, im));__syncthreads(); }
+    for (unsigned i=t;i<257;i+=256) { float2 x=values[i]; out[(size_t)frame*257+i]=sqrtf(__fadd_rn(__fmul_rn(x.x, x.x), __fmul_rn(x.y, x.y))); }
 }
+// tile-codegen:end audio.fixed512.0 family
+
 
 // Implicit im2col: each tile shares 16 output channels and 16 positions.
 // No expanded image matrix is allocated; reduction order remains IC/KY/KX.
-extern "C" __global__ void antfly_audio_conv_tiled_f32(float *out,const float *input,const float *weight,const float *bias,unsigned ic,unsigned oc,unsigned h,unsigned w,unsigned oh,unsigned ow) {
-    __shared__ float a[16][16], b[16][16];
-    unsigned x=threadIdx.x,y=threadIdx.y, channel=blockIdx.y*16+y,pos=blockIdx.x*16+x, batch=blockIdx.z;
-    float acc=channel<oc ? bias[channel] : 0.f;
-    for(unsigned base=0;base<ic*9;base+=16) {
-        unsigned ak=base+x, bk=base+y;
-        a[y][x]=(channel<oc && ak<ic*9) ? weight[(size_t)channel*ic*9+ak] : 0.f;
-        int iy=(int)((pos/ow)*2+bk/3%3)-1, ix=(int)((pos%ow)*2+bk%3)-1;
-        b[y][x]=(pos<oh*ow && bk<ic*9 && iy>=0 && iy<(int)h && ix>=0 && ix<(int)w) ? input[((size_t)batch*ic+bk/9)*h*w+(unsigned)iy*w+(unsigned)ix] : 0.f;
-        __syncthreads();
-        #pragma unroll
-        for(unsigned k=0;k<16;k++) acc=fmaf(a[y][k],b[k][x],acc);
-        __syncthreads();
-    }
-    if(channel<oc && pos<oh*ow) out[((size_t)batch*oc+channel)*oh*ow+pos]=acc;
-}
+// tile-codegen:begin convolution.stencil3_tiled family (do not edit; run: zig build tile-kernel-codegen -- --write)
+extern "C" __global__ void antfly_audio_conv_tiled_f32(float *out,const float *input,const float *weight,const float *bias,unsigned in_channels,unsigned out_channels,unsigned height,unsigned width,unsigned out_h,unsigned out_w) {
+__shared__ float a[16][16],b[16][16];
+unsigned x=threadIdx.x,y=threadIdx.y,channel=blockIdx.y*16+y,pos=blockIdx.x*16+x,batch=blockIdx.z;
+float acc=channel<out_channels ? bias[channel] : 0.f;
+for(unsigned base=0;base<in_channels*9;base+=16) {
+    unsigned ak=base+x,bk=base+y;
+    a[y][x]=(channel<out_channels && ak<in_channels*9) ? weight[(size_t)channel*in_channels*9+ak] : 0.f;
+    int iy=(int)((pos/out_w)*2+bk/3%3)-1,ix=(int)((pos%out_w)*2+bk%3)-1;
 
+    b[y][x]=(pos<out_h*out_w && bk<in_channels*9 && iy>=0 && iy<(int)height && ix>=0 && ix<(int)width) ? input[((size_t)batch*in_channels+bk/9)*height*width+(unsigned)iy*width+(unsigned)ix] : 0.f;
+    __syncthreads();
+    #pragma unroll
+    for(unsigned k=0;k<16;k++) acc=fmaf(a[y][k], b[k][x], acc);
+    __syncthreads();
+}
+if(channel<out_channels && pos<out_h*out_w) out[(((size_t)batch*out_channels+channel)*out_h*out_w)+pos]=acc;
+}
+// tile-codegen:end convolution.stencil3_tiled family
+
+
+// tile-codegen:begin audio.fixed512.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void antfly_audio_logmel_f32(const float *input,const float *plan,const float *mask,float *out,unsigned hop,float floor) {
 unsigned tid=threadIdx.x,frame=blockIdx.x;__shared__ float2 values[512];__shared__ float mag[257];
 for(unsigned i=tid;i<512;i+=256) { unsigned r=__brev(i)>>23; values[r]=make_float2(i<320 ? input[(size_t)frame*hop+i]*plan[512+i] : 0.f,0.f); }
 __syncthreads();
-for(unsigned len=2;len<=512;len*=2) { unsigned span=len/2,j=tid%span,a=(tid/span)*len+j,b=a+span,w=j*(512/len);float2 x=values[a],y=values[b];float2 v=make_float2(__fsub_rn(__fmul_rn(y.x,plan[2*w]),__fmul_rn(y.y,plan[2*w+1])),__fadd_rn(__fmul_rn(y.x,plan[2*w+1]),__fmul_rn(y.y,plan[2*w])));values[a]=make_float2(__fadd_rn(x.x,v.x),__fadd_rn(x.y,v.y));values[b]=make_float2(__fsub_rn(x.x,v.x),__fsub_rn(x.y,v.y));__syncthreads(); }
+for(unsigned len=2;len<=512;len*=2) { unsigned span=len/2,j=tid%span,a=(tid/span)*len+j,b=a+span,w=j*(512/len);float2 x=values[a],y=values[b];float2 v=make_float2(__fsub_rn(__fmul_rn(y.x, plan[2*w]), __fmul_rn(y.y, plan[2*w+1])),__fadd_rn(__fmul_rn(y.x, plan[2*w+1]), __fmul_rn(y.y, plan[2*w])));values[a]=make_float2(__fadd_rn(x.x, v.x),__fadd_rn(x.y, v.y));values[b]=make_float2(__fsub_rn(x.x, v.x),__fsub_rn(x.y, v.y));__syncthreads(); }
 bool bad=false;
-for(unsigned i=tid;i<257;i+=256) { float2 x=values[i];mag[i]=sqrtf(__fadd_rn(__fmul_rn(x.x,x.x),__fmul_rn(x.y,x.y)));bad|=!isfinite(mag[i]); }
+for(unsigned i=tid;i<257;i+=256) { float2 x=values[i];mag[i]=sqrtf(__fadd_rn(__fmul_rn(x.x, x.x), __fmul_rn(x.y, x.y)));bad|=!isfinite(mag[i]); }
 int nonfinite=__syncthreads_or(bad);
-if(tid<128) { unsigned first=(unsigned)plan[832+tid*3],end=(unsigned)plan[833+tid*3],off=(unsigned)plan[834+tid*3];float sum=0.f;for(unsigned k=nonfinite ? 0 : first;k<(nonfinite ? 257 : end);k++) { float weight=k>=first && k<end ? plan[off+k-first] : 0.f; sum=__fadd_rn(sum,__fmul_rn(mag[k],weight)); }out[(size_t)frame*128+tid]=logf(sum+floor)*mask[frame]; }
+if(tid<128) { unsigned first=(unsigned)plan[832+tid*3],end=(unsigned)plan[833+tid*3],off=(unsigned)plan[834+tid*3];float sum=0.f;for(unsigned k=nonfinite ? 0 : first;k<(nonfinite ? 257 : end);k++) { float weight=k>=first && k<end ? plan[off+k-first] : 0.f; sum=__fadd_rn(sum, __fmul_rn(mag[k], weight)); }out[(size_t)frame*128+tid]=logf(sum+floor)*mask[frame]; }
+
 }
+// tile-codegen:end audio.fixed512.1 family

@@ -60,10 +60,7 @@ extern "C" __global__ void termite_training_sum_squares_f32(
     }
     partial[threadIdx.x] = value;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
+    {{training_tensor_sum}}
     if (threadIdx.x == 0u) output[0] += partial[0];
 }
 // native-program:entry termite_masked_bce_accumulate_f32
@@ -163,18 +160,15 @@ extern "C" __global__ void termite_deberta_attention_backward_scores_f32(ANTFLY_
 
     float local_weighted_dp = 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) local_weighted_dp += scores[ki] * d_probability[ki];
+        if (antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) local_weighted_dp += scores[ki] * d_probability[ki];
     }
     reduction[tid] = local_weighted_dp;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reduction[tid] += reduction[tid + stride];
-        __syncthreads();
-    }
+    {{relative_probability_vjp_sum}}
     float dot_p_dp = denominator > 0.0f ? reduction[0] / denominator : 0.0f;
     unsigned int pair_base = row * seq_len;
     for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-        float probability = (denominator > 0.0f && termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) ? scores[ki] / denominator : 0.0f;
+        float probability = (denominator > 0.0f && antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) ? scores[ki] / denominator : 0.0f;
         probabilities[pair_base + ki] = probability;
         d_scores[pair_base + ki] = probability * (d_probability[ki] - dot_p_dp);
     }
@@ -205,7 +199,7 @@ extern "C" __global__ void termite_deberta_attention_backward_f32(ANTFLY_CUDA_DE
         if (segment == 0u) {
             unsigned int pair_base = ((b * num_heads + head) * seq_len + pos) * seq_len;
             for (unsigned int ki = 0; ki < seq_len; ++ki) {
-                if (!termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, pos, ki, seq_len, num_heads)) continue;
+                if (!antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, pos, ki, seq_len, num_heads)) continue;
                 float ds = d_scores[pair_base + ki];
                 unsigned int k_base = (b * seq_len + ki) * hidden + head_off;
                 unsigned int rel_base = (pos + seq_len - 1u - ki) * hidden + head_off;
@@ -214,7 +208,7 @@ extern "C" __global__ void termite_deberta_attention_backward_f32(ANTFLY_CUDA_DE
         } else {
             unsigned int ki = pos;
             for (unsigned int qi = 0; qi < seq_len; ++qi) {
-                if (!termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) continue;
+                if (!antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) continue;
                 unsigned int pair_idx = ((b * num_heads + head) * seq_len + qi) * seq_len + ki;
                 float p = probabilities[pair_idx];
                 float ds = d_scores[pair_idx];
@@ -243,7 +237,7 @@ extern "C" __global__ void termite_deberta_attention_backward_f32(ANTFLY_CUDA_DE
                 int ki_signed = (int)qi + (int)seq_len - 1 - (int)rel;
                 if (ki_signed < 0 || ki_signed >= (int)seq_len) continue;
                 unsigned int ki = (unsigned int)ki_signed;
-                if (!termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) continue;
+                if (!antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) continue;
                 unsigned int pair_idx = ((b * num_heads + head) * seq_len + qi) * seq_len + ki;
                 float ds = d_scores[pair_idx];
                 unsigned int q_base = (b * seq_len + qi) * hidden + head_off;

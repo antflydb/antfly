@@ -16,7 +16,18 @@
 //! A generated region inside a hand-maintained source file: the text
 //! between the begin and end marker lines is owned by the tile generator.
 
-pub const Region = struct { path: []const u8, begin: []const u8, end: []const u8, data: []const u8 };
+pub const ProgramUse = struct {
+    operation: []const u8,
+    source: []const u8,
+    scope: enum { phase, body },
+    precision: []const u8,
+    schedule: []const u8,
+    source_index: ?usize = null,
+    export_name: ?[]const u8 = null,
+    threads: ?[3]u32 = null,
+    static_scratch_bytes: ?usize = null,
+};
+pub const Region = struct { path: []const u8, begin: []const u8, end: []const u8, data: []const u8, programs: []const ProgramUse = &.{} };
 
 pub const metal_kernels_m = "src/backends/metal_kernels.m";
 pub const cuda_bundle = "src/ops/cuda/artifacts/inference_cuda_kernels.cu";
@@ -89,7 +100,21 @@ pub const Family = struct {
     indent: []const u8,
     name: []const u8,
     source: type,
+    programs: []const ProgramUse = &.{},
 };
+
+/// Provenance belongs to the existing family registry, not a parallel catalog.
+/// Select individual source indices when a family contains native ABI shells.
+pub fn shared(comptime family: Family, comptime programs: []const ProgramUse) Family {
+    @setEvalBranchQuota(100_000);
+    var result = family;
+    for (programs) |use| {
+        if (!operationFamilyName(use.operation)) @compileError("shared program operation must not name a model");
+        if (use.source_index) |index| if (index >= sourceCount(family.source)) @compileError("shared program source index outside family");
+    }
+    result.programs = family.programs ++ programs;
+    return result;
+}
 
 pub fn nativeFamily(comptime path: []const u8, comptime indent: []const u8, comptime name: []const u8, comptime source: type) Family {
     return .{ .path = path, .indent = indent, .name = name, .source = source };
@@ -136,9 +161,9 @@ fn regionCount(comptime families: []const Family) usize {
 pub fn operationFamilyName(name: []const u8) bool {
     var tokens = std.mem.tokenizeAny(u8, name, "._-/");
     while (tokens.next()) |token| {
-        inline for (.{ "bert", "modernbert", "roberta", "gemma", "qwen", "lighton", "florence", "whisper", "gliner", "clip", "e2b", "e4b", "a4b" }) |model| {
-            if (std.mem.eql(u8, token, model)) return false;
-            if (std.mem.startsWith(u8, token, model) and token.len > model.len and std.ascii.isDigit(token[model.len])) return false;
+        inline for (.{ "bert", "modernbert", "roberta", "gemma", "embeddinggemma", "qwen", "lighton", "lightonocr", "florence", "whisper", "gliner", "clip", "laya", "deberta", "nomic", "siglip", "e2b", "e4b", "a4b" }) |model| {
+            if (std.ascii.eqlIgnoreCase(token, model)) return false;
+            if (token.len > model.len and std.ascii.isDigit(token[model.len]) and std.ascii.eqlIgnoreCase(token[0..model.len], model)) return false;
         }
     }
     return true;
@@ -157,6 +182,16 @@ pub fn regions(comptime families: []const Family) [regionCount(families)]Region 
                 const key = if (count == 1) item.name else std.fmt.comptimePrint("{s}.{d}", .{ item.name, i });
                 const data = if (@hasDecl(item.source, "sources")) item.source.sources[i] else @field(item.source, std.fmt.comptimePrint("source_{d}", .{i}));
                 result[cursor] = region(item.path, item.indent, key, data);
+                var uses: []const ProgramUse = &.{};
+                for (item.programs) |use| {
+                    if (use.source_index == null or use.source_index.? == i) {
+                        if (use.export_name) |name| {
+                            if (std.mem.indexOf(u8, data, name ++ "(") == null and std.mem.indexOf(u8, data, "(" ++ name ++ ")") == null) @compileError("shared program provenance does not match its export: " ++ name);
+                        }
+                        uses = uses ++ [_]ProgramUse{use};
+                    }
+                }
+                result[cursor].programs = uses;
                 cursor += 1;
             }
         }
@@ -191,5 +226,16 @@ test "native family descriptors retain numbered keys and custom source paths" {
 
 test "numerical family names reject model owners and retain operation vocabulary" {
     for ([_][]const u8{ "attention.f16_hd64_prefill", "projection.q4q8.rows", "elementwise.clipping", "vision.flash" }) |name| try std.testing.expect(operationFamilyName(name));
-    for ([_][]const u8{ "attention.bert_prefill", "gemma4.projection", "cuda_qwen3vl_rope", "e4b_ffn" }) |name| try std.testing.expect(!operationFamilyName(name));
+    for ([_][]const u8{ "attention.bert_prefill", "gemma4.projection", "cuda_qwen3vl_rope", "e4b_ffn", "attention.block_laya", "reduce.deberta_embeddings", "normalization.nomic_pool", "projection.siglip2", "attention.LightOnOCR3", "EmbeddingGemma2.projection", "cuda_Gemma4_attention" }) |name| try std.testing.expect(!operationFamilyName(name));
+}
+
+test "shared program provenance applies only to its selected production region" {
+    const family = shared(cudaFamily("projection.test", struct {
+        pub const source_0 = "kernel first()";
+        pub const source_1 = "kernel second()";
+    }), &.{.{ .operation = "projection.dot", .source = "shared.zig", .scope = .phase, .precision = "F32", .schedule = "serial", .source_index = 1, .export_name = "second" }});
+    const entries = comptime regions(&.{family});
+    try std.testing.expectEqual(@as(usize, 0), entries[0].programs.len);
+    try std.testing.expectEqual(@as(usize, 1), entries[1].programs.len);
+    try std.testing.expectEqualStrings("projection.dot", entries[1].programs[0].operation);
 }

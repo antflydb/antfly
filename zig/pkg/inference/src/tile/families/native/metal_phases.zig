@@ -23,28 +23,28 @@ pub const phases = .{
     \\    for (uint ki = 0u; ki < p.seq_len; ++ki) {
     \\        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; if (!allowed) continue;
     \\        uint k_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim : (bh * p.seq_len + ki) * p.head_dim; float score = 0.0f;
-    \\        for (uint x = 0u; x < p.head_dim; ++x) score += q[q_base + x] * k[k_base + x];
-    \\        score *= scale;
-    \\        if (p.bias_mode == 1u) score += bias[(h * p.seq_len + qi) * p.seq_len + ki];
-    \\        else if (p.bias_mode == 2u) score += bias[(bh * p.seq_len + qi) * p.seq_len + ki];
-    \\        else if (p.bias_mode == 3u) score += bias[(b * p.seq_len + qi) * p.seq_len + ki];
+    ++ (@import("antfly_tile").native_projection.Dot{ .integer = "uint", .index = "x", .begin = "0u", .end = "p.head_dim", .left = "q[q_base + x]", .right = "k[k_base + x]", .accumulator = "score", .indent = "        " }).native() ++
+        \\        score *= scale;
+        \\        if (p.bias_mode == 1u) score += bias[(h * p.seq_len + qi) * p.seq_len + ki];
+        \\        else if (p.bias_mode == 2u) score += bias[(bh * p.seq_len + qi) * p.seq_len + ki];
+        \\        else if (p.bias_mode == 3u) score += bias[(b * p.seq_len + qi) * p.seq_len + ki];
     ,
     .relative_attention_scores =
     \\    for (uint ki = 0u; ki < p.seq_len; ++ki) {
     \\        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; if (!allowed) continue;
     \\        uint k_base = (b * p.seq_len + ki) * hidden + head_off; uint rel_idx = qi + p.seq_len - 1u - ki; uint rel_row = p.reserved1 != 0u ? uint(relative_index[rel_idx]) : rel_idx; uint rel_base = rel_row * hidden + head_off; float score = 0.0f;
-    \\        for (uint x = 0u; x < p.head_dim; ++x) score += q[q_base + x] * k[k_base + x] + q[q_base + x] * k_r[rel_base + x] + q_r[rel_base + x] * k[k_base + x];
-    ,
+    ++ (@import("antfly_tile").native_projection.Dot{
+        .integer = "uint",
+        .index = "x",
+        .begin = "0u",
+        .end = "p.head_dim",
+        .accumulator = "score",
+        .indent = "        ",
+        .terms = &.{ .{ .left = "q[q_base + x]", .right = "k[k_base + x]" }, .{ .left = "q[q_base + x]", .right = "k_r[rel_base + x]" }, .{ .left = "q_r[rel_base + x]", .right = "k[k_base + x]" } },
+    }).native(),
     .causal_attention_scores =
     \\        uint key_pos = p.kv_position_offset + ki;
-    \\        bool allowed = key_pos <= query_pos;
-    \\        if (!allowed && p.has_mask != 0u && query_pos < p.total_sequence_len && key_pos < p.total_sequence_len) {
-    \\            uint mask_idx = query_pos * p.total_sequence_len + key_pos;
-    \\            allowed = mask[mask_idx] != 0u;
-    \\        }
-    \\        if (key_pos > query_pos) allowed = false;
-    \\        if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window;
-    ,
+    ++ "        bool allowed = " ++ @import("antfly_tile").native_attention.CausalWindow.native("query_pos", "key_pos", "p.sliding_window") ++ ";\n",
     .segment_tensor_geometry =
     \\    const uint D = p.head_dim, hidden = p.num_heads * D, h = tg.y;
     \\    const uint QB = (p.seq_len + BQ - 1u) / BQ;
@@ -77,9 +77,7 @@ pub const phases = .{
     .attention_row_maximum =
     \\        scores[ki] = score;
     \\    }
-    \\    partials[lid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] = max(partials[lid], partials[lid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }
-    ,
+    ++ @import("antfly_tile").native_statistics.Tree.native(.{ .integer = "uint", .lane = "lid", .threads = "width", .barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);", .operation = .maximum, .planes = &.{.{ .partial = "partials", .value = "local_best" }} }),
     .suppressed_argmax_candidates =
     \\    uint end = min(start + block_size, p.out_dim);
     \\    float best = -INFINITY;
@@ -130,6 +128,16 @@ fn encoded(comptime text: []const u8) []const u8 {
 
 const tile = @import("antfly_tile");
 pub const boundary = .{
+    .gqa_shared_dot = encoded(@import("row_statistics.zig").native_stages.gqa_shared_dot),
+    .attention_row_maximum_stages = encoded(@import("row_statistics.zig").native_stages.attention_row_maximum_stages),
+    .relative_four_row_maximum = encoded(@import("row_statistics.zig").native_stages.relative_four_row_maximum),
+    .attention_tile_maximum = encoded(@import("row_statistics.zig").native_stages.attention_tile_maximum),
+    .attention_row_sum_stages = encoded(@import("row_statistics.zig").native_stages.attention_row_sum_stages),
+    .relative_four_row_sum = encoded(@import("row_statistics.zig").native_stages.relative_four_row_sum),
+    .attention_tile_sum = encoded(@import("row_statistics.zig").native_stages.attention_tile_sum),
+    .masked_loss_sum = encoded(@import("row_statistics.zig").native_stages.masked_loss_sum),
+    .masked_loss_moments = encoded(@import("row_statistics.zig").native_stages.masked_loss_moments),
+    .bounded_backward_moments = encoded(@import("row_statistics.zig").native_stages.bounded_backward_moments),
     .self_attention_scores = encoded(phases.self_attention_scores),
     .relative_attention_scores = encoded(phases.relative_attention_scores),
     .causal_attention_scores = encoded(phases.causal_attention_scores),

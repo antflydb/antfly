@@ -38,8 +38,8 @@ kernel void termite_encode_int8_per_head(device const float *in [[buffer(0)]], d
     uint head_dim = p.head_dim; uint num_kv_heads = p.num_kv_heads; uint total_heads = p.rows * num_kv_heads; if (gid.y >= total_heads) return;
     uint row = gid.y / num_kv_heads; uint head = gid.y - row * num_kv_heads; uint d = gid.x; uint row_values = num_kv_heads * head_dim; uint in_base = row * row_values + head * head_dim; uint out_base = row * p.key_row_bytes + head * (head_dim + 4u);
     float val = (d < head_dim) ? in[in_base + d] : 0.0f; float abs_val = (d < head_dim) ? fabs(val) : 0.0f;
-    threadgroup float tg_max[256]; tg_max[tid.x] = abs_val; threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = tg_size.x >> 1u; stride > 0u; stride >>= 1u) { if (tid.x < stride) { tg_max[tid.x] = max(tg_max[tid.x], tg_max[tid.x + stride]); } threadgroup_barrier(mem_flags::mem_threadgroup); }
+    threadgroup float tg_max[256];
+{{head_maximum}}
     float max_abs = tg_max[0]; float scale = max_abs == 0.0f ? 1.0f : max_abs / 127.0f; float inv_scale = 1.0f / scale;
     if (tid.x == 0u) { uint scale_bits = as_type<uint>(scale); out[out_base + 0u] = uchar(scale_bits & 0xffu); out[out_base + 1u] = uchar((scale_bits >> 8u) & 0xffu); out[out_base + 2u] = uchar((scale_bits >> 16u) & 0xffu); out[out_base + 3u] = uchar((scale_bits >> 24u) & 0xffu); }
     if (d < head_dim) { int q = int(clamp(round(val * inv_scale), -127.0f, 127.0f)); out[out_base + 4u + d] = uchar(q); }

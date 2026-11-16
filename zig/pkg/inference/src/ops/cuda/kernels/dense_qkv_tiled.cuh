@@ -37,9 +37,13 @@
         acc += input[row * in_dim + i] * termite_qkv_weight_value(weight[col * in_dim + i]);
     }
     partial[tid] = acc;
+// tile-codegen:begin statistics.dense_qkv family (do not edit; run: zig build tile-kernel-codegen -- --write)
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
         __syncthreads();
     }
+// tile-codegen:end statistics.dense_qkv family
     if (tid == 0u) dst[local] = partial[0];

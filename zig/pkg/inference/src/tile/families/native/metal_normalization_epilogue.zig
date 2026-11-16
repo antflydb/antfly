@@ -15,6 +15,7 @@
 
 const program = @import("../../native_program.zig");
 const tile = @import("antfly_tile");
+const statistics = @import("row_statistics.zig").metal;
 const f = tile.fexpr;
 fn emit(comptime expr: f.FExpr, comptime value: []const u8, comptime bias: []const u8, comptime gate: []const u8, comptime residual: []const u8) f.Emission {
     return .{ .expr = expr, .source = tile.native_math.metal, .inputs = .{ .value = value, .bias = bias, .gate = gate, .residual = residual } };
@@ -33,8 +34,7 @@ pub const source_0 = program.metal(program.render(
     \\    float mean; float variance;
     \\    if (Rows) {
     \\        threadgroup float *sums = scratch; threadgroup float *sqs = scratch + 256u;
-    \\        sums[tid] = sum; sqs[tid] = sq; threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\        for (uint stride = width >> 1; stride > 0u; stride >>= 1u) { if (tid < stride && tid + stride < 256u) { sums[tid] += sums[tid + stride]; sqs[tid] += sqs[tid + stride]; } threadgroup_barrier(mem_flags::mem_threadgroup); }
+    \\{{moments_tree}}
     \\        mean = sums[0] / float(p.hidden_size); variance = max(sqs[0] / float(p.hidden_size) - mean * mean, 0.0f);
     \\    } else {
     \\        mean = sum / float(p.hidden_size); variance = 0.0f;
@@ -46,6 +46,7 @@ pub const source_0 = program.metal(program.render(
     \\}
     \\
 , .{
+    .moments_tree = statistics.moments_tree,
     .affine = emit(tile.native_math.layer_affine, "(v - mean)", "gamma[i]", "inv_std", "beta[i]"),
 }));
 pub const source_1 = program.metal(program.render(
@@ -53,8 +54,7 @@ pub const source_1 = program.metal(program.render(
     \\__attribute__((always_inline)) inline float antfly_rms_tree_inverse(device const Input*input,uint base,uint hidden,float eps,threadgroup float*shmem,uint tid,uint tpg,device const float*sumsq,uint partial_base) {
     \\    float mean_square = 0.0f;
     \\    if (Precomputed) { for (uint i = tid; i < (hidden + 7u) / 8u; i += tpg) mean_square += sumsq[partial_base + i]; } else { for (uint i = tid; i < hidden; i += tpg) { float x = float(input[base + i]); mean_square += x * x; } }
-    \\    shmem[tid] = mean_square; threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    for (uint stride = tpg >> 1; stride > 0; stride >>= 1) { if (tid < stride) shmem[tid] += shmem[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+    \\{{rms_tree}}
     \\    mean_square = shmem[0] / float(hidden); return rsqrt(mean_square + eps);
     \\}
     \\template<bool Add, bool Scale, typename Input = float, bool Precomputed = false, bool ExpressionEpilogue = false> __attribute__((always_inline)) inline void termite_rms_norm_tree(device const Input *input, device const float *weight, device const float *residual, device float *output, threadgroup float *shmem, uint base, uint hidden, float eps, float scale, uint tid, uint tpg, device const float *sumsq = nullptr, uint partial_base = 0u) {
@@ -64,6 +64,7 @@ pub const source_1 = program.metal(program.render(
     \\}
     \\
 , .{
+    .rms_tree = statistics.rms_tree,
     .normalized = f.binding(tile.native_math.rms(.scale_then_weight), tile.native_math.metal, .{ .value = "float(input[base + i])", .weight = "weight[i]", .inverse = "inv_rms" }),
 }));
 pub const source_2 = program.metal(program.render(

@@ -334,12 +334,12 @@
            "                scores[j] = score;\n"
            "            }\n"
            "            partials[lid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "            for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] = max(partials[lid], partials[lid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+{{attention_row_maximum_stages}}
            "            float chunk_best = partials[0]; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "            if (chunk_best <= neg) continue;\n"
            TERMITE_MSL_SEGMENT_SCALAR_WEIGHTS
            "            partials[lid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "            for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] += partials[lid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+{{attention_row_sum_stages}}
            "            run_sum = run_sum * rescale + partials[0];\n"
            TERMITE_MSL_SEGMENT_SCALAR_PV
            "        }\n"
@@ -375,14 +375,14 @@
            "    }\n"
            "    partial[tid] = best;\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n"
-           "    for (uint stride = 128u; stride > 0; stride >>= 1u) { if (tid < stride) partial[tid] = max(partial[tid], partial[tid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+{{attention_tile_maximum}}
            "    best = partial[0];\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    float sum = 0.0f;\n"
            "    for (uint at = tid; at < tile[3]; at += 256u) { float weight = row[at] == -INFINITY ? 0.0f : exp(row[at] - best); row[at] = weight; sum += weight; }\n"
            "    partial[tid] = sum;\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n"
-           "    for (uint stride = 128u; stride > 0; stride >>= 1u) { if (tid < stride) partial[tid] += partial[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+{{attention_tile_sum}}
            "    sum = partial[0];\n"
            "    for (uint at = tid; at < tile[3]; at += 256u) row[at] = sum > 0.0f ? row[at] / sum : 0.0f;\n"
            "}\n"
@@ -478,8 +478,10 @@
            "    uint qi = tg.x; uint h = tg.y; uint b = tg.z; if (p.seq_len == 0u || p.head_dim == 0u || p.num_heads == 0u || qi >= p.seq_len || h >= p.num_heads || b >= p.batch) return;\n"
            "    uint lid = uint(tid); uint width = uint(tpg.x); uint hidden = p.num_heads * p.head_dim; uint relative_count = p.reserved0; uint bh = b * p.num_heads + h; uint cc_base = (bh * p.seq_len + qi) * p.seq_len; uint c2p_base = (bh * p.seq_len + qi) * relative_count; float scale = rsqrt(float(p.head_dim) * 3.0f); threadgroup float *scores = scratch; threadgroup float *partials = scratch + p.seq_len;\n"
            "    float local_best = -3.402823466e+38f; for (uint ki = lid; ki < p.seq_len; ki += width) { bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; uint rel_idx = qi + p.seq_len - 1u - ki; uint rel_row = p.reserved1 != 0u ? uint(relative_index[rel_idx]) : rel_idx; uint p2c_idx = (bh * p.seq_len + ki) * relative_count + rel_row; float c2p_score = p.reserved2 != 0u ? 0.0f : c2p[c2p_base + rel_row]; float score = allowed ? (cc[cc_base + ki] + c2p_score + p2c[p2c_idx]) * scale : -3.402823466e+38f; scores[ki] = score; local_best = max(local_best, score); } partials[lid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] = max(partials[lid], partials[lid + stride]); threadgroup_barrier(mem_flags::mem_threadgroup); } float best = partials[0]; threadgroup_barrier(mem_flags::mem_threadgroup); float local_sum = 0.0f; for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; if (s > -3.0e38f) local_sum += exp(s - best); } partials[lid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) { if (lid < stride) partials[lid] += partials[lid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } float denom = partials[0]; float inv_sum = denom > 0.0f ? 1.0f / denom : 0.0f; for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; scores[ki] = s > -3.0e38f ? exp(s - best) * inv_sum : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+{{attention_row_maximum_stages}}
+           " float best = partials[0]; threadgroup_barrier(mem_flags::mem_threadgroup); float local_sum = 0.0f; for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; if (s > -3.0e38f) local_sum += exp(s - best); } partials[lid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+{{attention_row_sum_stages}}
+           " float denom = partials[0]; float inv_sum = denom > 0.0f ? 1.0f / denom : 0.0f; for (uint ki = lid; ki < p.seq_len; ki += width) { float s = scores[ki]; scores[ki] = s > -3.0e38f ? exp(s - best) * inv_sum : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    uint head_off = h * p.head_dim; for (uint d = lid; d < p.head_dim; d += width) { float accum = 0.0f; for (uint ki = 0u; ki < p.seq_len; ++ki) { uint v_base = (b * p.seq_len + ki) * hidden + head_off; accum += scores[ki] * v[v_base + d]; } output[(b * p.seq_len + qi) * hidden + head_off + d] = accum; }\n"
            "}\n"
 // native-program:entry termite_attention_f32
@@ -731,7 +733,9 @@
            "    const uint qi = tg.x; const uint h = tg.y; if (qi >= p.q_len || h >= p.num_heads) return;\n"
            "    const uint NT = 256u; const uint heads_per_group = p.num_heads / p.num_kv_heads; const uint kv_h = h / heads_per_group; const uint q_stride = p.num_heads * p.head_dim; const uint kv_stride = p.num_kv_heads * p.head_dim; const uint q_base = qi * q_stride + h * p.head_dim; const uint kv_head_off = kv_h * p.head_dim; const uint out_base = qi * q_stride + h * p.head_dim; const float scale = rsqrt(float(p.head_dim)); const uint query_pos = p.query_position_offset + qi; threadgroup float *scores = shmem; threadgroup float *partials = shmem + p.kv_len;\n"
            "    float local_best = -3.402823466e+38f;\n"
-           "    for (uint ki = 0u; ki < p.kv_len; ++ki) { uint key_pos = p.kv_position_offset + ki; bool allowed = key_pos <= query_pos; if (!allowed && p.has_mask != 0u && query_pos < p.total_sequence_len && key_pos < p.total_sequence_len) { uint mask_idx = query_pos * p.total_sequence_len + key_pos; allowed = mask[mask_idx] != 0u; } if (key_pos > query_pos) allowed = false; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; float acc = 0.0f; if (allowed) { uint k_base = ki * kv_stride + kv_head_off; for (uint d = tid; d < p.head_dim; d += NT) acc += q[q_base + d] * k[k_base + d]; } partials[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) { if (tid < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } float score = allowed ? partials[0] * scale : -3.402823466e+38f; if (allowed && p.has_bias != 0u) score += bias[h * p.q_len * p.kv_len + qi * p.kv_len + key_pos]; if (tid == 0u) scores[ki] = score; if (score > local_best) local_best = score; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+           "    for (uint ki = 0u; ki < p.kv_len; ++ki) { uint key_pos = p.kv_position_offset + ki; bool allowed = key_pos <= query_pos; if (!allowed && p.has_mask != 0u && query_pos < p.total_sequence_len && key_pos < p.total_sequence_len) { uint mask_idx = query_pos * p.total_sequence_len + key_pos; allowed = mask[mask_idx] != 0u; } if (key_pos > query_pos) allowed = false; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; float acc = 0.0f; if (allowed) { uint k_base = ki * kv_stride + kv_head_off; for (uint d = tid; d < p.head_dim; d += NT) acc += q[q_base + d] * k[k_base + d]; } partials[tid] = acc; threadgroup_barrier(mem_flags::mem_threadgroup); \n"
+{{gqa_shared_dot}}
+           " float score = allowed ? partials[0] * scale : -3.402823466e+38f; if (allowed && p.has_bias != 0u) score += bias[h * p.q_len * p.kv_len + qi * p.kv_len + key_pos]; if (tid == 0u) scores[ki] = score; if (score > local_best) local_best = score; threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
            "    if (tid == 0u) { float sum = 0.0f; for (uint ki = 0u; ki < p.kv_len; ++ki) sum += exp(scores[ki] - local_best); partials[0] = sum > 0.0f ? 1.0f / sum : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup); const float inv_sum = partials[0];\n"
            "    for (uint d = tid; d < p.head_dim; d += NT) { float value = 0.0f; for (uint ki = 0u; ki < p.kv_len; ++ki) { float e = exp(scores[ki] - local_best) * inv_sum; uint v_base = ki * kv_stride + kv_head_off; value += e * v[v_base + d]; } output[out_base + d] = value; }\n"
            "}\n"

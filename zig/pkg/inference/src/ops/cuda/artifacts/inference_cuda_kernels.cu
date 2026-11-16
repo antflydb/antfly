@@ -538,7 +538,9 @@ extern "C" __global__ void termite_linear_f32(ANTFLY_CUDA_LINEAR_F32_PARAMS) {
     float acc = 0.0f;
     for (unsigned int k = 0; k < in_dim; ++k) {
         acc += input[row * in_dim + k] * weight[col * in_dim + k];
+
     }
+
     dst[idx] = acc;
 }
 
@@ -553,13 +555,18 @@ extern "C" __global__ void termite_linear_f32_tiled(ANTFLY_CUDA_LINEAR_F32_PARAM
     float acc = 0.0f;
     for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
         acc += input[row * in_dim + i] * weight[col * in_dim + i];
+
     }
+
     partial[tid] = acc;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
         __syncthreads();
     }
+
     if (tid == 0u) dst[global] = partial[0];
 }
 // tile-codegen:end quant_cuda.dense_f32.0 family
@@ -781,10 +788,13 @@ extern "C" __global__ void termite_gemma4_mtp_preproject_f32(ANTFLY_CUDA_GEMMA4_
     }
     partial[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
+        for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
         __syncthreads();
     }
+
     if (tid == 0u) dst[row] = partial[0];
 }
 // tile-codegen:end selection.direct.0 family
@@ -954,10 +964,13 @@ extern "C" __global__ void termite_gemma4_mtp_centroid_scores_hidden_f32(
     }
     partial[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
+        for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
         __syncthreads();
     }
+
     if (tid == 0u) centroid_scores[centroid] = partial[0];
 }
 // tile-codegen:end selection.direct.2 family
@@ -1036,10 +1049,13 @@ extern "C" __global__ void termite_gemma4_mtp_restricted_lm_head_scores_f32(
     }
     partial[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
+        for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
         __syncthreads();
     }
+
     if (tid == 0u) {
         partial_values[candidate] = partial[0];
         partial_tokens[candidate] = token;
@@ -1219,7 +1235,9 @@ extern "C" __global__ void termite_linear_bias_f32(
     float acc = bias[col];
     for (unsigned int k = 0; k < in_dim; ++k) {
         acc += input[row * in_dim + k] * weight[col * in_dim + k];
+
     }
+
     dst[idx] = acc;
 }
 // tile-codegen:end quant_cuda.dense_f32.3 family
@@ -2117,8 +2135,8 @@ extern "C" __global__ void termite_slice_last_dim_f32(
     unsigned int count = rows * out_cols;
     if (idx >= count) return;
     unsigned int row = idx / out_cols;
-    unsigned int out_col = idx - row * out_cols;
-    dst[idx] = input[row * cols + start + out_col];
+    unsigned int col = idx - row * out_cols;
+    dst[idx] = input[row * cols + start + col];
 }
 // tile-codegen:end tensor.layout.direct.9 family
 
@@ -2133,20 +2151,18 @@ extern "C" __global__ void termite_gliner_word_embeddings_f32(
     unsigned int num_words
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int out_count = batch * num_words * hidden_size;
-    if (idx >= out_count) return;
-
-    unsigned int d = idx % hidden_size;
-    unsigned int tmp = idx / hidden_size;
-    unsigned int word = tmp % num_words;
-    unsigned int b = tmp / num_words;
-    long long wanted = (long long)word + 1ll;
-
-    unsigned int token_base = b * seq_len;
-    unsigned int hidden_base = token_base * hidden_size + d;
-    for (unsigned int t = 0; t < seq_len; ++t) {
-        if (words_mask[token_base + t] == wanted) {
-            dst[idx] = hidden[hidden_base + t * hidden_size];
+    unsigned int count = (batch * num_words) * hidden_size;
+    if (idx >= count) return;
+    unsigned int row = idx / hidden_size;
+    unsigned int col = idx - row * hidden_size;
+    unsigned int word = row % num_words;
+    unsigned int batch_index = row / num_words;
+    long long wanted = (long long)(word + 1u);
+    unsigned int token_base = batch_index * seq_len;
+    unsigned int hidden_base = token_base * hidden_size + col;
+    for (unsigned int token = 0u; token < seq_len; ++token) {
+        if (words_mask[token_base + token] == wanted) {
+            dst[idx] = hidden[hidden_base + token * hidden_size];
             return;
         }
     }
@@ -2164,7 +2180,8 @@ extern "C" __global__ void termite_repeat_first_row_f32(
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int count = rows * dim;
     if (idx >= count) return;
-    unsigned int col = idx % dim;
+    unsigned int row = idx / dim;
+    unsigned int col = idx - row * dim;
     dst[idx] = src[col];
 }
 // tile-codegen:end tensor.layout.direct.10 family
@@ -2182,15 +2199,14 @@ extern "C" __global__ void termite_gliner_gru_combine_f32(
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int count = rows * dim;
     if (idx >= count) return;
-    unsigned int row = idx / dim;
-    unsigned int col = idx - row * dim;
+    unsigned int row = idx / dim, col = idx - row * dim;
     unsigned int gate_base = row * dim * 3u + col;
     float r = 1.0f / (1.0f + expf(-(gi[gate_base] + gh[gate_base])));
     float z = 1.0f / (1.0f + expf(-(gi[gate_base + dim] + gh[gate_base + dim])));
     float n = tanhf(gi[gate_base + dim * 2u] + r * gh[gate_base + dim * 2u]);
     float h0 = label_embeddings[idx];
     float h1 = (1.0f - z) * n + z * h0;
-    dst[idx] = add_residual ? h1 + h0 : h1;
+    dst[idx] = add_residual != 0u ? h1 + h0 : h1;
 }
 // tile-codegen:end sequence.transforms.direct.2 family
 
@@ -2231,6 +2247,7 @@ extern "C" __global__ void termite_conv2d_f32(ANTFLY_CUDA_CONV2D_F32_PARAMS) {
     unsigned int in_per_group = in_channels / groups;
     unsigned int out_per_group = out_channels / groups;
     unsigned int group = oc / out_per_group;
+
     float acc = bias[oc];
     for (unsigned int ig = 0; ig < in_per_group; ++ig) {
         unsigned int ic = group * in_per_group + ig;
@@ -2280,8 +2297,10 @@ extern "C" __global__ void termite_attention_f32(ANTFLY_CUDA_DENSE_ATTENTION_PAR
         if (has_mask && mask[b * seq_len + ki] == 0ll) continue;
         float score = 0.0f;
         unsigned int q_base = head_major ? ((b * num_heads + head) * seq_len + qi) * head_dim : (b * seq_len + qi) * hidden + head * head_dim;
-        unsigned int k_base = head_major ? ((b * num_heads + head) * seq_len + ki) * head_dim : (b * seq_len + ki) * hidden + head * head_dim;
-        for (unsigned int j = 0; j < head_dim; ++j) score += q[q_base + j] * k[k_base + j];
+        unsigned int k_base = head_major ? ((b * num_heads + head) * seq_len + ki) * head_dim : (b * seq_len + ki) * hidden + head * head_dim;        for (unsigned int j = 0; j < head_dim; ++j) {
+            score += q[q_base + j] * k[k_base + j];
+
+        }
         score *= scale;
         if (bias_mode == 1u) score += bias[(head * seq_len + qi) * seq_len + ki];
         if (bias_mode == 2u) score += bias[((b * num_heads + head) * seq_len + qi) * seq_len + ki];
@@ -2294,8 +2313,10 @@ extern "C" __global__ void termite_attention_f32(ANTFLY_CUDA_DENSE_ATTENTION_PAR
         if (has_mask && mask[b * seq_len + ki] == 0ll) continue;
         float score = 0.0f;
         unsigned int q_base = head_major ? ((b * num_heads + head) * seq_len + qi) * head_dim : (b * seq_len + qi) * hidden + head * head_dim;
-        unsigned int k_base = head_major ? ((b * num_heads + head) * seq_len + ki) * head_dim : (b * seq_len + ki) * hidden + head * head_dim;
-        for (unsigned int j = 0; j < head_dim; ++j) score += q[q_base + j] * k[k_base + j];
+        unsigned int k_base = head_major ? ((b * num_heads + head) * seq_len + ki) * head_dim : (b * seq_len + ki) * hidden + head * head_dim;        for (unsigned int j = 0; j < head_dim; ++j) {
+            score += q[q_base + j] * k[k_base + j];
+
+        }
         score *= scale;
         if (bias_mode == 1u) score += bias[(head * seq_len + qi) * seq_len + ki];
         if (bias_mode == 2u) score += bias[((b * num_heads + head) * seq_len + qi) * seq_len + ki];
@@ -2308,13 +2329,13 @@ extern "C" __global__ void termite_attention_f32(ANTFLY_CUDA_DENSE_ATTENTION_PAR
 }
 // tile-codegen:end attention.direct.0 family
 
-// tile-codegen:begin attention.block family (do not edit; run: zig build tile-kernel-codegen -- --write)
+// tile-codegen:begin attention.block.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_attention_f32_block(ANTFLY_CUDA_DENSE_ATTENTION_PARAMS) {
     constexpr bool Local = false;
     const unsigned int radius = 0u;
 #include "../kernels/block_local_attention.cuh"
 }
-// tile-codegen:end attention.block family
+// tile-codegen:end attention.block.0 family
 
 // Qwen3-VL vision attention for graph-layout [B, S, H, 64] tensors.  The
 // generic scalar fallback assigns one thread to every output channel and
@@ -2431,10 +2452,13 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64(ANTFLY_C
     }
     __syncthreads();
     #pragma unroll
-    for (unsigned int stride = 64u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) scratch[tid] = __fadd_rn(scratch[tid], scratch[tid + stride]);
+        for (unsigned int stride = 128u >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] = __fadd_rn(scratch[tid], scratch[tid + stride]);
+        }
         __syncthreads();
     }
+
     if (tid == 0u) shared_denom = scratch[0];
     __syncthreads();
 
@@ -2790,9 +2814,9 @@ extern "C" __global__ void termite_cross_attention_f32(
     for (unsigned int ki = 0; ki < enc_seq; ++ki) {
         if (mask != nullptr && mask[b * enc_seq + ki] == 0ll) continue;
         unsigned int k_base = (b * enc_seq + ki) * hidden + head * head_dim;
-        float score = 0.0f;
-        for (unsigned int j = 0; j < head_dim; ++j) {
+        float score = 0.0f;        for (unsigned int j = 0; j < head_dim; ++j) {
             score += q[q_base + j] * k[k_base + j];
+
         }
         score *= scale;
         max_score = fmaxf(max_score, score);
@@ -2803,9 +2827,9 @@ extern "C" __global__ void termite_cross_attention_f32(
     for (unsigned int ki = 0; ki < enc_seq; ++ki) {
         if (mask != nullptr && mask[b * enc_seq + ki] == 0ll) continue;
         unsigned int k_base = (b * enc_seq + ki) * hidden + head * head_dim;
-        float score = 0.0f;
-        for (unsigned int j = 0; j < head_dim; ++j) {
+        float score = 0.0f;        for (unsigned int j = 0; j < head_dim; ++j) {
             score += q[q_base + j] * k[k_base + j];
+
         }
         score *= scale;
         float e = expf(score - max_score);
@@ -2861,11 +2885,16 @@ extern "C" __global__ void termite_cross_attention_q1_f32(
     scratch[tid] = local_max;
     __syncthreads();
 
-    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+        for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+        }
         __syncthreads();
     }
+
     float max_score = scratch[0];
+    // Order every maximum read before any warp reuses scratch for its sum.
+    __syncthreads();
 
     float local_denom = 0.0f;
     for (unsigned int ki = tid; ki < enc_seq; ki += blockDim.x) {
@@ -2877,10 +2906,13 @@ extern "C" __global__ void termite_cross_attention_q1_f32(
     scratch[tid] = local_denom;
     __syncthreads();
 
-    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
         __syncthreads();
     }
+
     float denom = scratch[0];
 
     for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
@@ -2930,31 +2962,23 @@ extern "C" __global__ void termite_nchw_to_token_f32(ANTFLY_CUDA_TOKEN_TO_NCHW_F
 
 // tile-codegen:begin tensor.layout.direct.14 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_pack_windows_f32(ANTFLY_CUDA_PACK_WINDOWS_F32_PARAMS) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int windows_h = padded_h / window_size;
     unsigned int windows_w = padded_w / window_size;
-    unsigned int window_area = window_size * window_size;
-    unsigned int window_count = batch * windows_h * windows_w;
-    unsigned int total = window_count * window_area * dim;
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
 
+    unsigned int area = window_size * window_size;
+    unsigned int windows = batch * windows_h * windows_w;
+    unsigned int total = windows * area * dim;
+    if (idx >= total) return;
     unsigned int feature = idx % dim;
-    unsigned int token = (idx / dim) % window_area;
-    unsigned int window_idx = idx / (dim * window_area);
-    unsigned int dx = token % window_size;
-    unsigned int dy = token / window_size;
-    unsigned int ww = window_idx % windows_w;
-    unsigned int tmp = window_idx / windows_w;
-    unsigned int wh = tmp % windows_h;
-    unsigned int b = tmp / windows_h;
-    unsigned int src_y = wh * window_size + dy;
-    unsigned int src_x = ww * window_size + dx;
-    if (src_y >= height || src_x >= width) {
-        dst[idx] = 0.0f;
-        return;
-    }
-    unsigned int src_idx = (b * height * width + src_y * width + src_x) * dim + feature;
-    dst[idx] = src[src_idx];
+    unsigned int token = idx / dim;
+    unsigned int position = token % area, win = token / area;
+    unsigned int b = win / (windows_h * windows_w);
+    unsigned int wy = (win / windows_w) % windows_h, wx = win % windows_w;
+    unsigned int y = wy * window_size + position / window_size;
+    unsigned int x = wx * window_size + position % window_size;
+
+    dst[idx] = (y < height && x < width) ? src[((b * height + y) * width + x) * dim + feature] : 0.0f;
 }
 // tile-codegen:end tensor.layout.direct.14 family
 
@@ -2963,22 +2987,16 @@ extern "C" __global__ void termite_unpad_windows_f32(ANTFLY_CUDA_PACK_WINDOWS_F3
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = batch * height * width * dim;
     if (idx >= total) return;
-
     unsigned int feature = idx % dim;
-    unsigned int tmp = idx / dim;
-    unsigned int x = tmp % width;
-    tmp /= width;
-    unsigned int y = tmp % height;
-    unsigned int b = tmp / height;
+    unsigned int token = idx / dim;
+    unsigned int x = token % width;
+    token /= width;
+    unsigned int y = token % height, b = token / height;
     unsigned int windows_w = padded_w / window_size;
-    unsigned int wh = y / window_size;
-    unsigned int ww = x / window_size;
-    unsigned int dy = y % window_size;
-    unsigned int dx = x % window_size;
-    unsigned int window_idx = (b * (padded_h / window_size) + wh) * windows_w + ww;
-    unsigned int token = dy * window_size + dx;
-    unsigned int src_idx = (window_idx * window_size * window_size + token) * dim + feature;
-    dst[idx] = src[src_idx];
+    unsigned int win = (b * (padded_h / window_size) + y / window_size) * windows_w + x / window_size;
+    unsigned int position = (y % window_size) * window_size + x % window_size;
+    unsigned int source = win * window_size * window_size + position;
+    dst[idx] = src[source * dim + feature];
 }
 // tile-codegen:end tensor.layout.direct.15 family
 
@@ -3035,11 +3053,16 @@ extern "C" __global__ void termite_channel_scores_softmax_f32(
     }
     scratch[tid] = value;
     __syncthreads();
-    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+        for (unsigned int stride = 256u >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+        }
         __syncthreads();
     }
+
     float max_score = scratch[0];
+    // Order every maximum read before any warp reuses scratch for its sum.
+    __syncthreads();
     float exp_value = 0.0f;
     if (tid < channels_per_group) {
         exp_value = expf(row_scores[tid] - max_score);
@@ -3047,10 +3070,13 @@ extern "C" __global__ void termite_channel_scores_softmax_f32(
     }
     scratch[tid] = exp_value;
     __syncthreads();
-    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        for (unsigned int stride = 256u >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
         __syncthreads();
     }
+
     float denom = scratch[0];
     if (tid < channels_per_group) {
         unsigned int score_idx = ((b * groups + g) * channels_per_group + qc) * channels_per_group + tid;
@@ -3462,18 +3488,15 @@ extern "C" __global__ void termite_gqa_attention_f32(
     float max_score = -3.402823466e+38f;
 
     for (unsigned int ki = 0; ki < kv_seq_len; ++ki) {
-        unsigned int key_pos = kv_position_offset + ki;
-        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
-        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
-        bool future_blocked = key_pos > query_pos && !future_allowed;
-        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
-        bool valid = !(future_blocked || past_blocked);
+        unsigned int key_pos = kv_position_offset + ki;        bool valid = key_pos <= query_pos && (sliding_window == 0u || (query_pos - key_pos) < sliding_window);
         if (!valid) continue;
 
         unsigned int q_base = (b * q_seq_len + qi) * q_hidden + head * head_dim;
         unsigned int k_base = (b * kv_seq_len + ki) * kv_hidden + kv_head * head_dim;
-        float score = 0.0f;
-        for (unsigned int j = 0; j < head_dim; ++j) score += q[q_base + j] * k[k_base + j];
+        float score = 0.0f;        for (unsigned int j = 0; j < head_dim; ++j) {
+            score += q[q_base + j] * k[k_base + j];
+
+        }
         score *= scale;
         if (bias_mode == 1u) score += bias[(head * q_seq_len + qi) * kv_seq_len + ki];
         if (bias_mode == 2u) score += bias[((b * num_heads + head) * q_seq_len + qi) * kv_seq_len + ki];
@@ -3483,18 +3506,15 @@ extern "C" __global__ void termite_gqa_attention_f32(
     float denom = 0.0f;
     float acc = 0.0f;
     for (unsigned int ki = 0; ki < kv_seq_len; ++ki) {
-        unsigned int key_pos = kv_position_offset + ki;
-        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
-        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
-        bool future_blocked = key_pos > query_pos && !future_allowed;
-        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
-        bool valid = !(future_blocked || past_blocked);
+        unsigned int key_pos = kv_position_offset + ki;        bool valid = key_pos <= query_pos && (sliding_window == 0u || (query_pos - key_pos) < sliding_window);
         if (!valid) continue;
 
         unsigned int q_base = (b * q_seq_len + qi) * q_hidden + head * head_dim;
         unsigned int k_base = (b * kv_seq_len + ki) * kv_hidden + kv_head * head_dim;
-        float score = 0.0f;
-        for (unsigned int j = 0; j < head_dim; ++j) score += q[q_base + j] * k[k_base + j];
+        float score = 0.0f;        for (unsigned int j = 0; j < head_dim; ++j) {
+            score += q[q_base + j] * k[k_base + j];
+
+        }
         score *= scale;
         if (bias_mode == 1u) score += bias[(head * q_seq_len + qi) * kv_seq_len + ki];
         if (bias_mode == 2u) score += bias[((b * num_heads + head) * q_seq_len + qi) * kv_seq_len + ki];
@@ -7963,12 +7983,7 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(ANTFLY_CU
     __syncthreads();
 
     for (unsigned int ki = 0u; ki < kv_seq_len; ++ki) {
-        unsigned int key_pos = kv_position_offset + ki;
-        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
-        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
-        bool future_blocked = key_pos > query_pos && !future_allowed;
-        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
-        bool valid = !(future_blocked || past_blocked);
+        unsigned int key_pos = kv_position_offset + ki;        bool valid = key_pos <= query_pos && (sliding_window == 0u || (query_pos - key_pos) < sliding_window);
         unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
         if (physical_token == 0xffffffffu) valid = false;
         const unsigned char* k_row = valid ? k + physical_token * key_row_bytes : k;
@@ -8009,12 +8024,7 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(ANTFLY_CU
     __syncthreads();
     float acc = 0.0f;
     for (unsigned int ki = 0u; ki < kv_seq_len; ++ki) {
-        unsigned int key_pos = kv_position_offset + ki;
-        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
-        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
-        bool future_blocked = key_pos > query_pos && !future_allowed;
-        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
-        bool valid = !(future_blocked || past_blocked);
+        unsigned int key_pos = kv_position_offset + ki;        bool valid = key_pos <= query_pos && (sliding_window == 0u || (query_pos - key_pos) < sliding_window);
         unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
         if (physical_token == 0xffffffffu) valid = false;
         const unsigned char* k_row = valid ? k + physical_token * key_row_bytes : k;
@@ -11545,21 +11555,7 @@ extern "C" __global__ void termite_linear_q4_k_pair_nobias_f32_tile4(ANTFLY_CUDA
         #pragma unroll
         for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] = acc[c];
     }
-    __syncthreads();
-    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            #pragma unroll
-            for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] += partial[c][tid + stride];
-        }
-        __syncthreads();
-    }
-    if (tid == 0u) {
-        #pragma unroll
-        for (unsigned int c = 0; c < 4u; ++c) {
-            unsigned int col = col_tile + c;
-            if (col < out_dim) dst[row * out_dim + col] = partial[c][0];
-        }
-    }
+#include "../kernels/quant_tile4_publish.cuh"
 }
 
 extern "C" __global__ void termite_linear_q8_0_argmax_stage1_tile4(ANTFLY_CUDA_QUANT_ARGMAX_PARAMS) {
@@ -12603,10 +12599,13 @@ extern "C" __global__ void termite_linear_q4_k_qkv_nobias_f32_tiled(ANTFLY_CUDA_
         partial[tid] = acc;
     }
     __syncthreads();
-    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
+        for (unsigned int stride = 256u >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
         __syncthreads();
     }
+
     if (tid == 0u) dst[local] = partial[0];
 }
 // tile-codegen:end projection.direct.21 family
@@ -12662,10 +12661,13 @@ extern "C" __global__ void termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled(ANTFLY_
     }
     partial[tid] = acc;
     __syncthreads();
-    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
+        for (unsigned int stride = 256u >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
         __syncthreads();
     }
+
     if (tid == 0u) dst[local] = partial[0];
 }
 // tile-codegen:end projection.direct.22 family
@@ -12781,7 +12783,8 @@ extern "C" __global__ void termite_embedding_lookup_i32_q4_0_f32(ANTFLY_CUDA_EMB
 }
 // tile-codegen:end quant_cuda.embedding.1 family
 
-__device__ __forceinline__ bool termite_deberta_attention_key_valid(
+// tile-codegen:begin attention.relative_helpers.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+__device__ __forceinline__ bool antfly_relative_attention_key_valid_f32(
     const long long* mask,
     const float* attn_bias,
     unsigned int use_bias,
@@ -12799,7 +12802,7 @@ __device__ __forceinline__ bool termite_deberta_attention_key_valid(
     return mask[b * seq_len + ki] != 0ll;
 }
 
-__device__ __forceinline__ float termite_deberta_attention_score_f32(
+__device__ __forceinline__ float antfly_relative_attention_score_f32(
     const float* q,
     const float* k,
     const float* q_r,
@@ -12821,10 +12824,12 @@ __device__ __forceinline__ float termite_deberta_attention_score_f32(
     for (unsigned int d = 0; d < head_dim; ++d) {
         float qd = q[q_base + d];
         float kd = k[k_base + d];
-        score += qd * kd + qd * k_r[rel_base + d] + q_r[rel_base + d] * kd;
+score += qd * kd + qd * k_r[rel_base + d] + q_r[rel_base + d] * kd;
+
     }
     return score * rsqrtf((float)head_dim * 3.0f);
 }
+// tile-codegen:end attention.relative_helpers.0 family
 
 // One block owns one (batch, head, query) row. Scores are computed once per
 // key and shared by every output channel; the legacy kernel recomputed all
@@ -12845,8 +12850,8 @@ extern "C" __global__ void termite_deberta_attention_f32(ANTFLY_CUDA_DEBERTA_ATT
 
     float local_max = -3.402823466e+38f;
     for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
-            float score = termite_deberta_attention_score_f32(q, k, q_r, k_r, b, qi, ki, head, seq_len, num_heads, head_dim);
+        if (antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
+            float score = antfly_relative_attention_score_f32(q, k, q_r, k_r, b, qi, ki, head, seq_len, num_heads, head_dim);
             scores[ki] = score;
 
             local_max = fmaxf(local_max, score);
@@ -12857,20 +12862,18 @@ extern "C" __global__ void termite_deberta_attention_f32(ANTFLY_CUDA_DEBERTA_ATT
     }
     reduction[tid] = local_max;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reduction[tid] = fmaxf(reduction[tid], reduction[tid + stride]);
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            reduction[tid] = fmaxf(reduction[tid], reduction[tid + stride]);
+        }
         __syncthreads();
     }
-    float row_max = reduction[0];
-    // Every warp must consume reduction[0] before thread 0 can reuse that
-    // shared-memory location for the denominator reduction below. Without
-    // this barrier, long attention rows race after the first reduction and
-    // produce nondeterministic forward activations.
+    const float row_max = reduction[0];
     __syncthreads();
 
     float local_sum = 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
+        if (antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
             float e = expf(scores[ki] - row_max);
             scores[ki] = e;
             local_sum += e;
@@ -12880,10 +12883,13 @@ extern "C" __global__ void termite_deberta_attention_f32(ANTFLY_CUDA_DEBERTA_ATT
     }
     reduction[tid] = local_sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reduction[tid] += reduction[tid + stride];
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            reduction[tid] += reduction[tid + stride];
+        }
         __syncthreads();
     }
+
     float denom = reduction[0];
     __syncthreads();
 
@@ -12953,10 +12959,13 @@ extern "C" __global__ void termite_training_sum_squares_f32(
     }
     partial[threadIdx.x] = value;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
         __syncthreads();
     }
+
     if (threadIdx.x == 0u) output[0] += partial[0];
 }
 // tile-codegen:end training.direct.2 family
@@ -13200,11 +13209,15 @@ extern "C" __global__ void termite_selected_token_logprobs_f32(
     }
     reduction[threadIdx.x] = local_max;
     __syncthreads();
-    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) reduction[threadIdx.x] = fmaxf(reduction[threadIdx.x], reduction[threadIdx.x + stride]);
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            reduction[threadIdx.x] = fmaxf(reduction[threadIdx.x], reduction[threadIdx.x + stride]);
+        }
         __syncthreads();
     }
-    float row_max = reduction[0];
+    const float row_max = reduction[0];
+    __syncthreads();
+
 
     float local_sum = 0.0f;
     for (unsigned int col = threadIdx.x; col < vocab_size; col += blockDim.x) {
@@ -13212,10 +13225,14 @@ extern "C" __global__ void termite_selected_token_logprobs_f32(
     }
     reduction[threadIdx.x] = local_sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+        }
         __syncthreads();
     }
+
+
     if (threadIdx.x == 0) output[selected] = row_logits[token] - row_max - logf(reduction[0]);
 }
 // tile-codegen:end elementwise.direct.16 family
@@ -13345,29 +13362,23 @@ extern "C" __global__ void termite_primitive_transpose_2d_f32(
     unsigned int tile_cols
 ) {
     __shared__ float tile[32][33];
-    unsigned int tid = threadIdx.x;
-    unsigned int tx = tid & 31u;
-    unsigned int ty = tid >> 5u;
-    unsigned int tile_x = blockIdx.x % tile_cols;
-    unsigned int tile_y = blockIdx.x / tile_cols;
+    unsigned int tx = threadIdx.x & 31u, ty = threadIdx.x >> 5u;
+    unsigned int tile_x = blockIdx.x % tile_cols, tile_y = blockIdx.x / tile_cols;
+    unsigned int base = 0u;
     unsigned int input_x = tile_x * 32u + tx;
     unsigned int input_y = tile_y * 32u + ty;
-
     #pragma unroll
     for (unsigned int offset = 0u; offset < 32u; offset += 8u) {
-        if (input_x < cols && input_y + offset < rows) {
-            tile[ty + offset][tx] = input[(input_y + offset) * cols + input_x];
-        }
+        if (input_x < cols && input_y + offset < rows)
+            tile[ty + offset][tx] = input[base + (input_y + offset) * cols + input_x];
     }
     __syncthreads();
-
     unsigned int output_x = tile_y * 32u + tx;
     unsigned int output_y = tile_x * 32u + ty;
     #pragma unroll
     for (unsigned int offset = 0u; offset < 32u; offset += 8u) {
-        if (output_x < rows && output_y + offset < cols) {
-            output[(output_y + offset) * rows + output_x] = tile[tx][ty + offset];
-        }
+        if (output_x < rows && output_y + offset < cols)
+            output[base + (output_y + offset) * rows + output_x] = tile[tx][ty + offset];
     }
 }
 // tile-codegen:end tensor.layout.direct.29 family
@@ -13434,34 +13445,10 @@ extern "C" __global__ void termite_primitive_slice_f32(
 }
 // tile-codegen:end tensor.layout.direct.31 family
 
-__device__ __forceinline__ float termite_deberta_training_score(
-    const float* q,
-    const float* k,
-    const float* q_r,
-    const float* k_r,
-    unsigned int b,
-    unsigned int qi,
-    unsigned int ki,
-    unsigned int head,
-    unsigned int seq_len,
-    unsigned int num_heads,
-    unsigned int head_dim
-) {
-    unsigned int hidden = num_heads * head_dim;
-    unsigned int head_off = head * head_dim;
-    unsigned int q_base = (b * seq_len + qi) * hidden + head_off;
-    unsigned int k_base = (b * seq_len + ki) * hidden + head_off;
-    unsigned int rel_base = (qi + seq_len - 1u - ki) * hidden + head_off;
-    float value = 0.0f;
-    for (unsigned int d = 0; d < head_dim; ++d) {
-        float qd = q[q_base + d];
-        float kd = k[k_base + d];
-        value += qd * kd + qd * k_r[rel_base + d] + q_r[rel_base + d] * kd;
-    }
-    return value * rsqrtf((float)head_dim * 3.0f);
-}
 
-__device__ __forceinline__ float termite_deberta_training_dp(
+
+// tile-codegen:begin attention.relative_helpers.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+__device__ __forceinline__ float antfly_attention_probability_vjp_dot_f32(
     const float* v,
     const float* d_out,
     unsigned int b,
@@ -13477,9 +13464,14 @@ __device__ __forceinline__ float termite_deberta_training_dp(
     unsigned int out_base = (b * seq_len + qi) * hidden + head_off;
     unsigned int v_base = (b * seq_len + ki) * hidden + head_off;
     float value = 0.0f;
-    for (unsigned int d = 0; d < head_dim; ++d) value += d_out[out_base + d] * v[v_base + d];
+    for (unsigned int d = 0; d < head_dim; ++d) {
+        value += d_out[out_base + d] * v[v_base + d];
+
+    }
+
     return value;
 }
+// tile-codegen:end attention.relative_helpers.1 family
 
 
 
@@ -13503,10 +13495,10 @@ extern "C" __global__ void termite_deberta_attention_backward_scores_f32(ANTFLY_
 
     float local_max = -3.402823466e+38f;
     for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
-            float score = termite_deberta_training_score(q, k, q_r, k_r, b, qi, ki, head, seq_len, num_heads, head_dim);
+        if (antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
+            float score = antfly_relative_attention_score_f32(q, k, q_r, k_r, b, qi, ki, head, seq_len, num_heads, head_dim);
             scores[ki] = score;
-            d_probability[ki] = termite_deberta_training_dp(v, d_out, b, qi, ki, head, seq_len, num_heads, head_dim);
+            d_probability[ki] = antfly_attention_probability_vjp_dot_f32(v, d_out, b, qi, ki, head, seq_len, num_heads, head_dim);
 
             local_max = fmaxf(local_max, score);
         } else {
@@ -13517,20 +13509,18 @@ extern "C" __global__ void termite_deberta_attention_backward_scores_f32(ANTFLY_
     }
     reduction[tid] = local_max;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reduction[tid] = fmaxf(reduction[tid], reduction[tid + stride]);
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            reduction[tid] = fmaxf(reduction[tid], reduction[tid + stride]);
+        }
         __syncthreads();
     }
-    float row_max = reduction[0];
-    // Every warp must consume reduction[0] before thread 0 can reuse that
-    // shared-memory location for the denominator reduction below. Without
-    // this barrier, long attention rows race after the first reduction and
-    // produce nondeterministic forward activations.
+    const float row_max = reduction[0];
     __syncthreads();
 
     float local_sum = 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
+        if (antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) {
             float e = expf(scores[ki] - row_max);
             scores[ki] = e;
             local_sum += e;
@@ -13538,27 +13528,33 @@ extern "C" __global__ void termite_deberta_attention_backward_scores_f32(ANTFLY_
     }
     reduction[tid] = local_sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reduction[tid] += reduction[tid + stride];
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            reduction[tid] += reduction[tid + stride];
+        }
         __syncthreads();
     }
+
     float denominator = reduction[0];
     __syncthreads();
 
     float local_weighted_dp = 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-        if (termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) local_weighted_dp += scores[ki] * d_probability[ki];
+        if (antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) local_weighted_dp += scores[ki] * d_probability[ki];
     }
     reduction[tid] = local_weighted_dp;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reduction[tid] += reduction[tid + stride];
+        for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            reduction[tid] += reduction[tid + stride];
+        }
         __syncthreads();
     }
+
     float dot_p_dp = denominator > 0.0f ? reduction[0] / denominator : 0.0f;
     unsigned int pair_base = row * seq_len;
     for (unsigned int ki = tid; ki < seq_len; ki += blockDim.x) {
-        float probability = (denominator > 0.0f && termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) ? scores[ki] / denominator : 0.0f;
+        float probability = (denominator > 0.0f && antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) ? scores[ki] / denominator : 0.0f;
         probabilities[pair_base + ki] = probability;
         d_scores[pair_base + ki] = probability * (d_probability[ki] - dot_p_dp);
     }
@@ -13593,7 +13589,7 @@ extern "C" __global__ void termite_deberta_attention_backward_f32(ANTFLY_CUDA_DE
         if (segment == 0u) {
             unsigned int pair_base = ((b * num_heads + head) * seq_len + pos) * seq_len;
             for (unsigned int ki = 0; ki < seq_len; ++ki) {
-                if (!termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, pos, ki, seq_len, num_heads)) continue;
+                if (!antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, pos, ki, seq_len, num_heads)) continue;
                 float ds = d_scores[pair_base + ki];
                 unsigned int k_base = (b * seq_len + ki) * hidden + head_off;
                 unsigned int rel_base = (pos + seq_len - 1u - ki) * hidden + head_off;
@@ -13602,7 +13598,7 @@ extern "C" __global__ void termite_deberta_attention_backward_f32(ANTFLY_CUDA_DE
         } else {
             unsigned int ki = pos;
             for (unsigned int qi = 0; qi < seq_len; ++qi) {
-                if (!termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) continue;
+                if (!antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) continue;
                 unsigned int pair_idx = ((b * num_heads + head) * seq_len + qi) * seq_len + ki;
                 float p = probabilities[pair_idx];
                 float ds = d_scores[pair_idx];
@@ -13631,7 +13627,7 @@ extern "C" __global__ void termite_deberta_attention_backward_f32(ANTFLY_CUDA_DE
                 int ki_signed = (int)qi + (int)seq_len - 1 - (int)rel;
                 if (ki_signed < 0 || ki_signed >= (int)seq_len) continue;
                 unsigned int ki = (unsigned int)ki_signed;
-                if (!termite_deberta_attention_key_valid(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) continue;
+                if (!antfly_relative_attention_key_valid_f32(mask, attn_bias, use_bias, b, head, qi, ki, seq_len, num_heads)) continue;
                 unsigned int pair_idx = ((b * num_heads + head) * seq_len + qi) * seq_len + ki;
                 float ds = d_scores[pair_idx];
                 unsigned int q_base = (b * seq_len + qi) * hidden + head_off;
@@ -13690,9 +13686,10 @@ extern "C" __global__ void termite_deberta_attention_fused_f32(ANTFLY_CUDA_DEBER
                 for (unsigned int j = lane; j < head_dim; j += 32u) {
                     const float q_value = q[q_base + j];
                     const float k_value = k[k_base + j];
-                    partial += q_value * k_value;
-                    partial += q_value * k_r[rel_base + j];
-                    partial += q_r[rel_base + j] * k_value;
+partial += q_value * k_value;
+partial += q_value * k_r[rel_base + j];
+partial += q_r[rel_base + j] * k_value;
+
                 }
             }
             partial += __shfl_down_sync(0xffffffffu, partial, 16);
@@ -13711,14 +13708,13 @@ extern "C" __global__ void termite_deberta_attention_fused_f32(ANTFLY_CUDA_DEBER
     for (unsigned int ki = tid; ki < seq_len; ki += kThreads) local_max = fmaxf(local_max, probabilities[ki]);
     reductions[tid] = local_max;
     __syncthreads();
-    for (unsigned int stride = kThreads / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reductions[tid] = fmaxf(reductions[tid], reductions[tid + stride]);
+    for (unsigned int stride = kThreads >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            reductions[tid] = fmaxf(reductions[tid], reductions[tid + stride]);
+        }
         __syncthreads();
     }
     const float max_score = reductions[0];
-    // Every warp must consume the maximum before thread 0 reuses this
-    // shared location for its denominator partial. Ragged/long rows can
-    // otherwise observe the partial sum as their maximum.
     __syncthreads();
 
     float local_sum = 0.0f;
@@ -13729,10 +13725,14 @@ extern "C" __global__ void termite_deberta_attention_fused_f32(ANTFLY_CUDA_DEBER
     }
     reductions[tid] = local_sum;
     __syncthreads();
-    for (unsigned int stride = kThreads / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reductions[tid] += reductions[tid + stride];
+    for (unsigned int stride = kThreads >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            reductions[tid] += reductions[tid + stride];
+        }
         __syncthreads();
     }
+
+
     const float denom = reductions[0];
 
     if (tid < head_dim) {
@@ -13801,12 +13801,13 @@ extern "C" __global__ void termite_deberta_attention_stream_f32(
         const float qr1 = q_r[rel_base + lane + 32u];
         // Preserve the fused FP32 kernel's per-lane accumulation order.
         float score = 0.0f;
-        score += q0 * k0;
-        score += q0 * kr0;
-        score += qr0 * k0;
-        score += q1 * k1;
-        score += q1 * kr1;
-        score += qr1 * k1;
+score += q0 * k0;
+score += q0 * kr0;
+score += qr0 * k0;
+score += q1 * k1;
+score += q1 * kr1;
+score += qr1 * k1;
+
         score += __shfl_down_sync(0xffffffffu, score, 16);
         score += __shfl_down_sync(0xffffffffu, score, 8);
         score += __shfl_down_sync(0xffffffffu, score, 4);
@@ -14018,11 +14019,15 @@ extern "C" __global__ void termite_deberta_scores_softmax_f32(
     }
     reductions[tid] = local_max;
     __syncthreads();
-    for (unsigned int stride = kThreads / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reductions[tid] = fmaxf(reductions[tid], reductions[tid + stride]);
+    for (unsigned int stride = kThreads >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            reductions[tid] = fmaxf(reductions[tid], reductions[tid + stride]);
+        }
         __syncthreads();
     }
     const float max_score = reductions[0];
+    __syncthreads();
+
     float local_sum = 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += kThreads) {
         const float value = content_scores[score_base + ki];
@@ -14032,10 +14037,14 @@ extern "C" __global__ void termite_deberta_scores_softmax_f32(
     }
     reductions[tid] = local_sum;
     __syncthreads();
-    for (unsigned int stride = kThreads / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reductions[tid] += reductions[tid + stride];
+    for (unsigned int stride = kThreads >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            reductions[tid] += reductions[tid + stride];
+        }
         __syncthreads();
     }
+
+
     const float inv_sum = reductions[0] > 0.0f ? 1.0f / reductions[0] : 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += kThreads) content_scores[score_base + ki] *= inv_sum;
 }
@@ -15157,7 +15166,7 @@ extern "C" __global__ void antfly_q6_k_q8_1_argmax_rows1_k3840_tile8_v1(
 #include "../kernels/relative_attention_training.cuh"
 
 // Laya inference kernels. Keep outside compiler-owned generated regions.
-// tile-codegen:begin attention.block_laya family (do not edit; run: zig build tile-kernel-codegen -- --write)
+// tile-codegen:begin attention.block.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_laya_local_attention_f32(
     float* dst,
     const float* q,
@@ -15175,7 +15184,7 @@ extern "C" __global__ void termite_laya_local_attention_f32(
     const float* bias = nullptr;
 #include "../kernels/block_local_attention.cuh"
 }
-// tile-codegen:end attention.block_laya family
+// tile-codegen:end attention.block.1 family
 
 // Laya action features use uncalibrated, padded-option-masked logits.
 // One block owns each question; only thread zero reduces the at-most-20 options.

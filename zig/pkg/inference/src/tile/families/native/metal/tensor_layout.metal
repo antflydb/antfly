@@ -78,9 +78,7 @@ kernel void termite_apply_where_select_1x(device const float *cond [[buffer(0)]]
 // native-program:entry termite_slice_last_dim_f32_2d
 // native-program:indent 11
 kernel void termite_slice_last_dim_f32_2d(device const float *src [[buffer(0)]], device float *dst [[buffer(1)]], constant termite_metal_slice_last_dim_f32_2d_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
-    uint out_cols = p.out_cols; if (out_cols == 0u) return; uint row = gid / out_cols; uint col = gid - row * out_cols; if (row >= p.rows) return;
-    dst[row * out_cols + col] = src[row * p.cols + p.start + col];
-}
+{{slice_rows}}}
 // native-program:entry termite_copy_bytes
 // native-program:indent 11
 kernel void termite_copy_bytes(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]], constant uint &count [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
@@ -99,10 +97,8 @@ kernel void termite_gather_axis0_add_bias_f32_2d(device const float *input [[buf
 // native-program:entry termite_concat_lastdim_f32_2d
 // native-program:indent 11
 kernel void termite_concat_lastdim_f32_2d(device const float *a [[buffer(0)]], device const float *b [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_concat_lastdim_f32_2d_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
-    uint out_dim = p.dim_a + p.dim_b; uint total = p.rows * out_dim; if (gid >= total || out_dim == 0u) return;
-    uint row = gid / out_dim; uint col = gid - row * out_dim;
-    output[gid] = col < p.dim_a ? a[row * p.dim_a + col] : b[row * p.dim_b + (col - p.dim_a)];
-}
+    uint out_dim = p.dim_a + p.dim_b;
+{{concat_rows}}}
 // native-program:entry termite_argmax_axis_f32
 // native-program:indent 11
 kernel void termite_argmax_axis_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_argmax_axis_f32_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
@@ -193,17 +189,7 @@ kernel void termite_transpose_f32(device const float *input [[buffer(0)]], devic
 // native-program:entry termite_transpose_last2_tiled_f32
 // native-program:indent 11
 kernel void termite_transpose_last2_tiled_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_transpose_last2_params &p [[buffer(2)]], uint3 tid [[thread_position_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {
-    threadgroup float tile[32][33];
-    const uint R = p.rows; const uint C = p.cols;
-    const uint base = tg.z * R * C;
-    const uint x = tg.x * 32u + tid.x;
-    const uint y = tg.y * 32u + tid.y;
-    if (x < C && y < R) tile[tid.y][tid.x] = input[base + y * C + x];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint ox = tg.y * 32u + tid.x;
-    const uint oy = tg.x * 32u + tid.y;
-    if (ox < R && oy < C) output[base + oy * R + ox] = tile[tid.x][tid.y];
-}
+{{transpose}}}
 // native-program:entry termite_dot_general_rank1_reduce_f32
 // native-program:indent 11
 kernel void termite_dot_general_rank1_reduce_f32(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_dot_general_2d_f32_params &p [[buffer(3)]], threadgroup float *partials [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {

@@ -52,6 +52,7 @@
 
 // Two scores per lane, fixed shuffle order and FP32 online state. Exp and
 // the probability publication/rounding boundary are static numerical policies.
+// tile-codegen:begin attention.online_row64 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 #define ANTFLY_CUDA_ATTENTION_ONLINE_ROW64(Exp, ProbabilityStore) \
     for (unsigned int shift = 16u; shift; shift >>= 1u) \
         next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift)); \
@@ -71,6 +72,7 @@
         denominator[row] = denominator[row] * a + sum; \
         maximum[row] = next_max; \
     }
+// tile-codegen:end attention.online_row64 family
 
 // Publish aliased probabilities only after all score readers finish.
 #define ANTFLY_CUDA_ATTENTION_PUBLISH_HALF_ROWS64() \

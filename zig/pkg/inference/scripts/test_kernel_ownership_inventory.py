@@ -42,6 +42,16 @@ class OwnershipInventoryTest(unittest.TestCase):
         self.assertEqual([row["classification"] for row in canonical], ["canonical_native_surrounds", "canonical_native_include"])
         self.assertEqual(canonical[1]["output"], "leaf.cuh")
 
+    def test_shared_program_owner_is_a_verified_build_input(self):
+        self.inventory["tile_source_inputs"] = ["leaf.cuh"]
+        self.inventory["native_regions"][0]["programs"] = [{"operation": "projection.dot", "source": "leaf.cuh", "scope": "phase", "precision": "F32", "schedule": "serial"}]
+        report = ownership.verify(self.root, self.inventory)
+        sources = report["verification"]["shared_program_sources"]
+        self.assertEqual(sources, [{"source": "leaf.cuh", **ownership.fingerprint((self.package / "leaf.cuh").read_bytes())}])
+        self.inventory["tile_source_inputs"] = []
+        with self.assertRaisesRegex(ValueError, "absent from build inputs"):
+            ownership.verify(self.root, self.inventory)
+
     def test_records_catalog_image_and_producer_identity(self):
         cuda = self.package / "src/ops/cuda"
         (cuda / "prototypes").mkdir(parents=True)

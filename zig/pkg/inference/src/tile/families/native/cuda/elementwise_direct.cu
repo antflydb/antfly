@@ -369,24 +369,14 @@ extern "C" __global__ void termite_selected_token_logprobs_f32(
     for (unsigned int col = threadIdx.x; col < vocab_size; col += blockDim.x) {
         local_max = fmaxf(local_max, row_logits[col]);
     }
-    reduction[threadIdx.x] = local_max;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) reduction[threadIdx.x] = fmaxf(reduction[threadIdx.x], reduction[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    float row_max = reduction[0];
+{{selected_maximum}}
 
     float local_sum = 0.0f;
     for (unsigned int col = threadIdx.x; col < vocab_size; col += blockDim.x) {
         local_sum += expf(row_logits[col] - row_max);
     }
-    reduction[threadIdx.x] = local_sum;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        __syncthreads();
-    }
+{{selected_denominator}}
+
     if (threadIdx.x == 0) output[selected] = row_logits[token] - row_max - logf(reduction[0]);
 }
 // native-program:entry termite_deberta_scores_softmax_f32
@@ -426,13 +416,7 @@ extern "C" __global__ void termite_deberta_scores_softmax_f32(
         content_scores[score_base + ki] = score;
         local_max = fmaxf(local_max, score);
     }
-    reductions[tid] = local_max;
-    __syncthreads();
-    for (unsigned int stride = kThreads / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reductions[tid] = fmaxf(reductions[tid], reductions[tid + stride]);
-        __syncthreads();
-    }
-    const float max_score = reductions[0];
+{{relative_maximum}}
     float local_sum = 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += kThreads) {
         const float value = content_scores[score_base + ki];
@@ -440,12 +424,8 @@ extern "C" __global__ void termite_deberta_scores_softmax_f32(
         content_scores[score_base + ki] = probability;
         local_sum += probability;
     }
-    reductions[tid] = local_sum;
-    __syncthreads();
-    for (unsigned int stride = kThreads / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reductions[tid] += reductions[tid + stride];
-        __syncthreads();
-    }
+{{relative_denominator}}
+
     const float inv_sum = reductions[0] > 0.0f ? 1.0f / reductions[0] : 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += kThreads) content_scores[score_base + ki] *= inv_sum;
 }

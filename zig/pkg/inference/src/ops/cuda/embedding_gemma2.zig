@@ -274,7 +274,9 @@ pub const Module = struct {
     bf16_bshd_prefix_rf: driver.CUfunction = null,
     attention_split_merge: driver.CUfunction,
     attention_softmax: driver.CUfunction,
+    attention_softmax_narrow: driver.CUfunction,
     source_attention_softmax: driver.CUfunction,
+    source_attention_softmax_narrow: driver.CUfunction,
     matmul: driver.CUfunction,
     gelu_product: driver.CUfunction,
     gelu_mul_vjp: driver.CUfunction,
@@ -357,7 +359,9 @@ pub const Module = struct {
             .efficient_attention_hd256 = try function(ctx, m, "antfly_attention_efficient_bf16_hd256"),
             .attention_split_merge = try function(ctx, m, "antfly_attention_split_merge_bf16"),
             .attention_softmax = try function(ctx, m, "termite_embedding_gemma2_attention_softmax_bf16"),
+            .attention_softmax_narrow = try function(ctx, m, "antfly_score_softmax_rows_keys_legacy_bf16_warp256"),
             .source_attention_softmax = try function(ctx, m, "termite_softmax_scores_bf16_prefix"),
+            .source_attention_softmax_narrow = try function(ctx, m, "antfly_score_softmax_prefix_bf16_warp256"),
             .matmul = try function(ctx, m, "termite_embedding_gemma2_matmul_bf16"),
             .gelu_product = try function(ctx, m, "termite_embedding_gemma2_gelu_mul_bf16"),
             .gelu_mul_vjp = try function(ctx, m, "termite_embedding_gemma2_gelu_mul_vjp_f32"),
@@ -626,7 +630,7 @@ pub const Module = struct {
         var fp = floor;
         var args = [_]?*anyopaque{ @ptrCast(&ip), @ptrCast(&pp), @ptrCast(&mp), @ptrCast(&op), @ptrCast(&hp), @ptrCast(&fp) };
         try ctx.makeCurrent();
-        try ctx.launchKernel(self.audio_logmel, @intCast(frames), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
+        try ctx.launchKernel(self.audio_logmel, @intCast(frames), 1, 1, @import("antfly_tile").native_audio.Fft512.threads, 1, 1, 0, ctx.stream, &args, null);
         self.stats_.launches += 1;
         self.stats_.audio_frontend_fused_launches += 1;
     }
@@ -640,7 +644,7 @@ pub const Module = struct {
         var op = out.ptr;
         var args = [_]?*anyopaque{ @ptrCast(&ip), @ptrCast(&tp), @ptrCast(&op) };
         try ctx.makeCurrent();
-        try ctx.launchKernel(self.audio_fft512, @intCast(frames), 1, 1, 256, 1, 1, 0, ctx.stream, &args, null);
+        try ctx.launchKernel(self.audio_fft512, @intCast(frames), 1, 1, @import("antfly_tile").native_audio.Fft512.threads, 1, 1, 0, ctx.stream, &args, null);
         self.stats_.audio_fft_launches += 1;
         self.stats_.launches += 1;
     }
@@ -667,7 +671,7 @@ pub const Module = struct {
         var wo: u32 = @intCast(ow);
         var args = [_]?*anyopaque{ @ptrCast(&op), @ptrCast(&ip), @ptrCast(&wp), @ptrCast(&bp), @ptrCast(&ci), @ptrCast(&co), @ptrCast(&hh), @ptrCast(&ww), @ptrCast(&ho), @ptrCast(&wo) };
         try ctx.makeCurrent();
-        try ctx.launchKernel(if (bf16) self.audio_conv_bf16 else self.audio_conv_tiled, @intCast((oh * ow + 15) / 16), @intCast((oc + 15) / 16), @intCast(batch), if (bf16) 32 else 16, if (bf16) 1 else 16, 1, 0, ctx.stream, &args, null);
+        try ctx.launchKernel(if (bf16) self.audio_conv_bf16 else self.audio_conv_tiled, @intCast((oh * ow + 15) / 16), @intCast((oc + 15) / 16), @intCast(batch), if (bf16) 32 else @import("antfly_tile").native_convolution.Stencil3x3Stride2Tile16.threads[0], if (bf16) 1 else @import("antfly_tile").native_convolution.Stencil3x3Stride2Tile16.threads[1], 1, 0, ctx.stream, &args, null);
         self.stats_.launches += 1;
         if (bf16) self.stats_.audio_conv_bf16_launches += 1 else self.stats_.audio_conv_tiled_launches += 1;
     }
@@ -1324,7 +1328,9 @@ pub const Module = struct {
         var bi = batch_index;
         var tc = tile_capacity;
         var args = [_]?*anyopaque{ @ptrCast(&pp), @ptrCast(&sp), @ptrCast(&mp), @ptrCast(&s), @ptrCast(&qb), @ptrCast(&r), @ptrCast(&bi), @ptrCast(&tc) };
-        try launchShared(ctx, self.attention_softmax, &args, .{ rows * heads, 1, 1 }, .{ 256, 1, 1 }, 256 * 4);
+        const schedule = @import("antfly_tile").native_statistics.Bf16ScoreSoftmax;
+        const kernel = if (schedule.supportsNarrow(sequence, ctx.info.compute_major, ctx.info.compute_minor)) self.attention_softmax_narrow else self.attention_softmax;
+        try launchShared(ctx, kernel, &args, .{ rows * heads, 1, 1 }, .{ schedule.threads, 1, 1 }, schedule.threads * @sizeOf(f32));
         self.stats_.launches += 1;
     }
 
@@ -1346,7 +1352,9 @@ pub const Module = struct {
             .tile_capacity = tile_capacity,
         };
         var params = @import("launch_abi.zig").fieldsFor("SOFTMAX_SCORES_BF16_PREFIX", &arguments);
-        try launchShared(ctx, self.source_attention_softmax, &params, .{ query_count * heads, 1, 1 }, .{ 256, 1, 1 }, 256 * @sizeOf(f32));
+        const schedule = @import("antfly_tile").native_statistics.Bf16ScoreSoftmax;
+        const kernel = if (schedule.supportsNarrow(physical_sequence, ctx.info.compute_major, ctx.info.compute_minor)) self.source_attention_softmax_narrow else self.source_attention_softmax;
+        try launchShared(ctx, kernel, &params, .{ query_count * heads, 1, 1 }, .{ schedule.threads, 1, 1 }, schedule.threads * @sizeOf(f32));
         self.stats_.launches += 1;
     }
 
@@ -2074,6 +2082,64 @@ test "CUDA source score softmax masks only keys and publishes normalized BF16 on
         const expected: [3]u16 = if (row < 2) .{ 0x3f45, 0x3e6d, 0 } else .{ 0, 0, 0 };
         try std.testing.expectEqualSlices(u16, &expected, actual[(head * tile + row) * sequence ..][0..sequence]);
     };
+}
+
+test "CUDA source score softmax preserves narrow dispatch boundary and padded rows" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    const a = std.testing.allocator;
+    const rows = 3;
+    const tile = 5;
+    const heads = 2;
+    for ([_]usize{ 31, 270, 511, 512, 513, 846, 8192 }) |sequence| {
+        const n = heads * tile * sequence;
+        const input = try a.alloc(f32, n);
+        defer a.free(input);
+        const actual = try a.alloc(u16, n);
+        defer a.free(actual);
+        @memset(actual, 0x7fc5);
+        for (input, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 37 + 19) % 257)) - 128)) / 17.0;
+        const valid = sequence - 3;
+        // An excluded key must not enter either maximum or denominator.
+        for (0..heads * tile) |row| input[row * sequence + valid] = 1000;
+        var scores = try Buffer.alloc(&ctx, n * 4);
+        defer scores.free(&ctx);
+        var probs = try Buffer.alloc(&ctx, n * 2);
+        defer probs.free(&ctx);
+        errdefer ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        try scores.copyFromHost(&ctx, std.mem.sliceAsBytes(input));
+        try probs.copyFromHost(&ctx, std.mem.sliceAsBytes(actual));
+        try module.launchSourceAttentionSoftmax(&ctx, probs, scores, @intCast(sequence), @intCast(valid), 0, rows, heads, tile);
+        try probs.copyToHost(&ctx, std.mem.sliceAsBytes(actual));
+        try ctx.synchronize();
+        for (0..heads) |head| for (0..tile) |row| {
+            const base = (head * tile + row) * sequence;
+            if (row >= rows) {
+                for (actual[base..][0..sequence]) |v| try std.testing.expectEqual(@as(u16, 0x7fc5), v);
+                continue;
+            }
+            // Independent FP64 reference, distinct from the device tree.
+            var maximum: f64 = -std.math.inf(f64);
+            for (input[base..][0..valid]) |v| maximum = @max(maximum, v);
+            var sum: f64 = 0;
+            for (input[base..][0..valid]) |v| sum += @exp(@as(f64, v) - maximum);
+            for (0..valid) |key| {
+                const probability: f32 = @floatCast(@exp(@as(f64, input[base + key]) - maximum) / sum);
+                const expected: u16 = @truncate(@as(u32, @bitCast(@import("antfly_tile").fexpr.roundBf16Value(probability))) >> 16);
+                // One BF16 ULP admits vendor exp/reduction rounding while the
+                // separate frozen-kernel qualification requires bitwise parity.
+                const difference = @abs(@as(i32, actual[base + key]) - @as(i32, expected));
+                try std.testing.expect(difference <= 1);
+            }
+            for (actual[base + valid ..][0 .. sequence - valid]) |v| try std.testing.expectEqual(@as(u16, 0), v);
+        };
+    }
 }
 
 test "embeddinggemma2 CUDA contrastive shared reduction reuse preserves masked uniform objective and gradients" {

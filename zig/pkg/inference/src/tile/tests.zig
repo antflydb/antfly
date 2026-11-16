@@ -343,7 +343,7 @@ test {
 }
 
 test "native template tags preserve aggregate initializers and nested sections" {
-    const template = @import("source_template.zig");
+    const template = @import("antfly_tile").source_template;
     const actual = comptime template.render(
         "float x[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}}; " ++
             "Pair y = {{left, right}, {up, down}}; " ++

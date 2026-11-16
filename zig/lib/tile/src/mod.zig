@@ -31,3 +31,12 @@ pub const rows = @import("rows.zig");
 pub const conformance = @import("conformance.zig");
 pub const native_math = @import("native_math.zig");
 pub const native_normalization = @import("native_normalization.zig");
+pub const native_layout = @import("native_layout.zig");
+pub const native_statistics = @import("native_statistics.zig");
+
+pub const source_template = @import("source_template.zig");
+pub const native_convolution = @import("native_convolution.zig");
+pub const native_projection = @import("native_projection.zig");
+pub const native_audio = @import("native_audio.zig");
+pub const native_attention = @import("native_attention.zig");
+pub const native_sampling = @import("native_sampling.zig");

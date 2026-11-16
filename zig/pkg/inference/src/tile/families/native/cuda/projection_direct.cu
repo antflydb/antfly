@@ -748,10 +748,7 @@ extern "C" __global__ void termite_linear_q4_k_qkv_nobias_f32_tiled(ANTFLY_CUDA_
         partial[tid] = acc;
     }
     __syncthreads();
-    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
+    {{projection_tile_sum}}
     if (tid == 0u) dst[local] = partial[0];
 }
 // native-program:entry termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled
@@ -805,9 +802,6 @@ extern "C" __global__ void termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled(ANTFLY_
     }
     partial[tid] = acc;
     __syncthreads();
-    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
+    {{projection_tile_sum}}
     if (tid == 0u) dst[local] = partial[0];
 }

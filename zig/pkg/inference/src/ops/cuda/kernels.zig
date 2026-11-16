@@ -11002,13 +11002,15 @@ pub const KernelModule = struct {
             self.primitive_transpose_2d_f32 != null and
             !platform.env.getenvBoolDefault("TERMITE_CUDA_DISABLE_TILED_TRANSPOSE_2D", false))
         {
-            const tile_cols = (dims[1] + 31) / 32;
-            const tile_rows = (dims[0] + 31) / 32;
+            const transpose = @import("antfly_tile").native_layout;
+            const grid = transpose.Transpose.grid(dims[0], dims[1], 1) catch return error.InvalidCudaState;
+            const tile_cols: u32 = @intCast(grid[0]);
+            const tile_rows: u32 = @intCast(grid[1]);
             var rows_u32 = dims[0];
             var cols_u32 = dims[1];
             var tile_cols_mut = tile_cols;
             var params = launch_abi.addresses(.{ &output_ptr, &input_ptr, &rows_u32, &cols_u32, &tile_cols_mut });
-            return launchBlocks(self.primitive_transpose_2d_f32.?, ctx, @as(usize, tile_cols) * @as(usize, tile_rows), 256, &params);
+            return launchBlocks(self.primitive_transpose_2d_f32.?, ctx, @as(usize, tile_cols) * @as(usize, tile_rows), transpose.cuda_transpose.threads(), &params);
         }
         var count_u32 = try toU32(count);
         var rank_u32 = try toU32(rank);
@@ -11133,7 +11135,8 @@ pub const KernelModule = struct {
         head_dim: usize,
     ) driver_mod.Error!bool {
         const function = self.deberta_attention_stream_f32 orelse return false;
-        if (seq_len == 0 or seq_len > 512 or batch == 0 or num_heads == 0 or head_dim != 64) return false;
+        const schedule = @import("antfly_tile").native_attention.RelativeRow64;
+        if (!schedule.supports(batch, seq_len, num_heads, head_dim)) return false;
         const hidden = try checkedTensorElements(num_heads, head_dim);
         const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), hidden);
         const rel_count = try checkedTensorElements(2 * seq_len - 1, hidden);
@@ -11169,8 +11172,8 @@ pub const KernelModule = struct {
             @ptrCast(&num_heads_u32),
             @ptrCast(&head_dim_u32),
         };
-        const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), (seq_len + 7) / 8);
-        try launchBlocks(function, ctx, blocks, 256, &params);
+        const blocks = schedule.blocks(batch, seq_len, num_heads) catch return error.InvalidCudaState;
+        try launchBlocks(function, ctx, blocks, schedule.threads, &params);
         return true;
     }
 
@@ -17947,6 +17950,64 @@ fn smokeTurboquantKvFormat(
     }
 }
 
+// Ragged rows previously raced while reusing the maximum's shared slot.
+// Keep this fixture reachable from the native smoke command and CUDA tests so
+// running that test under Compute Sanitizer checks the real serving launch.
+fn smokeSelectedLogProbabilityRows(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    for ([_]usize{ 4, 33, 257, 4099 }) |width| {
+        const host = try allocator.alloc(f32, 2 * width);
+        defer allocator.free(host);
+        for (host, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 37 + 19) % 521)) - 260)) / 83;
+        const selected_rows = [_]u32{ 0, 1 };
+        const selected_tokens = [_]u32{ @intCast(width - 1), 0 };
+        var logits = try buffer_mod.DeviceBuffer.alloc(ctx, host.len * @sizeOf(f32));
+        defer logits.free(ctx);
+        var row_ids = try buffer_mod.DeviceBuffer.alloc(ctx, @sizeOf(@TypeOf(selected_rows)));
+        defer row_ids.free(ctx);
+        var token_ids = try buffer_mod.DeviceBuffer.alloc(ctx, @sizeOf(@TypeOf(selected_tokens)));
+        defer token_ids.free(ctx);
+        var output = try buffer_mod.DeviceBuffer.alloc(ctx, 2 * @sizeOf(f32));
+        defer output.free(ctx);
+        try logits.copyFromHost(ctx, std.mem.sliceAsBytes(host));
+        try row_ids.copyFromHost(ctx, std.mem.sliceAsBytes(&selected_rows));
+        try token_ids.copyFromHost(ctx, std.mem.sliceAsBytes(&selected_tokens));
+        try module.launchSelectedTokenLogprobsF32(ctx, output, logits, row_ids, token_ids, 2, 2, width);
+        try ctx.synchronize();
+        var actual: [2]f32 = undefined;
+        try output.copyToHost(ctx, std.mem.sliceAsBytes(&actual));
+        try ctx.synchronize();
+        var expected: [2]f32 = undefined;
+        for (0..2) |row| {
+            var maximum: f64 = -std.math.inf(f64);
+            for (host[row * width ..][0..width]) |value| maximum = @max(maximum, value);
+            var mass: f64 = 0;
+            for (host[row * width ..][0..width]) |value| mass += @exp(@as(f64, value) - maximum);
+            expected[row] = @floatCast(@as(f64, host[row * width + selected_tokens[row]]) - maximum - @log(mass));
+        }
+        try expectApproxSlice(&actual, &expected, 0.0001);
+    }
+}
+
+test "CUDA shared spatial reductions preserve cross and channel attention" {
+    if (!build_options.enable_cuda) return error.SkipZigTest;
+    smokeFlorence2Primitives(std.testing.allocator) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+}
+
+test "CUDA selected log probabilities preserve ragged row maxima" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var ctx = context_mod.CudaContext.initDefault() catch |err| switch (@as(anyerror, err)) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+    try smokeSelectedLogProbabilityRows(std.testing.allocator, &ctx, &module);
+}
+
 fn smokeBf16WeightPrimitives(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
     const rows: usize = 2;
     const in_dim: usize = 3;
@@ -18026,39 +18087,7 @@ fn smokeBf16WeightPrimitives(allocator: std.mem.Allocator, ctx: *context_mod.Cud
     try ctx.synchronize();
     try expectApproxSlice(embed_out, &expected_embed, 0.0001);
 
-    const logits_data = [_]f32{ 0.0, 1.0, 2.0, 3.0, 1.0, 0.0, -1.0, -2.0 };
-    const selected_rows = [_]u32{ 0, 1 };
-    const selected_tokens = [_]u32{ 3, 0 };
-    var logits = try buffer_mod.DeviceBuffer.alloc(ctx, logits_data.len * @sizeOf(f32));
-    defer logits.free(ctx);
-    var selected_rows_device = try buffer_mod.DeviceBuffer.alloc(ctx, selected_rows.len * @sizeOf(u32));
-    defer selected_rows_device.free(ctx);
-    var selected_tokens_device = try buffer_mod.DeviceBuffer.alloc(ctx, selected_tokens.len * @sizeOf(u32));
-    defer selected_tokens_device.free(ctx);
-    var selected_logps_device = try buffer_mod.DeviceBuffer.alloc(ctx, selected_tokens.len * @sizeOf(f32));
-    defer selected_logps_device.free(ctx);
-    try logits.copyFromHost(ctx, std.mem.sliceAsBytes(&logits_data));
-    try selected_rows_device.copyFromHost(ctx, std.mem.sliceAsBytes(&selected_rows));
-    try selected_tokens_device.copyFromHost(ctx, std.mem.sliceAsBytes(&selected_tokens));
-    try module.launchSelectedTokenLogprobsF32(
-        ctx,
-        selected_logps_device,
-        logits,
-        selected_rows_device,
-        selected_tokens_device,
-        selected_tokens.len,
-        2,
-        4,
-    );
-    try ctx.synchronize();
-    var selected_logps: [2]f32 = undefined;
-    try selected_logps_device.copyToHost(ctx, std.mem.sliceAsBytes(&selected_logps));
-    try ctx.synchronize();
-    const expected_selected = [_]f32{
-        3.0 - @log(@exp(0.0) + @exp(1.0) + @exp(2.0) + @exp(3.0)),
-        1.0 - @log(@exp(1.0) + @exp(0.0) + @exp(-1.0) + @exp(-2.0)),
-    };
-    try expectApproxSlice(&selected_logps, &expected_selected, 0.0001);
+    try smokeSelectedLogProbabilityRows(allocator, ctx, module);
 
     const q_out_dim: usize = 2;
     const kv_out_dim: usize = 1;

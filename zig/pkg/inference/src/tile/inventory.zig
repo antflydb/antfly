@@ -17,7 +17,7 @@
 const std = @import("std");
 const Region = @import("region.zig").Region;
 const schedules = @import("q4_q8_schedule.zig");
-pub const Entry = struct { family_region: []const u8, output: []const u8, bytes: usize, sha256: []const u8, owner: enum { tile_region, quant_region, generated_file } };
+pub const Entry = struct { family_region: []const u8, output: []const u8, bytes: usize, sha256: []const u8, owner: enum { tile_region, quant_region, generated_file }, programs: []const @import("region.zig").ProgramUse = &.{}, algorithm_sharing: enum { unclassified, shared_phases, shared_body } = .unclassified };
 const Row = struct { schedule: schedules.Schedule, threads: usize, static_shared_bytes: usize, abi: []const u8 };
 
 pub fn render(allocator: std.mem.Allocator, regions: []const Region, extra: []const Entry) ![]u8 {
@@ -32,7 +32,10 @@ pub fn render(allocator: std.mem.Allocator, regions: []const Region, extra: []co
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(region.data, &digest, .{});
         const hex = std.fmt.bytesToHex(digest, .lower);
-        entry.* = .{ .family_region = region.begin[begin..end], .output = region.path, .bytes = region.data.len, .sha256 = try allocator.dupe(u8, &hex), .owner = .tile_region };
+        entry.* = .{ .family_region = region.begin[begin..end], .output = region.path, .bytes = region.data.len, .sha256 = try allocator.dupe(u8, &hex), .owner = .tile_region, .programs = region.programs };
+        for (region.programs) |use| {
+            if (entry.algorithm_sharing != .shared_body) entry.algorithm_sharing = if (use.scope == .body) .shared_body else .shared_phases;
+        }
         initialized += 1;
     }
     @memcpy(entries[regions.len..], extra);

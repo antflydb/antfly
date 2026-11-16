@@ -144,10 +144,7 @@ extern "C" __global__ void termite_attention_f32_bert_prefill_s256_hd64(ANTFLY_C
     }
     __syncthreads();
     #pragma unroll
-    for (unsigned int stride = 64u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) scratch[tid] = __fadd_rn(scratch[tid], scratch[tid + stride]);
-        __syncthreads();
-    }
+    {{attention_sum_separate}}
     if (tid == 0u) shared_denom = scratch[0];
     __syncthreads();
 
@@ -411,11 +408,10 @@ extern "C" __global__ void termite_cross_attention_q1_f32(
     scratch[tid] = local_max;
     __syncthreads();
 
-    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
-        __syncthreads();
-    }
+    {{cross_row_maximum}}
     float max_score = scratch[0];
+    // Order every maximum read before any warp reuses scratch for its sum.
+    __syncthreads();
 
     float local_denom = 0.0f;
     for (unsigned int ki = tid; ki < enc_seq; ki += blockDim.x) {
@@ -427,10 +423,7 @@ extern "C" __global__ void termite_cross_attention_q1_f32(
     scratch[tid] = local_denom;
     __syncthreads();
 
-    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) scratch[tid] += scratch[tid + stride];
-        __syncthreads();
-    }
+    {{cross_row_sum}}
     float denom = scratch[0];
 
     for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
@@ -497,11 +490,10 @@ extern "C" __global__ void termite_channel_scores_softmax_f32(
     }
     scratch[tid] = value;
     __syncthreads();
-    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
-        __syncthreads();
-    }
+    {{channel_row_maximum}}
     float max_score = scratch[0];
+    // Order every maximum read before any warp reuses scratch for its sum.
+    __syncthreads();
     float exp_value = 0.0f;
     if (tid < channels_per_group) {
         exp_value = expf(row_scores[tid] - max_score);
@@ -509,10 +501,7 @@ extern "C" __global__ void termite_channel_scores_softmax_f32(
     }
     scratch[tid] = exp_value;
     __syncthreads();
-    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) scratch[tid] += scratch[tid + stride];
-        __syncthreads();
-    }
+    {{channel_row_sum}}
     float denom = scratch[0];
     if (tid < channels_per_group) {
         unsigned int score_idx = ((b * groups + g) * channels_per_group + qc) * channels_per_group + tid;
@@ -1453,9 +1442,7 @@ extern "C" __global__ void termite_deberta_attention_fused_f32(ANTFLY_CUDA_DEBER
                 for (unsigned int j = lane; j < head_dim; j += 32u) {
                     const float q_value = q[q_base + j];
                     const float k_value = k[k_base + j];
-                    partial += q_value * k_value;
-                    partial += q_value * k_r[rel_base + j];
-                    partial += q_r[rel_base + j] * k_value;
+{{relative_products}}
                 }
             }
             partial += __shfl_down_sync(0xffffffffu, partial, 16);
@@ -1472,30 +1459,15 @@ extern "C" __global__ void termite_deberta_attention_fused_f32(ANTFLY_CUDA_DEBER
 
     float local_max = -3.402823466e+38f;
     for (unsigned int ki = tid; ki < seq_len; ki += kThreads) local_max = fmaxf(local_max, probabilities[ki]);
-    reductions[tid] = local_max;
-    __syncthreads();
-    for (unsigned int stride = kThreads / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reductions[tid] = fmaxf(reductions[tid], reductions[tid + stride]);
-        __syncthreads();
-    }
-    const float max_score = reductions[0];
-    // Every warp must consume the maximum before thread 0 reuses this
-    // shared location for its denominator partial. Ragged/long rows can
-    // otherwise observe the partial sum as their maximum.
-    __syncthreads();
-
+{{relative_maximum}}
     float local_sum = 0.0f;
     for (unsigned int ki = tid; ki < seq_len; ki += kThreads) {
         const float probability = mask[b * seq_len + ki] != 0ll ? expf(probabilities[ki] - max_score) : 0.0f;
         probabilities[ki] = probability;
         local_sum += probability;
     }
-    reductions[tid] = local_sum;
-    __syncthreads();
-    for (unsigned int stride = kThreads / 2u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) reductions[tid] += reductions[tid + stride];
-        __syncthreads();
-    }
+{{relative_denominator}}
+
     const float denom = reductions[0];
 
     if (tid < head_dim) {
@@ -2035,9 +2007,9 @@ extern "C" __global__ void termite_deberta_attention_stream_f32(
     unsigned int num_heads,
     unsigned int head_dim
 ) {
-    constexpr unsigned int kWarpsPerBlock = 8u;
-    constexpr unsigned int kHeadDim = 64u;
-    if (seq_len == 0u || seq_len > 512u || head_dim != kHeadDim || blockDim.x != 256u) return;
+    constexpr unsigned int kWarpsPerBlock = {{relative_queries}}u;
+    constexpr unsigned int kHeadDim = {{relative_head_dim}}u;
+    if (seq_len == 0u || seq_len > {{relative_max_sequence}}u || head_dim != kHeadDim || blockDim.x != {{relative_threads}}u) return;
 
     const unsigned int lane = threadIdx.x & 31u;
     const unsigned int warp = threadIdx.x >> 5u;
@@ -2073,12 +2045,7 @@ extern "C" __global__ void termite_deberta_attention_stream_f32(
         const float qr1 = q_r[rel_base + lane + 32u];
         // Preserve the fused FP32 kernel's per-lane accumulation order.
         float score = 0.0f;
-        score += q0 * k0;
-        score += q0 * kr0;
-        score += qr0 * k0;
-        score += q1 * k1;
-        score += q1 * kr1;
-        score += qr1 * k1;
+{{relative_products_pair}}
         score += __shfl_down_sync(0xffffffffu, score, 16);
         score += __shfl_down_sync(0xffffffffu, score, 8);
         score += __shfl_down_sync(0xffffffffu, score, 4);

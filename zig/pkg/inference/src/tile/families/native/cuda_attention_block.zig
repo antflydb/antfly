@@ -23,3 +23,26 @@ pub const source_0 =
     \\}
     \\
 ;
+
+// Historical local-attention symbol; the numerical body belongs to the
+// same static full/local block program as the ordinary attention export.
+pub const source_1 =
+    \\extern "C" __global__ void termite_laya_local_attention_f32(
+    \\    float* dst,
+    \\    const float* q,
+    \\    const float* k,
+    \\    const float* v,
+    \\    const long long* mask,
+    \\    unsigned int batch,
+    \\    unsigned int seq_len,
+    \\    unsigned int num_heads,
+    \\    unsigned int head_dim,
+    \\    unsigned int radius
+    \\) {
+    \\    constexpr bool Local = true;
+    \\    const unsigned int head_major = 0u, causal = 0u, has_mask = 1u, bias_mode = 0u;
+    \\    const float* bias = nullptr;
+    \\#include "../kernels/block_local_attention.cuh"
+    \\}
+    \\
+;

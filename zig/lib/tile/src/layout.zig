@@ -202,3 +202,47 @@ pub const DenseIndex4 = struct {
         return std.fmt.comptimePrint("    {s} {s} = idx % {s};\n    {s} tmp = idx / {s};\n    {s} {s} = tmp % {s};\n    tmp /= {s};\n    {s} {s} = tmp % {s};\n    {s} {s} = tmp / {s};", .{ integer, d.axes[0], d.extents[0], integer, d.extents[0], integer, d.axes[1], d.extents[1], d.extents[1], integer, d.axes[2], d.extents[2], integer, d.axes[3], d.extents[2] });
     }
 };
+
+/// Page table entries are either block numbers (CUDA TQ) or token bases
+/// (Metal). Widened/capacity-checked and historical wrapping-U32 publication
+/// are distinct policies; sharing addressing must not interchange them.
+pub const PageTable = struct {
+    pub const Unit = enum { blocks, token_bases };
+    unit: Unit,
+    pub const Native = struct {
+        wide: bool,
+        page_size: []const u8,
+        block_count: []const u8,
+        capacity: []const u8 = "physical_token_capacity",
+        contiguous_flag: []const u8 = "p.contiguous_blocks",
+        contiguous_base: []const u8 = "p.contiguous_base_token",
+    };
+    pub fn native(comptime p: PageTable, comptime n: Native) []const u8 {
+        return @import("source_template.zig").render(
+            \\{{#wide}}    unsigned long long physical = (unsigned long long)logical_token;
+            \\    if (block_table != 0 && {{count}} != 0u && {{size}} != 0u) {
+            \\{{/wide}}{{^wide}}    if ({{contiguous}} != 0u) return {{base}} + logical_token;
+            \\{{/wide}}    {{u}} block_index = logical_token / {{size}};
+            \\    if (block_index >= {{count}}) return 0xffffffffu;
+            \\    {{u}} token_offset = logical_token - block_index * {{size}};
+            \\{{#wide}}        const unsigned long long physical_block = (unsigned long long)block_table[block_index];
+            \\        physical = physical_block{{#blocks}} * (unsigned long long){{size}}{{/blocks}} +
+            \\            (unsigned long long)token_offset;
+            \\    }
+            \\    if (physical > 0xffffffffull ||
+            \\        physical >= (unsigned long long){{capacity}}) return 0xffffffffu;
+            \\    return (unsigned int)physical;
+            \\{{/wide}}{{^wide}}    return block_table[block_index]{{#blocks}} * {{size}}{{/blocks}} + token_offset;
+            \\{{/wide}}
+        , .{ .wide = n.wide, .blocks = p.unit == .blocks, .u = if (n.wide) "unsigned int" else "uint", .count = n.block_count, .size = n.page_size, .capacity = n.capacity, .contiguous = n.contiguous_flag, .base = n.contiguous_base });
+    }
+    pub fn map(p: PageTable, logical: u32, table: []const u32, page_size: u32, capacity: u32) ?u32 {
+        if (page_size == 0) return null;
+        const block = logical / page_size;
+        if (block >= table.len) return null;
+        const base: u64 = @as(u64, table[block]) * (if (p.unit == .blocks) @as(u64, page_size) else 1);
+        const physical = base + logical % page_size;
+        if (physical >= capacity or physical > std.math.maxInt(u32)) return null;
+        return @intCast(physical);
+    }
+};

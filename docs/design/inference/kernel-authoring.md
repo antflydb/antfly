@@ -56,6 +56,32 @@ statistics algorithm and affine association explicitly; a centered variance
 pass, raw-moment tree and Welford recurrence are not interchangeable. A family
 may share its exports and epilogue while retaining each reduction schedule.
 
+Use `native_statistics.Tree` for matching shared-memory halving stages and
+`native_layout.Program` for dense row transforms/first-match selection. Preserve
+the existing branch-versus-select schedule, index bounds, mask storage and
+barriers in their bindings. These are shared algorithm owners; splitting an
+unchanged native source through `native_sources.zig` is only source packaging.
+See [the migration plan](shared-native-kernel-programs.md) before adding another
+algorithm vocabulary or describing generated regions as shared implementations.
+
+The shared core also owns ordered scalar/strided dots (`native_projection.Dot`),
+GRU arithmetic (`native_math.Gru`), attention state/window rules
+(`native_attention`), page reconstruction (`layout.PageTable`), and FFT complex
+products/butterflies (`native_audio`). `native_convolution.Direct` specializes
+1D as a unit-width spatial axis; preserve the caller's signedness and bias
+policies. Native CUDA fixed-size FFT and sparse mel arithmetic use `native_audio` too;
+vendor FFT and distinct MMA schedules remain separate choices.
+Transpose's descriptor generates launch constants for the production host
+adapters. Window packing retains distinct batched-remainder and derived-window
+decompositions: substituting the latter regressed Metal timing in qualification.
+
+Attach `region.shared` provenance to the actual consuming source indices and
+compatibility exports. State whether the program owns a phase or a full body;
+the inventory verifier fingerprints only owners present in the build inputs.
+Missing provenance is unclassified, rather than evidence that a native body is
+shared or unused. Do not relabel a raw template as a shared algorithm to raise
+coverage.
+
 Use operation, storage and schedule names for new helpers, entrypoints and source
 owners. For example, `antfly_qkv_rope_two_axis_bf16` describes its contract;
 a model-prefixed copy would hide that reuse opportunity. Keep shape variants

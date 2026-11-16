@@ -16,24 +16,53 @@
 //! Qualified native program instances and specialization exports.
 
 const program = @import("../../native_program.zig");
+const tile = @import("antfly_tile");
+const phases = .{
+    .uniform = tile.native_sampling.uniform("i", "p.seed"),
+    .candidate = (tile.native_sampling.TopK{ .count = "candidate_count", .value = "scaled", .id = "i" }).insert(),
+    .topk = (tile.native_sampling.TopK{ .count = "top_k", .value = "scaled", .id = "i" }).insert(),
+    .merge = (tile.native_sampling.TopK{ .count = "top_k", .value = "v", .id = "partial_ids[i]" }).insert(),
+};
+const trees = .{
+    .maximum = tile.native_statistics.Tree.native(.{
+        .integer = "uint",
+        .lane = "uint(tid)",
+        .threads = "uint(tg_size)",
+        .barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        .operation = .maximum,
+        .planes = &.{ .{ .partial = "shared", .value = "best" }, .{
+            .partial = "shared",
+            .value = "special",
+            .offset = "uint(tg_size)",
+            .when = "p.defer_monotonic_max != 0u",
+        } },
+    }),
+    .sum = tile.native_statistics.Tree.native(.{
+        .integer = "uint",
+        .lane = "uint(tid)",
+        .threads = "uint(tg_size)",
+        .barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        .planes = &.{.{ .partial = "shared", .value = "subtotal" }},
+    }),
+};
 
 pub const source_0 =
-    program.metal(
+    program.metal(program.render(
         \\kernel void termite_sample_nucleus_max_partials(device const float *logits [[buffer(0)]], device float *partials [[buffer(1)]], constant termite_metal_sample_logits_params &p [[buffer(2)]], device const termite_metal_penalty_entry *penalties [[buffer(3)]], threadgroup float *shared [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]], uint block [[threadgroup_position_in_grid]]) {
         \\    const uint block_size = 1024u; const uint block_count = (p.out_dim + block_size - 1u) / block_size; uint start = block * block_size; uint end = min(start + block_size, p.out_dim); float best = -INFINITY; float special = -INFINITY;
         \\    for (uint i = start + uint(tid); i < end; i += uint(tg_size)) { float raw = logits[i]; if (p.defer_monotonic_max != 0u && isfinite(raw)) { best = max(best, raw); } else { if (p.final_logit_softcap > 0.0f) raw = p.final_logit_softcap * tanh(raw / p.final_logit_softcap); float adjusted = termite_apply_sampling_penalties(raw, i, penalties, p.penalty_count, p); float scaled = adjusted / p.temperature; if (isfinite(scaled)) { if (p.defer_monotonic_max != 0u) special = max(special, scaled); else best = max(best, scaled); } } }
-        \\    shared[tid] = best; if (p.defer_monotonic_max != 0u) shared[uint(tg_size) + uint(tid)] = special; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = uint(tg_size) >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) { shared[tid] = max(shared[tid], shared[uint(tid) + stride]); if (p.defer_monotonic_max != 0u) shared[uint(tg_size) + uint(tid)] = max(shared[uint(tg_size) + uint(tid)], shared[uint(tg_size) + uint(tid) + stride]); } threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0u) { partials[block] = shared[0]; if (p.defer_monotonic_max != 0u) partials[block_count + block] = shared[uint(tg_size)]; }
+        \\    {{maximum}} if (tid == 0u) { partials[block] = shared[0]; if (p.defer_monotonic_max != 0u) partials[block_count + block] = shared[uint(tg_size)]; }
         \\}
         \\kernel void termite_sample_nucleus_max_reduce(device const float *partials [[buffer(0)]], device termite_metal_nucleus_state *state [[buffer(1)]], constant uint &block_count [[buffer(2)]], constant termite_metal_sample_logits_params &p [[buffer(3)]], threadgroup float *shared [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]]) {
-        \\    float best = -INFINITY; float special = -INFINITY; for (uint i = uint(tid); i < block_count; i += uint(tg_size)) { best = max(best, partials[i]); if (p.defer_monotonic_max != 0u) special = max(special, partials[block_count + i]); } shared[tid] = best; if (p.defer_monotonic_max != 0u) shared[uint(tg_size) + uint(tid)] = special; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = uint(tg_size) >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) { shared[tid] = max(shared[tid], shared[uint(tid) + stride]); if (p.defer_monotonic_max != 0u) shared[uint(tg_size) + uint(tid)] = max(shared[uint(tg_size) + uint(tid)], shared[uint(tg_size) + uint(tid) + stride]); } threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0u) { float reduced = shared[0]; if (p.defer_monotonic_max != 0u) { if (isfinite(reduced)) { float transformed = p.final_logit_softcap * tanh(reduced / p.final_logit_softcap); reduced = transformed / p.temperature; } reduced = max(reduced, shared[uint(tg_size)]); } state->max_logit = reduced; state->block_count = block_count; }
+        \\    float best = -INFINITY; float special = -INFINITY; for (uint i = uint(tid); i < block_count; i += uint(tg_size)) { best = max(best, partials[i]); if (p.defer_monotonic_max != 0u) special = max(special, partials[block_count + i]); } {{maximum}} if (tid == 0u) { float reduced = shared[0]; if (p.defer_monotonic_max != 0u) { if (isfinite(reduced)) { float transformed = p.final_logit_softcap * tanh(reduced / p.final_logit_softcap); reduced = transformed / p.temperature; } reduced = max(reduced, shared[uint(tg_size)]); } state->max_logit = reduced; state->block_count = block_count; }
         \\}
         \\kernel void termite_sample_nucleus_probs_partials(device const float *logits [[buffer(0)]], device float *probs [[buffer(1)]], device float *partials [[buffer(2)]], device const termite_metal_nucleus_state *state [[buffer(3)]], constant termite_metal_sample_logits_params &p [[buffer(4)]], device const termite_metal_penalty_entry *penalties [[buffer(5)]], threadgroup float *shared [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]], uint block [[threadgroup_position_in_grid]]) {
         \\    const uint block_size = 1024u; uint start = block * block_size; uint end = min(start + block_size, p.out_dim); float subtotal = 0.0f;
         \\    for (uint i = start + uint(tid); i < end; i += uint(tg_size)) { float raw = logits[i]; if (p.final_logit_softcap > 0.0f) raw = p.final_logit_softcap * tanh(raw / p.final_logit_softcap); float adjusted = termite_apply_sampling_penalties(raw, i, penalties, p.penalty_count, p); float scaled = adjusted / p.temperature; float prob = isfinite(scaled) ? exp(scaled - state->max_logit) : 0.0f; probs[i] = prob; subtotal += prob; }
-        \\    shared[tid] = subtotal; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = uint(tg_size) >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) shared[tid] += shared[uint(tid) + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0u) partials[block] = shared[0];
+        \\    {{sum}} if (tid == 0u) partials[block] = shared[0];
         \\}
         \\kernel void termite_sample_nucleus_sum_reduce(device const float *partials [[buffer(0)]], device termite_metal_nucleus_state *state [[buffer(1)]], constant float &top_p [[buffer(2)]], threadgroup float *shared [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]]) {
-        \\    float subtotal = 0.0f; for (uint i = uint(tid); i < state->block_count; i += uint(tg_size)) subtotal += partials[i]; shared[tid] = subtotal; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = uint(tg_size) >> 1u; stride > 0u; stride >>= 1u) { if (uint(tid) < stride) shared[tid] += shared[uint(tid) + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); } if (tid == 0u) { state->total_mass = shared[0]; state->target_mass = top_p * shared[0]; state->mass_above = 0.0f; state->prefix = 0u; state->cutoff_key = 0u; state->pass = 0u; }
+        \\    float subtotal = 0.0f; for (uint i = uint(tid); i < state->block_count; i += uint(tg_size)) subtotal += partials[i]; {{sum}} if (tid == 0u) { state->total_mass = shared[0]; state->target_mass = top_p * shared[0]; state->mass_above = 0.0f; state->prefix = 0u; state->cutoff_key = 0u; state->pass = 0u; }
         \\}
         \\kernel void termite_sample_nucleus_radix_histogram_serial(device const float *logits [[buffer(0)]], device const float *probs [[buffer(1)]], device float *histograms [[buffer(2)]], device const termite_metal_nucleus_state *state [[buffer(3)]], constant termite_metal_sample_logits_params &p [[buffer(4)]], device const termite_metal_penalty_entry *penalties [[buffer(5)]], ushort tid [[thread_index_in_threadgroup]], uint block [[threadgroup_position_in_grid]]) {
         \\    if (tid >= 16u) return; const uint block_size = 1024u; uint start = block * block_size; uint end = min(start + block_size, p.out_dim); uint shift = 28u - state->pass * 4u; uint prefix_mask = state->pass == 0u ? 0u : (0xffffffffu << (32u - state->pass * 4u)); float mass = 0.0f;
@@ -46,20 +75,20 @@ pub const source_0 =
         \\    if (tid < 16u) { float mass = 0.0f; uint simdgroup_count = (uint(tg_size) + 31u) >> 5u; for (uint group = 0u; group < simdgroup_count; ++group) mass += simd_histograms[group * 16u + uint(tid)]; histograms[block * 16u + uint(tid)] = mass; }
         \\}
         \\
-    );
+    , trees));
 
 pub const source_1 =
-    program.metal(
+    program.metal(program.render(
         \\kernel void termite_sample_nucleus_gumbel_partials(device const float *probs [[buffer(0)]], device float *partial_values [[buffer(1)]], device uint *partial_ids [[buffer(2)]], device const termite_metal_nucleus_state *state [[buffer(3)]], constant termite_metal_sample_logits_params &p [[buffer(4)]], threadgroup float *sh_vals [[threadgroup(0)]], threadgroup uint *sh_ids [[threadgroup(1)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]], uint block [[threadgroup_position_in_grid]]) {
         \\    const uint block_size = 1024u; uint start = block * block_size; uint end = min(start + block_size, p.out_dim); float best = -INFINITY; uint best_idx = 0xffffffffu;
-        \\    for (uint i = start + uint(tid); i < end; i += uint(tg_size)) { float prob = probs[i]; if (!(prob > 0.0f) || as_type<uint>(prob) < state->cutoff_key) continue; uint h = (i ^ p.seed) * 0x9E3779B9u; h ^= h >> 16; h *= 0x85EBCA6Bu; h ^= h >> 13; h *= 0xC2B2AE35u; h ^= h >> 16; float u = (float(h >> 8) + 0.5f) * (1.0f / 16777216.0f); float score = log(prob) - log(-log(u)); if (score > best || (score == best && i < best_idx)) { best = score; best_idx = i; } }
+        \\    for (uint i = start + uint(tid); i < end; i += uint(tg_size)) { float prob = probs[i]; if (!(prob > 0.0f) || as_type<uint>(prob) < state->cutoff_key) continue; {{uniform}} float score = log(prob) - log(-log(u)); if (score > best || (score == best && i < best_idx)) { best = score; best_idx = i; } }
         \\    sh_vals[tid] = best; sh_ids[tid] = best_idx; threadgroup_barrier(mem_flags::mem_threadgroup); termite_argmax_partial_tree(sh_vals, sh_ids, tid, tg_size); if (tid == 0u) { bool invalid = !(state->total_mass > 0.0f) || !isfinite(state->total_mass); partial_values[block] = invalid && block == 0u ? NAN : sh_vals[0]; partial_ids[block] = invalid && block == 0u ? 0xffffffffu : sh_ids[0]; }
         \\}
         \\
-    );
+    , phases));
 
 pub const source_2 =
-    program.metal(
+    program.metal(program.render(
         \\kernel void termite_sample_gumbel_partials(device const float *logits [[buffer(0)]], device float *partial_values [[buffer(1)]], device uint *partial_ids [[buffer(2)]], constant termite_metal_sample_logits_params &p [[buffer(3)]], device const termite_metal_penalty_entry *penalties [[buffer(4)]], threadgroup float *sh_vals [[threadgroup(0)]], threadgroup uint *sh_ids [[threadgroup(1)]], ushort tid [[thread_index_in_threadgroup]], ushort tg_size [[threads_per_threadgroup]], uint block [[threadgroup_position_in_grid]]) {
         \\    const uint block_size = 1024u;
         \\    uint start = block * block_size;
@@ -71,8 +100,7 @@ pub const source_2 =
         \\        float raw = logits[i];
         \\        if (p.final_logit_softcap > 0.0f) raw = p.final_logit_softcap * tanh(raw / p.final_logit_softcap);
         \\        float logit = termite_apply_sampling_penalties(raw, i, penalties, p.penalty_count, p);
-        \\        uint h = (i ^ p.seed) * 0x9E3779B9u; h ^= h >> 16; h *= 0x85EBCA6Bu; h ^= h >> 13; h *= 0xC2B2AE35u; h ^= h >> 16;
-        \\        float u = (float(h >> 8) + 0.5f) * (1.0f / 16777216.0f);
+        \\        {{uniform}}
         \\        float score = logit * inv_temp - log(-log(u));
         \\        if (score > best || (score == best && i < best_idx)) { best = score; best_idx = i; }
         \\    }
@@ -100,15 +128,7 @@ pub const source_2 =
         \\        for (uint i = 0u; i < p.out_dim; ++i) {
         \\            float adjusted = termite_apply_sampling_penalties(logits[i], i, penalties, p.penalty_count, p);
         \\            float scaled = (p.temperature > 0.0f) ? (adjusted / p.temperature) : adjusted;
-        \\            if (scaled <= top_vals[candidate_count - 1u]) continue;
-        \\            uint insert_at = candidate_count - 1u;
-        \\            while (insert_at > 0u && scaled > top_vals[insert_at - 1u]) {
-        \\                top_vals[insert_at] = top_vals[insert_at - 1u];
-        \\                top_idx[insert_at] = top_idx[insert_at - 1u];
-        \\                insert_at -= 1u;
-        \\            }
-        \\            top_vals[insert_at] = scaled;
-        \\            top_idx[insert_at] = i;
+        \\            {{candidate}}
         \\        }
         \\        cutoff = top_vals[candidate_count - 1u];
         \\    }
@@ -189,15 +209,7 @@ pub const source_2 =
         \\    for (uint i = start; i < end; ++i) {
         \\        float adjusted = termite_apply_sampling_penalties(logits[i], i, penalties, p.penalty_count, p);
         \\        float scaled = (p.temperature > 0.0f) ? (adjusted / p.temperature) : adjusted;
-        \\        if (scaled <= top_vals[top_k - 1u]) continue;
-        \\        uint insert_at = top_k - 1u;
-        \\        while (insert_at > 0u && scaled > top_vals[insert_at - 1u]) {
-        \\            top_vals[insert_at] = top_vals[insert_at - 1u];
-        \\            top_idx[insert_at] = top_idx[insert_at - 1u];
-        \\            insert_at -= 1u;
-        \\        }
-        \\        top_vals[insert_at] = scaled;
-        \\        top_idx[insert_at] = i;
+        \\        {{topk}}
         \\    }
         \\    uint base = block * top_k;
         \\    for (uint i = 0u; i < top_k; ++i) {
@@ -215,15 +227,7 @@ pub const source_2 =
         \\    for (uint i = 0u; i < top_k; ++i) { top_vals[i] = -INFINITY; top_idx[i] = 0u; }
         \\    for (uint i = 0u; i < p.candidate_count; ++i) {
         \\        float v = partial_values[i];
-        \\        if (v <= top_vals[top_k - 1u]) continue;
-        \\        uint insert_at = top_k - 1u;
-        \\        while (insert_at > 0u && v > top_vals[insert_at - 1u]) {
-        \\            top_vals[insert_at] = top_vals[insert_at - 1u];
-        \\            top_idx[insert_at] = top_idx[insert_at - 1u];
-        \\            insert_at -= 1u;
-        \\        }
-        \\        top_vals[insert_at] = v;
-        \\        top_idx[insert_at] = partial_ids[i];
+        \\        {{merge}}
         \\    }
         \\    float best_scaled = top_vals[0];
         \\    uint best_idx = top_idx[0];
@@ -270,4 +274,4 @@ pub const source_2 =
         \\    output[0] = best_idx;
         \\}
         \\
-    );
+    , phases));

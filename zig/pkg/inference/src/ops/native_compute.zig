@@ -14449,7 +14449,7 @@ fn writePreparedQ4KBlock(
     std.debug.assert(dest.len == prepared_q4_k_block_bytes);
     const d = decodeFp16Le(raw_block[0], raw_block[1]);
     const dmin = decodeFp16Le(raw_block[2], raw_block[3]);
-    unpackQ4KScaleMinsU8(raw_block[4..16], scales_out, mins_out);
+    @import("../graph/quant_recipe.zig").unpackScaleMinHeader(u8, raw_block[4..16], scales_out, mins_out);
     for (0..8) |i| {
         writeF32Le(dest[prepared_q4_k_dsc_offset + i * 4 ..][0..4], d * @as(f32, @floatFromInt(scales_out[i])));
         writeF32Le(dest[prepared_q4_k_dmn_offset + i * 4 ..][0..4], dmin * @as(f32, @floatFromInt(mins_out[i])));
@@ -14466,7 +14466,7 @@ fn writePreparedQ5KBlock(
     std.debug.assert(dest.len == prepared_q4_k_block_bytes);
     const d = decodeFp16Le(raw_block[0], raw_block[1]);
     const dmin = decodeFp16Le(raw_block[2], raw_block[3]);
-    unpackQ4KScaleMinsU8(raw_block[4..16], scales_out, mins_out);
+    @import("../graph/quant_recipe.zig").unpackScaleMinHeader(u8, raw_block[4..16], scales_out, mins_out);
     for (0..8) |i| {
         writeF32Le(dest[prepared_q4_k_dsc_offset + i * 4 ..][0..4], d * @as(f32, @floatFromInt(scales_out[i])));
         writeF32Le(dest[prepared_q4_k_dmn_offset + i * 4 ..][0..4], dmin * @as(f32, @floatFromInt(mins_out[i])));
@@ -33513,7 +33513,7 @@ fn dotQ5_KBlock(input_block: []const f32, block: []const u8) f32 {
 
     var scs: [8]f32 = undefined;
     var mins: [8]f32 = undefined;
-    unpackQ4KScaleMins(scales, &scs, &mins);
+    @import("../graph/quant_recipe.zig").unpackScaleMinHeader(f32, scales, &scs, &mins);
 
     const mask_0f: U8xN = @splat(0x0F);
     const mask_01: U8xN = @splat(0x01);
@@ -33550,7 +33550,7 @@ fn dotQ4_KBlock(input_block: []const f32, block: []const u8) f32 {
 
     var scs: [8]f32 = undefined;
     var mins: [8]f32 = undefined;
-    unpackQ4KScaleMins(scales, &scs, &mins);
+    @import("../graph/quant_recipe.zig").unpackScaleMinHeader(f32, scales, &scs, &mins);
 
     const mask_0f: U8xN = @splat(0x0F);
     var acc: F32xN = @splat(0.0);
@@ -34817,28 +34817,6 @@ fn dotQ6_KQ8_KBlock(q8_block: []const u8, q6_block: []const u8) f32 {
         acc += (x_d * scale) * @as(f32, @floatFromInt(centered_dot));
     }
     return acc;
-}
-
-fn unpackQ4KScaleMins(scales: []const u8, scs: *[8]f32, mins: *[8]f32) void {
-    for (0..4) |j| {
-        scs[j] = @floatFromInt(scales[j] & 63);
-        mins[j] = @floatFromInt(scales[j + 4] & 63);
-    }
-    for (4..8) |j| {
-        scs[j] = @floatFromInt((scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4));
-        mins[j] = @floatFromInt((scales[j + 4] >> 4) | ((scales[j] >> 6) << 4));
-    }
-}
-
-fn unpackQ4KScaleMinsU8(scales: []const u8, scs: *[8]u8, mins: *[8]u8) void {
-    for (0..4) |j| {
-        scs[j] = scales[j] & 63;
-        mins[j] = scales[j + 4] & 63;
-    }
-    for (4..8) |j| {
-        scs[j] = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
-        mins[j] = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
-    }
 }
 
 fn unpackQ4KValues(qs: []const u8, out: []u8) void {

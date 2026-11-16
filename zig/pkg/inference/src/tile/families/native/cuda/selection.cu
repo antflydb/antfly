@@ -35,10 +35,7 @@ extern "C" __global__ void termite_gemma4_mtp_preproject_f32(ANTFLY_CUDA_GEMMA4_
     }
     partial[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
+    {{selection_score_sum}}
     if (tid == 0u) dst[row] = partial[0];
 }
 // native-program:entry termite_gemma4_mtp_masked_select_f32
@@ -66,10 +63,7 @@ extern "C" __global__ void termite_gemma4_mtp_centroid_scores_hidden_f32(
     }
     partial[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
+    {{selection_score_sum}}
     if (tid == 0u) centroid_scores[centroid] = partial[0];
 }
 // native-program:entry termite_gemma4_mtp_centroid_topk_u32
@@ -144,10 +138,7 @@ extern "C" __global__ void termite_gemma4_mtp_restricted_lm_head_scores_f32(
     }
     partial[tid] = sum;
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
+    {{selection_score_sum}}
     if (tid == 0u) {
         partial_values[candidate] = partial[0];
         partial_tokens[candidate] = token;

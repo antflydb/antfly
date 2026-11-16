@@ -15,7 +15,11 @@
 
 //! Qualified native program instances and specialization exports.
 
-pub const source_0 =
+const program = @import("../../native_program.zig");
+const Dot = @import("antfly_tile").native_projection.Dot;
+const dots = .{ .shared_tree = @import("antfly_tile").native_statistics.Tree.native(.{ .integer = "unsigned int", .lane = "tid", .threads = "blockDim.x", .barrier = "__syncthreads();", .planes = &.{.{ .partial = "partial", .value = "acc" }} }), .serial = (Dot{ .integer = "unsigned int", .index = "k", .end = "in_dim", .left = "input[row * in_dim + k]", .right = "weight[col * in_dim + k]" }).native(), .parallel = (Dot{ .integer = "unsigned int", .index = "i", .begin = "tid", .end = "in_dim", .step = "blockDim.x", .left = "input[row * in_dim + i]", .right = "weight[col * in_dim + i]" }).native() };
+
+pub const source_0 = program.render(
     \\extern "C" __global__ void termite_linear_f32(ANTFLY_CUDA_LINEAR_F32_PARAMS) {
     \\    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     \\    unsigned int total = rows * out_dim;
@@ -23,9 +27,7 @@ pub const source_0 =
     \\    unsigned int row = idx / out_dim;
     \\    unsigned int col = idx - row * out_dim;
     \\    float acc = 0.0f;
-    \\    for (unsigned int k = 0; k < in_dim; ++k) {
-    \\        acc += input[row * in_dim + k] * weight[col * in_dim + k];
-    \\    }
+    \\{{serial}}
     \\    dst[idx] = acc;
     \\}
     \\
@@ -38,19 +40,12 @@ pub const source_0 =
     \\    unsigned int tid = threadIdx.x;
     \\    __shared__ float partial[256];
     \\    float acc = 0.0f;
-    \\    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
-    \\        acc += input[row * in_dim + i] * weight[col * in_dim + i];
-    \\    }
-    \\    partial[tid] = acc;
-    \\    __syncthreads();
-    \\    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-    \\        if (tid < stride) partial[tid] += partial[tid + stride];
-    \\        __syncthreads();
-    \\    }
+    \\{{parallel}}
+    \\{{shared_tree}}
     \\    if (tid == 0u) dst[global] = partial[0];
     \\}
     \\
-;
+, dots);
 
 pub const source_1 =
     \\extern "C" __global__ void termite_linear_bf16_weight_f32_tiled(ANTFLY_CUDA_LINEAR_BF16_WEIGHT_F32_TILED_PARAMS) {
@@ -66,7 +61,7 @@ pub const source_2 =
     \\
 ;
 
-pub const source_3 =
+pub const source_3 = program.render(
     \\extern "C" __global__ void termite_linear_bias_f32(
     \\    float* dst,
     \\    const float* input,
@@ -82,10 +77,8 @@ pub const source_3 =
     \\    unsigned int row = idx / out_dim;
     \\    unsigned int col = idx - row * out_dim;
     \\    float acc = bias[col];
-    \\    for (unsigned int k = 0; k < in_dim; ++k) {
-    \\        acc += input[row * in_dim + k] * weight[col * in_dim + k];
-    \\    }
+    \\{{serial}}
     \\    dst[idx] = acc;
     \\}
     \\
-;
+, dots);

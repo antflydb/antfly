@@ -44,6 +44,9 @@ pub const Expression = union(enum) {
 };
 pub const Recipe = struct {
     format: quant.Format,
+    /// Header components expose their real input/view extent. Whole-block
+    /// recipes retain the format geometry; no padded temporary block is needed.
+    input_geometry: ?struct { bytes: u16, lanes: u16 } = null,
     nodes: [128]Expression = undefined,
     count: u16 = 0,
     result: Id = 0,
@@ -74,7 +77,7 @@ pub const Recipe = struct {
                 else => {},
             }
         }
-        var reduced = Recipe{ .format = self.format };
+        var reduced = Recipe{ .format = self.format, .input_geometry = self.input_geometry };
         var ids: [128]Id = undefined;
         for (self.nodes[0..self.count], 0..) |node, index| {
             if (!live[index]) continue;
@@ -91,7 +94,7 @@ pub const Recipe = struct {
     /// loads and address expressions in every generated kernel. Components keep
     /// their own roots so schedules can still hoist scales independently.
     pub fn compact(self: Recipe) Recipe {
-        var reduced = Recipe{ .format = self.format };
+        var reduced = Recipe{ .format = self.format, .input_geometry = self.input_geometry };
         var ids: [128]Id = undefined;
         for (self.nodes[0..self.count], 0..) |node, index| {
             const mapped = remap(node, &ids);
@@ -143,10 +146,10 @@ pub const Recipe = struct {
         } };
     }
     pub fn blockBytes(self: Recipe) usize {
-        return tensor_types.bytesPerBlock(self.tensorType()).?;
+        return if (self.input_geometry) |g| g.bytes else tensor_types.bytesPerBlock(self.tensorType()).?;
     }
     pub fn blockValues(self: Recipe) usize {
-        return tensor_types.valuesPerBlock(self.tensorType()).?;
+        return if (self.input_geometry) |g| g.lanes else tensor_types.valuesPerBlock(self.tensorType()).?;
     }
 
     pub fn isFloat(self: *const Recipe, id: Id) bool {
@@ -348,6 +351,16 @@ pub inline fn evaluate(comptime recipe: Recipe, block: []const u8, lane: usize) 
     return evaluateLanes(recipe, 1, block, lane);
 }
 pub inline fn evaluateLanes(comptime recipe: Recipe, comptime width: usize, block: []const u8, first_lane: usize) (if (width == 1) f32 else @Vector(width, f32)) {
+    const value = evaluateValue(recipe, width, block, first_lane);
+    return if (comptime recipe.isFloat(recipe.result)) value else @floatFromInt(value);
+}
+/// Integer components feed packed CPU schedules directly. The recipe is fully
+/// unrolled at compile time; no float round trip or runtime interpreter exists.
+pub inline fn evaluateInteger(comptime recipe: Recipe, block: []const u8, lane: usize) i32 {
+    if (comptime recipe.isFloat(recipe.result)) @compileError("integer lowering requires an integer recipe component");
+    return evaluateValue(recipe, 1, block, lane);
+}
+inline fn evaluateValue(comptime recipe: Recipe, comptime width: usize, block: []const u8, first_lane: usize) (if (width == 1) (if (recipe.isFloat(recipe.result)) f32 else i32) else @Vector(width, if (recipe.isFloat(recipe.result)) f32 else i32)) {
     @setEvalBranchQuota(1000000);
     std.debug.assert(block.len >= recipe.blockBytes() and first_lane + width <= recipe.blockValues());
     const types = comptime blk: {
@@ -390,7 +403,7 @@ pub inline fn evaluateLanes(comptime recipe: Recipe, comptime width: usize, bloc
             .choose => |c| if (vector) @select(if (recipe.isFloat(@intCast(index))) f32 else i32, widen(@Vector(width, i32), values[c.condition]) != @as(@Vector(width, i32), @splat(0)), widen(T, values[c.yes]), widen(T, values[c.no])) else if (values[c.condition] != 0) values[c.yes] else values[c.no],
         };
     }
-    return if (comptime recipe.isFloat(recipe.result)) widen(if (width == 1) f32 else @Vector(width, f32), values[recipe.result]) else @floatFromInt(widen(if (width == 1) i32 else @Vector(width, i32), values[recipe.result]));
+    return widen(if (width == 1) (if (recipe.isFloat(recipe.result)) f32 else i32) else @Vector(width, if (recipe.isFloat(recipe.result)) f32 else i32), values[recipe.result]);
 }
 /// The CPU schedule is independent of format semantics. Eight lanes match the
 /// native quantized matmul width; partial tails preserve the public codec API.
@@ -500,7 +513,7 @@ test "shared quant recipes match every lane of independent GGUF block decoding" 
 
 /// Shared header extraction for schedules which hoist scales outside lane loops.
 pub fn scaleMinHeader(comptime minimum: bool) Recipe {
-    var b = Builder{ .recipe = .{ .format = .q4_k } };
+    var b = Builder{ .recipe = .{ .format = .q4_k, .input_geometry = .{ .bytes = 12, .lanes = 8 } } };
     const sub_index = b.put(.lane);
     b.recipe.result = b.f(b.scaleMin(sub_index, minimum, 0));
     return b.recipe;
@@ -508,7 +521,7 @@ pub fn scaleMinHeader(comptime minimum: bool) Recipe {
 
 /// Integer counterpart consumed by CUDA's tuned packed-dot schedules.
 pub fn scaleMinHeaderInteger(comptime minimum: bool) Recipe {
-    var b = Builder{ .recipe = .{ .format = .q4_k } };
+    var b = Builder{ .recipe = .{ .format = .q4_k, .input_geometry = .{ .bytes = 12, .lanes = 8 } } };
     const sub_index = b.put(.lane);
     b.recipe.result = b.scaleMin(sub_index, minimum, 0);
     return b.recipe;
@@ -546,4 +559,53 @@ pub fn q6SubblockScale() Recipe {
     const sub = b.put(.lane);
     b.recipe.result = b.q6Scale(sub);
     return b.recipe;
+}
+
+test "scale-min recipes consume twelve-byte headers and preserve every six-bit field" {
+    @setEvalBranchQuota(1000000);
+    const scale = comptime scaleMinHeaderInteger(false).compact();
+    const minimum = comptime scaleMinHeaderInteger(true).compact();
+    try std.testing.expectEqual(@as(usize, 12), scale.blockBytes());
+    try std.testing.expectEqual(@as(usize, 8), scale.blockValues());
+    // Pack independent six-bit fields using the file layout, then decode them
+    // through both integer and floating recipe lowerings, with no block padding.
+    for (0..64) |seed| {
+        var header: [12]u8 = @splat(0);
+        var scales: [8]u8 = undefined;
+        var minima: [8]u8 = undefined;
+        for (0..8) |j| {
+            scales[j] = @intCast((seed + j * 13) % 64);
+            minima[j] = @intCast((seed * 7 + j * 19) % 64);
+            if (j < 4) {
+                header[j] |= scales[j];
+                header[j + 4] |= minima[j];
+            } else {
+                header[j + 4] = (scales[j] & 15) | ((minima[j] & 15) << 4);
+                header[j - 4] |= (scales[j] >> 4) << 6;
+                header[j] |= (minima[j] >> 4) << 6;
+            }
+        }
+        inline for (0..8) |j| {
+            try std.testing.expectEqual(@as(i32, scales[j]), evaluateInteger(scale, &header, j));
+            try std.testing.expectEqual(@as(i32, minima[j]), evaluateInteger(minimum, &header, j));
+            try std.testing.expectEqual(@as(f32, @floatFromInt(scales[j])), evaluate(comptime scaleMinHeader(false).compact(), &header, j));
+            try std.testing.expectEqual(@as(f32, @floatFromInt(minima[j])), evaluate(comptime scaleMinHeader(true).compact(), &header, j));
+        }
+    }
+}
+
+/// CPU packed-dot schedules hoist both headers together. Inline scalar lanes
+/// retain the old constant-index loads and give the optimizer no dynamic recipe
+/// dispatch, vector gathers, temporary block or float/integer round trip.
+pub inline fn unpackScaleMinHeader(comptime T: type, header: []const u8, scales: *[8]T, minima: *[8]T) void {
+    @setEvalBranchQuota(100000);
+    if (T != u8 and T != f32) @compileError("scale-min header output must be U8 or F32");
+    const scale = comptime scaleMinHeaderInteger(false).compact();
+    const minimum = comptime scaleMinHeaderInteger(true).compact();
+    inline for (0..8) |j| {
+        const s = evaluateInteger(scale, header, j);
+        const m = evaluateInteger(minimum, header, j);
+        scales[j] = if (T == f32) @floatFromInt(s) else @intCast(s);
+        minima[j] = if (T == f32) @floatFromInt(m) else @intCast(m);
+    }
 }

@@ -18,11 +18,11 @@
 	           "    uint row = tg.x; uint width = threads_per_tg.x; if (p.hidden_size == 0u || width == 0u || tid >= 256u) return; uint row_base = row * p.hidden_size; float N = float(p.hidden_size); threadgroup float *a = scratch; threadgroup float *b = scratch + 256u;\n"
 	           "    float sum = 0.0f; float sq = 0.0f; for (uint i = tid; i < p.hidden_size; i += width) { float v = input[row_base + i]; sum += v; sq += v * v; }\n"
 	           "    a[tid] = sum; b[tid] = sq; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-	           "    for (uint stride = width >> 1; stride > 0u; stride >>= 1u) { if (tid < stride && tid + stride < 256u) { a[tid] += a[tid + stride]; b[tid] += b[tid + stride]; } threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+{{bounded_backward_moments}}
 	           "    float mean = a[0] / N; float variance = max(b[0] / N - mean * mean, 0.0f); float inv_std = rsqrt(variance + p.eps); threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 	           "    float sg = 0.0f; float sgx = 0.0f; for (uint i = tid; i < p.hidden_size; i += width) { float xhat = (input[row_base + i] - mean) * inv_std; float g = dy[row_base + i] * gamma[i]; sg += g; sgx += g * xhat; }\n"
 	           "    a[tid] = sg; b[tid] = sgx; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-	           "    for (uint stride = width >> 1; stride > 0u; stride >>= 1u) { if (tid < stride && tid + stride < 256u) { a[tid] += a[tid + stride]; b[tid] += b[tid + stride]; } threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+{{bounded_backward_moments}}
 	           "    float mean_g = a[0] / N; float mean_g_xhat = b[0] / N;\n"
 	           "    for (uint i = tid; i < p.hidden_size; i += width) { float xhat = (input[row_base + i] - mean) * inv_std; float g = dy[row_base + i] * gamma[i]; dx[row_base + i] = inv_std * (g - mean_g - xhat * mean_g_xhat); }\n"
 	           "    if (tid == 0u) { stats[row * 2u] = mean; stats[row * 2u + 1u] = inv_std; }\n"
@@ -64,13 +64,7 @@
            "    shmem[tid] = numerator;\n"
            "    shmem[tid + threads] = denom;\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {\n"
-           "        if (tid < stride) {\n"
-           "            shmem[tid] += shmem[tid + stride];\n"
-           "            shmem[tid + threads] += shmem[tid + threads + stride];\n"
-           "        }\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    }\n"
+{{masked_loss_moments}}
            "    if (tid == 0u) output[0] = p.mean_reduction != 0u ? shmem[0] / (shmem[threads] + p.eps) : shmem[0];\n"
            "}\n"
 // native-program:entry termite_masked_bce_with_logits_backward
@@ -88,10 +82,7 @@
            "    }\n"
            "    shmem[tid] = denom;\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    for (uint stride = threads >> 1u; stride > 0u; stride >>= 1u) {\n"
-           "        if (tid < stride) shmem[tid] += shmem[tid + stride];\n"
-           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-           "    }\n"
+{{masked_loss_sum}}
            "    const float scale = p.mean_reduction != 0u ? upstream[0] / (shmem[0] + p.eps) : upstream[0];\n"
            "    for (uint i = tid; i < p.elem_count; i += threads) {\n"
            "        const float m = mask[i];\n"

@@ -48,25 +48,7 @@ extern "C" __global__ void termite_gliner_word_embeddings_f32(
     unsigned int num_words
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int out_count = batch * num_words * hidden_size;
-    if (idx >= out_count) return;
-
-    unsigned int d = idx % hidden_size;
-    unsigned int tmp = idx / hidden_size;
-    unsigned int word = tmp % num_words;
-    unsigned int b = tmp / num_words;
-    long long wanted = (long long)word + 1ll;
-
-    unsigned int token_base = b * seq_len;
-    unsigned int hidden_base = token_base * hidden_size + d;
-    for (unsigned int t = 0; t < seq_len; ++t) {
-        if (words_mask[token_base + t] == wanted) {
-            dst[idx] = hidden[hidden_base + t * hidden_size];
-            return;
-        }
-    }
-    dst[idx] = 0.0f;
-}
+{{first_match_rows}}}
 // native-program:entry termite_gliner_gru_combine_f32
 extern "C" __global__ void termite_gliner_gru_combine_f32(
     float* dst,
@@ -78,18 +60,7 @@ extern "C" __global__ void termite_gliner_gru_combine_f32(
     unsigned int add_residual
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = rows * dim;
-    if (idx >= count) return;
-    unsigned int row = idx / dim;
-    unsigned int col = idx - row * dim;
-    unsigned int gate_base = row * dim * 3u + col;
-    float r = 1.0f / (1.0f + expf(-(gi[gate_base] + gh[gate_base])));
-    float z = 1.0f / (1.0f + expf(-(gi[gate_base + dim] + gh[gate_base + dim])));
-    float n = tanhf(gi[gate_base + dim * 2u] + r * gh[gate_base + dim * 2u]);
-    float h0 = label_embeddings[idx];
-    float h1 = (1.0f - z) * n + z * h0;
-    dst[idx] = add_residual ? h1 + h0 : h1;
-}
+{{gru}}}
 // native-program:entry termite_laya_action_features_f32
 extern "C" __global__ void termite_laya_action_features_f32(
     float* dst, const float* hidden, const float* logits, const long long* markers,

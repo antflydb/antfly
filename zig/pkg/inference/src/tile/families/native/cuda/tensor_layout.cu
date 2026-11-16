@@ -141,13 +141,7 @@ extern "C" __global__ void termite_take_rows_f32(
     unsigned int dim
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = rows * dim;
-    if (idx >= count) return;
-    unsigned int row = idx / dim;
-    unsigned int col = idx - row * dim;
-    unsigned int src_row = row_ids[row];
-    dst[idx] = src_row < source_rows ? input[src_row * dim + col] : 0.0f;
-}
+{{take_rows}}}
 // native-program:entry termite_slice_last_dim_f32
 extern "C" __global__ void termite_slice_last_dim_f32(
     float* dst,
@@ -158,12 +152,7 @@ extern "C" __global__ void termite_slice_last_dim_f32(
     unsigned int out_cols
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = rows * out_cols;
-    if (idx >= count) return;
-    unsigned int row = idx / out_cols;
-    unsigned int out_col = idx - row * out_cols;
-    dst[idx] = input[row * cols + start + out_col];
-}
+{{slice_rows}}}
 // native-program:entry termite_repeat_first_row_f32
 extern "C" __global__ void termite_repeat_first_row_f32(
     float* dst,
@@ -172,11 +161,7 @@ extern "C" __global__ void termite_repeat_first_row_f32(
     unsigned int dim
 ) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = rows * dim;
-    if (idx >= count) return;
-    unsigned int col = idx % dim;
-    dst[idx] = src[col];
-}
+{{repeat_rows}}}
 // native-program:entry termite_concat_lastdim_f32
 extern "C" __global__ void termite_concat_lastdim_f32(
     float* dst,
@@ -188,16 +173,7 @@ extern "C" __global__ void termite_concat_lastdim_f32(
 ) {
     unsigned int out_dim = dim_a + dim_b;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * out_dim;
-    if (idx >= count) return;
-    unsigned int row = idx / out_dim;
-    unsigned int col = idx - row * out_dim;
-    if (col < dim_a) {
-        dst[idx] = a[row * dim_a + col];
-    } else {
-        dst[idx] = b[row * dim_b + (col - dim_a)];
-    }
-}
+{{concat_rows}}}
 // native-program:entry termite_token_to_nchw_f32
 extern "C" __global__ void termite_token_to_nchw_f32(ANTFLY_CUDA_TOKEN_TO_NCHW_F32_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -218,49 +194,12 @@ extern "C" __global__ void termite_nchw_to_token_f32(ANTFLY_CUDA_TOKEN_TO_NCHW_F
 }
 // native-program:entry termite_pack_windows_f32
 extern "C" __global__ void termite_pack_windows_f32(ANTFLY_CUDA_PACK_WINDOWS_F32_PARAMS) {
-    unsigned int windows_h = padded_h / window_size;
-    unsigned int windows_w = padded_w / window_size;
-    unsigned int window_area = window_size * window_size;
-    unsigned int window_count = batch * windows_h * windows_w;
-    unsigned int total = window_count * window_area * dim;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-
-    unsigned int feature = idx % dim;
-    unsigned int token = (idx / dim) % window_area;
-    unsigned int window_idx = idx / (dim * window_area);
-    unsigned int dx = token % window_size;
-    unsigned int dy = token / window_size;
-    unsigned int ww = window_idx % windows_w;
-    unsigned int tmp = window_idx / windows_w;
-    unsigned int wh = tmp % windows_h;
-    unsigned int b = tmp / windows_h;
-    unsigned int src_y = wh * window_size + dy;
-    unsigned int src_x = ww * window_size + dx;
-    if (src_y >= height || src_x >= width) {
-        dst[idx] = 0.0f;
-        return;
-    }
-    unsigned int src_idx = (b * height * width + src_y * width + src_x) * dim + feature;
-    dst[idx] = src[src_idx];
-}
+{{window_pack}}}
 // native-program:entry termite_unpad_windows_f32
 extern "C" __global__ void termite_unpad_windows_f32(ANTFLY_CUDA_PACK_WINDOWS_F32_PARAMS) {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int total = batch * height * width * dim;
-    if (idx >= total) return;
-
-{{window_coordinates}}
-    unsigned int windows_w = padded_w / window_size;
-    unsigned int wh = y / window_size;
-    unsigned int ww = x / window_size;
-    unsigned int dy = y % window_size;
-    unsigned int dx = x % window_size;
-    unsigned int window_idx = (b * (padded_h / window_size) + wh) * windows_w + ww;
-    unsigned int token = dy * window_size + dx;
-    unsigned int src_idx = (window_idx * window_size * window_size + token) * dim + feature;
-    dst[idx] = src[src_idx];
-}
+{{window_unpack}}}
 // native-program:entry termite_pack_q8_0_tensor_core
 extern "C" __global__ void termite_pack_q8_0_tensor_core(
     unsigned char* dst,
@@ -465,32 +404,7 @@ extern "C" __global__ void termite_primitive_transpose_2d_f32(
     unsigned int cols,
     unsigned int tile_cols
 ) {
-    __shared__ float tile[32][33];
-    unsigned int tid = threadIdx.x;
-    unsigned int tx = tid & 31u;
-    unsigned int ty = tid >> 5u;
-    unsigned int tile_x = blockIdx.x % tile_cols;
-    unsigned int tile_y = blockIdx.x / tile_cols;
-    unsigned int input_x = tile_x * 32u + tx;
-    unsigned int input_y = tile_y * 32u + ty;
-
-    #pragma unroll
-    for (unsigned int offset = 0u; offset < 32u; offset += 8u) {
-        if (input_x < cols && input_y + offset < rows) {
-            tile[ty + offset][tx] = input[(input_y + offset) * cols + input_x];
-        }
-    }
-    __syncthreads();
-
-    unsigned int output_x = tile_y * 32u + tx;
-    unsigned int output_y = tile_x * 32u + ty;
-    #pragma unroll
-    for (unsigned int offset = 0u; offset < 32u; offset += 8u) {
-        if (output_x < rows && output_y + offset < cols) {
-            output[(output_y + offset) * rows + output_x] = tile[tx][ty + offset];
-        }
-    }
-}
+{{transpose}}}
 // native-program:entry termite_primitive_concat_f32
 extern "C" __global__ void termite_primitive_concat_f32(
     float* output,

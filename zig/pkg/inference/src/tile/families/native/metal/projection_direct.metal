@@ -105,16 +105,7 @@ kernel void termite_apply_linear_pair_1x_reduce(device const float *input [[buff
         acc_a += x * weight_a[row_base + i];
         acc_b += x * weight_b[row_base + i];
     }
-    partials_a[lane] = acc_a;
-    partials_b[lane] = acc_b;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 16u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) {
-            partials_a[lane] += partials_a[lane + stride];
-            partials_b[lane] += partials_b[lane + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+{{pair_tree}}
     if (lane == 0u) { output_a[group] = partials_a[0]; output_b[group] = partials_b[0]; }
 }
 // native-program:entry termite_apply_linear_bf16_multi_row_shared_reduce
@@ -155,12 +146,7 @@ kernel void termite_apply_linear_bf16_multi_row_shared_reduce(device const float
         for (uint r = 0u; r < p.rows; ++r) partials[r * 32u + lane] += input[r * p.in_dim + i] * w;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 16u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) {
-            for (uint r = 0u; r < p.rows; ++r) partials[r * 32u + lane] += partials[r * 32u + lane + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    {{rows_tree}}
     if (lane == 0u) {
         for (uint r = 0u; r < p.rows; ++r) output[r * p.out_dim + o] = partials[r * 32u];
     }

@@ -29,6 +29,7 @@ const whisper_model = @import("whisper_model.zig");
 const File = struct { path: []const u8, data: []const u8 };
 
 pub const files = [_]File{
+    .{ .path = "src/backends/generated_kernel_contracts.h", .data = @import("antfly_tile").native_layout.transpose_contract_header ++ @import("antfly_tile").native_attention.RelativeRow64.header ++ @import("antfly_tile").native_audio.Fft512.header ++ @import("antfly_tile").native_convolution.Stencil3x3Stride2Tile16.header ++ @import("antfly_tile").native_statistics.Bf16ScoreSoftmax.header },
     .{ .path = "../../lib/vectorindex/src/kmeans_distance.msl.h", .data = gpu.sourceMacro("ANTFLY_TILE_DISTANCE_MSL", @import("antfly_tile").scoring.metal_distance) },
     .{ .path = "src/ops/metal/generated/tile_whisper_logits_partials.metal", .data = gpu.renderMetal(whisper.kernel) },
     .{ .path = "src/ops/metal/generated/tile_whisper_logits_partials.msl.h", .data = gpu.renderMetalHeader(whisper.kernel, "antfly_tile_whisper_logits_partials_msl") },

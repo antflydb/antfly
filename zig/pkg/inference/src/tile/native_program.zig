@@ -15,7 +15,7 @@
 
 //! Native schedule descriptions expand before the backend compiler. Literal
 //! specializations retain their exact spelling and introduce no device wrapper.
-pub const render = @import("source_template.zig").render;
+pub const render = @import("antfly_tile").source_template.render;
 
 pub fn join(comptime parts: []const []const u8) []const u8 {
     comptime {

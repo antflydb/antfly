@@ -140,7 +140,7 @@ extern "C" __global__ void termite_embedding_gemma2_packed_heads_bf16(
             dst[d] = __float2bfloat16_rn(kind == 0u ? x * q_scale : x);
         } else {
             unsigned half = dim / 2u, pair = d % half;
-            float angle = __fmul_rn((float)(row % seq), eg2_training_rope_inverse_frequency(theta, dim, pair));
+            float angle = __fmul_rn((float)(row % seq), antfly_source_rotary_inverse_frequency_f32(theta, dim, pair));
             float sn, cs; sincosf(angle, &sn, &cs);
             float s = __bfloat162float(__float2bfloat16_rn(sn)), c = __bfloat162float(__float2bfloat16_rn(cs));
             float lo = __bfloat162float(normalized[pair]), hi = __bfloat162float(normalized[pair+half]);

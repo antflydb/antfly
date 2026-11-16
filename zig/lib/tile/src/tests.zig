@@ -16,6 +16,123 @@
 const std = @import("std");
 const core = @import("mod.zig");
 
+test "shared page mapping preserves entry units and rejects wide overflow" {
+    const blocks: core.layout.PageTable = .{ .unit = .blocks };
+    const bases: core.layout.PageTable = .{ .unit = .token_bases };
+    try std.testing.expectEqual(@as(?u32, 19), blocks.map(7, &.{ 9, 4 }, 4, 64));
+    try std.testing.expectEqual(@as(?u32, 7), bases.map(7, &.{ 9, 4 }, 4, 64));
+    try std.testing.expectEqual(@as(?u32, null), blocks.map(8, &.{ 9, 4 }, 4, 64));
+    try std.testing.expectEqual(@as(?u32, null), blocks.map(0, &.{std.math.maxInt(u32)}, 4, std.math.maxInt(u32)));
+    try std.testing.expectEqual(@as(?u32, null), bases.map(3, &.{std.math.maxInt(u32)}, 4, std.math.maxInt(u32)));
+    try std.testing.expectEqual(@as(?u32, null), blocks.map(0, &.{0}, 0, 64));
+}
+
+test "transpose launch contract covers tails and keeps backend schedules" {
+    try std.testing.expectEqual([3]usize{ 3, 2, 7 }, try core.native_layout.Transpose.grid(33, 65, 7));
+    try std.testing.expectEqual(@as(u32, 256), core.native_layout.cuda_transpose.threads());
+    try std.testing.expectEqual(@as(u32, 1024), core.native_layout.metal_transpose.threads());
+    try std.testing.expectError(error.InvalidLayout, core.native_layout.Transpose.grid(1, std.math.maxInt(usize), 1));
+}
+
+test "complex product keeps scalar and SIMD FFT butterfly association" {
+    const values = [_]f32{ 0, 1, -2, 1e-8, 1e8, -3.25 };
+    for (values, 0..) |r, i| {
+        const im = values[(i + 1) % values.len];
+        const wr: f32 = 0.37;
+        const wi: f32 = -0.83;
+        const actual = core.native_audio.product(r, im, wr, wi);
+        const expected_r = r * wr - im * wi;
+        const expected_i = r * wi + im * wr;
+        try std.testing.expectEqual(@as(u32, @bitCast(expected_r)), @as(u32, @bitCast(actual.real)));
+        try std.testing.expectEqual(@as(u32, @bitCast(expected_i)), @as(u32, @bitCast(actual.imag)));
+        const vector = core.native_audio.product(@as(@Vector(4, f32), @splat(r)), @as(@Vector(4, f32), @splat(im)), @as(@Vector(4, f32), @splat(wr)), @as(@Vector(4, f32), @splat(wi)));
+        try std.testing.expectEqual(@as(u32, @bitCast(expected_r)), @as(u32, @bitCast(vector.real[3])));
+    }
+    const rendered = comptime core.native_audio.real_product.renderNative(.{ .mul = "MUL", .sub = "SUB" }, .{ .real = "r", .imag = "i", .wr = "wr", .wi = "wi" }, null);
+    try std.testing.expectEqualStrings("SUB(MUL(r, wr), MUL(i, wi))", rendered);
+}
+
+test "online attention state agrees with independent stable softmax" {
+    const scores = [_]f32{ -100, 2, 3, -7, 9, 8, 30, -50 };
+    var old_max: f32 = -std.math.inf(f32);
+    var sum: f32 = 0;
+    var weighted: f32 = 0;
+    for (0..4) |tile| {
+        const new_max = @max(old_max, @max(scores[tile * 2], scores[tile * 2 + 1]));
+        const correction: f32 = if (std.math.isFinite(old_max)) @exp(old_max - new_max) else 0;
+        var tile_sum: f32 = 0;
+        var tile_weighted: f32 = 0;
+        for (0..2) |col| {
+            const i = tile * 2 + col;
+            const probability = core.native_attention.Online.probability.evaluate(core.native_math.ScalarMath, .{ .value = scores[i], .score = scores[i], .new_max = new_max });
+            tile_sum += probability;
+            tile_weighted += probability * @as(f32, @floatFromInt(i + 1));
+        }
+        sum = core.native_attention.Online.updateMass(sum, correction, tile_sum);
+        weighted = core.native_attention.Online.updateMass(weighted, correction, tile_weighted);
+        old_max = new_max;
+    }
+    var reference_sum: f64 = 0;
+    var reference_value: f64 = 0;
+    for (scores, 0..) |score, i| {
+        const p = @exp(@as(f64, score) - 30);
+        reference_sum += p;
+        reference_value += p * @as(f64, @floatFromInt(i + 1));
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(reference_value / reference_sum)), weighted / sum, 1e-6);
+    try std.testing.expect(core.native_attention.CausalWindow.contains(7, 4, 4));
+    try std.testing.expect(!core.native_attention.CausalWindow.contains(7, 3, 4));
+    try std.testing.expect(!core.native_attention.CausalWindow.contains(7, 8, 0));
+}
+
+test "shared GRU cell preserves independent reset update and candidate stages" {
+    for (0..32) |i| {
+        const x = @as(f32, @floatFromInt(i)) / 7 - 2;
+        const gi = [3]f32{ x, x * -0.7, x + 0.2 };
+        const gh = [3]f32{ x * 0.3, x - 0.4, x * -1.2 };
+        const previous = x / 3;
+        const r = 1 / (1 + @exp(-(gi[0] + gh[0])));
+        const z = 1 / (1 + @exp(-(gi[1] + gh[1])));
+        const n = std.math.tanh(gi[2] + r * gh[2]);
+        const expected = (1 - z) * n + z * previous;
+        try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(core.native_math.Gru.cell(gi, gh, previous))));
+    }
+}
+
+test "first matching row program keeps earliest token missing words and batches" {
+    var output: [12]f32 = @splat(-1);
+    var seen: [6]u8 = undefined;
+    try (core.native_layout.Program{ .operation = .first_match }).run(.{ .input = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, .output = &output, .rows = 6, .cols = 2, .mask = &.{ 2, 2, -1, 1, 3, 1 }, .sequence = 3, .words = 3, .seen = &seen });
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 1, 2, 0, 0, 7, 8, 0, 0, 9, 10 }, &output);
+    const before = output;
+    try std.testing.expectError(error.InvalidLayout, (core.native_layout.Program{ .operation = .first_match }).run(.{ .input = &.{}, .output = &output, .rows = 6, .cols = 2, .mask = &.{1}, .sequence = 3, .words = 3 }));
+    try std.testing.expectEqualSlices(f32, &before, &output);
+}
+
+test "shared native tree preserves cancellation association and interleaved planes" {
+    for ([_]usize{ 1, 2, 8, 32, 64, 256 }) |width| {
+        var a: [256]f32 = undefined;
+        var b: [256]f32 = undefined;
+        for (0..width) |lane| {
+            a[lane] = @as(f32, @floatFromInt(@as(i32, @intCast(lane % 13)) - 6)) * (if (lane % 3 == 0) @as(f32, 0x1p20) else @as(f32, 0x1p-8));
+            b[lane] = @as(f32, @floatFromInt(lane)) + 0.25;
+        }
+        var expected_a = a;
+        var expected_b = b;
+        var stride = width >> 1;
+        while (stride != 0) : (stride >>= 1) for (0..stride) |lane| {
+            expected_a[lane] += expected_a[lane + stride];
+            expected_b[lane] += expected_b[lane + stride];
+        };
+        try core.native_statistics.Tree.reduce(&.{ a[0..width], b[0..width] });
+        try std.testing.expectEqual(@as(u32, @bitCast(expected_a[0])), @as(u32, @bitCast(a[0])));
+        try std.testing.expectEqual(@as(u32, @bitCast(expected_b[0])), @as(u32, @bitCast(b[0])));
+    }
+    var invalid = [_]f32{ 1, 2, 3 };
+    try std.testing.expectError(error.InvalidLayout, core.native_statistics.Tree.reduce(&.{&invalid}));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, &invalid);
+}
+
 test "ordered suppression retains ties, first allowed NaN, infinities and empty identity" {
     const nan = std.math.nan(f32);
     const inf = std.math.inf(f32);
@@ -214,4 +331,27 @@ test "named adjoints preserve the original ordered activation formula and subtra
     }
     const e = comptime f.operand("left").minus(f.operand("right").minus(f.operand("tail")));
     try std.testing.expectEqualStrings("a - (b - c)", comptime e.renderNative(.{}, .{ .left = "a", .right = "b", .tail = "c" }, null));
+}
+
+test "relative row launch contract covers query tails and rejects overflow" {
+    const S = core.native_attention.RelativeRow64;
+    try std.testing.expectEqual(@as(usize, 8), try S.blocks(2, 9, 2));
+    try std.testing.expectEqual(@as(usize, 132), try S.blocks(2, 257, 2));
+    try std.testing.expect(!S.supports(1, 513, 2, 64));
+    try std.testing.expect(!S.supports(1, 7, 2, 32));
+    try std.testing.expectError(error.InvalidLayout, S.blocks(std.math.maxInt(usize), 512, 2));
+    try std.testing.expectError(error.InvalidLayout, S.blocks(1, 0, 1));
+}
+
+test "BF16 softmax schedule admission retains unqualified device baselines" {
+    const schedule = core.native_statistics.Bf16ScoreSoftmax;
+    // The serving optimization is physically qualified on GB10. In particular,
+    // A100 and L4 keep the original shared-tree occupancy/register contract.
+    for ([_][2]i32{ .{ 7, 5 }, .{ 8, 0 }, .{ 8, 9 }, .{ 9, 0 }, .{ 12, 0 }, .{ 12, 2 } }) |device| {
+        for ([_]usize{ 1, 31, 270, 511, 512, 513, 8192 }) |columns| {
+            try std.testing.expect(!schedule.supportsNarrow(columns, device[0], device[1]));
+        }
+    }
+    for ([_]usize{ 1, 31, 270, 511, 512 }) |columns| try std.testing.expect(schedule.supportsNarrow(columns, 12, 1));
+    for ([_]usize{ 0, 513, 8192, std.math.maxInt(usize) }) |columns| try std.testing.expect(!schedule.supportsNarrow(columns, 12, 1));
 }

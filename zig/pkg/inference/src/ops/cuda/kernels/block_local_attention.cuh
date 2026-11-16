@@ -29,11 +29,15 @@
             for (unsigned int d = tid; d < head_dim; d += blockDim.x) part += q[q_base + d] * k[k_base + d];
         }
         scratch[tid] = part;
-        __syncthreads();
-        for (unsigned int stride = 64u; stride > 0u; stride >>= 1u) {
-            if (tid < stride) scratch[tid] += scratch[tid + stride];
-            __syncthreads();
+// tile-codegen:begin statistics.block_attention.0 family (do not edit; run: zig build tile-kernel-codegen -- --write)
+    __syncthreads();
+    for (unsigned int stride = 128u >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
         }
+        __syncthreads();
+    }
+// tile-codegen:end statistics.block_attention.0 family
         if (tid == 0u) {
             float score = valid ? scratch[0] * scale : (-INFINITY);
             if (valid && bias_mode == 1u) score += bias[(head * seq_len + qi) * seq_len + ki];
@@ -56,11 +60,15 @@
         denom_part += e;
     }
     scratch[tid] = denom_part;
+// tile-codegen:begin statistics.block_attention.1 family (do not edit; run: zig build tile-kernel-codegen -- --write)
     __syncthreads();
-    for (unsigned int stride = 64u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) scratch[tid] += scratch[tid + stride];
+    for (unsigned int stride = 128u >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
         __syncthreads();
     }
+// tile-codegen:end statistics.block_attention.1 family
     if (tid == 0u) shared_denom = scratch[0];
     __syncthreads();
 

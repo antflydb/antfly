@@ -107,7 +107,7 @@ pub const helper_paged_attention_1x_params = HelperFragment{
 
 pub const helper_paged_attention_1x_page_token = HelperFragment{
     .name = "antfly_paged_attention_1x_page_token",
-    .msl = "template<typename Params> inline uint antfly_paged_attention_1x_page_token(device const uint *block_table, constant Params &p, uint logical_token) { if (p.contiguous_blocks != 0u) return p.contiguous_base_token + logical_token; uint logical_block = logical_token / p.page_size; uint token_in_block = logical_token - logical_block * p.page_size; if (logical_block >= p.block_count) return 0xffffffffu; return block_table[logical_block] + token_in_block; }",
+    .msl = "template<typename Params> inline uint antfly_paged_attention_1x_page_token(device const uint *block_table, constant Params &p, uint logical_token) {\n" ++ @import("../tile/families/native/attention_programs.zig").page_body ++ "}\n",
 };
 
 const helper_paged_decode_native = HelperFragment{
@@ -353,17 +353,20 @@ pub fn renderPrefillFlashKernel(
 /// buffer(6) as decode_1x, so it emits the same two self-contained fragments.
 pub const helper_attention_online_row32 = HelperFragment{
     .name = "antfly_attention_online_row32",
-    .msl =
-    \\// Exact online row phase. Score admission, masks, diagonal publication and
-    \\// matrix schedules remain with each caller.
-    \\__attribute__((always_inline)) inline void antfly_attention_online_row32(float sc, threadgroup const float *maxima, uint state_row, threadgroup half *probability, uint probability_index, thread float &m_old, thread float &m_new, thread float &corr, thread float &row_sum) {
-    \\    float row_max = simd_max(sc); m_old = maxima[state_row]; m_new = max(m_old, row_max);
-    \\    float e = 0.0f; corr = 1.0f;
-    \\    if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; }
-    \\    probability[probability_index] = half(e);
-    \\    row_sum = simd_sum(e);
-    \\}
-    ,
+    .msl = @import("antfly_tile").source_template.render(
+        \\// Exact online row phase. Score admission, masks, diagonal publication and
+        \\// matrix schedules remain with each caller.
+        \\__attribute__((always_inline)) inline void antfly_attention_online_row32(float sc, threadgroup const float *maxima, uint state_row, threadgroup half *probability, uint probability_index, thread float &m_old, thread float &m_new, thread float &corr, thread float &row_sum) {
+        \\    float row_max = simd_max(sc); m_old = maxima[state_row]; m_new = max(m_old, row_max);
+        \\    float e = 0.0f; corr = 1.0f;
+        \\    if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? {{correction}} : 0.0f; e = sc > -3.0e+38f ? {{probability}} : 0.0f; }
+        \\    probability[probability_index] = half(e);
+        \\    row_sum = simd_sum(e);
+        \\}
+    , .{
+        .correction = @import("antfly_tile").native_attention.Online.correction.renderNative(.{}, .{ .old_max = "m_old", .new_max = "m_new" }, null),
+        .probability = @import("antfly_tile").native_attention.Online.probability.renderNative(.{}, .{ .score = "sc", .new_max = "m_new" }, null),
+    }),
 };
 
 fn attentionHelpers(kind: AttentionKind) []const HelperFragment {

@@ -167,8 +167,7 @@ kernel void termite_florence_channel_softmax_f32(device float *scores [[buffer(0
 kernel void termite_dot_general_2d_f32_reduce(device const float *lhs [[buffer(0)]], device const float *rhs [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_dot_general_2d_f32_params &p [[buffer(3)]], threadgroup float *partials [[threadgroup(0)]], ushort lane [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
     uint total = p.m * p.n; if (group >= total || p.k == 0u) return; uint row = group / p.n; uint col = group - row * p.n; float acc = 0.0f;
     for (uint kk = uint(lane); kk < p.k; kk += 32u) { float r = p.rhs_contract_axis == 0u ? rhs[kk * p.n + col] : rhs[col * p.k + kk]; acc += lhs[row * p.k + kk] * r; }
-    partials[lane] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 16u; stride > 0u; stride >>= 1u) { if (lane < stride) partials[lane] += partials[lane + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }
+{{scalar_tree}}
     if (lane == 0u) output[group] = partials[0];
 }
 // native-program:entry antfly_video_position

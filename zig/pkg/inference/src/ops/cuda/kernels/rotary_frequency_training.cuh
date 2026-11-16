@@ -10,7 +10,7 @@
 // Reference: Transformers a96730c8c97b8efbf35bbaf7f5da33ec99231a49,
 // Torch 2.14.0+cu130, default RoPE, official google/embeddinggemma-2 config.
 
-static __device__ __constant__ unsigned int eg2_training_rope_sliding_bits[128] = {
+static __device__ __constant__ unsigned int antfly_rotary_dim256_theta10000_source_bits[128] = {
     0x3f800000u, 0x3f6e39f8u, 0x3f5dafd7u, 0x3f4e4badu, 0x3f3ff911u, 0x3f32a506u, 0x3f263de0u, 0x3f1ab32bu,
     0x3f0ff59au, 0x3f05f6efu, 0x3ef953cfu, 0x3ee8045fu, 0x3ed7e89bu, 0x3ec8eb24u, 0x3ebaf81bu, 0x3eadfcffu,
     0x3ea1e89bu, 0x3e96aaeau, 0x3e8c3504u, 0x3e827909u, 0x3e72d423u, 0x3e61f835u, 0x3e5247edu, 0x3e43ae7cu,
@@ -29,7 +29,7 @@ static __device__ __constant__ unsigned int eg2_training_rope_sliding_bits[128] 
     0x393a7753u, 0x392d8529u, 0x39217916u, 0x39164324u, 0x390bd472u, 0x39021f2bu, 0x38f22ce2u, 0x38e15c91u,
 };
 
-static __device__ __constant__ unsigned int eg2_training_rope_full_bits[256] = {
+static __device__ __constant__ unsigned int antfly_rotary_dim512_theta1000000_source_bits[256] = {
     0x3f800000u, 0x3f728cf8u, 0x3f65ced3u, 0x3f59bc10u, 0x3f4e4badu, 0x3f437523u, 0x3f39305cu, 0x3f2f75b1u,
     0x3f263de0u, 0x3f1d8209u, 0x3f153ba8u, 0x3f0d6492u, 0x3f05f6efu, 0x3efdda64u, 0x3ef0843cu, 0x3ee3e172u,
     0x3ed7e89bu, 0x3ecc90c7u, 0x3ec1d182u, 0x3eb7a2c7u, 0x3eadfcffu, 0x3ea4d8f8u, 0x3e9c2fe1u, 0x3e93fb45u,
@@ -64,12 +64,12 @@ static __device__ __constant__ unsigned int eg2_training_rope_full_bits[256] = {
     0x35ceaf79u, 0x35c3d3b1u, 0x35b989f2u, 0x35afca93u, 0x35a68e4cu, 0x359dce3bu, 0x359583dau, 0x358da8f9u,
 };
 
-__device__ __forceinline__ float eg2_training_rope_inverse_frequency(
+__device__ __forceinline__ float antfly_source_rotary_inverse_frequency_f32(
     float theta, unsigned int dim, unsigned int pair) {
     if (dim == 256u && theta == 10000.0f)
-        return __uint_as_float(eg2_training_rope_sliding_bits[pair]);
+        return __uint_as_float(antfly_rotary_dim256_theta10000_source_bits[pair]);
     if (dim == 512u && theta == 1000000.0f)
-        return __uint_as_float(eg2_training_rope_full_bits[pair]);
+        return __uint_as_float(antfly_rotary_dim512_theta1000000_source_bits[pair]);
     return __fdiv_rn(1.0f, powf(theta, (2.0f * pair) / (float)dim));
 }
 

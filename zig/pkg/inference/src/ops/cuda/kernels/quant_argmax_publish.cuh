@@ -14,14 +14,18 @@
 #endif
     #pragma unroll
     for (unsigned int c = 0; c < TERMITE_QUANT_ARGMAX_COLUMNS; ++c) partial[c][tid] = acc[c];
+// tile-codegen:begin statistics.quant_argmax_columns family (do not edit; run: zig build tile-kernel-codegen -- --write)
     __syncthreads();
-    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+    for (unsigned int stride = 256u >> 1; stride > 0u; stride >>= 1) {
         if (tid < stride) {
             #pragma unroll
-            for (unsigned int c = 0; c < TERMITE_QUANT_ARGMAX_COLUMNS; ++c) partial[c][tid] += partial[c][tid + stride];
+            for (unsigned int c = 0; c < TERMITE_QUANT_ARGMAX_COLUMNS; ++c) {
+            partial[c][tid] += partial[c][tid + stride];
+            }
         }
         __syncthreads();
     }
+// tile-codegen:end statistics.quant_argmax_columns family
     if (tid == 0u) {
         float best_value = -3.402823466e+38f;
         unsigned int best_index = 0xffffffffu;

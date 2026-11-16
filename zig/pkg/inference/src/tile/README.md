@@ -120,9 +120,30 @@ launches them yet; the OpenCL harness is the host-side reference for doing so.
 
 ## Production kernel families
 
+Generation coverage and algorithm sharing are different properties. The native
+registry emits both shared programs and retained backend-specific source bodies.
+`native_sources.zig` splits and packages existing source; it does not translate
+that source into a shared algorithm. Do not count those regions as cross-backend
+algorithm sharing merely because their output is generated.
+
+`antfly_tile.native_layout.Program` owns dense slice, repeat, zero-filled row
+gather, concatenation and first-match row selection. Native exports bind their
+historical parameters to those programs. The CPU first-match lowering keeps a
+token-major scan with one byte of seen-state per word; GPU lowerings keep the
+existing per-coordinate scan and mask storage type. Strict CPU row gather still
+rejects invalid ids; the native zero-fill program is a distinct contract.
+
+`antfly_tile.native_statistics.Tree` owns ordered shared-memory halving stages.
+CUDA interleaved planes and Metal scalar/paired planes bind the same stages,
+retaining their bounded layer-norm guard. Its broadcast phase reads shared
+state into every lane before a post-read barrier permits scratch reuse. Warp/SIMD,
+Welford and centered-versus-raw-moment algorithms remain separate schedules.
+The migration plan and qualification gates are in
+[`shared-native-kernel-programs.md`](../../../../../docs/design/inference/shared-native-kernel-programs.md).
+
 Production ownership is registered in `families/native.zig`. Its operation-named
 modules preserve the qualified native schedules already shared by inference.
-`native_program.zig` and `source_template.zig` expand exact source templates at
+`native_program.zig` and the tile core’s `source_template` expand source at
 comptime; names and static literals are parameters. They introduce no extra
 device call, runtime branch, scratch allocation or launch.
 

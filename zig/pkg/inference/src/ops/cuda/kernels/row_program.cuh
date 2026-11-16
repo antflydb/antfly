@@ -55,21 +55,27 @@ __device__ __forceinline__ void antfly_row_rms(
 }
 
 // Interleaved planes retain the original shared-tree schedule and barriers.
+// tile-codegen:begin statistics.shared_tree family (do not edit; run: zig build tile-kernel-codegen -- --write)
 template<unsigned Planes>
 __device__ __forceinline__ void antfly_row_tree_statistics(
     float (&values)[Planes], float* const (&partials)[Planes], unsigned threads = blockDim.x) {
     const unsigned tid = threadIdx.x;
     #pragma unroll
-    for (unsigned p = 0; p < Planes; ++p) partials[p][tid] = values[p];
+    for (unsigned p = 0; p < Planes; ++p) {
+    partials[p][tid] = values[p];
+    }
     __syncthreads();
-    for (unsigned stride = threads >> 1; stride; stride >>= 1) {
+    for (unsigned stride = threads >> 1; stride > 0u; stride >>= 1) {
         if (tid < stride) {
             #pragma unroll
-            for (unsigned p = 0; p < Planes; ++p) partials[p][tid] += partials[p][tid + stride];
+            for (unsigned p = 0; p < Planes; ++p) {
+            partials[p][tid] += partials[p][tid + stride];
+            }
         }
         __syncthreads();
     }
 }
+// tile-codegen:end statistics.shared_tree family
 
 template<typename Load>
 __device__ __forceinline__ float antfly_row_rms_tree_inverse(
@@ -83,7 +89,12 @@ __device__ __forceinline__ float antfly_row_rms_tree_inverse(
 
 // The fixed 256-thread tree may finish its final five stages in warp 0.
 // This is the same association as the original expanded vision row program.
-template<unsigned Planes> __device__ __forceinline__ void antfly_row_warp_finish_256(
+template<bool Maximum> __device__ __forceinline__ float antfly_row_tree_combine(float a, float b) {
+    if constexpr (Maximum) return fmaxf(a, b);
+    return a + b;
+}
+
+template<unsigned Planes, bool Maximum = false> __device__ __forceinline__ void antfly_row_warp_finish_256(
     float (&values)[Planes],float*const (&partials)[Planes]) {
     const unsigned tid=threadIdx.x;
     #pragma unroll
@@ -93,12 +104,13 @@ template<unsigned Planes> __device__ __forceinline__ void antfly_row_warp_finish
         #pragma unroll
         for(unsigned p=0;p<Planes;++p){
             float* v=partials[p];
-            values[p]=((v[tid]+v[tid+128])+(v[tid+64]+v[tid+192]))+
-                      ((v[tid+32]+v[tid+160])+(v[tid+96]+v[tid+224]));
+            values[p]=antfly_row_tree_combine<Maximum>(
+                antfly_row_tree_combine<Maximum>(antfly_row_tree_combine<Maximum>(v[tid],v[tid+128]),antfly_row_tree_combine<Maximum>(v[tid+64],v[tid+192])),
+                antfly_row_tree_combine<Maximum>(antfly_row_tree_combine<Maximum>(v[tid+32],v[tid+160]),antfly_row_tree_combine<Maximum>(v[tid+96],v[tid+224])));
         }
         for(unsigned step=16;step;step>>=1){
             #pragma unroll
-            for(unsigned p=0;p<Planes;++p)values[p]+=__shfl_down_sync(0xffffffffu,values[p],step);
+            for(unsigned p=0;p<Planes;++p)values[p]=antfly_row_tree_combine<Maximum>(values[p],__shfl_down_sync(0xffffffffu,values[p],step));
         }
         if(tid==0){
             #pragma unroll

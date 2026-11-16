@@ -2458,28 +2458,17 @@ const helper_termite_tq_decode_polar4_at = SourceFragment{
 
 const helper_termite_tq_physical_token = SourceFragment{
     .name = "termite_tq_physical_token",
-    .source =
-    \\__device__ __forceinline__ unsigned int termite_tq_physical_token(
-    \\    unsigned int logical_token,
-    \\    const unsigned int* block_table,
-    \\    unsigned int block_count,
-    \\    unsigned int page_size_tokens,
-    \\    unsigned int physical_token_capacity
-    \\) {
-    \\    unsigned long long physical = (unsigned long long)logical_token;
-    \\    if (block_table != 0 && block_count != 0u && page_size_tokens != 0u) {
-    \\        unsigned int block_index = logical_token / page_size_tokens;
-    \\        if (block_index >= block_count) return 0xffffffffu;
-    \\        unsigned int token_offset = logical_token - block_index * page_size_tokens;
-    \\        const unsigned long long physical_block = (unsigned long long)block_table[block_index];
-    \\        physical = physical_block * (unsigned long long)page_size_tokens +
-    \\            (unsigned long long)token_offset;
-    \\    }
-    \\    if (physical > 0xffffffffull ||
-    \\        physical >= (unsigned long long)physical_token_capacity) return 0xffffffffu;
-    \\    return (unsigned int)physical;
-    \\}
-    ,
+    .source = @import("antfly_tile").source_template.render(
+        \\__device__ __forceinline__ unsigned int termite_tq_physical_token(
+        \\    unsigned int logical_token,
+        \\    const unsigned int* block_table,
+        \\    unsigned int block_count,
+        \\    unsigned int page_size_tokens,
+        \\    unsigned int physical_token_capacity
+        \\) {
+        \\{{page_body}}
+        \\}
+    , .{ .page_body = (@import("antfly_tile").layout.PageTable{ .unit = .blocks }).native(.{ .wide = true, .page_size = "page_size_tokens", .block_count = "block_count" }) }),
 };
 
 const helper_termite_tq_f16_value = SourceFragment{

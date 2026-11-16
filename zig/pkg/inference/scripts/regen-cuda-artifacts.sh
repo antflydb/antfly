@@ -266,6 +266,8 @@ required_symbols=(
   antfly_attention_split_merge_bf16
   antfly_attention_efficient_bf16_hd256
   termite_embedding_gemma2_attention_softmax_bf16
+  antfly_score_softmax_rows_keys_legacy_bf16_warp256
+  antfly_score_softmax_prefix_bf16_warp256
   termite_embedding_gemma2_matmul_bf16
   termite_embedding_gemma2_gelu_mul_bf16
   termite_embedding_gemma2_gelu_mul_vjp_f32

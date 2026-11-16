@@ -66,7 +66,16 @@ def verify(root, inventory):
         return result
     indexed = {}
     outputs = {}
+    shared_sources = {}
+    source_inputs = set(inventory.get("tile_source_inputs", []))
     for entry in inventory["native_regions"]:
+        for program in entry.get("programs", []):
+            source = program["source"]
+            if source not in source_inputs:
+                raise ValueError("shared program owner absent from build inputs")
+            if program["scope"] not in ("phase", "body") or not program["precision"] or not program["schedule"]:
+                raise ValueError("incomplete shared program contract")
+            shared_sources[source] = {"source": source, **fingerprint(path(source).read_bytes())}
         owner, name = entry["owner"], entry["family_region"]
         if owner == "quant_region":
             name = name.strip().removeprefix("// quant-kernel-codegen:begin ").split(" (do not edit;", 1)[0]
@@ -128,7 +137,7 @@ def verify(root, inventory):
                 name = str(child.relative_to(package))
                 if name not in outputs and not any(row["output"] == name for row in leaves):
                     leaves.append({"output": name, "classification": "canonical_native_include", **fingerprint(child.read_bytes())})
-    return {**inventory, "verification": {"regions_and_files": len(verified), "standalone_cuda_inputs": standalone, "canonical_native": canonical + sorted(leaves, key=lambda row: row["output"]), "retention": "Canonical surrounds and include leaves are authored implementation, not dead-code candidates. Compatibility exports remain ABI adapters; lexical single-reference counts do not establish liveness."}}
+    return {**inventory, "verification": {"regions_and_files": len(verified), "standalone_cuda_inputs": standalone, "shared_program_sources": [shared_sources[name] for name in sorted(shared_sources)], "canonical_native": canonical + sorted(leaves, key=lambda row: row["output"]), "retention": "Canonical surrounds and include leaves are authored implementation, not dead-code candidates. Compatibility exports remain ABI adapters; lexical single-reference counts do not establish liveness."}}
 
 
 def main():

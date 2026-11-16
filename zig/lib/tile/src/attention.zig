@@ -121,7 +121,7 @@ fn query(comptime att: Attention, a: Args, h: usize, i: usize) void {
         const m_new = @max(m, @reduce(.Max, s));
         const corr = vmath.vexp(1, @splat(m - m_new))[0];
         const p = vmath.vexp(key_tile, s - @as(S, @splat(m_new)));
-        l = l * corr + @reduce(.Add, p);
+        l = @import("native_attention.zig").Online.updateMass(l, corr, @reduce(.Add, p));
         const probs: [key_tile]f32 = p;
         inline for (0..chunks) |c| o[c] *= @as(V, @splat(corr));
         for (0..n) |t| {
