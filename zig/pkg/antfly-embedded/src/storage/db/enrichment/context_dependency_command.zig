@@ -62,8 +62,14 @@ pub const Command = struct {
     /// bytes. Outbox keys embed each replica's local sequence, so replicas
     /// delete matching entries by content, not by key.
     acks: []const []const u8 = &.{},
+    /// Dependents this plan invalidates. Every replica journals their
+    /// rebuilds only once the plan applies, so a rebuild never runs against
+    /// dependency state the plan has not yet written.
+    rebuilds: []const Rebuild = &.{},
 
     pub const Put = struct { key: []const u8, value: []const u8 };
+    /// Hex-encoded artifact name and document key.
+    pub const Rebuild = struct { artifact: []const u8, doc_key: []const u8 };
     /// `digest` is empty when the key was absent.
     pub const Read = struct { key: []const u8, digest: []const u8 = "" };
     /// Every entry in `[lower, upper)`, in key order.
@@ -84,6 +90,8 @@ pub const Command = struct {
         for (self.scans) |s| if (!isHex(s.lower) or !isHex(s.upper) or s.digest.len != 64 or !isHex(s.digest)) return error.InvalidContextDependencyCommand;
         if (self.acks.len > max_effects) return error.InvalidContextDependencyCommand;
         for (self.acks) |d| if (d.len != 64 or !isHex(d)) return error.InvalidContextDependencyCommand;
+        if (self.rebuilds.len > max_effects or (self.rebuilds.len != 0 and self.isInbox())) return error.InvalidContextDependencyCommand;
+        for (self.rebuilds) |r| if (!isHex(r.artifact) or !isHex(r.doc_key) or r.artifact.len == 0 or r.doc_key.len == 0) return error.InvalidContextDependencyCommand;
     }
 
     /// Identity recorded after a successful apply.
@@ -132,6 +140,20 @@ fn isHex(s: []const u8) bool {
 
 fn hexAlloc(a: Allocator, bytes: []const u8) ![]u8 {
     return std.fmt.allocPrint(a, "{x}", .{bytes});
+}
+
+/// `refs` (any slice whose items have `artifact_name` and `doc_key`) as
+/// command rebuilds, allocated in `a`.
+pub fn rebuildsAlloc(a: Allocator, refs: anytype) ![]const Command.Rebuild {
+    if (refs.len > max_effects) return error.ContextBudgetExceeded;
+    const out = try a.alloc(Command.Rebuild, refs.len);
+    for (refs, out) |r, *o| o.* = .{ .artifact = try hexAlloc(a, r.artifact_name), .doc_key = try hexAlloc(a, r.doc_key) };
+    return out;
+}
+
+/// The decoded artifact name and document key of `rebuild`, in `a`.
+pub fn decodeRebuildAlloc(a: Allocator, rebuild: Command.Rebuild) !struct { artifact: []u8, doc_key: []u8 } {
+    return .{ .artifact = try unhexAlloc(a, rebuild.artifact), .doc_key = try unhexAlloc(a, rebuild.doc_key) };
 }
 
 fn unhexAlloc(a: Allocator, hex: []const u8) ![]u8 {
@@ -430,4 +452,24 @@ test "replicas apply leader plans identically and reject stale read sets" {
     try testing.expectEqual(Outcome.applied, try applyTxn(alloc, &again, inbox));
     try testing.expectEqual(@as(usize, 2), follower.countPrefix(&store.familyPrefix(inbox_family)));
     try testing.expectError(error.InvalidContextDependencyCommand, (Command{}).validate());
+}
+
+test "context dependency commands carry hex rebuilds on plans only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Ref = struct { artifact_name: []const u8, doc_key: []const u8 };
+    const rebuilds = try rebuildsAlloc(a, @as([]const Ref, &.{.{ .artifact_name = "brief", .doc_key = "person:\x001" }}));
+    const plan: Command = .{ .deletes = &.{"aa"}, .rebuilds = rebuilds };
+    try plan.validate();
+    const decoded = try decodeRebuildAlloc(a, plan.rebuilds[0]);
+    try std.testing.expectEqualStrings("brief", decoded.artifact);
+    try std.testing.expectEqualStrings("person:\x001", decoded.doc_key);
+    // Survives the JSON wire the host proposes.
+    const encoded = try std.json.Stringify.valueAlloc(a, plan, .{});
+    const parsed = try std.json.parseFromSliceLeaky(Command, a, encoded, .{});
+    try std.testing.expectEqualStrings(rebuilds[0].doc_key, parsed.rebuilds[0].doc_key);
+    // Inbox appends never journal; rebuilds must be hex.
+    try std.testing.expectError(error.InvalidContextDependencyCommand, (Command{ .inbox = &.{"n"}, .rebuilds = rebuilds }).validate());
+    try std.testing.expectError(error.InvalidContextDependencyCommand, (Command{ .deletes = &.{"aa"}, .rebuilds = &.{.{ .artifact = "zz", .doc_key = "00" }} }).validate());
 }

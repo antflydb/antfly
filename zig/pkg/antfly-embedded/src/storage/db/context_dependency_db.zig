@@ -630,6 +630,11 @@ pub fn applyNoticesConsuming(
         refs: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef) = .empty,
         summary: ApplySummary = .{},
 
+        fn rebuilds(p: *anyopaque) []const enrichment_types.GeneratedEnrichmentRef {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            return self.refs.items;
+        }
+
         fn reset(p: *anyopaque, a: Allocator) void {
             const self: *@This() = @ptrCast(@alignCast(p));
             for (self.refs.items) |ref| enrichment_types.freeGeneratedRef(a, ref);
@@ -675,8 +680,14 @@ pub fn applyNoticesConsuming(
         Pass.reset(&pass, alloc);
         pass.refs.deinit(alloc);
     }
-    try planAndCommit(alloc, primary, manager, .{ .ptr = &pass, .plan_fn = Pass.run, .reset_fn = Pass.reset });
+    try planAndCommit(alloc, primary, manager, .{ .ptr = &pass, .plan_fn = Pass.run, .reset_fn = Pass.reset, .rebuilds_fn = Pass.rebuilds });
     var summary = pass.summary;
+    if (manager.context_replication != null) {
+        // The proposal carries these; each replica journals them on apply.
+        Pass.reset(&pass, alloc);
+        pass.refs.deinit(alloc);
+        return summary;
+    }
     summary.rebuild_refs = try pass.refs.toOwnedSlice(alloc);
     return summary;
 }
@@ -767,6 +778,10 @@ pub const Planner = struct {
     ptr: *anyopaque,
     plan_fn: *const fn (ptr: *anyopaque, alloc: Allocator, reader: store.Reader, plan: *store.Plan) anyerror!void,
     reset_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator) void = null,
+    /// Rebuilds the last pass decided on. A replicated owner carries them in
+    /// the proposal and journals them when it applies, instead of returning
+    /// them for the caller to journal before the plan lands.
+    rebuilds_fn: ?*const fn (ptr: *anyopaque) []const enrichment_types.GeneratedEnrichmentRef = null,
 };
 
 pub const Committer = struct {
@@ -845,7 +860,11 @@ pub fn planAndCommit(alloc: Allocator, primary: *docstore_mod.DocStore, manager:
             defer plan.deinit();
             try planner.plan_fn(planner.ptr, alloc, recorder.reader(), &plan);
             if (plan.puts.items.len == 0 and plan.deletes.items.len == 0) return;
-            try collector.addCommand(try recorder.commandAlloc(&plan));
+            var command = try recorder.commandAlloc(&plan);
+            var rebuilds_arena = std.heap.ArenaAllocator.init(alloc);
+            defer rebuilds_arena.deinit();
+            if (planner.rebuilds_fn) |rebuilds| command.rebuilds = try command_mod.rebuildsAlloc(rebuilds_arena.allocator(), rebuilds(planner.ptr));
+            try collector.addCommand(command);
             return;
         }
         manager.lockContextProposals();
@@ -861,7 +880,10 @@ pub fn planAndCommit(alloc: Allocator, primary: *docstore_mod.DocStore, manager:
             defer plan.deinit();
             try planner.plan_fn(planner.ptr, alloc, recorder.reader(), &plan);
             if (plan.puts.items.len == 0 and plan.deletes.items.len == 0) return;
-            const command = try recorder.commandAlloc(&plan);
+            var command = try recorder.commandAlloc(&plan);
+            var rebuilds_arena = std.heap.ArenaAllocator.init(alloc);
+            defer rebuilds_arena.deinit();
+            if (planner.rebuilds_fn) |rebuilds| command.rebuilds = try command_mod.rebuildsAlloc(rebuilds_arena.allocator(), rebuilds(planner.ptr));
             try replication.propose(alloc, command);
             var check = try StoreReader.init(primary);
             defer check.deinit();

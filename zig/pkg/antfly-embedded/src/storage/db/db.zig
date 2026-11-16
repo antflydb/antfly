@@ -28451,6 +28451,30 @@ pub const DB = struct {
     fn afterContextDependencyApplied(self: *DB, command: @import("enrichment/context_dependency_command.zig").Command) !void {
         // Delivered notices are processed by the group leader's drain.
         if (command.isInbox()) self.signalContextInbox();
+        if (command.rebuilds.len != 0) {
+            // Journal rebuilds only now that the invalidation they follow
+            // has landed, so they observe the stale dependency state.
+            const command_mod = @import("enrichment/context_dependency_command.zig");
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var refs = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
+            errdefer {
+                for (refs.items) |ref| enrichment_types.freeGeneratedRef(self.alloc, ref);
+                refs.deinit(self.alloc);
+            }
+            for (command.rebuilds) |rebuild| {
+                const decoded = try command_mod.decodeRebuildAlloc(a, rebuild);
+                const ref = try enrichment_types.cloneGeneratedRef(self.alloc, .{ .kind = .asset, .index_name = decoded.artifact, .artifact_name = decoded.artifact, .doc_key = decoded.doc_key });
+                refs.append(self.alloc, ref) catch |err| {
+                    enrichment_types.freeGeneratedRef(self.alloc, ref);
+                    return err;
+                };
+            }
+            var summary = context_dependency_db.ApplySummary{ .rebuild_refs = try refs.toOwnedSlice(self.alloc) };
+            defer summary.deinit(self.alloc);
+            try self.journalContextRebuilds(&summary);
+        }
         var host_hex: [context_dependency_host_key.len * 2]u8 = undefined;
         _ = std.fmt.bufPrint(&host_hex, "{x}", .{context_dependency_host_key}) catch unreachable;
         for (command.puts) |p| if (std.mem.eql(u8, p.key, &host_hex)) {
@@ -155693,7 +155717,9 @@ test "db replicated context dependencies apply leader plans identically on every
     // delivers it (to the group inbox) and applies the inbox via a plan.
     try pair.apply(.{ .writes = &.{.{ .key = "n:2", .value = "{\"org\":\"o1\",\"title\":\"b\"}" }} });
     try std.testing.expect(!try follower.runContextMaintenance());
-    while (try leader.runContextMaintenance()) {}
+    // Deferred, as the data server runs it: the invalidation plan carries
+    // doc:a's rebuild, journaled on each replica only when it applies.
+    try std.testing.expectEqual(@as(usize, 1), try contextTestDeferredMaintenance(&leader, alloc, &pair, .{ .ptr = &pair, .deliver = ContextReplicaPair.deliver }));
     try std.testing.expectEqual(context_dependency_store.Freshness.stale, try contextSourcesTestFreshness(&leader, alloc, "doc:a"));
     try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&leader, alloc, "doc:b"));
     {
@@ -155714,21 +155740,34 @@ test "db replicated context dependencies apply leader plans identically on every
 
 /// Host-side deferred maintenance, as the data server runs it: the owner
 /// plans inside the call; the host proposes, delivers, and acknowledges.
-fn contextTestDeferredMaintenance(db: *DB, alloc: Allocator, pair: *ContextReplicaPair, deliver: context_dependency_db.Dispatcher) !void {
+/// Returns how many rebuilds the applied plans carried.
+fn contextTestDeferredMaintenance(db: *DB, alloc: Allocator, pair: *ContextReplicaPair, deliver: context_dependency_db.Dispatcher) !usize {
     const command_mod = @import("enrichment/context_dependency_command.zig");
+    var rebuilds: usize = 0;
     for (0..32) |_| {
         var collector = context_dependency_db.Collector{ .alloc = alloc };
         defer collector.deinit();
         context_dependency_db.active_collector = &collector;
+        const journaled = db.core.nextDerivedSequence();
         const more = db.runContextMaintenance() catch |err| {
             context_dependency_db.active_collector = null;
             return err;
         };
         context_dependency_db.active_collector = null;
+        // Planning journals nothing: rebuilds ride the proposal.
+        try std.testing.expectEqual(journaled, db.core.nextDerivedSequence());
         for (collector.commands.items) |encoded| {
             var parsed = try std.json.parseFromSlice(command_mod.Command, alloc, encoded, .{ .allocate = .alloc_always });
             defer parsed.deinit();
+            const leader_before = pair.leader.core.nextDerivedSequence();
+            const follower_before = pair.follower.core.nextDerivedSequence();
             try pair.apply(.{ .context_dependency = parsed.value });
+            rebuilds += parsed.value.rebuilds.len;
+            if (parsed.value.rebuilds.len != 0) {
+                // Journaled on every replica once the invalidation landed.
+                try std.testing.expect(pair.leader.core.nextDerivedSequence() > leader_before);
+                try std.testing.expect(pair.follower.core.nextDerivedSequence() > follower_before);
+            }
         }
         var acks = std.ArrayListUnmanaged([]const u8).empty;
         defer {
@@ -155740,7 +155779,7 @@ fn contextTestDeferredMaintenance(db: *DB, alloc: Allocator, pair: *ContextRepli
             try acks.append(alloc, try command_mod.ackDigestHexAlloc(alloc, d.notice));
         }
         if (acks.items.len != 0) try pair.apply(.{ .context_dependency = .{ .acks = acks.items } });
-        if (!more and collector.isEmpty()) return;
+        if (!more and collector.isEmpty()) return rebuilds;
     }
     return error.TestUnexpectedResult;
 }
@@ -155807,7 +155846,7 @@ test "db replicated context topology installs on every replica and catches up ne
 
     // Deferred, as the data server runs it (no proposal inside the owner call).
     const deliver_to_host: context_dependency_db.Dispatcher = .{ .ptr = &host, .deliver = Host.deliver };
-    try contextTestDeferredMaintenance(&leader, alloc, &host.pair, deliver_to_host);
+    _ = try contextTestDeferredMaintenance(&leader, alloc, &host.pair, deliver_to_host);
     try std.testing.expect(!try follower.runContextMaintenance());
     // Both replicas switched topology at the same log position.
     try std.testing.expectEqualStrings("srv:1", leader.contextSourceTableId());
@@ -155820,7 +155859,7 @@ test "db replicated context topology installs on every replica and catches up ne
     // Row changes stage notices on every replica; only the leader delivers,
     // and acknowledgements clear every replica's outbox.
     try host.pair.apply(.{ .writes = &.{.{ .key = "o:1", .value = "{\"org\":\"o1\",\"title\":\"t\"}" }} });
-    try contextTestDeferredMaintenance(&leader, alloc, &host.pair, deliver_to_host);
+    _ = try contextTestDeferredMaintenance(&leader, alloc, &host.pair, deliver_to_host);
     try std.testing.expect(host.delivered.items.len >= 2);
     const l = try contextTestDependencyFamiliesAlloc(&leader, alloc);
     defer alloc.free(l);
