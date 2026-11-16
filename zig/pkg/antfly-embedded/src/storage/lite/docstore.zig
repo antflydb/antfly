@@ -3875,20 +3875,39 @@ pub const Store = struct {
         if (generation.file.redo) |*redo| try redo.shared.pin(std.heap.page_allocator, self.file.runtime(), pin.sequence);
         // Reader-pin registry (inode_lock.Entry.reader_pins): registers
         // this same fixed sequence as a general page-reuse pin, not just
-        // a redo-overlay one -- `generation.file` is a plain,
-        // uncoordinated reader for an indexed_reclamation store (it never
-        // claims a `region` slot; see that registry's own doc comment),
-        // so without this it would be invisible to `reuseFrontier`'s
-        // combined computation beyond whatever `self.reader_frontier`
-        // already covers for this exact case. Registered on the same
-        // inode-keyed `Entry` `generation.file`/`self.file` both resolve
-        // to.
+        // a redo-overlay one -- in-process only, so it protects this
+        // generation against *this* process's own later reclaim
+        // regardless of whether the region fence below is also taken.
+        // Registered on the same inode-keyed `Entry` `generation.file`/
+        // `self.file` both resolve to.
         if (generation.file.inode_lock_ref.load(.acquire)) |entry| {
             try inode_lock.pinReader(entry, self.file.runtime(), .{ .data = pin.sequence, .metadata = pin.sequence });
         }
-        // An idle connection must not fence reclamation. Only actual read
-        // transactions hold the inode lock, including streams between calls.
-        if (generation.scoped_reader_lock and pin.kernel_reader) {
+        // perf/lwa-xproc-pagekind: the in-process pin above is invisible
+        // to a *different* OS process's own reclaim frontier
+        // (`shared_lock_region.Region.minimumPinnedSequence`), which only
+        // ever sees readers that claimed one of its reader-table slots.
+        // This gate used to be `generation.scoped_reader_lock and
+        // pin.kernel_reader` -- restricting the region claim/pin
+        // (`acquireReaderFence`, §8.3) to an `externally_locked` store,
+        // on the theory that a plain (non-externally-locked) connection's
+        // own read generation is only ever read while this same process
+        // holds the file exclusively, so no foreign writer could be
+        // reclaiming concurrently. That theory fails once a writer
+        // releases its exclusive hold right after commit and keeps
+        // reading through this same generation afterward (e.g. a
+        // mutation's own post-commit `hasGraphEndpointCleanup` probe,
+        // `db.zig`'s `finishBatchGraphEndpointCleanup`) -- by then another
+        // process can already hold the writer lock and be reclaiming
+        // pages this generation still points at, producing
+        // `UnexpectedNativePageKind`/`InvalidNativeAllocator` on the next
+        // read through it. `pin.kernel_reader` (false only for an idle
+        // connection's write-side pin, which never needs this) is the
+        // right gate on its own; `acquireReaderFence` already falls back
+        // to a cheap inode-only fence when no region exists, and is a
+        // free, no-syscall grant whenever this process's own exclusive
+        // hold is merely parked (the common case right after a commit).
+        if (pin.kernel_reader) {
             if (generation.kernel_readers == 0) {
                 // Own publication is excluded by the store mutex during pin
                 // admission. A forked child can retain a completed writer's
@@ -3951,7 +3970,11 @@ pub const Store = struct {
         std.debug.assert(generation.references > 0);
         if (pin.previous) |previous| previous.next = pin.next else generation.first_pin = pin.next;
         if (pin.next) |next| next.previous = pin.previous else generation.last_pin = pin.previous;
-        if (generation.scoped_reader_lock and pin.kernel_reader) {
+        // Mirrors `pinInitializedReadGeneration`'s own gate (perf/lwa-xproc-pagekind):
+        // every `pin.kernel_reader` pin now takes the region fence there,
+        // regardless of `scoped_reader_lock`, so every one must release it
+        // here too.
+        if (pin.kernel_reader) {
             generation.kernel_readers -= 1;
             if (generation.kernel_readers == 0) generation.file.releaseReaderFence();
         }
@@ -4000,6 +4023,57 @@ pub const Store = struct {
             self.startMaintenanceAssumeLocked();
             self.mutex.unlock();
         }
+    }
+
+    // perf/lwa-xproc-pagekind: a non-`externally_locked` connection's ordinary
+    // read generation (`pinInitializedReadGeneration`) used to register its
+    // pin only in the in-process `inode_lock.Entry.reader_pins` list, gated
+    // off the cross-process shared-region fence (`acquireReaderFence`, §8.3)
+    // by `generation.scoped_reader_lock`, which is only ever true for an
+    // `externally_locked` store. A plain writer-capable connection -- the
+    // common case -- is exactly the one every ordinary read (including a
+    // mutation's own post-commit `hasGraphEndpointCleanup` probe) goes
+    // through, and that pin is invisible to a *different* OS process's own
+    // `shared_lock_region.Region.minimumPinnedSequence()` scan, letting a
+    // foreign writer reuse pages this read still needs
+    // (`UnexpectedNativePageKind`/`InvalidNativeAllocator`, reproduced
+    // cross-process via `scripts/bench/lite_sqlite_comparison.py --workers 8
+    // --batch-path wire`). This test proves the fix without forking: a plain
+    // (non-externally-locked) read transaction must now show up in the
+    // shared region's reader table -- the same primitive a writer in another
+    // process actually consults -- for as long as it stays open, and must
+    // clear once it closes.
+    test "lite a plain (non-externally-locked) read generation claims the shared region's reader-table slot cross-process readers rely on" {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "xproc-pagekind-read-generation-region-fence.aflite");
+        defer a.free(path);
+
+        var coordinator = native.ReaderCoordinator.init(a, std.testing.io);
+        defer coordinator.deinit();
+        var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+        defer store.close();
+        // Wired the same way `lite_connection.zig`'s `Owner` wires it for a
+        // real connection -- see this file's own "lite reclamation automatic
+        // worker..." fixture above for the same pattern.
+        store.file.reader_coordinator = &coordinator;
+        try store.file.putDocument("alpha", "one");
+
+        const region = (try store.file.regionForInode()).?;
+        try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
+
+        var read = try Txn.openRead(&store);
+        var aborted = false;
+        errdefer if (!aborted) read.abort();
+        try std.testing.expect(!read.store.?.file.externally_locked);
+        // The bug: before the fix, this stayed `null` for the whole life of
+        // `read` -- a foreign process's writer would see no pin at all and
+        // could freely reuse pages `read` still points at.
+        try std.testing.expect(region.minimumPinnedSequence() != null);
+        read.abort();
+        aborted = true;
+        try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
     }
 
     pub fn getCatalogRecordAlloc(self: *Store, a: Allocator, key: []const u8) !?[]u8 {
