@@ -13711,6 +13711,13 @@ pub const DataServer = struct {
         const minimum_protocol_version = requiredRaftBatchProtocolVersion(req);
         var required_protocol_version = minimum_protocol_version;
         const deadline_ns = @min(route.admission_deadline_ns orelse std.math.maxInt(u64), self.dataRaftMonotonicNs() +| leader_wait_ns);
+        const completion_command = @import("antfly_local_sources").api_internal_batch.requiresCompletionProtocol(req);
+        if (completion_command) {
+            if (!linked_storage or req.restore_staging_scope != null or route.initial_child_bootstrap != null) return error.ChangefeedCapabilityUnsupported;
+            if (route.write_route_fence == null) return error.InvalidCatalogRouteFence;
+        }
+        const completion_io = self.dataRaftIo();
+        const completion_context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = deadline_ns, .deadline_io = if (completion_io) |*io| @import("antfly_runtime_abi").io_abi.Borrow.init(io) else null, .cancellation = route.visibility_cancellation };
         try ensureDataRaftBatchRouteActive(route);
         try self.reachDataRequestLifecycle(.{
             .phase = .routing_started,
@@ -13900,10 +13907,22 @@ pub const DataServer = struct {
                         const owner_source = try self.ensureKernelOwnerSource();
                         storage_owner_descriptor = if (route.initial_child_bootstrap) |bootstrap|
                             try owner_source.loadInitialChildDescriptor(alloc, group_id, table_name, bootstrap)
+                        else if (completion_command)
+                            try owner_source.loadCompletionDescriptor(alloc, group_id, table_name, completion_context)
                         else
                             try owner_source.loadDescriptor(alloc, group_id, table_name);
                     }
                 }
+            }
+
+            if (completion_command and preflighted_local_leader) {
+                const owner = switch (req.transaction.?) {
+                    .begin => |begin| begin.completion_owner orelse return error.InvalidHistoryAdmission,
+                    .prepare => |prepare| prepare.completion_owner orelse return error.InvalidHistoryAdmission,
+                    else => return error.InvalidBatchRequest,
+                };
+                const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
+                try @import("../api/completion_owner_admission.zig").require(alloc, admission_source.catalog, table_name, route.write_route_fence.?, storage_owner_descriptor.?.view(), owner, completion_context);
             }
 
             var target_index: ?u64 = null;

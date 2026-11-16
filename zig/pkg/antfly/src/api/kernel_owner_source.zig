@@ -3193,6 +3193,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         return descriptor;
     }
 
+    pub fn loadCompletionDescriptor(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, context: request_operation.RequestContext) !LoadedDescriptor {
+        try context.ensureActive();
+        var budget = self.catalog.budget(null);
+        budget.deadline_ns = @min(budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }) orelse std.math.maxInt(u64), budget.nowNs() +| 5 * std.time.ns_per_s);
+        budget.cancellation = context.cancellation;
+        const result = try self.loadDescriptorWithBudget(alloc, group_id, table_name, budget);
+        errdefer {
+            var owned = result;
+            owned.deinit(alloc);
+        }
+        try budget.checkpoint();
+        try context.ensureActive();
+        return result;
+    }
+
     pub fn loadDescriptor(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,

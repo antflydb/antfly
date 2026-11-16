@@ -472,6 +472,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_auth_test_step = b.step("antfly-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
+    const completion_owner_tests = b.addTest(.{
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &.{ "completion live owner", "routing clones exclude operational and schema payloads" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("completion-owner-admission-test", "Verify authoritative current completion owner capture and deadlines").dependOn(&b.addRunArtifact(completion_owner_tests).step);
     const completion_begin_tests = b.addTest(.{
         .root_module = options.api_http_runtime_test_mod,
         .filters = &.{"completion begin wire"},

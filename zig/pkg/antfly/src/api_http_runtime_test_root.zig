@@ -144,3 +144,7 @@ test "linear merge discovery" {
 test "completion begin wire discovery" {
     _ = @import("antfly_local_sources").api_internal_batch;
 }
+
+test "completion live owner discovery" {
+    _ = @import("api/completion_owner_admission.zig");
+}

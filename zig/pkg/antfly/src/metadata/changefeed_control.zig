@@ -958,7 +958,7 @@ pub fn validateEncodedWrite(bytes: []const u8) !void {
 /// Binds the authoritative base incarnation, excluding names, schema evolution
 /// and index publication. Runtime capability proof still selects exposure kind.
 pub fn tableBinding(table: anytype) Digest {
-    return hash(.{ .domain = "antfly:changefeed-table-binding:v1", .table_id = table.table_id, .engine = table.storage.engine, .object_generation = table.object_storage_generation, .object_identity = table.object_storage_identity, .restore_backup_id = table.restore_backup_id, .restore_location = table.restore_location });
+    return @import("antfly_local_sources").common_topology_records.tableStorageBinding(table);
 }
 const AuthorityRecord = struct { stamp: Stamp, digest: Digest };
 pub fn encodeAuthority(a: A, stamp: Stamp) ![]u8 {

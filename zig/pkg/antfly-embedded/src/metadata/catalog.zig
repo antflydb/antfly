@@ -81,6 +81,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     errdefer alloc.free(restore_location);
     return .{
         .storage = record.storage,
+        .routing_storage_binding = record.routing_storage_binding,
         .object_storage_generation = record.object_storage_generation,
         .object_storage_identity = record.object_storage_identity,
         .lake_index_catalog_json = lake_index_catalog_json,

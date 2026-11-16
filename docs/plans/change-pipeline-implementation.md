@@ -2437,6 +2437,52 @@ selection and encoder rejection. Live catalog admission, activation and
 production coordinator wiring remain next;
 all full destination/feed/bootstrap/pgoutput/client requirements remain open.
 
+## In progress: authoritative completion owner admission capture
+
+`api/completion_owner_admission.zig` captures one authoritative compact routing
+generation and compares cluster incarnation, route, table ID, topology epoch,
+physical namespace and table storage binding with the original fence and loaded
+owner descriptor. A catalog behind the original revision is unavailable rather
+than authority to proceed. Unrelated newer catalog revisions do not enter the
+owner digest. The helper rejects hidden/restore descriptors and non-native base
+bindings until those lifecycles are qualified; it never uses an admin snapshot.
+
+Its deadline is the minimum of request and original fence budgets, translated
+to the catalog clock once. A scoped cancellation pair preserves both tokens,
+including fallible checkpoints, during acquisition and validation. No borrowed
+capability escapes the function. Descriptor loading has a corresponding bounded
+owner-source method.
+
+DataServer now requires a route fence for completion commands and validates the
+frozen context against this capture after descriptor loading while the existing
+table activity admission lease remains held through proposal. Current leader
+and protocol activation are still checked by the existing proposal path. The
+protocol ceiling remains 30 and native BEGIN dispatch remains disabled; this
+wiring does not yet advertise protocol 31 or public coordinated feeds.
+
+The initial `completion-owner-admission-test history-control-apply-test` passed
+with exit 0 in `completion-owner-admission-test.log`. A stronger replacement
+storage-binding test then exposed that `cloneRoutingTable` discarded fixed
+storage settings/incarnation and private restore fields. The latter omission
+is intentional for compact routing, so the fix preserves fixed storage fields
+and carries an opaque `routing_storage_binding` digest over the original full
+table identity. Full durable records omit the optional field and preserve their
+prior JSON shape; raw restore paths remain excluded from routing. Compact
+re-cloning preserves an absent binding as absent, and completion admission
+rejects projections without this capability rather than manufacturing it.
+
+The stronger capture test passed with exit 0 in
+`completion-owner-admission-final-test.log` after this correction, including
+replacement table binding, expired fence budget and missing cluster incarnation.
+The combined projection/real-Raft verification completed with exit 0 in
+`completion-owner-projection-test.log`: the capture/clone cases and all six
+actual Raft regressions passed. It adds explicit clone checks for storage
+identity, opaque binding preservation, legacy absence, raw-path omission and
+default durable JSON shape. Source catalog
+generation completed. The existing Raft tests do not yet qualify an admitted
+protocol-31 completion transaction. Activation/coordinator integration, positive
+network receipts/certificates and every broader full issue requirement remain.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

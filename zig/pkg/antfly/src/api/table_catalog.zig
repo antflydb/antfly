@@ -892,7 +892,7 @@ fn cloneRoutingSnapshot(
     }
     for (source.tables, 0..) |table, index| {
         try budget.checkpointIndex(index);
-        tables[index] = try metadata_table_manager.cloneRoutingTable(alloc, table);
+        tables[index] = try metadata_table_manager.cloneCompactRoutingTable(alloc, table);
         table_count = index + 1;
     }
 

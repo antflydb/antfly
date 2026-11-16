@@ -20,6 +20,9 @@
 const std = @import("std");
 
 pub const TableRecord = struct {
+    /// Opaque identity on compact internal routing projections. Full durable
+    /// records omit this field; raw restore locations remain outside routing.
+    routing_storage_binding: ?[32]u8 = null,
     /// Internal metadata lifecycle intent; never accepted as public schema.
     relational_retirement_json: []const u8 = "",
     /// Native, CAS-published generations over authorized external lake sources.
@@ -46,8 +49,9 @@ pub const TableRecord = struct {
     pub fn jsonStringify(self: TableRecord, jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(TableRecord).@"struct".field_names) |field_name| {
+            const routing_field = comptime std.mem.eql(u8, field_name, "routing_storage_binding");
             const object_field = comptime std.mem.eql(u8, field_name, "object_storage_generation") or std.mem.eql(u8, field_name, "object_storage_identity");
-            if ((!object_field or self.storage.engine == .object) and (!std.mem.eql(u8, field_name, "lake_index_catalog_json") or self.lake_index_catalog_json.len != 0)) {
+            if ((!routing_field or self.routing_storage_binding != null) and (!object_field or self.storage.engine == .object) and (!std.mem.eql(u8, field_name, "lake_index_catalog_json") or self.lake_index_catalog_json.len != 0)) {
                 try jw.objectField(field_name);
                 try jw.write(@field(self, field_name));
             }
@@ -125,3 +129,22 @@ pub const RestoreCompletionFingerprint =
     [std.crypto.hash.sha2.Sha256.digest_length]u8;
 pub const empty_restore_completion_fingerprint: RestoreCompletionFingerprint =
     @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
+
+/// Preserve the established changefeed table-binding digest for full records.
+/// A compact projection carries that exact digest without private path strings.
+pub fn tableStorageBinding(table: anytype) [32]u8 {
+    if (@hasField(@TypeOf(table), "routing_storage_binding")) if (table.routing_storage_binding) |binding| return binding;
+    const Output = struct {
+        writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain, .flush = std.Io.Writer.noopFlush }, .buffer = &.{} },
+        sha: std.crypto.hash.sha2.Sha256 = .init(.{}),
+        fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", writer));
+            for (data[0 .. data.len - 1]) |bytes| self.sha.update(bytes);
+            for (0..splat) |_| self.sha.update(data[data.len - 1]);
+            return std.Io.Writer.countSplat(data, splat);
+        }
+    };
+    var output: Output = .{};
+    std.json.Stringify.value(.{ .domain = "antfly:changefeed-table-binding:v1", .table_id = table.table_id, .engine = table.storage.engine, .object_generation = table.object_storage_generation, .object_identity = table.object_storage_identity, .restore_backup_id = table.restore_backup_id, .restore_location = table.restore_location }, .{}, &output.writer) catch unreachable;
+    return output.sha.finalResult();
+}
