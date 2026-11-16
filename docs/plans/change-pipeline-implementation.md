@@ -2274,6 +2274,36 @@ both BEGIN record and plan. This extension passed under
 (all seven selected tests passed). Positive receipt network recovery, production
 activation and the full issue requirements remain.
 
+## In progress: frozen participant PREPARE input bindings
+
+Completion admission/manifest version 2 now requires a nonzero `input_digest`
+for every frozen participant, including guards and checkpoint anchors. Its
+versioned hashes bind those digests as well as original owner, namespace, role
+and locator. Version 1 preserves its original hash interpretation, rejects an
+unhashed input field, and cannot authorize the new prepare-input check. V2's
+certificate reservation accounts for the additional authenticated fields.
+
+The input digest uses a separate length-framed namespace-bound domain over the
+complete canonical private PREPARE encoding. `completionPrepareInput` uses the
+existing codec, preserving effects, guards, schema/policy fields and transaction
+identity without looking up current rows. `requireCompletionPrepareInput` also
+checks the prepare transaction ID against the plan before comparing its input.
+Callers must preserve the original encoding rather than recompile against later
+schema or topology. The whole-source admission fingerprint remains distinct.
+
+`transaction-completion-test` passed in `completion-input-binding-test.log`.
+The combined `completion-begin-wire-test transaction-completion-test` passed with
+exit 0 in `completion-prepare-input-test.log`, including explicit tests for V1
+non-reinterpretation, V2 missing/zero inputs, changed participant inputs changing
+admission/manifest identity, envelope round-trip and canonical prepare replay,
+plus effects/guard/topology substitutions. Source catalog generation completed.
+
+This contract is not yet invoked by the production durable prepare path. The
+server dispatcher continues to reject completion BEGIN. Durable prepare input
+checking, current owner fencing, all-applying-member activation, coordinator
+wiring, positive receipt collection/publication and all remaining full issue
+acceptance work remain outstanding.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

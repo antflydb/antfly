@@ -3737,6 +3737,25 @@ test "distributed txn private control wire keeps document revision metadata inde
     };
 }
 
+/// Encode every durable PREPARE input through the existing private codec.
+/// No current-row lookup, schema recompilation or projection is permitted when
+/// checking a frozen vote. Caller retains the original encoded input for retry.
+pub fn completionPrepareInput(a: std.mem.Allocator, request: db_mod.types.BatchRequest) ![]u8 {
+    const mutation = request.transaction orelse return error.InvalidBatchRequest;
+    if (mutation != .prepare) return error.InvalidBatchRequest;
+    if (std.mem.allEqual(u8, &mutation.prepare.txn_id, 0)) return error.InvalidBatchRequest;
+    return encodeBatchRequest(a, request);
+}
+
+pub fn requireCompletionPrepareInput(a: std.mem.Allocator, plan: @import("../storage/transaction_completion.zig").Admission, namespace: [24]u8, request: db_mod.types.BatchRequest) !void {
+    const mutation = request.transaction orelse return error.InvalidBatchRequest;
+    if (mutation != .prepare) return error.InvalidBatchRequest;
+    if (!std.mem.eql(u8, &mutation.prepare.txn_id, &plan.transaction_id)) return error.SourceTransactionIdentityConflict;
+    const encoded = try completionPrepareInput(a, request);
+    defer a.free(encoded);
+    try plan.requirePreparedInput(namespace, encoded);
+}
+
 /// A completion BEGIN freezes the same complete participant set at every root.
 /// Recovery order is coordinator first, then canonical namespace order excluding
 /// the coordinator. Unknown phases cannot downgrade to legacy admission.
@@ -3784,4 +3803,38 @@ test "completion begin wire preserves frozen envelope and rejects downgrade and 
     request.transaction.?.begin.participants = &.{ members[1].locator, members[0].locator };
     request.transaction.?.begin.txn_id[0] ^= 1;
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, request));
+}
+
+test "completion begin wire input binding includes original effects guards and topology" {
+    const a = std.testing.allocator;
+    const completion = @import("../storage/transaction_completion.zig");
+    var request: db_mod.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 2 } }, .writes = &.{.{ .key = "row", .value = "{\"v\":1}" }}, .deletes = &.{"old"} };
+    const raw = try completionPrepareInput(a, request);
+    defer a.free(raw);
+    const namespace: [24]u8 = @splat(2);
+    const members = [_]completion.Participant{.{ .namespace = namespace, .owner_fence = @splat(3), .roles = completion.Roles.effects | completion.Roles.guards, .locator = "writer", .input_digest = completion.preparedInputDigest(namespace, raw) }};
+    const plan: completion.Admission = .{ .version = 2, .transaction_id = @splat(1), .admission_digest = @splat(4), .coordinator_namespace = namespace, .coordinator_fence = @splat(3), .participants = &members };
+    try plan.requirePreparedInput(namespace, raw);
+    try requireCompletionPrepareInput(a, plan, namespace, request);
+    var decoded = try parseInternalBatchRequest(a, raw);
+    defer decoded.deinit(a);
+    const replay = try completionPrepareInput(a, decoded.req);
+    defer a.free(replay);
+    try std.testing.expectEqualStrings(raw, replay);
+    request.transaction.?.prepare.topology_epoch += 1;
+    const changed_topology = try completionPrepareInput(a, request);
+    defer a.free(changed_topology);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, plan.requirePreparedInput(namespace, changed_topology));
+    request.transaction.?.prepare.topology_epoch -= 1;
+    request.deletes = &.{"different-old"};
+    const changed_effect = try completionPrepareInput(a, request);
+    defer a.free(changed_effect);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, plan.requirePreparedInput(namespace, changed_effect));
+    request.deletes = &.{"old"};
+    request.predicates = &.{.{ .key = "guard", .expected_version = 3 }};
+    const changed_guard = try completionPrepareInput(a, request);
+    defer a.free(changed_guard);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, plan.requirePreparedInput(namespace, changed_guard));
+    request.transaction = null;
+    try std.testing.expectError(error.InvalidBatchRequest, completionPrepareInput(a, request));
 }

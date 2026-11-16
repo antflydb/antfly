@@ -90,6 +90,9 @@ pub const Participant = struct {
     namespace: Namespace,
     owner_fence: Digest,
     roles: u8,
+    /// Required by admission v2. Binds the complete original routed PREPARE
+    /// input, including guards and checkpoint-only work, before any vote.
+    input_digest: ?Digest = null,
     /// Exact original routing locator, not a name resolved against a later
     /// topology. Its owner fence binds the physical generation.
     locator: []const u8,
@@ -115,14 +118,18 @@ pub const Admission = struct {
         try self.validate();
         if (encoded_admission_bytes > max_bytes) return error.HistoryTooLarge;
         var certificate: u64 = 4096;
-        for (self.participants) |participant| certificate += 512 + 6 * @as(u64, @intCast(participant.locator.len)) + 2048;
+        for (self.participants) |participant| certificate += @as(u64, if (self.version == 2) 768 else 512) + 6 * @as(u64, @intCast(participant.locator.len)) + 2048;
         if (certificate > max_bytes) return error.HistoryTooLarge;
         return certificate + encoded_admission_bytes + 128;
     }
     pub fn validate(self: Admission) !void {
-        if (self.version != 1 or !nonzero(self.transaction_id) or !nonzero(self.admission_digest) or !nonzero(self.coordinator_namespace) or !nonzero(self.coordinator_fence) or self.participants.len == 0 or self.participants.len > max_participants) return error.InvalidTxnRecord;
+        if ((self.version != 1 and self.version != 2) or !nonzero(self.transaction_id) or !nonzero(self.admission_digest) or !nonzero(self.coordinator_namespace) or !nonzero(self.coordinator_fence) or self.participants.len == 0 or self.participants.len > max_participants) return error.InvalidTxnRecord;
         for (self.participants, 0..) |participant, i| {
             try participant.validate();
+            if (self.version == 1) {
+                // Legacy hashes never authenticated an input digest.
+                if (participant.input_digest != null) return error.InvalidTxnRecord;
+            } else if (participant.input_digest == null or !nonzero(participant.input_digest.?)) return error.InvalidTxnRecord;
             if (i != 0 and std.mem.order(u8, &self.participants[i - 1].namespace, &participant.namespace) != .lt) return error.InvalidTxnRecord;
         }
         const coordinator = self.find(self.coordinator_namespace) orelse return error.InvalidTxnRecord;
@@ -145,6 +152,15 @@ pub const Admission = struct {
         try self.validate();
         return self.find(namespace) orelse error.InvalidParticipant;
     }
+    /// `encoded_input` must be the canonical private PREPARE encoding captured
+    /// before durable BEGIN, never a recompiled request from current rows or a
+    /// later topology. Version 1 cannot authorize production input admission.
+    pub fn requirePreparedInput(self: Admission, namespace: Namespace, encoded_input: []const u8) !void {
+        try self.validate();
+        if (self.version != 2) return error.ChangefeedCapabilityUnsupported;
+        const participant = try self.member(namespace);
+        if (encoded_input.len == 0 or !same(participant.input_digest.?, preparedInputDigest(namespace, encoded_input))) return error.SourceTransactionIdentityConflict;
+    }
     pub fn manifest(self: Admission, commit_version: u64) !Manifest {
         const result: Manifest = .{ .version = self.version, .transaction_id = self.transaction_id, .admission_digest = self.admission_digest, .coordinator_namespace = self.coordinator_namespace, .coordinator_fence = self.coordinator_fence, .commit_version = commit_version, .participants = self.participants };
         try result.validate();
@@ -152,7 +168,7 @@ pub const Admission = struct {
     }
     pub fn digest(self: Admission) Digest {
         var sha = std.crypto.hash.sha2.Sha256.init(.{});
-        sha.update("antfly:transaction-completion-admission:v1");
+        sha.update(if (self.version == 2) "antfly:transaction-completion-admission:v2" else "antfly:transaction-completion-admission:v1");
         number(&sha, self.version);
         sha.update(&self.transaction_id);
         sha.update(&self.admission_digest);
@@ -162,6 +178,7 @@ pub const Admission = struct {
         for (self.participants) |participant| {
             sha.update(&participant.namespace);
             sha.update(&participant.owner_fence);
+            if (self.version == 2) sha.update(&(participant.input_digest orelse @as(Digest, @splat(0))));
             sha.update(&.{participant.roles});
             number(&sha, participant.locator.len);
             sha.update(participant.locator);
@@ -169,6 +186,16 @@ pub const Admission = struct {
         return sha.finalResult();
     }
 };
+/// Length-framed complete routed input. The source-level admission fingerprint
+/// remains a separate identity for the original whole source transaction.
+pub fn preparedInputDigest(namespace: Namespace, encoded_input: []const u8) Digest {
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    sha.update("antfly:transaction-completion-prepare-input:v1");
+    sha.update(&namespace);
+    number(&sha, encoded_input.len);
+    sha.update(encoded_input);
+    return sha.finalResult();
+}
 pub const AdmissionEnvelope = struct { admission: Admission, digest: Digest };
 pub fn encodeAdmission(a: A, admission: Admission) ![]u8 {
     try admission.validate();
@@ -205,7 +232,7 @@ pub const Manifest = struct {
     }
     pub fn digest(self: Manifest) Digest {
         var sha = std.crypto.hash.sha2.Sha256.init(.{});
-        sha.update("antfly:transaction-completion-manifest:v1");
+        sha.update(if (self.version == 2) "antfly:transaction-completion-manifest:v2" else "antfly:transaction-completion-manifest:v1");
         number(&sha, self.version);
         sha.update(&self.transaction_id);
         sha.update(&self.admission_digest);
@@ -216,6 +243,7 @@ pub const Manifest = struct {
         for (self.participants) |participant| {
             sha.update(&participant.namespace);
             sha.update(&participant.owner_fence);
+            if (self.version == 2) sha.update(&(participant.input_digest orelse @as(Digest, @splat(0))));
             sha.update(&.{participant.roles});
             number(&sha, participant.locator.len);
             sha.update(participant.locator);
@@ -500,4 +528,40 @@ test "transaction completion reservation covers escaped plans and every particip
     const reserved = try admission.reservationBytes(plan.len);
     try std.testing.expect(plan.len + certificate.len + 128 <= reserved);
     try std.testing.expectError(error.HistoryTooLarge, admission.reservationBytes(max_bytes + 1));
+}
+
+test "completion admission v2 freezes every participant prepare input without reinterpreting legacy hashes" {
+    const a = std.testing.allocator;
+    var members = [_]Participant{
+        .{ .namespace = @splat(1), .owner_fence = @splat(2), .roles = Roles.effects, .locator = "writer" },
+        .{ .namespace = @splat(3), .owner_fence = @splat(4), .roles = Roles.guards | Roles.checkpoint, .locator = "anchor" },
+    };
+    var plan: Admission = .{ .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = members[1].namespace, .coordinator_fence = members[1].owner_fence, .participants = &members };
+    const legacy_digest = plan.digest();
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, plan.requirePreparedInput(members[0].namespace, "effects"));
+    members[0].input_digest = preparedInputDigest(members[0].namespace, "effects");
+    try std.testing.expectEqual(legacy_digest, plan.digest());
+    try std.testing.expectError(error.InvalidTxnRecord, plan.validate());
+    plan.version = 2;
+    try std.testing.expectError(error.InvalidTxnRecord, plan.validate());
+    members[1].input_digest = preparedInputDigest(members[1].namespace, "guards-and-checkpoint");
+    try plan.requirePreparedInput(members[0].namespace, "effects");
+    try plan.requirePreparedInput(members[1].namespace, "guards-and-checkpoint");
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, plan.requirePreparedInput(members[0].namespace, "substituted-effects"));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, plan.requirePreparedInput(members[1].namespace, "effects"));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, plan.requirePreparedInput(members[0].namespace, ""));
+    const digest = plan.digest();
+    const manifest_digest = (try plan.manifest(7)).digest();
+    members[0].input_digest = preparedInputDigest(members[0].namespace, "changed");
+    try std.testing.expect(!same(digest, plan.digest()));
+    try std.testing.expect(!same(manifest_digest, (try plan.manifest(7)).digest()));
+    const encoded = try encodeAdmission(a, plan);
+    defer a.free(encoded);
+    var decoded = try parseAdmission(a, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqualDeep(plan, decoded.value.admission);
+    try std.testing.expectEqual(plan.digest(), decoded.value.digest);
+    try std.testing.expect(try plan.reservationBytes(encoded.len) > encoded.len);
+    members[0].input_digest = @splat(0);
+    try std.testing.expectError(error.InvalidTxnRecord, plan.validate());
 }
