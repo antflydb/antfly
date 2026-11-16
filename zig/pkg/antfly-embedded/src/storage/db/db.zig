@@ -32900,6 +32900,7 @@ pub const DB = struct {
         index_ref: index_manager_mod.ManagedIndexRef,
         applied_sequence: u64,
     ) !u64 {
+        _ = self;
         return try replay_source.latestMatchingSequence(
             alloc,
             applied_sequence,
@@ -155405,7 +155406,12 @@ fn waitForProtectedBackfillWithoutDrain(a: Allocator, db: *DB, name: []const u8,
             }
         }
         if (keep_a_serving) {
-            var result = try db.search(a, .{ .index_name = "A", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });
+            var result = db.search(a, .{ .index_name = "A", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 }) catch |err| {
+                const applied = try db.core.loadAppliedSequence(a, "A");
+                const target = try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, applied);
+                std.debug.print("PROTECTED-BACKFILL A unavailable during {s}: {s} applied={d} target={d} tail={d}\n", .{ name, @errorName(err), applied, target, db.core.store.lastReplaySequence(0) });
+                return err;
+            };
             defer result.deinit();
             try std.testing.expect(result.hits.len != 0);
         }
