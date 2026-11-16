@@ -7077,6 +7077,7 @@ pub const DataServer = struct {
         api_server_cfg.native_history_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPageOperation } else null;
         api_server_cfg.native_history_grant = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyGrantOperation } else null;
         api_server_cfg.native_history_resolution = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyResolutionOperation } else null;
+        api_server_cfg.native_history_owner = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyOwnerOperation } else null;
         api_server_cfg.native_history_publication = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPublicationOperation } else null;
         api_server_cfg.native_history_roots = if (linked_storage and (self.data_raft != null or self.remote_metadata != null)) self.historyRootsSource() else null;
         api_server_cfg.backend_runtime = self.backend_runtime;
@@ -13385,13 +13386,14 @@ pub const DataServer = struct {
         return .{ .ptr = self, .read_fn = historyPublicationRoutedOperation };
     }
 
-    const HistoryOperation = enum { control, page, grant, resolution, publication };
+    const HistoryOperation = enum { control, page, grant, resolution, publication, owner };
     fn historyRequestType(comptime kind: HistoryOperation) type {
         return switch (kind) {
             .control => @import("../api/history_control_operations.zig").wire.Request,
             .page => @import("../api/history_page_operations.zig").Request,
             .grant => @import("../api/history_grant_operations.zig").Request,
             .resolution => @import("../api/history_resolution_operations.zig").Request,
+            .owner => @import("../api/history_owner_operations.zig").Request,
             .publication => @import("../api/history_publication_operations.zig").Request,
         };
     }
@@ -13401,6 +13403,7 @@ pub const DataServer = struct {
             .page => @import("../api/history_page_operations.zig").pages.Page,
             .grant => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation,
             .resolution => @import("../api/history_resolution_operations.zig").wire.Reply,
+            .owner => @import("../api/history_owner_operations.zig").Reply,
             .publication => @import("../api/history_publication_operations.zig").Reply,
         };
     }
@@ -13459,6 +13462,7 @@ pub const DataServer = struct {
             .page => historyPageOperation(self, alloc, fence, table, input, context),
             .grant => historyGrantOperation(self, alloc, fence, table, input, context),
             .resolution => historyResolutionOperation(self, alloc, fence, table, input, context),
+            .owner => historyOwnerOperation(self, alloc, fence, table, input, context),
             .publication => historyPublicationOperation(self, alloc, fence, table, input, context),
         };
         // Only a compact, deadline-aware peer capture may discover a remote
@@ -13483,8 +13487,27 @@ pub const DataServer = struct {
             .page => client.fetchGroupHistoryPage(uri, group, table, input, fence, context),
             .grant => client.fetchGroupHistoryGrant(uri, group, table, input, fence, context),
             .resolution => client.fetchGroupHistoryResolution(uri, group, table, input, fence, context),
+            .owner => client.fetchGroupHistoryOwner(uri, group, table, input, fence, context),
             .publication => client.fetchGroupHistoryPublication(uri, group, table, input, fence, context),
         };
+    }
+
+    pub fn historyOwnerPort(self: *DataServer) @import("../api/history_owner_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = historyOwnerRoutedOperation };
+    }
+    fn historyOwnerRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.owner), context: antfly.public_api.operation.RequestContext) !historyResultType(.owner) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .owner, input, context);
+    }
+    fn historyOwnerOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.owner), context: antfly.public_api.operation.RequestContext) !historyResultType(.owner) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyLocalRead(alloc, fence, table, .owner, input, context);
+    }
+    fn captureHistoryOwner(owner: anytype, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.owner), context: antfly.public_api.operation.RequestContext) !historyResultType(.owner) {
+        const captured = try owner.captureCompletionOwnerRouted(alloc, fence, table, input.expected_table_binding, context);
+        const result: historyResultType(.owner) = .{ .owner = captured.owner, .observation = captured.observation };
+        try result.validate(input, fence);
+        return result;
     }
 
     fn historyPublicationOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.publication), context: antfly.public_api.operation.RequestContext) !historyResultType(.publication) {
@@ -13532,6 +13555,7 @@ pub const DataServer = struct {
                 .page => owner.orderedHistoryPageRouted(alloc, fence, table, input.request),
                 .grant => owner.orderedHistoryGrantRouted(alloc, fence, table, input.identity),
                 .resolution => owner.orderedHistoryResolutionRouted(alloc, fence, table, input.binding()),
+                .owner => captureHistoryOwner(owner, alloc, fence, table, input, context),
                 .publication => owner.orderedHistoryPublicationRouted(alloc, fence, table, input.binding()),
                 .control => unreachable,
             }) catch |err| switch (err) {
@@ -43693,7 +43717,7 @@ fn consumerTests() type {
                 };
                 const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
                 defer a.destroy(api_server);
-                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
                 var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
@@ -44088,7 +44112,8 @@ fn consumerTests() type {
                         changed_binding[0] ^= 1;
                         try std.testing.expectError(error.TopologyChanged, fixture_owner.captureCompletionOwnerRouted(fixture_alloc, fence, "docs", changed_binding, .{}));
                         try std.testing.expectError(error.DeadlineExceeded, fixture_owner.captureCompletionOwnerRouted(fixture_alloc, fence, "docs", expected_binding, .{ .deadline_ns = platform_time.monotonicNs() -| 1 }));
-                        const captured = try capture(fixture_alloc, fixture_owner, fence, expected_binding);
+                        try std.testing.expectError(error.TopologyChanged, fixture_origin.historyOwnerPort().read(fixture_alloc, fence, "docs", .{ .version = 1, .expected_table_binding = changed_binding }, .{}));
+                        const captured = try fixture_origin.historyOwnerPort().read(fixture_alloc, fence, "docs", .{ .version = 1, .expected_table_binding = expected_binding }, .{});
                         const current_owner = captured.owner;
                         try std.testing.expect(captured.observation.cut.term > 0 and captured.observation.cut.index > 0);
                         try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024), captured.observation.retention_limit_bytes);
@@ -44164,6 +44189,9 @@ fn consumerTests() type {
                 }
                 const retained_history = @import("antfly_local_sources").storage_committed_history;
                 const publication_query: retained_history.CompletionPublicationQuery = .{ .owner = current_owner, .transaction_id = txn_id, .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
+                const qualified = try origin.historyOwnerPort().read(a, route.fence().?, "docs", .{ .version = 1, .expected_table_binding = current_owner.table_binding }, .{});
+                try std.testing.expectEqual(current_owner, qualified.owner);
+                try std.testing.expect(qualified.observation.cut.index > 0);
                 const publication_input: @import("../api/history_publication_operations.zig").Request = .{ .version = 1, .owner = current_owner, .transaction_id = txn_id, .manifest_digest = publication_query.manifest_digest, .commit_version = 1001, .minimum_applied_index = 1 };
                 const observed_publication = try server.historyPublicationPort().read(a, route.fence().?, "docs", publication_input, .{});
                 try observed_publication.validate(publication_query);

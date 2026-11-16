@@ -3068,3 +3068,41 @@ uninitialized history, physical scope and minimum-cut rejection, retry/reopen,
 malformed input and invalid ABI are qualified by this run. Formatting and diff
 checks passed. The result remains an observation of preconditions, not a quota
 reservation or a global completion decision.
+
+### Remote current-owner qualification
+
+The private `history/owner-v1` contract captures and qualifies a native retained
+history participant across nodes. Its request carries the expected table binding
+from the coordinator's original catalog generation; its versioned reply carries
+the full physical owner and native admission observation. The observation binds
+the owner digest and positive persisted cut, with the configured retention ceiling
+explicitly remaining a policy limit rather than an available-capacity promise.
+The client rejects a changed metadata incarnation, namespace, topology or table
+binding, and rejects a native observation for a different physical root.
+
+The endpoint follows the existing signed service-only retained-history boundary,
+including during legacy migration. Strict JSON, 4096-byte bodies, the original
+catalog route fence, acknowledgement and one shared relative deadline apply.
+DataServer routes only to the known eligible leader and retries local transient
+read admission within that deadline. This is a read: it neither reserves quota
+nor accepts a transaction nor advances a source checkpoint. Full coordinator
+integration and the remaining public feed/bootstrap/retention/CDC qualification
+requirements remain outstanding. Test results follow after verification.
+
+`owner-capture-qualified-test.log` completed with exit 0: all 21 signed retained
+history RPC/authentication tests and all nine real-Raft cases passed, with zero
+failures, skips or leaks. The initial sandboxed run compiled successfully but
+could not bind the fixture's loopback listener; the permitted run resolved that
+environment restriction. The native observation and all owner identity checks
+are validated at the typed port boundary as well as HTTP decoding. A final run
+also exercises remote capture before freezing BEGIN/PREPARE/RESOLVE inputs.
+
+`owner-capture-final-test.log` completed with exit 0: all 21 RPC/authentication
+cases and nine real-Raft cases passed again, with zero skips, failures or leaks.
+The coordinator fixture now rejects a changed expected binding over signed HTTP,
+qualifies the owner remotely before freezing the plan, submits canonical
+BEGIN/PREPARE/RESOLVE commands and publishes/re-observes the certificate. Remote
+qualification also succeeds after an idle protocol barrier without manufacturing
+an extra native write. OpenAPI generation, license, formatting and diff checks
+passed. This completes the remote qualification prerequisite, not the full
+production coordinator, source integration or public changefeed objective.

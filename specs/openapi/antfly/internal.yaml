@@ -63,6 +63,82 @@ paths:
             X-Antfly-Raft-Mutation-Outcome:
               schema: {type: string, enum: [not-proposed-v1, not-applied-v1, unknown-v1, committed-v1]}
         '504': {description: Shared deadline exhausted; mutation may have committed}
+  /groups/{group_id}/tables/{table_name}/history/owner-v1:
+    post:
+      tags: [retained-history]
+      operationId: captureNativeHistoryOwner
+      summary: Qualify the current native history participant owner
+      description: |
+        Signed service-only bounded read, including during legacy migration.
+        Captures the current participant owner under the original catalog route
+        fence and expected table binding, establishes ReadIndex, and qualifies
+        retained committed history at an actual positive persisted native cut.
+        Validates owner and catalog identity before and after the read. The
+        observation binds the returned owner and minimum applied index of one.
+        Qualification does not reserve retention, vote, accept a transaction,
+        advance a source checkpoint, or authorize replay. One shared routing
+        deadline bounds all work. Request and response are limited to 4096 bytes.
+      security:
+        - InternalServicePrincipal: []
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema: {type: integer, format: uint64, minimum: 1}
+        - name: table_name
+          in: path
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 1024}
+        - name: X-Antfly-Catalog-Route-Fence
+          in: header
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 16384}
+        - name: X-Antfly-Catalog-Route-Deadline-Ms
+          in: header
+          required: true
+          schema: {type: integer, minimum: 1, maximum: 5000}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NativeHistoryOwnerRequest'}
+      responses:
+        '200':
+          description: Qualified current owner and request-bound actual native storage cut.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryOwnerReply'}
+        '400':
+          description: Invalid request or catalog fence.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+        '401':
+          description: Missing or invalid signed service authority.
+        '403':
+          description: Internal service authority required.
+        '409':
+          description: Retention scope or topology conflicts; inspect the typed code.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+        '413':
+          description: Request exceeds the 4096 byte admission limit.
+        '500':
+          description: Corrupt history or internal owner failure.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+        '501':
+          description: Unsupported native owner profile.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
+        '503':
+          description: Leader, routing, deadline or storage admission is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NativeHistoryPublicationError'}
   /groups/{group_id}/tables/{table_name}/history/publication-v1:
     post:
       tags: [retained-history]
@@ -592,6 +668,12 @@ components:
             sequence: {type: integer, minimum: 1}
     NativeHistoryPublicationOwner:
       {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"metadata_group_id":{"type":"integer","format":"uint64","minimum":1},"metadata_incarnation":{"$ref":"#/components/schemas/NativeHistoryDigest","description":"Canonical 32-byte nonzero lowercase hexadecimal incarnation encoded as ASCII bytes."},"namespace":{"$ref":"#/components/schemas/NativeHistoryNamespace"},"table_binding":{"$ref":"#/components/schemas/NativeHistoryDigest"},"root_generation":{"type":"integer","format":"uint64","minimum":0},"group_id":{"type":"integer","format":"uint64","minimum":1},"topology_epoch":{"type":"integer","format":"uint64","minimum":0}},"required":["version","metadata_group_id","metadata_incarnation","namespace","table_binding","root_generation","group_id","topology_epoch"]}
+    NativeHistoryOwnerRequest:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"expected_table_binding":{"$ref":"#/components/schemas/NativeHistoryDigest"}},"required":["version","expected_table_binding"]}
+    NativeHistoryOwnerObservation:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"request_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"cut":{"$ref":"#/components/schemas/NativeHistoryPublicationCut"},"retention_limit_bytes":{"type":"integer","format":"uint64","minimum":1}},"required":["version","request_digest","cut","retention_limit_bytes"]}
+    NativeHistoryOwnerReply:
+      {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"observation":{"$ref":"#/components/schemas/NativeHistoryOwnerObservation"}},"required":["version","owner","observation"]}
     NativeHistoryPublicationRequest:
       {"type":"object","additionalProperties":false,"properties":{"version":{"type":"integer","enum":[1]},"owner":{"$ref":"#/components/schemas/NativeHistoryPublicationOwner"},"transaction_id":{"$ref":"#/components/schemas/NativeHistoryConsumerId"},"manifest_digest":{"$ref":"#/components/schemas/NativeHistoryDigest"},"commit_version":{"type":"integer","format":"uint64","minimum":1},"minimum_applied_index":{"type":"integer","format":"uint64","minimum":1}},"required":["version","owner","transaction_id","manifest_digest","commit_version","minimum_applied_index"]}
     NativeHistoryPublicationCut:

@@ -329,6 +329,24 @@ pub const NativeHistoryNamespace = []const i64;
 
 pub const NativeHistoryOutcome = std.json.Value;
 
+pub const NativeHistoryOwnerObservation = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    cut: NativeHistoryPublicationCut,
+    retention_limit_bytes: u64,
+};
+
+pub const NativeHistoryOwnerReply = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    observation: NativeHistoryOwnerObservation,
+};
+
+pub const NativeHistoryOwnerRequest = struct {
+    version: i64,
+    expected_table_binding: NativeHistoryDigest,
+};
+
 pub const NativeHistoryPageError = struct {
     version: i64,
     code: []const u8,

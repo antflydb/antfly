@@ -484,7 +484,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("completion-begin-wire-test", "Verify frozen completion BEGIN encoding and downgrade rejection").dependOn(&b.addRunArtifact(completion_begin_tests).step);
-    const history_capability_filters = &.{ "internal capabilities advertise only the serving history apply profile", "internal namespace requires a service principal except hot standby", "history control ingress", "history control client", "history page ingress", "history page client", "history grant ingress", "history grant client", "history resolution ingress", "history resolution client", "history publication ingress", "history publication client" };
+    const history_capability_filters = &.{ "internal capabilities advertise only the serving history apply profile", "internal namespace requires a service principal except hot standby", "history control ingress", "history control client", "history page ingress", "history page client", "history grant ingress", "history grant client", "history resolution ingress", "history resolution client", "history publication ingress", "history publication client", "history owner ingress", "history owner client" };
     const history_capability_tests = b.addTest(.{
         .root_module = options.api_http_runtime_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api HTTP runtime discovery"}, history_capability_filters),
