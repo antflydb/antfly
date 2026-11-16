@@ -155217,7 +155217,6 @@ fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_siz
     const privacy = @import("../../privacy/document.zig");
     const catalog = @import("../../privacy/catalog.zig");
     const Probe = struct {
-        deterministic: embedder_mod.DeterministicDenseEmbedder = .{},
         batches: std.atomic.Value(usize) = .init(0),
         items: std.atomic.Value(usize) = .init(0),
         largest_batch: std.atomic.Value(usize) = .init(0),
@@ -155246,7 +155245,7 @@ fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_siz
             }
             for (texts, vectors) |text, *vector| {
                 try std.testing.expect(std.mem.indexOf(u8, text, "a@b.co") == null);
-                vector.* = try embedder_mod.DeterministicDenseEmbedder.embedDense(&self.deterministic, out, name, text, dims);
+                vector.* = try protectedBackfillVector(out, name, text, dims);
                 initialized += 1;
             }
             _ = self.items.fetchAdd(texts.len, .release);
@@ -155304,7 +155303,7 @@ fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_siz
             try waitForProtectedBackfillWithoutDrain(a, &db, name, writes[0].key, document_count, i != 0);
         } else try db.runUntilIdle();
         std.debug.print("\nPROTECTED-BACKFILL docs={d} index={s} wall_ms={d} batches={d} completed_items={d} primary_scans={d} native_merges={d}\n", .{ document_count, name, (monotonicTimeNs() -| started) / std.time.ns_per_ms, probe.batches.load(.acquire) - calls_before, probe.items.load(.acquire) - items_before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before, index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before });
-        const verified = try verifyProtectedBackfillOutput(a, &db, name, embedding, writes, dimensions, chunk_size < 1024, &probe.deterministic);
+        const verified = try verifyProtectedBackfillOutput(a, &db, name, embedding, writes, dimensions, chunk_size < 1024);
         if (i == 1) {
             migration_calls = probe.batches.load(.acquire) - calls_before;
             migration_items = probe.items.load(.acquire) - items_before;
@@ -155335,7 +155334,7 @@ fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_siz
     for ([_][]const u8{ "A", "B" }) |name| {
         if (workers) try waitForProtectedBackfillWithoutDrain(a, &db, name, writes[0].key, document_count, false);
         const embedding = try catalog.managedName(scratch, version, name);
-        _ = try verifyProtectedBackfillOutput(a, &db, name, embedding, writes, dimensions, chunk_size < 1024, &probe.deterministic);
+        _ = try verifyProtectedBackfillOutput(a, &db, name, embedding, writes, dimensions, chunk_size < 1024);
     }
     try std.testing.expectEqual(completed_before_reopen, probe.items.load(.acquire));
     try std.testing.expectEqual(privacy_before_reopen, probe.privacy_calls.load(.acquire));
@@ -155382,7 +155381,21 @@ fn waitForProtectedBackfillWithoutDrain(a: Allocator, db: *DB, name: []const u8,
     }
 }
 
-fn verifyProtectedBackfillOutput(a: Allocator, db: *DB, name: []const u8, embedding: []const u8, writes: []const types.BatchWrite, dimensions: u32, multi_chunk: bool, deterministic: *embedder_mod.DeterministicDenseEmbedder) !usize {
+fn protectedBackfillVector(a: Allocator, model: []const u8, text: []const u8, dimensions: u32) ![]f32 {
+    var provider: embedder_mod.DeterministicDenseEmbedder = .{ .seed = std.hash.Wyhash.hash(0, model) };
+    return embedder_mod.DeterministicDenseEmbedder.embedDense(&provider, a, model, text, dimensions);
+}
+
+test "privacy protected model migration oracle rejects substituted model vectors" {
+    const a = std.testing.allocator;
+    const first = try protectedBackfillVector(a, "model-A", "same protected input", 384);
+    defer a.free(first);
+    const second = try protectedBackfillVector(a, "model-B", "same protected input", 384);
+    defer a.free(second);
+    try std.testing.expect(!std.mem.eql(f32, first, second));
+}
+
+fn verifyProtectedBackfillOutput(a: Allocator, db: *DB, name: []const u8, embedding: []const u8, writes: []const types.BatchWrite, dimensions: u32, multi_chunk: bool) !usize {
     var vector_count: usize = 0;
     for (writes) |write| {
         var manifest = (try db.getDocumentArtifactManifest(a, write.key, name)) orelse return error.TestUnexpectedResult;
@@ -155397,7 +155410,7 @@ fn verifyProtectedBackfillOutput(a: Allocator, db: *DB, name: []const u8, embedd
         defer reconstructed.deinit(a);
         for (parsed.value.vectors) |vector| {
             try std.testing.expect(std.mem.indexOfScalar(u8, vector.source_text, '@') == null);
-            const expected = try embedder_mod.DeterministicDenseEmbedder.embedDense(deterministic, a, embedding, vector.source_text, dimensions);
+            const expected = try protectedBackfillVector(a, embedding, vector.source_text, dimensions);
             defer a.free(expected);
             try std.testing.expectEqualSlices(f32, expected, vector.values);
             for (vector.source_text) |byte| {
