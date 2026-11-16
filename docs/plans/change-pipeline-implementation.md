@@ -2564,8 +2564,19 @@ missing owner and mixed row mutations. `completion-resolution-fence-test.log` fi
 suites, all seven history-consumer tests, compiled-owner reopen test and six
 actual-Raft tests passed. This qualifies owner-bound row resolution/reopen and
 its negative authority cases. Explicit v2 zero-effect/abort/fresh-entry terminal
-retry cases still need extension. Certificate publication, original-root
+retry cases are covered by the additional qualification below. Certificate publication, original-root
 handoff retention and production recovery callers remain outstanding.
+
+### Resolution edge-case qualification
+
+The native consumer fixture now exercises a fresh-entry terminal retry and
+compares its receipt with the original, rejects a replacement owner after commit,
+resolves a prepared guard/checkpoint participant into an explicit no-effect
+receipt at its actual Raft entry, and aborts an unprepared v2 participant without
+manufacturing a committed receipt. It also rejects ownerless abort and commit
+before prepare without advancing the applied marker. The focused run completed with exit 0
+in `completion-resolution-zero-effect-test.log`: all seven history-consumer
+cases and the local storage discovery suite passed.
 
 ## Working constraints
 

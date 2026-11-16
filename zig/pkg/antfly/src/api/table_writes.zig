@@ -40541,6 +40541,45 @@ fn implementationTests() type {
             try db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 4 });
             try std.testing.expectEqual(@as(u64, 7), (try db.orderedApplyReceipt()).?.index);
             try std.testing.expectEqual(.committed, try db.getTransactionStatus(v2_id));
+            // A new log entry may retry the terminal decision, but cannot
+            // replace its original authority or mint a newer effects receipt.
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.resolveReplicatedCompletionTransactionAtOrderedReceipt(v2_id, .committed, 40, .{ .term = 1, .index = 8 }, null, replacement_owner));
+            try std.testing.expectEqual(@as(u64, 7), (try db.orderedApplyReceipt()).?.index);
+            try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(v2_id, .committed, 40, .{ .term = 1, .index = 8 }, null, routed_owner);
+            const retried = try db.historyResolution(a, .{ .authority = .raft, .namespace = namespace, .transaction_id = v2_id, .owner_fence = routed_owner.digest(), .manifest_digest = (try v2.manifest(40)).digest(), .commit_version = 40, .minimum_applied_index = 8 });
+            try std.testing.expectEqualDeep(receipt.resolution, retried.resolution);
+
+            // Guard/checkpoint participants still require an explicit prepared
+            // vote. Their positive no-effect receipt comes from resolution.
+            const guard_id: [16]u8 = @splat(10);
+            const guard_prepare: db_mod.types.BatchRequest = .{ .timestamp_ns = 50, .document_version_scheme = .revision_v1, .transaction = .{ .prepare = .{ .txn_id = guard_id, .topology_epoch = 1, .completion_owner = routed_owner } } };
+            const guard_input = try batch_wire.completionPrepareInput(a, guard_prepare);
+            defer a.free(guard_input);
+            const guard_members = [_]completion.Participant{.{ .namespace = namespace, .owner_fence = routed_owner.digest(), .roles = completion.Roles.guards | completion.Roles.checkpoint, .locator = members[0].locator, .input_digest = completion.preparedInputDigest(namespace, guard_input) }};
+            var guard_plan: completion.Admission = .{ .version = 2, .transaction_id = guard_id, .admission_digest = @splat(11), .coordinator_namespace = namespace, .coordinator_fence = routed_owner.digest(), .participants = &guard_members };
+            const guard_bytes = try completion.encodeAdmission(a, guard_plan);
+            defer a.free(guard_bytes);
+            _ = try db.beginReplicatedCompletionTransaction(guard_bytes, routed_owner, 50, 51, true, .{ .term = 1, .index = 9 });
+            try std.testing.expectError(error.SourceOutcomeUnresolved, db.resolveReplicatedCompletionTransactionAtOrderedReceipt(guard_id, .committed, 52, .{ .term = 1, .index = 10 }, null, routed_owner));
+            try std.testing.expectEqual(@as(u64, 9), (try db.orderedApplyReceipt()).?.index);
+            try db.writeReplicatedTransactionAtOrderedReceipt(guard_id, .{ .completion_owner = routed_owner, .completion_input_digest = guard_members[0].input_digest, .document_version_scheme = .revision_v1 }, .{ .term = 1, .index = 10 });
+            try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(guard_id, .committed, 52, .{ .term = 1, .index = 11 }, null, routed_owner);
+            const guard_receipt = try db.historyResolution(a, .{ .authority = .raft, .namespace = namespace, .transaction_id = guard_id, .owner_fence = routed_owner.digest(), .manifest_digest = (try guard_plan.manifest(52)).digest(), .commit_version = 52, .minimum_applied_index = 11 });
+            try std.testing.expect(guard_receipt.resolution.?.outcome == .no_effect);
+            try std.testing.expectEqual(@as(u64, 11), std.mem.readInt(u64, guard_receipt.resolution.?.source_position[8..16], .little));
+
+            // Abort is legal before a prepared vote, but cannot manufacture a
+            // committed no-effect receipt for that participant.
+            guard_plan.transaction_id = @splat(12);
+            const abort_bytes = try completion.encodeAdmission(a, guard_plan);
+            defer a.free(abort_bytes);
+            _ = try db.beginReplicatedCompletionTransaction(abort_bytes, routed_owner, 60, 61, true, .{ .term = 1, .index = 12 });
+            try std.testing.expectError(error.InvalidHistoryAdmission, db.resolveReplicatedTransactionAtOrderedReceipt(guard_plan.transaction_id, .aborted, 62, .write, .none, .{ .term = 1, .index = 13 }, null));
+            try std.testing.expectEqual(.pending, try db.getTransactionStatus(guard_plan.transaction_id));
+            try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(guard_plan.transaction_id, .aborted, 62, .{ .term = 1, .index = 13 }, null, routed_owner);
+            try std.testing.expectEqual(.aborted, try db.getTransactionStatus(guard_plan.transaction_id));
+            const aborted = try db.historyResolution(a, .{ .authority = .raft, .namespace = namespace, .transaction_id = guard_plan.transaction_id, .owner_fence = routed_owner.digest(), .manifest_digest = (try guard_plan.manifest(62)).digest(), .commit_version = 62, .minimum_applied_index = 13 });
+            try std.testing.expect(aborted.resolution == null);
         }
 
         test "ordered history consumer grant wire contracts" {
