@@ -1096,24 +1096,39 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }.lessThan);
 
+            if (decoded.record.changed_doc_keys.len != 0 or decoded.record.deleted_doc_keys.len != 0 or decoded.record.overwritten_doc_keys.len != 0) {
+                const key = try alloc.dupe(u8, &internal_keys.primary_source_revision_key);
+                try appendSourceRevisionWrite(alloc, key, sequence, writes, owned_keys, owned_values);
+            }
             for (artifact_names.items) |artifact_name| {
                 const key = try internal_keys.artifactSourceRevisionKeyAlloc(alloc, artifact_name);
-                var key_transferred = false;
-                errdefer if (!key_transferred) alloc.free(key);
-                const value = try alloc.alloc(u8, @sizeOf(u64));
-                var value_transferred = false;
-                errdefer if (!value_transferred) alloc.free(value);
-                std.mem.writeInt(u64, value[0..8], sequence, .big);
-                try owned_keys.append(alloc, key);
-                key_transferred = true;
-                try owned_values.append(alloc, value);
-                value_transferred = true;
-                // Preserve the key order required by the bulk-ingest append fast path.
-                // Replay metadata sorts between user rows and identity metadata.
-                var insert_at: usize = 0;
-                while (insert_at < writes.items.len and std.mem.order(u8, writes.items[insert_at].key, key) != .gt) : (insert_at += 1) {}
-                try writes.insert(alloc, insert_at, .{ .key = key, .value = value });
+                try appendSourceRevisionWrite(alloc, key, sequence, writes, owned_keys, owned_values);
             }
+        }
+
+        fn appendSourceRevisionWrite(
+            alloc: Allocator,
+            key: []u8,
+            sequence: u64,
+            writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+        ) !void {
+            var key_transferred = false;
+            errdefer if (!key_transferred) alloc.free(key);
+            const value = try alloc.alloc(u8, @sizeOf(u64));
+            var value_transferred = false;
+            errdefer if (!value_transferred) alloc.free(value);
+            std.mem.writeInt(u64, value[0..8], sequence, .big);
+            try owned_keys.append(alloc, key);
+            key_transferred = true;
+            try owned_values.append(alloc, value);
+            value_transferred = true;
+            // Preserve the key order required by the bulk-ingest append fast path.
+            // Replay metadata sorts between user rows and identity metadata.
+            var insert_at: usize = 0;
+            while (insert_at < writes.items.len and std.mem.order(u8, writes.items[insert_at].key, key) != .gt) : (insert_at += 1) {}
+            try writes.insert(alloc, insert_at, .{ .key = key, .value = value });
         }
 
         pub fn appendAssetArtifactSourceIndexDelete(

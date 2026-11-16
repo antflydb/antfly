@@ -337,28 +337,8 @@ pub fn requireConsumersPublishedWithBudget(db: anytype, a: A, req: @import("type
             if (db.core.index_manager.loadFailure(name) != null) return error.IndexRebuilding;
             var applied = try db.core.loadAppliedSequence(scratch, name);
             if (db.executor.appliedSequence(name)) |live| applied = @max(applied, live);
-            const target = target: {
-                // Completed source proofs below (or local counters above)
-                // fence primary changes. Projection lag must then follow this
-                // consumer's artifact markers, not a sibling's kind-wide tail.
-                // Observe markers at the same cut as those source proofs.
-                if (names.len != 0) {
-                    var scoped = applied;
-                    for (names) |source| {
-                        const key = try keys.artifactSourceRevisionKeyAlloc(scratch, source);
-                        if (budget) |b| try b.consume(key.len + @sizeOf(u64));
-                        const raw = read.get(key) catch |err| switch (err) {
-                            error.NotFound => break,
-                            else => return err,
-                        };
-                        if (raw.len != @sizeOf(u64)) return error.InvalidArtifactSourceRevision;
-                        scoped = @max(scoped, std.mem.readInt(u64, raw[0..8], .big));
-                    } else break :target scoped;
-                }
-                // Imported/legacy stores without complete source markers keep
-                // the conservative aggregate fence until markers are written.
-                break :target try db.managedIndexReplayTargetSequence(scratch, name, entry.config.kind, applied);
-            };
+            const target = (try @import("derived/replay_source.zig").artifactTargetAtCut(scratch, &read, names, applied, budget)) orelse
+                try db.managedIndexReplayTargetSequence(scratch, name, entry.config.kind, applied);
             if (applied < target) return error.IndexRebuilding;
             const checkpoint = try db.core.loadProjectionCheckpoint(scratch, name);
             if (checkpoint.status != .clean or checkpoint.config_hash != @import("types.zig").indexConfigHash(entry.config)) return error.IndexRebuilding;

@@ -310,7 +310,10 @@ def test_protected_model_backfill_batches(
         assert all(
             r["status"] == 502
             and r.get("response_error") in ("BrokenPipeError", "ConnectionResetError")
-            and r["started"] < released_at <= r["completed"]
+            and (
+                r["started"] in {attempt["started"] for attempt in pre_crash_work}
+                or r["started"] < released_at <= r["completed"]
+            )
             for r in abandoned
         ), abandoned
         report["abandoned_held_embedding_calls"] = len(abandoned)

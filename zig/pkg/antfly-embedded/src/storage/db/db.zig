@@ -32898,7 +32898,16 @@ pub const DB = struct {
         index_ref: index_manager_mod.ManagedIndexRef,
         applied_sequence: u64,
     ) !u64 {
-        _ = self;
+        const names = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_ref.name);
+        defer {
+            for (names) |name| alloc.free(name);
+            alloc.free(names);
+        }
+        if (names.len != 0) {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            if (try replay_source_mod.artifactTargetAtCut(alloc, &read, names, applied_sequence, null)) |target| return target;
+        }
         return try replay_source.latestMatchingSequence(
             alloc,
             applied_sequence,
@@ -155480,7 +155489,8 @@ test "privacy scoped readiness serves A while sibling B backfills" {
         .targets = &.{.{ .kind = .dense_vector, .index_name = "B" }},
     }} });
     try std.testing.expect(sibling_tail > a_applied);
-    try std.testing.expectEqual(sibling_tail, try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, a_applied));
+    try std.testing.expectEqual(sibling_tail, try db.core.replaySource().latestMatchingSequence(a, a_applied, .dense_vector));
+    try std.testing.expectEqual(a_applied, try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, a_applied));
     const calls = embedder.calls;
     var result = try db.search(a, req);
     defer result.deinit();
@@ -155543,6 +155553,12 @@ test "privacy scoped readiness serves A while sibling B backfills" {
     defer ready_b.deinit();
     try std.testing.expectEqual(@as(usize, 1), ready_a.hits.len);
     try std.testing.expectEqual(@as(usize, 1), ready_b.hits.len);
+    try db.batch(.{ .deletes = &.{"doc"}, .sync_level = .write });
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, req));
+    try db.runUntilIdle();
+    var deleted = try db.search(a, req);
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), deleted.hits.len);
 }
 
 test "privacy scoped readiness status isolates shared catch-up telemetry" {
