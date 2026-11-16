@@ -1927,6 +1927,10 @@ pub const Owner = struct {
     /// `test_cumulative_sync_calls + current's own test_sync_calls` is
     /// stable across any number of swaps.
     test_cumulative_sync_calls: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
+    /// The same bridge for the outgoing generation's `Store.test_groups_total`
+    /// and `Store.test_group_members_total` group-commit counters.
+    test_cumulative_groups: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
+    test_cumulative_group_members: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
 
     /// A retiring generation rejects further publication once nothing else
     /// still needs it writable -- except a `WriterLane`-admitted call still
@@ -2020,6 +2024,18 @@ pub const Owner = struct {
     /// a different process's publication. Cursor continuation deliberately
     /// uses its pinned generation without reopening the connection.
     pub fn refresh(self: *Owner) !*h.Handle {
+        return self.refreshOrTurnBusy() catch |err| switch (err) {
+            error.MaintenanceTurnBusy => error.FileBusy,
+            else => err,
+        };
+    }
+
+    /// `refresh`, except that a replacement open which needs the
+    /// cross-process maintenance turn while another writer holds it fails
+    /// with `error.MaintenanceTurnBusy` instead of `error.FileBusy`, so a
+    /// caller holding the writer lease (`Connection.refresh`) can give the
+    /// lease back and wait for the turn instead of failing at once.
+    fn refreshOrTurnBusy(self: *Owner) !*h.Handle {
         wal_trace.recordOp(.serving_runtime_refresh);
         if (comptime h.builtin.is_test) _ = self.test_refresh_count.fetchAdd(1, .release);
         var known_maintenance: ?*h.Handle = null;
@@ -2143,7 +2159,7 @@ pub const Owner = struct {
                 options.allocator_state_donor = &certified.?;
             } else if (certified.?.header.indexed_reclamation and !try self.unindexedRuntimeOpen(&certified.?)) {
                 retained_turn = try self.retainMaintenanceTurnAssumeLocked();
-                if (!retained_turn) return error.FileBusy;
+                if (!retained_turn) return error.MaintenanceTurnBusy;
             }
         }
         const replacement = try api.openLiteHandleAllocWithSharedInference(alloc, self.path, options, false, h.handleLockIo(), null, self.current);
@@ -2204,10 +2220,13 @@ pub const Owner = struct {
         // replaced (see `test_cumulative_sync_calls`'s doc comment): this is
         // the one place `self.current` is ever reassigned.
         if (comptime h.builtin.is_test) if (self.current) |outgoing| {
-            _ = self.test_cumulative_sync_calls.fetchAdd(
-                outgoing.owned_lite_backend.?.native_docstore.?.file.test_sync_calls.load(.monotonic),
-                .monotonic,
-            );
+            const outgoing_store = outgoing.owned_lite_backend.?.native_docstore.?;
+            _ = self.test_cumulative_sync_calls.fetchAdd(outgoing_store.file.test_sync_calls.load(.monotonic), .monotonic);
+            _ = self.test_cumulative_groups.fetchAdd(outgoing_store.test_groups_total.load(.acquire), .monotonic);
+            _ = self.test_cumulative_group_members.fetchAdd(outgoing_store.test_group_members_total.load(.acquire), .monotonic);
+            // A test's simulated fsync latency belongs to the path, not to
+            // one generation's file.
+            replacement.owned_lite_backend.?.native_docstore.?.file.test_sync_delay_ns.store(outgoing_store.file.test_sync_delay_ns.load(.monotonic), .monotonic);
         };
         // Marks the new generation subject to the `active_writer` backstop
         // (native.zig's `publishCheckpoint`/inode_lock.zig's own doc
@@ -4338,7 +4357,10 @@ pub const Connection = struct {
     /// test call to this function) passes `false`, preserving the
     /// original wait behavior where it is not self-referential.
     pub fn refresh(self: *Connection, lease: *?native.PathWriterLock, intent: api.StorageIntent, skip_lane_wait: bool) !*h.Handle {
-        var root = try self.owner.refresh();
+        var root = self.owner.refreshOrTurnBusy() catch |err| switch (err) {
+            error.MaintenanceTurnBusy => try self.refreshAfterMaintenanceTurn(lease, skip_lane_wait),
+            else => return err,
+        };
         if (self.options.profile == .native and self.options.open_mode == .writer and
             (usesCapacityAdmission(root) or (intent == .mutation and try self.needsReuseAdmission(root))))
         {
@@ -4388,6 +4410,33 @@ pub const Connection = struct {
         self.current = root;
         self.attach(root);
         return root;
+    }
+
+    /// The replacement open needs the maintenance turn, and a maintenance
+    /// writer holds it. That writer needs the writer lease to finish its
+    /// own commit, so waiting with the lease held only runs out the clock.
+    /// Give the lease back, back off until the turn may be free, reacquire,
+    /// and refresh again, all within this call's busy timeout -- the same
+    /// shape as the allocator-proof wait in `refresh`.
+    fn refreshAfterMaintenanceTurn(self: *Connection, lease: *?native.PathWriterLock, skip_lane_wait: bool) !*h.Handle {
+        const io = h.handleLockIo();
+        const deadline = self.admissionDeadline();
+        var backoff_ns: i96 = 100 * std.time.ns_per_us;
+        while (true) {
+            if (lease.*) |*held| held.close();
+            lease.* = null;
+            self.gate.mutex.unlock(io);
+            const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+            const slept = remaining > 0 and (if (io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake)) |_| true else |_| false);
+            self.gate.mutex.lockUncancelable(io);
+            if (!slept) return error.FileBusy;
+            backoff_ns = @min(backoff_ns * 2, 5 * std.time.ns_per_ms);
+            lease.* = try self.acquirePathLeaseAssumeLocked(skip_lane_wait);
+            return self.owner.refreshOrTurnBusy() catch |err| switch (err) {
+                error.MaintenanceTurnBusy => continue,
+                else => return err,
+            };
+        }
     }
 
     fn needsReuseAdmission(self: *Connection, root: *h.Handle) !bool {
@@ -6181,6 +6230,39 @@ test "capi native allocator proof maintenance capture joins the bounded lease qu
     // `worker_threads` never populates for this bounded-queue admission
     // either, contended or not.
     try std.testing.expectEqual(std.Io.Limit.limited(2), owner.path_lock_io.concurrent_limit);
+}
+
+test "capi native refresh waiting for the maintenance turn hands the lease back and reacquires it" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const io = h.handleLockIo();
+    {
+        var fixture = try AdmissionFollowupFixture.init("refresh-turn-wait", 1000, .batch);
+        defer fixture.deinit();
+        const connection = fixture.connection;
+        var lease: ?native.PathWriterLock = try connection.acquire();
+        defer {
+            if (lease) |*held| held.close();
+            connection.gate.mutex.unlock(io);
+        }
+        const root = try connection.refreshAfterMaintenanceTurn(&lease, false);
+        try std.testing.expect(lease != null);
+        try std.testing.expectEqual(connection.owner.current.?, root);
+    }
+    {
+        // No busy timeout: fail at once, with the lease already given back
+        // and the gate held again, exactly as the caller's own error path
+        // expects.
+        var fixture = try AdmissionFollowupFixture.init("refresh-turn-wait-no-timeout", 0, .batch);
+        defer fixture.deinit();
+        const connection = fixture.connection;
+        var lease: ?native.PathWriterLock = try connection.acquire();
+        defer {
+            if (lease) |*held| held.close();
+            connection.gate.mutex.unlock(io);
+        }
+        try std.testing.expectError(error.FileBusy, connection.refreshAfterMaintenanceTurn(&lease, false));
+        try std.testing.expect(lease == null);
+    }
 }
 
 test "issue1015 issue1431 native background turns coordinate across independent owners" {

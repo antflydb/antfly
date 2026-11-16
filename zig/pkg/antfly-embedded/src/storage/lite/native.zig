@@ -20007,6 +20007,7 @@ pub const NativeFile = struct {
                         // non-redo path.
                         if (hooks) |h| h.release(h.context);
                         defer if (hooks) |h| h.reacquire(h.context);
+                        self.applyTestSyncDelay();
                         redo.writer.sync() catch |err| break :blk err;
                         break :blk {};
                     }) catch {
@@ -20225,6 +20226,7 @@ pub const NativeFile = struct {
                     // concurrency.
                     if (hooks) |h| h.release(h.context);
                     defer if (hooks) |h| h.reacquire(h.context);
+                    self.applyTestSyncDelay();
                     redo.writer.sync() catch |err| break :blk err;
                     break :blk {};
                 }) catch {
@@ -20519,6 +20521,20 @@ pub const NativeFile = struct {
         self.durability_policy = policy;
     }
 
+    /// Test-only: sleep for `test_sync_delay_ns` before a durability-barrier
+    /// syscall. Called on every commit fsync path -- the redo log's own
+    /// `redo.writer.sync()` as well as `syncIfRequired` -- so a test that
+    /// slows fsyncs to force group-commit sharing sees the delay no matter
+    /// which durability path the file is on.
+    fn applyTestSyncDelay(self: *NativeFile) void {
+        if (comptime !builtin.is_test) return;
+        const delay_ns = self.test_sync_delay_ns.load(.monotonic);
+        if (delay_ns != 0) _ = std.c.nanosleep(&.{
+            .sec = @intCast(delay_ns / std.time.ns_per_s),
+            .nsec = @intCast(delay_ns % std.time.ns_per_s),
+        }, null);
+    }
+
     fn syncIfRequired(self: *NativeFile, hooks: ?SyncLockHooks) !void {
         if (!self.no_sync and self.transaction_header == null) {
             // WS2: release the caller's lock (if any) for exactly the
@@ -20530,13 +20546,7 @@ pub const NativeFile = struct {
             // parameter, never a shared field: see `SyncLockHooks`.
             if (hooks) |h| h.release(h.context);
             defer if (hooks) |h| h.reacquire(h.context);
-            if (comptime builtin.is_test) {
-                const delay_ns = self.test_sync_delay_ns.load(.monotonic);
-                if (delay_ns != 0) _ = std.c.nanosleep(&.{
-                    .sec = @intCast(delay_ns / std.time.ns_per_s),
-                    .nsec = @intCast(delay_ns % std.time.ns_per_s),
-                }, null);
-            }
+            self.applyTestSyncDelay();
             if (self.durability_policy) |policy|
                 try antfly_platform.filesystem.syncData(self.file.handle, policy)
             else

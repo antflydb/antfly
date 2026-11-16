@@ -10530,7 +10530,9 @@ fn ws3WriterLaneProbeWrite(handle: ?*anyopaque, ordinal: usize, index: usize) !v
     const request = try std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"k:{d}:{d}\":{{\"v\":\"writer lane probe\"}}}},\"sync_level\":\"write\"}}", .{ ordinal, index });
     var output: capi.Buffer = .{};
     defer antfly_buffer_free(&output);
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{ .ptr = request.ptr, .len = request.len }, &output));
+    const code = antfly_db_batch_json(handle, .{ .ptr = request.ptr, .len = request.len }, &output);
+    if (code != .ok) std.debug.print("writer {d} write {d} failed: {s}\n", .{ ordinal, index, std.mem.span(antfly_last_error_detail()) });
+    try std.testing.expectEqual(capi.ErrorCode.ok, code);
 }
 
 /// This used to read `connection.owner.current`'s live `NativeFile.
@@ -10560,6 +10562,20 @@ fn ws3WriterLaneTestSyncCalls(handle_ptr: ?*anyopaque) u64 {
     const owner = connection.owner;
     return owner.test_cumulative_sync_calls.load(.monotonic) +
         owner.current.?.owned_lite_backend.?.native_docstore.?.file.test_sync_calls.load(.monotonic);
+}
+
+/// Group-commit counters (`Store.test_groups_total`/`test_group_members_total`)
+/// as running totals across `Owner.refresh` generation swaps, bridged the
+/// same way as `ws3WriterLaneTestSyncCalls`.
+fn ws3WriterLaneTestGroups(handle_ptr: ?*anyopaque) struct { groups: u64, members: u64 } {
+    const entry = HandleEntry.capture(handle_ptr).?;
+    defer entry.release();
+    const owner = entry.lock_handle.lite_connection.?.owner;
+    const store = owner.current.?.owned_lite_backend.?.native_docstore.?;
+    return .{
+        .groups = owner.test_cumulative_groups.load(.monotonic) + store.test_groups_total.load(.acquire),
+        .members = owner.test_cumulative_group_members.load(.monotonic) + store.test_group_members_total.load(.acquire),
+    };
 }
 
 // WS3 acceptance test (lite-single-commit-write-path.md §6 test 9's shape,
@@ -10698,15 +10714,11 @@ test "WS3 writer lane: concurrent public-API writers share group-commit fsyncs" 
     try std.testing.expect(separate_per_write <= solo_per_write + 0.01);
 }
 
-/// `connection.owner.current`'s live `Store` (docstore.zig), for the group-
-/// size counters: `NativeFile.test_sync_delay_ns` (set this), `Store.
-/// test_groups_total`/`test_group_members_total` (read these). Like
-/// `ws3WriterLaneTestSyncCalls`, this can in principle go stale across an
-/// `Owner.refresh` generation swap (that replaces the whole `Store`, not
-/// just its `NativeFile`, so there is no cumulative bridge for the group
-/// counters the way `Owner.test_cumulative_sync_calls` bridges syncs) --
-/// acceptable here: this test's total write volume and wall-clock window
-/// are both much smaller than the test that motivated that bridge.
+/// `connection.owner.current`'s live `Store` (docstore.zig), for the WS3
+/// tests' simulated fsync latency: `NativeFile.test_sync_delay_ns` (set this; an
+/// `Owner.refresh` generation swap carries it to the replacement file).
+/// Read the group counters through `ws3WriterLaneTestGroups`, which bridges
+/// those swaps.
 const Ws3NativeStore = std.meta.Child(std.meta.Child(@FieldType(std.meta.Child(@FieldType(Handle, "owned_lite_backend")), "native_docstore")));
 fn ws3WriterLaneStore(handle_ptr: ?*anyopaque) *Ws3NativeStore {
     const entry = HandleEntry.capture(handle_ptr).?;
@@ -10758,10 +10770,8 @@ test "WS3 writer lane: a slow fsync forces concurrent writers to share groups" {
 
     const Scenario = struct {
         fn run(writer_handles: []const ?*anyopaque) !struct { syncs: u64, writes: usize, groups: u64, members: u64 } {
-            const store = ws3WriterLaneStore(writer_handles[0]);
             const sync_before = ws3WriterLaneTestSyncCalls(writer_handles[0]);
-            const groups_before = store.test_groups_total.load(.acquire);
-            const members_before = store.test_group_members_total.load(.acquire);
+            const groups_before = ws3WriterLaneTestGroups(writer_handles[0]);
             var start = std.atomic.Value(bool).init(false);
             var workers: [writer_count]Worker = undefined;
             var threads: [writer_count]std.Thread = undefined;
@@ -10774,13 +10784,12 @@ test "WS3 writer lane: a slow fsync forces concurrent writers to share groups" {
             for (threads) |thread| thread.join();
             for (workers) |worker| if (worker.failure) |err| return err;
             const sync_after = ws3WriterLaneTestSyncCalls(writer_handles[0]);
-            const groups_after = store.test_groups_total.load(.acquire);
-            const members_after = store.test_group_members_total.load(.acquire);
+            const groups_after = ws3WriterLaneTestGroups(writer_handles[0]);
             return .{
                 .syncs = sync_after - sync_before,
                 .writes = per_writer * writer_count,
-                .groups = groups_after -| groups_before,
-                .members = members_after -| members_before,
+                .groups = groups_after.groups - groups_before.groups,
+                .members = groups_after.members - groups_before.members,
             };
         }
     };
@@ -10853,6 +10862,19 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
     const entry = HandleEntry.capture(handle).?;
     defer entry.release();
     const connection = entry.lock_handle.lite_connection.?;
+    // Park the owner's background worker for this test. A maintenance turn
+    // that wants the writer lease takes `gate.mutex` and waits for the
+    // lease the lane has parked, and the writer below stays parked inside
+    // its durability wait until this test lets it go. This test is about
+    // the writer's own locks, not a worker queued behind it.
+    {
+        const owner = connection.owner;
+        owner.stopping.store(true, .release);
+        owner.wake.set(handleLockIo());
+        if (owner.worker) |worker| worker.join();
+        owner.worker = null;
+        owner.stopping.store(false, .release);
+    }
 
     const Probe = struct {
         released: std.Io.Event = .unset,
@@ -10888,8 +10910,24 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
     // must be immediately acquirable from this thread right now: nothing
     // else in this process is queued for the connection, so another
     // same-process caller could enter immediately.
-    const connection_mutex_free = connection.mutex.tryLock();
-    if (connection_mutex_free) connection.mutex.unlock(handleLockIo());
+    //
+    // The writer stays parked until `probe.proceed`, so a lock it still
+    // held would never come free. Retry for a bounded window instead of a
+    // single `tryLock`: the owner's background maintenance turn takes these
+    // mutexes briefly on its own schedule, which is not what this checks.
+    const LockProbe = struct {
+        fn acquirable(mutex: anytype) bool {
+            for (0..1000) |_| {
+                if (mutex.tryLock()) {
+                    mutex.unlock(handleLockIo());
+                    return true;
+                }
+                handleLockIo().sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+            return false;
+        }
+    };
+    const connection_mutex_free = LockProbe.acquirable(&connection.mutex);
     // The path gate's lease mutex is also free here, unlike before the
     // writer lane existed: `WriterLane.checkout` already released
     // `connection.gate.mutex` right after establishing/refreshing the
@@ -10901,8 +10939,7 @@ test "WS3 writer lane: capi connection locks are free during the primary write's
     // `PathGate` either (it polls the lane directly), so gate.mutex being
     // free carries no priority-inversion risk the way it would have under
     // the old per-call retain/handoff design.
-    const gate_mutex_free = connection.gate.mutex.tryLock();
-    if (gate_mutex_free) connection.gate.mutex.unlock(handleLockIo());
+    const gate_mutex_free = LockProbe.acquirable(&connection.gate.mutex);
     probe.proceed.set(handleLockIo());
     thread.join();
 
