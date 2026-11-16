@@ -7196,10 +7196,12 @@ pub const DataServer = struct {
         self.write_source.setLocalChangeHook(self.localChangeHook());
         self.write_source.setLocalIndexRepairDebtHook(self.localIndexRepairDebtHook());
         _ = self.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
+        self.write_source.completion_coordinator = if (linked_storage and self.data_raft != null) .{ .owners = self.historyOwnerPort(), .recovery = self.completionRecovery() } else null;
         _ = self.write_source.withStandaloneSqlRangeGuards(self.data_raft == null and api_server_cfg.deployment_mode == .standalone);
         _ = self.write_source.withNativeHistoryOwner(self.data_raft == null and api_server_cfg.deployment_mode == .standalone);
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
+            apply_sm.write_source.completion_coordinator = self.write_source.completion_coordinator;
         }
         const promotion_leadership = self.promotionLeadershipSource();
         api_server_cfg.relational_maintenance_leadership = self.relationalMaintenanceLeadershipSource();
@@ -43585,7 +43587,17 @@ fn consumerTests() type {
                     // participant remains present even though it emits no rows.
                     var effect = input(owner(601), Frozen.completion.Roles.effects);
                     const writes = [_]antfly.db.types.TransactionWrite{.{ .key = "row", .value = row }};
-                    effect.prepare.writes = &writes;
+                    effect.prepare = try (antfly.db.types.TransactionIntentRequest{
+                        .completion_owner = owner(601),
+                        .writes = &writes,
+                        .row_policy_principal_proof = "signed-principal",
+                        .row_policy_database = "database",
+                        .row_policy_admitted_at_seconds = 123,
+                        .normalized_graph_rows = true,
+                        .schema_version = 4,
+                        .relational_schema_version = 5,
+                        .relational_integrity_generation_set = @splat(7),
+                    }).completionBatch(@splat(5), 1000, 4);
                     var plan = try Frozen.Plan.freeze(a, @splat(5), @splat(6), owner(602), &.{ input(owner(602), Frozen.completion.Roles.guards | Frozen.completion.Roles.checkpoint), effect }, 1001);
                     var plan_live = true;
                     defer if (plan_live) plan.deinit();
@@ -43595,6 +43607,13 @@ fn consumerTests() type {
                     var retry = try plan.prepare(a, 0);
                     defer retry.deinit(a);
                     try std.testing.expectEqualStrings("{\"n\":1}", retry.req.writes[0].value);
+                    try std.testing.expectEqualStrings("signed-principal", retry.req.row_policy_principal_proof);
+                    try std.testing.expectEqualStrings("database", retry.req.row_policy_database);
+                    try std.testing.expectEqual(@as(i64, 123), retry.req.row_policy_admitted_at_seconds);
+                    try std.testing.expect(retry.req.normalized_graph_rows);
+                    try std.testing.expectEqual(@as(?u32, 4), retry.req.schema_version);
+                    try std.testing.expectEqual(@as(?u32, 5), retry.req.relational_schema_version);
+                    try std.testing.expectEqualDeep(@as(?[32]u8, @splat(7)), retry.req.relational_integrity_generation_set);
                     const encoded = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(a, retry.req);
                     defer a.free(encoded);
                     try plan.admission.requirePreparedInput(owner(601).namespace, encoded);
@@ -43619,6 +43638,15 @@ fn consumerTests() type {
             try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
             const a = std.testing.allocator;
             const good = Fixture.input(Fixture.owner(601), Frozen.completion.Roles.effects);
+            var derived = try Frozen.Plan.freezeDerived(a, @splat(5), Fixture.owner(601), &.{ good, Fixture.input(Fixture.owner(602), Frozen.completion.Roles.guards) }, 1001);
+            defer derived.deinit();
+            var reordered = try Frozen.Plan.freezeDerived(a, @splat(5), Fixture.owner(601), &.{ Fixture.input(Fixture.owner(602), Frozen.completion.Roles.guards), good }, 9000);
+            defer reordered.deinit();
+            try std.testing.expectEqualDeep(derived.admission.digest(), reordered.admission.digest());
+            try std.testing.expectError(error.InvalidBatchRequest, (antfly.db.types.TransactionIntentRequest{}).completionBatch(@splat(5), 1000, 4));
+            try std.testing.expectError(error.UnsupportedOperation, (antfly.db.types.TransactionIntentRequest{ .completion_owner = Fixture.owner(601), .restore_staging_scope = @splat(9) }).completionBatch(@splat(5), 1000, 4));
+            try std.testing.expectError(error.InvalidBatchRequest, (antfly.db.types.TransactionIntentRequest{ .completion_owner = Fixture.owner(601), .completion_input_digest = @splat(9) }).completionBatch(@splat(5), 1000, 4));
+
             try std.testing.expectError(error.InvalidParticipant, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{ good, good }, 1001));
             var wrong = good;
             wrong.prepare.transaction.?.prepare.completion_owner.?.root_generation += 1;
@@ -44506,6 +44534,28 @@ fn consumerTests() type {
                 break :blk host.raftStatus(601).?.last_index;
             };
             try std.testing.expectEqual(previous_last, recovered_last);
+            const NormalCompletion = struct {
+                noinline fn run(alloc: std.mem.Allocator, origin_server: *DataServer, value: []const u8) !void {
+                    const txn = @import("../api/distributed_txn.zig");
+                    var participant_worker = txn.LocalTableWriteParticipantWorker.init(origin_server.write_source.source());
+                    const outcome = try txn.executeMultiTableCommitWithOptions(alloc, origin_server.write_source.catalog, participant_worker.worker(), @splat(114), 2000, 2001, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "normal-completion", .value = value }} }}, .write, null, .{ .completion = .{ .owners = origin_server.historyOwnerPort(), .recovery = origin_server.completionRecovery() } });
+                    try std.testing.expect(outcome == .committed);
+                    try std.testing.expect(!outcome.committed.propagation_pending);
+                }
+            };
+            try NormalCompletion.run(a, server, "{\"v\":7}");
+            const normal_last = blk: {
+                lockAtomic(&server.data_raft_mutex);
+                defer server.data_raft_mutex.unlock();
+                break :blk host.raftStatus(601).?.last_index;
+            };
+            try NormalCompletion.run(a, server, "{\"v\":7}");
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, NormalCompletion.run(a, server, "{\"v\":8}"));
+            {
+                lockAtomic(&server.data_raft_mutex);
+                defer server.data_raft_mutex.unlock();
+                try std.testing.expectEqual(normal_last, host.raftStatus(601).?.last_index);
+            }
         }
 
         test "data raft ordered history proposal authority fences term membership and missing owners" {

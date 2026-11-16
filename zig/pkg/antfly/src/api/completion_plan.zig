@@ -113,6 +113,19 @@ pub const Plan = struct {
         return .{ .arena = arena, .admission = admission, .admission_bytes = encoded, .participants = participants, .participant_ids = ids, .begin_timestamp = begin_timestamp, .created_at_ns = created_at_ns };
     }
 
+    /// Derive a retry identity from canonical namespace order and the complete
+    /// frozen input, independent of route enumeration and admission wall time.
+    pub fn freezeDerived(a: A, transaction_id: [16]u8, coordinator: completion.RoutedOwner, inputs: []const Input, created_at_ns: u64) !Plan {
+        var plan = try freeze(a, transaction_id, @splat(1), coordinator, inputs, created_at_ns);
+        errdefer plan.deinit();
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly:ordinary-completion-input:v1");
+        hash.update(&plan.admission.digest());
+        plan.admission.admission_digest = hash.finalResult();
+        plan.admission_bytes = try completion.encodeAdmission(plan.arena.allocator(), plan.admission);
+        return plan;
+    }
+
     /// The BEGIN request borrows this plan's admission and locator slices.
     /// Encode/submit it before destroying the plan; its timestamp never changes.
     pub fn begin(self: *const Plan, index: usize) !types.BatchRequest {

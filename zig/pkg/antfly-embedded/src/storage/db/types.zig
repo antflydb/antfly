@@ -1793,6 +1793,34 @@ pub const TransactionIntentRequest = struct {
     predicates: []const TransactionVersionPredicate = &.{},
     integrity: []const TransactionIntegrityOperation = &.{},
     integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
+
+    /// Compile the complete authenticated intent before freezing its input
+    /// digest. A source command requires its global checkpoint participant;
+    /// dropping it into a root-local PREPARE would lose acknowledgement safety.
+    pub fn completionBatch(self: @This(), txn_id: TxnId, begin_timestamp: u64, topology_epoch: u64) !BatchRequest {
+        if (self.source_admission != null) return error.UnsupportedOperation;
+        if (self.completion_input_digest != null) return error.InvalidBatchRequest;
+        if (self.restore_staging_scope != null or self.restore_staging_plan_id != null) return error.UnsupportedOperation;
+        const owner = self.completion_owner orelse return error.InvalidBatchRequest;
+        try owner.validate();
+        if (begin_timestamp == 0 or topology_epoch != owner.topology_epoch) return error.TopologyChanged;
+        var request: BatchRequest = .{
+            .timestamp_ns = begin_timestamp,
+            .sync_level = .write,
+            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .completion_owner = owner } },
+        };
+        // Compile-time exhaustiveness prevents newly added intent adjuncts
+        // from being silently omitted from the frozen canonical input.
+        inline for (comptime std.meta.fieldNames(@This())) |name| {
+            if (comptime std.mem.eql(u8, name, "completion_owner") or
+                std.mem.eql(u8, name, "completion_input_digest") or
+                std.mem.eql(u8, name, "source_admission")) continue;
+            if (comptime !@hasField(BatchRequest, name)) @compileError("unmapped completion PREPARE field: " ++ name);
+            @field(request, name) = @field(self, name);
+        }
+        request.document_version_scheme = .revision_v1;
+        return request;
+    }
 };
 
 pub const SplitState = struct {

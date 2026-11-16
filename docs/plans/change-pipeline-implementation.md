@@ -3367,3 +3367,50 @@ deduplication/capacity, scheduled admission mismatch, ordinary expiry abort,
 source-purpose preservation and the filtered local legacy fallback are covered.
 Generation, license, formatting and diff checks passed. Normal application/source
 admission, bounded fanout and the remaining full issue scope are not complete.
+
+### Normal retained-history transaction admission
+
+Normal provisioned Raft transaction commits now receive a completion coordinator
+from DataServer. Before any BEGIN, it uses one authoritative routing session to
+qualify every original native owner through the same signed/read-index ports as
+recovery, compiles the entire authenticated intent, freezes canonical PREPARE
+bytes, and checks the complete reservation against each root's policy ceiling.
+All explicitly unsupported roots retain the legacy path; a mixed-capability
+transaction fails before BEGIN. Capability qualification is not a reservation of
+currently free bytes; native ordered BEGIN remains the capacity authority.
+
+The intent compiler maps every shared intent field at compile time, so adding an
+unmapped adjunct fails compilation. Row-policy proof/database/admission time,
+range guards, graph effects, integrity commands and relational generation/schema
+fences cannot disappear into a reduced completion payload. Root-local source
+commands, restore scopes and precomputed digest substitution are explicitly
+rejected. The existing legacy fanout uses the same complete intent mapping.
+
+The ordinary admission digest derives from the canonical frozen participant set
+and complete inputs, independent of route enumeration and admission wall time.
+Coordinator selection uses namespace order. Qualified existing COMMIT resumes
+terminal recovery, matching pending state remains outcome-unknown, and changed
+input under the same ID is rejected. Each fresh phase makes one mutation attempt;
+a failed/unknown BEGIN, PREPARE or coordinator decision leaves retained recovery
+ownership and is not replayed within the pass. After a durable coordinator
+COMMIT, recovery must positively assemble/publish every participant certificate;
+incomplete work is reported as propagation pending, not a fresh commit failure.
+
+Qualification: `normal-completion-admission-qualified-build.log`,
+`ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build history-control-apply-test -j2`
+with loopback networking enabled, passed all 11 tests with no skips or leaks.
+The actual native/Raft fixture now exercises normal distributed transaction
+assembly, completion publication, identical stable-ID retry with no additional
+Raft append, and changed-input rejection with no additional append. Existing
+allocation-failure coverage now uses the exhaustive intent compiler and checks
+policy/schema/generation adjunct round trips. Canonical derived admission is
+stable across reordered inputs and changed wall time; invalid compiler inputs
+are rejected. An earlier sandbox-only run could not bind its loopback listener;
+the same compiled suite passed when networking was enabled.
+
+This is progress, not completion of #1698/#1639. Non-write visibility levels
+currently fail before BEGIN on the new path rather than claim an unsatisfied
+index barrier. Hosted metadata writers, standalone/native source admission,
+source-global checkpoint participants, automatic root policy activation, bounded
+parallel admission/recovery and obligation/retention release remain unfinished,
+alongside the previously listed public feed/bootstrap/pgoutput/client scope.

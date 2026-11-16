@@ -1188,6 +1188,8 @@ test "distributed txn local participant prepare preserves the guarded catalog ro
 pub const ExecuteResult = contract.ExecuteResult;
 
 pub const ExecuteOptions = struct {
+    completion: ?@import("completion_admission.zig").Coordinator = null,
+    completion_context: @import("antfly_local_sources").api_operation.RequestContext = .{},
     /// Preserve the terminal coordinator decision for an externally supplied
     /// transaction ID's retry window.
     retain_terminal: bool = false,
@@ -1498,6 +1500,26 @@ fn executeMultiTableCommitOnce(
     for (participants.items, 0..) |participant, i| {
         participant_ids[i] = try participantIdForGroupScoped(alloc, participant.table_name, participant.group_id, participant.restore_staging_scope, participant.restore_staging_plan_id);
         participant_ids_initialized += 1;
+    }
+
+    if (options.completion) |completion_coordinator| {
+        const inputs = try alloc.alloc(@import("completion_admission.zig").Input, participants.items.len);
+        defer alloc.free(inputs);
+        for (participants.items, inputs) |*participant, *input| input.* = .{
+            .table_name = participant.table_name,
+            .group_id = participant.group_id,
+            .topology_epoch = participant.topology_epoch,
+            .intent = participant.intentRequest(),
+        };
+        if (try completion_coordinator.commit(alloc, txn_id, begin_timestamp, commit_version, inputs, sync_level, options.completion_context)) |completed| {
+            if (completed.propagation_pending and options.report_post_commit_failure) return error.CommitPropagationIncomplete;
+            return .{ .committed = .{
+                .participant_count = participants.items.len,
+                .coordinator_group_id = completed.coordinator_group_id,
+                .coordinator_table_name = completed.coordinator_table_name,
+                .propagation_pending = completed.propagation_pending,
+            } };
+        }
     }
 
     // Allocate every coordination slot before contacting a participant. No
@@ -2039,6 +2061,35 @@ const ParticipantTxn = struct {
     relational_retirement: ?integrity_retirement.Command = null,
     relational_index_maintenance: ?@import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Command = null,
 
+    /// One complete intent mapping feeds both legacy participants and the
+    /// immutable retained-history PREPARE compiler.
+    fn intentRequest(self: *const ParticipantTxn) db_mod.types.TransactionIntentRequest {
+        return .{
+            .row_policy_principal_proof = self.row_policy_principal_proof,
+            .row_policy_database = self.row_policy_database,
+            .row_policy_admitted_at_seconds = self.row_policy_admitted_at_seconds,
+            .normalized_graph_rows = self.normalized_graph_rows,
+            .writes = self.writes.items,
+            .deletes = self.deletes.items,
+            .transforms = self.transforms.items,
+            .graph_writes = self.graph_writes.items,
+            .graph_deletes = self.graph_deletes.items,
+            .predicates = self.predicates.items,
+            .integrity = self.integrity.items,
+            .integrity_commands = self.integrity_commands.items,
+            .range_guards = self.range_guards.items,
+            .relational_activation = self.relational_activation,
+            .relational_retirement = self.relational_retirement,
+            .relational_index_maintenance = self.relational_index_maintenance,
+            .relational_schema_version = self.relational_schema_version,
+            .schema_version = self.schema_version,
+            .relational_integrity_generation_set = self.relational_integrity_generation_set,
+            .restore_staging_scope = self.restore_staging_scope,
+            .restore_staging_plan_id = self.restore_staging_plan_id,
+            .relational_repair = self.relational_repair,
+        };
+    }
+
     fn statusRequest(self: ParticipantTxn, txn_id: db_mod.types.TxnId) TxnStatusRequest {
         return .{ .txn_id = txn_id, .restore_staging_scope = self.restore_staging_scope, .restore_staging_plan_id = self.restore_staging_plan_id };
     }
@@ -2152,30 +2203,7 @@ const PrepareFanoutTask = struct {
             .route_fence = participant.route_fence,
             .txn_id = txn_id,
             .topology_epoch = participant.topology_epoch,
-            .req = .{
-                .row_policy_principal_proof = participant.row_policy_principal_proof,
-                .row_policy_database = participant.row_policy_database,
-                .row_policy_admitted_at_seconds = participant.row_policy_admitted_at_seconds,
-                .normalized_graph_rows = participant.normalized_graph_rows,
-                .writes = participant.writes.items,
-                .deletes = participant.deletes.items,
-                .transforms = participant.transforms.items,
-                .graph_writes = participant.graph_writes.items,
-                .graph_deletes = participant.graph_deletes.items,
-                .predicates = participant.predicates.items,
-                .integrity = participant.integrity.items,
-                .integrity_commands = participant.integrity_commands.items,
-                .range_guards = participant.range_guards.items,
-                .relational_activation = participant.relational_activation,
-                .relational_retirement = participant.relational_retirement,
-                .relational_index_maintenance = participant.relational_index_maintenance,
-                .relational_schema_version = participant.relational_schema_version,
-                .schema_version = participant.schema_version,
-                .relational_integrity_generation_set = participant.relational_integrity_generation_set,
-                .restore_staging_scope = participant.restore_staging_scope,
-                .restore_staging_plan_id = participant.restore_staging_plan_id,
-                .relational_repair = participant.relational_repair,
-            },
+            .req = participant.intentRequest(),
         }) catch |err| {
             slot.err = err;
         };

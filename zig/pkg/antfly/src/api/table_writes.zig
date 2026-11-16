@@ -7008,6 +7008,7 @@ pub const ProvisionedTableWriteSource = struct {
     local_change_hook: ?LocalChangeHook = null,
     local_index_repair_debt_hook: ?LocalIndexRepairDebtHook = null,
     raft_batcher: ?RaftBatcher = null,
+    completion_coordinator: ?@import("completion_admission.zig").Coordinator = null,
     /// Set only after startup proves this process is the non-Raft standalone
     /// data owner. A temporarily absent Raft callback is not that proof.
     standalone_sql_range_guards: bool = false,
@@ -22400,6 +22401,8 @@ pub const ProvisionedTableWriteSource = struct {
             sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
             .{
+                .completion = self.completion_coordinator,
+                .completion_context = .{ .cancellation = cancellation },
                 .retain_terminal = retain_terminal,
                 .report_post_commit_failure = false,
                 .fanout_io = self.tableActivityIo(),
