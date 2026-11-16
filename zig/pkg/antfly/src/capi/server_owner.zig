@@ -4601,7 +4601,8 @@ pub fn storageOwnerSourcePlanObservation(owner: ?*anyopaque, request: *const ker
     var parsed = std.json.parseFromSlice(source_plan_control.Query, handle.alloc, request.request_json.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return sourcePlanInputStatus(err);
     defer parsed.deinit();
     const result = handle.db.sourcePlanObservation(parsed.value) catch |err| return storageOwnerStatusFromError(err);
-    return sourcePlanResponse(out, result);
+    result.validate(parsed.value) catch return storageOwnerStatusFromError(error.SourceAdmissionCorrupt);
+    return sourcePlanResponse(out, source_plan_wire.ObservationReply{ .version = 1, .query_digest = parsed.value.digest(), .observation = result });
 }
 pub fn storageOwnerSourcePlanChunk(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     out.* = .{};
@@ -4613,10 +4614,11 @@ pub fn storageOwnerSourcePlanChunk(owner: ?*anyopaque, request: *const kernel_ow
     defer parsed.deinit();
     const result = handle.db.sourcePlanChunk(handle.alloc, parsed.value) catch |err| return storageOwnerStatusFromError(err);
     defer handle.alloc.free(result.bytes);
+    result.observation.validate(parsed.value.query) catch return storageOwnerStatusFromError(error.SourceAdmissionCorrupt);
     const encoded = handle.alloc.alloc(u8, std.base64.standard.Encoder.calcSize(result.bytes.len)) catch |err| return storageOwnerStatusFromError(err);
     defer handle.alloc.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, result.bytes);
-    return sourcePlanResponse(out, source_plan_wire.ChunkReply{ .observation = result.observation, .chunk_base64 = encoded });
+    return sourcePlanResponse(out, source_plan_wire.ChunkReply{ .version = 1, .request_digest = parsed.value.digest(), .observation = result.observation, .chunk_base64 = encoded });
 }
 pub fn storageOwnerOrderedSourcePlanOutcome(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     out.* = .{};

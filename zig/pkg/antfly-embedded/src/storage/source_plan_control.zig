@@ -74,12 +74,28 @@ pub const Observation = struct {
     cut: Digest,
     quota: storage.Quota,
     status: ?storage.Status = null,
+    pub fn validate(self: Observation, query: Query) !void {
+        try query.validate();
+        if (!std.meta.eql(self.root, query.root)) return error.InvalidSourcePlanWire;
+        self.quota.validate() catch return error.InvalidSourcePlanWire;
+        storage.validateCut(self.root, self.cut, self.quota.active == 0 and self.quota.epoch == 1) catch return error.InvalidSourcePlanWire;
+        if (self.root.authority == .raft) {
+            if (std.mem.readInt(u64, self.cut[8..16], .little) < query.minimum_applied_index) return error.InvalidSourcePlanWire;
+        } else if (std.mem.readInt(u64, self.cut[0..8], .little) < query.minimum_native_sequence) return error.InvalidSourcePlanWire;
+        if (query.spec) |spec| {
+            const status = self.status orelse return error.InvalidSourcePlanWire;
+            status.validate(self.root, spec, self.quota, self.cut) catch return error.InvalidSourcePlanWire;
+        } else if (self.status != null) return error.InvalidSourcePlanWire;
+    }
 };
 pub const Query = struct {
     root: storage.Root,
     spec: ?storage.Spec = null,
     minimum_applied_index: u64 = 0,
     minimum_native_sequence: u64 = 0,
+    pub fn digest(self: Query) Digest {
+        return valueDigest("antfly:source-plan-query:v1", self);
+    }
     pub fn validate(self: Query) !void {
         try self.root.validate();
         if (self.spec) |spec| try spec.validate(self.root);
@@ -93,6 +109,9 @@ pub const ReadRequest = struct {
     query: Query,
     seal: Digest,
     ordinal: u16,
+    pub fn digest(self: ReadRequest) Digest {
+        return valueDigest("antfly:source-plan-read:v1", self);
+    }
     pub fn validate(self: ReadRequest) !void {
         try self.query.validate();
         const spec = self.query.spec orelse return error.InvalidSourceAdmission;

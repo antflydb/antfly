@@ -5391,10 +5391,10 @@ test "compiled source plan opaque transport retains sealed binary and exact orde
     {
         var response = try owner.sourcePlanJson(.observation, "docs", query_json);
         defer response.deinit();
-        var parsed = try std.json.parseFromSlice(control.Observation, a, response.bytes(), .{});
+        var parsed = try std.json.parseFromSlice(wire.ObservationReply, a, response.bytes(), .{});
         defer parsed.deinit();
-        try std.testing.expectEqual(seal, parsed.value.status.?.seal.?);
-        try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, parsed.value.cut[8..16], .little));
+        try std.testing.expectEqual(seal, parsed.value.observation.status.?.seal.?);
+        try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, parsed.value.observation.cut[8..16], .little));
     }
     const read_json = try std.json.Stringify.valueAlloc(a, control.ReadRequest{ .query = query, .seal = seal, .ordinal = 0 }, .{});
     defer a.free(read_json);
@@ -5408,6 +5408,11 @@ test "compiled source plan opaque transport retains sealed binary and exact orde
         try std.testing.expectEqualSlices(u8, &frame, &decoded);
         try std.testing.expectEqual(seal, parsed.value.observation.status.?.seal.?);
     }
+    const typed_observation = try owner.sourcePlanObservation(a, "docs", query);
+    try std.testing.expectEqual(seal, typed_observation.status.?.seal.?);
+    const typed_chunk = try owner.sourcePlanChunk(a, "docs", .{ .query = query, .seal = seal, .ordinal = 0 });
+    defer a.free(typed_chunk.bytes);
+    try std.testing.expectEqualSlices(u8, &frame, typed_chunk.bytes);
     command.action = .fence;
     try std.testing.expect((try Helper.apply(a, &owner, command, 5)) == .applied);
     command.action = .reclaim;

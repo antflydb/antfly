@@ -620,6 +620,25 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn sourcePlanObservation(self: *Owner, a: std.mem.Allocator, table_name: []const u8, query: @import("antfly_local_sources").storage_source_plan_control.Query) !@import("antfly_local_sources").storage_source_plan_control.Observation {
+        const wire = @import("antfly_local_sources").storage_source_plan_wire;
+        try query.validate();
+        const json = try std.json.Stringify.valueAlloc(a, query, .{});
+        defer a.free(json);
+        var response = try self.sourcePlanJson(.observation, table_name, json);
+        defer response.deinit();
+        return wire.decodeObservation(a, query, response.bytes());
+    }
+    pub fn sourcePlanChunk(self: *Owner, a: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").storage_source_plan_control.ReadRequest) !@import("antfly_local_sources").storage_source_plan_control.Read {
+        const wire = @import("antfly_local_sources").storage_source_plan_wire;
+        try request.validate();
+        const json = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(json);
+        var response = try self.sourcePlanJson(.chunk, table_name, json);
+        defer response.deinit();
+        return wire.decodeChunkReply(a, request, response.bytes());
+    }
+
     pub fn orderedHistoryControlJson(self: *Owner, table_name: []const u8, command_json: []const u8, raft_term: u64, raft_index: u64) !Response {
         if (raft_term == 0 or raft_index == 0 or command_json.len > 4096) return error.InvalidArgument;
         var response: Response = .{};

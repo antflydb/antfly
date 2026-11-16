@@ -87,7 +87,39 @@ pub const Decoded = struct {
     }
 };
 pub const Recovery = struct { command: Command, entry: control.Entry, minimum_applied_index: u64 };
-pub const ChunkReply = struct { observation: control.Observation, chunk_base64: []const u8 };
+pub const max_observation_bytes = 4096;
+pub const ObservationReply = struct { version: u8, query_digest: storage.Digest, observation: control.Observation };
+pub const ChunkReply = struct { version: u8, request_digest: storage.Digest, observation: control.Observation, chunk_base64: []const u8 };
+pub fn decodeObservation(a: A, query: control.Query, bytes: []const u8) !control.Observation {
+    try query.validate();
+    if (bytes.len > max_observation_bytes) return error.InvalidSourcePlanWire;
+    var parsed = std.json.parseFromSlice(ObservationReply, a, bytes, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSourcePlanWire;
+    defer parsed.deinit();
+    if (parsed.value.version != 1 or !std.mem.eql(u8, &parsed.value.query_digest, &query.digest())) return error.InvalidSourcePlanWire;
+    try parsed.value.observation.validate(query);
+    return parsed.value.observation;
+}
+pub fn decodeChunkReply(a: A, request: control.ReadRequest, bytes: []const u8) !control.Read {
+    try request.validate();
+    if (bytes.len > max_bytes) return error.InvalidSourcePlanWire;
+    var parsed = std.json.parseFromSlice(ChunkReply, a, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSourcePlanWire;
+    defer parsed.deinit();
+    const reply = parsed.value;
+    if (reply.version != 1 or !std.mem.eql(u8, &reply.request_digest, &request.digest())) return error.InvalidSourcePlanWire;
+    try reply.observation.validate(request.query);
+    const status = reply.observation.status orelse return error.InvalidSourcePlanWire;
+    if (!status.present or status.fence != null or status.reclamation != null or status.seal == null or !std.mem.eql(u8, &status.seal.?, &request.seal)) return error.InvalidSourcePlanWire;
+    const spec = request.query.spec.?;
+    const expected = try spec.chunkLen(request.ordinal);
+    if (reply.chunk_base64.len != std.base64.standard.Encoder.calcSize(expected)) return error.InvalidSourcePlanWire;
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(reply.chunk_base64) catch return error.InvalidSourcePlanWire;
+    if (decoded_len != expected) return error.InvalidSourcePlanWire;
+    const chunk = try a.alloc(u8, expected);
+    errdefer a.free(chunk);
+    std.base64.standard.Decoder.decode(chunk, reply.chunk_base64) catch return error.InvalidSourcePlanWire;
+    if (!canonical(chunk, reply.chunk_base64) or !std.mem.eql(u8, &storage.chunkDigest(request.ordinal, chunk), &spec.chunk_hashes[request.ordinal])) return error.InvalidSourcePlanWire;
+    return .{ .observation = reply.observation, .bytes = chunk };
+}
 pub fn fromCommand(a: A, value: Command) !Decoded {
     if (value.version != 1 or value.chunk_base64.len > std.base64.standard.Encoder.calcSize(storage.chunk_bytes)) return error.InvalidSourcePlanWire;
     const length = std.base64.standard.Decoder.calcSizeForSlice(value.chunk_base64) catch return error.InvalidSourcePlanWire;
@@ -195,4 +227,160 @@ fn allocationRoundTrip(a: A) !void {
 }
 test "source plan wire allocation failure releases every owned buffer" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationRoundTrip, .{});
+}
+
+fn testCut() storage.Digest {
+    var cut: storage.Digest = @splat(0);
+    std.mem.writeInt(u64, cut[0..8], 1, .little);
+    std.mem.writeInt(u64, cut[8..16], 2, .little);
+    cut[31] = 1;
+    return cut;
+}
+fn decodeObservationAllocation(a: A, query: control.Query, bytes: []const u8) !void {
+    _ = try decodeObservation(a, query, bytes);
+}
+fn expectBadObservation(query: control.Query, reply: ObservationReply) !void {
+    const a = std.testing.allocator;
+    const bytes = try std.json.Stringify.valueAlloc(a, reply, .{});
+    defer a.free(bytes);
+    try std.testing.expectError(error.InvalidSourcePlanWire, decodeObservation(a, query, bytes));
+}
+
+test "source plan observations bind unsealed upload identity root quota and read cut" {
+    const a = std.testing.allocator;
+    const payload: [64]u8 = @splat(255);
+    const hashes = [_]storage.Digest{storage.chunkDigest(0, &payload)};
+    const request = fixture(&payload, &hashes);
+    const query: control.Query = .{ .root = request.root, .spec = request.spec, .minimum_applied_index = 2 };
+    const observation: control.Observation = .{ .root = request.root, .cut = testCut(), .quota = .{ .active = 1, .reserved = request.spec.reservationBytes() }, .status = .{ .present = true } };
+    const reply: ObservationReply = .{ .version = 1, .query_digest = query.digest(), .observation = observation };
+    const bytes = try std.json.Stringify.valueAlloc(a, reply, .{});
+    defer a.free(bytes);
+    try std.testing.expectEqualDeep(observation, try decodeObservation(a, query, bytes));
+    try std.testing.checkAllAllocationFailures(a, decodeObservationAllocation, .{ query, bytes });
+    var other = query;
+    std.mem.writeInt(u64, other.spec.?.attempt[0..8], 2, .big);
+    try std.testing.expectError(error.InvalidSourcePlanWire, decodeObservation(a, other, bytes));
+    var bad = reply;
+    bad.observation.root.fence[0] ^= 1;
+    try expectBadObservation(query, bad);
+    bad = reply;
+    bad.observation.quota.reserved = 1;
+    try expectBadObservation(query, bad);
+    bad = reply;
+    bad.observation.status.?.received[15] = 1;
+    try expectBadObservation(query, bad);
+    bad = reply;
+    bad.observation.status = null;
+    try expectBadObservation(query, bad);
+    bad = reply;
+    bad.version = 2;
+    try expectBadObservation(query, bad);
+    bad = reply;
+    std.mem.writeInt(u64, bad.observation.cut[8..16], 1, .little);
+    try expectBadObservation(query, bad);
+    const duplicate = try std.fmt.allocPrint(a, "{s},\"version\":1}}", .{bytes[0 .. bytes.len - 1]});
+    defer a.free(duplicate);
+    try std.testing.expectError(error.InvalidSourcePlanWire, decodeObservation(a, query, duplicate));
+}
+
+test "source plan empty native observation distinguishes initial zero from retained work" {
+    const a = std.testing.allocator;
+    var root: storage.Root = .{ .authority = .native, .namespace = @splat(1), .generation = 0, .fence = @splat(2) };
+    std.mem.writeInt(u64, root.namespace[0..8], 1, .big);
+    const query: control.Query = .{ .root = root };
+    var cut: storage.Digest = @splat(0);
+    cut[31] = 2;
+    const reply: ObservationReply = .{ .version = 1, .query_digest = query.digest(), .observation = .{ .root = root, .cut = cut, .quota = .{} } };
+    const bytes = try std.json.Stringify.valueAlloc(a, reply, .{});
+    defer a.free(bytes);
+    _ = try decodeObservation(a, query, bytes);
+    var bad = reply;
+    bad.observation.quota.epoch = 2;
+    try expectBadObservation(query, bad);
+    var ahead = query;
+    ahead.minimum_native_sequence = 1;
+    bad = reply;
+    bad.query_digest = ahead.digest();
+    try expectBadObservation(ahead, bad);
+}
+
+fn expectInvalidChunkReply(a: A, request: control.ReadRequest, bytes: []const u8) !void {
+    const unexpected = decodeChunkReply(a, request, bytes) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(error.InvalidSourcePlanWire, err);
+        return;
+    };
+    defer a.free(unexpected.bytes);
+    return error.TestExpectedError;
+}
+fn decodeReadAllocation(a: A, request: control.ReadRequest, bytes: []const u8) !void {
+    const read = try decodeChunkReply(a, request, bytes);
+    defer a.free(read.bytes);
+}
+fn readReplyRoundTrip(a: A, comptime fail_decode: bool) !void {
+    var txn: storage.test_support.Txn = .{};
+    defer txn.deinit();
+    var frame: [128]u8 = @splat(255);
+    @memcpy(frame[0..4], "AFP1");
+    std.mem.writeInt(u32, frame[4..8], 1, .little);
+    std.mem.writeInt(u64, frame[8..16], 10, .little);
+    std.mem.writeInt(u64, frame[16..24], 11, .little);
+    std.mem.writeInt(u64, frame[24..32], 1, .little);
+    const digest = try storage.frozenDigest(&frame);
+    @memcpy(frame[32..64], &digest);
+    const hashes = [_]storage.Digest{storage.chunkDigest(0, &frame)};
+    var request = fixture(&frame, &hashes);
+    request.spec.plan_digest = digest;
+    std.crypto.hash.sha2.Sha256.hash(&frame, &request.spec.checksum, .{});
+    try storage.stageBegin(a, &txn, request.root, request.spec);
+    try storage.stageChunk(a, &txn, request.root, request.spec, 0, &frame);
+    const seal = try storage.stageSeal(a, &txn, request.root, request.spec, testCut());
+    const query: control.Query = .{ .root = request.root, .spec = request.spec, .minimum_applied_index = 2 };
+    const read: control.ReadRequest = .{ .query = query, .seal = seal, .ordinal = 0 };
+    const observation: control.Observation = .{ .root = request.root, .cut = testCut(), .quota = try storage.readQuota(&txn, request.root), .status = try storage.inspect(a, &txn, request.root, request.spec) };
+    var encoded: [172]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&encoded, &frame);
+    const reply: ChunkReply = .{ .version = 1, .request_digest = read.digest(), .observation = observation, .chunk_base64 = &encoded };
+    const bytes = try std.json.Stringify.valueAlloc(a, reply, .{});
+    defer a.free(bytes);
+    if (fail_decode) {
+        try std.testing.checkAllAllocationFailures(a, decodeReadAllocation, .{ read, bytes });
+        return;
+    }
+    const decoded = try decodeChunkReply(a, read, bytes);
+    defer a.free(decoded.bytes);
+    try std.testing.expectEqualSlices(u8, &frame, decoded.bytes);
+    var different = read;
+    different.seal[0] ^= 1;
+    try expectInvalidChunkReply(a, different, bytes);
+    // Same encoded length can describe either 129 or 127 decoded bytes.
+    // Reject both before invoking a decoder with a 128-byte destination.
+    const final = encoded[encoded.len - 1];
+    encoded[encoded.len - 1] = 'A';
+    const too_many = try std.json.Stringify.valueAlloc(a, reply, .{});
+    defer a.free(too_many);
+    try expectInvalidChunkReply(a, read, too_many);
+    encoded[encoded.len - 1] = final;
+    const penultimate = encoded[encoded.len - 2];
+    encoded[encoded.len - 2] = '=';
+    const too_few = try std.json.Stringify.valueAlloc(a, reply, .{});
+    defer a.free(too_few);
+    try expectInvalidChunkReply(a, read, too_few);
+    encoded[encoded.len - 2] = penultimate;
+    encoded[0] = if (encoded[0] == 'A') 'B' else 'A';
+    const corrupted = try std.json.Stringify.valueAlloc(a, reply, .{});
+    defer a.free(corrupted);
+    try expectInvalidChunkReply(a, read, corrupted);
+    // Owned binary is independent of both encoded reply buffers.
+    @memset(bytes, 0);
+    try std.testing.expectEqualSlices(u8, &frame, decoded.bytes);
+}
+
+test "source plan chunk replies verify bound seal identity and owned authenticated bytes" {
+    try readReplyRoundTrip(std.testing.allocator, false);
+}
+
+test "source plan read reply allocation failure releases parsed and binary ownership" {
+    try readReplyRoundTrip(std.testing.allocator, true);
 }

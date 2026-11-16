@@ -4030,3 +4030,51 @@ adapter, or the source-global head/checkpoint participant. These remain required
 alongside destination integration, public feeds, coherent bootstrap/retention,
 production pgoutput and qualification with an existing PostgreSQL CDC client.
 The full goal and both issues remain incomplete.
+
+### Request-bound source-plan observations and owned chunk reads
+
+Private observation replies now include the exact typed query digest. Chunk
+replies include the typed read-request digest, covering the upload, expected
+seal, ordinal and minimum cut. This binds even unsealed presence/bitmap replies,
+which have no seal proof yet, to their requested upload. Typed opaque-owner
+client methods validate these replies and return independently owned binary.
+The native owner validates generated observations before serialization.
+
+Observation validation checks physical root equality, authority-specific cut
+encoding and the requested minimum native sequence or Raft index. Quota bounds
+include the minimum possible charge for its active upload count. Lifecycle
+validation rejects unused bitmap bits, impossible presence/absence combinations,
+partial un-fenced seals, proof/position mismatch, future seal/fence positions,
+Raft term/index contradictions and reclamation without an advanced epoch.
+An initial zero native source clock is allowed only without artifact debt and
+with the initial storage epoch; it is not a synthetic positive seal cut.
+Seal, fence and reclamation evidence are recomputed from the exact spec.
+
+Chunk decoding requires a live matching seal and authenticates owned bytes with
+the requested ordinal's hash. It bounds both JSON and decoded binary, verifies
+canonical base64, and explicitly compares the decoder's computed output size
+before writing. Merely matching encoded length is insufficient: changed padding
+can otherwise describe a larger or smaller decoded output of the same encoded
+length. Tests cover both cases. Parsed and binary allocations are freed on all
+failed decoder paths. Existing ledger hashes and by-value engine layouts are
+unchanged (engine descriptor 51, opaque owner header 104); these are private
+version-1 source-plan reply envelopes.
+
+Qualification: `source-plan-observation-padding-test.log` passes all 20 direct
+wire/storage/completion cases, including upload substitution, root/quota/bitmap
+corruption, native-zero distinction, causal native/Raft cuts, proof tampering,
+owned bytes, padding changes, and all allocation failure points in both read
+reply decoders. `source-plan-observation-qualified-test.log` completes with exit
+0 for `source-plan-wire-test history-resolution-owner-test native-source-plan-control-test source-plan-apply-test` with the compiled source-plan owner filter;
+the opaque-owner, two native-control cases and Raft case all pass without skips
+or leaks. After the final decoder-size guard, `source-plan-observation-final-test.log`
+completes `source-plan-wire-test history-resolution-owner-test` with the same
+compiled-owner filter successfully. The actual typed observation/chunk methods
+are exercised across the compiled owner. Formatting and diff checks pass.
+
+Production HTTP ports, route/leader qualification and the source worker adapter
+are still outstanding; this contract supplies the validated read boundary they
+need. Native empty-target provisioning, the source-global head/checkpoint,
+destination integrations, public feeds, coherent bootstrap/retention, production
+pgoutput and existing-client qualification remain required. Neither issue nor
+the full goal is complete.

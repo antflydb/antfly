@@ -60,6 +60,22 @@ fn validatePosition(root: Root, position: Digest) !void {
     try completion.validatePosition(position);
     if (position[31] != @as(u8, if (root.authority == .native) 2 else 1)) return error.InvalidTxnRecord;
 }
+/// Zero is allowed before the root's first native source-clock mutation.
+pub fn validateCut(root: Root, cut: Digest, allow_empty_native: bool) !void {
+    try root.validate();
+    if (allow_empty_native and root.authority == .native and cut[31] == 2 and std.mem.allEqual(u8, cut[0..31], 0)) return;
+    try validatePosition(root, cut);
+}
+fn requireAtOrBefore(root: Root, earlier: Digest, later: Digest) !void {
+    const first = std.mem.readInt(u64, earlier[0..8], .little);
+    const last = std.mem.readInt(u64, later[0..8], .little);
+    if (first > last) return error.SourceAdmissionCorrupt;
+    if (root.authority == .raft) {
+        const index = std.mem.readInt(u64, earlier[8..16], .little);
+        const end = std.mem.readInt(u64, later[8..16], .little);
+        if (index > end or (index == end and first != last)) return error.SourceAdmissionCorrupt;
+    }
+}
 pub fn namespaceFor(root: Root, epoch: u64) Digest {
     return valueDigest("antfly:native-source-plan-namespace:v1", .{ .root = root, .epoch = epoch });
 }
@@ -134,7 +150,14 @@ pub fn frozenDigest(bytes: []const u8) !Digest {
     return hash.finish();
 }
 
-pub const Quota = struct { epoch: u64 = 1, active: u16 = 0, reserved: u64 = 0 };
+pub const Quota = struct {
+    epoch: u64 = 1,
+    active: u16 = 0,
+    reserved: u64 = 0,
+    pub fn validate(self: Quota) !void {
+        if (self.epoch == 0 or self.active > max_active or self.reserved > max_reserved_bytes or ((self.active == 0) != (self.reserved == 0)) or self.reserved < @as(u64, self.active) * (frozen_header_bytes + max_record_bytes + 128)) return error.SourceAdmissionCorrupt;
+    }
+};
 fn quotaKey(root: Root) [quota_prefix.len + 32]u8 {
     return scopedKey(quota_prefix, root);
 }
@@ -179,7 +202,7 @@ pub fn readQuota(txn: anytype, root: Root) !Quota {
     std.crypto.hash.sha2.Sha256.hash(raw[0..32], &digest, .{});
     if (!std.mem.eql(u8, &digest, raw[32..64])) return error.SourceAdmissionCorrupt;
     const quota: Quota = .{ .epoch = std.mem.readInt(u64, raw[4..12], .little), .reserved = std.mem.readInt(u64, raw[12..20], .little), .active = std.mem.readInt(u16, raw[20..22], .little) };
-    if (quota.epoch == 0 or quota.active > max_active or quota.reserved > max_reserved_bytes or ((quota.active == 0) != (quota.reserved == 0))) return error.SourceAdmissionCorrupt;
+    try quota.validate();
     return quota;
 }
 pub fn hasActive(txn: anytype, root: Root) !bool {
@@ -273,6 +296,37 @@ pub const Status = struct {
     seal: ?Digest = null,
     fence: ?Digest = null,
     reclamation: ?Digest = null,
+    pub fn validate(self: Status, root: Root, spec: Spec, quota: Quota, cut: Digest) !void {
+        try spec.validate(root);
+        try quota.validate();
+        try validateCut(root, cut, !self.present and quota.active == 0 and quota.epoch == 1);
+        if ((self.seal == null) != (self.sealed_position == null) or (self.fence == null) != (self.fenced_position == null)) return error.SourceAdmissionCorrupt;
+        if (!self.present) {
+            if (!std.mem.allEqual(u8, &self.received, 0) or self.seal != null or self.fence != null) return error.SourceAdmissionCorrupt;
+            if (quota.epoch > spec.storage_epoch) {
+                const proof = self.reclamation orelse return error.SourceAdmissionCorrupt;
+                if (!same(proof, valueDigest("antfly:native-source-plan-reclaimed:v1", spec.id()))) return error.SourceAdmissionCorrupt;
+            } else if (self.reclamation != null) return error.SourceAdmissionCorrupt;
+            return;
+        }
+        if (self.reclamation != null or quota.active == 0 or quota.reserved < spec.reservationBytes() or quota.epoch < spec.storage_epoch or std.mem.readInt(u64, cut[0..8], .little) == 0) return error.SourceAdmissionCorrupt;
+        for (0..128) |ordinal| {
+            const present = self.received[ordinal / 8] & (@as(u8, 1) << @as(u3, @intCast(ordinal % 8))) != 0;
+            if (ordinal >= spec.chunk_hashes.len and present) return error.SourceAdmissionCorrupt;
+            if (ordinal < spec.chunk_hashes.len and self.seal != null and self.fence == null and !present) return error.SourceAdmissionCorrupt;
+        }
+        if (self.sealed_position) |position| {
+            try validatePosition(root, position);
+            try requireAtOrBefore(root, position, cut);
+            if (!same(self.seal.?, sealProof(spec, position))) return error.SourceAdmissionCorrupt;
+        }
+        if (self.fenced_position) |position| {
+            try validatePosition(root, position);
+            try requireAtOrBefore(root, position, cut);
+            if (quota.epoch <= spec.storage_epoch or !same(self.fence.?, fenceProof(spec))) return error.SourceAdmissionCorrupt;
+            if (self.sealed_position) |sealed| try requireAtOrBefore(root, sealed, position);
+        }
+    }
 };
 /// A snapshot observation, not authority by itself. The serving facade binds
 /// it to its independently qualified root and actual native/Raft read cut.
@@ -452,7 +506,7 @@ pub fn reclamationProof(txn: anytype, root: Root, spec: Spec) !Digest {
 
 const TestTxn = struct {
     map: std.StringHashMapUnmanaged([]u8) = .empty,
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         var it = self.map.iterator();
         while (it.next()) |entry| {
             std.testing.allocator.free(entry.key_ptr.*);
@@ -460,10 +514,10 @@ const TestTxn = struct {
         }
         self.map.deinit(std.testing.allocator);
     }
-    fn get(self: *@This(), key: []const u8) ![]const u8 {
+    pub fn get(self: *@This(), key: []const u8) ![]const u8 {
         return self.map.get(key) orelse error.NotFound;
     }
-    fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+    pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
         const a = std.testing.allocator;
         const k = try a.dupe(u8, key);
         errdefer a.free(k);
@@ -476,7 +530,7 @@ const TestTxn = struct {
         }
         slot.value_ptr.* = v;
     }
-    fn delete(self: *@This(), key: []const u8) !void {
+    pub fn delete(self: *@This(), key: []const u8) !void {
         const entry = self.map.fetchRemove(key) orelse return error.NotFound;
         std.testing.allocator.free(entry.key);
         std.testing.allocator.free(entry.value);
@@ -641,4 +695,89 @@ test "source artifact missing quota and corrupted retained chunks fail closed" {
     try std.testing.expectError(error.SourceAdmissionCorrupt, readSealedAlloc(a, &txn, root, spec, seal));
     try txn.delete(&quotaKey(root));
     try std.testing.expectError(error.SourceAdmissionCorrupt, stageBegin(a, &txn, root, spec));
+}
+
+/// Shared in-memory transaction fixture for adjacent codec qualification only.
+pub const test_support = if (@import("builtin").is_test) struct {
+    pub const Txn = TestTxn;
+} else struct {};
+
+test "source artifact observations authenticate lifecycle evidence and causal cuts" {
+    const a = std.testing.allocator;
+    var txn: TestTxn = .{};
+    defer txn.deinit();
+    const root = testRoot();
+    var frame: [128]u8 = undefined;
+    var hashes: [1]Digest = undefined;
+    const spec = try testSpec(root, &frame, &hashes, 1);
+    try stageBegin(a, &txn, root, spec);
+    try stageChunk(a, &txn, root, spec, 0, &frame);
+    _ = try stageSeal(a, &txn, root, spec, testPosition(2));
+    const sealed = try inspect(a, &txn, root, spec);
+    const quota = try readQuota(&txn, root);
+    try sealed.validate(root, spec, quota, testPosition(2));
+    try std.testing.expectError(error.SourceAdmissionCorrupt, sealed.validate(root, spec, quota, testPosition(1)));
+    var bad = sealed;
+    bad.seal.?[0] ^= 1;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, bad.validate(root, spec, quota, testPosition(3)));
+    bad = sealed;
+    bad.received[0] = 0;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, bad.validate(root, spec, quota, testPosition(3)));
+    bad = sealed;
+    bad.received[15] = 1;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, bad.validate(root, spec, quota, testPosition(3)));
+    bad = sealed;
+    bad.sealed_position = null;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, bad.validate(root, spec, quota, testPosition(3)));
+    try std.testing.expectError(error.SourceAdmissionCorrupt, sealed.validate(root, spec, .{}, testPosition(3)));
+    bad = sealed;
+    bad.fenced_position = testPosition(1);
+    bad.fence = fenceProof(spec);
+    var fenced_quota = quota;
+    fenced_quota.epoch = 2;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, bad.validate(root, spec, fenced_quota, testPosition(3)));
+    _ = try stageFence(a, &txn, root, spec, testPosition(3));
+    const fenced = try inspect(a, &txn, root, spec);
+    try fenced.validate(root, spec, try readQuota(&txn, root), testPosition(4));
+    try std.testing.expectError(error.SourceAdmissionCorrupt, fenced.validate(root, spec, quota, testPosition(4)));
+    try std.testing.expect(try stageReclaim(a, &txn, root, spec, 1));
+    const retired = try inspect(a, &txn, root, spec);
+    const released = try readQuota(&txn, root);
+    try retired.validate(root, spec, released, testPosition(4));
+    bad = retired;
+    bad.reclamation.?[0] ^= 1;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, bad.validate(root, spec, released, testPosition(4)));
+    bad = retired;
+    bad.received[0] = 1;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, bad.validate(root, spec, released, testPosition(4)));
+    try std.testing.expectError(error.SourceAdmissionCorrupt, (Quota{ .active = 1, .reserved = 1 }).validate());
+}
+
+test "source artifact raft observations reject index term and authority substitution" {
+    const a = std.testing.allocator;
+    var txn: TestTxn = .{};
+    defer txn.deinit();
+    var root = testRoot();
+    root.authority = .raft;
+    var frame: [128]u8 = undefined;
+    var hashes: [1]Digest = undefined;
+    const spec = try testSpec(root, &frame, &hashes, 1);
+    var cut: Digest = @splat(0);
+    std.mem.writeInt(u64, cut[0..8], 1, .little);
+    std.mem.writeInt(u64, cut[8..16], 2, .little);
+    cut[31] = 1;
+    try stageBegin(a, &txn, root, spec);
+    try stageChunk(a, &txn, root, spec, 0, &frame);
+    _ = try stageSeal(a, &txn, root, spec, cut);
+    const status = try inspect(a, &txn, root, spec);
+    const quota = try readQuota(&txn, root);
+    try status.validate(root, spec, quota, cut);
+    try std.testing.expectError(error.InvalidTxnRecord, status.validate(root, spec, quota, testPosition(5)));
+    var bad = cut;
+    std.mem.writeInt(u64, bad[0..8], 2, .little);
+    try std.testing.expectError(error.SourceAdmissionCorrupt, status.validate(root, spec, quota, bad));
+    std.mem.writeInt(u64, bad[8..16], 1, .little);
+    try std.testing.expectError(error.SourceAdmissionCorrupt, status.validate(root, spec, quota, bad));
+    std.mem.writeInt(u64, bad[8..16], 3, .little);
+    try status.validate(root, spec, quota, bad);
 }
