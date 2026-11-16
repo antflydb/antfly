@@ -13,10 +13,17 @@ pub const Options = struct {
     capacity_bytes: usize = 0,
     device_bytes: usize = 0,
     precision: factory.PjrtSessionOptions.Precision = .f32,
+    media_bucket_rows: usize = 0,
+    gemm: @FieldType(factory.PjrtSessionOptions, "gemm") = .provider_default,
 
     pub fn parse(self: *Options, arg: []const u8, value: []const u8) !bool {
         if (std.mem.eql(u8, arg, "--pjrt-device")) {
             self.device = std.meta.stringToEnum(@FieldType(Options, "device"), value) orelse return error.InvalidPjrtDevice;
+        } else if (std.mem.eql(u8, arg, "--pjrt-media-bucket-rows")) {
+            self.media_bucket_rows = try std.fmt.parseInt(usize, value, 10);
+            if (self.media_bucket_rows > 256) return error.InvalidPjrtBucket;
+        } else if (std.mem.eql(u8, arg, "--pjrt-gemm")) {
+            self.gemm = std.meta.stringToEnum(@TypeOf(self.gemm), value) orelse return error.InvalidPjrtGemm;
         } else if (std.mem.eql(u8, arg, "--pjrt-unified-memory")) {
             self.unified_memory = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidPjrtMemoryPolicy;
         } else if (std.mem.eql(u8, arg, "--pjrt-capacity-bytes")) {
@@ -32,6 +39,7 @@ pub const Options = struct {
     pub fn sessionOptions(self: Options) !factory.PjrtSessionOptions {
         return .{
             .precision = self.precision,
+            .gemm = self.gemm,
             .memory_policy = switch (self.device) {
                 .cpu => if (self.capacity_bytes != 0 or self.device_bytes != 0 or self.unified_memory) return error.InvalidPjrtMemoryPolicy else .cpu,
                 .cuda => if (self.capacity_bytes == 0 or self.device_bytes == 0 or self.capacity_bytes > self.device_bytes)
@@ -49,5 +57,6 @@ pub const Options = struct {
         manager.required_backend_invalid = false;
         manager.pjrt_memory_policy = options.memory_policy;
         manager.pjrt_precision = options.precision;
+        manager.pjrt_gemm = options.gemm;
     }
 };

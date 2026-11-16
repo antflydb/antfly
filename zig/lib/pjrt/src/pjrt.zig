@@ -516,6 +516,8 @@ pub const Client = struct {
     handle: *c.PjrtClient,
     device: *c.PjrtDevice,
     lib: std.DynLib,
+    /// Immutable after publication; all shapes use the same selected schedule.
+    compile_options: CompileOptions = .{},
 
     pub fn platformName(self: *const Client) PjrtError![]const u8 {
         var args = std.mem.zeroes(c.ClientPlatformNameArgs);
@@ -662,7 +664,7 @@ pub const Client = struct {
     /// Compile an HLO program targeting a specific device.
     /// `num_outputs` is the number of output buffers the program produces.
     pub fn compileForDevice(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice) PjrtError!LoadedExecutable {
-        return self.compileWithOptions(hlo_bytes, num_outputs, target_device, .{});
+        return self.compileWithOptions(hlo_bytes, num_outputs, target_device, self.compile_options);
     }
 
     pub fn compileWithOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice, options: CompileOptions) PjrtError!LoadedExecutable {
@@ -1421,7 +1423,7 @@ test "compile and deserialize reject native output arity with balanced ownership
     api._fns[c.Api.FN_EXEC_NUM_OUTPUTS] = @ptrCast(&Fake.count);
     api._fns[c.Api.FN_LOADED_EXEC_DESTROY] = @ptrCast(&Fake.destroyLoaded);
     api._fns[c.Api.FN_EXEC_DESTROY] = @ptrCast(&Fake.destroyExecutable);
-    const client = Client{ .lib = undefined, .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1) };
+    var client = Client{ .lib = undefined, .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1) };
     Fake.loaded_destroyed = 0;
     Fake.executable_destroyed = 0;
     Fake.strict_compiles = 0;
@@ -1430,10 +1432,12 @@ test "compile and deserialize reject native output arity with balanced ownership
     Fake.vendor_expected = true;
     defer Fake.vendor_expected = false;
     try std.testing.expectError(error.OutputCountMismatch, client.compileWithOptions("hlo", 2, @ptrFromInt(1), .{ .gpu_gemm = .vendor }));
+    client.compile_options = .{ .gpu_gemm = .vendor };
+    try std.testing.expectError(error.OutputCountMismatch, client.compile("hlo", 2));
     try std.testing.expectError(error.OutputCountMismatch, client.deserializeExecutable("serialized", 2));
-    try std.testing.expectEqual(@as(usize, 3), Fake.strict_compiles);
-    try std.testing.expectEqual(@as(usize, 4), Fake.loaded_destroyed);
-    try std.testing.expectEqual(@as(usize, 4), Fake.executable_destroyed);
+    try std.testing.expectEqual(@as(usize, 4), Fake.strict_compiles);
+    try std.testing.expectEqual(@as(usize, 5), Fake.loaded_destroyed);
+    try std.testing.expectEqual(@as(usize, 5), Fake.executable_destroyed);
 }
 
 test "float32 downloads use logical host bytes and reject invalid type size and shape" {

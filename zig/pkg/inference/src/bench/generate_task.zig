@@ -55,6 +55,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .compiled_partition_backend = if (is_pjrt) .pjrt else null,
         .compiled_attachment_target = .whole_model,
         .pjrt_client = client,
+        .pjrt_media_bucket_rows = options.pjrt.media_bucket_rows,
     };
     defer pipeline.deinit();
     const image_bytes = if (options.generate_image) |path| try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(64 * 1024 * 1024)) else null;
@@ -101,6 +102,8 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .model_dir = options.model_dir,
         .backend = @tagName(model.session.backend()),
         .pjrt_device = if (is_pjrt) @tagName(options.pjrt.device) else null,
+        .pjrt_media_bucket_rows = options.pjrt.media_bucket_rows,
+        .pjrt_gemm = if (is_pjrt) @tagName(options.pjrt.gemm) else null,
         .pjrt_precision = if (is_pjrt) @tagName(options.pjrt.precision) else null,
         .whole_model_required = is_pjrt,
         .modalities = .{ .image = image_bytes != null, .audio = audio_bytes != null, .video = video_bytes != null },

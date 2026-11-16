@@ -44,6 +44,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .backend = @tagName(model.session.backend()),
         .model_dir = options.model_dir,
         .pjrt_device = if (is_pjrt) @tagName(options.pjrt.device) else null,
+        .pjrt_gemm = if (is_pjrt) @tagName(options.pjrt.gemm) else null,
         .pjrt_precision = if (is_pjrt) @tagName(options.pjrt.precision) else null,
         .compiled_stages_required = is_pjrt,
         .model_load_in_timing = false,

@@ -384,6 +384,7 @@ const HostSessionOptions = struct {
     weights: host_weights.HostPreparation = .{},
     pjrt_memory_policy: ?PjrtSessionOptions.MemoryPolicy = null,
     pjrt_precision: @import("precision.zig").Policy = .f32,
+    pjrt_gemm: @import("precision.zig").Gemm = .provider_default,
 };
 
 pub const PjrtSessionOptions = struct {
@@ -393,6 +394,7 @@ pub const PjrtSessionOptions = struct {
         cpu,
         cuda: struct { capacity_bytes: usize, device_bytes: usize, unified_memory: bool = false },
     };
+    gemm: @import("precision.zig").Gemm = .provider_default,
     task_override: ?TaskOverride = null,
     /// BF16 is explicit opt-in; model/device qualification gates default rollout.
     precision: @import("precision.zig").Policy = .f32,
@@ -476,6 +478,10 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
             .cuda => |limit| .{ .cuda = .{ .capacity_bytes = limit.capacity_bytes, .device_bytes = limit.device_bytes } },
         } else null;
         impl.backend_data.pjrt.client = try pjrt_lib.pjrt.Client.initFromEnvWithMemoryPolicy(allocator, policy);
+        impl.backend_data.pjrt.client.?.compile_options.gpu_gemm = switch (preparation.pjrt_gemm) {
+            .provider_default => .provider_default,
+            .vendor => .vendor,
+        };
         impl.backend_data.pjrt.parameters = @import("../graph/pjrt_parameters.zig").Store.init(allocator, &impl.backend_data.pjrt.client.?);
     }
     const host_data = switch (preparation.backend) {
@@ -510,13 +516,13 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
 
 pub fn createPjrtSessionWithOptions(allocator: std.mem.Allocator, model_path: []const u8, options: PjrtSessionOptions) !Session {
     if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
-    return openHostSession(allocator, model_path, options.task_override, .{ .backend = .pjrt, .pjrt_memory_policy = options.memory_policy, .pjrt_precision = options.precision });
+    return openHostSession(allocator, model_path, options.task_override, .{ .backend = .pjrt, .pjrt_memory_policy = options.memory_policy, .pjrt_precision = options.precision, .pjrt_gemm = options.gemm });
 }
 
 /// Retains the caller's resolved source and policy through synchronous loading.
 pub fn createPjrtSessionFromManifestWithOptions(allocator: std.mem.Allocator, model_path: []const u8, manifest: *const manifest_mod.ModelManifest, options: PjrtSessionOptions) !Session {
     if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
-    return openHostSessionFromManifest(allocator, model_path, manifest, options.task_override, .{ .backend = .pjrt, .pjrt_memory_policy = options.memory_policy, .pjrt_precision = options.precision });
+    return openHostSessionFromManifest(allocator, model_path, manifest, options.task_override, .{ .backend = .pjrt, .pjrt_memory_policy = options.memory_policy, .pjrt_precision = options.precision, .pjrt_gemm = options.gemm });
 }
 
 test "host preparation shares execution and device-upload ownership and unwinds allocation failures" {

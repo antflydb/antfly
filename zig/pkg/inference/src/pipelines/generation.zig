@@ -2732,6 +2732,7 @@ pub const NativeGenerationPipeline = struct {
     /// pointer to pjrt.Client; used by the compiled backend registry.
     pjrt_client: ?*anyopaque = null,
     /// Defaults to the loaded PJRT session policy when a session owns the client.
+    pjrt_media_bucket_rows: usize = 0,
     pjrt_precision: ?@import("../execution/precision.zig").Policy = null,
     pjrt_admission: ?*const @import("../graph/pjrt_admission.zig").Context = null,
     pjrt_plugin_path: ?[:0]const u8 = null,
@@ -7971,7 +7972,7 @@ pub const NativeGenerationPipeline = struct {
         const values = try self.cb.toFloat32(tensor, self.allocator);
         var values_owned = true;
         errdefer if (values_owned) self.allocator.free(values);
-        var prefix = @import("../execution/media_prefix.zig").Prefix{ .embeddings = try backends.Tensor.initFloat32Owned(self.allocator, "input_embeddings", &.{ 1, @intCast(rows), self.gpt_config.hidden_size }, values), .position_delta = delta };
+        var prefix = @import("../execution/media_prefix.zig").Prefix{ .bucket_rows = self.pjrt_media_bucket_rows, .embeddings = try backends.Tensor.initFloat32Owned(self.allocator, "input_embeddings", &.{ 1, @intCast(rows), self.gpt_config.hidden_size }, values), .position_delta = delta };
         values_owned = false;
         prefix.retained = retained;
         retained = null;

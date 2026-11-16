@@ -501,6 +501,26 @@ test "model program public decoder prefix keeps new embeddings and token tails d
         const expected = try reference.toFloat32(expected_outputs[0].value, a);
         defer a.free(expected);
         @import("../architectures/gpt.zig").applyFinalLogitSoftcapInPlace(config, expected);
+        const prepared = @import("media_prefix.zig").Prefix{ .embeddings = prefix.borrowedView("input_embeddings"), .bucket_rows = 4 };
+        const bucketed = try prepared.run(compiled, ids.asInt64(), a, .{ .native_call_policy = .in_process });
+        defer a.free(bucketed);
+        try std.testing.expectEqual(expected.len, bucketed.len);
+        for (expected, bucketed) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.002 + @abs(want) * 1e-4);
+        if (round == 1) {
+            var next = try Tensor.initInt64(a, "input_ids", &.{ 1, 4 }, &.{ 1, 2, 4, 5 });
+            defer next.deinit();
+            const extra = [_]@import("capture.zig").Input{ .{ .tensor = next }, .{ .tensor = prefix } };
+            const oracle = try frontend.run(frontend.context, &reference, a, &extra);
+            defer a.free(oracle);
+            defer for (oracle) |output| reference.free(output.value);
+            const values = try reference.toFloat32(oracle[0].value, a);
+            defer a.free(values);
+            @import("../architectures/gpt.zig").applyFinalLogitSoftcapInPlace(config, values);
+            const reused = try prepared.run(compiled, next.asInt64(), a, .{ .native_call_policy = .in_process });
+            defer a.free(reused);
+            try std.testing.expectEqual(values.len, reused.len);
+            for (values, reused) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.002 + @abs(want) * 1e-4);
+        }
         const actual = try compiled.runWithControl(&.{ ids, prefix }, a, .{ .native_call_policy = .in_process });
         defer a.free(actual);
         defer for (actual) |*output| output.deinit();

@@ -5,3 +5,6 @@
 /// normalization, softmax, pooling and dot partial reductions in F32. Public vectors
 /// remain F32. This is immutable model policy, never inferred from a model name.
 pub const Policy = enum { f32, bf16 };
+
+/// Provider schedule is independent of tensor storage/publication precision.
+pub const Gemm = enum { provider_default, vendor };

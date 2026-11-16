@@ -12,7 +12,7 @@ const gpt = @import("../architectures/gpt.zig");
 const Config = @import("../models/gpt.zig").Config;
 
 pub fn resolve(config: *Config) capture.Forward {
-    return .{ .context = config, .fingerprint = 5, .output_names = &.{"logits"}, .validate = validate, .run = run };
+    return .{ .context = config, .fingerprint = 6, .output_names = &.{"logits"}, .validate = validate, .run = run };
 }
 
 const Inputs = struct {
@@ -21,6 +21,7 @@ const Inputs = struct {
     prefix: ?Tensor = null,
     positions: ?Tensor = null,
     visibility: ?Tensor = null,
+    logits_row: ?Tensor = null,
     fn prefixRows(self: Inputs) usize {
         return if (self.prefix) |prefix| @intCast(prefix.shape[prefix.shape.len - 2]) else 0;
     }
@@ -32,9 +33,10 @@ fn parse(config: Config, inputs: []const capture.Input) !Inputs {
     var prefix: ?Tensor = null;
     var positions: ?Tensor = null;
     var visibility: ?Tensor = null;
+    var logits_row: ?Tensor = null;
     for (inputs) |input| {
         _ = try capture.inputShape(input.tensor);
-        const slot = if (std.mem.eql(u8, input.tensor.name, "input_ids")) &ids else if (std.mem.eql(u8, input.tensor.name, "ple_input_ids")) &ple else if (std.mem.eql(u8, input.tensor.name, "input_embeddings")) &prefix else if (std.mem.eql(u8, input.tensor.name, "position_ids")) &positions else if (std.mem.eql(u8, input.tensor.name, "attention_or_mask")) &visibility else return error.UnexpectedModelProgramInput;
+        const slot = if (std.mem.eql(u8, input.tensor.name, "input_ids")) &ids else if (std.mem.eql(u8, input.tensor.name, "ple_input_ids")) &ple else if (std.mem.eql(u8, input.tensor.name, "input_embeddings")) &prefix else if (std.mem.eql(u8, input.tensor.name, "position_ids")) &positions else if (std.mem.eql(u8, input.tensor.name, "attention_or_mask")) &visibility else if (std.mem.eql(u8, input.tensor.name, "logits_row")) &logits_row else return error.UnexpectedModelProgramInput;
         if (slot.* != null) return error.DuplicateInputs;
         slot.* = input.tensor;
     }
@@ -60,7 +62,11 @@ fn parse(config: Config, inputs: []const capture.Input) !Inputs {
         if (value.dtype != .u8 or value.shape.len != 2 or value.shape[0] != text.shape[1] or value.shape[1] != text.shape[1]) return error.InvalidAttentionMask;
         for (value.data) |bit| if (bit > 1) return error.InvalidAttentionMask;
     }
-    return .{ .ids = text, .ple_ids = ple, .prefix = prefix, .positions = positions, .visibility = visibility };
+    if (logits_row) |value| {
+        if (value.dtype != .i64 or !value.isAlignedFor(i64) or value.shape.len != 1 or value.shape[0] != 1) return error.InvalidInputShape;
+        if (value.asInt64()[0] < 0 or value.asInt64()[0] >= text.shape[1]) return error.InvalidInputShape;
+    }
+    return .{ .logits_row = logits_row, .ids = text, .ple_ids = ple, .prefix = prefix, .positions = positions, .visibility = visibility };
 }
 
 fn validate(raw: *anyopaque, inputs: []const capture.Input) !void {
@@ -103,8 +109,18 @@ fn run(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, dec
     } else null;
     defer if (positions) |values| a.free(values);
     const context = gpt.DecodeContext{ .total_sequence_len = rows, .query_sequence_len = rows, .kv_sequence_len = rows, .input_ids = input.ids.asInt64(), .mrope_positions = positions, .attn_or_mask = if (input.visibility) |value| value.data else null, .qwen3vl_text_only = positions == null };
+    const indices = if (input.logits_row) |row| (try cb.fromConstantBytes(row.data, .i64, row.shape)) orelse return error.UnsupportedPrimitiveOp else null;
+    defer if (indices) |value| cb.free(value);
     hidden_owned = false; // the ordinary decoder consumes its input rows
-    const logits = try gpt.forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(cb, a, config.*, hidden, .{}, 1, rows, &context, ple);
+    const logits = if (indices) |index| selected: {
+        const result = try gpt.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(cb, a, config.*, hidden, .{}, 1, rows, &context, ple);
+        defer cb.free(result.hidden);
+        const selected_hidden = try cb.primGather(result.hidden, index, 0, &.{ @intCast(rows), @intCast(width) });
+        defer cb.free(selected_hidden);
+        const lm_weight = try gpt.getLmHeadWeight(cb, config.*);
+        defer cb.free(lm_weight);
+        break :selected try cb.linearNoBias(selected_hidden, lm_weight, 1, width, config.vocab_size);
+    } else try gpt.forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(cb, a, config.*, hidden, .{}, 1, rows, &context, ple);
     errdefer cb.free(logits);
     const transform = gpt.finalLogitTransform(config.*);
     const outputs = try a.alloc(capture.Output, 1);

@@ -1313,6 +1313,8 @@ pub const NodeConfig = struct {
     /// allocator capacities. F32 remains the default qualification profile.
     pjrt_memory_policy: ?session_factory.PjrtSessionOptions.MemoryPolicy = null,
     pjrt_precision: session_factory.PjrtSessionOptions.Precision = .f32,
+    pjrt_media_bucket_rows: usize = 0,
+    pjrt_gemm: @import("../execution/precision.zig").Gemm = .provider_default,
     audio_readers: []const transcribing_api.NamedConfig = &.{},
     chunking_limits: @import("../pipelines/media_chunk_limits.zig").Limits = .{},
     models_dir: []const u8 = "./models",
@@ -4604,6 +4606,7 @@ pub const Node = struct {
         var config = supplied_config;
         config.chunking_limits = try config.chunking_limits.environment(allocator);
         try config.request_limits.validate();
+        if (config.pjrt_media_bucket_rows > 256) return error.InvalidPjrtBucket;
         try config.cooperative_execution.validate();
         if (config.http_max_connections == 0 or config.http_max_request_tasks == 0 or config.http_max_body_bytes == 0)
             return error.InvalidHttpTransportCapacity;
@@ -4620,6 +4623,7 @@ pub const Node = struct {
         var session_manager = backends_mod.SessionManager.init(allocator);
         session_manager.pjrt_memory_policy = config.pjrt_memory_policy;
         session_manager.pjrt_precision = config.pjrt_precision;
+        session_manager.pjrt_gemm = config.pjrt_gemm;
         session_manager.process_termination_available = config.process_termination_available;
         session_manager.native_call_policy = config.native_call_policy;
         if (!config.inference_proxy) try session_manager.validateRequiredBackendPolicy();
@@ -18694,6 +18698,7 @@ pub const Node = struct {
             .pjrt_client = client,
             .generation_admission = &model.generation_admission,
             .media_prepaid = .{ .process_bytes = media.host_scratch_bytes },
+            .pjrt_media_bucket_rows = self.config.pjrt_media_bucket_rows,
         };
         defer pipeline.deinit();
         if (stream) return self.streamGenerate(ctx, body.model, &pipeline, null, messages, config, parser, include_usage, null, completion);

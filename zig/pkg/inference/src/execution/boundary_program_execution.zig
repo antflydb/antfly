@@ -23,7 +23,8 @@ const Inputs = struct {
     a: A,
     tensors: std.ArrayList(Tensor) = .empty,
     fn floats(self: *Inputs, name: []const u8, shape: []const i64, values: []const f32) !void {
-        try self.tensors.append(self.a, try Tensor.initFloat32(self.a, name, shape, values));
+        const dimensions = try self.a.dupe(i64, shape);
+        try self.tensors.append(self.a, .{ .name = name, .data = @constCast(std.mem.sliceAsBytes(values)), .shape = dimensions, .dtype = .f32, .allocator = self.a, .owns_data = false, .owns_shape = true });
     }
     fn ints(self: *Inputs, name: []const u8, shape: []const i64, values: []const i32) !void {
         try self.tensors.append(self.a, try Tensor.initInt32(self.a, name, shape, values));
@@ -35,14 +36,12 @@ const Inputs = struct {
     }
     fn execute(self: *Inputs, session: Session, control: ?Control) ![]Tensor {
         const outputs = try session.runWithControl(self.tensors.items, self.a, control);
-        defer self.a.free(outputs);
-        defer for (outputs) |*output| output.deinit();
-        const retained = try self.a.alloc(Tensor, outputs.len);
-        for (outputs, retained) |output, *copy| {
-            if (output.dtype != .f32) return error.InvalidBoundaryScorerOutput;
-            copy.* = try Tensor.initFloat32(self.a, output.name, output.shape, output.asFloat32());
+        errdefer {
+            for (outputs) |*output| output.deinit();
+            self.a.free(outputs);
         }
-        return retained;
+        for (outputs) |output| if (output.dtype != .f32) return error.InvalidBoundaryScorerOutput;
+        return outputs;
     }
 };
 
@@ -86,6 +85,7 @@ fn execute(comptime windows: bool, session: Session, allocator: A, output_alloca
     var routed = try engine.routeEncoded(a, config, prepared, hidden.asFloat32(), encoder_options);
     defer routed.deinit();
     var owner = Owner{ .session = session, .config = config, .prepared = prepared, .core = &routed, .a = a, .control = options.control };
+    defer owner.deinit();
     if (prepared.query_width != 0) try owner.prepareHeads(options.head_limits);
     return if (windows)
         pipeline.runScoredWindows(output_allocator, config, prepared, schemas, owner.score_view, owner.scorer(), options, &.{})
@@ -105,6 +105,11 @@ const Owner = struct {
     score_view: ?scoring.CandidateScoreView = null,
     pool: ?math.SharedPool = null,
     means: []f32 = &.{},
+
+    fn deinit(self: *Owner) void {
+        for (self.proposals) |*output| output.deinit();
+        for (self.candidates) |*output| output.deinit();
+    }
 
     fn coreInputs(self: *const Owner) !Inputs {
         var inputs = Inputs{ .a = self.a };
@@ -180,6 +185,7 @@ const Owner = struct {
         var inputs = Inputs{ .a = storage.alloc() };
         try inputs.floats("head.classification_states", &.{ @intCast(b), @intCast(c), self.config.encoder.hidden_size }, self.core.classification_states);
         const outputs = try inputs.execute(self.session, control);
+        storage.outputs = outputs;
         return .{ .storage = storage, .logits = try outputValues(outputs, "classification_logits") };
     }
     fn selfOf(raw: *anyopaque) *Owner {
@@ -256,6 +262,7 @@ const Owner = struct {
             try inputs.floats("head.explicit.inside_mean", &.{ 1, @intCast(q), 1 }, means);
         }
         const outputs = try inputs.execute(self.session, control);
+        storage.outputs = outputs;
         return .{ .storage = storage, .logits = try outputValues(outputs, "explicit_logits"), .valid = valid };
     }
     fn clamp(value: i128, limit: usize) usize {
@@ -327,6 +334,7 @@ const Owner = struct {
         try inputs.floats("head.relation.geometry", &.{ @intCast(p), 2 }, geometry);
         try inputs.booleans("head.relation.valid", &.{@intCast(p)}, valid);
         const outputs = try inputs.execute(self.session, control);
+        storage.outputs = outputs;
         return .{ .storage = storage, .logits = try outputValues(outputs, "relation_logits"), .valid = valid };
     }
     fn record(raw: *anyopaque, allocator: A, request: scoring.RecordRequest, limits: tasks.Limits, control: ?Control) !scoring.RecordScores {
@@ -407,6 +415,7 @@ const Owner = struct {
         if (request.mode == .natural) try inputs.floats("head.record.object_logits", &.{@intCast(count)}, object_source);
         try inputs.tensors.append(a, try Tensor.initInt64(a, "head.record.mode", &.{1}, &.{@backingInt(request.mode)}));
         const outputs = try inputs.execute(self.session, control);
+        storage.outputs = outputs;
         const compiled_objects = try outputValues(outputs, "record_objects");
         const assignments = try outputValues(outputs, "record_assignments");
         if (compiled_objects.len != padded_instances or assignments.len != padded_instances * f * (count + 1)) return error.InvalidBoundaryScorerOutput;
