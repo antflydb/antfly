@@ -17,6 +17,8 @@ const std = @import("std");
 const context_mod = @import("context.zig");
 const driver_mod = @import("driver.zig");
 const allocation_budget = @import("allocation_budget.zig");
+const host_retirement = @import("host_retirement.zig");
+const memory = @import("../../runtime/tier/memory.zig");
 const allocation_ledger = @import("allocation_ledger.zig");
 
 pub const HostBuffer = struct {
@@ -71,6 +73,68 @@ pub const HostBuffer = struct {
 
     pub fn constBytes(self: HostBuffer) []const u8 {
         return self.bytes();
+    }
+};
+
+/// Immutable checkpoint storage accessible to device-side gathers without a
+/// full VRAM copy. The owner outlives every resident descriptor and graph.
+/// Host bytes have an independent load lease, never the device scratch pool.
+pub const MappedHostBuffer = struct {
+    host: HostBuffer = .{},
+    device_ptr: driver_mod.CUdeviceptr = 0,
+
+    owner: ?*host_retirement.Owner = null,
+
+    pub fn alloc(ctx: *context_mod.CudaContext, len: usize) !MappedHostBuffer {
+        return allocAdmitted(ctx, len, null);
+    }
+
+    pub fn allocAdmitted(ctx: *context_mod.CudaContext, len: usize, lease: ?*?memory.AdmissionLease) !MappedHostBuffer {
+        if (len == 0) return error.InvalidCudaState;
+        if (ctx.driver.fns.cuMemHostAlloc == null or ctx.driver.fns.cuMemHostGetDevicePointer == null) return error.CudaSymbolMissing;
+        try ctx.makeCurrent();
+        const owner = try host_retirement.Owner.create(ctx.ctx, ctx.device, len, lease);
+        return allocUsingOwner(ctx, len, owner);
+    }
+
+    fn allocUsingOwner(ctx: *context_mod.CudaContext, len: usize, owner: *host_retirement.Owner) !MappedHostBuffer {
+        errdefer owner.retire(true); // No device reader has seen this allocation.
+        const alloc_host = ctx.driver.fns.cuMemHostAlloc orelse return error.CudaSymbolMissing;
+        const device_pointer = ctx.driver.fns.cuMemHostGetDevicePointer orelse return error.CudaSymbolMissing;
+        // CU_MEMHOSTALLOC_DEVICEMAP; preserve ordinary cached CPU stores.
+        if (alloc_host(&owner.ptr, len, 0x02) != driver_mod.CUDA_SUCCESS) return error.CudaHostAllocationFailed;
+        if (owner.ptr == null) return error.InvalidCudaState;
+        var device_ptr: driver_mod.CUdeviceptr = 0;
+        if (device_pointer(&device_ptr, owner.ptr, 0) != driver_mod.CUDA_SUCCESS) return error.CudaDriverError;
+        if (device_ptr == 0) return error.InvalidCudaState;
+        if (owner.lease) |*held| try held.retain(held.amounts);
+        return .{ .host = .{ .ptr = owner.ptr, .len = len }, .device_ptr = device_ptr, .owner = owner };
+    }
+
+    pub fn view(self: MappedHostBuffer) DeviceBuffer {
+        return .{ .ptr = self.device_ptr, .len = self.host.len, .borrowed = true };
+    }
+
+    pub fn clear(self: *MappedHostBuffer, ctx: *context_mod.CudaContext) driver_mod.Error!void {
+        if (self.host.ptr == null) return;
+        // Readers may be asynchronous, including captured decode kernels.
+        // A failed wait/free must leave ownership intact for a later retry.
+        try ctx.synchronize();
+        if (self.owner) |owner| {
+            try owner.freeHost();
+            owner.retire(true);
+        } else try self.host.freeChecked(ctx);
+        self.* = .{};
+    }
+
+    /// Transfer failed waits/frees to the process owner without dropping its
+    /// primary retain, driver library, or independent host admission lease.
+    pub fn retire(self: *MappedHostBuffer, ctx: *context_mod.CudaContext) void {
+        const owner = self.owner orelse return;
+        const drained = ctx.ctx != null and ctx.driver.fns.cuCtxSetCurrent(ctx.ctx) == driver_mod.CUDA_SUCCESS and
+            ctx.driver.fns.cuStreamSynchronize(ctx.stream) == driver_mod.CUDA_SUCCESS;
+        owner.retire(drained);
+        self.* = .{};
     }
 };
 
@@ -356,4 +420,105 @@ test "CUDA quarantine pins primary lifetime across external final release and ha
     successor.releaseResources();
     try std.testing.expectEqual(@as(usize, 0), Mock.references);
     try std.testing.expectEqual(before.live, shared.snapshot().live);
+}
+
+test "Gemma4 CUDA host PLE mapped allocation waits for readers and retains failed frees" {
+    const Fake = struct {
+        var bytes: [64]u8 = undefined;
+        var waits: usize = 0;
+        var frees: usize = 0;
+        var fail_free: bool = false;
+        var fail_device: bool = false;
+        fn getCurrent(ptr: *driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            ptr.* = @ptrFromInt(1);
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn contextWait() callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn releasePrimary(_: driver_mod.CUdevice) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn alloc(ptr: *?*anyopaque, len: usize, flags: c_uint) callconv(.c) driver_mod.CUresult {
+            if (len != bytes.len or flags != 2) return 1;
+            ptr.* = &bytes;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn device(ptr: *driver_mod.CUdeviceptr, _: ?*anyopaque, flags: c_uint) callconv(.c) driver_mod.CUresult {
+            if (flags != 0 or fail_device) return 1;
+            ptr.* = 0x123456;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn wait(_: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            waits += 1;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn free(_: ?*anyopaque) callconv(.c) driver_mod.CUresult {
+            frees += 1;
+            return if (fail_free) 1 else driver_mod.CUDA_SUCCESS;
+        }
+    };
+    var ctx: context_mod.CudaContext = undefined;
+    ctx.ctx = @ptrFromInt(1);
+    ctx.stream = null;
+    ctx.stats = .{};
+    ctx.driver.fns.cuCtxSetCurrent = Fake.current;
+    ctx.driver.fns.cuMemHostAlloc = Fake.alloc;
+    ctx.driver.fns.cuMemHostGetDevicePointer = Fake.device;
+    ctx.driver.fns.cuMemFreeHost = Fake.free;
+    ctx.driver.fns.cuStreamSynchronize = Fake.wait;
+    Fake.waits = 0;
+    Fake.frees = 0;
+    Fake.fail_free = false;
+    var mapped = MappedHostBuffer{ .host = .{ .len = 64 } };
+    try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, Fake.alloc(&mapped.host.ptr, 64, 2));
+    try std.testing.expectEqual(driver_mod.CUDA_SUCCESS, Fake.device(&mapped.device_ptr, mapped.host.ptr, 0));
+    var view = mapped.view();
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x123456), view.ptr);
+    try std.testing.expect(view.borrowed and view.allocation_token == null);
+    view.free(&ctx);
+    try std.testing.expectEqual(@as(usize, 0), Fake.frees);
+    Fake.fail_free = true;
+    try std.testing.expectError(error.CudaDriverError, mapped.clear(&ctx));
+    try std.testing.expect(mapped.host.ptr != null and mapped.device_ptr != 0);
+    try std.testing.expectEqual(@as(usize, 1), Fake.waits);
+    Fake.fail_free = false;
+    try mapped.clear(&ctx);
+    try std.testing.expect(mapped.host.ptr == null and mapped.device_ptr == 0);
+    try std.testing.expectEqual(@as(usize, 2), Fake.waits);
+    try std.testing.expectEqual(@as(usize, 2), Fake.frees);
+    ctx.driver.fns.cuMemHostGetDevicePointer = null;
+    try std.testing.expectError(error.CudaSymbolMissing, MappedHostBuffer.alloc(&ctx, 64));
+    // A real allocation followed by a failed device-alias query must not
+    // drop ownership/admission when rollback's cuMemFreeHost also fails.
+    var controller = memory.AdmissionController{};
+    var queue = host_retirement.Queue{ .allocator = std.testing.allocator };
+    const owner = try std.testing.allocator.create(host_retirement.Owner);
+    owner.* = .{
+        .queue = &queue,
+        .driver = undefined,
+        .owns_library = false,
+        .primary = ctx.ctx,
+        .device = 0,
+        .bytes = 64,
+        .lease = try controller.tryAcquire(.gpu, .{}, .{ .host_weight_bytes = 64 }, false),
+    };
+    owner.driver.fns.cuCtxGetCurrent = Fake.getCurrent;
+    owner.driver.fns.cuCtxSetCurrent = Fake.current;
+    owner.driver.fns.cuCtxSynchronize = Fake.contextWait;
+    owner.driver.fns.cuMemFreeHost = Fake.free;
+    owner.driver.fns.cuDevicePrimaryCtxRelease = Fake.releasePrimary;
+    ctx.driver.fns.cuMemHostGetDevicePointer = Fake.device;
+    Fake.fail_device = true;
+    Fake.fail_free = true;
+    try std.testing.expectError(error.CudaDriverError, MappedHostBuffer.allocUsingOwner(&ctx, 64, owner));
+    try std.testing.expect(queue.head != null and queue.head.?.ptr != null);
+    try std.testing.expectEqual(@as(usize, 64), controller.snapshot().host_weight_bytes);
+    Fake.fail_free = false;
+    queue.retry();
+    try std.testing.expect(queue.head == null);
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
 }
