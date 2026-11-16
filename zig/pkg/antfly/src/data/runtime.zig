@@ -1950,6 +1950,15 @@ const RaftTableApplyStateMachine = struct {
         req: antfly.db.types.BatchRequest,
         storage_owner_descriptor: ?kernel_owner_descriptor.Descriptor,
     ) !void {
+        if (@import("antfly_local_sources").api_internal_batch.requiresCompletionProtocol(req)) {
+            if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+            const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
+            const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
+                error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
+                else => return err,
+            };
+            if (floor < @import("../common/data_raft_protocol.zig").batch_completion_admission_protocol_version) return error.UnsupportedBatchProtocolVersion;
+        }
         if (@import("builtin").is_test) {
             self.test_faults.document_apply_attempts += 1;
             if (self.test_faults.semantic_rejection_once) |rejection| {
@@ -43291,15 +43300,20 @@ fn consumerTests() type {
             const a = std.testing.allocator;
             const Catalog = struct {
                 fn snapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
-                    return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = @constCast(&[_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" }}), .ranges = @constCast(&[_]antfly.metadata.table_manager.RangeRecord{.{ .group_id = 601, .table_id = 7, .range_id = 601, .start_key = "", .end_key = null }}), .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+                    return .{ .status = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .metrics = .{} }, .tables = @constCast(&[_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" }}), .ranges = @constCast(&[_]antfly.metadata.table_manager.RangeRecord{.{ .group_id = 601, .table_id = 7, .range_id = 601, .start_key = "", .end_key = null }}), .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
                 }
                 fn free(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn routingSnapshot(ptr: *anyopaque, deadline: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+                    const result = try antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free).routingSnapshot(ptr, deadline);
+                    for (result.tables) |*table| table.routing_storage_binding = @import("antfly_local_sources").common_topology_records.tableStorageBinding(table.*);
+                    return result;
+                }
                 fn tableSnapshot(ptr: *anyopaque, _: []const u8, deadline: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
-                    return antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free).routingSnapshot(ptr, deadline);
+                    return routingSnapshot(ptr, deadline);
                 }
                 fn iface(ptr: *anyopaque) antfly.public_api.table_catalog.CatalogSource {
                     const Adapter = antfly.public_api.table_catalog.TestAdminRoutingAdapter(snapshot, free);
-                    return .{ .ptr = ptr, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = free, .routing_snapshot = Adapter.routingSnapshot, .table_routing_snapshot = tableSnapshot, .linearizable_table_routing_snapshot = tableSnapshot, .linearizable_routing_snapshot = Adapter.linearizableSnapshot, .free_routing_snapshot = Adapter.freeRoutingSnapshot } };
+                    return .{ .ptr = ptr, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = free, .routing_snapshot = routingSnapshot, .table_routing_snapshot = tableSnapshot, .linearizable_table_routing_snapshot = tableSnapshot, .linearizable_routing_snapshot = routingSnapshot, .free_routing_snapshot = Adapter.freeRoutingSnapshot } };
                 }
             };
             var tmp = std.testing.tmpDir(.{});
@@ -43346,8 +43360,19 @@ fn consumerTests() type {
             try host.campaignGroup(601);
             _ = try host.runProgressRoundBounded(64, 64);
             try std.testing.expect(host.isLocalLeader(601));
+            const DiagnosticTransport = struct {
+                fn execute(_: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    return error.UnexpectedRemoteRaftRequest;
+                }
+            };
+            var transport_context: u8 = 0;
+            var transport_stack = try antfly.raft.transport.HttpTransportStack.init(a, .{
+                .snapshot = .{ .root_dir = root },
+            }, .{ .ptr = &transport_context, .vtable = &.{ .execute = DiagnosticTransport.execute } }, std.testing.io, null);
+            defer transport_stack.deinit();
             var http: antfly.raft.HttpHost = undefined;
             http.host = &host;
+            http.transport_stack = &transport_stack;
             var managed: antfly.raft.ManagedHttpHostService = undefined;
             managed.metrics = .{};
             managed.host.http_host = &http;
@@ -43356,7 +43381,7 @@ fn consumerTests() type {
             managed.host.owned_file_replica_provider = null;
             const server = try a.create(DataServer);
             defer a.destroy(server);
-            server.* = .{ .alloc = a, .data_raft = &managed, .data_raft_apply = &sm, .backend_runtime = runtime.ptr(), .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a), .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier()), .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, catalog), .status_source = undefined, .api_server_cfg = .{}, .query_async_limit = .nothing, .listener_cfg = undefined };
+            server.* = .{ .alloc = a, .data_raft = &managed, .data_raft_apply = &sm, .kernel_owner_source = &owner, .backend_runtime = runtime.ptr(), .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a), .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier()), .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, catalog), .status_source = undefined, .api_server_cfg = .{}, .query_async_limit = .nothing, .listener_cfg = undefined };
             defer server.provisioned_storage.deinit();
             defer {
                 var it = server.data_raft_protocol_activations.valueIterator();
@@ -43813,6 +43838,36 @@ fn consumerTests() type {
                     try std.testing.expectEqual(feed_control.Phase.deleted, deleted.value.phase);
                     try std.testing.expect(deleted.value.roots[0].released);
                 }
+                // Qualify actual protocol-31 admission, native apply and a
+                // positive immutable completion receipt over signed HTTP.
+                const completion_contract = resolution_operations.wire.completion;
+                var completion_descriptor = try owner.loadCompletionDescriptor(a, 601, "docs", .{});
+                defer completion_descriptor.deinit(a);
+                const current_owner = try @import("../api/completion_owner_admission.zig").capture(a, catalog, "docs", route.fence().?, completion_descriptor.view(), .{});
+                const txn_id: [16]u8 = @splat(95);
+                const prepare: antfly.db.types.BatchRequest = .{ .timestamp_ns = 1000, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = current_owner.topology_epoch, .completion_owner = current_owner } }, .writes = &.{.{ .key = "completion-row", .value = "{\"done\":true}" }} };
+                const prepare_bytes = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(a, prepare);
+                defer a.free(prepare_bytes);
+                const locator = try @import("antfly_local_sources").api_local_transaction_contract.participantIdForGroupScoped(a, "docs", 601, null, null);
+                defer a.free(locator);
+                const participants = [_]completion_contract.Participant{.{ .namespace = namespace, .owner_fence = current_owner.digest(), .roles = completion_contract.Roles.effects, .locator = locator, .input_digest = completion_contract.preparedInputDigest(namespace, prepare_bytes) }};
+                const plan: completion_contract.Admission = .{ .version = 2, .transaction_id = txn_id, .admission_digest = @splat(96), .coordinator_namespace = namespace, .coordinator_fence = current_owner.digest(), .participants = &participants };
+                const encoded_plan = try completion_contract.encodeAdmission(a, plan);
+                defer a.free(encoded_plan);
+                const begin: antfly.db.types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .begin = .{ .txn_id = txn_id, .begin_timestamp = 1000, .created_at_ns = platform_time.realtimeNs(), .topology_epoch = current_owner.topology_epoch, .retain_terminal = true, .participants = &.{locator}, .completion_admission = encoded_plan, .completion_owner = current_owner } } };
+                for ([_]antfly.db.types.BatchRequest{ begin, prepare, .{ .sync_level = .write, .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = .committed, .commit_version = 1001 } } } }) |command| {
+                    try server.proposeRaftBatchGroupWithLeaderWait(a, 601, "docs", command, .{ .discovery = .cached, .write_route_fence = route.fence(), .admission_deadline_ns = server.dataRaftMonotonicNs() + 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
+                }
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_admission_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                const positive_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = txn_id, .owner_fence = current_owner.digest(), .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const positive = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
+                try positive.validate(positive_input.binding());
+                try std.testing.expect(positive.resolution != null);
+                try std.testing.expect(positive.resolution.?.outcome.effects.sequence > 0);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const positive_retry = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
+                try std.testing.expectEqualDeep(positive.resolution, positive_retry.resolution);
             }
             const rejected = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 99 } });
             try std.testing.expectEqual(.checkpoint_conflict, rejected.outcome.?.rejected);
@@ -43897,13 +43952,17 @@ fn consumerTests() type {
             const version = @import("../common/data_raft_protocol.zig");
             const request: antfly.db.types.BatchRequest = .{ .transaction = .{ .begin = .{ .txn_id = @splat(1), .begin_timestamp = 1, .created_at_ns = 2, .topology_epoch = 3, .participants = &.{"table2:4:docs:group:7"}, .completion_admission = "reserved" } } };
             try std.testing.expectEqual(version.batch_completion_admission_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
-            try std.testing.expect(version.batch_completion_admission_protocol_version > version.batch_protocol_version);
-            try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, data_raft_batch.encode(std.testing.allocator, "docs", request));
+            try std.testing.expect(version.batch_completion_admission_protocol_version <= version.batch_protocol_version);
+            try std.testing.expectError(error.InvalidBatchRequest, data_raft_batch.encode(std.testing.allocator, "docs", request));
             const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
             const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 7, .topology_epoch = 3 };
             const prepare: antfly.db.types.BatchRequest = .{ .timestamp_ns = 10, .document_version_scheme = .revision_v1, .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 3, .completion_owner = owner } } };
             try std.testing.expectEqual(version.batch_completion_admission_protocol_version, DataServer.requiredRaftBatchProtocolVersion(prepare));
-            try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, data_raft_batch.encode(std.testing.allocator, "docs", prepare));
+            const encoded = try data_raft_batch.encode(std.testing.allocator, "docs", prepare);
+            defer std.testing.allocator.free(encoded);
+            var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
+            defer decoded.deinit(std.testing.allocator);
+            try std.testing.expectEqualDeep(owner, decoded.batch.req.transaction.?.prepare.completion_owner.?);
             const raw = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(std.testing.allocator, prepare);
             defer std.testing.allocator.free(raw);
             const normalized = try DataServer.raftBatchRequestForActiveProtocol(prepare, version.batch_completion_admission_protocol_version, 9999);

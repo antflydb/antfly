@@ -40,9 +40,9 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 30;
-/// Reserved until frozen BEGIN, PREPARE input/owner validation and every
-/// applying-member activation are fully wired. The current ceiling stays 30.
+pub const batch_protocol_version: u16 = 31;
+/// Frozen completion BEGIN and owner/input-fenced PREPARE require durable
+/// activation across every applying member before proposal or native apply.
 pub const batch_completion_admission_protocol_version: u16 = 31;
 /// Dedicated retained-history control entries require native ordered dispatch
 /// and a durable all-applying-member activation barrier.

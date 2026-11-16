@@ -2503,6 +2503,46 @@ as well as native prepare/retry/reopen/commit. Protocol 31 remains reserved and
 BEGIN dispatch disabled until actual activation/native/network qualification.
 All full issue acceptance requirements remain in scope.
 
+## In progress: actual protocol-31 completion apply qualification
+
+The working implementation raises the native serving decoder ceiling to 31,
+adds floor checks to both the raw retained fold and native document apply, and
+dispatches owner-fenced v2 BEGIN into the atomic native admission method. The
+server validates the original complete participant order, actual local locator,
+owner group and unsupported mixed/restore inputs before dispatch. API-only
+profiles remain below the native history floor. Native owner ABI is now 97 so
+pre-activation owner binaries cannot silently share this capability.
+
+The real Raft fixture now captures a current opaque table binding and owner,
+freezes PREPARE timestamp/revision/input, submits BEGIN/PREPARE/commit through
+the actual proposal path, checks durable activation, and fetches/retries a
+positive immutable effects receipt through signed HTTP from a caller with no
+replica. This qualifies the private single-root path; it does not advertise a
+public distributed completion guarantee.
+
+ABI 97 qualification passed the compiled owner receipt/reopen scope. After
+fixing the real-Raft fixture to share its existing storage owner and initialize
+its diagnostic transport, `history-control-apply-test history-retained-rpc-test`
+finished with exit 0: six real-Raft tests and fifteen signed HTTP tests passed
+(`completion-activation-test.log`). The positive path submits BEGIN, PREPARE and
+commit through the general proposer and retries the immutable receipt remotely.
+Source catalog generation completed before the ABI-only bump.
+
+Completion BEGIN now uses a closed set of allowed request fields. Unrelated
+private mutation fields must retain their defaults, including fields added in
+future revisions; authorization and schema admission context remain allowed.
+The codec and storage dispatch both enforce this constraint. The focused wire
+and real-Raft regression run completed with exit 0 in
+`completion-begin-closed-set-test.log`: the local wire suite, runtime discovery
+suite and all six real-Raft tests passed. The validator checks empty slice
+lengths, preserving decoded empty arrays without comparing allocator addresses.
+Terminal resolution/recovery owner fencing, mixed-member rejection and original
+root retention still need explicit audit/qualification before this activation
+stage can be considered complete. A positive single-root happy-path receipt
+cannot prove cross-root completion or topology recovery. Complete certificate
+publication, production source/coordinator wiring and all public feed/bootstrap/
+retention/pgoutput/existing-client requirements remain mandatory.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

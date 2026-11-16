@@ -2458,6 +2458,10 @@ pub const RaftApplyStore = struct {
             try operations.append(alloc, .{ .set_raft_batch_protocol = version });
             return;
         }
+        if (@import("antfly_local_sources").api_internal_batch.requiresCompletionProtocol(decoded.batch.req)) {
+            if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
+            try operations.append(alloc, .{ .require_batch_protocol = @import("../../common/data_raft_protocol.zig").batch_completion_admission_protocol_version });
+        }
         const native_transfer = decoded.batch.req.restore_staging != null or
             (if (decoded.batch.req.merge_page) |page| page.source.integrity != null else false) or
             (if (decoded.batch.req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| source.integrity != null else false else false);

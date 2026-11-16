@@ -74,9 +74,6 @@ pub fn applyReplicatedTransactionMutationInternal(
     if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
     switch (mutation) {
         .begin => |begin| {
-            // Never discard a frozen plan through the legacy BEGIN handler.
-            // Durable completion admission is activated separately.
-            if (begin.completion_admission != null) return error.ChangefeedCapabilityUnsupported;
             const local_participant = try local_transaction_contract.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
             defer alloc.free(local_participant);
             if (begin.participants.len == 0) return error.InvalidBatchRequest;
@@ -90,6 +87,20 @@ pub fn applyReplicatedTransactionMutationInternal(
                 if (std.mem.eql(u8, participant, local_participant)) local_present = true;
             }
             if (!local_present) return error.InvalidBatchRequest;
+            if (begin.completion_admission) |raw| {
+                try @import("antfly_local_sources").api_internal_batch.validateCompletionBeginRequest(req);
+                const entry = raft_entry orelse return error.ChangefeedCapabilityUnsupported;
+                const binding = begin.completion_owner orelse return error.InvalidHistoryAdmission;
+                if (binding.group_id != group_id) return error.TopologyChanged;
+                try @import("antfly_local_sources").api_internal_batch.validateCompletionBegin(alloc, raw, begin.txn_id, begin.participants, binding, begin.topology_epoch);
+                const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
+                var plan = try completion.parseAdmission(alloc, raw);
+                defer plan.deinit();
+                const member = try plan.value.admission.member(binding.namespace);
+                if (!std.mem.eql(u8, member.locator, local_participant)) return error.InvalidParticipant;
+                _ = try db.beginReplicatedCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, begin.retain_terminal, entry);
+                return;
+            }
             const coordinator = std.mem.eql(u8, begin.participants[0], local_participant);
             const local_only = [_][]const u8{local_participant};
             // Only the coordinator owns the full participant fan-out. A

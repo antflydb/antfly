@@ -2366,6 +2366,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
                 }
                 try writer.writeByte(']');
                 if (begin.completion_admission) |raw| {
+                    try validateCompletionBeginRequest(req);
                     try validateCompletionBegin(alloc, raw, begin.txn_id, begin.participants, begin.completion_owner, begin.topology_epoch);
                     try writer.print(",\"completion_admission\":{f}", .{std.json.fmt(raw, .{})});
                     if (begin.completion_owner) |owner| try writer.print(",\"completion_owner\":{f}", .{std.json.fmt(owner, .{})});
@@ -3780,10 +3781,32 @@ pub fn requireCompletionPrepareInput(a: std.mem.Allocator, plan: @import("../sto
     try plan.requirePreparedInput(namespace, encoded);
 }
 
+/// Completion BEGIN reserves a frozen plan; it cannot carry another mutation.
+/// New private fields fail closed until explicitly reviewed for this phase.
+pub fn validateCompletionBeginRequest(req: db_mod.types.BatchRequest) !void {
+    const defaults: db_mod.types.BatchRequest = .{};
+    inline for (comptime std.meta.fieldNames(db_mod.types.BatchRequest)) |name| {
+        if (comptime std.mem.eql(u8, name, "transaction") or
+            std.mem.eql(u8, name, "timestamp_ns") or
+            std.mem.eql(u8, name, "document_version_scheme") or
+            std.mem.eql(u8, name, "sync_level") or
+            std.mem.eql(u8, name, "schema_version") or
+            std.mem.eql(u8, name, "row_policy_principal_proof") or
+            std.mem.eql(u8, name, "row_policy_database") or
+            std.mem.eql(u8, name, "row_policy_admitted_at_seconds") or
+            std.mem.eql(u8, name, "row_policy_install_bundle")) continue;
+        const field = @field(req, name);
+        if (comptime @typeInfo(@TypeOf(field)) == .pointer and @typeInfo(@TypeOf(field)).pointer.size == .slice) {
+            // Decoding owns empty arrays; their addresses are not mutations.
+            if (field.len != 0) return error.InvalidBatchRequest;
+        } else if (!std.meta.eql(field, @field(defaults, name))) return error.InvalidBatchRequest;
+    }
+}
+
 /// A completion BEGIN freezes the same complete participant set at every root.
 /// Recovery order is coordinator first, then canonical namespace order excluding
 /// the coordinator. Unknown phases cannot downgrade to legacy admission.
-fn validateCompletionBegin(a: std.mem.Allocator, raw: []const u8, id: [16]u8, participants: []const []const u8, owner: ?@import("../storage/transaction_completion.zig").RoutedOwner, topology_epoch: u64) !void {
+pub fn validateCompletionBegin(a: std.mem.Allocator, raw: []const u8, id: [16]u8, participants: []const []const u8, owner: ?@import("../storage/transaction_completion.zig").RoutedOwner, topology_epoch: u64) !void {
     const completion = @import("../storage/transaction_completion.zig");
     var plan = completion.parseAdmission(a, raw) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBatchRequest;
     defer plan.deinit();
@@ -3933,4 +3956,17 @@ test "completion begin wire prepare owner survives guarded replay and refuses le
     request.document_version_scheme = .revision_v1;
     request.transaction.?.prepare.topology_epoch += 1;
     try std.testing.expectError(error.InvalidBatchRequest, completionPrepareInput(a, request));
+}
+
+test "completion begin wire rejects unrelated private mutations" {
+    try validateCompletionBeginRequest(.{});
+    const empty = try std.testing.allocator.alloc(db_mod.types.BatchWrite, 0);
+    defer std.testing.allocator.free(empty);
+    try validateCompletionBeginRequest(.{ .writes = empty });
+    try validateCompletionBeginRequest(.{ .timestamp_ns = 10, .document_version_scheme = .revision_v1, .schema_version = 2 });
+    try std.testing.expectError(error.InvalidBatchRequest, validateCompletionBeginRequest(.{ .activate_range_tracking = true }));
+    try std.testing.expectError(error.InvalidBatchRequest, validateCompletionBeginRequest(.{ .restore_staging_plan_id = @splat(1) }));
+    try std.testing.expectError(error.InvalidBatchRequest, validateCompletionBeginRequest(.{ .graph_endpoint_cleanup = true }));
+    try std.testing.expectError(error.InvalidBatchRequest, validateCompletionBeginRequest(.{ .relational_repair = true }));
+    try std.testing.expectError(error.InvalidBatchRequest, validateCompletionBeginRequest(.{ .deletes = &.{"row"} }));
 }
