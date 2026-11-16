@@ -3006,3 +3006,65 @@ skips or leaks. This includes actual signed HTTP BEGIN/PREPARE/RESOLVE and
 certificate publication, the local publication port, immutable recovery reads,
 clock-preserving signing at simulated time, malformed-response unknown outcomes
 and both migration auth boundaries. Formatting and diff checks passed.
+
+## In progress: native admission qualification and current-owner capture
+
+A catalog descriptor alone cannot qualify completion admission: native BEGIN
+also requires the actual physical namespace/root generation, writable Raft
+authority and initialized committed-history state. The new private
+`history_admission_wire.zig` query carries the original owner and positive
+minimum native index; its bounded, request-bound reply reports the actual
+persisted cut and the retention policy's total ceiling. It does not reserve
+capacity, initialize history, create a consumer, cast a vote or authorize a
+source checkpoint. No invented transaction or consumer identity is used.
+
+`DB.historyAdmission` checks physical generation and namespace, persisted
+identity, Raft authority, history state and the ordered marker in one read
+transaction. Closed, read-only, hidden, restore-staged and async-mirrored owners
+cannot qualify. Uninitialized history fails explicitly before BEGIN rather than
+being inferred from a group projection watermark. The compiled owner operation
+uses a 4096-byte strict JSON codec with native ABI 102 and engine descriptor 47.
+
+`ProvisionedKernelOwnerSource.captureCompletionOwnerRouted` captures the current
+owner from authoritative metadata and descriptor, requires the caller's frozen
+table binding, and qualifies the actual acquired owner under the existing
+leader ReadIndex/frozen proof and before/after catalog/owner checks. It retains
+one original deadline and both cancellation scopes. Sparse native cuts remain
+separate from group progress; a protocol barrier need not invent a native write.
+
+The actual-Raft fixture now uses this qualified owner to freeze its plan before
+signed HTTP BEGIN/PREPARE/RESOLVE. It checks changed binding and expired caller
+scope, and captures again after an idle barrier, requiring the same owner and
+actual native cut. The compiled owner fixture covers an uninitialized root,
+positive qualification, retry/reopen, lagging requested cut, wrong physical root
+or namespace, malformed query and invalid ABI.
+
+`completion-admission-wire-test.log` completed with exit 0: all seven pure wire
+and completion contract tests passed. Source/control catalog generation and
+formatting/diff checks passed. Native/real-Raft qualification results are
+recorded below. The first attempt stopped
+before compilation because pruned object output left a cached configure-script
+path; local manifests/build configuration metadata were invalidated before the
+rebuild. Current worktree caches and immutable dependency fixtures are preserved.
+
+This adds the native/source capture prerequisite. Remote owner capture still
+needs its spec-first signed HTTP interface, and the normal application/source
+coordinator is still on the legacy path. Initialization/configuration of a
+previously unconfigured history root, global source-head admission, full
+coordinator recovery, retention/GC, public feeds, coherent bootstrap and actual
+CDC-client qualification remain required by the full objective.
+
+The first native qualification run passed all nine real-Raft cases, but its
+compiled-owner negative test found that `ChangefeedCapabilityUnsupported` lacked
+an exact private status mapping and became `StorageKernelFailure`. Status 929
+was appended for this error without renumbering any published identity. The
+exhaustive inverse/uniqueness audit in `completion-admission-status-test.log`
+passed all 15 tests. Engine-error and source/control catalog generation passed.
+
+`completion-admission-status-qualified-test.log` completed with exit 0: the
+compiled ABI-102 owner case and all nine real-Raft cases passed, with no failures,
+skips or leaks. Positive capture, idle sparse cuts, binding/expiry rejection,
+uninitialized history, physical scope and minimum-cut rejection, retry/reopen,
+malformed input and invalid ABI are qualified by this run. Formatting and diff
+checks passed. The result remains an observation of preconditions, not a quota
+reservation or a global completion decision.

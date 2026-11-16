@@ -44067,13 +44067,31 @@ fn consumerTests() type {
                 // positive immutable completion receipt over signed HTTP.
                 const completion_contract = resolution_operations.wire.completion;
                 const CompletionAdmissionFixture = struct {
+                    noinline fn capture(fixture_alloc: std.mem.Allocator, fixture_owner: *antfly.public_api.ProvisionedKernelOwnerSource, fence: antfly.metadata_api.CatalogRouteFence, expected_binding: [32]u8) !antfly.public_api.ProvisionedKernelOwnerSource.CapturedCompletionOwner {
+                        const capture_context: antfly.public_api.operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s };
+                        return qualified: while (true) {
+                            try capture_context.ensureActive();
+                            break :qualified fixture_owner.captureCompletionOwnerRouted(fixture_alloc, fence, "docs", expected_binding, capture_context) catch |err| switch (err) {
+                                error.ReadUnavailable, error.StorageReadTemporarilyUnavailable => {
+                                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                                    continue;
+                                },
+                                else => return err,
+                            };
+                        };
+                    }
                     // Keep the large private batch temporaries off the parent
                     // HTTP/Raft fixture's already large stack frame.
-                    noinline fn run(fixture_alloc: std.mem.Allocator, fixture_server: *DataServer, fixture_owner: *antfly.public_api.ProvisionedKernelOwnerSource, fixture_catalog: antfly.public_api.table_catalog.CatalogSource, fence: antfly.metadata_api.CatalogRouteFence, fixture_namespace: [24]u8, fixture_origin: *DataServer, fixture_endpoint: []const u8, fixture_credential: []const u8) !@import("../api/completion_plan.zig").Plan {
+                    noinline fn run(fixture_alloc: std.mem.Allocator, fixture_owner: *antfly.public_api.ProvisionedKernelOwnerSource, fence: antfly.metadata_api.CatalogRouteFence, fixture_namespace: [24]u8, expected_binding: [32]u8, fixture_origin: *DataServer, fixture_endpoint: []const u8, fixture_credential: []const u8) !@import("../api/completion_plan.zig").Plan {
                         const fixture_completion = @import("../api/completion_plan.zig").completion;
-                        var completion_descriptor = try fixture_owner.loadCompletionDescriptor(fixture_alloc, 601, "docs", .{});
-                        defer completion_descriptor.deinit(fixture_alloc);
-                        const current_owner = try @import("../api/completion_owner_admission.zig").capture(fixture_alloc, fixture_catalog, "docs", fence, completion_descriptor.view(), .{});
+                        var changed_binding = expected_binding;
+                        changed_binding[0] ^= 1;
+                        try std.testing.expectError(error.TopologyChanged, fixture_owner.captureCompletionOwnerRouted(fixture_alloc, fence, "docs", changed_binding, .{}));
+                        try std.testing.expectError(error.DeadlineExceeded, fixture_owner.captureCompletionOwnerRouted(fixture_alloc, fence, "docs", expected_binding, .{ .deadline_ns = platform_time.monotonicNs() -| 1 }));
+                        const captured = try capture(fixture_alloc, fixture_owner, fence, expected_binding);
+                        const current_owner = captured.owner;
+                        try std.testing.expect(captured.observation.cut.term > 0 and captured.observation.cut.index > 0);
+                        try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024), captured.observation.retention_limit_bytes);
                         const txn_id: [16]u8 = @splat(95);
                         const prepare: antfly.db.types.BatchRequest = .{ .timestamp_ns = 1000, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = current_owner.topology_epoch, .completion_owner = current_owner } }, .writes = &.{.{ .key = "completion-row", .value = "{\"done\":true}" }} };
                         const prepare_bytes = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(fixture_alloc, prepare);
@@ -44084,7 +44102,6 @@ fn consumerTests() type {
                         errdefer frozen.deinit();
                         const plan = frozen.admission;
                         try plan.requirePreparedInput(fixture_namespace, prepare_bytes);
-                        _ = fixture_server;
                         var client = antfly.public_api.ApiHttpClient.init(fixture_alloc, try fixture_origin.distributedReadExecutor());
                         _ = client.withInternalServiceAuth(fixture_credential, "history-runtime");
                         var writer: @import("../api/completion_participant.zig").HttpWriter = .{ .client = &client, .base_uri = fixture_endpoint };
@@ -44095,7 +44112,7 @@ fn consumerTests() type {
                         return frozen;
                     }
                 };
-                var frozen = try CompletionAdmissionFixture.run(a, server, &owner, catalog, route.fence().?, namespace, origin, base, secret);
+                var frozen = try CompletionAdmissionFixture.run(a, &owner, route.fence().?, namespace, feed_control.tableBinding(feed_table), origin, base, secret);
                 defer frozen.deinit();
                 const plan = frozen.admission;
                 const current_owner = frozen.participants[0].owner;
@@ -44152,6 +44169,9 @@ fn consumerTests() type {
                 try observed_publication.validate(publication_query);
                 // Recovery must not manufacture a native write for a no-op.
                 try std.testing.expect(observed_publication.cut.index < idle_barrier_index);
+                const idle_owner = try CompletionAdmissionFixture.capture(a, &owner, route.fence().?, feed_control.tableBinding(feed_table));
+                try std.testing.expectEqualDeep(current_owner, idle_owner.owner);
+                try std.testing.expectEqualDeep(observed_publication.cut, idle_owner.observation.cut);
                 const idle_resolution = try server.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
                 try idle_resolution.validate(positive_input.binding());
                 try std.testing.expectEqualDeep(positive.resolution, idle_resolution.resolution);

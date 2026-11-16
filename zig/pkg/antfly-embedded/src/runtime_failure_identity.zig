@@ -31,6 +31,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .changefeed_capability_unsupported, .err = error.ChangefeedCapabilityUnsupported },
     .{ .status = .history_consumer_conflict, .err = error.HistoryConsumerConflict },
     .{ .status = .invalid_history_admission, .err = error.InvalidHistoryAdmission },
     .{ .status = .history_too_large, .err = error.HistoryTooLarge },

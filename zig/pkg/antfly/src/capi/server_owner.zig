@@ -4610,6 +4610,29 @@ pub fn storageOwnerHistoryGrant(
     return .ok;
 }
 
+pub fn storageOwnerHistoryAdmission(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const history = @import("antfly_local_sources").storage_history_admission_wire;
+    if (request.request_json.len > history.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const query = history.decodeQuery(handle.alloc, request.request_json.slice()) catch |err| return if (err == error.OutOfMemory) storageOwnerStatusFromError(err) else .invalid_argument;
+    const reply = handle.db.historyAdmission(query) catch |err| return storageOwnerStatusFromError(err);
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, reply, .{}) catch |err| return storageOwnerStatusFromError(err);
+    if (bytes.len > history.max_bytes) {
+        std.heap.c_allocator.free(bytes);
+        return storageOwnerStatusFromError(error.HistoryCorrupt);
+    }
+    out_response.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
 pub fn storageOwnerHistoryPublication(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,
