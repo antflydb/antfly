@@ -100823,7 +100823,9 @@ fn testSequentialManagedDenseBackfills(workers: bool) !void {
                 var result = try self.db.?.search(alloc, .{ .index_name = "A", .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } }, .limit = 1 });
                 defer result.deinit();
                 try std.testing.expectEqual(@as(usize, 1), result.hits.len);
-                sleepNs(2 * std.time.ns_per_ms);
+                // Keep B active beyond the two-second projection quiet
+                // interval so maintenance observes a genuinely busy backfill.
+                sleepNs(50 * std.time.ns_per_ms);
             }
             const vector = try alloc.alloc(f32, dims);
             @memset(vector, 0);
