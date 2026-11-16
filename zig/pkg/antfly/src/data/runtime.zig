@@ -44536,6 +44536,48 @@ fn consumerTests() type {
                     }
                     try std.testing.expectEqual(@as(usize, 2), late_fence.validations);
                 }
+                const HostedAdmission = struct {
+                    noinline fn run(alloc: std.mem.Allocator, endpoint_uri: []const u8, source_catalog: antfly.public_api.table_catalog.CatalogSource, executor: antfly.common.http.RequestExecutor, root_path: []const u8, credential: []const u8) !void {
+                        const Router = struct {
+                            uri: []const u8,
+                            fn localNode(_: *anyopaque) u64 {
+                                return 0;
+                            }
+                            fn localStatus(_: *anyopaque, _: u64) antfly.raft.host.HostedReplicaStatus {
+                                return .absent;
+                            }
+                            fn leader(_: *anyopaque, group: u64) ?u64 {
+                                return if (group == 601) 1 else null;
+                            }
+                            fn status(_: *anyopaque, _: u64, _: u64) antfly.raft.host.HostedReplicaStatus {
+                                return .active;
+                            }
+                            fn baseUri(ptr: *anyopaque, allocator: std.mem.Allocator, node: u64) !?[]u8 {
+                                if (node != 1) return null;
+                                return try allocator.dupe(u8, (@as(*@This(), @ptrCast(@alignCast(ptr)))).uri);
+                            }
+                            fn router(self: *@This()) @import("../api/table_router.zig").HostedGroupRouter {
+                                return .{ .ptr = self, .vtable = &.{ .local_node_id = localNode, .local_status = localStatus, .group_leader_node_id = leader, .node_status = status, .node_base_uri = baseUri } };
+                            }
+                        };
+                        var hosted_router: Router = .{ .uri = endpoint_uri };
+                        const cache_root = try std.fmt.allocPrint(alloc, "{s}/hosted-completion", .{root_path});
+                        defer alloc.free(cache_root);
+                        defer antfly.public_api.table_writes.closeHostedManagedDbCacheForRoot(cache_root);
+                        var hosted = antfly.public_api.table_writes.HostedProvisionedTableWriteSource.init(cache_root, source_catalog, hosted_router.router(), executor);
+                        _ = hosted.withInternalServiceAuth(credential, "history-runtime").withCompletionAdmission();
+                        const source = hosted.source();
+                        const input = [_]@import("../api/distributed_txn.zig").TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "hosted-completion", .value = "{\"v\":9}" }} }};
+                        const hosted_outcome = (try source.commitTransactionWithId(alloc, @splat(115), 3000, &input, .write)).?;
+                        try std.testing.expect(hosted_outcome == .committed);
+                        try std.testing.expect(!hosted_outcome.committed.propagation_pending);
+                        const retried = (try source.commitTransactionWithId(alloc, @splat(115), 3000, &input, .full_index)).?;
+                        try std.testing.expect(retried == .committed);
+                        try std.testing.expect(!retried.committed.propagation_pending);
+                        try std.testing.expect(!retried.committed.visibility_pending);
+                    }
+                };
+                try HostedAdmission.run(a, base, catalog, try origin.distributedReadExecutor(), root, secret);
             }
             const rejected = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 99 } });
             try std.testing.expectEqual(.checkpoint_conflict, rejected.outcome.?.rejected);

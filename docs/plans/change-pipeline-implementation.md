@@ -3463,3 +3463,42 @@ qualification requirements remain unproven. Hosted metadata writers and
 source-global admission are still outstanding. This removes the explicit
 non-write-sync rejection recorded in the preceding admission milestone; it does
 not complete either issue.
+
+### Metadata-hosted completion transport
+
+The production metadata CDC worker now enables completion admission on its
+HostedProvisionedTableWriteSource. A synchronous hosted transport supplies the
+same owner, retained-decision, resolution, publication and canonical participant
+ports used by the provisioned Raft coordinator. Readers use the existing strict,
+bounded signed history RPCs; mutations use the existing signed routed-batch
+writer with exactly one attempt. The adapter's stack lifetime ends with the
+synchronous commit; retained native state and DataServer maintenance own later
+recovery. Physical-only legacy adapters can retain their original callback set.
+
+Endpoint selection requires an explicit known leader and active local/remote
+replica eligibility. It resolves that leader's endpoint within the request's
+original clock/cancellation budget, then rechecks leadership and eligibility
+before dispatch. Unknown/ineligible leadership, a changed leader during lookup,
+missing internal service credentials, and cancellation fail conservatively;
+there is no placement fallback or mutation rediscovery/replay. An authenticated
+unsupported response from every root can still select the coordinator's legacy
+path. Missing credentials or leader evidence cannot establish unsupported
+history capability.
+
+Qualification: `hosted-completion-admission-test2.log`,
+`ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build history-control-apply-test -j2`
+with loopback networking enabled, passed all 12 cases with no skips or leaks.
+The actual native Raft HTTP fixture now uses a replica-less hosted adapter's
+TableWriteSource stable-ID commit callback, authenticates every private RPC,
+commits its ordinary transaction, and retries with full-index visibility without
+propagation/visibility debt. Endpoint tests verify unknown/inactive leaders,
+lookup-time leadership changes, missing credentials and cancellation without
+arbitrary endpoint fallback; allocated rejected endpoints are released. A first
+compile found only a fixture-local shadowed variable, corrected before this
+successful run. Formatting, license and diff checks passed.
+
+This connects ordinary hosted commits to retained completion. It does not make
+the full CDC source transaction contract complete: source-global admission,
+checkpoint/head anchors, root-policy activation and its rollout, retention
+obligation release, public feeds, bootstrap, destination-specific integration,
+pgoutput factory wiring and existing-client qualification remain outstanding.

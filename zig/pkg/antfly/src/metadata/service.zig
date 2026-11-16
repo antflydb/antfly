@@ -13645,6 +13645,7 @@ pub const MetadataHttpService = struct {
             cdc_group_router.router(),
             self.raft.host.http_host.request_executor,
         );
+        _ = hosted_write_source.withCompletionAdmission();
         _ = hosted_write_source.withBackendRuntime(runtime);
         _ = hosted_write_source.withSecretStore(self.secret_store);
         _ = hosted_write_source.withInternalServiceAuth(

@@ -25167,6 +25167,9 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
     };
 
+    /// Production metadata writers enable the signed retained-history path.
+    /// Physical-only adapters may expose just the legacy local callback set.
+    completion_admission: bool = false,
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     router: table_router.HostedGroupRouter,
@@ -25199,6 +25202,11 @@ pub const HostedProvisionedTableWriteSource = struct {
             .router = router,
             .executor = executor,
         };
+    }
+
+    pub fn withCompletionAdmission(self: *HostedProvisionedTableWriteSource) *HostedProvisionedTableWriteSource {
+        self.completion_admission = true;
+        return self;
     }
 
     pub fn withBackendRuntime(self: *HostedProvisionedTableWriteSource, backend_runtime: *db_mod.background_runtime.BackendRuntime) *HostedProvisionedTableWriteSource {
@@ -26507,6 +26515,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
         _ = worker_impl.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        var completion_transport: @import("hosted_completion.zig").Hosted = .{ .catalog = self.catalog, .router = self.router, .executor = self.executor, .secret = self.internal_service_secret, .issuer = self.internal_service_issuer };
         const commit_version = begin_timestamp + 1;
         return try distributed_txn.executeMultiTableCommitWithOptions(
             alloc,
@@ -26519,6 +26528,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             sync_level,
             if (comptime build_options.with_tla) tracing.stderrAntflyTraceWriter() else null,
             .{
+                .completion = if (self.completion_admission) completion_transport.coordinator() else null,
+                .completion_context = .{ .cancellation = cancellation },
                 .retain_terminal = retain_terminal,
                 .report_post_commit_failure = false,
                 .fanout_io = if (self.backend_runtime) |runtime| runtime.apiIo() else null,
