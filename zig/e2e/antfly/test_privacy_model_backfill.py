@@ -280,7 +280,11 @@ def test_protected_model_backfill_batches(
             api._server.restart()
             cpu_before = cpu_seconds()
             report["server_cpu_scope"] = "post-restart"
-            assert behavior["model_held"].wait(timeout=20)
+            # A killed worker's durable producer lease remains fenced until
+            # its 30-second TTL expires. Recovery of already published vectors
+            # must not wait for a replacement producer to reach inference.
+            # All new B responses remain gated throughout this proof; the
+            # completion check below separately requires resumed production.
 
             def recovered_publication():
                 status = api.get(f"/tables/{table}/indexes/b")["status"]
