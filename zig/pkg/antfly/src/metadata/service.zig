@@ -3685,7 +3685,7 @@ fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16
         },
         else => {},
     }
-    if (command == .apply_source_control) return metadata_topology_protocol.source_control_version;
+    if (command == .apply_source_control) return @import("source_control.zig").requiredProtocolEncoded(command.apply_source_control);
     if (command == .apply_changefeed_control) return metadata_topology_protocol.changefeed_control_version;
     if (command == .apply_transaction_sessions) return metadata_topology_protocol.transaction_sessions_version;
     if (command == .apply_system_catalog) {
@@ -23950,7 +23950,18 @@ test "selected owner readiness transition index cancels while observations are l
 }
 
 test "source control requires its coordinated decoder floor before metadata proposal" {
-    try std.testing.expectEqual(metadata_topology_protocol.source_control_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_source_control = "{}" }));
+    const contract = @import("source_control.zig");
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(@import("source_artifact_control.zig").protocol_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_source_control = "{}" }));
+    const scope: contract.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
+    var write: contract.Write = .{ .table_id = 7, .source_id = scope.source_id, .expected_revision = 0, .expected_binding = scope.identity(), .expected_catalog_digest = @splat(5), .mutation = .{ .configure = scope } };
+    const legacy = try contract.encodeWrite(a, write);
+    defer a.free(legacy);
+    try std.testing.expectEqual(contract.protocol_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_source_control = legacy }));
+    write.mutation = .{ .seal_artifact = .{ .reservation_digest = @splat(6), .stamp = @splat(7) } };
+    const artifact = try contract.encodeWrite(a, write);
+    defer a.free(artifact);
+    try std.testing.expectEqual(contract.artifact_control.protocol_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_source_control = artifact }));
 }
 
 test "changefeed control requires its coordinated decoder floor before metadata proposal" {

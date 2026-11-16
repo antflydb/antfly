@@ -34,7 +34,18 @@ pub const Plan = struct {
     digest: control.Digest,
     transaction_id: [16]u8,
     manifest: []const u8,
+    artifact: ?control.artifact_control.Spec = null,
 };
+pub const PlanOptions = struct { source_sequence: u64, upload_token: u64, source_purpose: control.Digest };
+fn AdapterType(comptime T: type) type {
+    return if (@typeInfo(T) == .pointer) @typeInfo(T).pointer.child else T;
+}
+fn requireArtifactAdapter(adapter: anytype, state: control.State) !void {
+    if (state.artifact_control != null and !@hasDecl(AdapterType(@TypeOf(adapter)), "sealArtifact")) return error.UnsupportedOperation;
+}
+fn options(state: control.State, sequence: u64, purpose: control.Digest) !PlanOptions {
+    return .{ .source_sequence = sequence, .source_purpose = purpose, .upload_token = std.math.add(u64, if (state.artifact_control) |ledger| ledger.next_token else 0, 1) catch return error.SourceReceiptExpired };
+}
 pub const Replan = struct {
     plan: Plan,
     not_admitted_receipt: []const u8,
@@ -81,6 +92,40 @@ fn accept(svc: anytype, a: A, scope: control.Scope, catalog: control.Digest, sta
     } }, request);
 }
 
+fn refreshAfterRelease(svc: anytype, a: A, scope: control.Scope, state: *std.json.Parsed(control.State), request: anytype) !void {
+    if (state.value.artifact_control == null) return;
+    const accepted = state.value.accepted.reservation_digest;
+    var next = try load(svc, a, scope, request);
+    errdefer next.deinit();
+    if (!std.mem.eql(u8, &accepted, &next.value.accepted.reservation_digest)) return error.SourceControlConflict;
+    state.deinit();
+    state.* = next;
+}
+
+fn sealArtifact(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catalog: control.Digest, state: *std.json.Parsed(control.State), payload: anytype, request: anytype) !void {
+    const pending = state.value.pending orelse return error.SourcePendingWork;
+    if (pending.artifact == null) return;
+    const record = (state.value.artifact_control orelse return error.InvalidSourceControl).current orelse return error.SourcePendingWork;
+    const reservation = pending.identity(scope);
+    if (!std.mem.eql(u8, &record.reservation, &reservation)) return error.SourcePayloadConflict;
+    if (record.phase == .sealed) return;
+    if (record.phase != .reserved) return error.SourcePendingWork;
+    if (comptime @hasDecl(AdapterType(@TypeOf(adapter)), "sealArtifact")) {
+        try request.ensureActive();
+        const stamp: control.Digest = try adapter.sealArtifact(a, scope, pending, payload, request);
+        try request.ensureActive();
+        // Unknown sealing outcomes never authorize BEGIN in this pass.
+        try mutate(svc, a, scope, catalog, state.value, .{ .seal_artifact = .{ .reservation_digest = reservation, .stamp = stamp } }, request);
+        var next = try load(svc, a, scope, request);
+        errdefer next.deinit();
+        const confirmed = next.value.pending orelse return error.SourceOutcomeUnresolved;
+        const sealed = (next.value.artifact_control orelse return error.InvalidSourceControl).current orelse return error.SourceOutcomeUnresolved;
+        if (!std.mem.eql(u8, &confirmed.identity(scope), &reservation) or sealed.phase != .sealed or !std.mem.eql(u8, &sealed.stamp.?, &stamp)) return error.SourceOutcomeUnresolved;
+        state.deinit();
+        state.* = next;
+    } else return error.UnsupportedOperation;
+}
+
 /// Recovery needs no source rows if destination admission already happened.
 /// A failed release blocks the next reservation so its durable receipt cannot
 /// be overwritten while the destination still retains coordinator ACK debt.
@@ -92,6 +137,7 @@ pub fn recover(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catal
     var state = try load(svc, a, scope, request);
     errdefer state.deinit();
     if (state.value.scope == null) return state;
+    try requireArtifactAdapter(adapter, state.value);
     if (state.value.scope.?.source_ordinal != scope.source_ordinal) {
         // Ordinals locate catalog entries; relocating the same immutable source
         // must preserve its pending authority and both progress frontiers.
@@ -100,8 +146,10 @@ pub fn recover(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catal
         state.deinit();
         state = next;
     }
-    if (state.value.accepted.sequence != 0)
+    if (state.value.accepted.sequence != 0) {
         try adapter.release(a, scope, state.value.accepted.reference, request);
+        try refreshAfterRelease(svc, a, scope, &state, request);
+    }
     if (state.value.pending) |pending| {
         if (try adapter.resolve(arena.allocator(), scope, pending, request)) |result| {
             try accept(svc, a, scope, catalog, state.value, result, request);
@@ -110,6 +158,7 @@ pub fn recover(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catal
             state = next;
             if (!std.mem.eql(u8, &state.value.accepted.reservation_digest, &result.reservation_digest)) return error.SourceControlConflict;
             try adapter.release(a, scope, state.value.accepted.reference, request);
+            try refreshAfterRelease(svc, a, scope, &state, request);
         }
     }
     return state;
@@ -150,9 +199,14 @@ pub fn deliver(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catal
         // Validate the predecessor before asking the destination to plan.
         const previous: ?[]const u8 = if (state.value.accepted.sequence == 0) null else state.value.accepted.checkpoint;
         if (!equalOptional(input.expected_checkpoint, previous)) return error.SourceCheckpointConflict;
-        const plan: Plan = try adapter.plan(scratch, scope, input, payload);
+        const sequence = std.math.add(u64, state.value.accepted.sequence, 1) catch return error.SourceReceiptExpired;
+        const plan: Plan = if (comptime @hasDecl(AdapterType(@TypeOf(adapter)), "planFrozen"))
+            try adapter.planFrozen(scratch, scope, input, payload, try options(state.value, sequence, try control.inputFingerprint(scope, .{ .source_sequence = sequence, .batch_id = input.batch_id, .checkpoint = input.checkpoint, .expected_checkpoint = input.expected_checkpoint, .payload_digest = input.payload_digest, .accepted_at_ns = input.accepted_at_ns })), request)
+        else
+            try adapter.plan(scratch, scope, input, payload);
+        if (plan.artifact != null and !@hasDecl(AdapterType(@TypeOf(adapter)), "sealArtifact")) return error.UnsupportedOperation;
         const reservation: control.Reservation = .{
-            .sequence = std.math.add(u64, state.value.accepted.sequence, 1) catch return error.SourceReceiptExpired,
+            .sequence = sequence,
             .batch_id = input.batch_id,
             .checkpoint = input.checkpoint,
             .expected_checkpoint = input.expected_checkpoint,
@@ -162,12 +216,16 @@ pub fn deliver(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catal
             .transaction_id = plan.transaction_id,
             .destination = scope.destination,
             .delivery_manifest = plan.manifest,
+            .artifact = plan.artifact,
         };
         try mutate(svc, a, scope, catalog, state.value, .{ .reserve = reservation }, request);
         const next = try load(svc, a, scope, request);
         state.deinit();
         state = next;
     }
+    const before_seal = state.value.pending orelse return error.SourceControlConflict;
+    if (!matches(input, .{ .batch_id = before_seal.batch_id, .checkpoint = before_seal.checkpoint, .expected_checkpoint = before_seal.expected_checkpoint, .payload_digest = before_seal.payload_digest })) return error.SourcePayloadConflict;
+    try sealArtifact(svc, adapter, a, scope, catalog, &state, payload, request);
     const pending = state.value.pending orelse return error.SourceControlConflict;
     if (!matches(input, .{
         .batch_id = pending.batch_id,
@@ -185,6 +243,7 @@ pub fn deliver(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catal
     state = next;
     if (!std.mem.eql(u8, &state.value.accepted.reservation_digest, &result.reservation_digest)) return error.SourceControlConflict;
     try adapter.release(a, scope, state.value.accepted.reference, request);
+    try refreshAfterRelease(svc, a, scope, &state, request);
     return state;
 }
 
@@ -199,6 +258,7 @@ pub fn replan(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catalo
     try adapter.validateScope(scope);
     var state = try load(svc, a, scope, request);
     errdefer state.deinit();
+    try requireArtifactAdapter(adapter, state.value);
     if (state.value.scope) |bound| if (bound.source_ordinal != scope.source_ordinal) {
         try mutate(svc, a, scope, catalog, state.value, .{ .configure = scope }, request);
         const next = try load(svc, a, scope, request);
@@ -207,6 +267,7 @@ pub fn replan(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catalo
     };
     if (state.value.accepted.sequence != 0) {
         try adapter.release(a, scope, state.value.accepted.reference, request);
+        try refreshAfterRelease(svc, a, scope, &state, request);
         if (state.value.pending == null and matches(input, try adapter.inspect(scratch, scope, state.value.accepted.reference))) return state;
     }
     const pending = state.value.pending orelse return error.SourcePendingWork;
@@ -223,12 +284,17 @@ pub fn replan(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catalo
         state.deinit();
         return next;
     }
-    const replacement: Replan = try adapter.replan(scratch, scope, pending, payload, request);
+    const replacement: Replan = if (comptime @hasDecl(AdapterType(@TypeOf(adapter)), "replanFrozen"))
+        try adapter.replanFrozen(scratch, scope, pending, payload, try options(state.value, pending.sequence, try pending.inputFingerprint(scope)), request)
+    else
+        try adapter.replan(scratch, scope, pending, payload, request);
+    if (replacement.plan.artifact != null and !@hasDecl(AdapterType(@TypeOf(adapter)), "sealArtifact")) return error.UnsupportedOperation;
     try mutate(svc, a, scope, catalog, state.value, .{ .replan = .{
         .reservation_digest = expected_reservation,
         .plan_digest = replacement.plan.digest,
         .transaction_id = replacement.plan.transaction_id,
         .delivery_manifest = replacement.plan.manifest,
+        .artifact = replacement.plan.artifact,
         .not_admitted_receipt = replacement.not_admitted_receipt,
     } }, request);
     const next = try load(svc, a, scope, request);
@@ -370,4 +436,157 @@ test "delivery recovers lost destination and metadata acknowledgments before rel
     try std.testing.expectEqual(@as(u32, 2), relocated.value.scope.?.source_ordinal);
     try std.testing.expectEqual(@as(u64, 2), relocated.value.committed.sequence);
     try std.testing.expectEqual(@as(usize, 2), adapter.admissions);
+}
+
+test "delivery recovers sealed source artifacts after a lost metadata reply without provider rows" {
+    const a = std.testing.allocator;
+    const Context = struct {
+        pub fn ensureActive(_: @This()) !void {}
+    };
+    const Service = struct {
+        a: A,
+        value: []u8,
+        metadata_group_id: u64 = 1,
+        lose_seal: bool = true,
+        lost: bool = false,
+        floor: u16 = 0,
+        pub fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: Context, version: u16) !void {
+            self.floor = @max(self.floor, version);
+        }
+        pub fn ensureLinearizableReadWithContext(_: *@This(), _: Context) !void {}
+        pub fn projectedStore(self: *@This()) ?*@This() {
+            return self;
+        }
+        pub fn getSourceControl(self: *@This(), allocator: A, _: u64, _: u64, _: control.Digest) ![]u8 {
+            return allocator.dupe(u8, self.value);
+        }
+        pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: anytype) !u64 {
+            var write = try control.parseWrite(self.a, command.apply_source_control);
+            defer write.deinit();
+            var before = try control.parse(self.a, self.value);
+            defer before.deinit();
+            if (write.value.expected_revision != before.value.revision) return error.SourceControlConflict;
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            const next = try write.value.mutation.apply(arena.allocator(), before.value);
+            const bytes = try control.encode(self.a, next);
+            self.a.free(self.value);
+            self.value = bytes;
+            self.lost = self.lose_seal and write.value.mutation == .seal_artifact;
+            if (self.lost) self.lose_seal = false;
+            return next.revision;
+        }
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: Context) !void {
+            if (self.lost) return error.TestLostSealReply;
+        }
+    };
+    const Storage = struct { bytes: ?[]u8 = null, receipt: ?[]u8 = null, uploads: usize = 0, admissions: usize = 0 };
+    const Adapter = struct {
+        backing: A,
+        svc: *Service,
+        storage: *Storage,
+        pub fn validateScope(_: *@This(), scope: control.Scope) !void {
+            try scope.validate();
+        }
+        pub fn planFrozen(_: *@This(), _: A, scope: control.Scope, _: Input, payload: []const u8, grant: PlanOptions, _: Context) !Plan {
+            try std.testing.expectEqual(@as(u64, 1), grant.source_sequence);
+            var attempt: [16]u8 = @splat(1);
+            std.mem.writeInt(u64, attempt[0..8], grant.upload_token, .big);
+            return .{ .digest = @splat(4), .transaction_id = @splat(5), .manifest = "original-frozen-owner", .artifact = .{ .namespace = @splat(9), .binding = scope.identity(), .domain = control.artifact_control.domainFor(scope.identity()), .attempt = attempt, .bytes = payload.len, .checksum = control.digest(payload), .plan_digest = @splat(11) } };
+        }
+        pub fn sealArtifact(self: *@This(), _: A, scope: control.Scope, pending: control.Reservation, payload: []const u8, request: Context) !control.Digest {
+            var journal = try load(self.svc, self.backing, scope, request);
+            defer journal.deinit();
+            const record = journal.value.artifact_control.?.current.?;
+            try std.testing.expectEqual(.reserved, record.phase);
+            try std.testing.expectEqual(pending.identity(scope), record.reservation);
+            try std.testing.expectEqual(@as(u64, payload.len), journal.value.artifact_control.?.chargedBytes());
+            try std.testing.expectEqual(record.spec.checksum, control.digest(payload));
+            self.storage.bytes = try self.backing.dupe(u8, payload);
+            self.storage.uploads += 1;
+            return @splat(13);
+        }
+        pub fn resolve(self: *@This(), allocator: A, scope: control.Scope, pending: control.Reservation, request: Context) !?Acceptance {
+            var journal = try load(self.svc, allocator, scope, request);
+            defer journal.deinit();
+            const record = journal.value.artifact_control.?.current orelse return error.SourcePendingWork;
+            if (record.phase == .reserved) return null;
+            // Recovery uses owned stored input, not another provider capture.
+            return try self.admit(allocator, scope, pending, self.storage.bytes.?, request);
+        }
+        pub fn admit(self: *@This(), _: A, scope: control.Scope, pending: control.Reservation, payload: []const u8, request: Context) !Acceptance {
+            var journal = try load(self.svc, self.backing, scope, request);
+            defer journal.deinit();
+            try std.testing.expectEqual(.sealed, journal.value.artifact_control.?.current.?.phase);
+            try std.testing.expectEqualSlices(u8, self.storage.bytes.?, payload);
+            try std.testing.expectEqual(@as(usize, 0), self.storage.admissions);
+            self.storage.admissions += 1;
+            self.storage.receipt = try std.json.Stringify.valueAlloc(self.backing, pending, .{});
+            return .{ .reservation_digest = pending.identity(scope), .receipt = self.storage.receipt.?, .commit_reference = "native-commit" };
+        }
+        pub fn release(self: *@This(), allocator: A, scope: control.Scope, receipt: []const u8, request: Context) !void {
+            var original = try std.json.parseFromSlice(control.Reservation, allocator, receipt, .{});
+            defer original.deinit();
+            const id = original.value.identity(scope);
+            var journal = try load(self.svc, allocator, scope, request);
+            defer journal.deinit();
+            if (journal.value.artifact_control.?.current == null) {
+                try std.testing.expectEqual(id, journal.value.artifact_control.?.last_reclaimed.?.reservation);
+                return;
+            }
+            try std.testing.expectEqual(id, journal.value.accepted.reservation_digest);
+            try mutate(self.svc, allocator, scope, @splat(9), journal.value, .{ .retire_artifact = .{ .reservation_digest = id, .proof = @splat(14), .reason = .committed } }, request);
+            const retired = try load(self.svc, allocator, scope, request);
+            journal.deinit();
+            journal = retired;
+            // Simulate a trusted fenced storage cleanup before returning quota.
+            self.backing.free(self.storage.bytes.?);
+            self.storage.bytes = null;
+            try mutate(self.svc, allocator, scope, @splat(9), journal.value, .{ .reclaim_artifact = .{ .reservation_digest = id, .proof = @splat(15) } }, request);
+        }
+        pub fn inspect(_: *@This(), allocator: A, _: control.Scope, receipt: []const u8) !ReceiptIdentity {
+            const value = try std.json.parseFromSliceLeaky(control.Reservation, allocator, receipt, .{});
+            return .{ .batch_id = value.batch_id, .checkpoint = value.checkpoint, .expected_checkpoint = value.expected_checkpoint, .payload_digest = value.payload_digest };
+        }
+    };
+    var svc: Service = .{ .a = a, .value = try control.encode(a, .{}) };
+    defer a.free(svc.value);
+    var storage: Storage = .{};
+    defer if (storage.bytes) |bytes| a.free(bytes);
+    defer if (storage.receipt) |receipt| a.free(receipt);
+    var adapter: Adapter = .{ .backing = a, .svc = &svc, .storage = &storage };
+    const scope: control.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(6) };
+    const payload: [128]u8 = @splat(1);
+    const input: Input = .{ .batch_id = "one", .checkpoint = "cp1", .payload_digest = control.digest(&payload), .accepted_at_ns = 123 };
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, deliver(&svc, &adapter, a, scope, @splat(9), input, &payload, Context{}));
+    try std.testing.expectEqual(@as(usize, 1), storage.uploads);
+    try std.testing.expectEqual(@as(usize, 0), storage.admissions);
+    try std.testing.expectEqual(control.artifact_control.protocol_version, svc.floor);
+    var pending = try load(&svc, a, scope, Context{});
+    defer pending.deinit();
+    try std.testing.expectEqual(.sealed, pending.value.artifact_control.?.current.?.phase);
+    try std.testing.expectEqual(@as(u64, 0), pending.value.accepted.sequence);
+    // Replace the worker while the separate storage owner retains the input.
+    var restarted: Adapter = .{ .backing = a, .svc = &svc, .storage = &storage };
+    var recovered = try recover(&svc, &restarted, a, scope, @splat(9), Context{});
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(u64, 1), recovered.value.committed.sequence);
+    try std.testing.expectEqual(@as(u64, 0), recovered.value.artifact_control.?.chargedBytes());
+    try std.testing.expect(!control.hasWork(recovered.value));
+    try std.testing.expectEqual(@as(usize, 1), storage.admissions);
+    try std.testing.expectEqual(@as(usize, 1), storage.uploads);
+    var duplicate = try deliver(&svc, &restarted, a, scope, @splat(9), input, &payload, Context{});
+    defer duplicate.deinit();
+    try std.testing.expectEqual(@as(usize, 1), storage.admissions);
+    const Legacy = struct {
+        pub fn validateScope(_: *@This(), _: control.Scope) !void {}
+        pub fn release(_: *@This(), _: A, _: control.Scope, _: []const u8, _: Context) !void {
+            return error.UnexpectedLegacyRelease;
+        }
+        pub fn resolve(_: *@This(), _: A, _: control.Scope, _: control.Reservation, _: Context) !?Acceptance {
+            return error.UnexpectedLegacyResolution;
+        }
+    };
+    var legacy: Legacy = .{};
+    try std.testing.expectError(error.UnsupportedOperation, recover(&svc, &legacy, a, scope, @splat(9), Context{}));
 }

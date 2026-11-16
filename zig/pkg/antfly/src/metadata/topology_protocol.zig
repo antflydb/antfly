@@ -131,7 +131,8 @@ const std = @import("std");
 /// Version 99 atomically settles accepted root controls with their metadata effects.
 /// Version 100 reconciles monotonic root effects without inventing command receipts.
 /// Version 101 records distinct retirement-fence attempts for unresolved controls.
-pub const current_version: u16 = 101;
+/// Version 102 reserves and seals quota for recoverable source-plan artifacts.
+pub const current_version: u16 = 102;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;

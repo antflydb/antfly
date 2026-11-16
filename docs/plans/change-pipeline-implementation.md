@@ -3791,3 +3791,62 @@ This supplies the artifact contract needed by the distributed source adapter.
 Persisting, pinning and reclaiming the artifact, binding its trusted reference
 into the source journal, source-global checkpoint integration, production worker
 wiring and every other outstanding requirement of the full goal remain required.
+
+### Source artifact reservation, sealing, and reclamation journal
+
+The existing source-control actor now owns bounded frozen-plan artifact debt.
+A source reserves one payload (up to the AFP1 envelope bound) before upload,
+seals a verified backend witness before destination admission, and keeps the
+charge through acceptance and authoritative commit. Retirement makes bytes
+eligible for cleanup; only a trusted fenced storage-reclamation proof returns
+quota. Monotonic upload tokens and a retained reclamation record prevent old
+proofs from releasing a newer allocation. Unsealed abandonment is a distinct
+metadata CAS that cannot win after sealing; sealed work requires positive
+destination rejection/fencing evidence before replanning.
+
+`source_artifact_control` is backend-neutral. Native backing must reuse native/
+Raft durability; it must not require an additional provider WAL or make cloud
+artifact storage mandatory for default native ingestion. Existing object-backed
+profiles may supply their own verified backend. The metadata journal treats
+backend evidence as trusted private adapter input, never a public proof. The
+actual storage adapter/physical proof verifier is not supplied by this change.
+
+Modern delivery planning receives the source sequence, next upload token and a
+logical input fingerprint. That fingerprint excludes destination manifests and
+artifact hashes, avoiding a circular identity when PREPARE carries the source
+purpose. Replanning preserves logical ownership while changing physical upload
+authority. Legacy reservation identities and JSON shapes remain unchanged when
+no artifact is used. Artifact commands require coordinated metadata floor 102;
+legacy source commands retain floor 90. Classification parses typed commands,
+including escaped field names, and rejects duplicate fields. No native ABI or
+public endpoint changes.
+
+The delivery coordinator reserves before calling the storage sealer, observes
+durable sealing before admission, and does not admit in the pass that loses a
+seal reply. It refreshes source state after release because cleanup changes the
+same journal. Unsupported adapters cannot consume an artifact-enabled scope.
+Artifact debt contributes to existing retention-work counters, preventing table
+retirement through commit until reclamation completes. Snapshot installation
+and reopening preserve that debt and upload authority. Reseeding the same
+destination preserves its negotiated contract; an explicit fully drained move
+to a different destination binding renegotiates capabilities, including Iceberg.
+
+Qualification: `source-artifact-journal-qualified-test.log`,
+`ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build source-control-test source-admission-test -j2`,
+completed successfully with all 41 reported metadata/native-adapter cases passing
+without skips or leaks. This covers actual metadata reopen/snapshot behavior,
+retention counters, coordinated decoder classification and existing native
+receipt/restart/transform regressions. `source-artifact-logical-identity-test.log`
+passed all 11 direct control/delivery cases after the final fingerprint helper
+change, including lost sealing replies, worker replacement without provider
+rows, quota lifecycle, proof replay, replanning and destination migration.
+Formatting/diff checks passed. Initial inline JSON writer compilation was fixed
+before qualification. GC reclaimed 86.0 GiB from this worktree's inactive build
+cache using its documented recent-write override while retaining live-build
+protection.
+
+The actual native/object artifact backing, distributed destination adapter,
+source-global checkpoint/head and production source-worker integration remain
+unfinished. Native completion-obligation release, public feeds, coherent
+bootstrap/retention, production pgoutput and existing-client qualification also
+remain required by the unchanged full goal. Neither issue is complete.

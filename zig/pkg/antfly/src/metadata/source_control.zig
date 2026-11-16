@@ -19,7 +19,9 @@
 //! either. This module never treats acceptance as an index publication.
 const std = @import("std");
 const A = std.mem.Allocator;
+const source_contract = @This();
 pub const Digest = [32]u8;
+pub const artifact_control = @import("source_artifact_control.zig");
 pub const protocol_version: u16 = 90;
 pub const max_pending_bytes = 1024 * 1024;
 pub const max_state_bytes = 8 * 1024 * 1024;
@@ -95,6 +97,23 @@ pub const Scope = struct {
         });
     }
 };
+/// Logical source ownership is independent of a destination plan/upload attempt.
+/// Including artifact or manifest digests here would create a circular identity
+/// when the frozen PREPARE bytes themselves carry this purpose.
+pub const LogicalInput = struct {
+    source_sequence: u64,
+    batch_id: []const u8,
+    checkpoint: []const u8,
+    expected_checkpoint: ?[]const u8 = null,
+    payload_digest: Digest,
+    accepted_at_ns: u64,
+};
+pub fn inputFingerprint(scope: Scope, input: LogicalInput) !Digest {
+    try scope.validate();
+    if (input.source_sequence == 0 or input.accepted_at_ns == 0 or input.accepted_at_ns == std.math.maxInt(u64) or !text(input.batch_id, 256, false) or !text(input.checkpoint, 1024, false) or !nonzero(input.payload_digest)) return error.InvalidSourceControl;
+    if (input.expected_checkpoint) |prior| if (!text(prior, 1024, false)) return error.InvalidSourceControl;
+    return hashValue(.{ .domain = "antfly:logical-source-input:v1", .scope = scope.identity(), .input = input });
+}
 pub const Reservation = struct {
     sequence: u64,
     batch_id: []const u8,
@@ -109,16 +128,25 @@ pub const Reservation = struct {
     delivery_manifest: []const u8,
     previous_reservation_digest: Digest = @splat(0),
     replan_receipt: []const u8 = "",
+    artifact: ?artifact_control.Spec = null,
+    pub fn jsonStringify(self: Reservation, stream: anytype) @TypeOf(stream.*).Error!void {
+        return writeArtifactFields(self, stream);
+    }
+
     pub fn validate(self: Reservation) !void {
         if (self.sequence == 0 or self.accepted_at_ns == 0 or self.accepted_at_ns == std.math.maxInt(u64) or
             !text(self.batch_id, 256, false) or !text(self.checkpoint, 1024, false) or
             !text(self.delivery_manifest, max_pending_bytes, false) or
             !nonzero(self.payload_digest) or !nonzero(self.plan_digest) or !nonzero(self.transaction_id)) return error.InvalidSourceControl;
+        if (self.artifact) |spec| try spec.validate();
         if (self.expected_checkpoint) |previous| if (!text(previous, 1024, false)) return error.InvalidSourceControl;
         if (!text(self.replan_receipt, 8192, true) or nonzero(self.previous_reservation_digest) != (self.replan_receipt.len != 0)) return error.InvalidSourceControl;
     }
+    pub fn inputFingerprint(self: Reservation, scope: Scope) !Digest {
+        return source_contract.inputFingerprint(scope, .{ .source_sequence = self.sequence, .batch_id = self.batch_id, .checkpoint = self.checkpoint, .expected_checkpoint = self.expected_checkpoint, .payload_digest = self.payload_digest, .accepted_at_ns = self.accepted_at_ns });
+    }
     pub fn identity(self: Reservation, scope: Scope) Digest {
-        return hashValue(.{
+        const legacy = hashValue(.{
             .domain = "antfly:source-reservation:v1",
             .scope = scope.identity(),
             .sequence = self.sequence,
@@ -134,6 +162,7 @@ pub const Reservation = struct {
             .previous_reservation_digest = self.previous_reservation_digest,
             .replan_receipt = self.replan_receipt,
         });
+        return if (self.artifact) |spec| hashValue(.{ .domain = "antfly:source-reservation:v2", .legacy = legacy, .artifact = spec }) else legacy;
     }
 };
 pub const Frontier = struct {
@@ -161,11 +190,15 @@ pub const State = struct {
     retired: bool = false,
     retirement_receipt: []const u8 = "",
     retired_reservation_digest: Digest = @splat(0),
+    artifact_control: ?@import("source_artifact_control.zig").State = null,
+    pub fn jsonStringify(self: State, stream: anytype) @TypeOf(stream.*).Error!void {
+        return writeArtifactFields(self, stream);
+    }
 
     pub fn validate(self: State) !void {
         if (self.version != 1 or self.outstanding.len > max_outstanding or !text(self.retirement_receipt, 8192, true)) return error.InvalidSourceControl;
         if (self.scope) |scope| try scope.validate() else {
-            if (self.revision != 0 or self.pending != null or self.accepted.sequence != 0 or self.committed.sequence != 0 or self.outstanding.len != 0 or self.retired) return error.InvalidSourceControl;
+            if (self.revision != 0 or self.pending != null or self.artifact_control != null or self.accepted.sequence != 0 or self.committed.sequence != 0 or self.outstanding.len != 0 or self.retired) return error.InvalidSourceControl;
         }
         if (self.committed.sequence > self.accepted.sequence) return error.InvalidSourceControl;
         for ([_]Frontier{ self.accepted, self.committed }) |frontier| {
@@ -199,6 +232,28 @@ pub const State = struct {
             (!std.mem.eql(u8, &self.accepted.receipt_digest, &self.committed.receipt_digest) or
                 !std.mem.eql(u8, &self.accepted.reservation_digest, &self.committed.reservation_digest) or
                 !std.mem.eql(u8, self.accepted.checkpoint, self.committed.checkpoint))) return error.InvalidSourceControl;
+        if (self.artifact_control) |ledger| {
+            try ledger.validate();
+            if (ledger.last_reclaimed) |last| if (!std.mem.eql(u8, &last.spec.binding, &self.scope.?.identity())) return error.InvalidSourceControl;
+            if (ledger.current) |record| {
+                if (!std.mem.eql(u8, &record.spec.binding, &self.scope.?.identity()) or self.retired) return error.InvalidSourceControl;
+                switch (record.phase) {
+                    .reserved, .sealed => {
+                        const pending = self.pending orelse return error.InvalidSourceControl;
+                        if (!std.mem.eql(u8, &record.reservation, &pending.identity(self.scope.?)) or pending.artifact == null or !std.meta.eql(record.spec, pending.artifact.?)) return error.InvalidSourceControl;
+                    },
+                    .accepted => if (self.pending != null or !std.mem.eql(u8, &record.reservation, &self.accepted.reservation_digest)) return error.InvalidSourceControl,
+                    .garbage => {
+                        if (self.pending) |pending| {
+                            if (!std.mem.eql(u8, &record.reservation, &pending.identity(self.scope.?)) or pending.artifact == null or !std.meta.eql(record.spec, pending.artifact.?)) return error.InvalidSourceControl;
+                        } else if (!std.mem.eql(u8, &record.reservation, &self.accepted.reservation_digest)) return error.InvalidSourceControl;
+                    },
+                }
+            } else if (self.pending) |pending| {
+                const reclaimed = ledger.last_reclaimed orelse return error.InvalidSourceControl;
+                if (pending.artifact == null or !std.mem.eql(u8, &reclaimed.reservation, &pending.identity(self.scope.?)) or !std.meta.eql(reclaimed.spec, pending.artifact.?)) return error.InvalidSourceControl;
+            }
+        } else if (self.pending) |pending| if (pending.artifact != null) return error.InvalidSourceControl;
         if (self.retired and (self.pending != null or self.outstanding.len != 0 or self.retirement_receipt.len == 0)) return error.InvalidSourceControl;
         if (!self.retired and (self.retirement_receipt.len != 0 or nonzero(self.retired_reservation_digest))) return error.InvalidSourceControl;
     }
@@ -212,18 +267,27 @@ fn predecessor(previous: ?[]const u8, accepted: Frontier) bool {
     if (accepted.sequence == 0) return previous == null;
     return previous != null and std.mem.eql(u8, previous.?, accepted.checkpoint);
 }
+pub const Replan = struct {
+    reservation_digest: Digest,
+    plan_digest: Digest,
+    transaction_id: [16]u8,
+    delivery_manifest: []const u8,
+    not_admitted_receipt: []const u8,
+    artifact: ?artifact_control.Spec = null,
+    pub fn jsonStringify(self: Replan, stream: anytype) @TypeOf(stream.*).Error!void {
+        return writeArtifactFields(self, stream);
+    }
+};
+
 pub const Mutation = union(enum) {
     configure: Scope,
     reserve: Reservation,
     /// The adapter proves old routes cannot admit a delayed original attempt.
     /// This changes delivery authority, not logical source progress or payload.
-    replan: struct {
-        reservation_digest: Digest,
-        plan_digest: Digest,
-        transaction_id: [16]u8,
-        delivery_manifest: []const u8,
-        not_admitted_receipt: []const u8,
-    },
+    replan: Replan,
+    seal_artifact: struct { reservation_digest: Digest, stamp: Digest },
+    retire_artifact: struct { reservation_digest: Digest, proof: Digest, reason: enum { unsealed, not_admitted, committed } },
+    reclaim_artifact: struct { reservation_digest: Digest, proof: Digest },
     accept: struct {
         reservation_digest: Digest,
         receipt: []const u8,
@@ -242,8 +306,14 @@ pub const Mutation = union(enum) {
         switch (self) {
             .configure, .reseed => |scope| try scope.validate(),
             .reserve => |reservation| try reservation.validate(),
-            .replan => |plan| if (!nonzero(plan.reservation_digest) or !nonzero(plan.plan_digest) or !nonzero(plan.transaction_id) or
-                !text(plan.delivery_manifest, max_pending_bytes, false) or !text(plan.not_admitted_receipt, 8192, false)) return error.InvalidSourceControl,
+            .replan => |plan| {
+                if (plan.artifact) |spec| try spec.validate();
+                if (!nonzero(plan.reservation_digest) or !nonzero(plan.plan_digest) or !nonzero(plan.transaction_id) or
+                    !text(plan.delivery_manifest, max_pending_bytes, false) or !text(plan.not_admitted_receipt, 8192, false)) return error.InvalidSourceControl;
+            },
+            .seal_artifact => |seal| if (!nonzero(seal.reservation_digest) or !nonzero(seal.stamp)) return error.InvalidSourceControl,
+            .retire_artifact => |retirement| if (!nonzero(retirement.reservation_digest) or !nonzero(retirement.proof)) return error.InvalidSourceControl,
+            .reclaim_artifact => |reclaimed| if (!nonzero(reclaimed.reservation_digest) or !nonzero(reclaimed.proof)) return error.InvalidSourceControl,
             .accept => |accepted| {
                 if (!nonzero(accepted.reservation_digest) or !text(accepted.receipt, 8192, false)) return error.InvalidSourceControl;
                 if (accepted.commit_reference) |ref| if (!text(ref, 8192, false)) return error.InvalidSourceControl;
@@ -266,7 +336,11 @@ pub const Mutation = union(enum) {
                 const prior = state.scope orelse return error.SourceBindingConflict;
                 if (!state.retired or scope.table_id != prior.table_id or !std.mem.eql(u8, &scope.source_id, &prior.source_id) or
                     scope.generation != (std.math.add(u64, prior.generation, 1) catch return error.SourceBindingConflict)) return error.SourceBindingConflict;
-                next = .{ .scope = scope, .revision = next.revision };
+                if (state.artifact_control) |ledger| if (ledger.current != null) return error.SourcePendingWork;
+                // Preserve the negotiated artifact contract for the same destination.
+                // An explicit, fully drained destination migration renegotiates it.
+                const retain_profile = state.artifact_control != null and scope.destination == prior.destination and std.mem.eql(u8, &scope.destination_binding, &prior.destination_binding);
+                next = .{ .scope = scope, .revision = next.revision, .artifact_control = if (retain_profile) .{} else null };
             },
             .reserve => |reservation| {
                 const scope = state.scope orelse return error.SourceBindingConflict;
@@ -280,6 +354,9 @@ pub const Mutation = union(enum) {
                     acceptance_credit > max_outstanding_encoded_bytes - outstandingBytes(state.outstanding)) return error.SourceAdmissionBackpressure;
                 if (reservation.sequence != (std.math.add(u64, state.accepted.sequence, 1) catch return error.SourceReceiptExpired)) return error.SourceReceiptExpired;
                 if (!predecessor(reservation.expected_checkpoint, state.accepted)) return error.SourceCheckpointConflict;
+                if (reservation.artifact) |spec| {
+                    next.artifact_control = try (state.artifact_control orelse artifact_control.State{}).reserve(reservation.identity(scope), spec, scope.identity());
+                } else if (state.artifact_control != null) return error.UnsupportedOperation;
                 next.pending = reservation;
             },
             .replan => |plan| {
@@ -290,16 +367,56 @@ pub const Mutation = union(enum) {
                     std.mem.eql(u8, &pending.plan_digest, &plan.plan_digest) and
                     std.mem.eql(u8, &pending.transaction_id, &plan.transaction_id) and
                     std.mem.eql(u8, pending.delivery_manifest, plan.delivery_manifest) and
-                    std.mem.eql(u8, pending.replan_receipt, plan.not_admitted_receipt)) return state;
+                    std.mem.eql(u8, pending.replan_receipt, plan.not_admitted_receipt) and std.meta.eql(pending.artifact, plan.artifact)) return state;
                 if (!std.mem.eql(u8, &pending.identity(scope), &plan.reservation_digest)) return error.SourcePayloadConflict;
                 if (std.mem.eql(u8, &pending.transaction_id, &plan.transaction_id) or
                     std.mem.eql(u8, &pending.plan_digest, &plan.plan_digest) or
                     std.mem.eql(u8, pending.delivery_manifest, plan.delivery_manifest)) return error.InvalidSourceControl;
+                if (pending.artifact != null) {
+                    const ledger = state.artifact_control orelse return error.InvalidSourceControl;
+                    const reclaimed = ledger.last_reclaimed orelse return error.SourcePendingWork;
+                    if (ledger.current != null or !std.mem.eql(u8, &reclaimed.reservation, &plan.reservation_digest) or !std.mem.eql(u8, &reclaimed.retirement, &digest(plan.not_admitted_receipt)) or plan.artifact == null) return error.SourcePendingWork;
+                } else if (state.artifact_control != null and plan.artifact == null) return error.UnsupportedOperation;
                 next.pending.?.previous_reservation_digest = plan.reservation_digest;
                 next.pending.?.plan_digest = plan.plan_digest;
                 next.pending.?.transaction_id = plan.transaction_id;
                 next.pending.?.delivery_manifest = plan.delivery_manifest;
                 next.pending.?.replan_receipt = plan.not_admitted_receipt;
+                next.pending.?.artifact = plan.artifact;
+                if (plan.artifact) |spec| next.artifact_control = try (state.artifact_control orelse artifact_control.State{}).reserve(next.pending.?.identity(scope), spec, scope.identity());
+            },
+            .seal_artifact => |seal| {
+                const pending = state.pending orelse return error.SourcePendingWork;
+                const scope = state.scope orelse return error.SourceBindingConflict;
+                if (pending.artifact == null or !std.mem.eql(u8, &pending.identity(scope), &seal.reservation_digest)) return error.SourcePayloadConflict;
+                const ledger = state.artifact_control orelse return error.InvalidSourceControl;
+                const sealed = try ledger.seal(seal.reservation_digest, seal.stamp);
+                if (std.meta.eql(ledger, sealed)) return state;
+                next.artifact_control = sealed;
+            },
+            .retire_artifact => |retirement| {
+                const ledger = state.artifact_control orelse return error.SourcePendingWork;
+                const record = ledger.current orelse return error.SourcePendingWork;
+                switch (retirement.reason) {
+                    .unsealed => {
+                        const pending = state.pending orelse return error.SourcePendingWork;
+                        if ((record.phase != .reserved and record.phase != .garbage) or record.stamp != null or !std.mem.eql(u8, &pending.identity(state.scope.?), &retirement.reservation_digest)) return error.SourcePendingWork;
+                    },
+                    .not_admitted => {
+                        const pending = state.pending orelse return error.SourcePendingWork;
+                        if (record.phase == .accepted or !std.mem.eql(u8, &pending.identity(state.scope.?), &retirement.reservation_digest)) return error.SourcePendingWork;
+                    },
+                    .committed => if (state.pending != null or !std.mem.eql(u8, &state.committed.reservation_digest, &retirement.reservation_digest) or (record.phase != .accepted and record.phase != .garbage)) return error.SourcePendingWork,
+                }
+                const retired = try ledger.retire(retirement.reservation_digest, retirement.proof);
+                if (std.meta.eql(ledger, retired)) return state;
+                next.artifact_control = retired;
+            },
+            .reclaim_artifact => |reclaimed| {
+                const ledger = state.artifact_control orelse return error.SourcePendingWork;
+                const released = try ledger.reclaim(reclaimed.reservation_digest, reclaimed.proof);
+                if (std.meta.eql(ledger, released)) return state;
+                next.artifact_control = released;
             },
             .accept => |accepted| {
                 const scope = state.scope orelse return error.SourceBindingConflict;
@@ -313,6 +430,7 @@ pub const Mutation = union(enum) {
                 };
                 const id = pending.identity(scope);
                 if (!std.mem.eql(u8, &id, &accepted.reservation_digest)) return error.SourcePayloadConflict;
+                if (pending.artifact != null) next.artifact_control = try (state.artifact_control orelse return error.InvalidSourceControl).accept(accepted.reservation_digest);
                 const outstanding = try a.alloc(Accepted, state.outstanding.len + 1);
                 @memcpy(outstanding[0..state.outstanding.len], state.outstanding);
                 outstanding[state.outstanding.len] = .{
@@ -355,13 +473,18 @@ pub const Mutation = union(enum) {
                 }
                 const pending = state.pending orelse return error.SourceCheckpointConflict;
                 if (!std.mem.eql(u8, &pending.identity(scope), &retirement.reservation_digest)) return error.SourcePayloadConflict;
+                if (pending.artifact != null) {
+                    const ledger = state.artifact_control orelse return error.InvalidSourceControl;
+                    const reclaimed = ledger.last_reclaimed orelse return error.SourcePendingWork;
+                    if (ledger.current != null or !std.mem.eql(u8, &reclaimed.reservation, &retirement.reservation_digest) or !std.mem.eql(u8, &reclaimed.retirement, &digest(retirement.receipt))) return error.SourcePendingWork;
+                }
                 next.pending = null;
                 next.retired = true;
                 next.retired_reservation_digest = retirement.reservation_digest;
                 next.retirement_receipt = retirement.receipt;
             },
             .retire => |retirement| {
-                if (state.pending != null or state.outstanding.len != 0) return error.SourcePendingWork;
+                if (state.pending != null or state.outstanding.len != 0 or (if (state.artifact_control) |ledger| ledger.current != null else false)) return error.SourcePendingWork;
                 if (state.scope == null) return error.SourceBindingConflict;
                 if (state.retired) {
                     if (!std.mem.eql(u8, state.retirement_receipt, retirement.receipt) or nonzero(state.retired_reservation_digest)) return error.SourcePayloadConflict;
@@ -401,7 +524,7 @@ pub fn encode(a: A, state: State) ![]u8 {
 }
 pub fn parse(a: A, bytes: []const u8) !std.json.Parsed(State) {
     if (bytes.len == 0 or bytes.len > max_state_bytes) return error.SourceControlCorrupt;
-    var parsed = std.json.parseFromSlice(State, a, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+    var parsed = std.json.parseFromSlice(State, a, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.SourceControlCorrupt,
     };
@@ -418,7 +541,7 @@ pub fn encodeWrite(a: A, write: Write) ![]u8 {
 }
 pub fn parseWrite(a: A, bytes: []const u8) !std.json.Parsed(Write) {
     if (bytes.len == 0 or bytes.len > max_state_bytes) return error.InvalidSourceControl;
-    var parsed = std.json.parseFromSlice(Write, a, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+    var parsed = std.json.parseFromSlice(Write, a, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidSourceControl,
     };
@@ -566,7 +689,7 @@ pub fn definitionDigest(a: A, sources_json: []const u8, ordinal: u32) !Digest {
     return hash.finalResult();
 }
 pub fn hasWork(state: State) bool {
-    return state.pending != null or state.outstanding.len != 0;
+    return state.pending != null or state.outstanding.len != 0 or (if (state.artifact_control) |ledger| ledger.current != null else false);
 }
 pub fn validateEncodedWrite(bytes: []const u8) !void {
     var parsed = try parseWrite(std.heap.page_allocator, bytes);
@@ -590,7 +713,7 @@ pub fn readOnService(svc: anytype, a: A, table_id: u64, source_id: Digest, reque
 pub fn mutateOnService(svc: anytype, a: A, write: Write, request: anytype) !void {
     try write.validate();
     try request.ensureActive();
-    _ = try svc.ensureTableTopologyProtocolReadyWithContext(request, protocol_version);
+    _ = try svc.ensureTableTopologyProtocolReadyWithContext(request, requiredProtocol(write.mutation));
     try svc.ensureLinearizableReadWithContext(request);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const bytes = try store.getSourceControl(a, svc.metadata_group_id, write.table_id, write.source_id);
@@ -859,4 +982,163 @@ test "source control replans only proven unadmitted delivery while retaining log
     const current = state.pending.?.identity(scope);
     state = try (Mutation{ .accept = .{ .reservation_digest = current, .receipt = "new-route-accepted", .commit_reference = "new-route-committed" } }).apply(ca, state);
     try std.testing.expectEqual(@as(u64, 1), state.committed.sequence);
+}
+
+fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
+    try stream.beginObject();
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
+        const include = if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control")) @field(value, name) != null else true;
+        if (include) {
+            try stream.objectField(name);
+            try stream.write(@field(value, name));
+        }
+    }
+    try stream.endObject();
+}
+pub fn requiredProtocol(mutation: Mutation) u16 {
+    return switch (mutation) {
+        .reserve => |reservation| if (reservation.artifact != null) artifact_control.protocol_version else protocol_version,
+        .replan => |plan| if (plan.artifact != null) artifact_control.protocol_version else protocol_version,
+        .seal_artifact, .retire_artifact, .reclaim_artifact => artifact_control.protocol_version,
+        else => protocol_version,
+    };
+}
+pub fn requiredProtocolEncoded(bytes: []const u8) u16 {
+    var write = parseWrite(std.heap.page_allocator, bytes) catch return artifact_control.protocol_version;
+    defer write.deinit();
+    return requiredProtocol(write.value.mutation);
+}
+
+fn artifactTestSpec(scope: Scope, token: u64) artifact_control.Spec {
+    var attempt: [16]u8 = @splat(1);
+    std.mem.writeInt(u64, attempt[0..8], token, .big);
+    return .{ .namespace = @splat(9), .binding = scope.identity(), .domain = artifact_control.domainFor(scope.identity()), .attempt = attempt, .bytes = 1024, .checksum = @splat(10), .plan_digest = @splat(11) };
+}
+
+test "source control artifact quota remains charged through acceptance and returns only after reclamation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const scope: Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
+    var state = try (Mutation{ .configure = scope }).apply(ca, .{});
+    const legacy = try encode(ca, state);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "artifact_control") == null);
+    var reservation: Reservation = .{ .sequence = 1, .batch_id = "batch", .checkpoint = "cp1", .accepted_at_ns = 1, .payload_digest = @splat(5), .plan_digest = @splat(6), .transaction_id = @splat(7), .destination = .native, .delivery_manifest = "frozen-reference" };
+    const legacy_id = reservation.identity(scope);
+    const old_write: Write = .{ .table_id = 7, .source_id = scope.source_id, .expected_revision = state.revision, .expected_binding = scope.identity(), .expected_catalog_digest = @splat(8), .mutation = .{ .reserve = reservation } };
+    const old_bytes = try encodeWrite(ca, old_write);
+    try std.testing.expect(std.mem.indexOf(u8, old_bytes, "artifact") == null);
+    try std.testing.expectEqual(protocol_version, requiredProtocolEncoded(old_bytes));
+    reservation.artifact = artifactTestSpec(scope, 1);
+    try std.testing.expect(!std.mem.eql(u8, &legacy_id, &reservation.identity(scope)));
+    var modern_write = old_write;
+    modern_write.mutation = .{ .reserve = reservation };
+    const modern_bytes = try encodeWrite(ca, modern_write);
+    try std.testing.expectEqual(artifact_control.protocol_version, requiredProtocolEncoded(modern_bytes));
+    const escaped = try std.mem.replaceOwned(u8, ca, modern_bytes, "\"artifact\"", "\"arti\\u0066act\"");
+    try std.testing.expectEqual(artifact_control.protocol_version, requiredProtocolEncoded(escaped));
+    const duplicate = try std.mem.replaceOwned(u8, ca, modern_bytes, "\"artifact\":", "\"artifact\":null,\"artifact\":");
+    try std.testing.expectError(error.InvalidSourceControl, parseWrite(ca, duplicate));
+    state = try modern_write.mutation.apply(ca, state);
+    const id = reservation.identity(scope);
+    try std.testing.expectEqual(@as(u64, 1024), state.artifact_control.?.chargedBytes());
+    try std.testing.expect(hasWork(state));
+    const accept: Mutation = .{ .accept = .{ .reservation_digest = id, .receipt = "native-accepted", .commit_reference = "native-commit" } };
+    try std.testing.expectError(error.SourcePendingWork, accept.apply(ca, state));
+    try std.testing.expectError(error.SourcePendingWork, (Mutation{ .reclaim_artifact = .{ .reservation_digest = id, .proof = @splat(12) } }).apply(ca, state));
+    const seal: Mutation = .{ .seal_artifact = .{ .reservation_digest = id, .stamp = @splat(13) } };
+    state = try seal.apply(ca, state);
+    try std.testing.expectEqual(state.revision, (try seal.apply(ca, state)).revision);
+    try std.testing.expectError(error.SourcePendingWork, (Mutation{ .retire_artifact = .{ .reservation_digest = id, .proof = @splat(14), .reason = .unsealed } }).apply(ca, state));
+    const saved = try encode(ca, state);
+    var reopened = try parse(a, saved);
+    defer reopened.deinit();
+    try std.testing.expectEqual(.sealed, reopened.value.artifact_control.?.current.?.phase);
+    try std.testing.expectEqual(@as(u64, 1024), reopened.value.artifact_control.?.chargedBytes());
+    state = try accept.apply(ca, state);
+    try std.testing.expectEqual(@as(u64, 1), state.committed.sequence);
+    try std.testing.expectEqual(@as(usize, 0), state.outstanding.len);
+    try std.testing.expect(hasWork(state));
+    try std.testing.expectEqual(@as(u64, 1024), state.artifact_control.?.chargedBytes());
+    var next_reservation = reservation;
+    next_reservation.sequence = 2;
+    next_reservation.batch_id = "batch2";
+    next_reservation.expected_checkpoint = "cp1";
+    next_reservation.checkpoint = "cp2";
+    next_reservation.artifact = artifactTestSpec(scope, 2);
+    try std.testing.expectError(error.SourceAdmissionBackpressure, (Mutation{ .reserve = next_reservation }).apply(ca, state));
+    const retire: Mutation = .{ .retire_artifact = .{ .reservation_digest = id, .proof = @splat(14), .reason = .committed } };
+    state = try retire.apply(ca, state);
+    try std.testing.expectEqual(@as(u64, 1024), state.artifact_control.?.chargedBytes());
+    try std.testing.expectError(error.SourcePendingWork, (Mutation{ .retire = .{ .receipt = "source-closed" } }).apply(ca, state));
+    const reclaim: Mutation = .{ .reclaim_artifact = .{ .reservation_digest = id, .proof = @splat(15) } };
+    state = try reclaim.apply(ca, state);
+    try std.testing.expectEqual(@as(u64, 0), state.artifact_control.?.chargedBytes());
+    try std.testing.expect(!hasWork(state));
+    try std.testing.expectEqual(state.revision, (try reclaim.apply(ca, state)).revision);
+    next_reservation.artifact = null;
+    try std.testing.expectError(error.UnsupportedOperation, (Mutation{ .reserve = next_reservation }).apply(ca, state));
+    next_reservation.artifact = artifactTestSpec(scope, 1);
+    try std.testing.expectError(error.SourceReceiptExpired, (Mutation{ .reserve = next_reservation }).apply(ca, state));
+    next_reservation.artifact = artifactTestSpec(scope, 2);
+    state = try (Mutation{ .reserve = next_reservation }).apply(ca, state);
+    // A late proof for the previous allocation cannot release current quota.
+    state = try reclaim.apply(ca, state);
+    try std.testing.expectEqual(@as(u64, 1024), state.artifact_control.?.chargedBytes());
+    var corrupt = state;
+    corrupt.artifact_control.?.current.?.spec.checksum[0] ^= 1;
+    try std.testing.expectError(error.InvalidSourceControl, corrupt.validate());
+}
+
+test "source control artifact replanning requires fenced cleanup and never reuses upload authority" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var scope: Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
+    var state = try (Mutation{ .configure = scope }).apply(ca, .{});
+    const reservation: Reservation = .{ .sequence = 1, .batch_id = "batch", .checkpoint = "cp1", .accepted_at_ns = 1, .payload_digest = @splat(5), .plan_digest = @splat(6), .transaction_id = @splat(7), .destination = .native, .delivery_manifest = "original", .artifact = artifactTestSpec(scope, 1) };
+    state = try (Mutation{ .reserve = reservation }).apply(ca, state);
+    const id = reservation.identity(scope);
+    const logical_input = try reservation.inputFingerprint(scope);
+    const replacement: Mutation = .{ .replan = .{ .reservation_digest = id, .plan_digest = @splat(8), .transaction_id = @splat(9), .delivery_manifest = "replacement", .not_admitted_receipt = "fenced-original", .artifact = artifactTestSpec(scope, 2) } };
+    try std.testing.expectError(error.SourcePendingWork, replacement.apply(ca, state));
+    state = try (Mutation{ .retire_artifact = .{ .reservation_digest = id, .proof = digest("fenced-original"), .reason = .unsealed } }).apply(ca, state);
+    try std.testing.expectError(error.SourcePendingWork, replacement.apply(ca, state));
+    state = try (Mutation{ .reclaim_artifact = .{ .reservation_digest = id, .proof = @splat(10) } }).apply(ca, state);
+    var wrong = replacement;
+    wrong.replan.not_admitted_receipt = "different-proof";
+    try std.testing.expectError(error.SourcePendingWork, wrong.apply(ca, state));
+    state = try replacement.apply(ca, state);
+    try std.testing.expectEqual(logical_input, try state.pending.?.inputFingerprint(scope));
+    try std.testing.expectEqual(@as(u64, 1), state.pending.?.sequence);
+    try std.testing.expectEqual(@as(u64, 2), state.artifact_control.?.current.?.spec.token());
+    try std.testing.expectEqual(@as(u64, 0), state.accepted.sequence);
+    try std.testing.expectError(error.SourcePayloadConflict, (Mutation{ .seal_artifact = .{ .reservation_digest = id, .stamp = @splat(13) } }).apply(ca, state));
+    const replacement_id = state.pending.?.identity(scope);
+    state = try (Mutation{ .retire_artifact = .{ .reservation_digest = replacement_id, .proof = digest("fenced-replacement"), .reason = .unsealed } }).apply(ca, state);
+    state = try (Mutation{ .reclaim_artifact = .{ .reservation_digest = replacement_id, .proof = @splat(11) } }).apply(ca, state);
+    try std.testing.expectError(error.SourcePendingWork, (Mutation{ .reject_and_retire = .{ .reservation_digest = replacement_id, .receipt = "different-proof" } }).apply(ca, state));
+    state = try (Mutation{ .reject_and_retire = .{ .reservation_digest = replacement_id, .receipt = "fenced-replacement" } }).apply(ca, state);
+    try std.testing.expect(state.retired and !hasWork(state));
+    const retired = state;
+    scope.generation += 1;
+    state = try (Mutation{ .reseed = scope }).apply(ca, state);
+    var fresh = reservation;
+    fresh.artifact = null;
+    try std.testing.expectError(error.UnsupportedOperation, (Mutation{ .reserve = fresh }).apply(ca, state));
+    fresh.artifact = artifactTestSpec(scope, 1);
+    state = try (Mutation{ .reserve = fresh }).apply(ca, state);
+    try std.testing.expectEqual(@as(u64, 1), state.artifact_control.?.next_token);
+    try std.testing.expect(!std.mem.eql(u8, &reservation.artifact.?.domain, &state.pending.?.artifact.?.domain));
+    var lake_scope = scope;
+    lake_scope.destination = .writable_iceberg;
+    lake_scope.destination_binding = @splat(19);
+    const migrated = try (Mutation{ .reseed = lake_scope }).apply(ca, retired);
+    try std.testing.expect(migrated.artifact_control == null);
+    var lake_reservation = reservation;
+    lake_reservation.destination = .writable_iceberg;
+    lake_reservation.artifact = null;
+    _ = try (Mutation{ .reserve = lake_reservation }).apply(ca, migrated);
 }
