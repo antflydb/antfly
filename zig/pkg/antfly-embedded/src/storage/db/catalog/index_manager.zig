@@ -19314,26 +19314,19 @@ pub const IndexManager = struct {
             // derived posting commit. A busy source continually moves this
             // candidate, while posting catch-up to an already-stable tip can
             // publish immediately once the exact sequence boundary matches.
-            // Do not hold vector_block_build_mu here: the builder acquires it
-            // after pinning the entry mutation epoch. Re-entering that mutex
-            // would deadlock every finite bulk load at its first quiet tip.
             if (self.primary_store) |primary| {
                 const source_sequence = primary.lastReplaySequence(0);
                 if (self.vector_block_candidate_sequence.load(.acquire) != source_sequence) {
                     self.vector_block_candidate_sequence.store(source_sequence, .release);
                     self.vector_block_candidate_since_ns.store(platform_time.monotonicNs(), .release);
                 }
-                _ = self.maintainVectorBlockBaseIfQuiescent(entry) catch |err| blk: {
-                    // Native exact-vector publication is an optimization;
-                    // the primary artifact store remains the correctness
-                    // fallback when a snapshot cannot be built yet.
-                    std.log.warn("shared vector-block maintenance deferred index={s} sequence={} err={s}", .{
-                        name,
-                        source_sequence,
-                        @errorName(err),
-                    });
-                    break :blk false;
-                };
+                // A fixed primary tip does not mean enrichment/backfill is
+                // idle: many small derived batches can share that source cut.
+                // Never stage a corpus snapshot from this replay commit path
+                // while its caller holds apply admission. The native mutation
+                // chain above remains incremental; a fenced/missing generation
+                // stays on exact primary fallback until the existing online
+                // maintenance owner or explicit idle drain repairs it once.
             }
         }
     }
