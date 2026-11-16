@@ -1161,6 +1161,10 @@ fn applyOrderedHistoryConsumerControl(self: *DB, command: @import("history_consu
 fn nativeHistoryGrant(self: *DB, requested: @import("history_consumer.zig").GrantIdentity) engine.Outcome(@import("history_consumer.zig").GrantObservation) {
     return .{ .value = self.nativeHistoryGrant(requested) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn publishReplicatedCompletionCertificate(self: *DB, raw: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, entry: @import("db/types.zig").OrderedApplyReceipt) engine.Outcome(@import("committed_history.zig").CompletionPublication) {
+    return .{ .value = self.publishReplicatedCompletionCertificate(raw, owner, entry) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn historyResolution(self: *DB, allocator: Allocator, request: @import("history_resolution_wire.zig").Request) engine.Outcome(@import("history_resolution_wire.zig").Reply) {
     return .{ .value = self.historyResolution(allocator, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

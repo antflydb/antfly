@@ -31,6 +31,45 @@ const reservation_prefix = "\x00\x00__committed_history__:reservation:";
 const intents_prefix = "\x00\x00__txn_intents__:";
 const completion = frame.completion;
 const completion_credit_prefix = "\x00\x00__committed_history__:completion_credit:";
+pub const completion_certificate_prefix = "\x00\x00__committed_history__:completion_certificate:";
+const completion_retained_prefix = "\x00\x00__committed_history__:completion_retained:";
+pub const CompletionPublicationPosition = struct { term: u64, index: u64 };
+pub const CompletionPublication = struct { digest: completion.Digest, retained_bytes: u64, position: CompletionPublicationPosition };
+pub const completion_publication_prefix = "\x00\x00__committed_history__:completion_publication:";
+pub fn completionPublicationKey(index: u64) [completion_publication_prefix.len + 8]u8 {
+    var key: [completion_publication_prefix.len + 8]u8 = undefined;
+    @memcpy(key[0..completion_publication_prefix.len], completion_publication_prefix);
+    std.mem.writeInt(u64, key[completion_publication_prefix.len..], index, .big);
+    return key;
+}
+pub const CompletionPublicationRecord = struct {
+    transaction_id: [16]u8,
+    position: CompletionPublicationPosition,
+    certificate_digest: completion.Digest,
+    pub const encoded_len = 96;
+    pub fn encode(self: CompletionPublicationRecord) [encoded_len]u8 {
+        var raw: [encoded_len]u8 = undefined;
+        @memcpy(raw[0..16], &self.transaction_id);
+        std.mem.writeInt(u64, raw[16..24], self.position.term, .little);
+        std.mem.writeInt(u64, raw[24..32], self.position.index, .little);
+        @memcpy(raw[32..64], &self.certificate_digest);
+        @memcpy(raw[64..96], &frame.digest(raw[0..64]));
+        return raw;
+    }
+    pub fn decode(raw: []const u8) !CompletionPublicationRecord {
+        if (raw.len != encoded_len or !std.mem.eql(u8, raw[64..96], &frame.digest(raw[0..64]))) return error.HistoryCorrupt;
+        const record: CompletionPublicationRecord = .{ .transaction_id = raw[0..16].*, .position = .{ .term = std.mem.readInt(u64, raw[16..24], .little), .index = std.mem.readInt(u64, raw[24..32], .little) }, .certificate_digest = raw[32..64].* };
+        if (record.position.term == 0 or record.position.index == 0 or std.mem.allEqual(u8, &record.transaction_id, 0) or std.mem.allEqual(u8, &record.certificate_digest, 0)) return error.HistoryCorrupt;
+        return record;
+    }
+};
+pub fn completionCertificateKey(id: [16]u8) [completion_certificate_prefix.len + 16]u8 {
+    return completion_certificate_prefix.* ++ id;
+}
+fn completionRetainedKey(id: [16]u8) [completion_retained_prefix.len + 16]u8 {
+    return completion_retained_prefix.* ++ id;
+}
+
 pub const default_limit: u64 = 256 * 1024 * 1024;
 pub const max_consumers = 32;
 const transaction_overhead: u64 = 2 * frame.max_schema_bytes + 1024 + 256 * 32;
@@ -244,6 +283,112 @@ const CompletionCredit = struct {
         return raw;
     }
 };
+/// Exact charge for retained evidence. The primary coordinator record is not
+/// the retention authority; this ledger survives its eventual cleanup.
+const RetainedCompletion = struct {
+    bytes: u64,
+    plan_bytes: u64,
+    receipt_bytes: u64,
+    certificate_bytes: u64,
+    position: CompletionPublicationPosition,
+    admission_digest: completion.Digest,
+    certificate_digest: completion.Digest,
+    const encoded_len = 148;
+    fn encode(self: RetainedCompletion) [encoded_len]u8 {
+        var raw: [encoded_len]u8 = undefined;
+        @memcpy(raw[0..4], "CRT1");
+        for ([_]u64{ self.bytes, self.plan_bytes, self.receipt_bytes, self.certificate_bytes }, 0..) |value, i| std.mem.writeInt(u64, raw[4 + i * 8 ..][0..8], value, .little);
+        std.mem.writeInt(u64, raw[36..44], self.position.term, .little);
+        std.mem.writeInt(u64, raw[44..52], self.position.index, .little);
+        @memcpy(raw[52..84], &self.admission_digest);
+        @memcpy(raw[84..116], &self.certificate_digest);
+        @memcpy(raw[116..148], &frame.digest(raw[0..116]));
+        return raw;
+    }
+    fn decode(raw: []const u8) !RetainedCompletion {
+        if (raw.len != encoded_len or !std.mem.eql(u8, raw[0..4], "CRT1") or !std.mem.eql(u8, raw[116..148], &frame.digest(raw[0..116]))) return error.HistoryCorrupt;
+        return .{ .bytes = std.mem.readInt(u64, raw[4..12], .little), .plan_bytes = std.mem.readInt(u64, raw[12..20], .little), .receipt_bytes = std.mem.readInt(u64, raw[20..28], .little), .certificate_bytes = std.mem.readInt(u64, raw[28..36], .little), .position = .{ .term = std.mem.readInt(u64, raw[36..44], .little), .index = std.mem.readInt(u64, raw[44..52], .little) }, .admission_digest = raw[52..84].*, .certificate_digest = raw[84..116].* };
+    }
+};
+
+/// Trusted ordered owner publication only. The caller must authenticate every
+/// remote receipt through qualified original-owner reads before this reducer.
+/// The caller holds native apply admission and commits this transaction together
+/// with its ordered marker; failures require aborting the entire transaction.
+pub fn publishCompletion(a: A, txn: anytype, physical_namespace: frame.Namespace, physical_root_generation: u64, owner: completion.RoutedOwner, raw: []const u8, position: CompletionPublicationPosition, allow_create: bool) !CompletionPublication {
+    try owner.validate();
+    if (position.term == 0 or position.index == 0) return error.InvalidHistoryAdmission;
+    if (!std.mem.eql(u8, &physical_namespace, &owner.namespace) or owner.root_generation != physical_root_generation) return error.HistoryResynchronizationRequired;
+    var state = (try load(txn)) orelse return error.HistoryResynchronizationRequired;
+    try requireNamespace(txn, state, physical_namespace);
+    _ = try authority.require(txn, .raft, physical_namespace);
+    var parsed = try completion.parse(a, raw);
+    defer parsed.deinit();
+    const certificate = parsed.value.certificate;
+    const manifest = certificate.manifest;
+    try manifest.admission().requireRoutedOwner(owner);
+    const id = manifest.transaction_id;
+    const plan_key = completion.admission_prefix.* ++ id;
+    const plan_raw = (try optional(txn, &plan_key)) orelse return error.HistoryResynchronizationRequired;
+    var plan = try completion.parseAdmission(a, plan_raw);
+    defer plan.deinit();
+    if (!std.mem.eql(u8, &plan.value.digest, &manifest.admission().digest())) return error.DecisionConflict;
+    const receipt_key = completion.resolutionKey(id);
+    const receipt_raw = (try optional(txn, &receipt_key)) orelse return error.SourceOutcomeUnresolved;
+    var local = try completion.parseResolution(a, manifest, receipt_raw);
+    defer local.deinit();
+    const marker = (try optional(txn, &keys.ordered_document_applied_entry_key)) orelse return error.HistoryAuthorityRequired;
+    if (marker.len != 16) return error.HistoryCorrupt;
+    const wire = @import("history_resolution_wire.zig");
+    const request: wire.Request = .{ .authority = .raft, .namespace = physical_namespace, .transaction_id = id, .owner_fence = owner.digest(), .manifest_digest = manifest.digest(), .commit_version = manifest.commit_version, .minimum_applied_index = 1 };
+    _ = try wire.Reply.init(request, .{ .term = std.mem.readInt(u64, marker[0..8], .little), .index = std.mem.readInt(u64, marker[8..16], .little) }, local.value.resolution);
+    var found = false;
+    for (certificate.resolutions) |receipt| if (std.mem.eql(u8, &receipt.namespace, &physical_namespace)) {
+        if (!std.mem.eql(u8, &receipt.digest(), &local.value.digest)) return error.DecisionConflict;
+        found = true;
+        break;
+    };
+    if (!found) return error.InvalidParticipant;
+    const canonical = try completion.encode(a, certificate);
+    defer a.free(canonical);
+    const certificate_key = completionCertificateKey(id);
+    const retained_key = completionRetainedKey(id);
+    const stored_certificate = try optional(txn, &certificate_key);
+    const stored_retained = try optional(txn, &retained_key);
+    const credit = try CompletionCredit.load(txn, id);
+    const publication_key = completionPublicationKey(position.index);
+    const overhead = plan_key.len + receipt_key.len + certificate_key.len + retained_key.len + publication_key.len + CompletionPublicationRecord.encoded_len + RetainedCompletion.encoded_len + 128;
+    const charge: u64 = std.math.add(u64, overhead, plan_raw.len + receipt_raw.len + canonical.len) catch return error.HistoryTooLarge;
+    const retained: RetainedCompletion = .{ .bytes = charge, .plan_bytes = plan_raw.len, .receipt_bytes = receipt_raw.len, .certificate_bytes = canonical.len, .position = position, .admission_digest = plan.value.digest, .certificate_digest = parsed.value.digest };
+    if (stored_certificate != null or stored_retained != null) {
+        if (stored_certificate == null or stored_retained == null) return error.HistoryCorrupt;
+        const previous = try RetainedCompletion.decode(stored_retained.?);
+        if (!std.mem.eql(u8, stored_certificate.?, canonical)) return error.DecisionConflict;
+        var expected = retained;
+        expected.position = previous.position;
+        if (!std.meta.eql(previous, expected) or credit.bytes != 0 or state.retained_bytes < charge) return error.HistoryCorrupt;
+        const index_raw = (try optional(txn, &completionPublicationKey(previous.position.index))) orelse return error.HistoryCorrupt;
+        const index_record = try CompletionPublicationRecord.decode(index_raw);
+        if (!std.mem.eql(u8, &index_record.transaction_id, &id) or !std.mem.eql(u8, &index_record.certificate_digest, &previous.certificate_digest) or !std.meta.eql(index_record.position, previous.position) or previous.position.index > std.mem.readInt(u64, marker[8..16], .little) or previous.position.term > std.mem.readInt(u64, marker[0..8], .little)) return error.HistoryCorrupt;
+        return .{ .digest = previous.certificate_digest, .retained_bytes = previous.bytes, .position = previous.position };
+    }
+    if (!allow_create) return error.SourceOutcomeUnresolved;
+    if (position.index <= std.mem.readInt(u64, marker[8..16], .little) or position.term < std.mem.readInt(u64, marker[0..8], .little)) return error.HistoryAuthorityRequired;
+    if (try optional(txn, &publication_key) != null) return error.HistoryCorrupt;
+    const reserved = try plan.value.admission.reservationBytes(plan_raw.len);
+    if (credit.bytes != reserved or !std.mem.eql(u8, &credit.digest, &plan.value.digest) or charge > reserved or state.reserved_bytes < reserved) return error.HistoryCorrupt;
+    state.reserved_bytes -= reserved;
+    state.retained_bytes = std.math.add(u64, state.retained_bytes, charge) catch return error.HistoryFull;
+    if (state.retained_bytes > state.limit or state.reserved_bytes > state.limit - state.retained_bytes) return error.HistoryFull;
+    const index_record: CompletionPublicationRecord = .{ .transaction_id = id, .position = position, .certificate_digest = retained.certificate_digest };
+    try txn.put(&publication_key, &index_record.encode());
+    try txn.put(&certificate_key, canonical);
+    try txn.put(&retained_key, &retained.encode());
+    try txn.delete(&completionCreditKey(id));
+    try save(txn, state);
+    return .{ .digest = retained.certificate_digest, .retained_bytes = retained.bytes, .position = position };
+}
+
 /// Called under the native prepare/apply fence, before publishing the vote.
 /// BEGIN's durable credit must still bind this exact immutable admission.
 pub fn requireCompletionReservation(txn: anytype, namespace: frame.Namespace, admission: completion.Admission) !void {

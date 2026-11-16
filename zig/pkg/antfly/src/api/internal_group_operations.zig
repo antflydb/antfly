@@ -591,6 +591,7 @@ pub const Operations = struct {
                     if (ack.participants.len == 0 or ack.participants.len > 64) return error.InvalidArgument;
                     for (ack.participants) |participant| if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidArgument;
                 },
+                .publish_completion => |publication| if (publication.completion_owner.group_id != group_id) return error.InvalidArgument,
                 .cleanup => {},
             }
             break :transaction .transaction;

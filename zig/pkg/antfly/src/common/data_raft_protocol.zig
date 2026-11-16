@@ -40,10 +40,24 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 31;
+pub const batch_protocol_version: u16 = 32;
 /// Frozen completion BEGIN and owner/input-fenced PREPARE require durable
 /// activation across every applying member before proposal or native apply.
 pub const batch_completion_admission_protocol_version: u16 = 31;
+/// Complete-certificate publication adds retained accounting and an ordered
+/// publication journal. Version-31 admission support does not imply this phase.
+pub const batch_completion_publication_protocol_version: u16 = 32;
+pub fn completionProtocolVersion(request: anytype) ?u16 {
+    const mutation = request.transaction orelse return null;
+    return switch (mutation) {
+        .publish_completion => batch_completion_publication_protocol_version,
+        .begin => |value| if (value.completion_admission != null or value.completion_owner != null) batch_completion_admission_protocol_version else null,
+        .prepare => |value| if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
+        .resolve => |value| if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
+        else => null,
+    };
+}
+
 /// Dedicated retained-history control entries require native ordered dispatch
 /// and a durable all-applying-member activation barrier.
 pub const batch_history_control_protocol_version: u16 = 30;

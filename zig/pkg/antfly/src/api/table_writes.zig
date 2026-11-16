@@ -40580,6 +40580,66 @@ fn implementationTests() type {
             try std.testing.expectEqual(.aborted, try db.getTransactionStatus(guard_plan.transaction_id));
             const aborted = try db.historyResolution(a, .{ .authority = .raft, .namespace = namespace, .transaction_id = guard_plan.transaction_id, .owner_fence = routed_owner.digest(), .manifest_digest = (try guard_plan.manifest(62)).digest(), .commit_version = 62, .minimum_applied_index = 13 });
             try std.testing.expect(aborted.resolution == null);
+
+            const StateReader = struct {
+                fn read(database: *db_mod.DB) !retained_history.State {
+                    var txn = try database.core.store.beginReadTxn();
+                    defer txn.abort();
+                    return (try retained_history.load(&txn)).?;
+                }
+            };
+            const before_publication = try StateReader.read(&db);
+            const certificate = try completion.encode(a, .{ .manifest = try v2.manifest(40), .resolutions = &.{receipt.resolution.?} });
+            defer a.free(certificate);
+            try std.testing.expectError(error.SourceOutcomeUnresolved, db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 13 }));
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.publishReplicatedCompletionCertificate(certificate, replacement_owner, .{ .term = 1, .index = 14 }));
+            var conflicting_receipt = receipt.resolution.?;
+            conflicting_receipt.outcome.effects.frame_digest[0] ^= 1;
+            const conflicting_certificate = try completion.encode(a, .{ .manifest = try v2.manifest(40), .resolutions = &.{conflicting_receipt} });
+            defer a.free(conflicting_certificate);
+            try std.testing.expectError(error.DecisionConflict, db.publishReplicatedCompletionCertificate(conflicting_certificate, routed_owner, .{ .term = 1, .index = 14 }));
+            try std.testing.expectEqualDeep(before_publication, try StateReader.read(&db));
+            try std.testing.expectEqual(@as(u64, 13), (try db.orderedApplyReceipt()).?.index);
+            const publication = try db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 14 });
+            const after_publication = try StateReader.read(&db);
+            try std.testing.expectEqual(@as(u64, 14), publication.position.index);
+            const publication_record_raw = try db.core.store.get(a, &retained_history.completionPublicationKey(14));
+            defer a.free(publication_record_raw);
+            const publication_record = try retained_history.CompletionPublicationRecord.decode(publication_record_raw);
+            try std.testing.expectEqualDeep(v2_id, publication_record.transaction_id);
+            try std.testing.expectEqualDeep(publication.position, publication_record.position);
+            try std.testing.expectEqualDeep(publication.digest, publication_record.certificate_digest);
+            try std.testing.expectEqual(before_publication.reserved_bytes - try v2.reservationBytes(v2_bytes.len), after_publication.reserved_bytes);
+            try std.testing.expectEqual(before_publication.retained_bytes + publication.retained_bytes, after_publication.retained_bytes);
+            try std.testing.expectEqual(before_publication.latest, after_publication.latest);
+            try std.testing.expectEqualDeep(publication, try db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 14 }));
+            try std.testing.expectEqualDeep(publication, try db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 15 }));
+            try std.testing.expectEqualDeep(after_publication, try StateReader.read(&db));
+            try std.testing.expectError(error.NotFound, db.core.store.get(a, &retained_history.completionPublicationKey(15)));
+            const stored_certificate = try db.core.store.get(a, &retained_history.completionCertificateKey(v2_id));
+            defer a.free(stored_certificate);
+            try std.testing.expectEqualStrings(certificate, stored_certificate);
+            opened = false;
+            db.close();
+            db = try db_mod.DB.open(a, path, options);
+            opened = true;
+            try std.testing.expectEqualDeep(publication, try db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 14 }));
+            try std.testing.expectEqualDeep(after_publication, try StateReader.read(&db));
+            try std.testing.expectEqual(@as(u64, 15), (try db.orderedApplyReceipt()).?.index);
+            var committed_guard_plan = guard_plan;
+            committed_guard_plan.transaction_id = guard_id;
+            const guard_certificate = try completion.encode(a, .{ .manifest = try committed_guard_plan.manifest(52), .resolutions = &.{guard_receipt.resolution.?} });
+            defer a.free(guard_certificate);
+            const guard_publication = try db.publishReplicatedCompletionCertificate(guard_certificate, routed_owner, .{ .term = 1, .index = 16 });
+            const after_guard_publication = try StateReader.read(&db);
+            try std.testing.expectEqual(@as(u64, 16), guard_publication.position.index);
+            const guard_record_raw = try db.core.store.get(a, &retained_history.completionPublicationKey(16));
+            defer a.free(guard_record_raw);
+            const guard_record = try retained_history.CompletionPublicationRecord.decode(guard_record_raw);
+            try std.testing.expectEqualDeep(guard_id, guard_record.transaction_id);
+            try std.testing.expectEqual(after_publication.reserved_bytes - try committed_guard_plan.reservationBytes(guard_bytes.len), after_guard_publication.reserved_bytes);
+            try std.testing.expectEqual(after_publication.retained_bytes + guard_publication.retained_bytes, after_guard_publication.retained_bytes);
+            try std.testing.expectEqual(before_publication.latest, after_guard_publication.latest);
         }
 
         test "ordered history consumer grant wire contracts" {

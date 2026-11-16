@@ -218,6 +218,12 @@ pub fn applyReplicatedTransactionMutationInternal(
                 }
             }
         },
+        .publish_completion => |publication| {
+            try @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req);
+            const entry = raft_entry orelse return error.ChangefeedCapabilityUnsupported;
+            if (publication.completion_owner.group_id != group_id) return error.TopologyChanged;
+            _ = try db.publishReplicatedCompletionCertificate(publication.certificate, publication.completion_owner, entry);
+        },
         .acknowledge => |ack| (if (raft_entry) |entry|
             db.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(ack.txn_id, ack.participant, entry)
         else

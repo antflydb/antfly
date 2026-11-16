@@ -25992,6 +25992,39 @@ pub const DB = struct {
         }
     }
 
+    /// Private ordered publication of a certificate assembled from qualified
+    /// participant reads. Authorization and all-member protocol admission belong
+    /// to the serving Raft leader; native ownership and accounting remain here.
+    pub fn publishReplicatedCompletionCertificate(self: *DB, raw: []const u8, owner: @import("../transaction_completion.zig").RoutedOwner, entry: OrderedApplyReceipt) !@import("../committed_history.zig").CompletionPublication {
+        if (comptime storage_engine.enabled) return storage_engine.call("publishReplicatedCompletionCertificate", .{ self, raw, owner, entry });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (self.local_execution.replication_async_batch_mirror != null) return error.HistoryAuthorityRequired;
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        const disposition = try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry);
+        var txn = try self.core.store.beginWriteTxn();
+        var txn_open = true;
+        defer if (txn_open) txn.abort();
+        const result = try @import("../committed_history.zig").publishCompletion(self.alloc, &txn, namespace, self.core.root_generation, owner, raw, .{ .term = entry.term, .index = entry.index }, disposition == .apply);
+        if (disposition == .already_applied) {
+            txn.abort();
+            txn_open = false;
+            return result;
+        }
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+        try txn.put(marker.key, marker.value);
+        try txn.commit();
+        txn_open = false;
+        return result;
+    }
+
     /// Authenticated native owner provisioning for a resident managed writer.
     /// The serving owner must already have resolved this exact namespace from
     /// its linearizable catalog. This cannot convert a Raft-owned artifact.

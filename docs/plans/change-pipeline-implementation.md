@@ -2622,6 +2622,66 @@ Original-root retirement and topology handoff must preserve the evidence and row
 history until their consumers no longer need it. These are pending implementation
 requirements, not guarantees supplied by the assembler.
 
+## In progress: atomic native certificate publication
+
+`committed_history.publishCompletion` validates the complete certificate against
+the frozen v2 plan, original routed owner and physical namespace/root generation.
+It compares the included local resolution with the immutable locally retained
+receipt and checks that receipt against the actual persisted Raft apply cut.
+The trusted caller must still obtain remote evidence from qualified owner reads;
+structural validation does not authenticate a remote producer.
+
+The reducer canonicalizes the certificate and atomically exchanges the exact
+CCV1 reservation for a checksummed CRT1 retained-byte ledger covering the plan,
+local receipt, certificate, first-publication journal, keys and fixed record
+overhead. The checksummed journal is ordered by the actual first publication
+Raft index, making zero-effect certificates discoverable without a row frame.
+Fresh-entry retries preserve that original position and do not append another
+journal record. Exact retries compare
+all stored bytes, ledger fields and accounting without charging twice. Missing
+credit, conflicting receipt, mismatched owner or corrupt ledger fails before
+commit. The original plan remains retained and charged; primary metadata GC is
+still conservatively blocked pending the independent retention lifecycle.
+
+`DB.publishReplicatedCompletionCertificate` holds snapshot mutation admission and
+the native apply lock, rejects hidden/restore/mirrored scopes, and commits the
+publication together with the actual ordered marker. A previously applied entry
+cannot create a missing publication or rewrite the marker. Engine descriptor 45
+and owner ABI 99 prevent linking this layout with an older owner. Source/control
+catalog generation passed. The new native tests check debit/charge equality,
+row and positive no-effect certificates, same/fresh-entry retries, reopen,
+conflicting local evidence, wrong-root rejection and journal identity/duplicate
+checks. The first run found a duplicate test-local declaration; its compiled ABI
+scope passed, and the declaration was corrected after the run completed. The
+revised source run in `completion-publication-native-test.log` passed all seven
+history-consumer cases and local storage discovery after correcting that
+fixture's DB pointer argument.
+
+The source native accounting suite passed (seven history-consumer cases plus
+local storage discovery). The command is now wired as the isolated private
+`publish_completion_v1` transaction phase: it owns its complete certificate bytes,
+rejects downgraded/missing-owner/mixed-row forms, and binds transaction ID and
+original routed owner. Proposal admission revalidates that owner; native dispatch
+uses the actual committed Raft entry. Publication requires its own version-32
+all-applying-member activation floor; version-31 completion admission does not
+imply publication support. The encoder/decoder ceiling, proposer, native apply
+and projection fold share that required-version classification.
+
+The combined wire/native/compiled-owner/real-Raft run in
+`completion-publication-raft-test.log` finished with exit 0: all 27 wire/local
+cases, seven history-consumer cases, compiled-owner reopen scope and six real-Raft
+cases passed. Its real-Raft fixture takes qualified signed HTTP receipts,
+assembles the certificate, proposes publication twice and checks the durable
+version-32 floor. The protocol preflight negative fixture now exercises both
+history control (30 vs 29) and publication (32 vs 31), including upgrading the
+incompatible peer and distinguishing unknown capability. That additional
+qualification finished with exit 0 in
+`completion-publication-mixed-version-test.log`: all six real-Raft cases passed,
+including both explicit mixed-version preflight cases. The production coordinator, native/HA completion publication,
+independent metadata GC, owner-fenced retained-evidence GC, original-root topology
+handoff and all public/source/bootstrap/pgoutput/client requirements remain
+outstanding.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

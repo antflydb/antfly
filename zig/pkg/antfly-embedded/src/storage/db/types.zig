@@ -229,6 +229,12 @@ pub const TransactionMutation = union(enum) {
         status: TxnStatus,
         commit_version: u64,
     },
+    /// Private complete-certificate publication, isolated from row effects.
+    publish_completion: struct {
+        txn_id: TxnId,
+        completion_owner: @import("../transaction_completion.zig").RoutedOwner,
+        certificate: []const u8,
+    },
     /// Coordinator-side acknowledgement that one participant has durably
     /// learned the terminal decision. This must be ordered by coordinator
     /// Raft rather than written by a replica-local recovery worker.

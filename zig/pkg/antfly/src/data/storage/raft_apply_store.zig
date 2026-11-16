@@ -2458,9 +2458,9 @@ pub const RaftApplyStore = struct {
             try operations.append(alloc, .{ .set_raft_batch_protocol = version });
             return;
         }
-        if (@import("antfly_local_sources").api_internal_batch.requiresCompletionProtocol(decoded.batch.req)) {
+        if (@import("../../common/data_raft_protocol.zig").completionProtocolVersion(decoded.batch.req)) |required| {
             if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
-            try operations.append(alloc, .{ .require_batch_protocol = @import("../../common/data_raft_protocol.zig").batch_completion_admission_protocol_version });
+            try operations.append(alloc, .{ .require_batch_protocol = required });
         }
         const native_transfer = decoded.batch.req.restore_staging != null or
             (if (decoded.batch.req.merge_page) |page| page.source.integrity != null else false) or

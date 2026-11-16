@@ -1950,14 +1950,14 @@ const RaftTableApplyStateMachine = struct {
         req: antfly.db.types.BatchRequest,
         storage_owner_descriptor: ?kernel_owner_descriptor.Descriptor,
     ) !void {
-        if (@import("antfly_local_sources").api_internal_batch.requiresCompletionProtocol(req)) {
+        if (@import("../common/data_raft_protocol.zig").completionProtocolVersion(req)) |required| {
             if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
             const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
             const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
                 error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
                 else => return err,
             };
-            if (floor < @import("../common/data_raft_protocol.zig").batch_completion_admission_protocol_version) return error.UnsupportedBatchProtocolVersion;
+            if (floor < required) return error.UnsupportedBatchProtocolVersion;
         }
         if (@import("builtin").is_test) {
             self.test_faults.document_apply_attempts += 1;
@@ -12790,8 +12790,7 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
-        if (@import("antfly_local_sources").api_internal_batch.requiresCompletionProtocol(req))
-            return @import("../common/data_raft_protocol.zig").batch_completion_admission_protocol_version;
+        if (@import("../common/data_raft_protocol.zig").completionProtocolVersion(req)) |required| return required;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
             return @import("../common/data_raft_protocol.zig").batch_dense_artifact_flags_protocol_version;
         if (req.graph_endpoint_cleanup) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
@@ -13934,6 +13933,7 @@ pub const DataServer = struct {
                     .begin => |begin| begin.completion_owner orelse return error.InvalidHistoryAdmission,
                     .prepare => |prepare| prepare.completion_owner orelse return error.InvalidHistoryAdmission,
                     .resolve => |resolve| resolve.completion_owner orelse return error.InvalidHistoryAdmission,
+                    .publish_completion => |publication| publication.completion_owner,
                     else => return error.InvalidBatchRequest,
                 };
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
@@ -43879,6 +43879,11 @@ fn consumerTests() type {
                 var checked_certificate = try completion_contract.parse(a, certificate_bytes);
                 defer checked_certificate.deinit();
                 try std.testing.expectEqual(@as(usize, 1), checked_certificate.value.certificate.resolutions.len);
+                const publication: antfly.db.types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .publish_completion = .{ .txn_id = txn_id, .completion_owner = current_owner, .certificate = certificate_bytes } } };
+                for (0..2) |_| {
+                    try server.proposeRaftBatchGroupWithLeaderWait(a, 601, "docs", publication, .{ .discovery = .cached, .write_route_fence = route.fence(), .admission_deadline_ns = server.dataRaftMonotonicNs() + 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
+                }
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
             }
             const rejected = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 99 } });
             try std.testing.expectEqual(.checkpoint_conflict, rejected.outcome.?.rejected);
@@ -43989,54 +43994,55 @@ fn consumerTests() type {
         }
 
         test "data raft ordered history protocol preflight distinguishes incompatible and unavailable peers" {
-            const a = std.testing.allocator;
-            const required = @import("history_control_entry.zig").required_protocol_version;
-            const Fake = struct {
-                versions: [3]u16 = .{ required, required - 1, required },
-                probes: [3]usize = @splat(0),
-                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
-                    const self: *@This() = @ptrCast(@alignCast(ptr));
-                    const index: usize = if (std.mem.startsWith(u8, request.uri, "http://peer-2/")) 0 else if (std.mem.startsWith(u8, request.uri, "http://peer-3/")) 1 else 2;
-                    self.probes[index] += 1;
-                    return .{ .status = 200, .body = try std.fmt.allocPrint(alloc, "{{\"data_raft_batch_protocol_version\":{d}}}", .{self.versions[index]}) };
+            inline for (.{ @import("history_control_entry.zig").required_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version }) |required| {
+                const a = std.testing.allocator;
+                const Fake = struct {
+                    versions: [3]u16 = .{ required, required - 1, required },
+                    probes: [3]usize = @splat(0),
+                    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        const index: usize = if (std.mem.startsWith(u8, request.uri, "http://peer-2/")) 0 else if (std.mem.startsWith(u8, request.uri, "http://peer-3/")) 1 else 2;
+                        self.probes[index] += 1;
+                        return .{ .status = 200, .body = try std.fmt.allocPrint(alloc, "{{\"data_raft_batch_protocol_version\":{d}}}", .{self.versions[index]}) };
+                    }
+                };
+                var fake: Fake = .{};
+                var http_host: antfly.raft.HttpHost = undefined;
+                http_host.request_executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } };
+                var raft: antfly.raft.ManagedHttpHostService = undefined;
+                raft.host.http_host = &http_host;
+                var server: DataServer = undefined;
+                server.alloc = a;
+                server.backend_runtime = null;
+                server.data_raft = &raft;
+                server.api_server_cfg = .{};
+                server.data_raft_protocol_capability_mutex = .unlocked;
+                server.data_raft_protocol_capabilities = .empty;
+                defer {
+                    var it = server.data_raft_protocol_capabilities.valueIterator();
+                    while (it.next()) |entry| a.destroy(entry.*);
+                    server.data_raft_protocol_capabilities.deinit(a);
                 }
-            };
-            var fake: Fake = .{};
-            var http_host: antfly.raft.HttpHost = undefined;
-            http_host.request_executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } };
-            var raft: antfly.raft.ManagedHttpHostService = undefined;
-            raft.host.http_host = &http_host;
-            var server: DataServer = undefined;
-            server.alloc = a;
-            server.backend_runtime = null;
-            server.data_raft = &raft;
-            server.api_server_cfg = .{};
-            server.data_raft_protocol_capability_mutex = .unlocked;
-            server.data_raft_protocol_capabilities = .empty;
-            defer {
-                var it = server.data_raft_protocol_capabilities.valueIterator();
-                while (it.next()) |entry| a.destroy(entry.*);
-                server.data_raft_protocol_capabilities.deinit(a);
+                var plan: DataRaftProtocolProbePlan = .{ .routes_complete = true, .conf_state_fingerprint = 123, .peers = &.{ .{ .node_id = 2, .raft_url = "http://peer-2" }, .{ .node_id = 3, .raft_url = "http://peer-3" }, .{ .node_id = 4, .raft_url = "http://peer-4" } } };
+                const mixed = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
+                try std.testing.expectEqual(@as(u16, 0), mixed.activatable_version);
+                try std.testing.expectEqual(.unsupported, mixed.failure);
+                try std.testing.expectEqual(@as(u64, 123), mixed.conf_state_fingerprint);
+                try std.testing.expectEqualSlices(usize, &.{ 1, 1, 0 }, &fake.probes);
+                fake.versions[1] = required;
+                const upgraded = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
+                try std.testing.expectEqual(required, upgraded.activatable_version);
+                try std.testing.expectEqual(.none, upgraded.failure);
+                try std.testing.expectEqualSlices(usize, &.{ 2, 2, 1 }, &fake.probes);
+                fake.versions[2] = 0;
+                const unknown = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
+                try std.testing.expectEqual(@as(u16, 0), unknown.activatable_version);
+                try std.testing.expectEqual(.unavailable, unknown.failure);
+                plan.routes_complete = false;
+                const missing = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
+                try std.testing.expectEqual(.unavailable, missing.failure);
+                try std.testing.expectEqualSlices(usize, &.{ 3, 3, 2 }, &fake.probes);
             }
-            var plan: DataRaftProtocolProbePlan = .{ .routes_complete = true, .conf_state_fingerprint = 123, .peers = &.{ .{ .node_id = 2, .raft_url = "http://peer-2" }, .{ .node_id = 3, .raft_url = "http://peer-3" }, .{ .node_id = 4, .raft_url = "http://peer-4" } } };
-            const mixed = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
-            try std.testing.expectEqual(@as(u16, 0), mixed.activatable_version);
-            try std.testing.expectEqual(.unsupported, mixed.failure);
-            try std.testing.expectEqual(@as(u64, 123), mixed.conf_state_fingerprint);
-            try std.testing.expectEqualSlices(usize, &.{ 1, 1, 0 }, &fake.probes);
-            fake.versions[1] = required;
-            const upgraded = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
-            try std.testing.expectEqual(required, upgraded.activatable_version);
-            try std.testing.expectEqual(.none, upgraded.failure);
-            try std.testing.expectEqualSlices(usize, &.{ 2, 2, 1 }, &fake.probes);
-            fake.versions[2] = 0;
-            const unknown = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
-            try std.testing.expectEqual(@as(u16, 0), unknown.activatable_version);
-            try std.testing.expectEqual(.unavailable, unknown.failure);
-            plan.routes_complete = false;
-            const missing = server.dataRaftBatchProtocolPreflight(a, plan, required, std.math.maxInt(u64), null);
-            try std.testing.expectEqual(.unavailable, missing.failure);
-            try std.testing.expectEqualSlices(usize, &.{ 3, 3, 2 }, &fake.probes);
         }
 
         test "raft cleanup protocol preflight rejects mixed decoders and rechecks upgraded peers" {

@@ -537,6 +537,7 @@ pub const OwnedBatchRequest = struct {
     merge_proof_adoption: ?std.json.Parsed(@import("../storage/db/merge_proof_adoption.zig").Command) = null,
     transaction_participants: [][]const u8 = &.{},
     transaction_completion_admission: ?[]u8 = null,
+    transaction_completion_certificate: ?[]u8 = null,
     split_checkpoint_range_start: ?[]u8 = null,
     split_checkpoint_range_end: ?[]u8 = null,
     split_transition_key: ?[]u8 = null,
@@ -600,6 +601,7 @@ pub const OwnedBatchRequest = struct {
         for (self.predicates) |predicate| alloc.free(@constCast(predicate.key));
         if (self.predicates.len > 0) alloc.free(self.predicates);
         if (self.transaction_completion_admission) |raw| alloc.free(raw);
+        if (self.transaction_completion_certificate) |raw| alloc.free(raw);
         for (self.transaction_participants) |participant| alloc.free(participant);
         if (self.transaction_participants.len > 0) alloc.free(self.transaction_participants);
         if (self.split_checkpoint_range_start) |value| alloc.free(value);
@@ -1507,6 +1509,8 @@ fn parseBatchRequestWithOptions(
 
     var transaction_completion_admission: ?[]u8 = null;
     errdefer if (transaction_completion_admission) |raw| alloc.free(raw);
+    var transaction_completion_certificate: ?[]u8 = null;
+    errdefer if (transaction_completion_certificate) |raw| alloc.free(raw);
     var transaction_participants: [][]const u8 = &.{};
     var transaction_participants_initialized: usize = 0;
     errdefer {
@@ -1526,12 +1530,22 @@ fn parseBatchRequestWithOptions(
         if (completion_begin != object.contains("completion_admission")) return error.InvalidBatchRequest;
         const completion_prepare = std.mem.eql(u8, phase_value.string, "prepare_completion_v1");
         const completion_resolve = std.mem.eql(u8, phase_value.string, "resolve_completion_v1");
-        if (!completion_begin and !completion_prepare and !completion_resolve and object.contains("completion_owner")) return error.InvalidBatchRequest;
+        const completion_publish = std.mem.eql(u8, phase_value.string, "publish_completion_v1");
+        if (completion_publish != object.contains("completion_certificate")) return error.InvalidBatchRequest;
+        if (!completion_begin and !completion_prepare and !completion_resolve and !completion_publish and object.contains("completion_owner")) return error.InvalidBatchRequest;
         var completion_owner: ?@import("../storage/transaction_completion.zig").RoutedOwner = null;
         if (object.get("completion_owner")) |item| {
             var parsed_owner = std.json.parseFromValue(@import("../storage/transaction_completion.zig").RoutedOwner, alloc, item, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBatchRequest;
             defer parsed_owner.deinit();
             completion_owner = parsed_owner.value;
+        }
+        if (completion_publish) {
+            const raw = object.get("completion_certificate").?;
+            if (raw != .string) return error.InvalidBatchRequest;
+            const binding = completion_owner orelse return error.InvalidBatchRequest;
+            try validateCompletionPublication(alloc, txn_id, binding, raw.string);
+            transaction_completion_certificate = try alloc.dupe(u8, raw.string);
+            break :transaction .{ .publish_completion = .{ .txn_id = txn_id, .completion_owner = binding, .certificate = transaction_completion_certificate.? } };
         }
         if (std.mem.eql(u8, phase_value.string, "begin") or completion_begin) {
             const participants_value = object.get("participants") orelse return error.InvalidBatchRequest;
@@ -1649,7 +1663,7 @@ fn parseBatchRequestWithOptions(
     if (relational_generation_gc != null and (transaction != null or relational_topology != null or row_policy_publication != null or writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0 or integrity.len != 0 or integrity_commands != null or relational_activation != null or relational_retirement != null or relational_index_maintenance != null or split_checkpoint != null or split_replication != null or split_transition != null or merge_checkpoint != null or merge_replication != null or merge_source_transition != null)) return error.InvalidBatchRequest;
     if (relational_topology != null and (relational_schema_version != null or relational_integrity_generation_set != null or relational_repair)) return error.InvalidBatchRequest;
     if (transaction) |mutation| switch (mutation) {
-        .begin, .resolve, .acknowledge, .acknowledge_many, .cleanup => if (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0)
+        .begin, .resolve, .publish_completion, .acknowledge, .acknowledge_many, .cleanup => if (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or predicates.len != 0)
             return error.InvalidBatchRequest,
         .prepare => {},
     };
@@ -1718,6 +1732,7 @@ fn parseBatchRequestWithOptions(
         .merge_proof_adoption = merge_proof_adoption,
         .transaction_participants = transaction_participants,
         .transaction_completion_admission = transaction_completion_admission,
+        .transaction_completion_certificate = transaction_completion_certificate,
         .split_checkpoint_range_start = checkpoint_start,
         .split_checkpoint_range_end = checkpoint_end,
         .split_transition_key = transition_key,
@@ -2399,6 +2414,12 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
                     if (resolve.completion_owner != null) "resolve_completion_v1" else "resolve", &txn_hex, std.json.fmt(@tagName(resolve.status), .{}), resolve.commit_version,
                 });
                 if (resolve.completion_owner) |owner| try writer.print(",\"completion_owner\":{f}", .{std.json.fmt(owner, .{})});
+            },
+            .publish_completion => |publication| {
+                try validateCompletionControlRequest(req);
+                try validateCompletionPublication(alloc, publication.txn_id, publication.completion_owner, publication.certificate);
+                const txn_hex = std.fmt.bytesToHex(publication.txn_id, .lower);
+                try writer.print("\"phase\":\"publish_completion_v1\",\"txn_id\":\"{s}\",\"completion_owner\":{f},\"completion_certificate\":{f}", .{ &txn_hex, std.json.fmt(publication.completion_owner, .{}), std.json.fmt(publication.certificate, .{}) });
             },
             .acknowledge => |ack| {
                 const txn_hex = std.fmt.bytesToHex(ack.txn_id, .lower);
@@ -3818,6 +3839,14 @@ pub fn validateCompletionControlRequest(req: db_mod.types.BatchRequest) !void {
 /// A completion BEGIN freezes the same complete participant set at every root.
 /// Recovery order is coordinator first, then canonical namespace order excluding
 /// the coordinator. Unknown phases cannot downgrade to legacy admission.
+pub fn validateCompletionPublication(a: std.mem.Allocator, id: [16]u8, owner: @import("../storage/transaction_completion.zig").RoutedOwner, raw: []const u8) !void {
+    const completion = @import("../storage/transaction_completion.zig");
+    var parsed = completion.parse(a, raw) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBatchRequest;
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, &parsed.value.certificate.manifest.transaction_id, &id)) return error.InvalidBatchRequest;
+    try parsed.value.certificate.manifest.admission().requireRoutedOwner(owner);
+}
+
 pub fn validateCompletionBegin(a: std.mem.Allocator, raw: []const u8, id: [16]u8, participants: []const []const u8, owner: ?@import("../storage/transaction_completion.zig").RoutedOwner, topology_epoch: u64) !void {
     const completion = @import("../storage/transaction_completion.zig");
     var plan = completion.parseAdmission(a, raw) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBatchRequest;
@@ -3935,6 +3964,7 @@ pub fn requiresCompletionProtocol(request: db_mod.types.BatchRequest) bool {
         .begin => |begin| begin.completion_admission != null or begin.completion_owner != null,
         .prepare => |prepare| prepare.completion_owner != null,
         .resolve => |resolve| resolve.completion_owner != null,
+        .publish_completion => true,
         else => false,
     };
 }
@@ -4010,4 +4040,45 @@ test "completion begin wire resolution fences owner and rejects downgrade" {
     try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, missing));
     request.deletes = &.{"unrelated"};
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, request));
+}
+
+test "completion begin wire publication owns complete certificate and rejects downgrade" {
+    const a = std.testing.allocator;
+    const completion = @import("../storage/transaction_completion.zig");
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 7, .topology_epoch = 3 };
+    const members = [_]completion.Participant{.{ .namespace = owner.namespace, .owner_fence = owner.digest(), .roles = completion.Roles.guards, .locator = "table2:4:docs:group:7", .input_digest = @splat(5) }};
+    const manifest: completion.Manifest = .{ .version = 2, .transaction_id = @splat(4), .admission_digest = @splat(6), .coordinator_namespace = owner.namespace, .coordinator_fence = owner.digest(), .participants = &members, .commit_version = 10 };
+    var position: [32]u8 = @splat(0);
+    std.mem.writeInt(u64, position[0..8], 1, .little);
+    std.mem.writeInt(u64, position[8..16], 1, .little);
+    position[31] = 1;
+    const receipt: completion.Resolution = .{ .namespace = owner.namespace, .owner_fence = owner.digest(), .manifest_digest = manifest.digest(), .commit_version = 10, .source_position = position, .outcome = .{ .no_effect = completion.noEffectProof(manifest, owner.namespace, position) } };
+    const certificate = try completion.encode(a, .{ .manifest = manifest, .resolutions = &.{receipt} });
+    defer a.free(certificate);
+    var request: db_mod.types.BatchRequest = .{ .transaction = .{ .publish_completion = .{ .txn_id = manifest.transaction_id, .completion_owner = owner, .certificate = certificate } } };
+    const raw = try encodeBatchRequest(a, request);
+    defer a.free(raw);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, raw));
+    var decoded = try parseInternalBatchRequest(a, raw);
+    defer decoded.deinit(a);
+    try std.testing.expect(requiresCompletionProtocol(decoded.req));
+    try std.testing.expectEqualStrings(certificate, decoded.req.transaction.?.publish_completion.certificate);
+    try std.testing.expectEqualDeep(owner, decoded.req.transaction.?.publish_completion.completion_owner);
+    request.deletes = &.{"unrelated"};
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, request));
+    request.deletes = &.{};
+    request.transaction.?.publish_completion.txn_id[0] ^= 1;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, request));
+    var json = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer json.deinit();
+    const transaction = json.value.object.getPtr("_transaction").?;
+    try transaction.object.put(json.arena.allocator(), "phase", .{ .string = "resolve" });
+    const downgraded = try std.json.Stringify.valueAlloc(a, json.value, .{});
+    defer a.free(downgraded);
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, downgraded));
+    try transaction.object.put(json.arena.allocator(), "phase", .{ .string = "publish_completion_v1" });
+    _ = transaction.object.swapRemove("completion_owner");
+    const missing = try std.json.Stringify.valueAlloc(a, json.value, .{});
+    defer a.free(missing);
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, missing));
 }
