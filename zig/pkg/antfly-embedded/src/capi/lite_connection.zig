@@ -2478,6 +2478,16 @@ pub const Owner = struct {
         return self.current == null or self.registeredDemand().any();
     }
 
+    /// `registeredDemandOrUnknown` without clock-driven demand: what a
+    /// write or a lane checkin can make worth an immediate turn.
+    fn mutationDemandOrUnknown(self: *Owner) bool {
+        return self.current == null or mutationDemand(self.registeredDemand()).any();
+    }
+
+    /// How often clock-driven demand alone (TTL cleanup) gets a turn.
+    /// Matches `maintenanceWaitMillis`'s idle poll.
+    const periodic_turn_interval_ns: i96 = std.time.ns_per_s;
+
     fn tableDemand(database: *h.db_mod.DB) Demand {
         return .{
             .index = database.core.hasManagedIndexes(),
@@ -2534,7 +2544,20 @@ pub const Owner = struct {
     pub fn notifyMutation(self: *Owner) void {
         self.allocator_certificate_pending = true;
         self.maybeRaiseAllocatorCertificateBootstrapWorthwhile();
-        self.notifyDemand(self.registeredDemand());
+        self.notifyDemand(mutationDemand(self.registeredDemand()));
+    }
+
+    /// The part of `registered` a write can make urgent. TTL cleanup is
+    /// clock-driven (`ttl_runtime.Config.interval_ms`), and the idle
+    /// worker's periodic poll (`maintenanceWaitMillis`, 1s while any demand
+    /// is registered) already services it. Every Lite database outside
+    /// tests runs a TTL runtime, so counting it here made every write wake a
+    /// full maintenance turn that took the writer lease, and the next write
+    /// queued behind that turn even with no index, enrichment or resolver.
+    fn mutationDemand(registered: Demand) Demand {
+        var mask = registered;
+        mask.ttl = false;
+        return mask;
     }
 
     /// Cheap and lock-free (reads fields already resident on the current
@@ -3716,6 +3739,7 @@ pub const Owner = struct {
         // explicit stop) wakes this immediately.
         var next_wait_ms: i64 = if (self.registeredDemandOrUnknown()) 1000 else no_scheduled_wait;
         var earliest_turn_ns: i96 = 0;
+        var next_periodic_turn_ns: i96 = 0;
         while (!self.stopping.load(.acquire)) {
             // Bound the wait while `WriterLane.checkin` still has a lease
             // parked: `maintainParkedLease` is what actually enforces
@@ -3769,13 +3793,21 @@ pub const Owner = struct {
             // is true -- `notifyDemand`'s own doc comment), so this cannot
             // starve real work, only the lease-parking timer's own spurious
             // wakes.
-            if (earliest_turn_ns == 0 and !self.registeredDemandOrUnknown() and !self.maintenance_pending and
+            //
+            // Clock-driven demand (TTL cleanup, which every Lite database
+            // outside tests registers) does not count here: a checkin
+            // wake on every write would otherwise run a full turn, which
+            // takes the writer lease, between consecutive writes. It gets
+            // at most one turn per `periodic_turn_interval_ns` instead.
+            const periodic_due = self.registeredDemand().ttl and now >= next_periodic_turn_ns;
+            if (earliest_turn_ns == 0 and !self.mutationDemandOrUnknown() and !periodic_due and !self.maintenance_pending and
                 !self.maintenance_storage_pending and self.maintenance_table_cursor == 0)
             {
                 next_wait_ms = self.maintenanceWaitMillis(false);
                 earliest_turn_ns = 0;
                 continue;
             }
+            next_periodic_turn_ns = now + periodic_turn_interval_ns;
             const pending = self.maintenanceTurn() catch |err| blk: {
                 // Capture/control failures otherwise disappear before the
                 // detached replay diagnostics can observe them.
@@ -3792,7 +3824,11 @@ pub const Owner = struct {
             // namespace. Otherwise 45 unrelated tables add 4.5 seconds to
             // every activation, delivery, claim and publication observation.
             next_wait_ms = self.maintenanceWaitMillis(pending);
-            earliest_turn_ns = if (next_wait_ms < 0) 0 else std.Io.Clock.awake.now(io).nanoseconds + if (pending) @as(i96, next_wait_ms) * std.time.ns_per_ms else 0;
+            // Only a turn that left work behind schedules a follow-up. After
+            // an idle turn this stays 0: a nonzero `earliest_turn_ns` (it
+            // used to be set to "now" here) disables the idle skip above,
+            // so every later lane-checkin wake ran a full turn.
+            earliest_turn_ns = if (next_wait_ms < 0 or !pending) 0 else std.Io.Clock.awake.now(io).nanoseconds + @as(i96, next_wait_ms) * std.time.ns_per_ms;
         }
     }
 
@@ -6342,6 +6378,61 @@ test "no-consumer path registeredDemand is empty for a plain Lite DB" {
     try std.testing.expectEqual(Owner.no_scheduled_wait, owner.maintenanceWaitMillisForTest(false));
     // Pending-from-this-turn still takes priority over demand, unaffected.
     try std.testing.expectEqual(@as(i64, 100), owner.maintenanceWaitMillisForTest(true));
+}
+
+test "no-consumer path clock-driven TTL demand does not run a maintenance turn per write" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("no-consumer-ttl-turns");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    // Outside tests every Lite database runs a TTL runtime
+    // (`ttl_runtime.Config.enabled` defaults to `!builtin.is_test`); enable
+    // it here so this exercises the same demand the product sees.
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .ttl_cleanup = .{ .enabled = true } }, true);
+    _ = try wrapper.lite_connection.?.owner.current.?.db.deleteIndex("full_text_index_v0");
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    const owner = wrapper.lite_connection.?.owner;
+    try std.testing.expect(owner.worker != null);
+    const demand = owner.registeredDemandForTest();
+    try std.testing.expect(demand.ttl);
+    try std.testing.expect(!Owner.mutationDemand(demand).any());
+
+    // Let the index deletion's own drain finish before measuring.
+    {
+        var quiet_ms: u64 = 0;
+        var last = owner.publication_stats.maintenance_lease.acquisitions;
+        var waited_ms: u64 = 0;
+        while ((quiet_ms < 1500 or owner.maintenance_pending) and waited_ms < 20000) : (waited_ms += 20) {
+            io.sleep(.fromMilliseconds(20), .awake) catch {};
+            const now_count = owner.publication_stats.maintenance_lease.acquisitions;
+            if (now_count == last) quiet_ms += 20 else {
+                quiet_ms = 0;
+                last = now_count;
+            }
+        }
+    }
+
+    const leases_before = owner.publication_stats.maintenance_lease.acquisitions;
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    var output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&output);
+    var body_buf: [160]u8 = undefined;
+    for (0..300) |i| {
+        const body = try std.fmt.bufPrint(&body_buf, "{{\"inserts\":{{\"doc:{d}\":{{\"search_text\":\"ttl demand write {d}\"}}}},\"sync_level\":\"write\"}}", .{ i, i });
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(id, .fromSlice(body), &output));
+        api.antfly_buffer_free_zero(&output);
+    }
+    const elapsed_s: u64 = @intCast(@divTrunc(std.Io.Clock.awake.now(io).nanoseconds - started, std.time.ns_per_s));
+    const maintenance_leases = owner.publication_stats.maintenance_lease.acquisitions - leases_before;
+    // Clock-driven demand gets at most one turn per second. Every write's
+    // lane checkin wakes the worker, and before this was gated each wake
+    // ran a full turn that took the writer lease: hundreds here.
+    try std.testing.expect(maintenance_leases <= elapsed_s + 3);
 }
 
 test "no-consumer path 1037 real primary writes cause no consumer-driven background work" {
