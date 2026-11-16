@@ -12776,6 +12776,8 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.transaction) |mutation| if (mutation == .begin and mutation.begin.completion_admission != null)
+            return @import("../common/data_raft_protocol.zig").batch_completion_admission_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
             return @import("../common/data_raft_protocol.zig").batch_dense_artifact_flags_protocol_version;
         if (req.graph_endpoint_cleanup) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
@@ -43865,6 +43867,14 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 2), try peers.historyControlLeader(601, 1, 2, true));
             peers.groups.getPtr(601).?.nodes.clearRetainingCapacity();
             try std.testing.expectError(error.GroupLeaderUnavailable, peers.historyControlLeader(601, 1, 2, true));
+        }
+
+        test "data raft ordered history completion BEGIN cannot use the legacy activation floor" {
+            const version = @import("../common/data_raft_protocol.zig");
+            const request: antfly.db.types.BatchRequest = .{ .transaction = .{ .begin = .{ .txn_id = @splat(1), .begin_timestamp = 1, .created_at_ns = 2, .topology_epoch = 3, .participants = &.{"table2:4:docs:group:7"}, .completion_admission = "reserved" } } };
+            try std.testing.expectEqual(version.batch_completion_admission_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+            try std.testing.expect(version.batch_completion_admission_protocol_version > version.batch_protocol_version);
+            try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, data_raft_batch.encode(std.testing.allocator, "docs", request));
         }
 
         test "data raft ordered history protocol preflight distinguishes incompatible and unavailable peers" {

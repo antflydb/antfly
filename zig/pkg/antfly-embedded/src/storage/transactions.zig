@@ -325,6 +325,9 @@ pub const ResolutionExtraBatch = struct {
 /// transaction metadata transition. Raft apply uses this to fence the exact log
 /// entry without a crash window between the transaction and its replay marker.
 pub const MutationExtraBatch = struct {
+    /// Computed by trusted private PREPARE dispatch over the complete original
+    /// canonical input. Never supplied directly by public mutation JSON.
+    completion_input_digest: ?[32]u8 = null,
     /// Immutable source-command fingerprint installed with BEGIN and required
     /// by PREPARE. Ordinary sessions cannot adopt a source transaction ID.
     source_purpose: ?[32]u8 = null,
@@ -800,6 +803,32 @@ pub const TxnManager = struct {
         try self.writeIntentsExtraBatch(txn_id, intents, predicates, .{});
     }
 
+    /// A true result means the original prepared images are already durable.
+    /// Check before materializing transforms/defaults on a retry. Null denotes
+    /// an ordinary or legacy transaction, never a v2 prepare authorization.
+    pub fn completionPrepareStatus(self: *TxnManager, txn_id: TxnId, input_digest: ?[32]u8, source_purpose: ?[32]u8) !?bool {
+        var frozen = (try self.getCompletionAdmission(self.alloc, txn_id)) orelse return null;
+        defer frozen.deinit();
+        const plan = frozen.value.admission;
+        if (plan.version != 2) {
+            if (input_digest != null) return error.ChangefeedCapabilityUnsupported;
+            return null;
+        }
+        const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
+        defer self.alloc.free(namespace);
+        if (namespace.len != 24) return error.InvalidTxnRecord;
+        const member = try plan.member(namespace[0..24].*);
+        const supplied = input_digest orelse return error.SourceTransactionIdentityConflict;
+        if (!std.mem.eql(u8, &supplied, &member.input_digest.?)) return error.SourceTransactionIdentityConflict;
+        var probe = try self.store.beginProbe();
+        defer probe.abort();
+        try @import("committed_history.zig").requireCompletionReservation(&probe, namespace[0..24].*, plan);
+        const record = try self.loadTransactionRecord(txn_id);
+        if (!samePurpose(record.source_purpose, source_purpose)) return error.SourceTransactionIdentityConflict;
+        if (record.status != .pending) return TxnError.DecisionConflict;
+        return record.prepared_known and record.prepared;
+    }
+
     pub fn writeIntentsExtraBatch(
         self: *TxnManager,
         txn_id: TxnId,
@@ -817,7 +846,12 @@ pub const TxnManager = struct {
             defer frozen.deinit();
             const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
             defer self.alloc.free(namespace);
+            if (namespace.len != 24) return error.InvalidTxnRecord;
             const participant = try frozen.value.admission.member(namespace[0..24].*);
+            if (frozen.value.admission.version == 2) {
+                const supplied = extra_batch.completion_input_digest orelse return error.SourceTransactionIdentityConflict;
+                if (!std.mem.eql(u8, &supplied, &participant.input_digest.?)) return error.SourceTransactionIdentityConflict;
+            } else if (extra_batch.completion_input_digest != null) return error.ChangefeedCapabilityUnsupported;
             if (participant.roles & completion.Roles.effects == 0) {
                 if (extra_batch.graph_sources.len != 0) return error.InvalidParticipant;
                 for (intents) |intent| if (participant.roles & completion.Roles.checkpoint == 0 or !isRawMetadataIntentKey(intent.key)) return error.InvalidParticipant;
@@ -3897,12 +3931,19 @@ test "committed history completion admission raft resolution requires applying c
         _ = try history.admit(&enroll, namespace, @splat(1), 4 * 1024 * 1024, 1000, 1);
         try enroll.commit();
     }
-    const members = [_]completion.Participant{.{ .namespace = namespace, .owner_fence = @splat(4), .roles = completion.Roles.guards, .locator = "coordinator" }};
-    const admission: completion.Admission = .{ .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = @splat(4), .participants = &members };
+    const input_digest = completion.preparedInputDigest(namespace, "guard-only-input");
+    const members = [_]completion.Participant{.{ .namespace = namespace, .owner_fence = @splat(4), .roles = completion.Roles.guards, .locator = "coordinator", .input_digest = input_digest }};
+    const admission: completion.Admission = .{ .version = 2, .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = @splat(4), .participants = &members };
     var manager = try TxnManager.init(a, &store);
     defer manager.deinit();
     try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{});
-    try manager.writeIntents(admission.transaction_id, &.{}, &.{});
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.writeIntents(admission.transaction_id, &.{}, &.{}));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.writeIntentsExtraBatch(admission.transaction_id, &.{}, &.{}, .{ .completion_input_digest = @splat(7) }));
+    try std.testing.expectEqual(@as(?bool, false), try manager.completionPrepareStatus(admission.transaction_id, input_digest, null));
+    try manager.writeIntentsExtraBatch(admission.transaction_id, &.{}, &.{}, .{ .completion_input_digest = input_digest });
+    try std.testing.expectEqual(@as(?bool, true), try manager.completionPrepareStatus(admission.transaction_id, input_digest, null));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.completionPrepareStatus(admission.transaction_id, input_digest, @splat(8)));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.completionPrepareStatus(admission.transaction_id, null, null));
     try std.testing.expectError(error.HistoryAuthorityRequired, manager.resolveIntents(admission.transaction_id, .committed, 20));
     try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(admission.transaction_id));
     try std.testing.expectError(error.NotFound, manager.getAlloc(a, &completion.requestKey(admission.transaction_id)));

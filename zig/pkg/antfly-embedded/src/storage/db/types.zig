@@ -1755,6 +1755,9 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    /// Trusted digest computed from canonical private PREPARE before native
+    /// materialization. A frozen v2 plan rejects omission or substitution.
+    completion_input_digest: ?[32]u8 = null,
     /// Trusted source transaction metadata; public mutation JSON never sets it.
     source_admission: ?@import("../source_admission.zig").Command = null,
     document_version_scheme: DocumentVersionScheme = .admit_current,

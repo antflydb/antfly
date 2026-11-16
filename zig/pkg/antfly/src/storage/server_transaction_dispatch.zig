@@ -119,7 +119,13 @@ pub fn applyReplicatedTransactionMutationInternal(
                 );
         },
         .prepare => |prepare| {
+            const wire = @import("antfly_local_sources").api_internal_batch;
+            const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
+            const encoded_input = try wire.completionPrepareInput(alloc, req);
+            defer alloc.free(encoded_input);
+            const namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(db.core.identity_namespace);
             const intents: db_mod.types.TransactionIntentRequest = .{
+                .completion_input_digest = completion.preparedInputDigest(namespace, encoded_input),
                 .document_version_scheme = req.document_version_scheme,
                 .row_policy_principal_proof = req.row_policy_principal_proof,
                 .row_policy_database = req.row_policy_database,

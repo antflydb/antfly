@@ -26273,6 +26273,36 @@ pub const DB = struct {
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
     ) !void {
+        {
+            // Serialize this observation with decisions and prepared writes.
+            // An actual already-applied Raft entry is immutable and must stay
+            // replayable even after its transaction has committed or retired.
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            if (ordered_receipt) |identity| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
+                .already_applied => return,
+                .apply => {},
+            };
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            if (try manager.completionPrepareStatus(txn_id, req.completion_input_digest, if (req.source_admission) |command| command.fingerprint() else null)) |prepared| {
+                if (ordered_receipt == null) {
+                    var read = try self.core.store.beginReadTxn();
+                    defer read.abort();
+                    _ = try @import("../source_authority.zig").require(&read, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+                }
+                if (prepared) {
+                    // Keep first materialized images; only this actual entry's
+                    // applied marker advances on a fresh ordered retry.
+                    if (ordered_receipt) |identity| {
+                        var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+                        const marker = orderedApplyReceiptWrite(identity, &value_buf);
+                        try self.core.store.putBatch(&.{marker}, &.{});
+                    }
+                    return;
+                }
+            }
+        }
         const source_admission_mod = @import("../source_admission.zig");
         if (req.source_admission) |command| {
             try command.validate();
@@ -26664,10 +26694,11 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .completion_input_digest = req.completion_input_digest, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .completion_input_digest = req.completion_input_digest,
                 .source_purpose = if (req.source_admission) |command| command.fingerprint() else null,
                 .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,

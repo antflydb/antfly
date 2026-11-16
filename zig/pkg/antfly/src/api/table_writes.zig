@@ -40476,6 +40476,47 @@ fn implementationTests() type {
             const after_full = try db.core.store.get(a, retained_history.state_key);
             defer a.free(after_full);
             try std.testing.expectEqualStrings(before_full, after_full);
+            const batch_wire = @import("antfly_local_sources").api_internal_batch;
+            const v2_id: [16]u8 = @splat(9);
+            const prepare: db_mod.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = v2_id, .topology_epoch = 1 } }, .writes = &.{.{ .key = "v2-row", .value = "{\"v\":1}" }} };
+            const prepare_bytes = try batch_wire.completionPrepareInput(a, prepare);
+            defer a.free(prepare_bytes);
+            const input_digest = completion.preparedInputDigest(namespace, prepare_bytes);
+            const v2_members = [_]completion.Participant{.{ .namespace = namespace, .owner_fence = @splat(2), .roles = completion.Roles.effects, .locator = members[0].locator, .input_digest = input_digest }};
+            const v2: completion.Admission = .{ .version = 2, .transaction_id = v2_id, .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = @splat(2), .participants = &v2_members };
+            const v2_bytes = try completion.encodeAdmission(a, v2);
+            defer a.free(v2_bytes);
+            _ = try db.beginReplicatedCompletionTransaction(v2_bytes, 30, 31, true, .{ .term = 1, .index = 3 });
+            var intent_request: db_mod.types.TransactionIntentRequest = .{ .writes = &.{.{ .key = "v2-row", .value = "{\"v\":1}" }} };
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 4 }));
+            intent_request.completion_input_digest = @splat(7);
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 4 }));
+            try std.testing.expectEqual(@as(u64, 3), (try db.orderedApplyReceipt()).?.index);
+            intent_request.completion_input_digest = input_digest;
+            try db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 4 });
+            try std.testing.expect((try db.get(a, "v2-row")) == null);
+            const intent_key = try std.fmt.allocPrint(a, "\x00\x00__txn_intents__:{s}:v2-row", .{&v2_id});
+            defer a.free(intent_key);
+            const original_intents = try db.core.store.get(a, intent_key);
+            defer a.free(original_intents);
+            try db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 5 });
+            try std.testing.expectEqual(@as(u64, 5), (try db.orderedApplyReceipt()).?.index);
+            const retry_intents = try db.core.store.get(a, intent_key);
+            defer a.free(retry_intents);
+            try std.testing.expectEqualStrings(original_intents, retry_intents);
+            opened = false;
+            db.close();
+            db = try db_mod.DB.open(a, path, options);
+            opened = true;
+            try db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 6 });
+            try db.resolveReplicatedTransactionAtOrderedReceipt(v2_id, .committed, 40, .write, .none, .{ .term = 1, .index = 7 }, null);
+            const receipt = try db.historyResolution(a, .{ .authority = .raft, .namespace = namespace, .transaction_id = v2_id, .owner_fence = @splat(2), .manifest_digest = (try v2.manifest(40)).digest(), .commit_version = 40, .minimum_applied_index = 7 });
+            try std.testing.expect(receipt.resolution != null);
+            try std.testing.expectEqual(@as(u64, 7), receipt.cut.index);
+            try std.testing.expectEqual(@as(u64, 1), receipt.resolution.?.outcome.effects.sequence);
+            try db.writeReplicatedTransactionAtOrderedReceipt(v2_id, intent_request, .{ .term = 1, .index = 4 });
+            try std.testing.expectEqual(@as(u64, 7), (try db.orderedApplyReceipt()).?.index);
+            try std.testing.expectEqual(.committed, try db.getTransactionStatus(v2_id));
         }
 
         test "ordered history consumer grant wire contracts" {

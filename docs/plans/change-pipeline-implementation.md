@@ -2304,6 +2304,50 @@ checking, current owner fencing, all-applying-member activation, coordinator
 wiring, positive receipt collection/publication and all remaining full issue
 acceptance work remain outstanding.
 
+## In progress: durable v2 PREPARE input enforcement
+
+The native transaction request and mutation-extra batch now carry a trusted
+completion-input digest, computed by private server dispatch from the complete
+canonical PREPARE request and physical namespace. V2 transaction-manager intent
+admission rejects omitted or substituted digests before writing intents; V1
+cannot be silently upgraded through this field. Existing role and reserved
+completion-capacity checks remain in that path.
+
+DB prepare observes a v2 durable prepare under the apply lock before expanding
+transforms/defaults or recompiling row images. An exact pending retry retains
+its original prepared bytes. Under Raft, a fresh retry entry advances only its
+actual applied marker under the same lock; it does not rewrite intents or emit
+a new row event. The typed request boundary changes engine descriptor to 41.
+
+The retry shortcut also verifies the original source-purpose binding. It cannot
+use a local request to prepare a Raft-authoritative v2 transaction. Old actual
+Raft PREPARE entries remain replayable after commit/retirement through the
+existing applied-cut check, without rewriting or advancing committed state.
+
+Completion admission reserves protocol 31 while the advertised ceiling remains
+30. Proposal minimum-version selection and the Raft encoder/decoder refuse the
+new BEGIN below that floor, preventing a versioned batch from being admitted as
+legacy work before complete activation. Production BEGIN dispatch still rejects
+it until owner/input ingress and all-applying-member activation are fully wired.
+
+The compiled-owner gate passed against descriptor 41 and all six actual Raft
+tests passed in `completion-prepare-enforcement-test.log`, including reserved
+activation-floor selection and encoder rejection. That combined command exited
+1 because the DB test used an incorrect direct intent lookup key. After inspecting
+the actual intent format (transaction prefix + raw ID + colon + logical row key),
+the source suite was rerun successfully: all seven selected tests passed with
+exit 0 in `completion-prepare-source-test.log`.
+
+The DB test checks missing/wrong input rejection without marker advance,
+byte-identical original intents across a fresh retry, physical reopen, commit
+resolution, a positive effects receipt at the actual committed cut and replay
+of an old PREPARE after commit. `docstore-history-test` also passed all ten
+selected tests with exit 0 in `completion-prepare-manager-test.log`; the extended
+v2 zero-effect fixture directly verifies missing/wrong input rejection and that
+a prepared retry cannot bypass source-purpose binding. Source catalog generation
+completed. Production activation, positive network receipt collection/publication
+and all broader issue requirements remain outstanding.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build
