@@ -155130,10 +155130,15 @@ test "privacy scoped readiness serves A while sibling B backfills" {
         try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config, .coverage_generation = i + 1 });
         const text_name = if (i == 0) "text-A" else "text-B";
         const text_config = try std.fmt.allocPrint(scratch, "{{\"sources\":[{{\"artifact\":\"{s}\",\"field\":\"text\"}}]}}", .{chunks});
-        try db.addIndex(.{ .name = text_name, .kind = .full_text, .config_json = text_config });
+        // Keep a populated primary text index as A's independent match-all
+        // lane, and an unfinished artifact-backed text B for filter fencing.
+        try db.addIndex(.{ .name = text_name, .kind = .full_text, .config_json = if (i == 0) "{}" else text_config });
         if (i == 0) {
             try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"Orchard guidance.\"}" }}, .sync_level = .write });
             try db.runUntilIdle();
+            var baseline_text = try db.search(a, .{ .index_name = "text-A" });
+            defer baseline_text.deinit();
+            try std.testing.expectEqual(@as(usize, 1), baseline_text.hits.len);
         }
     }
     const vector = try embedder_mod.DeterministicDenseEmbedder.embedDense(&embedder.deterministic, scratch, embeddings[0], "Orchard guidance.", 3);
