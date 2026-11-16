@@ -4557,6 +4557,81 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
     return .ok;
 }
 
+const source_plan_wire = @import("antfly_local_sources").storage_source_plan_wire;
+const source_plan_control = source_plan_wire.control;
+fn sourcePlanInputStatus(err: anyerror) kernel_owner_abi.Status {
+    return storageOwnerStatusFromError(switch (err) {
+        error.OutOfMemory, error.InvalidSourceAdmission, error.SourcePayloadConflict, error.InvalidSourcePlanWire => err,
+        else => error.InvalidSourcePlanWire,
+    });
+}
+fn sourcePlanResponse(out: *kernel_owner_abi.OwnedBytes, value: anytype) kernel_owner_abi.Status {
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, value, .{}) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+pub fn storageOwnerNativeSourcePlanControl(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > source_plan_wire.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var decoded = source_plan_wire.decode(handle.alloc, request.request_json.slice()) catch |err| return sourcePlanInputStatus(err);
+    defer decoded.deinit();
+    const result = handle.db.nativeSourcePlanControl(decoded.request) catch |err| return storageOwnerStatusFromError(err);
+    return sourcePlanResponse(out, result);
+}
+pub fn storageOwnerOrderedSourcePlanControl(owner: ?*anyopaque, request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request.raft_term == 0 or request.raft_index == 0 or request.request_json.len > source_plan_wire.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var decoded = source_plan_wire.decode(handle.alloc, request.request_json.slice()) catch |err| return sourcePlanInputStatus(err);
+    defer decoded.deinit();
+    const result = handle.db.applyOrderedSourcePlanControl(decoded.request, .{ .term = request.raft_term, .index = request.raft_index }, true) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    return sourcePlanResponse(out, result);
+}
+pub fn storageOwnerSourcePlanObservation(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > source_plan_wire.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(source_plan_control.Query, handle.alloc, request.request_json.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return sourcePlanInputStatus(err);
+    defer parsed.deinit();
+    const result = handle.db.sourcePlanObservation(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    return sourcePlanResponse(out, result);
+}
+pub fn storageOwnerSourcePlanChunk(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > source_plan_wire.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(source_plan_control.ReadRequest, handle.alloc, request.request_json.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return sourcePlanInputStatus(err);
+    defer parsed.deinit();
+    const result = handle.db.sourcePlanChunk(handle.alloc, parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    defer handle.alloc.free(result.bytes);
+    const encoded = handle.alloc.alloc(u8, std.base64.standard.Encoder.calcSize(result.bytes.len)) catch |err| return storageOwnerStatusFromError(err);
+    defer handle.alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, result.bytes);
+    return sourcePlanResponse(out, source_plan_wire.ChunkReply{ .observation = result.observation, .chunk_base64 = encoded });
+}
+pub fn storageOwnerOrderedSourcePlanOutcome(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > source_plan_wire.max_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(source_plan_wire.Recovery, handle.alloc, request.request_json.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return sourcePlanInputStatus(err);
+    defer parsed.deinit();
+    var decoded = source_plan_wire.fromCommand(handle.alloc, parsed.value.command) catch |err| return sourcePlanInputStatus(err);
+    defer decoded.deinit();
+    const result = handle.db.orderedSourcePlanOutcome(.{ .request = decoded.request, .entry = parsed.value.entry, .minimum_applied_index = parsed.value.minimum_applied_index }) catch |err| return storageOwnerStatusFromError(err);
+    return sourcePlanResponse(out, result);
+}
+
 pub fn storageOwnerOrderedHistoryControlJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest,

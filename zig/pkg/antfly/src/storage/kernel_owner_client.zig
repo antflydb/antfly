@@ -601,6 +601,25 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn orderedSourcePlanControlJson(self: *Owner, table_name: []const u8, command_json: []const u8, raft_term: u64, raft_index: u64) !Response {
+        if (raft_term == 0 or raft_index == 0 or command_json.len > @import("antfly_local_sources").storage_source_plan_wire.max_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_ordered_source_plan_control(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(command_json), .raft_term = raft_term, .raft_index = raft_index }, &response.buffer));
+        return response;
+    }
+    pub fn sourcePlanJson(self: *Owner, comptime operation: enum { native_control, observation, chunk, outcome }, table_name: []const u8, request_json: []const u8) !Response {
+        if (request_json.len > @import("antfly_local_sources").storage_source_plan_wire.max_bytes) return error.InvalidArgument;
+        const function = comptime switch (operation) {
+            .native_control => abi.antfly_storage_owner_native_source_plan_control,
+            .observation => abi.antfly_storage_owner_source_plan_observation,
+            .chunk => abi.antfly_storage_owner_source_plan_chunk,
+            .outcome => abi.antfly_storage_owner_ordered_source_plan_outcome,
+        };
+        var response: Response = .{};
+        try statusToError(function(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(request_json) }, &response.buffer));
+        return response;
+    }
+
     pub fn orderedHistoryControlJson(self: *Owner, table_name: []const u8, command_json: []const u8, raft_term: u64, raft_index: u64) !Response {
         if (raft_term == 0 or raft_index == 0 or command_json.len > 4096) return error.InvalidArgument;
         var response: Response = .{};

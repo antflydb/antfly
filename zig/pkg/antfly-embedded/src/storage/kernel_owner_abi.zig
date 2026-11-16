@@ -1979,6 +1979,14 @@ pub extern fn antfly_storage_owner_replicated_batch_at_raft_entry_json(
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
+/// Additive source-plan operations reuse the stable JSON headers. Only trusted
+/// native-owner callers may invoke them after qualifying the physical root.
+pub extern fn antfly_storage_owner_native_source_plan_control(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_source_plan_control(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_source_plan_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_source_plan_chunk(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_source_plan_outcome(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+
 /// Private committed retention command. Uses the same immutable entry identity
 /// header; its request/response JSON are typed history command/outcome values.
 pub extern fn antfly_storage_owner_ordered_history_control_json(

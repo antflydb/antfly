@@ -901,3 +901,5 @@ pub const storage_read_session_values = @import("storage/read_session_values.zig
 pub const storage_source_plan_storage = @import("storage/source_plan_storage.zig");
 
 pub const storage_source_plan_control = @import("storage/source_plan_control.zig");
+
+pub const storage_source_plan_wire = @import("storage/source_plan_wire.zig");

@@ -31,6 +31,16 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_source_plan_wire, .err = error.InvalidSourcePlanWire },
+    .{ .status = .invalid_source_admission, .err = error.InvalidSourceAdmission },
+    .{ .status = .source_admission_corrupt, .err = error.SourceAdmissionCorrupt },
+    .{ .status = .source_receipt_expired, .err = error.SourceReceiptExpired },
+    .{ .status = .source_pending_work, .err = error.SourcePendingWork },
+    .{ .status = .source_payload_conflict, .err = error.SourcePayloadConflict },
+    .{ .status = .source_admission_backpressure, .err = error.SourceAdmissionBackpressure },
+    .{ .status = .invalid_txn_record, .err = error.InvalidTxnRecord },
+    .{ .status = .source_outcome_unresolved, .err = error.SourceOutcomeUnresolved },
+
     .{ .status = .changefeed_capability_unsupported, .err = error.ChangefeedCapabilityUnsupported },
     .{ .status = .history_consumer_conflict, .err = error.HistoryConsumerConflict },
     .{ .status = .invalid_history_admission, .err = error.InvalidHistoryAdmission },
@@ -1289,4 +1299,17 @@ test "descriptor pressure preserves actionable identities across storage owners"
         try validateFailureEnvelope(value, &failure, abi.abi_version);
         try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
     }
+}
+
+test "source plan failures preserve exact opaque owner identities" {
+    inline for (.{ error.InvalidSourcePlanWire, error.InvalidSourceAdmission, error.SourceAdmissionCorrupt, error.SourceReceiptExpired, error.SourcePendingWork, error.SourcePayloadConflict, error.SourceAdmissionBackpressure, error.InvalidTxnRecord, error.SourceOutcomeUnresolved }) |err| {
+        const value = statusFromError(err);
+        try std.testing.expect(value != .internal);
+        try std.testing.expectError(err, statusToError(value));
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+        try validateFailureEnvelope(value, &failure, abi.abi_version);
+        try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+    }
+    try std.testing.expectEqual(@as(u32, 930), @backingInt(statusFromError(error.InvalidSourcePlanWire)));
+    try std.testing.expectEqual(@as(u32, 938), @backingInt(statusFromError(error.SourceOutcomeUnresolved)));
 }

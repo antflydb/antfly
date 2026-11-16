@@ -887,6 +887,15 @@ pub const Status = enum(u32) {
     corrupt_ordered_apply_receipt = 927,
     history_consumer_conflict = 928,
     changefeed_capability_unsupported = 929,
+    invalid_source_plan_wire = 930,
+    invalid_source_admission = 931,
+    source_admission_corrupt = 932,
+    source_receipt_expired = 933,
+    source_pending_work = 934,
+    source_payload_conflict = 935,
+    source_admission_backpressure = 936,
+    invalid_txn_record = 937,
+    source_outcome_unresolved = 938,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

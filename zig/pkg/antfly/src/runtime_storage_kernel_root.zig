@@ -171,6 +171,11 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerBatchBorrowedDocuments, "antfly_storage_owner_batch_borrowed_documents");
     exportInternal(&storage_kernel_exports.storageOwnerReplicatedBatchJson, "antfly_storage_owner_replicated_batch_json");
     exportInternal(&storage_kernel_exports.storageOwnerReplicatedBatchAtRaftEntryJson, "antfly_storage_owner_replicated_batch_at_raft_entry_json");
+    exportInternal(&storage_kernel_exports.storageOwnerNativeSourcePlanControl, "antfly_storage_owner_native_source_plan_control");
+    exportInternal(&storage_kernel_exports.storageOwnerOrderedSourcePlanControl, "antfly_storage_owner_ordered_source_plan_control");
+    exportInternal(&storage_kernel_exports.storageOwnerSourcePlanObservation, "antfly_storage_owner_source_plan_observation");
+    exportInternal(&storage_kernel_exports.storageOwnerSourcePlanChunk, "antfly_storage_owner_source_plan_chunk");
+    exportInternal(&storage_kernel_exports.storageOwnerOrderedSourcePlanOutcome, "antfly_storage_owner_ordered_source_plan_outcome");
     exportInternal(&storage_kernel_exports.storageOwnerOrderedHistoryControlJson, "antfly_storage_owner_ordered_history_control_json");
     exportInternal(&storage_kernel_exports.storageOwnerOrderedHistoryPage, "antfly_storage_owner_ordered_history_page");
     exportInternal(&storage_kernel_exports.storageOwnerOrderedHistoryOutcome, "antfly_storage_owner_ordered_history_outcome");

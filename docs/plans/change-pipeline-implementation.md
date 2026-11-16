@@ -3936,3 +3936,48 @@ route qualification, source worker adapters and source-global checkpoint/head
 integration remain outstanding. Public feeds, coherent bootstrap/retention,
 production pgoutput and qualification with an existing CDC client remain part
 of the unchanged full goal. This does not complete either issue.
+
+### Binary-safe opaque-owner source-plan transport
+
+`source_plan_wire.zig` encodes private version-1 staging commands with canonical
+base64 chunks, bounded to 2 MiB JSON and 1 MiB decoded binary. Decoding rejects
+unknown/duplicate fields, unsupported versions, noncanonical padding, ignored
+action fields and payload/hash disagreement. Parsed spec slices and decoded
+binary have explicit ownership; arbitrary binary bytes survive input-buffer
+release. Encoding keeps the command's semantic fingerprint unchanged. The
+codec has no authority to qualify a source or a physical root.
+
+Five additive opaque-owner operations expose native control, ordered control,
+qualified observation, sealed chunk read and read-only ordered outcome recovery.
+They reuse the existing versioned JSON headers; the opaque owner ABI remains
+104 and the native engine descriptor remains 51. Responses own their storage;
+chunk responses carry base64 rather than interpreting binary payloads as UTF-8.
+The ordered writer uses the actual supplied term/index and its existing atomic
+apply-marker path. Recovery does not propose or apply the command again.
+Source-plan semantic errors have append-only runtime status identities 930–938,
+so malformed commands, expired receipts, backpressure, conflicts and corruption
+retain their identities across the boundary. Parse failures are normalized to
+the declared malformed-wire error rather than generic kernel failures.
+
+Qualification: `source-plan-wire-qualified-test.log` passes all 14 direct wire /
+storage / completion tests, including arbitrary bytes, owned round trips,
+canonical encodings, strict decoding and every allocation-failure point.
+`source-plan-error-identity-test.log` passes all 16 failure-registry tests,
+including exact source-plan error round trips and stable new status numbers.
+`source-plan-opaque-owner-qualified-test.log` completes with exit 0 for
+`zig build source-plan-wire-test history-resolution-owner-test -Dstorage-owner-test-filter='compiled source plan' -j2`.
+The actual compiled-owner case passes upload, early-seal rejection, exact
+outcome recovery, seal retry, reopen, qualified observation, binary chunk
+readback, fencing, reclamation and late-admission rejection. It also verifies
+old header rejection, malformed input on all four generic JSON operations and
+expired chunk reads retaining their exact errors. No skips or leaks were
+reported. Formatting and diff checks passed.
+
+This qualifies ordered native DB application through the opaque owner, not a
+new data-Raft entry or production HTTP route. Dedicated activated Raft dispatch,
+serving route qualification, native empty-target authority provisioning, worker
+adapters and source-global head/checkpoint integration remain outstanding.
+No public endpoint or capability is advertised by this change. The unchanged
+full goal still includes destination integration, public feeds, coherent
+bootstrap/retention, production pgoutput and an existing CDC client's complete
+snapshot/stream/reconnect qualification. Neither issue is complete.

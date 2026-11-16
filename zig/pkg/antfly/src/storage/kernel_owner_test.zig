@@ -5307,3 +5307,113 @@ test "compiled ordered history root policy captures without consumers and fences
     try std.testing.expectEqual(@as(u64, 2), reenrolled.epoch);
     try std.testing.expectEqual(@as(u64, 3), reenrolled.start);
 }
+
+test "compiled source plan opaque transport retains sealed binary and exact ordered outcomes" {
+    const a = std.testing.allocator;
+    const wire = @import("antfly_local_sources").storage_source_plan_wire;
+    const control = wire.control;
+    const storage = control.storage;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const options: abi.OpenRequest = .{ .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 11, .identity_range_id = 13, .schema_json = .fromSlice("{}"), .indexes_json = .fromSlice("{}") };
+    var owner = try client.Owner.open(options);
+    var opened = true;
+    defer if (opened) owner.deinit();
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 11, .big);
+    std.mem.writeInt(u64, namespace[16..24], 13, .big);
+    const root: storage.Root = .{ .authority = .raft, .namespace = namespace, .generation = 0, .fence = @splat(2) };
+    var frame: [128]u8 = @splat(255);
+    @memcpy(frame[0..4], "AFP1");
+    std.mem.writeInt(u32, frame[4..8], 1, .little);
+    std.mem.writeInt(u64, frame[8..16], 10, .little);
+    std.mem.writeInt(u64, frame[16..24], 11, .little);
+    std.mem.writeInt(u64, frame[24..32], 1, .little);
+    const plan_digest = try storage.frozenDigest(&frame);
+    @memcpy(frame[32..64], &plan_digest);
+    var checksum: storage.Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&frame, &checksum, .{});
+    const hashes = [_]storage.Digest{storage.chunkDigest(0, &frame)};
+    var attempt: [16]u8 = @splat(1);
+    std.mem.writeInt(u64, attempt[0..8], 1, .big);
+    const spec: storage.Spec = .{ .namespace = storage.namespaceFor(root, 1), .storage_epoch = 1, .binding = @splat(3), .domain = storage.domainFor(@splat(3)), .attempt = attempt, .bytes = frame.len, .checksum = checksum, .plan_digest = plan_digest, .chunk_hashes = &hashes };
+    var command: control.Request = .{ .root = root, .spec = spec, .action = .begin };
+    const Helper = struct {
+        fn apply(alloc: std.mem.Allocator, target: *client.Owner, request: control.Request, index: u64) !control.Outcome {
+            const encoded = try wire.encode(alloc, request);
+            defer alloc.free(encoded);
+            var response = try target.orderedSourcePlanControlJson("docs", encoded, 1, index);
+            defer response.deinit();
+            var parsed = try std.json.parseFromSlice(control.Outcome, alloc, response.bytes(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" });
+            defer parsed.deinit();
+            return parsed.value;
+        }
+    };
+    try std.testing.expectError(error.InvalidSourcePlanWire, owner.sourcePlanJson(.native_control, "docs", "{}"));
+    try std.testing.expectError(error.InvalidSourcePlanWire, owner.sourcePlanJson(.observation, "docs", "{}"));
+    try std.testing.expectError(error.InvalidSourcePlanWire, owner.sourcePlanJson(.chunk, "docs", "{}"));
+    try std.testing.expectError(error.InvalidSourcePlanWire, owner.sourcePlanJson(.outcome, "docs", "{}"));
+    var rejected_bytes: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_ordered_source_plan_control(null, &.{ .version = abi.abi_version - 1 }, &rejected_bytes));
+    try std.testing.expect((try Helper.apply(a, &owner, command, 1)) == .applied);
+    command.action = .seal;
+    const rejected = try Helper.apply(a, &owner, command, 2);
+    try std.testing.expect(rejected == .rejected and rejected.rejected == .pending);
+    var recovery_command = try wire.Encoded.init(a, command);
+    defer recovery_command.deinit();
+    const recovery = try std.json.Stringify.valueAlloc(a, wire.Recovery{ .command = recovery_command.command, .entry = .{ .term = 1, .index = 2 }, .minimum_applied_index = 2 }, .{});
+    defer a.free(recovery);
+    {
+        var response = try owner.sourcePlanJson(.outcome, "docs", recovery);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(control.Outcome, a, response.bytes(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualDeep(rejected, parsed.value);
+    }
+    command.action = .chunk;
+    command.chunk = &frame;
+    try std.testing.expect((try Helper.apply(a, &owner, command, 3)) == .applied);
+    command.action = .seal;
+    command.chunk = "";
+    const sealed = try Helper.apply(a, &owner, command, 4);
+    try std.testing.expectEqualDeep(sealed, try Helper.apply(a, &owner, command, 4));
+    const seal = sealed.applied.seal.?;
+    owner.deinit();
+    opened = false;
+    owner = try client.Owner.open(options);
+    opened = true;
+    const query: control.Query = .{ .root = root, .spec = spec, .minimum_applied_index = 4 };
+    const query_json = try std.json.Stringify.valueAlloc(a, query, .{});
+    defer a.free(query_json);
+    {
+        var response = try owner.sourcePlanJson(.observation, "docs", query_json);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(control.Observation, a, response.bytes(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(seal, parsed.value.status.?.seal.?);
+        try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, parsed.value.cut[8..16], .little));
+    }
+    const read_json = try std.json.Stringify.valueAlloc(a, control.ReadRequest{ .query = query, .seal = seal, .ordinal = 0 }, .{});
+    defer a.free(read_json);
+    {
+        var response = try owner.sourcePlanJson(.chunk, "docs", read_json);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(wire.ChunkReply, a, response.bytes(), .{});
+        defer parsed.deinit();
+        var decoded: [128]u8 = undefined;
+        try std.base64.standard.Decoder.decode(&decoded, parsed.value.chunk_base64);
+        try std.testing.expectEqualSlices(u8, &frame, &decoded);
+        try std.testing.expectEqual(seal, parsed.value.observation.status.?.seal.?);
+    }
+    command.action = .fence;
+    try std.testing.expect((try Helper.apply(a, &owner, command, 5)) == .applied);
+    command.action = .reclaim;
+    try std.testing.expect((try Helper.apply(a, &owner, command, 6)).applied.reclamation != null);
+    try std.testing.expectError(error.SourceReceiptExpired, owner.sourcePlanJson(.chunk, "docs", read_json));
+    command.action = .begin;
+    const expired = try Helper.apply(a, &owner, command, 7);
+    try std.testing.expect(expired == .rejected and expired.rejected == .expired);
+}
