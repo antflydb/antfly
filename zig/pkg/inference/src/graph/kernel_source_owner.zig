@@ -22,16 +22,30 @@ pub const NativeOwner = struct {
     include_path: []const u8,
 };
 
-/// Standalone artifacts contain at most one native family. Reject repeated
-/// owners rather than silently storing an incomplete include closure.
+/// Store each matching, disjoint native component exactly once. Translation
+/// units can combine shared phases and a complete schedule. JIT payloads are
+/// unchanged; expansion reverses storage against the same owner table.
 pub fn compact(allocator: std.mem.Allocator, source: []const u8, owners: []const NativeOwner) !?[]u8 {
+    return rewrite(allocator, source, owners, false);
+}
+
+fn rewrite(allocator: std.mem.Allocator, source: []const u8, owners: []const NativeOwner, comptime expanding: bool) !?[]u8 {
+    var result: ?[]u8 = null;
+    errdefer if (result) |data| allocator.free(data);
     for (owners) |owner| {
-        if (std.mem.indexOf(u8, source, owner.source)) |start| {
-            if (std.mem.count(u8, source, owner.source) != 1) return error.RepeatedNativeSourceOwner;
-            return try std.mem.concat(allocator, u8, &.{ source[0..start], "#include \"", owner.include_path, "\"\n", source[start + owner.source.len ..] });
-        }
+        const include = try std.mem.concat(allocator, u8, &.{ "#include \"", owner.include_path, "\"\n" });
+        defer allocator.free(include);
+        const current = result orelse source;
+        const from = if (expanding) include else owner.source;
+        const to = if (expanding) owner.source else include;
+        const count = std.mem.count(u8, current, from);
+        if (count == 0) continue;
+        if (count != 1) return error.RepeatedNativeSourceOwner;
+        const updated = try std.mem.replaceOwned(u8, allocator, current, from, to);
+        if (result) |data| allocator.free(data);
+        result = updated;
     }
-    return null;
+    return result;
 }
 
 test "native source storage roundtrip retains the complete semantic payload" {
@@ -49,13 +63,23 @@ test "native source storage roundtrip retains the complete semantic payload" {
 /// Reconstruct the complete native source for offline validation. Production
 /// JIT does not read stored files or depend on include resolution.
 pub fn expand(allocator: std.mem.Allocator, source: []const u8, owners: []const NativeOwner) !?[]u8 {
-    for (owners) |owner| {
-        const include = try std.mem.concat(allocator, u8, &.{ "#include \"", owner.include_path, "\"\n" });
-        defer allocator.free(include);
-        if (std.mem.indexOf(u8, source, include) != null) {
-            if (std.mem.count(u8, source, include) != 1) return error.RepeatedNativeSourceOwner;
-            return try std.mem.replaceOwned(u8, allocator, source, include, owner.source);
-        }
+    return rewrite(allocator, source, owners, true);
+}
+
+test "native source storage roundtrip preserves multiple components in either order" {
+    const phases = NativeOwner{ .source = "#define shared_phase(x) ((x) + 1)\n", .include_path = "phases.h" };
+    const schedule = NativeOwner{ .source = "void schedule() { shared_phase(3); }\n", .include_path = "schedule.h" };
+    const full = "// ABI prefix\n" ++ phases.source ++ "// schedule boundary\n" ++ schedule.source ++ "// exports\n";
+    for ([_][2]NativeOwner{ .{ phases, schedule }, .{ schedule, phases } }) |owners| {
+        const stored = (try compact(std.testing.allocator, full, &owners)).?;
+        defer std.testing.allocator.free(stored);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, stored, "#include"));
+        const restored = (try expand(std.testing.allocator, stored, &owners)).?;
+        defer std.testing.allocator.free(restored);
+        try std.testing.expectEqualStrings(full, restored);
+        try std.testing.expectError(error.RepeatedNativeSourceOwner, compact(std.testing.allocator, full ++ schedule.source, &owners));
+        const repeated = try std.mem.concat(std.testing.allocator, u8, &.{ stored, "#include \"schedule.h\"\n" });
+        defer std.testing.allocator.free(repeated);
+        try std.testing.expectError(error.RepeatedNativeSourceOwner, expand(std.testing.allocator, repeated, &owners));
     }
-    return null;
 }

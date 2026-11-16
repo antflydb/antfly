@@ -24,8 +24,13 @@
 // Default-on automatic SM89 selection; rollback: ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK=0.
 // Tiled consumer opt-in: ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK_CONSUMER=tiled64.
 
+#ifndef __CUDACC_RTC__
 #include <math.h>
+#endif
 #include <cuda_fp16.h>
+
+#include "../../../graph/templates/cuda_attention_scalar_phases.cuh"
+
 
 __device__ __forceinline__ float termite_warp_reduce_sum_f32(float value) {
     value += __shfl_down_sync(0xffffffffu, value, 16);

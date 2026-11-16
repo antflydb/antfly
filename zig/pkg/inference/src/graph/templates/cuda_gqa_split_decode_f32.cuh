@@ -1,6 +1,11 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
+
 // Native split-K GQA schedules: geometry fixes registers and shared extents.
 // Scalar replay, reduction trees, masks and accumulation order stay explicit.
 #ifndef ANTFLY_GQA_SPLIT_F32
@@ -35,10 +40,7 @@
 template<unsigned HeadDim, unsigned Threads, unsigned HeadsPerKv, unsigned Splits, unsigned MaxHeads>
 __device__ __forceinline__ void antfly_gqa_split_stage(ANTFLY_GQA_SPLIT_STAGE_PARAMS) {
     if (decode_scalars != 0) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-        total_sequence_len = decode_scalars[3];
+        ANTFLY_DECODE_REPLAY_TOTAL(decode_scalars)
     }
     if (kv_seq_len < split_kv_min_tokens) return;
     if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
@@ -57,15 +59,7 @@ __device__ __forceinline__ void antfly_gqa_split_stage(ANTFLY_GQA_SPLIT_STAGE_PA
     unsigned int key_start = 0u;
     unsigned int key_end = 0u;
     if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        const unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start, key_end)
     }
     unsigned int split_begin = (kv_seq_len * split) / splits;
     unsigned int split_end = (kv_seq_len * (split + 1u)) / splits;
@@ -251,9 +245,7 @@ __device__ __forceinline__ void antfly_gqa_split_reduce(ANTFLY_GQA_SPLIT_REDUCE_
 template<unsigned HeadDim, unsigned Threads, unsigned HeadsPerKv, unsigned MaxHeads>
 __device__ __forceinline__ void antfly_gqa_serial(ANTFLY_GQA_SERIAL_PARAMS) {
     if (decode_scalars != 0) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
+        ANTFLY_DECODE_REPLAY_KV(decode_scalars)
     }
     if (kv_seq_len >= split_kv_min_tokens) return;
     const unsigned int block = blockIdx.x;
@@ -272,15 +264,7 @@ __device__ __forceinline__ void antfly_gqa_serial(ANTFLY_GQA_SERIAL_PARAMS) {
     unsigned int key_start = 0u;
     unsigned int key_end = 0u;
     if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        const unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start, key_end)
     }
     const unsigned int heads_per_group = num_heads / num_kv_heads;
     const unsigned int kv_head = head / heads_per_group;

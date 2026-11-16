@@ -7,15 +7,7 @@
     unsigned int key_start = 0u;
     unsigned int key_end = 0u;
     if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start, key_end)
     }
 
     unsigned int heads_per_group = num_heads / num_kv_heads;

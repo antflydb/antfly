@@ -580,10 +580,7 @@ extern "C" __global__ void termite_gqa_attention_f32(
 // native-program:entry termite_gqa_attention_decode_turboquant_fast_f32
 extern "C" __global__ void termite_gqa_attention_decode_turboquant_fast_f32(ANTFLY_CUDA_PAGED_ATTENTION_PARAMS) {
     if (decode_scalars != 0) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-        total_sequence_len = decode_scalars[3];
+        ANTFLY_DECODE_REPLAY_TOTAL(decode_scalars)
     }
 
     unsigned int lane = threadIdx.x;
@@ -692,17 +689,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_tiled_f16_exact_f32(ANT
         if (valid_row) {
             const unsigned int query_pos = query_position_offset + qi;
             if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-                const unsigned int visible = query_pos - kv_position_offset + 1u;
-                end = visible < kv_seq_len ? visible : kv_seq_len;
-                if (sliding_window != 0u) {
-                    const unsigned int window_start_abs = query_pos + 1u > sliding_window
-                        ? query_pos + 1u - sliding_window
-                        : 0u;
-                    if (window_start_abs > kv_position_offset) {
-                        start = window_start_abs - kv_position_offset;
-                        if (start > end) start = end;
-                    }
-                }
+                ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, start, end)
             }
         }
         key_start[tid] = start;
@@ -821,32 +808,12 @@ extern "C" __global__ void termite_gqa_attention_prefill_tiled_f16_warp_f32(ANTF
     unsigned int key_start1 = 0u, key_end1 = 0u;
     const unsigned int query_pos0 = query_position_offset + qi0;
     if (kv_seq_len != 0u && query_pos0 >= kv_position_offset) {
-        const unsigned int visible = query_pos0 - kv_position_offset + 1u;
-        key_end0 = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            const unsigned int window_start_abs = query_pos0 + 1u > sliding_window
-                ? query_pos0 + 1u - sliding_window
-                : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start0 = window_start_abs - kv_position_offset;
-                if (key_start0 > key_end0) key_start0 = key_end0;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos0, kv_seq_len, kv_position_offset, sliding_window, key_start0, key_end0)
     }
     if (row_valid1) {
         const unsigned int query_pos1 = query_position_offset + qi1;
         if (kv_seq_len != 0u && query_pos1 >= kv_position_offset) {
-            const unsigned int visible = query_pos1 - kv_position_offset + 1u;
-            key_end1 = visible < kv_seq_len ? visible : kv_seq_len;
-            if (sliding_window != 0u) {
-                const unsigned int window_start_abs = query_pos1 + 1u > sliding_window
-                    ? query_pos1 + 1u - sliding_window
-                    : 0u;
-                if (window_start_abs > kv_position_offset) {
-                    key_start1 = window_start_abs - kv_position_offset;
-                    if (key_start1 > key_end1) key_start1 = key_end1;
-                }
-            }
+            ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos1, kv_seq_len, kv_position_offset, sliding_window, key_start1, key_end1)
         }
     }
 
@@ -992,27 +959,11 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(AN
     {
         unsigned int query_pos = query_position_offset + qi0_clamped;
         if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-            unsigned int visible = query_pos - kv_position_offset + 1u;
-            key_end0 = visible < kv_seq_len ? visible : kv_seq_len;
-            if (sliding_window != 0u) {
-                unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-                if (window_start_abs > kv_position_offset) {
-                    key_start0 = window_start_abs - kv_position_offset;
-                    if (key_start0 > key_end0) key_start0 = key_end0;
-                }
-            }
+            ANTFLY_CAUSAL_KEY_WINDOW(unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start0, key_end0)
         }
         query_pos = query_position_offset + qi1_clamped;
         if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-            unsigned int visible = query_pos - kv_position_offset + 1u;
-            key_end1 = visible < kv_seq_len ? visible : kv_seq_len;
-            if (sliding_window != 0u) {
-                unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-                if (window_start_abs > kv_position_offset) {
-                    key_start1 = window_start_abs - kv_position_offset;
-                    if (key_start1 > key_end1) key_start1 = key_end1;
-                }
-            }
+            ANTFLY_CAUSAL_KEY_WINDOW(unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start1, key_end1)
         }
     }
     if (!row_valid0) { key_start0 = 0u; key_end0 = 0u; }
@@ -1028,14 +979,9 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(AN
         unsigned int first_pos = query_position_offset + tile_row_start;
         unsigned int last_pos = query_position_offset + qi_last;
         if (kv_seq_len != 0u && last_pos >= kv_position_offset) {
-            unsigned int visible = last_pos - kv_position_offset + 1u;
-            block_key_end = visible < kv_seq_len ? visible : kv_seq_len;
+            ANTFLY_CAUSAL_KEY_END(unsigned int, last_pos, kv_seq_len, kv_position_offset, block_key_end)
             if (sliding_window != 0u && first_pos >= kv_position_offset) {
-                unsigned int window_start_abs = (first_pos + 1u > sliding_window) ? (first_pos + 1u - sliding_window) : 0u;
-                if (window_start_abs > kv_position_offset) {
-                    block_key_start = window_start_abs - kv_position_offset;
-                    if (block_key_start > block_key_end) block_key_start = block_key_end;
-                }
+                ANTFLY_CAUSAL_WINDOW_START(unsigned int, first_pos, sliding_window, kv_position_offset, block_key_start, block_key_end)
             }
         }
     }
@@ -1275,10 +1221,7 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage2_
 // native-program:entry termite_gqa_attention_decode_turboquant_f32
 extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(ANTFLY_CUDA_PAGED_ATTENTION_PARAMS) {
     if (decode_scalars != 0) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-        total_sequence_len = decode_scalars[3];
+        ANTFLY_DECODE_REPLAY_TOTAL(decode_scalars)
     }
 
     const unsigned int score_cache_limit = 4096u;

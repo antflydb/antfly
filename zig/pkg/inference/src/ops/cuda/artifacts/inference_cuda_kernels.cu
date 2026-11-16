@@ -25,6 +25,35 @@
 using namespace nvcuda;
 
 // quant-kernel-codegen:begin shared CUDA helpers (do not edit; run: zig build quant-kernel-codegen -- --write)
+#ifndef ANTFLY_CAUSAL_KEY_WINDOW_PHASES
+#define ANTFLY_CAUSAL_KEY_WINDOW_PHASES
+#define ANTFLY_CAUSAL_KEY_END(TempType, Query, Count, Offset, End) \
+    TempType visible = Query - Offset + 1u; \
+    End = visible < Count ? visible : Count;
+#define ANTFLY_CAUSAL_WINDOW_START(TempType, Query, Window, Offset, Begin, End) \
+    TempType window_start_abs = (Query + 1u > Window) ? (Query + 1u - Window) : 0u; \
+    if (window_start_abs > Offset) { \
+        Begin = window_start_abs - Offset; \
+        if (Begin > End) Begin = End; \
+    }
+#define ANTFLY_CAUSAL_KEY_WINDOW(TempType, Query, Count, Offset, Window, Begin, End) \
+    ANTFLY_CAUSAL_KEY_END(TempType, Query, Count, Offset, End) \
+    if (Window != 0u) { \
+        ANTFLY_CAUSAL_WINDOW_START(TempType, Query, Window, Offset, Begin, End) \
+    }
+#endif
+#ifndef ANTFLY_DECODE_REPLAY_PHASES
+#define ANTFLY_DECODE_REPLAY_PHASES
+#define ANTFLY_DECODE_REPLAY_KV(Scalars) \
+    kv_position_offset = Scalars[4]; \
+    query_position_offset = Scalars[1]; \
+    kv_seq_len = Scalars[2];
+#define ANTFLY_DECODE_REPLAY_TOTAL(Scalars) \
+    ANTFLY_DECODE_REPLAY_KV(Scalars) \
+    total_sequence_len = Scalars[3];
+#endif
+
+
 static __device__ __forceinline__ float antfly_half_le_to_float(const unsigned char *p) {
     const unsigned short bits = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
     return __half2float(__ushort_as_half(bits));
@@ -3809,6 +3838,11 @@ extern "C" __global__ void termite_gqa_attention_decode_scalars_f32(
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
+
 // Native split-K GQA schedules: geometry fixes registers and shared extents.
 // Scalar replay, reduction trees, masks and accumulation order stay explicit.
 #ifndef ANTFLY_GQA_SPLIT_F32
@@ -3843,10 +3877,7 @@ extern "C" __global__ void termite_gqa_attention_decode_scalars_f32(
 template<unsigned HeadDim, unsigned Threads, unsigned HeadsPerKv, unsigned Splits, unsigned MaxHeads>
 __device__ __forceinline__ void antfly_gqa_split_stage(ANTFLY_GQA_SPLIT_STAGE_PARAMS) {
     if (decode_scalars != 0) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-        total_sequence_len = decode_scalars[3];
+        ANTFLY_DECODE_REPLAY_TOTAL(decode_scalars)
     }
     if (kv_seq_len < split_kv_min_tokens) return;
     if (batch != 1u || q_seq_len != 1u || mask_len != 0u || bias_mode != 0u ||
@@ -3865,15 +3896,7 @@ __device__ __forceinline__ void antfly_gqa_split_stage(ANTFLY_GQA_SPLIT_STAGE_PA
     unsigned int key_start = 0u;
     unsigned int key_end = 0u;
     if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        const unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start, key_end)
     }
     unsigned int split_begin = (kv_seq_len * split) / splits;
     unsigned int split_end = (kv_seq_len * (split + 1u)) / splits;
@@ -4059,9 +4082,7 @@ __device__ __forceinline__ void antfly_gqa_split_reduce(ANTFLY_GQA_SPLIT_REDUCE_
 template<unsigned HeadDim, unsigned Threads, unsigned HeadsPerKv, unsigned MaxHeads>
 __device__ __forceinline__ void antfly_gqa_serial(ANTFLY_GQA_SERIAL_PARAMS) {
     if (decode_scalars != 0) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
+        ANTFLY_DECODE_REPLAY_KV(decode_scalars)
     }
     if (kv_seq_len >= split_kv_min_tokens) return;
     const unsigned int block = blockIdx.x;
@@ -4080,15 +4101,7 @@ __device__ __forceinline__ void antfly_gqa_serial(ANTFLY_GQA_SERIAL_PARAMS) {
     unsigned int key_start = 0u;
     unsigned int key_end = 0u;
     if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        const unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start, key_end)
     }
     const unsigned int heads_per_group = num_heads / num_kv_heads;
     const unsigned int kv_head = head / heads_per_group;
@@ -4140,6 +4153,11 @@ __device__ __forceinline__ void antfly_gqa_serial(ANTFLY_GQA_SERIAL_PARAMS) {
 #endif
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
 // Exact score prework and chronological online-softmax consumers. Geometry
 // specializes statically; serial and tiled schedules retain their own lane
 // ownership, scratch capacity, launch admission, and floating-point recurrence.
@@ -4200,10 +4218,7 @@ __device__ __forceinline__ void antfly_gqa_serial(ANTFLY_GQA_SERIAL_PARAMS) {
 template<unsigned HeadDim, unsigned Threads, unsigned HeadsPerKv, unsigned MaxHeads, unsigned Chunks, unsigned MaxScores>
 __device__ __forceinline__ void antfly_gqa_score_prework(ANTFLY_GQA_SCORE_PARAMS) {
     if (decode_scalars != 0) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-        total_sequence_len = decode_scalars[3];
+        ANTFLY_DECODE_REPLAY_TOTAL(decode_scalars)
     }
     if (batch != 1u || q_seq_len != 1u || head_dim != HeadDim || blockDim.x != Threads ||
         score_capacity == 0u || score_capacity > MaxScores || chunk_size == 0u ||
@@ -4221,15 +4236,7 @@ __device__ __forceinline__ void antfly_gqa_score_prework(ANTFLY_GQA_SCORE_PARAMS
     unsigned int key_start = 0u;
     unsigned int key_end = 0u;
     if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        const unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start, key_end)
     }
     const unsigned int visible_count = key_end - key_start;
     if (visible_count > score_capacity) return;
@@ -4264,10 +4271,7 @@ __device__ __forceinline__ void antfly_gqa_score_prework(ANTFLY_GQA_SCORE_PARAMS
 template<unsigned HeadDim, unsigned Threads, unsigned HeadsPerKv, unsigned MaxHeads, unsigned MaxScores, bool Tiled>
 __device__ __forceinline__ void antfly_gqa_score_consumer(ANTFLY_GQA_SCORE_CONSUMER_PARAMS) {
     if (decode_scalars != 0) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-        total_sequence_len = decode_scalars[3];
+        ANTFLY_DECODE_REPLAY_TOTAL(decode_scalars)
     }
     const unsigned int head = blockIdx.x;
     const unsigned int output_tile = blockIdx.y;
@@ -4287,15 +4291,7 @@ __device__ __forceinline__ void antfly_gqa_score_consumer(ANTFLY_GQA_SCORE_CONSU
     unsigned int key_start = 0u;
     unsigned int key_end = 0u;
     if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        const unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start, key_end)
     }
     if (key_start > key_end) key_start = key_end;
     if (key_end - key_start > score_capacity) return;
@@ -4455,13 +4451,14 @@ extern "C" __global__ void antfly_gqa_attention_decode_turboquant_score_prework_
 // Opt-in generated attention candidate from graph/quant_kernel_compiler.zig.
 // antfly-splitk:begin common
 #include <cuda_fp16.h>
-#include <float.h>
+#ifndef __CUDACC_RTC__
 #include <stddef.h>
-#include <stdint.h>
+#endif
 #ifndef ANTFLY_SPLITK_COMMON_DEFINED
 #define ANTFLY_SPLITK_COMMON_DEFINED
 namespace antfly_splitk_common {
 
+constexpr float kFiniteMax = 0x1.fffffep127f;
 constexpr unsigned kHeads = 8u;
 constexpr unsigned kKvHeads = 1u;
 constexpr unsigned kSplits = 64u;
@@ -4563,10 +4560,7 @@ __device__ __forceinline__ void splitk_online_body(
 ) {
     constexpr unsigned kMaxItems = kHeadDim / kThreads;
     if (decode_scalars != nullptr) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-        total_sequence_len = decode_scalars[3];
+        ANTFLY_DECODE_REPLAY_TOTAL(decode_scalars)
     }
     constexpr unsigned kRowBytes = kHeadDim * sizeof(__half);
     if (dst == nullptr || completion_counters == nullptr ||
@@ -4594,18 +4588,7 @@ __device__ __forceinline__ void splitk_online_body(
     unsigned key_start = 0u;
     unsigned key_end = 0u;
     if (kv_seq_len != 0u && query_position_offset >= kv_position_offset) {
-        const unsigned visible = query_position_offset - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (kSlidingWindow != 0u) {
-            const unsigned window_start_abs =
-                query_position_offset + 1u > kSlidingWindow
-                ? query_position_offset + 1u - kSlidingWindow
-                : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(const unsigned, query_position_offset, kv_seq_len, kv_position_offset, kSlidingWindow, key_start, key_end)
     }
     const unsigned visible_count = key_end - key_start;
     // Host admission rejects dynamic replay scalars outside the qualified
@@ -4652,7 +4635,7 @@ __device__ __forceinline__ void splitk_online_body(
     __shared__ float beta;
     __shared__ float scale_input;
     if (tid == 0u) {
-        running_max = -FLT_MAX;
+        running_max = -kFiniteMax;
         running_denom = 0.0f;
         scale_input = (float)kHeadDim;
     }
@@ -4729,7 +4712,7 @@ __device__ __forceinline__ void splitk_online_body(
     __shared__ float merge_beta[kSplits];
     __shared__ float final_denom;
     if (tid == 0u) {
-        float merge_max = -FLT_MAX;
+        float merge_max = -kFiniteMax;
         float merge_denom = 0.0f;
         for (unsigned merge_split = 0u;
              merge_split < kSplits;
@@ -4805,6 +4788,11 @@ __device__ __forceinline__ void splitk_online_body(
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
 // Typed, default-off SM89 q=1 paged-GQA split-K online-softmax template.
 //
 // One CTA owns one (query head, chronological KV split). It publishes a stable
@@ -4815,9 +4803,9 @@ __device__ __forceinline__ void splitk_online_body(
 // works for ordinary launches and CUDA graph replay without host-side memset.
 
 #include <cuda_fp16.h>
-#include <float.h>
+#ifndef __CUDACC_RTC__
 #include <stddef.h>
-#include <stdint.h>
+#endif
 
 #ifndef ANTFLY_SPLITK_ONLINE_NAMESPACE
 #error "ANTFLY_SPLITK_ONLINE_NAMESPACE must name a unique renderer-owned namespace"
@@ -4918,6 +4906,11 @@ extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
 // Typed, default-off SM89 q=1 paged-GQA split-K online-softmax template.
 //
 // One CTA owns one (query head, chronological KV split). It publishes a stable
@@ -4928,9 +4921,9 @@ extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
 // works for ordinary launches and CUDA graph replay without host-side memset.
 
 #include <cuda_fp16.h>
-#include <float.h>
+#ifndef __CUDACC_RTC__
 #include <stddef.h>
-#include <stdint.h>
+#endif
 
 #ifndef ANTFLY_SPLITK_ONLINE_NAMESPACE
 #error "ANTFLY_SPLITK_ONLINE_NAMESPACE must name a unique renderer-owned namespace"
@@ -5014,9 +5007,11 @@ extern "C" __global__ void ANTFLY_SPLITK_ONLINE_KERNEL(
 // antfly-flash:begin common
 #include <cuda_fp16.h>
 #include <mma.h>
+#ifndef __CUDACC_RTC__
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#endif
 #ifndef ANTFLY_FLASH_COMMON_DEFINED
 #define ANTFLY_FLASH_COMMON_DEFINED
 namespace antfly_flash_common {
@@ -5052,8 +5047,16 @@ enum PrototypeStatus : unsigned {
     kStatusAddressOverflow = 10u,
 };
 
-static __device__ __forceinline__ bool pointer_aligned(const void* ptr, uintptr_t alignment) {
-    return (reinterpret_cast<uintptr_t>(ptr) & (alignment - 1u)) == 0u;
+// Runtime compilation supplies pointer-sized builtins without host C headers.
+#ifdef __CUDACC_RTC__
+using PointerBits = unsigned long long;
+#else
+using PointerBits = uintptr_t;
+#endif
+static_assert(sizeof(PointerBits) == sizeof(void*), "pointer alignment integer width");
+
+static __device__ __forceinline__ bool pointer_aligned(const void* ptr, PointerBits alignment) {
+    return (reinterpret_cast<PointerBits>(ptr) & (alignment - 1u)) == 0u;
 }
 
 static __device__ __forceinline__ unsigned ceil_div_u32(unsigned value, unsigned divisor) {
@@ -5096,17 +5099,7 @@ static __device__ __forceinline__ VisibleRange visible_range(
 ) {
     VisibleRange result{0u, 0u};
     if (query_pos < kv_position_offset) return result;
-    const unsigned visible = query_pos - kv_position_offset + 1u;
-    result.end = visible < kv_seq_len ? visible : kv_seq_len;
-    if (sliding_window != 0u) {
-        const unsigned window_start_abs = query_pos + 1u > sliding_window
-            ? query_pos + 1u - sliding_window
-            : 0u;
-        if (window_start_abs > kv_position_offset) {
-            result.begin = window_start_abs - kv_position_offset;
-            if (result.begin > result.end) result.begin = result.end;
-        }
-    }
+    ANTFLY_CAUSAL_KEY_WINDOW(const unsigned, query_pos, kv_seq_len, kv_position_offset, sliding_window, result.begin, result.end)
     return result;
 }
 
@@ -5895,6 +5888,11 @@ static __device__ void reference_prefill_body(
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
 // Typed SM89 paged-GQA Flash prefill: qualified E2B and opt-in E4B.
 //
 // The typed CUDA renderer supplies a unique namespace, one production entry
@@ -5922,9 +5920,11 @@ static __device__ void reference_prefill_body(
 
 #include <cuda_fp16.h>
 #include <mma.h>
+#ifndef __CUDACC_RTC__
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#endif
 
 #ifndef ANTFLY_FLASH_NAMESPACE
 #error "ANTFLY_FLASH_NAMESPACE must name a unique renderer-owned namespace"
@@ -6054,6 +6054,11 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
 // Typed SM89 paged-GQA Flash prefill: qualified E2B and opt-in E4B.
 //
 // The typed CUDA renderer supplies a unique namespace, one production entry
@@ -6081,9 +6086,11 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 
 #include <cuda_fp16.h>
 #include <mma.h>
+#ifndef __CUDACC_RTC__
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#endif
 
 #ifndef ANTFLY_FLASH_NAMESPACE
 #error "ANTFLY_FLASH_NAMESPACE must name a unique renderer-owned namespace"
@@ -6213,6 +6220,11 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
 // Typed SM89 paged-GQA Flash prefill: qualified E2B and opt-in E4B.
 //
 // The typed CUDA renderer supplies a unique namespace, one production entry
@@ -6240,9 +6252,11 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 
 #include <cuda_fp16.h>
 #include <mma.h>
+#ifndef __CUDACC_RTC__
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#endif
 
 #ifndef ANTFLY_FLASH_NAMESPACE
 #error "ANTFLY_FLASH_NAMESPACE must name a unique renderer-owned namespace"
@@ -6372,6 +6386,11 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
 // Typed SM89 paged-GQA Flash prefill: qualified E2B and opt-in E4B.
 //
 // The typed CUDA renderer supplies a unique namespace, one production entry
@@ -6399,9 +6418,11 @@ ANTFLY_FLASH_REFERENCE_KERNEL(
 
 #include <cuda_fp16.h>
 #include <mma.h>
+#ifndef __CUDACC_RTC__
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#endif
 
 #ifndef ANTFLY_FLASH_NAMESPACE
 #error "ANTFLY_FLASH_NAMESPACE must name a unique renderer-owned namespace"
@@ -6900,10 +6921,7 @@ __device__ __forceinline__ void termite_tq_fast_online_impl(ANTFLY_CUDA_PAGED_AT
 // tile-codegen:begin attention.direct.9 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_decode_turboquant_fast_f32(ANTFLY_CUDA_PAGED_ATTENTION_PARAMS) {
     if (decode_scalars != 0) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-        total_sequence_len = decode_scalars[3];
+        ANTFLY_DECODE_REPLAY_TOTAL(decode_scalars)
     }
 
     unsigned int lane = threadIdx.x;
@@ -6927,15 +6945,7 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_fast_f32(ANTF
     unsigned int key_end = 0u;
     unsigned int query_pos = query_position_offset;
     if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start, key_end)
     }
 
     unsigned int heads_per_group = num_heads / num_kv_heads;
@@ -6979,15 +6989,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_fast_f32(ANT
     unsigned int key_start = 0u;
     unsigned int key_end = 0u;
     if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start, key_end)
     }
 
     unsigned int heads_per_group = num_heads / num_kv_heads;
@@ -7060,17 +7062,7 @@ extern "C" __global__ void termite_gqa_attention_prefill_tiled_f16_exact_f32(ANT
         if (valid_row) {
             const unsigned int query_pos = query_position_offset + qi;
             if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-                const unsigned int visible = query_pos - kv_position_offset + 1u;
-                end = visible < kv_seq_len ? visible : kv_seq_len;
-                if (sliding_window != 0u) {
-                    const unsigned int window_start_abs = query_pos + 1u > sliding_window
-                        ? query_pos + 1u - sliding_window
-                        : 0u;
-                    if (window_start_abs > kv_position_offset) {
-                        start = window_start_abs - kv_position_offset;
-                        if (start > end) start = end;
-                    }
-                }
+                ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, start, end)
             }
         }
         key_start[tid] = start;
@@ -7214,32 +7206,12 @@ extern "C" __global__ void termite_gqa_attention_prefill_tiled_f16_warp_f32(ANTF
     unsigned int key_start1 = 0u, key_end1 = 0u;
     const unsigned int query_pos0 = query_position_offset + qi0;
     if (kv_seq_len != 0u && query_pos0 >= kv_position_offset) {
-        const unsigned int visible = query_pos0 - kv_position_offset + 1u;
-        key_end0 = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            const unsigned int window_start_abs = query_pos0 + 1u > sliding_window
-                ? query_pos0 + 1u - sliding_window
-                : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start0 = window_start_abs - kv_position_offset;
-                if (key_start0 > key_end0) key_start0 = key_end0;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos0, kv_seq_len, kv_position_offset, sliding_window, key_start0, key_end0)
     }
     if (row_valid1) {
         const unsigned int query_pos1 = query_position_offset + qi1;
         if (kv_seq_len != 0u && query_pos1 >= kv_position_offset) {
-            const unsigned int visible = query_pos1 - kv_position_offset + 1u;
-            key_end1 = visible < kv_seq_len ? visible : kv_seq_len;
-            if (sliding_window != 0u) {
-                const unsigned int window_start_abs = query_pos1 + 1u > sliding_window
-                    ? query_pos1 + 1u - sliding_window
-                    : 0u;
-                if (window_start_abs > kv_position_offset) {
-                    key_start1 = window_start_abs - kv_position_offset;
-                    if (key_start1 > key_end1) key_start1 = key_end1;
-                }
-            }
+            ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos1, kv_seq_len, kv_position_offset, sliding_window, key_start1, key_end1)
         }
     }
 
@@ -7402,27 +7374,11 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(AN
     {
         unsigned int query_pos = query_position_offset + qi0_clamped;
         if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-            unsigned int visible = query_pos - kv_position_offset + 1u;
-            key_end0 = visible < kv_seq_len ? visible : kv_seq_len;
-            if (sliding_window != 0u) {
-                unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-                if (window_start_abs > kv_position_offset) {
-                    key_start0 = window_start_abs - kv_position_offset;
-                    if (key_start0 > key_end0) key_start0 = key_end0;
-                }
-            }
+            ANTFLY_CAUSAL_KEY_WINDOW(unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start0, key_end0)
         }
         query_pos = query_position_offset + qi1_clamped;
         if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-            unsigned int visible = query_pos - kv_position_offset + 1u;
-            key_end1 = visible < kv_seq_len ? visible : kv_seq_len;
-            if (sliding_window != 0u) {
-                unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-                if (window_start_abs > kv_position_offset) {
-                    key_start1 = window_start_abs - kv_position_offset;
-                    if (key_start1 > key_end1) key_start1 = key_end1;
-                }
-            }
+            ANTFLY_CAUSAL_KEY_WINDOW(unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start1, key_end1)
         }
     }
     if (!row_valid0) { key_start0 = 0u; key_end0 = 0u; }
@@ -7438,14 +7394,9 @@ extern "C" __global__ void termite_gqa_attention_prefill_turboquant_tiled_f32(AN
         unsigned int first_pos = query_position_offset + tile_row_start;
         unsigned int last_pos = query_position_offset + qi_last;
         if (kv_seq_len != 0u && last_pos >= kv_position_offset) {
-            unsigned int visible = last_pos - kv_position_offset + 1u;
-            block_key_end = visible < kv_seq_len ? visible : kv_seq_len;
+            ANTFLY_CAUSAL_KEY_END(unsigned int, last_pos, kv_seq_len, kv_position_offset, block_key_end)
             if (sliding_window != 0u && first_pos >= kv_position_offset) {
-                unsigned int window_start_abs = (first_pos + 1u > sliding_window) ? (first_pos + 1u - sliding_window) : 0u;
-                if (window_start_abs > kv_position_offset) {
-                    block_key_start = window_start_abs - kv_position_offset;
-                    if (block_key_start > block_key_end) block_key_start = block_key_end;
-                }
+                ANTFLY_CAUSAL_WINDOW_START(unsigned int, first_pos, sliding_window, kv_position_offset, block_key_start, block_key_end)
             }
         }
     }
@@ -7942,10 +7893,7 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_split_stage2_
 // tile-codegen:begin attention.direct.19 family (do not edit; run: zig build tile-kernel-codegen -- --write)
 extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(ANTFLY_CUDA_PAGED_ATTENTION_PARAMS) {
     if (decode_scalars != 0) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-        total_sequence_len = decode_scalars[3];
+        ANTFLY_DECODE_REPLAY_TOTAL(decode_scalars)
     }
 
     const unsigned int score_cache_limit = 4096u;

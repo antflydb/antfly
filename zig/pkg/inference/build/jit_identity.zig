@@ -164,6 +164,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         "src/ops/cuda/prototypes/bf16_activation_programs.cu",
         "src/ops/cuda/prototypes/vision_projection_programs.cu",
         "src/ops/cuda/prototypes/vision_f16_programs.cu",
+        "src/graph/templates/cuda_attention_scalar_phases.cuh",
         "src/graph/templates/cuda_gqa_flash_prefill_f16_sm89.cuh",
         "src/graph/templates/cuda_gqa_decode_splitk_online_sm89.cuh",
         "src/graph/templates/cuda_gqa_split_decode_f32.cuh",

@@ -21,7 +21,9 @@
 // beat the handwritten CUDA baseline.
 
 #include <cuda_fp16.h>
+#ifndef __CUDACC_RTC__
 #include <math.h>
+#endif
 #include <stdint.h>
 
 static __device__ __forceinline__ float antfly_half_le_to_float(const uint8_t *p) {

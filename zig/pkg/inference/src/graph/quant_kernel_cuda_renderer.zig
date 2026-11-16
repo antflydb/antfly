@@ -1968,9 +1968,7 @@ pub fn renderKernel(allocator: std.mem.Allocator, plan: RenderPlan) ![]u8 {
     try out.appendSlice(allocator, promotionComment(plan.kind));
     try out.appendSlice(allocator, "\n\n");
     for (support.includes) |include| {
-        try out.appendSlice(allocator, "#include ");
-        try out.appendSlice(allocator, include);
-        try out.append(allocator, '\n');
+        try appendCudaInclude(allocator, &out, include);
     }
     try out.append(allocator, '\n');
     for (support.helpers) |helper| {
@@ -2002,6 +2000,17 @@ pub fn attentionPlanId(plan: AttentionRenderPlan, allocator: std.mem.Allocator) 
             @tagName(plan.lowering.query_storage),
         }),
     };
+}
+
+// NVRTC provides device math declarations. Host math headers can erase CUDA
+// annotations through libc compatibility macros and must remain AOT-only.
+fn appendCudaInclude(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), include: []const u8) !void {
+    const host_math = std.mem.eql(u8, include, "<math.h>");
+    if (host_math) try out.appendSlice(allocator, "#ifndef __CUDACC_RTC__\n");
+    try out.appendSlice(allocator, "#include ");
+    try out.appendSlice(allocator, include);
+    try out.append(allocator, '\n');
+    if (host_math) try out.appendSlice(allocator, "#endif\n");
 }
 
 pub fn renderAttentionKernel(allocator: std.mem.Allocator, plan: AttentionRenderPlan) ![]u8 {
@@ -2041,9 +2050,7 @@ pub fn renderAttentionKernel(allocator: std.mem.Allocator, plan: AttentionRender
             "// Runtime opt-in: ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE=1.\n\n",
     );
     for (includes_math) |include| {
-        try out.appendSlice(allocator, "#include ");
-        try out.appendSlice(allocator, include);
-        try out.append(allocator, '\n');
+        try appendCudaInclude(allocator, &out, include);
     }
     if (plan.lowering.reduction == .parallel_scores_then_serial) {
         try out.appendSlice(allocator, "#include <cuda_fp16.h>\n");
@@ -2186,6 +2193,8 @@ pub fn renderFlashPrefillKernel(
             "// Default-on automatic SM89 selection; rollback: ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off.\n",
         );
     }
+    try helper_attention_scalar_phases.append(allocator, &out);
+    try out.append(allocator, '\n');
     try out.appendSlice(allocator, body);
     return out.toOwnedSlice(allocator);
 }
@@ -2208,11 +2217,11 @@ test "standalone CUDA attention includes reconstruct complete runtime templates"
         .{ attention_score_prework_source, "cuda_gqa_score_prework_f32.cuh" },
     };
     inline for (templates) |entry| {
-        const full = "// geometry prefix\n" ++ entry[0] ++ "// ABI wrappers\n";
+        const full = "// geometry prefix\n" ++ helper_attention_scalar_phases.source ++ entry[0] ++ "// ABI wrappers\n";
         const compact = (try compactAttentionSourceFile(std.testing.allocator, full)).?;
         defer std.testing.allocator.free(compact);
-        const include = "#include \"../../../graph/templates/" ++ entry[1] ++ "\"\n";
-        const rebuilt = try std.mem.replaceOwned(u8, std.testing.allocator, compact, include, entry[0]);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, compact, "#include"));
+        const rebuilt = (try expandNativeSourceFile(std.testing.allocator, compact)).?;
         defer std.testing.allocator.free(rebuilt);
         try std.testing.expectEqualStrings(full, rebuilt);
         try std.testing.expect(compact.len < 256);
@@ -2314,6 +2323,8 @@ pub fn renderSplitkOnlineDecodeKernel(
         plan.kernel_id,
         plan.production_baseline,
     });
+    try helper_attention_scalar_phases.append(allocator, &out);
+    try out.append(allocator, '\n');
     try out.appendSlice(allocator, body);
     return out.toOwnedSlice(allocator);
 }
@@ -2426,7 +2437,13 @@ const helper_termite_block_reduce_sum_f32 = SourceFragment{
     ,
 };
 
+const helper_attention_scalar_phases = SourceFragment{
+    .name = "ANTFLY_CAUSAL_KEY_WINDOW",
+    .source = @import("antfly_tile").native_attention.CausalWindow.cudaSource() ++ @import("antfly_tile").native_attention.DecodeReplay.cudaSource(),
+};
+
 pub const attention_runtime_external_helpers = [_]SourceFragment{
+    helper_attention_scalar_phases,
     helper_termite_warp_reduce_sum_f32,
     helper_termite_block_reduce_sum_f32,
 };
@@ -2711,6 +2728,7 @@ const q6_k_q8_helpers = [_]SourceFragment{
 /// One definition per helper in the runtime bundle. Standalone artifacts use
 /// these same fragments; the code generator owns the runtime copies as well.
 pub const runtime_shared_helpers = [_]SourceFragment{
+    helper_attention_scalar_phases,
     helper_half_le_to_float,
     helper_warp_reduce_sum,
     helper_termite_half_to_float,
@@ -4436,6 +4454,7 @@ test "E4B Flash bounds and plan identity keep E2B qualification separate" {
 }
 
 const native_source_owners = [_]@import("kernel_source_owner.zig").NativeOwner{
+    .{ .source = helper_attention_scalar_phases.source, .include_path = "../../../graph/templates/cuda_attention_scalar_phases.cuh" },
     .{ .source = flash_prefill_f16_sm89_template, .include_path = "../../../graph/templates/cuda_gqa_flash_prefill_f16_sm89.cuh" },
     .{ .source = splitk_online_decode_sm89_template, .include_path = "../../../graph/templates/cuda_gqa_decode_splitk_online_sm89.cuh" },
     .{ .source = attention_split_source, .include_path = "../../../graph/templates/cuda_gqa_split_decode_f32.cuh" },

@@ -15,6 +15,31 @@ pub const Online = struct {
 };
 
 pub const CausalWindow = struct {
+    /// Native U32 phases. Callers retain zero initialization, empty/query
+    /// guards and replay admission. Arguments are side-effect-free names or
+    /// lvalues; the native wrapping add/subtract association is intentional.
+    pub fn cudaSource() []const u8 {
+        return
+        \\#ifndef ANTFLY_CAUSAL_KEY_WINDOW_PHASES
+        \\#define ANTFLY_CAUSAL_KEY_WINDOW_PHASES
+        \\#define ANTFLY_CAUSAL_KEY_END(TempType, Query, Count, Offset, End) \
+        \\    TempType visible = Query - Offset + 1u; \
+        \\    End = visible < Count ? visible : Count;
+        \\#define ANTFLY_CAUSAL_WINDOW_START(TempType, Query, Window, Offset, Begin, End) \
+        \\    TempType window_start_abs = (Query + 1u > Window) ? (Query + 1u - Window) : 0u; \
+        \\    if (window_start_abs > Offset) { \
+        \\        Begin = window_start_abs - Offset; \
+        \\        if (Begin > End) Begin = End; \
+        \\    }
+        \\#define ANTFLY_CAUSAL_KEY_WINDOW(TempType, Query, Count, Offset, Window, Begin, End) \
+        \\    ANTFLY_CAUSAL_KEY_END(TempType, Query, Count, Offset, End) \
+        \\    if (Window != 0u) { \
+        \\        ANTFLY_CAUSAL_WINDOW_START(TempType, Query, Window, Offset, Begin, End) \
+        \\    }
+        \\#endif
+        \\
+        ;
+    }
     pub fn contains(query: u32, key: u32, window: u32) bool {
         return key <= query and (window == 0 or query - key < window);
     }
@@ -73,4 +98,24 @@ pub const RelativeRow64 = struct {
         "#define ANTFLY_RELATIVE_ROW64_THREADS {d}u\n#define ANTFLY_RELATIVE_ROW64_QUERIES {d}u\n#define ANTFLY_RELATIVE_ROW64_HEAD_DIM {d}u\n#define ANTFLY_RELATIVE_ROW64_MAX_SEQUENCE {d}u\n",
         .{ threads, queries_per_group, head_dim, max_sequence },
     );
+};
+
+/// Device scalar replay preserves the native load order. Serial consumers do
+/// not acquire total_sequence_len, which may be unused/stale on that schedule.
+pub const DecodeReplay = struct {
+    pub fn cudaSource() []const u8 {
+        return
+        \\#ifndef ANTFLY_DECODE_REPLAY_PHASES
+        \\#define ANTFLY_DECODE_REPLAY_PHASES
+        \\#define ANTFLY_DECODE_REPLAY_KV(Scalars) \
+        \\    kv_position_offset = Scalars[4]; \
+        \\    query_position_offset = Scalars[1]; \
+        \\    kv_seq_len = Scalars[2];
+        \\#define ANTFLY_DECODE_REPLAY_TOTAL(Scalars) \
+        \\    ANTFLY_DECODE_REPLAY_KV(Scalars) \
+        \\    total_sequence_len = Scalars[3];
+        \\#endif
+        \\
+        ;
+    }
 };

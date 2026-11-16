@@ -1,5 +1,10 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
 // Exact score prework and chronological online-softmax consumers. Geometry
 // specializes statically; serial and tiled schedules retain their own lane
 // ownership, scratch capacity, launch admission, and floating-point recurrence.
@@ -60,10 +65,7 @@
 template<unsigned HeadDim, unsigned Threads, unsigned HeadsPerKv, unsigned MaxHeads, unsigned Chunks, unsigned MaxScores>
 __device__ __forceinline__ void antfly_gqa_score_prework(ANTFLY_GQA_SCORE_PARAMS) {
     if (decode_scalars != 0) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-        total_sequence_len = decode_scalars[3];
+        ANTFLY_DECODE_REPLAY_TOTAL(decode_scalars)
     }
     if (batch != 1u || q_seq_len != 1u || head_dim != HeadDim || blockDim.x != Threads ||
         score_capacity == 0u || score_capacity > MaxScores || chunk_size == 0u ||
@@ -81,15 +83,7 @@ __device__ __forceinline__ void antfly_gqa_score_prework(ANTFLY_GQA_SCORE_PARAMS
     unsigned int key_start = 0u;
     unsigned int key_end = 0u;
     if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        const unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start, key_end)
     }
     const unsigned int visible_count = key_end - key_start;
     if (visible_count > score_capacity) return;
@@ -124,10 +118,7 @@ __device__ __forceinline__ void antfly_gqa_score_prework(ANTFLY_GQA_SCORE_PARAMS
 template<unsigned HeadDim, unsigned Threads, unsigned HeadsPerKv, unsigned MaxHeads, unsigned MaxScores, bool Tiled>
 __device__ __forceinline__ void antfly_gqa_score_consumer(ANTFLY_GQA_SCORE_CONSUMER_PARAMS) {
     if (decode_scalars != 0) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-        total_sequence_len = decode_scalars[3];
+        ANTFLY_DECODE_REPLAY_TOTAL(decode_scalars)
     }
     const unsigned int head = blockIdx.x;
     const unsigned int output_tile = blockIdx.y;
@@ -147,15 +138,7 @@ __device__ __forceinline__ void antfly_gqa_score_consumer(ANTFLY_GQA_SCORE_CONSU
     unsigned int key_start = 0u;
     unsigned int key_end = 0u;
     if (kv_seq_len != 0u && query_pos >= kv_position_offset) {
-        const unsigned int visible = query_pos - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (sliding_window != 0u) {
-            const unsigned int window_start_abs = (query_pos + 1u > sliding_window) ? (query_pos + 1u - sliding_window) : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(const unsigned int, query_pos, kv_seq_len, kv_position_offset, sliding_window, key_start, key_end)
     }
     if (key_start > key_end) key_start = key_end;
     if (key_end - key_start > score_capacity) return;

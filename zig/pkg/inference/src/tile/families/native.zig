@@ -27,6 +27,9 @@ const metal_convolution_sources = @import("../native_sources.zig").sources(progr
 const attention_prefix_bf16_sources = @import("../native_sources.zig").sources(@embedFile("native/cuda/attention_prefix_bf16.cu"), .cuda);
 
 pub const regions = r.regions(&.{
+    r.shared(r.nativeFamily("src/graph/templates/cuda_attention_scalar_phases.cuh", "", "attention.scalar_phases", struct {
+        pub const source_0 = @import("antfly_tile").native_attention.CausalWindow.cudaSource() ++ @import("antfly_tile").native_attention.DecodeReplay.cudaSource();
+    }), &.{.{ .operation = "attention.window_replay", .source = "../../lib/tile/src/native_attention.zig", .scope = .phase, .precision = "native wrapping U32 bounds and ordered device scalar acquisition", .schedule = "caller-owned guards; scalar and first/last-query tile bounds" }}),
     r.shared(r.metalFamily("training.adamw", metal_phases.adamw), &.{.{ .operation = "training.adamw", .source = "../../lib/tile/src/native_math.zig", .scope = .phase, .precision = "F32 ordered moments and decay", .schedule = "pointwise; preserve aliasing, gradient clear and optional flag" }}),
     r.shared(r.nativeFamily("src/ops/cuda/kernels/local_relative_attention_program.cuh", "", "statistics.relative_shuffle", row_statistics.cuda_relative_shuffle), &.{.{ .operation = "statistics.shuffle", .source = "../../lib/tile/src/native_statistics.zig", .scope = .phase, .precision = "F32 fmaxf / explicit RN addition", .schedule = "full warp XOR 16/8/4/2/1" }}),
     r.shared(r.nativeFamily("src/ops/cuda/kernels/ragged_boundary_programs.cuh", "", "statistics.ragged_shuffle", row_statistics.cuda_ragged_shuffle), &.{.{ .operation = "statistics.shuffle", .source = "../../lib/tile/src/native_statistics.zig", .scope = .phase, .precision = "F32 sum or native typed maximum", .schedule = "full warp XOR 16/8/4/2/1" }}),

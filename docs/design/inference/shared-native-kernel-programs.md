@@ -204,7 +204,7 @@ complete merely because a shared primitive exists.
 The common-program tests pass, including the admission contract that preserves
 A100/L4 baselines. Ownership verification checks emitted regions/files, actual
 shared-source fingerprints and include closure. The direct annotations cover
-128 of 651 Tile regions; this is provenance at the annotated region, not a
+129 of 652 Tile regions; this is provenance at the annotated region, not a
 percentage of serving kernels or a transitive call-graph coverage metric.
 Unclassified regions are not evidence of dead code or duplicated algorithms.
 
@@ -442,3 +442,49 @@ baseline. Consequently kernel instructions/resources remain unchanged; no new
 speedup or whole-codebase reduction is claimed. CPU/Metal numerical programs
 are unchanged in this follow-up. The private CUDA checkout/cache is removed,
 and the cache fixture removes its temporary build tree.
+
+### Causal bounds, decode replay and shared source storage
+
+CUDA dense/paged, serial/split-K, score-prework, paired/multi-row MMA and SM89
+attention share the existing `native_attention.CausalWindow` range phases and
+`DecodeReplay` scalar acquisition. Callers retain empty/query guards, per-row
+validity, first/last-query tile bounds and U32 wrapping behavior. Serial replay
+reads only KV/query state; schedules that need total length acquire it in the
+original order. Temporary declaration types stay explicit static parameters.
+
+One generated header serves raw AOT/prototype includes. Runtime source emits
+the same phases before embedding templates, so those conditional includes are
+skipped without application include paths. The existing source-storage owner
+now compacts/expands multiple disjoint components per translation unit, with
+round-trip and duplicate/error-cleanup tests. Stored AOT files include both
+shared phases and schedules; JIT/identity consumers retain complete source.
+This adds one generated header under the existing core owner, not another
+algorithm catalog, compiler or device entry point. Generated copies earn no
+maintained-source reduction credit.
+
+Full-payload NVRTC checks reproduced a pre-existing missing-host-header failure
+on the committed WMMA baseline. The templates now keep host C headers AOT-only;
+NVRTC uses device math declarations, an explicitly checked pointer-width type,
+and the exact IEEE F32 finite maximum. AOT pointer alignment retains uintptr_t.
+Four complete Flash/split-K/score-prework payloads compile with CUDA toolkit
+headers only, without application/system include paths or device-default
+workarounds. Three offline prototype inclusion paths also preprocess correctly.
+
+The integer phase probe passes 492,192 frozen-code comparisons, 102,336
+independent visibility cases and 10,000 replay cases under undefined-behavior
+sanitization, including legacy U32 wrap behavior. The clean-baseline generators,
+52 core tests, two source-storage tests and ownership verification pass; the
+inventory covers 859 emitted items and 65 canonical native files. Final CUDA
+13.2 PTX, seven-architecture fatbin and SM89 cubin remain byte-identical to the
+baseline after the NVRTC repair. This establishes native instruction/resource
+parity; JIT smoke checks establish compilation, not new model performance wins.
+Concurrent PJRT edits are excluded from this qualification checkout.
+
+The strict cache fixture also reproduced a baseline warm-cache miss on
+Glowworm. Measured native targets differ between its Cortex-A725/X925 CPU
+cohorts. The test fixture now uses one MIDR cohort for child builds and restores
+the original affinity on class cleanup; production target selection is unchanged.
+Cache-hit/invalidation assertions pass without relaxation, and affinity restoration
+is checked. The timestamp-preservation experiment was rejected. Qualification
+receipts retain both baseline failures and successful controls. The isolated
+checkout/cache and local integer-probe binary are removed after collection.

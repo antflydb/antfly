@@ -65,6 +65,26 @@ class RuntimeCacheTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        # Cache controls compare the same native host target. Zig can detect
+        # different tuning models on heterogeneous ARM cores; child builds
+        # inherit one cohort, with the caller's affinity restored afterward.
+        if sys.platform == "linux":
+            original_affinity = os.sched_getaffinity(0)
+            try:
+                identities = {
+                    cpu: Path(
+                        f"/sys/devices/system/cpu/cpu{cpu}/regs/"
+                        "identification/midr_el1"
+                    ).read_text().strip()
+                    for cpu in original_affinity
+                }
+            except OSError:
+                identities = {}
+            if len(set(identities.values())) > 1:
+                identity = identities[min(original_affinity)]
+                cohort = {cpu for cpu, value in identities.items() if value == identity}
+                os.sched_setaffinity(0, cohort)
+                cls.addClassCleanup(os.sched_setaffinity, 0, original_affinity)
         cls.macos_sdk = None
         if sys.platform == "darwin":
             # Pin external Xcode selection for this cohort. Automatic discovery
@@ -1843,6 +1863,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     ("metal_projection_native.metal", "metal_paged_decode_native.metal")
                     if backend == "metal"
                     else (
+                        "cuda_attention_scalar_phases.cuh",
                         "cuda_gqa_flash_prefill_f16_sm89.cuh",
                         "cuda_gqa_decode_splitk_online_sm89.cuh",
                         "cuda_gqa_split_decode_f32.cuh",
@@ -2002,6 +2023,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     "src/ops/cuda/prototypes/bf16_activation_programs.cu",
                     "src/ops/cuda/prototypes/vision_projection_programs.cu",
                     "src/ops/cuda/prototypes/vision_f16_programs.cu",
+                    "src/graph/templates/cuda_attention_scalar_phases.cuh",
                     "src/graph/templates/cuda_gqa_flash_prefill_f16_sm89.cuh",
                     "src/graph/templates/cuda_gqa_decode_splitk_online_sm89.cuh",
                     "src/graph/templates/cuda_gqa_split_decode_f32.cuh",

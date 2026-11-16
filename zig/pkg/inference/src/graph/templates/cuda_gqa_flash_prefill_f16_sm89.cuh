@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
 // Typed SM89 paged-GQA Flash prefill: qualified E2B and opt-in E4B.
 //
 // The typed CUDA renderer supplies a unique namespace, one production entry
@@ -39,9 +44,11 @@
 
 #include <cuda_fp16.h>
 #include <mma.h>
+#ifndef __CUDACC_RTC__
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#endif
 
 #ifndef ANTFLY_FLASH_NAMESPACE
 #error "ANTFLY_FLASH_NAMESPACE must name a unique renderer-owned namespace"
@@ -59,9 +66,11 @@
 // antfly-flash:begin common
 #include <cuda_fp16.h>
 #include <mma.h>
+#ifndef __CUDACC_RTC__
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#endif
 #ifndef ANTFLY_FLASH_COMMON_DEFINED
 #define ANTFLY_FLASH_COMMON_DEFINED
 namespace antfly_flash_common {
@@ -97,8 +106,16 @@ enum PrototypeStatus : unsigned {
     kStatusAddressOverflow = 10u,
 };
 
-static __device__ __forceinline__ bool pointer_aligned(const void* ptr, uintptr_t alignment) {
-    return (reinterpret_cast<uintptr_t>(ptr) & (alignment - 1u)) == 0u;
+// Runtime compilation supplies pointer-sized builtins without host C headers.
+#ifdef __CUDACC_RTC__
+using PointerBits = unsigned long long;
+#else
+using PointerBits = uintptr_t;
+#endif
+static_assert(sizeof(PointerBits) == sizeof(void*), "pointer alignment integer width");
+
+static __device__ __forceinline__ bool pointer_aligned(const void* ptr, PointerBits alignment) {
+    return (reinterpret_cast<PointerBits>(ptr) & (alignment - 1u)) == 0u;
 }
 
 static __device__ __forceinline__ unsigned ceil_div_u32(unsigned value, unsigned divisor) {
@@ -141,17 +158,7 @@ static __device__ __forceinline__ VisibleRange visible_range(
 ) {
     VisibleRange result{0u, 0u};
     if (query_pos < kv_position_offset) return result;
-    const unsigned visible = query_pos - kv_position_offset + 1u;
-    result.end = visible < kv_seq_len ? visible : kv_seq_len;
-    if (sliding_window != 0u) {
-        const unsigned window_start_abs = query_pos + 1u > sliding_window
-            ? query_pos + 1u - sliding_window
-            : 0u;
-        if (window_start_abs > kv_position_offset) {
-            result.begin = window_start_abs - kv_position_offset;
-            if (result.begin > result.end) result.begin = result.end;
-        }
-    }
+    ANTFLY_CAUSAL_KEY_WINDOW(const unsigned, query_pos, kv_seq_len, kv_position_offset, sliding_window, result.begin, result.end)
     return result;
 }
 

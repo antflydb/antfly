@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
+// Runtime source supplies these phases before embedding the template.
+#if !defined(ANTFLY_CAUSAL_KEY_WINDOW_PHASES) || !defined(ANTFLY_DECODE_REPLAY_PHASES)
+#include "cuda_attention_scalar_phases.cuh"
+#endif
 // Typed, default-off SM89 q=1 paged-GQA split-K online-softmax template.
 //
 // One CTA owns one (query head, chronological KV split). It publishes a stable
@@ -22,9 +27,9 @@
 // works for ordinary launches and CUDA graph replay without host-side memset.
 
 #include <cuda_fp16.h>
-#include <float.h>
+#ifndef __CUDACC_RTC__
 #include <stddef.h>
-#include <stdint.h>
+#endif
 
 #ifndef ANTFLY_SPLITK_ONLINE_NAMESPACE
 #error "ANTFLY_SPLITK_ONLINE_NAMESPACE must name a unique renderer-owned namespace"
@@ -44,13 +49,14 @@
 
 // antfly-splitk:begin common
 #include <cuda_fp16.h>
-#include <float.h>
+#ifndef __CUDACC_RTC__
 #include <stddef.h>
-#include <stdint.h>
+#endif
 #ifndef ANTFLY_SPLITK_COMMON_DEFINED
 #define ANTFLY_SPLITK_COMMON_DEFINED
 namespace antfly_splitk_common {
 
+constexpr float kFiniteMax = 0x1.fffffep127f;
 constexpr unsigned kHeads = 8u;
 constexpr unsigned kKvHeads = 1u;
 constexpr unsigned kSplits = 64u;
@@ -152,10 +158,7 @@ __device__ __forceinline__ void splitk_online_body(
 ) {
     constexpr unsigned kMaxItems = kHeadDim / kThreads;
     if (decode_scalars != nullptr) {
-        kv_position_offset = decode_scalars[4];
-        query_position_offset = decode_scalars[1];
-        kv_seq_len = decode_scalars[2];
-        total_sequence_len = decode_scalars[3];
+        ANTFLY_DECODE_REPLAY_TOTAL(decode_scalars)
     }
     constexpr unsigned kRowBytes = kHeadDim * sizeof(__half);
     if (dst == nullptr || completion_counters == nullptr ||
@@ -183,18 +186,7 @@ __device__ __forceinline__ void splitk_online_body(
     unsigned key_start = 0u;
     unsigned key_end = 0u;
     if (kv_seq_len != 0u && query_position_offset >= kv_position_offset) {
-        const unsigned visible = query_position_offset - kv_position_offset + 1u;
-        key_end = visible < kv_seq_len ? visible : kv_seq_len;
-        if (kSlidingWindow != 0u) {
-            const unsigned window_start_abs =
-                query_position_offset + 1u > kSlidingWindow
-                ? query_position_offset + 1u - kSlidingWindow
-                : 0u;
-            if (window_start_abs > kv_position_offset) {
-                key_start = window_start_abs - kv_position_offset;
-                if (key_start > key_end) key_start = key_end;
-            }
-        }
+        ANTFLY_CAUSAL_KEY_WINDOW(const unsigned, query_position_offset, kv_seq_len, kv_position_offset, kSlidingWindow, key_start, key_end)
     }
     const unsigned visible_count = key_end - key_start;
     // Host admission rejects dynamic replay scalars outside the qualified
@@ -241,7 +233,7 @@ __device__ __forceinline__ void splitk_online_body(
     __shared__ float beta;
     __shared__ float scale_input;
     if (tid == 0u) {
-        running_max = -FLT_MAX;
+        running_max = -kFiniteMax;
         running_denom = 0.0f;
         scale_input = (float)kHeadDim;
     }
@@ -318,7 +310,7 @@ __device__ __forceinline__ void splitk_online_body(
     __shared__ float merge_beta[kSplits];
     __shared__ float final_denom;
     if (tid == 0u) {
-        float merge_max = -FLT_MAX;
+        float merge_max = -kFiniteMax;
         float merge_denom = 0.0f;
         for (unsigned merge_split = 0u;
              merge_split < kSplits;

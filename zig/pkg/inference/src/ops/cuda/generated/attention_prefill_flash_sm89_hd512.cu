@@ -6,6 +6,8 @@
 // runtime_default_enabled=true
 // exact_token_parity_qualified=true
 // Default-on automatic SM89 selection; rollback: ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off.
+#include "../../../graph/templates/cuda_attention_scalar_phases.cuh"
+
 #define ANTFLY_FLASH_NAMESPACE antfly_flash_prefill_sm89_hd512_global_f32_v1
 #define ANTFLY_FLASH_KERNEL antfly_gqa_attention_prefill_flash_sm89_hd512_global_f32_v1
 #define ANTFLY_FLASH_KV_HEADS 1

@@ -22,7 +22,12 @@
 // production_enabled=false
 // Runtime opt-in: ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE=1.
 
+#ifndef __CUDACC_RTC__
 #include <math.h>
+#endif
+
+#include "../../../graph/templates/cuda_attention_scalar_phases.cuh"
+
 
 __device__ __forceinline__ float termite_warp_reduce_sum_f32(float value) {
     value += __shfl_down_sync(0xffffffffu, value, 16);

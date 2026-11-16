@@ -8,14 +8,9 @@
         unsigned int first_pos = query_position_offset + tile_row_start;
         unsigned int last_pos = query_position_offset + qi_last;
         if (kv_seq_len != 0u && last_pos >= kv_position_offset) {
-            unsigned int visible = last_pos - kv_position_offset + 1u;
-            block_key_end = visible < kv_seq_len ? visible : kv_seq_len;
+            ANTFLY_CAUSAL_KEY_END(unsigned int, last_pos, kv_seq_len, kv_position_offset, block_key_end)
             if (sliding_window != 0u && first_pos >= kv_position_offset) {
-                unsigned int window_start_abs = (first_pos + 1u > sliding_window) ? (first_pos + 1u - sliding_window) : 0u;
-                if (window_start_abs > kv_position_offset) {
-                    block_key_start = window_start_abs - kv_position_offset;
-                    if (block_key_start > block_key_end) block_key_start = block_key_end;
-                }
+                ANTFLY_CAUSAL_WINDOW_START(unsigned int, first_pos, sliding_window, kv_position_offset, block_key_start, block_key_end)
             }
         }
     }

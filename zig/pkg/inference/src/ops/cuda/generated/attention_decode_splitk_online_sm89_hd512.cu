@@ -5,6 +5,8 @@
 // production_baseline=termite_gqa_attention_decode_turboquant_fast_f32
 // runtime_default_enabled=false
 // exact_token_parity_qualified=false
+#include "../../../graph/templates/cuda_attention_scalar_phases.cuh"
+
 #define ANTFLY_SPLITK_ONLINE_NAMESPACE antfly_splitk_online_decode_sm89_hd512_global_f16_f32_v1
 #define ANTFLY_SPLITK_ONLINE_KERNEL antfly_gqa_attention_decode_splitk_online_sm89_hd512_global_f16_f32_v1
 #define ANTFLY_SPLITK_ONLINE_HEAD_DIM 512

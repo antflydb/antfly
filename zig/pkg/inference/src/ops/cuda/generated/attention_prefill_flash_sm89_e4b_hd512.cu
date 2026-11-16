@@ -5,6 +5,8 @@
 // production_baseline=termite_gqa_attention_prefill_turboquant_fast_f32
 // runtime_default_enabled=false
 // exact_token_parity_qualified=false
+#include "../../../graph/templates/cuda_attention_scalar_phases.cuh"
+
 #define ANTFLY_FLASH_NAMESPACE antfly_flash_prefill_sm89_e4b_hd512_global_f32_v1
 #define ANTFLY_FLASH_KERNEL antfly_gqa_attention_prefill_flash_sm89_e4b_hd512_global_f32_v1
 #define ANTFLY_FLASH_KV_HEADS 2
