@@ -112,6 +112,14 @@ test "ordered history routed pages retain real images and discard failed final f
     const grant_observation = try owners.orderedHistoryGrantRouted(a, fence, "docs", grant_identity);
     try std.testing.expectEqualDeep(enrolled.applied.consumer.?, grant_observation.active.consumer);
     try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    const resolution: history.history_resolution_wire.Request = .{ .authority = .raft, .namespace = namespace, .transaction_id = @splat(9), .owner_fence = @splat(4), .manifest_digest = @splat(5), .commit_version = 6, .minimum_applied_index = 1 };
+    const observed_resolution = try owners.orderedHistoryResolutionRouted(a, fence, "docs", resolution);
+    try observed_resolution.validate(resolution);
+    try std.testing.expect(observed_resolution.resolution == null);
+    try std.testing.expectEqual(@as(u64, 2), observed_resolution.cut.index);
+    try std.testing.expectEqual(resolution.digest(), observed_resolution.request_digest);
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
 
     fixture.validations = 0;
     fixture.mode = .leader_loss;
@@ -121,6 +129,9 @@ test "ordered history routed pages retain real images and discard failed final f
     try std.testing.expectEqual(@as(usize, 2), fixture.validations);
     fixture.validations = 0;
     try std.testing.expectError(error.NotLeader, owners.orderedHistoryGrantRouted(a, fence, "docs", grant_identity));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    fixture.validations = 0;
+    try std.testing.expectError(error.NotLeader, owners.orderedHistoryResolutionRouted(a, fence, "docs", resolution));
     try std.testing.expectEqual(@as(usize, 2), fixture.validations);
     fixture.validations = 0;
     fixture.mode = .route_change;
@@ -134,12 +145,26 @@ test "ordered history routed pages retain real images and discard failed final f
     fixture.ranges[0].range_id = 7;
     try std.testing.expectError(error.TopologyChanged, owners.orderedHistoryGrantRouted(a, fence, "docs", grant_identity));
     try std.testing.expectEqual(@as(usize, 2), fixture.validations);
-    try std.testing.expectEqual(@as(usize, 9), fixture.waits);
+    fixture.validations = 0;
+    fixture.ranges[0].range_id = 7;
+    try std.testing.expectError(error.TopologyChanged, owners.orderedHistoryResolutionRouted(a, fence, "docs", resolution));
+    try std.testing.expectEqual(@as(usize, 2), fixture.validations);
+    try std.testing.expectEqual(@as(usize, 12), fixture.waits);
     fixture.mode = .normal;
     fixture.ranges[0].range_id = 7;
     var future = recovery;
     future.minimum_applied_index = 3;
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owners.orderedHistoryOutcomeRouted(a, fence, "docs", future));
+    var ahead = resolution;
+    ahead.minimum_applied_index = 3;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owners.orderedHistoryResolutionRouted(a, fence, "docs", ahead));
+    ahead = resolution;
+    ahead.namespace[0] ^= 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, owners.orderedHistoryResolutionRouted(a, fence, "docs", ahead));
+    ahead = resolution;
+    ahead.authority = .native;
+    ahead.minimum_applied_index = 0;
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, owners.orderedHistoryResolutionRouted(a, fence, "docs", ahead));
 }
 
 test "compiled ordered history control retains native outcomes without catalog reads" {

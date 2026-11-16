@@ -88,6 +88,7 @@ pub fn add(
             tests.executable.root_module.addObject(test_metadata.object);
             runs[index] = tests.run(b);
             if (index == 0) b.step("history-resolution-owner-test", "Verify compiled immutable resolution reads and qualified cuts").dependOn(&runs[index].step);
+            if (index == 1) b.step("history-resolution-routed-test", "Verify frozen routed completion receipt reads").dependOn(&runs[index].step);
             if (index == 2) {
                 b.step("enrichment-compute-owner-test", "Run the compiled media owner contract regressions").dependOn(&runs[index].step);
                 tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);

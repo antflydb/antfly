@@ -1788,12 +1788,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         return parsed.value;
     }
 
-    const HistoryReadKind = enum { page, outcome, grant };
+    const HistoryReadKind = enum { page, outcome, grant, resolution };
     fn HistoryReadInput(comptime kind: HistoryReadKind) type {
         return switch (kind) {
             .page => table_write_source.history_page.Request,
             .outcome => table_write_source.history_ordered.Lookup,
             .grant => table_write_source.history_consumer.GrantIdentity,
+            .resolution => table_write_source.history_resolution_wire.Request,
         };
     }
     fn HistoryReadResult(comptime kind: HistoryReadKind) type {
@@ -1801,6 +1802,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .page => table_write_source.history_page.Page,
             .outcome => table_write_source.history_ordered.Outcome,
             .grant => table_write_source.history_consumer.GrantObservation,
+            .resolution => table_write_source.history_resolution_wire.Reply,
         };
     }
 
@@ -1816,6 +1818,10 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     pub fn orderedHistoryGrantRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, identity: table_write_source.history_consumer.GrantIdentity) !table_write_source.history_consumer.GrantObservation {
         return self.historyReadRouted(alloc, fence, table_name, .grant, identity);
+    }
+
+    pub fn orderedHistoryResolutionRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, request: table_write_source.history_resolution_wire.Request) !table_write_source.history_resolution_wire.Reply {
+        return self.historyReadRouted(alloc, fence, table_name, .resolution, request);
     }
 
     fn historyReadRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, comptime kind: HistoryReadKind, request: HistoryReadInput(kind)) !HistoryReadResult(kind) {
@@ -1834,8 +1840,13 @@ pub const ProvisionedKernelOwnerSource = struct {
             .page => request.reference.namespace,
             .outcome => request.command.namespace(),
             .grant => request.namespace,
+            .resolution => request.namespace,
         };
         if (comptime kind == .grant) try request.validate();
+        if (comptime kind == .resolution) {
+            try request.validate();
+            if (request.authority != .raft) return error.ChangefeedCapabilityUnsupported;
+        }
         if (!std.mem.eql(u8, &namespace, &requested_namespace)) return error.HistoryResynchronizationRequired;
         const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
         const opts: db_types.ScanOptions = .{ .execution_deadline_ns = context.deadline_ns, .cancellation = fence.admission_cancellation };
@@ -1847,6 +1858,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (request.minimum_applied_index < request.entry.index) return error.InvalidHistoryAdmission;
             if (proof.applied_index < request.minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
         }
+        if (comptime kind == .resolution) if (proof.applied_index < request.minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
         var lease = try self.acquireWithControls(group, table_name, .from(opts));
         defer lease.deinit();
@@ -1860,10 +1872,19 @@ pub const ProvisionedKernelOwnerSource = struct {
                 break :blk try lease.owner().orderedHistoryOutcome(alloc, table_name, recovery);
             },
             .grant => try lease.owner().orderedHistoryGrant(alloc, table_name, request, proof.applied_index),
+            .resolution => blk: {
+                var qualified = request;
+                qualified.minimum_applied_index = proof.applied_index;
+                break :blk try lease.owner().historyResolution(alloc, table_name, qualified);
+            },
         };
         errdefer if (comptime kind == .page) result.deinit();
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
         try self.validateRoutedRead(alloc, fence, group, table_name);
+        // The compiled owner validated the stronger actual ReadIndex request.
+        // Preserve its observed cut while binding the outward reply to the
+        // original logical request, only after every final fence passes.
+        if (comptime kind == .resolution) return table_write_source.history_resolution_wire.Reply.init(request, result.cut, result.resolution);
         return result;
     }
 

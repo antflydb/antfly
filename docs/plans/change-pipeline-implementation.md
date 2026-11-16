@@ -2138,8 +2138,22 @@ including receipt lookup in a snapshot with primary transaction metadata absent.
 The initial direct wire gate passed four tests in
 `history-resolution-wire-test.log`; source catalog generation completed.
 
-Routed strong-read integration and its before/after frozen-owner/catalog checks,
-signed network receipt transport, mutation-side input/owner validation and
+The provisioned owner source now routes receipt reads through the same captured
+ReadIndex and frozen owner/catalog validation as retained page and grant reads.
+It rejects native authority requests on this Raft path and requested minimum
+indices ahead of the captured proof before acquiring an owner. The compiled
+storage request uses the captured proof's applied index. Only after final owner
+and catalog validation succeeds does the route rebind the reply digest to the
+original logical request, retaining the actual stronger observed storage cut.
+
+The compiled routed gate passed in `history-resolution-routed-test.log` using
+`history-resolution-routed-test -Dstorage-owner-source-test-filter='ordered
+history routed pages'`. Its real owner fixture checks cut-bound absence and
+original request binding, leader loss and route replacement during final
+validation, future-cut rejection, wrong namespace and wrong authority. This is
+a routed compiled-owner qualification, not network or failover qualification.
+
+Signed network receipt transport, mutation-side input/owner validation and
 protocol activation, authenticated collection, complete certificate publication,
 retention/GC handoff and topology recovery still require implementation and
 qualification. The direct storage read does not itself establish leadership or
