@@ -9297,23 +9297,25 @@ pub const NativeFile = struct {
         // valid prefix recomputes the real `tail`/`last_sequence` the
         // same way a cold `recoverRedoLog` open would, without re-applying
         // any record content (already shared and current).
-        if (self.redo) |*redo| {
-            const current = redo.writer.last_sequence orelse 0;
-            if (latest > current) {
-                const io = self.runtime();
-                const Noop = struct {
-                    fn onRecord(_: ?*anyopaque, _: redo_log.RecordView) anyerror!void {}
-                };
-                const outcome = try redo_log.replay(self.allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, redo.checkpoint_sequence, Noop.onRecord, null);
-                if (outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
-                redo.writer.tail = outcome.valid_bytes;
-                redo.writer.last_sequence = outcome.last_sequence;
-                if (latest > redo.durable_sequence) redo.durable_sequence = latest;
-            }
-        }
         const base = self.activeCheckpoint().commit_sequence;
-        if (base >= latest) return;
+        const redo_stale = if (self.redo) |*redo| latest > (redo.writer.last_sequence orelse 0) else false;
+        if (base >= latest and !redo_stale) return;
         const io = self.runtime();
+        // perf/lwa-xproc-redocorrupt: read the real on-disk checkpoint (and
+        // thus the authoritative fold boundary, `redo_folded_through`)
+        // before, not after, the redo writer's own no-op replay below. A
+        // fold whose physical log reclaim another same-process instance
+        // deferred (a reader pinned behind it) consumes a commit sequence
+        // without ever appending a log record for it, so the log skips
+        // that sequence (`checkpointRedoLog`'s own "consumed-but-unlogged
+        // sequence" case, design doc §9.3b). Replaying from this
+        // instance's own, still-stale `redo.checkpoint_sequence` -- the
+        // original ordering here, which only refreshed it afterward, down
+        // in the `base`-staleness branch below -- walks straight into that
+        // skipped sequence and reports it as `error.NativeRedoLogCorrupt`:
+        // the same class of bug `refreshCrossProcessRedoOverlay` was fixed
+        // for (commit `9a31bd7778`), just reached from this in-process
+        // staleness path instead of the cross-process one.
         var header_bytes: [header_size]u8 = undefined;
         try readHeaderExactAt(self.file, io, &header_bytes);
         var header = try decodeHeader(&header_bytes);
@@ -9321,6 +9323,26 @@ pub const NativeFile = struct {
         header.checkpoints = loadCheckpointSlots(self.file, io, header.page_size, file_size);
         const recovered = try recoverActiveCheckpoint(self.file, io, header, file_size, false);
         header.active_checkpoint = recovered.index;
+        if (self.redo) |*redo| {
+            const disk_folded_through = header.checkpoints[header.active_checkpoint].redo_folded_through;
+            if (disk_folded_through > redo.checkpoint_sequence) redo.checkpoint_sequence = disk_folded_through;
+            const current = redo.writer.last_sequence orelse 0;
+            if (latest > current) {
+                const Noop = struct {
+                    fn onRecord(_: ?*anyopaque, _: redo_log.RecordView) anyerror!void {}
+                };
+                // Records at or below the adopted checkpoint's fold
+                // boundary are already in its tree -- start after the
+                // later of the two, exactly `refreshCrossProcessRedoOverlay`'s
+                // own fix.
+                const outcome = try redo_log.replay(self.allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, @max(redo.durable_sequence, redo.checkpoint_sequence), Noop.onRecord, null);
+                if (outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
+                redo.writer.tail = outcome.valid_bytes;
+                redo.writer.last_sequence = outcome.last_sequence;
+                if (latest > redo.durable_sequence) redo.durable_sequence = latest;
+            }
+        }
+        if (base >= latest) return;
         // perf/lwa-stale-base: for a redo-log file, the on-disk checkpoint
         // slot's own `commit_sequence` just read above is only the last
         // real *fold* boundary (`recoverRedoLog`'s own `folded_through`) --
@@ -33930,6 +33952,102 @@ test "lite redo log in-process base refresh also resyncs the redo writer's own c
     const confirmed = (try reopened.getDocumentAlloc(a, "second-doc")).?;
     defer a.free(confirmed);
     try std.testing.expectEqualStrings("second-value", confirmed);
+}
+
+// `refreshIfWriterBaseStale`'s own sibling of the cross-process fix in
+// `refreshCrossProcessRedoOverlay` (commit `9a31bd7778`): a fold whose
+// physical log reclaim is deferred (a reader pinned behind it) consumes a
+// commit sequence without ever appending a log record for it, so the log
+// skips that sequence. A second in-process writer-mode handle that has
+// been idle since before the fold still carries its own, now-stale
+// `redo.checkpoint_sequence` (the fold boundary as of its own last catch
+// up). The original code only refreshed that field *after* running the
+// redo writer's own no-op-callback replay -- so that replay walked
+// straight into the skipped sequence and reported
+// `error.NativeRedoLogCorrupt`, exactly the live failure
+// `scripts/bench/lite_sqlite_comparison.py --workers 8`'s full-text
+// derived catch-up hit (its own index-apply commit runs through this same
+// `beginTransaction` -> `refreshIfWriterBaseStale` path on a second,
+// idle-since-before-the-fold handle). The fix reads the real on-disk fold
+// boundary first and folds it into `redo.checkpoint_sequence` before that
+// replay ever runs.
+test "lite redo log a second writer-mode handle catches up across a deferred fold's skipped sequence" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-stale-writer-deferred-fold.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one");
+    try writer.commitTransaction();
+    try std.testing.expectEqual(@as(u64, 1), writer.activeCheckpoint().commit_sequence);
+
+    // A second in-process writer-mode handle, idle from here on until its
+    // own `beginTransaction` call far below -- exactly the "borrowed index
+    // writer" shape `refreshIfWriterBaseStale`'s own doc comment names,
+    // and the shape the full-text index's own `native_catalog_sink.zig`
+    // commit path takes on `Store.file`.
+    var second = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true });
+    try std.testing.expect(second.redo != null);
+    try std.testing.expectEqual(@as(u64, 1), second.redo.?.writer.last_sequence);
+
+    // A cross-process-style reader pin, taken while the log still only
+    // holds "alpha" -- enough to defer the fold's own reclaim below
+    // without involving a second process or a fork.
+    var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    try reader.refreshCrossProcessRedoOverlay(); // pins at "alpha"'s sequence
+
+    try writer.beginTransaction();
+    try writer.putDocument("beta", "two");
+    try writer.commitTransaction();
+    try std.testing.expectEqual(@as(u64, 2), writer.activeCheckpoint().commit_sequence);
+
+    const tail_before = writer.redo.?.writer.tail;
+    try writer.checkpointRedoLog();
+    // Deferred: `reader`'s pin is still behind this fold, so the log's
+    // physical bytes for "alpha"/"beta" were not reclaimed -- but the
+    // fold's own bare commit still consumed a real sequence (3) with no
+    // log record of its own.
+    try std.testing.expectEqual(tail_before, writer.redo.?.writer.tail);
+    try std.testing.expectEqual(@as(u64, 3), writer.activeCheckpoint().commit_sequence);
+
+    // A genuinely new record lands *past* the skipped sequence. Replaying
+    // "alpha"/"beta" as ordinary (non-superseded) records and then
+    // expecting sequence 3 to continue them -- instead of treating both
+    // as already covered by the fold's own tree and only picking back up
+    // here -- is exactly the gap that used to report `corrupt_record`.
+    try writer.beginTransaction();
+    try writer.putDocument("gamma", "three");
+    try writer.commitTransaction();
+    try std.testing.expectEqual(@as(u64, 4), writer.activeCheckpoint().commit_sequence);
+
+    // `second` has been idle since before any of the above. Its own
+    // `beginTransaction` -> `refreshIfWriterBaseStale` must catch it up
+    // across the fold's skipped sequence rather than surfacing
+    // `error.NativeRedoLogCorrupt`.
+    try second.beginTransaction();
+    try second.putDocument("second-doc", "second-value");
+    try second.commitTransaction();
+    try std.testing.expectEqual(@as(u64, 5), second.activeCheckpoint().commit_sequence);
+
+    const value = (try second.getDocumentAlloc(a, "second-doc")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("second-value", value);
+
+    // Reopening fresh must still see every commit above, confirming the
+    // log itself is structurally valid, not merely that `second`'s own
+    // in-memory view limped past the check.
+    second.close();
+    reader.close();
+    writer.close();
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    inline for (.{ "alpha", "beta", "gamma", "second-doc" }) |k| {
+        const got = (try reopened.getDocumentAlloc(a, k)) orelse return error.TestUnexpectedResult;
+        a.free(got);
+    }
 }
 
 // A reader in this same process shares the writer's in-memory overlay and
