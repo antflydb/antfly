@@ -1547,6 +1547,21 @@ pub const IndexManager = struct {
     /// Durable generated-artifact cleanup uses the same single-flight shape,
     /// but runs in bounded pages so it cannot monopolize structural locks.
     artifact_cleanup_state: std.atomic.Value(u8) = .init(0),
+    /// Bounds `db.zig`'s `onGeneratedArtifactCleanupGiveUp` resubmission: a
+    /// transient failure burst longer than one `cleanup_job_owner.drain`
+    /// run's 8-attempt budget (e.g. a rate-limited dependency) must still
+    /// clear, but a genuinely permanent failure must not resubmit forever.
+    /// Reset to 0 by `advanceArtifactCleanup`'s own non-error returns.
+    artifact_cleanup_giveup_rounds: std.atomic.Value(u32) = .init(0),
+    /// Set by every `db.zig` `scheduleGeneratedArtifactCleanupContext` call
+    /// (mirrors `attachHllMaintenance`'s `hll_maintenance_lane`/
+    /// `hll_maintenance_owner_id` pair below). `cleanup_job_owner.Port`'s
+    /// `on_give_up` callback only receives its own `ptr`
+    /// (`*execution_resources.AsyncContext`), not the lane/owner_id used to
+    /// schedule it, so `onGeneratedArtifactCleanupGiveUp` reads these back
+    /// from `ctx.index_manager` to resubmit a bounded number of times.
+    artifact_cleanup_lane: ?background_runtime_mod.DurableJobLane = null,
+    artifact_cleanup_owner_id: u64 = 0,
     // Bulk text backfill performs its own policy compaction at durable batch
     // boundaries. Keep the asynchronous scheduler from competing with it (or
     // compacting an older schema generation) for CPU, mmap residency, and the

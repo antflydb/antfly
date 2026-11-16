@@ -10065,6 +10065,8 @@ pub const DB = struct {
         lane: background_runtime_mod.DurableJobLane,
         owner_id: u64,
     ) void {
+        ctx.index_manager.artifact_cleanup_lane = lane;
+        ctx.index_manager.artifact_cleanup_owner_id = owner_id;
         @import("cleanup_job_owner.zig").schedule(.{
             .ptr = ctx,
             .state = &ctx.index_manager.artifact_cleanup_state,
@@ -10074,12 +10076,40 @@ pub const DB = struct {
             .closing = &ctx.background_closing,
             .advance = advanceArtifactCleanup,
             .name = "generated-artifact",
+            .on_give_up = onGeneratedArtifactCleanupGiveUp,
         });
+    }
+
+    /// `cleanup_job_owner.drain` gives up (and never resubmits on its own)
+    /// once one run exhausts its 8-attempt budget, regardless of whether
+    /// `advance`'s failures were ever going to clear -- see its own doc
+    /// comment; that unconditional stop is the deliberate fix for a prior
+    /// liveness bug (a truly permanent `advance` failure resubmitting
+    /// forever). But "exhausted 8 attempts" is not the same thing as
+    /// "permanent": a dependency rate limit or other bounded burst of
+    /// transient failures can easily outlast one run without ever being
+    /// unrecoverable. Resubmit a bounded number of additional rounds here
+    /// (each its own fresh 8-attempt budget) before truly stopping, so this
+    /// differs from the fixed bug only in being finite -- a genuinely
+    /// permanent failure still stops for good, just after more total
+    /// attempts instead of looping forever.
+    const max_generated_artifact_cleanup_giveup_rounds: u32 = 4;
+    fn onGeneratedArtifactCleanupGiveUp(ptr: *anyopaque, _: anyerror) void {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        const rounds = ctx.index_manager.artifact_cleanup_giveup_rounds.fetchAdd(1, .acq_rel) + 1;
+        if (rounds > max_generated_artifact_cleanup_giveup_rounds) return;
+        const lane = ctx.index_manager.artifact_cleanup_lane orelse return;
+        scheduleGeneratedArtifactCleanupContext(ctx, lane, ctx.index_manager.artifact_cleanup_owner_id);
     }
 
     fn advanceArtifactCleanup(ptr: *anyopaque) !@import("cleanup_job_owner.zig").Advance {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-        return try advanceGeneratedArtifactCleanupContext(ctx, null);
+        const result = try advanceGeneratedArtifactCleanupContext(ctx, null);
+        // A successful advance (even mid-burst, interleaved with failures)
+        // demonstrates forward progress; reset the give-up bookkeeping so
+        // an unrelated later burst gets its own full round budget.
+        ctx.index_manager.artifact_cleanup_giveup_rounds.store(0, .release);
+        return result;
     }
 
     const retired_index_artifact_repair_cleanup_page_size: usize = 64;
