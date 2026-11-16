@@ -31252,6 +31252,16 @@ const MaterializedDenseBatch = struct {
     items: std.ArrayListUnmanaged(ChunkedDenseWindowItem) = .empty,
     rejected: std.AutoHashMapUnmanaged(u64, void) = .empty,
     bytes: usize = 0,
+    fn flushForRequest(self: *@This(), runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder, embedding_name: []const u8, request: enrichment_types.GeneratedEnrichmentRequest, consumers: []const []const u8, window: *GeneratedReplayWindow, scope: *FailureScope) !bool {
+        _ = try flushChunkedDenseItems(runtime, provider, embedding_name, request.expected_dims, consumers, &self.texts, &self.items, window, true, scope, &self.rejected);
+        self.bytes = 0;
+        // The batch result describes all of its members, not necessarily the
+        // current document. Failed members and stale-source rejections are
+        // recorded individually; only this request's rejection stops its work.
+        if (self.rejected.contains(requestFailureFingerprint(request))) return false;
+        scope.enterRequest(request);
+        return true;
+    }
     fn discardRequest(self: *@This(), alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) void {
         // A failed append can leave an owned text without its metadata item.
         while (self.texts.items.len > self.items.items.len) alloc.free(@constCast(self.texts.pop().?));
@@ -31322,9 +31332,7 @@ fn processMaterializedChunkDenseRequestWithBatch(
         // The pending batch belongs to earlier requests, so its terminal
         // failure must not suppress this unattempted document.
         if (!try scheduler.sameInputBudget(runtime, chunk_items.items[0].request, null, request, null)) {
-            _ = try flushChunkedDenseItems(runtime, pinned_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, chunk_texts, chunk_items, window, true, scope, &batch.rejected);
-            batch.bytes = 0;
-            scope.enterRequest(request);
+            if (!try batch.flushForRequest(runtime, pinned_embedder, embedding_artifact_name, request, consumer_indexes, window, scope)) return;
         }
     };
     var cached_items = std.ArrayListUnmanaged(CachedChunkDenseWindowItem).empty;
@@ -31475,15 +31483,7 @@ fn processMaterializedChunkDenseRequestWithBatch(
         try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, assetProviderRequestContext(runtime));
         try processCachedChunkDenseItems(runtime, request, consumer_indexes, window, &cached_items, max_window_items, scope);
         if (shared == null or collect.stopped_for_batch) {
-            const includes_request = for (chunk_items.items) |item| {
-                if (sameRequestFailureIdentity(item.request, request)) break true;
-            } else false;
-            const complete = try flushChunkedDenseItems(runtime, pinned_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, chunk_texts, chunk_items, window, true, scope, rejected_requests);
-            batch_source_bytes.* = 0;
-            // A byte boundary can stop before this document contributes any
-            // input. A failed preceding batch must not suppress its first row.
-            if (!complete and includes_request) return;
-            scope.enterRequest(request);
+            if (!try batch.flushForRequest(runtime, pinned_embedder, embedding_artifact_name, request, consumer_indexes, window, scope)) return;
         }
         if (rejected_requests.contains(requestFailureFingerprint(request))) return;
         try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
@@ -31499,14 +31499,14 @@ fn processMaterializedChunkDenseRequestWithBatch(
     var source_guarded_in_window = false;
     for (existing_embedding_keys.items) |embedding_key| {
         if (try derivedEmbeddingBelongsToDesiredChunkSet(runtime.alloc, embedding_key, &desired_chunk_keys)) continue;
-        // Retire stale outputs only after pending replacement inference succeeds.
-        if (!try flushChunkedDenseItems(runtime, pinned_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, chunk_texts, chunk_items, window, true, scope, rejected_requests)) return;
-        batch_source_bytes.* = 0;
-        if (rejected_requests.contains(requestFailureFingerprint(request))) return;
-        // Finish preceding replacement work before guarded cleanup. Later
-        // requests may share this bounded window with independent guards.
+        // Retire stale outputs only after this request's replacements succeed.
+        // An unrelated failed batch must not suppress cached or empty cleanup.
+        if (!try batch.flushForRequest(runtime, pinned_embedder, embedding_artifact_name, request, consumer_indexes, window, scope)) return;
+        // Finish preceding replacement work before guarded cleanup, without
+        // crediting this request before its deletions have even been queued.
+        // Later requests may share the window with independent source guards.
         if (window.source_guards.items.len == 0)
-            try flushGeneratedReplayWindowWithIdentity(runtime, window, scope.completedFingerprint());
+            try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
         try guardStaleEmbeddingDelete(runtime, window, source_key, source_digest, request, embedding_key, &source_guarded_in_window);
         try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.artifact_delete_keys, &window.artifact_delete_key_index, embedding_key);
         try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
@@ -42648,6 +42648,12 @@ test "legacy materialized chunk embeddings retain unattempted documents after by
     try testOrderedChunkVectorCarry(true, .legacy_boundary_terminal);
 }
 
+test "legacy materialized chunk embeddings clean stale outputs after an unrelated terminal batch" {
+    try testOrderedChunkVectorCarry(true, .legacy_cleanup_terminal);
+    try testOrderedChunkVectorCarry(true, .legacy_cleanup_terminal_empty);
+    try testOrderedChunkVectorCarry(true, .legacy_cleanup_terminal_current);
+}
+
 test "legacy materialized chunk embeddings retain queued inputs when later preparation fails" {
     try testOrderedChunkVectorCarry(true, .legacy_preparation_retry);
     try testOrderedChunkVectorCarry(true, .legacy_preparation_retry_cached);
@@ -42692,7 +42698,7 @@ test "ordered materialized chunk embeddings preserve relational retry budgets" {
     try testOrderedChunkVectorCarry(true, .relational_retry);
 }
 
-const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize };
+const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current };
 
 fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
@@ -42704,6 +42710,10 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         capability_calls: usize = 0,
         publications: usize = 0,
         cached_publications: usize = 0,
+        cleanup_db: ?*db_mod.DB = null,
+        cleanup_runtime: ?*EnrichmentRuntime = null,
+        cleanup_stale_key: []const u8 = "",
+        cleanup_deletions: usize = 0,
         generation: u8 = 1,
         change_generation: bool = false,
         fail_first_batch: bool = false,
@@ -42722,6 +42732,32 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             try std.testing.expectEqual(@as(usize, 1), batch.dense_embeddings.len);
             try std.testing.expectEqualStrings("legacy-doc-0", batch.dense_embeddings[0].parent_doc_key orelse return error.TestUnexpectedResult);
             self.cached_publications += 1;
+            return .{ .sequence = 0 };
+        }
+        fn publishCleanup(ptr: *anyopaque, batch: derived_types.DerivedBatch, promotions: []const GeneratedArtifactPromotion, deletes: []const []const u8, guards: []const GeneratedSourceGuard, fence: ?GeneratedWriteFence) !GeneratedRecordCommit {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 0), promotions.len);
+            // An earlier publication cannot forgive B's retry episode before
+            // B's guarded cleanup has committed.
+            try std.testing.expect(self.cleanup_runtime.?.retry_failure_count == 1);
+            for (batch.dense_embeddings) |embedding| {
+                try std.testing.expectEqualStrings("legacy-doc-1", embedding.parent_doc_key orelse return error.TestUnexpectedResult);
+                self.cached_publications += 1;
+            }
+            // Capture the legacy publication boundary independently of the
+            // fixture's ordered DB, but commit deletions with the real source
+            // and lease validators so obsolete outputs cannot disappear early.
+            var txn = try self.cleanup_db.?.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try validateRuntimeStoreWriteFenceTxn(self.cleanup_runtime.?, &txn, fence);
+            for (guards) |guard| try validateGeneratedSourceGuard(std.testing.allocator, &txn, guard);
+            for (deletes) |key| {
+                try std.testing.expect(guards.len > 0);
+                try std.testing.expectEqualStrings(self.cleanup_stale_key, key);
+                try txn.delete(key);
+            }
+            try txn.commit();
+            self.cleanup_deletions += deletes.len;
             return .{ .sequence = 0 };
         }
         fn caps(ptr: *anyopaque, _: Allocator, _: []const u8) !inference_work.InferenceCapabilities {
@@ -42843,7 +42879,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         try db.addEnrichment(.{ .name = "other", .kind = .embedding, .field = "body", .source_artifact_name = "chunks", .expected_dims = 2 });
         try db.addIndex(.{ .name = "other_vector", .kind = .dense_vector, .config_json = "{\"field\":\"dense\",\"dims\":2,\"embedding_name\":\"other\"}" });
     }
-    if (batching == .legacy or batching == .legacy_bytes or batching == .legacy_budget or batching == .legacy_boundary_terminal or batching == .legacy_metadata_retry or batching == .legacy_metadata_terminal or batching == .legacy_preparation_retry or batching == .legacy_preparation_retry_cached) {
+    if (batching == .legacy or batching == .legacy_bytes or batching == .legacy_budget or batching == .legacy_boundary_terminal or batching == .legacy_metadata_retry or batching == .legacy_metadata_terminal or batching == .legacy_preparation_retry or batching == .legacy_preparation_retry_cached or batching == .legacy_cleanup_terminal or batching == .legacy_cleanup_terminal_empty or batching == .legacy_cleanup_terminal_current) {
         const count = 3;
         var keys: [count][]u8 = undefined;
         var initialized: usize = 0;
@@ -42851,7 +42887,8 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         for (&keys, 0..) |*key, i| {
             key.* = try std.fmt.allocPrint(alloc, "legacy-doc-{d}", .{i});
             initialized += 1;
-            try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = key.*, .value = "{\"body\":\"hello world\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = i + 1 });
+            try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = key.*, .value = if (batching == .legacy_cleanup_terminal_empty and i == 1) "{\"body\":\"\"}" else "{\"body\":\"hello world\"}" }}, .timestamp_ns = 100 }, .{ .term = 1, .index = i + 1 });
+            if (batching == .legacy_cleanup_terminal_empty and i == 1) continue;
             const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, key.*, "chunks", 0);
             defer alloc.free(chunk);
             try db.core.store.putBatch(&.{.{ .key = chunk, .value = "{\"body\":\"hello world\"}" }}, &.{});
@@ -42873,6 +42910,62 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         defer freeWorkerChunkCache(runtime.alloc, &cache);
         var window: GeneratedReplayWindow = .{ .alloc = runtime.alloc };
         defer window.deinit();
+        if (batching == .legacy_cleanup_terminal or batching == .legacy_cleanup_terminal_empty or batching == .legacy_cleanup_terminal_current) {
+            const cached = batching == .legacy_cleanup_terminal;
+            const failed_current = batching == .legacy_cleanup_terminal_current;
+            var scheduler = try ScopedReplay.load(runtime);
+            defer scheduler.deinit(runtime.alloc);
+            runtime.retry_scheduler = &scheduler;
+            defer runtime.retry_scheduler = null;
+            for (&requests) |*request| request.sequence = 10;
+            const current_chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, keys[1], "chunks", 0);
+            defer alloc.free(current_chunk);
+            const current_output = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, current_chunk, "model");
+            defer alloc.free(current_output);
+            const stale_chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, keys[1], "chunks", 99);
+            defer alloc.free(stale_chunk);
+            const stale_output = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, stale_chunk, "model");
+            defer alloc.free(stale_output);
+            const encoded = try enrichment_artifact_codec.encodeProducedDenseEmbeddingAlloc(alloc, retainedTextEmbeddingHashAtRevision(requests[1], "hello world", @splat(1)), true, &.{ 1, 2 });
+            defer alloc.free(encoded);
+            if (cached) try db.core.store.putBatch(&.{.{ .key = current_output, .value = encoded }}, &.{});
+            try db.core.store.putBatch(&.{.{ .key = stale_output, .value = encoded }}, &.{});
+            harness.cleanup_db = &db;
+            harness.cleanup_runtime = runtime;
+            harness.cleanup_stale_key = stale_output;
+            runtime.retry_failure_fingerprint = requestFailureFingerprint(requests[1]);
+            runtime.retry_failure_count = 1;
+            harness.fail_first_batch = true;
+            const previous_writer = runtime.write_fn;
+            const previous_write_ctx = runtime.write_ctx;
+            defer {
+                runtime.write_fn = previous_writer;
+                runtime.write_ctx = previous_write_ctx;
+            }
+            runtime.write_fn = Harness.publishCleanup;
+            runtime.write_ctx = &harness;
+            var scope: FailureScope = .{};
+            try processChunkedDenseWindow(runtime, requests[0..2], &cache, &window, &scope);
+            try std.testing.expectEqualSlices(usize, if (failed_current) &.{2} else &.{1}, harness.batches.items);
+            try std.testing.expectEqual(@as(u64, if (failed_current) 2 else 1), runtime.fatal_error_count);
+            try std.testing.expectEqual(@as(usize, @intFromBool(!failed_current)), window.artifact_delete_keys.items.len);
+            try scope.publish(runtime, &window, true);
+            try std.testing.expect(window.isEmpty());
+            try std.testing.expect(runtime.retry_failure_count == 0);
+            try std.testing.expectEqual(@as(usize, @intFromBool(cached)), harness.cached_publications);
+            try std.testing.expectEqual(@as(usize, @intFromBool(!failed_current)), harness.cleanup_deletions);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.state.tickets.items.len);
+            const pending_fn = runtime.failure_pending_fn orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(failed_current, try pending_fn(runtime.failure_ctx.?, failureIdentityForRequest(requests[1]), requests[1].index_name));
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            if (failed_current)
+                _ = try read.get(stale_output)
+            else
+                try std.testing.expectError(error.NotFound, read.get(stale_output));
+            if (cached) try std.testing.expectEqualSlices(u8, encoded, try read.get(current_output));
+            return;
+        }
         if (batching == .legacy_metadata_retry or batching == .legacy_metadata_terminal or batching == .legacy_preparation_retry or batching == .legacy_preparation_retry_cached) {
             var scheduler = try ScopedReplay.load(runtime);
             defer scheduler.deinit(runtime.alloc);
