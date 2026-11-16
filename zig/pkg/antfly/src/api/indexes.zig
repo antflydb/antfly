@@ -2215,6 +2215,9 @@ const AggregatedIndexStatus = struct {
     source_replay: [64]db_mod.types.IndexSourceReplayStatus = @as([64]db_mod.types.IndexSourceReplayStatus, @splat(.{ .artifact_name = "" })),
     source_replay_count: usize = 0,
     replay_catch_up_required: bool = false,
+    // All observed physical consumers retain their own checkpoint fence;
+    // shard-wide producer telemetry cannot establish this proof.
+    scoped_checkpoint_complete: bool = true,
     catch_up_active: bool = false,
     catch_up_phase: db_mod.types.DenseCatchUpStats.Phase = .idle,
     catch_up_applied_sequence: u64 = 0,
@@ -2816,6 +2819,8 @@ fn aggregateIndexStatusIndexed(
                 aggregate.embedding_activity.merge(runtime.group_id, item.embedding_activity);
             }
         }
+        aggregate.scoped_checkpoint_complete = aggregate.scoped_checkpoint_complete and
+            std.mem.eql(u8, public_item.projection_checkpoint_status, "clean");
         aggregate.replay_applied_sequence += public_item.replay_applied_sequence;
         aggregate.replay_target_sequence += public_item.replay_target_sequence;
         for (public_item.source_replay) |source| accumulateSourceReplayStatus(&aggregate, source);
@@ -3707,14 +3712,18 @@ fn appendEnrichmentRuntimeStatus(alloc: std.mem.Allocator, out: *std.ArrayListUn
 /// A fresh, complete physical consumer proof supersedes shard-wide producer
 /// telemetry for readiness. Missing/stale topology, source debt and publication
 /// debt keep the conservative producer fence; diagnostics remain unmodified.
-fn independentConsumerComplete(item: anytype, observation: IndexReadinessObservation, table_doc_count: u64, sparse: bool, generation: u64, config_hash: u64) bool {
+fn independentConsumerComplete(item: anytype, observation: IndexReadinessObservation, table_doc_count: u64, coverage_policy: EmbeddingsCoveragePolicy, sparse: bool, generation: u64, config_hash: u64) bool {
     const Item = @TypeOf(item);
     if (!@hasField(Item, "coverage_produced_count") or !@hasField(Item, "coverage_skipped_count") or !@hasField(Item, "coverage_terminal_failed_count")) return false;
     if (!observation.completionFencesClear()) return false;
+    if (@hasField(Item, "projection_checkpoint_status") and !std.mem.eql(u8, item.projection_checkpoint_status, "clean")) return false;
+    if (@hasField(Item, "scoped_checkpoint_complete") and !item.scoped_checkpoint_complete) return false;
+    if (@hasField(Item, "dense_vector_projection_pending") and item.dense_vector_projection_pending) return false;
     if (aggregateRuntimeCoverageIncomplete(item, generation, config_hash)) return false;
     if (!coverageReplayCurrent(item.replay_applied_sequence, item.replay_target_sequence, item.replay_catch_up_required)) return false;
     if (item.coverage_terminal_failed_count != 0) return false;
-    if (!coverageAllSourcesTerminal(table_doc_count, item.coverage_produced_count, item.coverage_skipped_count, item.coverage_terminal_failed_count)) return false;
+    if (!coverageCountersValid(table_doc_count, item.coverage_produced_count, item.coverage_skipped_count, item.coverage_terminal_failed_count)) return false;
+    if (coverage_policy != .external and !coverageAllSourcesTerminal(table_doc_count, item.coverage_produced_count, item.coverage_skipped_count, item.coverage_terminal_failed_count)) return false;
     return embeddingsArtifactPublishComplete(item, sparse, item.coverage_produced_count);
 }
 
@@ -3800,7 +3809,7 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     const visible_root_node = if (embeddings_materialization_current) item.root_node else 0;
     const readiness_observation = indexReadinessObservation(item, authority, coverage_generation);
     const visible_enrichment = if (embeddings_materialization_current) enrichment else null;
-    const readiness_enrichment = if (index_type == .embeddings and independentConsumerComplete(public_item, readiness_observation, table_doc_count, embeddings_sparse, coverage_generation, coverage_config_hash)) null else visible_enrichment;
+    const readiness_enrichment = if (index_type == .embeddings and independentConsumerComplete(public_item, readiness_observation, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash)) null else visible_enrichment;
     const embeddings_view = if (index_type == .embeddings)
         embeddingsRuntimeView(public_item, table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, readiness_enrichment, coverage_runtime_present)
     else
@@ -3842,10 +3851,17 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     const dense_catch_up = async_indexing.dense_catch_up;
     var catch_up_active = if (embeddings_materialization_current) public_item.catch_up_active else false;
     var catch_up_phase = if (embeddings_materialization_current) public_item.catch_up_phase else .idle;
-    const catch_up_applied_sequence = if (embeddings_materialization_current) public_item.catch_up_applied_sequence else 0;
+    var catch_up_applied_sequence = if (embeddings_materialization_current) public_item.catch_up_applied_sequence else 0;
     const catch_up_target_sequence = if (embeddings_materialization_current) public_item.catch_up_target_sequence else 0;
     if (index_type == .embeddings and catch_up_active and catch_up_phase == .idle and dense_catch_up.active)
         catch_up_phase = dense_catch_up.phase;
+    if (index_type == .embeddings) if (embeddings_view) |view| {
+        if (!view.backfill_active) {
+            catch_up_active = false;
+            catch_up_phase = .idle;
+            catch_up_applied_sequence = @max(catch_up_applied_sequence, catch_up_target_sequence);
+        }
+    };
     const catch_up_pending = catch_up_active or catch_up_target_sequence > catch_up_applied_sequence;
     if (catch_up_pending) {
         replay_catch_up_required = true;
@@ -7447,6 +7463,7 @@ fn consumerTests() type {
                 .name = "vec",
                 .kind = .dense_vector,
                 .doc_count = 1,
+                .serving_snapshot_ready = true,
                 .node_count = 1,
                 .coverage_produced_count = 1,
                 .publication_target_count = 1,
@@ -7530,6 +7547,13 @@ fn consumerTests() type {
                 try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, view, 1, .strict, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = !failed, .worker_failed = failed }, null, null, .{}, metadata, true);
                 try ant_json.testing.expectSubsetJsonText(a, "{\"rebuilding\":false,\"backfill_active\":false,\"dense_replay_applied_sequence\":9,\"dense_replay_target_sequence\":9,\"readiness\":{\"state\":\"ready\",\"queryable\":true,\"complete\":true}}", encoded.items);
             }
+            // External coverage may intentionally omit vectors, while its
+            // own physical publication and zero-producer identity are complete.
+            var external = item;
+            external.source_replay = &.{};
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, external, 10, .external, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true }, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"rebuilding\":false,\"readiness\":{\"complete\":true}}", encoded.items);
             // The same worker diagnostics cannot discharge A's own source debt.
             sources[0].producer_complete = false;
             item.source_replay = &sources;
@@ -7545,6 +7569,18 @@ fn consumerTests() type {
             item.runtime_target_observation_complete = false;
             encoded.clearRetainingCapacity();
             try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, item, 1, .strict, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true }, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"complete\":false}}", encoded.items);
+            item.runtime_target_observation_complete = true;
+            item.projection_checkpoint_status = "rebuilding";
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, item, 1, .strict, false, 7, 41, worker, .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true }, null, null, .{}, metadata, true);
+            try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"complete\":false}}", encoded.items);
+            var dirty_indexes = [_]db_mod.types.DBIndexStats{item};
+            const dirty_runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{ .group_id = 7, .metadata = metadata, .stats = .{ .source_doc_count = 1, .doc_count = 1, .index_count = 1, .indexes = &dirty_indexes, .async_indexing = worker, .enrichment = .{ .enabled = true, .applied_sequence = 2, .target_sequence = 100, .retrying = true } } }};
+            const dirty_aggregate = aggregateIndexStatusIndexed(&dirty_runtimes, "A", &.{7}, 7, 41, null).?;
+            try std.testing.expect(!dirty_aggregate.scoped_checkpoint_complete);
+            encoded.clearRetainingCapacity();
+            try appendSingleIndexRuntimeStatus(a, &encoded, .embeddings, dirty_aggregate, 1, .strict, false, 7, 41, worker, dirty_aggregate.enrichment, null, null, .{}, null, true);
             try ant_json.testing.expectSubsetJsonText(a, "{\"readiness\":{\"complete\":false}}", encoded.items);
         }
 
@@ -9345,7 +9381,7 @@ fn consumerTests() type {
             const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "search_idx", &local_status)).?;
             defer alloc.free(encoded);
             try ant_json.testing.expectSubsetJsonText(alloc,
-                \\{"status":{"incarnation":"g-000000000000002a","total_indexed":0,"milestones":{"queryable":{"reached":false}},"readiness":{"state":"pending","queryable":false,"incarnation":"g-000000000000002a"}},"shard_status":{"7":{"incarnation":"g-000000000000002a","milestones":{"queryable":{"reached":false,"blockers":["incarnation"]}},"readiness":{"state":"pending","queryable":false,"incarnation":"g-000000000000002a","pending_reasons":["incarnation_pending"]}}}}
+                \\{"status":{"incarnation":"g-000000000000002a","total_indexed":0,"milestones":{"queryable":{"reached":false}},"readiness":{"state":"pending","queryable":false,"incarnation":"g-000000000000002a"}},"shard_status":{"7":{"incarnation":"g-000000000000002a","milestones":{"queryable":{"reached":false,"blockers":["runtime_observation","incarnation"]}},"readiness":{"state":"pending","queryable":false,"incarnation":"g-000000000000002a","pending_reasons":["runtime_unavailable","incarnation_pending"]}}}}
             , encoded);
         }
 
