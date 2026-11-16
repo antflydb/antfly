@@ -25701,7 +25701,7 @@ pub const DB = struct {
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
         const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
         _ = try plan.member(namespace);
-        if (plan.version == 2) {
+        if (plan.version >= 2) {
             const binding = owner orelse return error.InvalidHistoryAdmission;
             try plan.requireRoutedOwner(binding);
             if (!std.mem.eql(u8, &binding.namespace, &namespace) or binding.root_generation != self.core.root_generation) return error.HistoryResynchronizationRequired;

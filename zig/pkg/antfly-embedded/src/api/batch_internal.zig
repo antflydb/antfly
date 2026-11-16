@@ -3852,7 +3852,7 @@ pub fn validateCompletionBegin(a: std.mem.Allocator, raw: []const u8, id: [16]u8
     var plan = completion.parseAdmission(a, raw) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBatchRequest;
     defer plan.deinit();
     const admission = plan.value.admission;
-    if (admission.version == 2) {
+    if (admission.version >= 2) {
         const binding = owner orelse return error.InvalidBatchRequest;
         try admission.requireRoutedOwner(binding);
         if (binding.topology_epoch != topology_epoch) return error.InvalidBatchRequest;

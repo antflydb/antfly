@@ -3106,3 +3106,56 @@ qualification also succeeds after an idle protocol barrier without manufacturing
 an extra native write. OpenAPI generation, license, formatting and diff checks
 passed. This completes the remote qualification prerequisite, not the full
 production coordinator, source integration or public changefeed objective.
+
+### Retained original participant owners for coordinator restart
+
+Remote capture exposed a durable recovery gap: admission v2 authenticated each
+owner digest but did not retain its full original identity. Resolving locators
+against the current catalog after restart cannot reconstruct an old root
+generation safely. Admission/manifest v3 therefore require a full `RoutedOwner`
+for every member, validate namespace and digest equality, and expose
+`recoveryOwner(namespace)` from the retained admission. Both the admission and
+complete certificate carry these identities; their domain-separated v3 hashes
+bind the same canonical member identity, roles, original input digest and locator.
+No catalog refresh can replace a retained owner.
+
+The frozen production plan now emits v3. Legacy v1/v2 digests and serialized
+member shapes remain unchanged; legacy recovery cannot invent a missing owner.
+Reservation accounting includes every owner's serialized representation in the
+certificate, including guard/checkpoint participants with no public row effects.
+Private BEGIN, PREPARE and resolution paths continue enforcing original input
+and owner bindings for v3 as for v2.
+
+Raft protocol 33 gates admission and certificate v3 before proposal and native
+apply. Version selection decodes the JSON envelope header under bounded input
+instead of matching text, recognizes escaped field names, rejects duplicate
+versions, and preserves allocation errors. Existing v1/v2 admission and
+certificate entries retain protocol 31/32 requirements for replay compatibility.
+The applying group retains its monotonic activated protocol floor.
+
+`completion-recovery-contract-test.log` passed all six pure completion tests.
+`completion-recovery-protocol-test.log` passed both protocol tests, including
+allocation failure injection. The broader durable/native/Raft run is pending.
+This repairs the retained-input prerequisite; normal coordinator execution,
+background certificate recovery/publication and the full source/public-feed
+objective remain outstanding.
+
+The first broader run passed the 11 storage and 27 frame cases, but the real
+Raft case exposed two native `version == 2` gates: native BEGIN and prepared
+status lookup rejected v3. Both gates now apply the same owner/input fencing to
+v2 and v3. The focused BEGIN target also proved to contain only discovery tests
+for the external codec module. An executable test in its compilation root now
+calls private encoding/decoding and validation directly, checks v3 round-trip,
+rejects public injection, missing or replaced owners, substituted participant
+locators and changed topology. Its result and the corrected native result remain
+pending; discovery success alone is not evidence of these rejection contracts.
+
+`completion-recovery-native-test.log` completed with exit 0: 11 committed-history
+storage cases, 27 frame cases, six focused BEGIN-root cases (including the new
+executable boundary check), and all nine real-Raft cases passed, with no failures,
+skips or leaks. The actual native owner now accepts and retains v3 BEGIN,
+validates the original input at PREPARE, resolves and publishes a v3 certificate.
+The group activates protocol 33 before admission and retains it through the idle
+barrier/read qualification. The all-member preflight suite covers incompatible
+and unavailable peers at protocol 33 as well as the older retained-history
+floors. Source/control catalog generation, formatting and diff checks passed.

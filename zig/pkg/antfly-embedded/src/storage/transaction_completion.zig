@@ -128,6 +128,13 @@ pub const Participant = struct {
     /// Exact original routing locator, not a name resolved against a later
     /// topology. Its owner fence binds the physical generation.
     locator: []const u8,
+    /// Required by v3: retained original owner for restart recovery. Never
+    /// reconstruct it by resolving the locator against a later catalog.
+    routed_owner: ?RoutedOwner = null,
+    pub fn jsonStringify(self: Participant, stream: anytype) @TypeOf(stream.*).Error!void {
+        if (self.routed_owner) |owner| return stream.write(.{ .namespace = self.namespace, .owner_fence = self.owner_fence, .roles = self.roles, .input_digest = self.input_digest, .locator = self.locator, .routed_owner = owner });
+        return stream.write(.{ .namespace = self.namespace, .owner_fence = self.owner_fence, .roles = self.roles, .input_digest = self.input_digest, .locator = self.locator });
+    }
     fn validate(self: Participant) !void {
         if (!nonzero(self.namespace) or !nonzero(self.owner_fence) or self.roles == 0 or self.roles & ~@as(u8, 7) != 0 or self.locator.len == 0 or self.locator.len > max_locator_bytes or !std.unicode.utf8ValidateSlice(self.locator)) return error.InvalidTxnRecord;
     }
@@ -150,18 +157,23 @@ pub const Admission = struct {
         try self.validate();
         if (encoded_admission_bytes > max_bytes) return error.HistoryTooLarge;
         var certificate: u64 = 4096;
-        for (self.participants) |participant| certificate += @as(u64, if (self.version == 2) 768 else 512) + 6 * @as(u64, @intCast(participant.locator.len)) + 2048;
+        for (self.participants) |participant| certificate += @as(u64, if (self.version == 3) 4096 else if (self.version == 2) 768 else 512) + 6 * @as(u64, @intCast(participant.locator.len)) + 2048;
         if (certificate > max_bytes) return error.HistoryTooLarge;
         return certificate + encoded_admission_bytes + 128;
     }
     pub fn validate(self: Admission) !void {
-        if ((self.version != 1 and self.version != 2) or !nonzero(self.transaction_id) or !nonzero(self.admission_digest) or !nonzero(self.coordinator_namespace) or !nonzero(self.coordinator_fence) or self.participants.len == 0 or self.participants.len > max_participants) return error.InvalidTxnRecord;
+        if ((self.version != 1 and self.version != 2 and self.version != 3) or !nonzero(self.transaction_id) or !nonzero(self.admission_digest) or !nonzero(self.coordinator_namespace) or !nonzero(self.coordinator_fence) or self.participants.len == 0 or self.participants.len > max_participants) return error.InvalidTxnRecord;
         for (self.participants, 0..) |participant, i| {
             try participant.validate();
             if (self.version == 1) {
                 // Legacy hashes never authenticated an input digest.
                 if (participant.input_digest != null) return error.InvalidTxnRecord;
             } else if (participant.input_digest == null or !nonzero(participant.input_digest.?)) return error.InvalidTxnRecord;
+            if (self.version == 3) {
+                const owner = participant.routed_owner orelse return error.InvalidTxnRecord;
+                try owner.validate();
+                if (!same(owner.namespace, participant.namespace) or !same(owner.digest(), participant.owner_fence)) return error.InvalidTxnRecord;
+            } else if (participant.routed_owner != null) return error.InvalidTxnRecord;
             if (i != 0 and std.mem.order(u8, &self.participants[i - 1].namespace, &participant.namespace) != .lt) return error.InvalidTxnRecord;
         }
         const coordinator = self.find(self.coordinator_namespace) orelse return error.InvalidTxnRecord;
@@ -187,16 +199,23 @@ pub const Admission = struct {
     pub fn requireRoutedOwner(self: Admission, owner: RoutedOwner) !void {
         try self.validate();
         try owner.validate();
-        if (self.version != 2) return error.ChangefeedCapabilityUnsupported;
+        if (self.version < 2) return error.ChangefeedCapabilityUnsupported;
         const participant = try self.member(owner.namespace);
         if (!same(participant.owner_fence, owner.digest())) return error.TopologyChanged;
+    }
+    /// Recovery may use this identity only with its original authoritative
+    /// route fence and retained native evidence; it is not a fresh owner lease.
+    pub fn recoveryOwner(self: Admission, namespace: Namespace) !RoutedOwner {
+        try self.validate();
+        if (self.version != 3) return error.ChangefeedCapabilityUnsupported;
+        return (try self.member(namespace)).routed_owner.?;
     }
     /// `encoded_input` must be the canonical private PREPARE encoding captured
     /// before durable BEGIN, never a recompiled request from current rows or a
     /// later topology. Version 1 cannot authorize production input admission.
     pub fn requirePreparedInput(self: Admission, namespace: Namespace, encoded_input: []const u8) !void {
         try self.validate();
-        if (self.version != 2) return error.ChangefeedCapabilityUnsupported;
+        if (self.version < 2) return error.ChangefeedCapabilityUnsupported;
         const participant = try self.member(namespace);
         if (encoded_input.len == 0 or !same(participant.input_digest.?, preparedInputDigest(namespace, encoded_input))) return error.SourceTransactionIdentityConflict;
     }
@@ -207,7 +226,11 @@ pub const Admission = struct {
     }
     pub fn digest(self: Admission) Digest {
         var sha = std.crypto.hash.sha2.Sha256.init(.{});
-        sha.update(if (self.version == 2) "antfly:transaction-completion-admission:v2" else "antfly:transaction-completion-admission:v1");
+        sha.update(switch (self.version) {
+            3 => "antfly:transaction-completion-admission:v3",
+            2 => "antfly:transaction-completion-admission:v2",
+            else => "antfly:transaction-completion-admission:v1",
+        });
         number(&sha, self.version);
         sha.update(&self.transaction_id);
         sha.update(&self.admission_digest);
@@ -217,7 +240,7 @@ pub const Admission = struct {
         for (self.participants) |participant| {
             sha.update(&participant.namespace);
             sha.update(&participant.owner_fence);
-            if (self.version == 2) sha.update(&(participant.input_digest orelse @as(Digest, @splat(0))));
+            if (self.version >= 2) sha.update(&(participant.input_digest orelse @as(Digest, @splat(0))));
             sha.update(&.{participant.roles});
             number(&sha, participant.locator.len);
             sha.update(participant.locator);
@@ -271,7 +294,11 @@ pub const Manifest = struct {
     }
     pub fn digest(self: Manifest) Digest {
         var sha = std.crypto.hash.sha2.Sha256.init(.{});
-        sha.update(if (self.version == 2) "antfly:transaction-completion-manifest:v2" else "antfly:transaction-completion-manifest:v1");
+        sha.update(switch (self.version) {
+            3 => "antfly:transaction-completion-manifest:v3",
+            2 => "antfly:transaction-completion-manifest:v2",
+            else => "antfly:transaction-completion-manifest:v1",
+        });
         number(&sha, self.version);
         sha.update(&self.transaction_id);
         sha.update(&self.admission_digest);
@@ -282,7 +309,7 @@ pub const Manifest = struct {
         for (self.participants) |participant| {
             sha.update(&participant.namespace);
             sha.update(&participant.owner_fence);
-            if (self.version == 2) sha.update(&(participant.input_digest orelse @as(Digest, @splat(0))));
+            if (self.version >= 2) sha.update(&(participant.input_digest orelse @as(Digest, @splat(0))));
             sha.update(&.{participant.roles});
             number(&sha, participant.locator.len);
             sha.update(participant.locator);
@@ -635,4 +662,56 @@ test "completion routed owner fences cluster table generation root and topology 
     owner = original;
     owner.metadata_incarnation[0] = 'A';
     try std.testing.expectError(error.InvalidTxnRecord, owner.validate());
+}
+
+test "completion admission v3 retains authenticated original owners through restart encoding" {
+    const a = std.testing.allocator;
+    const first: RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 7, .group_id = 9, .topology_epoch = 4 };
+    var second = first;
+    second.namespace = @splat(3);
+    second.group_id = 10;
+    second.root_generation = 8;
+    var members = [_]Participant{
+        .{ .namespace = first.namespace, .owner_fence = first.digest(), .input_digest = @splat(4), .roles = Roles.effects, .locator = "writer", .routed_owner = first },
+        .{ .namespace = second.namespace, .owner_fence = second.digest(), .input_digest = @splat(5), .roles = Roles.guards | Roles.checkpoint, .locator = "checkpoint", .routed_owner = second },
+    };
+    var admission: Admission = .{ .version = 3, .transaction_id = @splat(6), .admission_digest = @splat(7), .coordinator_namespace = second.namespace, .coordinator_fence = second.digest(), .participants = &members };
+    const bytes = try encodeAdmission(a, admission);
+    defer a.free(bytes);
+    var retained = try parseAdmission(a, bytes);
+    defer retained.deinit();
+    try std.testing.expectEqualDeep(admission, retained.value.admission);
+    try std.testing.expectEqual(first, try retained.value.admission.recoveryOwner(first.namespace));
+    try std.testing.expectEqual(second, try retained.value.admission.recoveryOwner(second.namespace));
+    // Replacing the current catalog owner cannot change retained recovery input.
+    second.root_generation += 1;
+    try std.testing.expectError(error.TopologyChanged, retained.value.admission.requireRoutedOwner(second));
+    try std.testing.expectEqual(@as(u64, 8), (try retained.value.admission.recoveryOwner(second.namespace)).root_generation);
+    const manifest = try admission.manifest(100);
+    var resolutions: [2]Resolution = undefined;
+    for (&resolutions, members) |*resolution, member| {
+        var position: Digest = @splat(0);
+        std.mem.writeInt(u64, position[0..8], 2, .little);
+        position[31] = 2;
+        resolution.* = .{ .namespace = member.namespace, .owner_fence = member.owner_fence, .manifest_digest = manifest.digest(), .commit_version = 100, .source_position = position, .outcome = .{ .no_effect = noEffectProof(manifest, member.namespace, position) } };
+    }
+    const certificate = try encode(a, .{ .manifest = manifest, .resolutions = &resolutions });
+    defer a.free(certificate);
+    try std.testing.expect(bytes.len + certificate.len + 128 <= try admission.reservationBytes(bytes.len));
+    var parsed_certificate = try parse(a, certificate);
+    defer parsed_certificate.deinit();
+    try std.testing.expectEqual(first, try parsed_certificate.value.certificate.manifest.admission().recoveryOwner(first.namespace));
+    members[0].routed_owner.?.root_generation += 1;
+    try std.testing.expectError(error.InvalidTxnRecord, admission.validate());
+    members[0].routed_owner = null;
+    try std.testing.expectError(error.InvalidTxnRecord, admission.validate());
+    admission.version = 2;
+    try std.testing.expectError(error.InvalidTxnRecord, admission.validate());
+    members[1].routed_owner = null;
+    try admission.validate();
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, admission.recoveryOwner(first.namespace));
+    try std.testing.expect(!same(admission.digest(), retained.value.admission.digest()));
+    const old_bytes = try encodeAdmission(a, admission);
+    defer a.free(old_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, old_bytes, "routed_owner") == null);
 }

@@ -1950,7 +1950,7 @@ const RaftTableApplyStateMachine = struct {
         req: antfly.db.types.BatchRequest,
         storage_owner_descriptor: ?kernel_owner_descriptor.Descriptor,
     ) !void {
-        if (@import("../common/data_raft_protocol.zig").completionProtocolVersion(req)) |required| {
+        if (try @import("../common/data_raft_protocol.zig").completionProtocolVersion(self.alloc, req)) |required| {
             if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
             const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
             const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
@@ -12795,8 +12795,8 @@ pub const DataServer = struct {
         return proposal;
     }
 
-    fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
-        if (@import("../common/data_raft_protocol.zig").completionProtocolVersion(req)) |required| return required;
+    fn requiredRaftBatchProtocolVersion(alloc: std.mem.Allocator, req: antfly.db.types.BatchRequest) !u16 {
+        if (try @import("../common/data_raft_protocol.zig").completionProtocolVersion(alloc, req)) |required| return required;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
             return @import("../common/data_raft_protocol.zig").batch_dense_artifact_flags_protocol_version;
         if (req.graph_endpoint_cleanup) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
@@ -13768,7 +13768,7 @@ pub const DataServer = struct {
             return error.OnlineMergeArtifactCatalogUncoordinated;
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         var proposal_req = req;
-        const minimum_protocol_version = requiredRaftBatchProtocolVersion(req);
+        const minimum_protocol_version = try requiredRaftBatchProtocolVersion(alloc, req);
         var required_protocol_version = minimum_protocol_version;
         const deadline_ns = @min(route.admission_deadline_ns orelse std.math.maxInt(u64), self.dataRaftMonotonicNs() +| leader_wait_ns);
         const completion_command = @import("antfly_local_sources").api_internal_batch.requiresCompletionProtocol(req);
@@ -25319,16 +25319,16 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
         try std.testing.expect(!onlineMergeRaftBatchHasArtifactBarrier(admitted));
         admitted.artifact_catalog = .{ .namespace = @splat(1), .binding = binding, .catalogs = catalogs };
         try std.testing.expect(onlineMergeRaftBatchHasArtifactBarrier(admitted));
-        try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, DataServer.requiredRaftBatchProtocolVersion(admitted));
+        try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, admitted));
         var extended_admission = admitted;
         extended_admission.artifact_catalog.?.binding.effect_protocol = 15;
-        try std.testing.expectEqual(@as(u16, 15), DataServer.requiredRaftBatchProtocolVersion(extended_admission));
+        try std.testing.expectEqual(@as(u16, 15), try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, extended_admission));
         extended_admission = admitted;
         extended_admission.artifact_catalog = null;
         extended_admission.online_source.?.admit.artifact_catalog.?.effect_protocol = 15;
-        try std.testing.expectEqual(@as(u16, 15), DataServer.requiredRaftBatchProtocolVersion(extended_admission));
+        try std.testing.expectEqual(@as(u16, 15), try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, extended_admission));
         const invalid_publication: antfly.db.types.BatchRequest = .{ .artifact_publication = .{ .mode = .activate, .namespace = @splat(0), .authority_epoch = 0, .catalog_digest = @splat(0), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) } };
-        try std.testing.expectEqual(@as(u16, 15), DataServer.requiredRaftBatchProtocolVersion(invalid_publication));
+        try std.testing.expectEqual(@as(u16, 15), try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, invalid_publication));
         try std.testing.expectError(error.InvalidBatchRequest, @import("antfly_local_sources").storage_db_artifact_publication.validateRequest(alloc, invalid_publication));
         const adoption: antfly.db.types.BatchRequest = .{ .merge_proof_adoption = .{
             .transition_id = 1,
@@ -25337,7 +25337,7 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
             .proof_digest = @splat(2),
             .record_digest = @splat(3),
         } };
-        try std.testing.expectEqual(data_raft_batch.merge_proof_adoption_protocol_version, DataServer.requiredRaftBatchProtocolVersion(adoption));
+        try std.testing.expectEqual(data_raft_batch.merge_proof_adoption_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, adoption));
         // The current decoder must support this feature's stable activation
         // floor, including after later features raise the advertised version.
         try std.testing.expect(data_raft_batch.protocol_version >= data_raft_batch.merge_proof_adoption_protocol_version);
@@ -25350,7 +25350,7 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
             .artifact_effects = &.{.{ .key = "untrusted", .value = null }},
         } };
         const merge_page_protocol = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
-        try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(unbound_vector_page));
+        try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, unbound_vector_page));
         var unbound_vector_chunk = unbound_vector_page;
         unbound_vector_chunk.merge_page.?.artifact_effects = &.{};
         unbound_vector_chunk.merge_page.?.chunk = .{
@@ -25363,7 +25363,7 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
             .data = "x",
             .chunk_digest = @splat(2),
         };
-        try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(unbound_vector_chunk));
+        try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, unbound_vector_chunk));
         admitted.artifact_catalog.?.binding.epoch += 1;
         try std.testing.expect(!onlineMergeRaftBatchHasArtifactBarrier(admitted));
         var accepted = rollback_accept;
@@ -35413,19 +35413,19 @@ fn consumerTests() type {
         test "time series document revision protocol dominates older envelope features" {
             const p = @import("../common/data_raft_protocol.zig");
             var req: antfly.db.types.BatchRequest = .{ .document_version_scheme = .revision_v1, .writes = &.{.{ .key = "row", .value = "{}" }} };
-            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, req));
             req.document_version_scheme = .legacy;
-            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
+            try std.testing.expect(try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, req) < p.batch_document_revisions_protocol_version);
             // A copy can carry only a floor, with no signed TTL source or
             // current-write marker. It still requires every applying replica
             // to understand the versioned envelope before proposal.
             req.merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
             req.merge_page = .{ .source = .{ .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .pin_digest = @splat(7), .applied_index = 1 }, .sequence = 1, .phase = .rows, .next = "row", .exhausted = true, .digest = @splat(0), .timestamps = &.{1}, .document_version_floor = 1 };
             req.merge_page.?.digest = @import("antfly_local_sources").storage_db_merge_page_contract.commandDigest(req);
-            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, req));
             req.merge_page.?.document_version_floor = 0;
             req.merge_page.?.digest = @import("antfly_local_sources").storage_db_merge_page_contract.commandDigest(req);
-            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
+            try std.testing.expect(try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, req) < p.batch_document_revisions_protocol_version);
             req = .{ .restore_staging = .{ .import_page = .{
                 .expected = @splat(1),
                 .next = "progress",
@@ -35434,9 +35434,9 @@ fn consumerTests() type {
                 .document_timestamps = .{ .version_floor = 0 },
             } } };
             // Even an empty source must explicitly preserve timestamp absence.
-            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+            try std.testing.expectEqual(p.batch_document_revisions_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, req));
             req.restore_staging.?.import_page.document_timestamps = null;
-            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(req) < p.batch_document_revisions_protocol_version);
+            try std.testing.expect(try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, req) < p.batch_document_revisions_protocol_version);
         }
 
         test "time series optional revision upgrade preserves a mixed group's mandatory protocol floor" {
@@ -38438,33 +38438,33 @@ fn consumerTests() type {
             defer alloc.free(retirement);
             try std.testing.expectEqual(
                 @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version,
-                DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = retirement, .value = "1" }} }),
+                try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .merge_artifacts = &.{.{ .key = retirement, .value = "1" }} }),
             );
             const row_protocol = @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .writes = &.{.{ .key = "a", .value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"b\",\"edge_id\":\"one\"}]}}}" }} }));
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }} }));
-            try std.testing.expectEqual(row_protocol, DataServer.requiredRaftBatchProtocolVersion(.{ .predicates = &.{.{ .key = "row", .expected_version = 0, .unique_absence = true }} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .writes = &.{.{ .key = "a", .value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"b\",\"edge_id\":\"one\"}]}}}" }} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }} }));
+            try std.testing.expectEqual(row_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .predicates = &.{.{ .key = "row", .expected_version = 0, .unique_absence = true }} }));
             try std.testing.expectEqual(
                 data_raft_batch.merge_artifacts_protocol_version,
-                DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = "artifact", .value = "payload" }} }),
+                try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .merge_artifacts = &.{.{ .key = "artifact", .value = "payload" }} }),
             );
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_endpoint_cleanup = true }));
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .transaction = .{ .resolve = .{ .txn_id = @splat(0), .status = .committed, .commit_version = 1 } } }));
-            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(.{ .transaction = .{ .prepare = .{ .txn_id = @splat(0), .topology_epoch = 1 } } }) < data_raft_batch.merge_retirements_protocol_version);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .writes = &.{.{ .key = "a", .value = "{\"links\":[\"hub\"]}" }}, .transaction = .{ .prepare = .{ .txn_id = @splat(0), .topology_epoch = 1 } } }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .graph_endpoint_cleanup = true }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .transaction = .{ .resolve = .{ .txn_id = @splat(0), .status = .committed, .commit_version = 1 } } }));
+            try std.testing.expect(try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(0), .topology_epoch = 1 } } }) < data_raft_batch.merge_retirements_protocol_version);
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .writes = &.{.{ .key = "a", .value = "{\"links\":[\"hub\"]}" }}, .transaction = .{ .prepare = .{ .txn_id = @splat(0), .topology_epoch = 1 } } }));
             // A pending-target write is a deterministic rejection. It must
             // advance the committed entry so the next cleanup page can apply.
             try std.testing.expectEqual(error.IntegrityTopologyBusy, RaftTableApplyStateMachine.ExpectedApplyFailure.forRequest(error.IntegrityTopologyBusy, .{ .graph_writes = &.{.{ .index_name = "g", .source = "new", .target = "hub", .edge_type = "R" }} }).?.toError());
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .deletes = &.{"b"} }));
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} }));
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one" }} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .deletes = &.{"b"} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one" }} }));
             const relationship = try antfly.internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "fact", "g", "R", "b", "a", "one");
             defer alloc.free(relationship);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = relationship, .value = "payload" }} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .merge_artifacts = &.{.{ .key = relationship, .value = "payload" }} }));
 
             try std.testing.expectEqual(
                 data_raft_batch.timestamp_protocol_version,
-                DataServer.requiredRaftBatchProtocolVersion(.{}),
+                try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{}),
             );
             try std.testing.expect(!batchRequiresDocumentDbApply(.{
                 .split_transition = .{
@@ -38505,7 +38505,7 @@ fn consumerTests() type {
             }));
             try std.testing.expectEqual(
                 data_raft_batch.merge_transition_protocol_version,
-                DataServer.requiredRaftBatchProtocolVersion(.{
+                try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{
                     .merge_source_transition = .{
                         .kind = .finalize,
                         .transition_id = 7001,
@@ -38515,7 +38515,7 @@ fn consumerTests() type {
             );
             try std.testing.expectEqual(
                 data_raft_batch.split_delta_predecessor_protocol_version,
-                DataServer.requiredRaftBatchProtocolVersion(.{
+                try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{
                     .split_replication = .{
                         .transition_id = 7001,
                         .attempt_epoch = 1,
@@ -38534,7 +38534,7 @@ fn consumerTests() type {
             );
             try std.testing.expectEqual(
                 data_raft_batch.merge_copy_attempt_protocol_version,
-                DataServer.requiredRaftBatchProtocolVersion(.{
+                try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{
                     .merge_checkpoint = .{
                         .kind = .accept,
                         .transition_id = 7001,
@@ -43222,7 +43222,7 @@ fn consumerTests() type {
             const value = try codec.encodeProducedDenseEmbeddingAlloc(a, 7, true, &.{ 1, 2 });
             defer a.free(value);
             const request: antfly.db.types.BatchRequest = .{ .writes = &.{.{ .key = "v", .value = value }} };
-            const required = DataServer.requiredRaftBatchProtocolVersion(request);
+            const required = try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request);
             try std.testing.expectEqual(@as(u16, 29), required);
             var activated = DataRaftProtocolActivationEntry{};
             activated.protocol_version.store(28, .release);
@@ -43306,7 +43306,7 @@ fn consumerTests() type {
             const revisions = @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version;
             const cleanup = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
             try std.testing.expect(cleanup > revisions);
-            try std.testing.expectEqual(cleanup, DataServer.requiredRaftBatchProtocolVersion(request));
+            try std.testing.expectEqual(cleanup, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
             // A group already activated at v27 is still unsafe: neither a
             // durable old barrier nor a same-term pending one admits cleanup.
             var activation: DataRaftProtocolActivationEntry = .{};
@@ -44142,7 +44142,7 @@ fn consumerTests() type {
                 const plan = frozen.admission;
                 const current_owner = frozen.participants[0].owner;
                 const txn_id = plan.transaction_id;
-                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_admission_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
                 const positive_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = txn_id, .owner_fence = current_owner.digest(), .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const positive = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
@@ -44170,10 +44170,10 @@ fn consumerTests() type {
                 var remote_writer: @import("../api/completion_participant.zig").HttpWriter = .{ .client = &publication_client, .base_uri = base };
                 const remote_participant: @import("../api/completion_participant.zig").Port = .{ .writer = remote_writer.writer() };
                 try remote_participant.submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
-                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
                 // An idle root must remain readable after an ordered protocol
                 // barrier, without requiring another document mutation.
-                const idle_barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version);
+                const idle_barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", @import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version);
                 defer a.free(idle_barrier);
                 const idle_barrier_index = blk: {
                     lockAtomic(&server.data_raft_mutex);
@@ -44376,14 +44376,14 @@ fn consumerTests() type {
 
         test "data raft ordered history completion BEGIN cannot use the legacy activation floor" {
             const version = @import("../common/data_raft_protocol.zig");
-            const request: antfly.db.types.BatchRequest = .{ .transaction = .{ .begin = .{ .txn_id = @splat(1), .begin_timestamp = 1, .created_at_ns = 2, .topology_epoch = 3, .participants = &.{"table2:4:docs:group:7"}, .completion_admission = "reserved" } } };
-            try std.testing.expectEqual(version.batch_completion_admission_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+            const request: antfly.db.types.BatchRequest = .{ .transaction = .{ .begin = .{ .txn_id = @splat(1), .begin_timestamp = 1, .created_at_ns = 2, .topology_epoch = 3, .participants = &.{"table2:4:docs:group:7"}, .completion_admission = "{\"admission\":{\"version\":2}}" } } };
+            try std.testing.expectEqual(version.batch_completion_admission_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
             try std.testing.expect(version.batch_completion_admission_protocol_version <= version.batch_protocol_version);
             try std.testing.expectError(error.InvalidBatchRequest, data_raft_batch.encode(std.testing.allocator, "docs", request));
             const completion = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion;
             const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 7, .topology_epoch = 3 };
             const prepare: antfly.db.types.BatchRequest = .{ .timestamp_ns = 10, .document_version_scheme = .revision_v1, .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 3, .completion_owner = owner } } };
-            try std.testing.expectEqual(version.batch_completion_admission_protocol_version, DataServer.requiredRaftBatchProtocolVersion(prepare));
+            try std.testing.expectEqual(version.batch_completion_admission_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, prepare));
             const encoded = try data_raft_batch.encode(std.testing.allocator, "docs", prepare);
             defer std.testing.allocator.free(encoded);
             var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
@@ -44404,7 +44404,7 @@ fn consumerTests() type {
         }
 
         test "data raft ordered history protocol preflight distinguishes incompatible and unavailable peers" {
-            inline for (.{ @import("history_control_entry.zig").required_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version }) |required| {
+            inline for (.{ @import("history_control_entry.zig").required_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version }) |required| {
                 const a = std.testing.allocator;
                 const Fake = struct {
                     versions: [3]u16 = .{ required, required - 1, required },
@@ -44495,7 +44495,7 @@ fn consumerTests() type {
                 },
             };
             const request: antfly.db.types.BatchRequest = .{ .graph_endpoint_cleanup = true };
-            const required = DataServer.requiredRaftBatchProtocolVersion(request);
+            const required = try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request);
             const deadline = std.math.maxInt(u64);
             const mixed = server.dataRaftBatchProtocolPreflight(alloc, plan, required, deadline, null);
             try std.testing.expectEqual(@as(u16, 0), mixed.activatable_version);
@@ -44595,7 +44595,7 @@ fn consumerTests() type {
             };
             page_request.merge_page.?.digest = pages.commandDigest(page_request);
             const merge_page_protocol = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
-            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(page_request));
+            try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, page_request));
             const page_proposal = DataServer.raftBatchRequestForProtocol(page_request, true, 999);
             try std.testing.expectEqual(@as(u64, 0), page_proposal.timestamp_ns);
             const page_bytes = try data_raft_batch.encode(alloc, "docs", page_proposal);
@@ -44605,20 +44605,20 @@ fn consumerTests() type {
             try std.testing.expectEqualDeep(page_request.merge_page.?, page_decoded.batch.req.merge_page.?);
             try std.testing.expectEqualStrings(page_request.writes[0].value, page_decoded.batch.req.writes[0].value);
             page_request.merge_page.?.source.retention = .{ .epoch = 1, .after_sequence = 5 };
-            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(page_request));
+            try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, page_request));
             page_request.merge_page.?.digest = pages.commandDigest(page_request);
             const chunks = try pages.RowChunks(antfly.db.types.BatchRequest).init(page_request);
             const chunk = try chunks.requestAt(0);
-            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(chunk));
+            try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, chunk));
             page_request.merge_page.?.next_snapshot_position = .{ .object = 1, .offset = 8, .remaining = 0 };
-            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(page_request));
+            try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, page_request));
             const source_request: antfly.db.types.BatchRequest = .{ .online_source = .{ .admit = .{ .scope = .{
                 .fence = .{ .transition_id = 1, .attempt = 1, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = .{ .table_id = 4, .shard_id = 2, .range_id = 6 }, .catalog_digest = @splat(1) },
                 .receiver_namespace = .{ .table_id = 4, .shard_id = 3, .range_id = 5 },
                 .consumer_epoch = 1,
                 .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
             } } } };
-            try std.testing.expectEqual(data_raft_batch.source_pin_protocol_version, DataServer.requiredRaftBatchProtocolVersion(source_request));
+            try std.testing.expectEqual(data_raft_batch.source_pin_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, source_request));
             try std.testing.expectEqual(@as(u64, 0), DataServer.materializeRaftBatchTimestamp(source_request, 999).timestamp_ns);
             // Receiver acceptance has an artifact adjunct but no online_source
             // command. It must remain valid across timestamp negotiation and
@@ -44645,7 +44645,7 @@ fn consumerTests() type {
             try inventory.validateRequest(accept_request);
             const accept_proposal = DataServer.raftBatchRequestForProtocol(accept_request, true, 999);
             try std.testing.expectEqual(@as(u64, 0), accept_proposal.timestamp_ns);
-            try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, DataServer.requiredRaftBatchProtocolVersion(accept_proposal));
+            try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, accept_proposal));
             try inventory.validateRequest(accept_proposal);
             const accept_bytes = try data_raft_batch.encode(alloc, "docs", accept_proposal);
             defer alloc.free(accept_bytes);
@@ -44654,8 +44654,8 @@ fn consumerTests() type {
             try inventory.validateRequest(accept_decoded.batch.req);
             try std.testing.expectEqualDeep(accept_proposal.artifact_catalog.?, accept_decoded.batch.req.artifact_catalog.?);
             page_request.merge_page.?.source.integrity = .{ .catalog_digest = @splat(2), .generation_set = @splat(3) };
-            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(page_request));
-            try std.testing.expectEqual(@as(u16, 12), DataServer.requiredRaftBatchProtocolVersion(.{
+            try std.testing.expectEqual(merge_page_protocol, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, page_request));
+            try std.testing.expectEqual(@as(u16, 12), try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{
                 .restore_staging = .{ .finish = .{ .scope = @splat(4), .phase = .validated } },
             }));
         }
@@ -49969,8 +49969,8 @@ fn implementationTests() type {
             // Main's neutral cleanup semantics require the newer decoder even
             // when the generation-planned command shape itself predates it.
             const cleanup = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
-            try std.testing.expectEqual(cleanup, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true }));
-            try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .deletes = &.{"hub"} }));
+            try std.testing.expectEqual(cleanup, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true }));
+            try std.testing.expectEqual(version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .deletes = &.{"hub"} }));
         }
 
         test "leann replication round requires an attached Raft owner and its protocol version" {
@@ -49978,7 +49978,7 @@ fn implementationTests() type {
             server.data_raft = null;
             try server.runLeannReplicationRound();
             const version = @import("../common/data_raft_protocol.zig").batch_dense_artifact_flags_protocol_version;
-            try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .leann_record = .{ .index_name = "idx", .record = "L" } }));
+            try std.testing.expectEqual(version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, .{ .leann_record = .{ .index_name = "idx", .record = "L" } }));
         }
 
         test "data runtime native FK retirement preserves source ownership and exact cold path" {
@@ -59765,13 +59765,13 @@ test "grouped source protocol dominates coexisting graph envelope features" {
         .catalogs = .{},
         .binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3), .effect_protocol = 16 },
     }, .graph_endpoint_cleanup = true };
-    try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    try std.testing.expectEqual(protocol.batch_group_source_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
     request.artifact_catalog.?.binding.effect_protocol = 17;
-    try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    try std.testing.expectEqual(protocol.batch_execution_identity_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
     request = .{ .group_source = .{ .action = .activate, .artifact = "turns", .definition = .{ .table_incarnation = 1, .configuration = @splat(2) }, .namespace = @splat(1), .backfill = .{ .route = .{ .value = "" } } } };
-    try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    try std.testing.expectEqual(protocol.batch_group_source_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
     request.group_source.?.action = .activate_catalog;
-    try std.testing.expectEqual(protocol.batch_dense_artifact_flags_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
+    try std.testing.expectEqual(protocol.batch_dense_artifact_flags_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(std.testing.allocator, request));
     const encoded = try data_raft_batch.encode(std.testing.allocator, "docs", request);
     defer std.testing.allocator.free(encoded);
     var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);

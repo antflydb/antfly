@@ -84,7 +84,7 @@ pub const Plan = struct {
             const name = try owned.dupe(u8, input.locator);
             if ((try unique_locators.getOrPut(owned, name)).found_existing) return error.InvalidParticipant;
             participants[i] = .{ .owner = input.owner, .locator = name, .prepare_bytes = bytes };
-            members[i] = .{ .namespace = input.owner.namespace, .owner_fence = input.owner.digest(), .roles = input.roles, .input_digest = completion.preparedInputDigest(input.owner.namespace, bytes), .locator = name };
+            members[i] = .{ .namespace = input.owner.namespace, .owner_fence = input.owner.digest(), .roles = input.roles, .input_digest = completion.preparedInputDigest(input.owner.namespace, bytes), .locator = name, .routed_owner = input.owner };
         }
         // Admission order is canonical, independent of route enumeration or
         // fanout completion order. Keep the corresponding payloads together.
@@ -95,7 +95,7 @@ pub const Plan = struct {
                 std.mem.swap(completion.Participant, &members[j], &members[j - 1]);
             }
         }
-        const admission: completion.Admission = .{ .version = 2, .transaction_id = transaction_id, .admission_digest = admission_digest, .coordinator_namespace = coordinator.namespace, .coordinator_fence = coordinator.digest(), .participants = members };
+        const admission: completion.Admission = .{ .version = 3, .transaction_id = transaction_id, .admission_digest = admission_digest, .coordinator_namespace = coordinator.namespace, .coordinator_fence = coordinator.digest(), .participants = members };
         try admission.validate();
         try admission.requireRoutedOwner(coordinator);
         const encoded = try completion.encodeAdmission(owned, admission);

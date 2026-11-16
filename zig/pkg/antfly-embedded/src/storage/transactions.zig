@@ -815,7 +815,7 @@ pub const TxnManager = struct {
         };
         defer frozen.deinit();
         const plan = frozen.value.admission;
-        if (plan.version != 2) {
+        if (plan.version < 2) {
             if (input_digest != null or owner != null) return error.ChangefeedCapabilityUnsupported;
             return null;
         }
@@ -856,7 +856,7 @@ pub const TxnManager = struct {
             defer self.alloc.free(namespace);
             if (namespace.len != 24) return error.InvalidTxnRecord;
             const participant = try frozen.value.admission.member(namespace[0..24].*);
-            if (frozen.value.admission.version == 2) {
+            if (frozen.value.admission.version >= 2) {
                 const supplied = extra_batch.completion_input_digest orelse return error.SourceTransactionIdentityConflict;
                 if (!std.mem.eql(u8, &supplied, &participant.input_digest.?)) return error.SourceTransactionIdentityConflict;
                 const binding = extra_batch.completion_owner orelse return error.InvalidHistoryAdmission;
@@ -6058,4 +6058,48 @@ test "time series source language reserves signed source slots before voting" {
     try std.testing.expectEqual(legacy + 16, try retainedIntentBytesForLanguage(std.testing.allocator, intent, true));
     const deleted: WriteIntent = .{ .key = "row", .value = null };
     try std.testing.expectEqual(try retainedIntentBytes(std.testing.allocator, deleted), try retainedIntentBytesForLanguage(std.testing.allocator, deleted, true));
+}
+
+test "committed history completion admission v3 durably retains every original recovery owner" {
+    const history = @import("committed_history.zig");
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const namespace: completion.Namespace = @splat(33);
+    {
+        var bind = try store.beginWriteTxn();
+        errdefer bind.abort();
+        try bind.put(&internal_keys.identity_namespace_key, &namespace);
+        try @import("source_authority.zig").bind(&bind, .raft, namespace);
+        _ = try history.admit(&bind, namespace, @splat(1), 4 * 1024 * 1024, 1000, 1);
+        try bind.commit();
+    }
+    const coordinator: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(2), .root_generation = 7, .group_id = 3, .topology_epoch = 4 };
+    var follower = coordinator;
+    follower.namespace = @splat(34);
+    follower.group_id = 5;
+    follower.root_generation = 8;
+    const members = [_]completion.Participant{
+        .{ .namespace = coordinator.namespace, .owner_fence = coordinator.digest(), .roles = completion.Roles.guards, .locator = "coordinator", .input_digest = @splat(3), .routed_owner = coordinator },
+        .{ .namespace = follower.namespace, .owner_fence = follower.digest(), .roles = completion.Roles.checkpoint, .locator = "checkpoint", .input_digest = @splat(4), .routed_owner = follower },
+    };
+    const admission: completion.Admission = .{ .version = 3, .transaction_id = @splat(5), .admission_digest = @splat(6), .coordinator_namespace = namespace, .coordinator_fence = coordinator.digest(), .participants = &members };
+    {
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try manager.initTransactionWithCompletionAdmission(admission, 10, 11, true, .{});
+    }
+    var reopened = try TxnManager.init(a, &store);
+    defer reopened.deinit();
+    var saved = (try reopened.getCompletionAdmission(a, admission.transaction_id)) orelse return error.TestExpectedRetainedAdmission;
+    defer saved.deinit();
+    try std.testing.expectEqual(admission.digest(), saved.value.digest);
+    try std.testing.expectEqual(coordinator, try saved.value.admission.recoveryOwner(coordinator.namespace));
+    try std.testing.expectEqual(follower, try saved.value.admission.recoveryOwner(follower.namespace));
+    try reopened.initTransactionWithCompletionAdmission(saved.value.admission, 10, 11, true, .{});
+    follower.root_generation += 1;
+    try std.testing.expectError(error.TopologyChanged, saved.value.admission.requireRoutedOwner(follower));
+    try std.testing.expectEqual(TxnStatus.pending, try reopened.getTransactionStatus(admission.transaction_id));
 }

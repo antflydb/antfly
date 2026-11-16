@@ -148,3 +148,31 @@ test "completion begin wire discovery" {
 test "completion live owner discovery" {
     _ = @import("api/completion_owner_admission.zig");
 }
+
+test "completion begin wire executes retained owner validation across the private boundary" {
+    const std = @import("std");
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const batch = local.api_internal_batch;
+    const completion = local.api_local_table_writes.table_write_source.history_resolution_wire.completion;
+    const types = local.storage_db_selected_root.db.types;
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 7, .group_id = 9, .topology_epoch = 4 };
+    const members = [_]completion.Participant{.{ .namespace = owner.namespace, .owner_fence = owner.digest(), .input_digest = @splat(3), .roles = completion.Roles.guards | completion.Roles.checkpoint, .locator = "table2:00000004:docs:9", .routed_owner = owner }};
+    const admission: completion.Admission = .{ .version = 3, .transaction_id = @splat(4), .admission_digest = @splat(5), .coordinator_namespace = owner.namespace, .coordinator_fence = owner.digest(), .participants = &members };
+    const raw = try completion.encodeAdmission(a, admission);
+    defer a.free(raw);
+    var request: types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .begin = .{ .txn_id = admission.transaction_id, .begin_timestamp = 10, .created_at_ns = 11, .topology_epoch = owner.topology_epoch, .participants = &.{members[0].locator}, .completion_admission = raw, .completion_owner = owner } } };
+    const encoded = try batch.encodeBatchRequest(a, request);
+    defer a.free(encoded);
+    var decoded = try batch.parseInternalBatchRequest(a, encoded);
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings(raw, decoded.req.transaction.?.begin.completion_admission.?);
+    try std.testing.expectError(error.InvalidBatchRequest, batch.parseBatchRequest(a, encoded));
+    request.transaction.?.begin.completion_owner = null;
+    try std.testing.expectError(error.InvalidBatchRequest, batch.encodeBatchRequest(a, request));
+    var replaced = owner;
+    replaced.root_generation += 1;
+    try std.testing.expectError(error.TopologyChanged, batch.validateCompletionBegin(a, raw, admission.transaction_id, &.{members[0].locator}, replaced, owner.topology_epoch));
+    try std.testing.expectError(error.InvalidBatchRequest, batch.validateCompletionBegin(a, raw, admission.transaction_id, &.{"substituted"}, owner, owner.topology_epoch));
+    try std.testing.expectError(error.InvalidBatchRequest, batch.validateCompletionBegin(a, raw, admission.transaction_id, &.{members[0].locator}, owner, owner.topology_epoch + 1));
+}

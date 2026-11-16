@@ -40,18 +40,29 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 32;
+pub const batch_protocol_version: u16 = 33;
 /// Frozen completion BEGIN and owner/input-fenced PREPARE require durable
 /// activation across every applying member before proposal or native apply.
 pub const batch_completion_admission_protocol_version: u16 = 31;
 /// Complete-certificate publication adds retained accounting and an ordered
 /// publication journal. Version-31 admission support does not imply this phase.
 pub const batch_completion_publication_protocol_version: u16 = 32;
-pub fn completionProtocolVersion(request: anytype) ?u16 {
+/// Version 33 retains full original participant owners for restart recovery.
+/// Old v1/v2 admissions and certificates retain their original protocol floors.
+pub const batch_completion_recovery_protocol_version: u16 = 33;
+fn completionEnvelopeVersion(a: @import("std").mem.Allocator, bytes: []const u8, comptime certificate: bool) !u16 {
+    const std = @import("std");
+    if (bytes.len == 0 or bytes.len > 16 * 1024 * 1024) return error.InvalidTxnRecord;
+    const Header = if (certificate) struct { certificate: struct { manifest: struct { version: u16 = 1 } } } else struct { admission: struct { version: u16 = 1 } };
+    var parsed = std.json.parseFromSlice(Header, a, bytes, .{ .ignore_unknown_fields = true, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidTxnRecord;
+    defer parsed.deinit();
+    return if (certificate) parsed.value.certificate.manifest.version else parsed.value.admission.version;
+}
+pub fn completionProtocolVersion(a: @import("std").mem.Allocator, request: anytype) !?u16 {
     const mutation = request.transaction orelse return null;
     return switch (mutation) {
-        .publish_completion => batch_completion_publication_protocol_version,
-        .begin => |value| if (value.completion_admission != null or value.completion_owner != null) batch_completion_admission_protocol_version else null,
+        .publish_completion => |value| if (try completionEnvelopeVersion(a, value.certificate, true) >= 3) batch_completion_recovery_protocol_version else batch_completion_publication_protocol_version,
+        .begin => |value| if (value.completion_admission) |bytes| (if (try completionEnvelopeVersion(a, bytes, false) >= 3) batch_completion_recovery_protocol_version else batch_completion_admission_protocol_version) else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
         .prepare => |value| if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
         .resolve => |value| if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
         else => null,
@@ -127,4 +138,31 @@ test "data raft protocol advertisement requires native history apply support" {
     try std.testing.expectEqual(batch_protocol_version, maximumForHistoryApply(true));
     try std.testing.expect(maximumForHistoryApply(false) < batch_history_control_protocol_version);
     try std.testing.expectEqual(@as(u16, 29), maximumForHistoryApply(false));
+}
+
+test "completion recovery protocol classifies decoded envelope versions without downgrading legacy" {
+    const std = @import("std");
+    const a = std.testing.allocator;
+    const Mutation = union(enum) {
+        begin: struct { completion_admission: ?[]const u8 = null, completion_owner: ?u8 = null },
+        prepare: struct { completion_owner: ?u8 = null },
+        resolve: struct { completion_owner: ?u8 = null },
+        publish_completion: struct { certificate: []const u8 },
+        other,
+    };
+    const Request = struct { transaction: ?Mutation };
+    try std.testing.expectEqual(@as(?u16, null), try completionProtocolVersion(a, Request{ .transaction = null }));
+    try std.testing.expectEqual(@as(?u16, 31), try completionProtocolVersion(a, Request{ .transaction = .{ .begin = .{ .completion_admission = "{\"admission\":{\"version\":2}}" } } }));
+    try std.testing.expectEqual(@as(?u16, 31), try completionProtocolVersion(a, Request{ .transaction = .{ .begin = .{ .completion_admission = "{\"admission\":{}}" } } }));
+    try std.testing.expectEqual(@as(?u16, 33), try completionProtocolVersion(a, Request{ .transaction = .{ .begin = .{ .completion_admission = "{\"admission\":{\"ver\\u0073ion\":3}}" } } }));
+    try std.testing.expectEqual(@as(?u16, 32), try completionProtocolVersion(a, Request{ .transaction = .{ .publish_completion = .{ .certificate = "{\"certificate\":{\"manifest\":{\"version\":2}}}" } } }));
+    try std.testing.expectEqual(@as(?u16, 33), try completionProtocolVersion(a, Request{ .transaction = .{ .publish_completion = .{ .certificate = "{\"certificate\":{\"manifest\":{\"version\":3}}}" } } }));
+    try std.testing.expectError(error.InvalidTxnRecord, completionProtocolVersion(a, Request{ .transaction = .{ .begin = .{ .completion_admission = "{\"admission\":{\"version\":2,\"version\":3}}" } } }));
+    try std.testing.expectError(error.InvalidTxnRecord, completionEnvelopeVersion(a, "invalid", false));
+    const Failure = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try std.testing.expectEqual(@as(u16, 3), try completionEnvelopeVersion(allocator, "{\"admission\":{\"version\":3}}", false));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.run, .{});
 }
