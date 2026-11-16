@@ -2348,6 +2348,31 @@ a prepared retry cannot bypass source-purpose binding. Source catalog generation
 completed. Production activation, positive network receipt collection/publication
 and all broader issue requirements remain outstanding.
 
+## In progress: routed completion owner identity
+
+The private receipt spec now names the implemented
+`X-Antfly-Catalog-Route-Deadline-Ms` header. `make generate` passed in
+`completion-receipt-header-generate.log`; unrelated model-explorer drift was
+removed. This corrects the spec contract without changing runtime behavior.
+
+`completion.RoutedOwner` now defines the current authoritative physical-owner
+context: canonical nonzero metadata cluster incarnation and group, immutable
+storage/table binding, physical namespace, root generation, data group and
+topology epoch. Its separate domain-bound digest is the participant's owner
+fence. Root generation zero is a valid initial generation. The binding excludes
+leader term and unrelated catalog revision; leadership and current routing must
+be validated separately at admission. V2 `Admission.requireRoutedOwner` compares
+this context against the exact frozen member and rejects changed ownership.
+
+`transaction-completion-test` passed with exit 0 in
+`completion-routed-owner-test.log`, including cluster/table/root/topology/group
+changes, namespace substitution and invalid incarnation encodings. This is the
+identity contract, not live-owner qualification. The next boundary must construct
+it from a frozen current catalog capture and actual acquired owner, carry it in
+versioned BEGIN, verify physical identity at native apply, then complete the
+all-applying-member activation and production coordinator path. Full public
+feed, bootstrap, destination and existing CDC client qualification remain open.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

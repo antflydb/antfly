@@ -86,6 +86,38 @@ fn number(sha: *std.crypto.hash.sha2.Sha256, value: u64) void {
     std.mem.writeInt(u64, &raw, value, .big);
     sha.update(&raw);
 }
+/// Current authoritative routed owner supplied by trusted catalog/native-owner
+/// admission. It is a physical generation binding, not a leader lease. A digest
+/// alone establishes no authority; callers must capture and revalidate this
+/// context against their frozen catalog route and actual acquired owner.
+pub const RoutedOwner = struct {
+    version: u8 = 1,
+    metadata_group_id: u64,
+    metadata_incarnation: [32]u8,
+    namespace: Namespace,
+    table_binding: Digest,
+    root_generation: u64,
+    group_id: u64,
+    topology_epoch: u64,
+    pub fn validate(self: RoutedOwner) !void {
+        if (self.version != 1 or self.metadata_group_id == 0 or self.group_id == 0 or !nonzero(self.namespace) or std.mem.readInt(u64, self.namespace[0..8], .big) == 0 or !nonzero(self.table_binding) or std.mem.allEqual(u8, &self.metadata_incarnation, '0')) return error.InvalidTxnRecord;
+        for (self.metadata_incarnation) |char| if (!std.ascii.isDigit(char) and !(char >= 'a' and char <= 'f')) return error.InvalidTxnRecord;
+    }
+    pub fn digest(self: RoutedOwner) Digest {
+        var sha = std.crypto.hash.sha2.Sha256.init(.{});
+        sha.update("antfly:transaction-completion-routed-owner:v1");
+        number(&sha, self.version);
+        number(&sha, self.metadata_group_id);
+        sha.update(&self.metadata_incarnation);
+        sha.update(&self.namespace);
+        sha.update(&self.table_binding);
+        number(&sha, self.root_generation);
+        number(&sha, self.group_id);
+        number(&sha, self.topology_epoch);
+        return sha.finalResult();
+    }
+};
+
 pub const Participant = struct {
     namespace: Namespace,
     owner_fence: Digest,
@@ -151,6 +183,13 @@ pub const Admission = struct {
     pub fn member(self: Admission, namespace: Namespace) !Participant {
         try self.validate();
         return self.find(namespace) orelse error.InvalidParticipant;
+    }
+    pub fn requireRoutedOwner(self: Admission, owner: RoutedOwner) !void {
+        try self.validate();
+        try owner.validate();
+        if (self.version != 2) return error.ChangefeedCapabilityUnsupported;
+        const participant = try self.member(owner.namespace);
+        if (!same(participant.owner_fence, owner.digest())) return error.TopologyChanged;
     }
     /// `encoded_input` must be the canonical private PREPARE encoding captured
     /// before durable BEGIN, never a recompiled request from current rows or a
@@ -564,4 +603,36 @@ test "completion admission v2 freezes every participant prepare input without re
     try std.testing.expect(try plan.reservationBytes(encoded.len) > encoded.len);
     members[0].input_digest = @splat(0);
     try std.testing.expectError(error.InvalidTxnRecord, plan.validate());
+}
+
+test "completion routed owner fences cluster table generation root and topology without leader identity" {
+    var owner: RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 3, .topology_epoch = 4 };
+    try owner.validate();
+    const members = [_]Participant{.{ .namespace = owner.namespace, .owner_fence = owner.digest(), .roles = Roles.guards, .locator = "root", .input_digest = @splat(5) }};
+    const plan: Admission = .{ .version = 2, .transaction_id = @splat(6), .admission_digest = @splat(7), .coordinator_namespace = owner.namespace, .coordinator_fence = owner.digest(), .participants = &members };
+    try plan.requireRoutedOwner(owner);
+    const original = owner;
+    owner.root_generation += 1;
+    try std.testing.expectError(error.TopologyChanged, plan.requireRoutedOwner(owner));
+    owner = original;
+    owner.topology_epoch += 1;
+    try std.testing.expectError(error.TopologyChanged, plan.requireRoutedOwner(owner));
+    owner = original;
+    owner.table_binding[0] ^= 1;
+    try std.testing.expectError(error.TopologyChanged, plan.requireRoutedOwner(owner));
+    owner = original;
+    owner.metadata_incarnation[0] = 'a';
+    try std.testing.expectError(error.TopologyChanged, plan.requireRoutedOwner(owner));
+    owner = original;
+    owner.group_id += 1;
+    try std.testing.expectError(error.TopologyChanged, plan.requireRoutedOwner(owner));
+    owner = original;
+    owner.namespace[23] ^= 1;
+    try std.testing.expectError(error.InvalidParticipant, plan.requireRoutedOwner(owner));
+    owner = original;
+    owner.metadata_incarnation = @splat('0');
+    try std.testing.expectError(error.InvalidTxnRecord, owner.validate());
+    owner = original;
+    owner.metadata_incarnation[0] = 'A';
+    try std.testing.expectError(error.InvalidTxnRecord, owner.validate());
 }
