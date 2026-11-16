@@ -2928,6 +2928,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InvalidEnrichmentConfig,
         error.ArtifactDependencyFailed,
         error.InvalidEmbeddingResponse,
+        error.InvalidInferenceCapabilities,
         error.InvalidEmbeddingDimensions,
         error.InvalidEmbeddingIdentity,
         error.EmbeddingIdentityMismatch,
@@ -4220,12 +4221,16 @@ fn isEnrichmentProgressPending(err: anyerror) bool {
 }
 
 fn isEnrichmentControlError(err: anyerror) bool {
-    return err == error.EnrichmentRetryAborted or isEnrichmentProgressPending(err);
+    return err == error.EnrichmentRetryAborted or err == error.Cancelled or err == error.Canceled or
+        err == error.EnrichmentWaitCanceled or isEnrichmentProgressPending(err);
 }
 
 test "commit requirements prepared sources defer background publication without terminal failure" {
     try std.testing.expect(isEnrichmentProgressPending(error.IntentConflict));
     try std.testing.expect(isEnrichmentControlError(error.IntentConflict));
+    try std.testing.expect(isEnrichmentControlError(error.Cancelled));
+    try std.testing.expect(isEnrichmentControlError(error.Canceled));
+    try std.testing.expect(isEnrichmentControlError(error.EnrichmentWaitCanceled));
 }
 
 test "enrichment distinguishes transient capacity from permanent resource limits" {
@@ -4243,6 +4248,7 @@ test "enrichment retries unknown errors and isolates known permanent errors" {
     }
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedEmbeddingProvider));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.InvalidEmbeddingDimensions));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.InvalidInferenceCapabilities));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.InvalidEmbeddingIdentity));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.EmbeddingIdentityMismatch));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.ReadRequestFailed));
@@ -43099,7 +43105,9 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-vector-carry", .{tmp.sub_path});
     defer alloc.free(path);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    const pressure_limit: u64 = if (batching == .collection_too_large) 1024 else 48 * 1024;
+    // Minimal ordered capture needs about 52 KiB in this fixture. 64 KiB
+    // admits that operation but denies accumulated cross-document inputs.
+    const pressure_limit: u64 = if (batching == .collection_too_large) 1024 else 64 * 1024;
     budgets[@backingInt(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .soft_limit_bytes = pressure_limit, .hard_limit_bytes = pressure_limit };
     var pressure_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer pressure_manager.deinit(alloc);
@@ -43478,6 +43486,19 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                 try std.testing.expectEqual(@as(usize, 0), harness.provider_calls);
                 try std.testing.expectEqual(@as(u64, count), runtime.fatal_error_count);
             } else {
+                const logical = @import("../artifact_chunk_cursor.zig");
+                var expected: usize = 0;
+                {
+                    var read = try runtime.store.beginRead();
+                    defer read.abort();
+                    var borrowed: logical.BorrowedRead = .{ .read = &read };
+                    for (keys) |key| {
+                        var cursor = try logical.Cursor(logical.BorrowedRead).openNamed(alloc, &borrowed, key, "chunks");
+                        defer cursor.close();
+                        while (try cursor.next()) |_| expected += 1;
+                    }
+                }
+                if (batching == .collection_multi) try std.testing.expect(expected > count);
                 var complete = false;
                 var accepted = before;
                 for (0..256) |_| {
@@ -43501,9 +43522,21 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                     }
                 }
                 try std.testing.expect(complete);
-                const expected: usize = count * (if (batching == .collection_multi) @as(usize, 3) else 1);
                 try std.testing.expectEqual(expected, harness.provider_calls);
-                try std.testing.expectEqual(before + expected, harness.queued.items.len);
+                var published = std.StringHashMapUnmanaged(void).empty;
+                defer freeOwnedKeySet(alloc, &published);
+                for (harness.queued.items[before..]) |bytes| {
+                    var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, bytes);
+                    defer decoded.deinit();
+                    for (decoded.command.mutations) |mutation| {
+                        if (mutation.family != .derived_vector or mutation.value == null) continue;
+                        try std.testing.expect(!published.contains(mutation.key));
+                        const owned = try alloc.dupe(u8, mutation.key);
+                        errdefer alloc.free(owned);
+                        try published.put(alloc, owned, {});
+                    }
+                }
+                try std.testing.expectEqual(expected, published.count());
                 for (harness.batches.items) |size| try std.testing.expect(size <= 32);
             }
             try std.testing.expect(test_ordered_collection_pressure_drains.load(.acquire) > denied_before);
