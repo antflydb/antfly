@@ -1136,7 +1136,15 @@ pub const HandleGuard = struct {
                 var owned = lease;
                 // A thread of this process queued for the gate takes the
                 // lease as is, unless another process is waiting for it.
-                if (!(guard.connection_gate_held and connection.gate.mutex.retainForWaiter(io, &owned, connection.storeIdentity()))) owned.close();
+                if (!(guard.connection_gate_held and connection.gate.mutex.retainForWaiter(io, &owned, connection.storeIdentity()))) {
+                    // Commits staged under this lease (a ride-along group
+                    // nobody waits on) must finish before it goes: the
+                    // store's own flush loop only drives them while the
+                    // writer lane holds the lease, and this one never did.
+                    // This call's own durability wait is already over.
+                    if (connection.current) |root| if (root.owned_lite_backend) |*backend| if (backend.native_docstore) |store| store.ensureDurableForReuse();
+                    owned.close();
+                }
             }
             if (guard.connection_gate_held) connection.gate.mutex.unlock(io);
             if (writer_lane_owes_connection_mutex_release) connection.mutex.unlock(io);

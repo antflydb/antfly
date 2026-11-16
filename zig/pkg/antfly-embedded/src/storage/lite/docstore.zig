@@ -3182,6 +3182,15 @@ pub const Store = struct {
     /// will: it drives the group itself straight away (the same barrier
     /// the idle window would have run, just without the wait).
     writer_held_by_maintenance: std.atomic.Value(bool) = .init(false),
+    /// Set by an owner that leases this store's writes across processes
+    /// (capi Lite): writes this Store starts on its own thread -- the
+    /// idle-turn redo fold and the flush loop's ride-along drain -- run
+    /// only while `try_enter` grants them the writer, and are skipped
+    /// otherwise. A caller's own commits, including a ride-along waiter
+    /// driving its own group, already run under that caller's lease. Without this, those background commits could run with no
+    /// lease at all, or while a maintenance snapshot (a second NativeFile
+    /// on the same inode) held the writer and was publishing.
+    background_write_admission: ?BackgroundWriteAdmission = null,
     /// How long `maybeCheckpointRedoLogOnIdleTurn`'s opportunistic fold
     /// (no byte-capacity pressure, `threshold_due` false) waits for
     /// genuine quiet before running, separate from `ride_along_idle_ns`
@@ -5459,6 +5468,12 @@ pub const Store = struct {
                         // thread happens to reach it first.
                         const flush_scope = wal_trace.scope(.ride_along_flush);
                         defer flush_scope.end();
+                        // Not `backgroundDrainDurable`: this waiter's own
+                        // call staged the request under a lease it still
+                        // holds (its path lease, or the lane's parked lease,
+                        // which every handoff drains first), so it may
+                        // drive the group. Only drivers with no caller
+                        // context (the flush loop, the idle fold) are gated.
                         self.store.forceDrainDurable();
                     }
                     self.store.commit_mutex.lockUncancelable(io);
@@ -5572,6 +5587,31 @@ pub const Store = struct {
     /// member, so durability stays prefix-ordered. `plan.durable` is
     /// ignored (always treated as non-durable); `plan.context` must stay
     /// valid until the returned ticket resolves.
+    pub const BackgroundWriteAdmission = struct {
+        ptr: *anyopaque,
+        try_enter: *const fn (*anyopaque) bool,
+        leave: *const fn (*anyopaque) void,
+    };
+
+    fn enterBackgroundWrite(self: *Store) bool {
+        const admission = self.background_write_admission orelse return true;
+        return admission.try_enter(admission.ptr);
+    }
+
+    fn leaveBackgroundWrite(self: *Store) void {
+        if (self.background_write_admission) |admission| admission.leave(admission.ptr);
+    }
+
+    /// `forceDrainDurable` for a drain this Store starts on its own; see
+    /// `background_write_admission`. A refused drain is retried by the
+    /// caller's next turn, and pending requests are drained by the next
+    /// writer that leads a group or by the owner before it gives the lease up.
+    fn backgroundDrainDurable(self: *Store) void {
+        if (!self.enterBackgroundWrite()) return;
+        defer self.leaveBackgroundWrite();
+        self.forceDrainDurable();
+    }
+
     pub fn stageRideAlong(self: *Store, plan: MutationPlan) !Ticket {
         if (test_ride_along_hook) |hook| hook(plan.estimated_bytes, self.ride_along_pending_bytes);
         const staged = try self.enqueueRequest(plan, true);
@@ -5739,7 +5779,7 @@ pub const Store = struct {
                 // see the doc comment on that Stage tag.
                 const flush_scope = wal_trace.scope(.ride_along_flush);
                 defer flush_scope.end();
-                self.forceDrainDurable();
+                self.backgroundDrainDurable();
             }
             // §9.4 (revised, step 4): same wake, independent of the
             // ride-along check above -- a workload with no ride-along
@@ -5821,6 +5861,8 @@ pub const Store = struct {
     /// mirrors.
     fn maybeCheckpointRedoLogOnIdleTurn(self: *Store) void {
         if (self.read_only) return;
+        if (!self.enterBackgroundWrite()) return;
+        defer self.leaveBackgroundWrite();
         if (self.writer_admission) |admission| admission.enter(admission.ptr, .allocator_service) catch return;
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStoreExclusive(self);

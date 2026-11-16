@@ -1134,6 +1134,12 @@ pub const WriterLane = struct {
     /// silent `NotFound` once the lease could actually change hands).
     /// Meaningless while `parked` is `null`.
     parked_store: ?*NativeStore = null,
+    /// `checkin` found a foreign process waiting past its fairness quantum
+    /// but parked the lease instead of closing it: the checking-in writer
+    /// is about to drive its own staged group, so the lease must outlive
+    /// that commit. The next local checkout, or `maintainParkedLease`,
+    /// drains the store and hands the lease over.
+    foreign_release_due: bool = false,
 
     const poll_initial_ns: i96 = 50 * std.time.ns_per_us;
     const poll_max_ns: i96 = 2 * std.time.ns_per_ms;
@@ -1224,6 +1230,21 @@ pub const WriterLane = struct {
         var backoff_ns: i96 = poll_initial_ns;
         self.mutex.lockUncancelable(io);
         while (true) {
+            if (self.parked != null and self.foreign_release_due) {
+                var overdue = self.parked.?;
+                const overdue_store = self.parked_store;
+                self.parked = null;
+                self.parked_store = null;
+                self.foreign_release_due = false;
+                self.mutex.unlock(io);
+                if (overdue_store) |held_store| {
+                    held_store.ensureDurableForReuse();
+                    held_store.sync() catch {};
+                }
+                overdue.close();
+                self.mutex.lockUncancelable(io);
+                continue;
+            }
             if (self.parked) |parked| {
                 self.parked = null;
                 self.checked_out = true;
@@ -1387,6 +1408,7 @@ pub const WriterLane = struct {
         const lease = self.parked orelse return null;
         if (self.last_root == null or self.last_root != current_root) return null;
         self.parked = null;
+        self.foreign_release_due = false;
         return lease;
     }
 
@@ -1420,6 +1442,7 @@ pub const WriterLane = struct {
         defer self.mutex.unlock(io);
         const lease = self.parked orelse return null;
         self.parked = null;
+        self.foreign_release_due = false;
         return lease;
     }
 
@@ -1457,10 +1480,6 @@ pub const WriterLane = struct {
         self.mutex.unlock(io);
     }
 
-    /// Pairs with `markCheckedOutByMaintenance`; see its own doc comment.
-    /// Wakes waiters in `checkout`/`waitParkedForStore`; finding nothing
-    /// parked (this maintenance lease was closed, not parked), they fall
-    /// through to a fresh kernel acquisition, which now succeeds.
     pub fn clearCheckedOutByMaintenance(self: *WriterLane) void {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
@@ -1623,8 +1642,13 @@ pub const WriterLane = struct {
             return;
         }
         const own_pid = antfly_platform.process.currentId() orelse 0;
-        const foreign_overdue = force_release or (lease.othersWaitingAcrossProcesses(own_pid) and now - lease.acquired_ns >= foreign_fairness_quantum_ns);
-        if (!foreign_overdue) {
+        const foreign_overdue = lease.othersWaitingAcrossProcesses(own_pid) and now - lease.acquired_ns >= foreign_fairness_quantum_ns;
+        // Only an explicit release (a suspend, which never has a staged
+        // commit of its own) closes the lease here. A writer checking in
+        // before its durability wait still has to drive its own group under
+        // this lease, and draining for it from here waits on itself.
+        if (!force_release) {
+            if (foreign_overdue) self.foreign_release_due = true;
             self.parked = lease;
             self.parked_since_ns = now;
             self.parked_store = store;
@@ -1647,6 +1671,7 @@ pub const WriterLane = struct {
         self.checked_out = false;
         self.mutex.unlock(io);
         self.signalReleased(io);
+        store.ensureDurableForReuse();
         store.sync() catch {};
         lease.close();
     }
@@ -1693,6 +1718,7 @@ pub const WriterLane = struct {
             self.mutex.unlock(io);
             return null;
         };
+
         const own_pid = antfly_platform.process.currentId() orelse 0;
         const now = std.Io.Clock.awake.now(io).nanoseconds;
         const foreign_waiting = lease.othersWaitingAcrossProcesses(own_pid);
@@ -1719,10 +1745,17 @@ pub const WriterLane = struct {
             return @max(1 * std.time.ns_per_ms, @min(quantum_remaining, idle_remaining));
         }
         self.parked = null;
+        self.foreign_release_due = false;
         const store = self.parked_store;
         self.parked_store = null;
         self.mutex.unlock(io);
-        if (store) |held_store| held_store.sync() catch {};
+        // Commits staged under this lease (ride-along groups, or a group a
+        // writer drives after checking the lane in) must finish before the
+        // lease goes.
+        if (store) |held_store| {
+            held_store.ensureDurableForReuse();
+            held_store.sync() catch {};
+        }
         lease.close();
         return null;
     }
@@ -2863,6 +2896,14 @@ pub const Owner = struct {
         self.writer_lane.markCheckedOutByMaintenance();
         errdefer self.writer_lane.clearCheckedOutByMaintenance();
         const maintenance_store = root.owned_lite_backend.?.native_docstore.?;
+        // The lease may have come from a path that did not drain the
+        // foreground store (a gate handoff, another root's park, a fresh
+        // lock). Its commits must finish before this second NativeFile on
+        // the same inode starts writing; new background ones are now
+        // refused because the lane is checked out.
+        if (self.current) |current| if (current.owned_lite_backend.?.native_docstore) |foreground_store| {
+            if (foreground_store != maintenance_store) foreground_store.ensureDurableForReuse();
+        };
         maintenance_store.writer_held_by_maintenance.store(true, .release);
         errdefer maintenance_store.writer_held_by_maintenance.store(false, .release);
         // The hold starts here: admission checks and rebases run under it.
@@ -4531,6 +4572,9 @@ pub const Connection = struct {
 
     fn attach(self: *Connection, root: *h.Handle) void {
         std.debug.assert(!self.attached);
+        if (root.owned_lite_backend) |*backend| if (backend.native_docstore) |store| {
+            store.background_write_admission = .{ .ptr = &self.owner.writer_lane, .try_enter = backgroundWriteRefused, .leave = backgroundWriteLeave };
+        };
         std.debug.assert(root.sql_sessions.count() == 0 and root.sql_cursors.count() == 0);
         root.lite_connection_context = self;
         root.sql_sessions = self.sql_sessions;
@@ -4544,6 +4588,19 @@ pub const Connection = struct {
         self.table_handles = .empty;
         self.attached = true;
     }
+
+    /// A lease-managed store never writes from its own thread: its writes
+    /// happen only under a lease some caller holds. The idle-turn fold
+    /// and the flush loop's ride-along drain are refused; ride-along groups
+    /// are driven by their own waiters, by the next writer to lead a
+    /// group, or by whoever releases the lease (every release path drains
+    /// first), and the log folds inline at its capacity threshold or
+    /// through the maintenance snapshot.
+    fn backgroundWriteRefused(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn backgroundWriteLeave(_: *anyopaque) void {}
 
     pub fn detach(self: *Connection) void {
         if (!self.attached) return;
