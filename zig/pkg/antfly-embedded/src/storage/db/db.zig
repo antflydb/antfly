@@ -100800,6 +100800,92 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
     try std.testing.expectEqual(replacement_calls, probe.calls);
 }
 
+test "db sequential managed dense backfills coalesce shared vector snapshot repair" {
+    try testSequentialManagedDenseBackfills(false);
+}
+
+test "db sequential managed dense backfills coalesce shared vector snapshots with workers" {
+    try testSequentialManagedDenseBackfills(true);
+}
+
+fn testSequentialManagedDenseBackfills(workers: bool) !void {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        db: ?*DB = null,
+        workers: bool = false,
+        fn embed(raw: *anyopaque, alloc: Allocator, name: []const u8, _: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            if (self.workers and std.mem.eql(u8, name, "B")) {
+                // Exercise serving and autonomous maintenance between small
+                // backfill calls, rather than only at a manual idle barrier.
+                var result = try self.db.?.search(alloc, .{ .index_name = "A", .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } }, .limit = 1 });
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+                sleepNs(2 * std.time.ns_per_ms);
+            }
+            const vector = try alloc.alloc(f32, dims);
+            @memset(vector, 0);
+            vector[if (std.mem.eql(u8, name, "A")) 0 else 1] = 1;
+            return vector;
+        }
+    };
+    var probe: Probe = .{ .workers = workers };
+    var directory = try TestDirectory.init("sequential-dense-vector-snapshots");
+    defer directory.cleanup();
+    const options: OpenOptions = .{
+        .start_index_workers = workers,
+        .start_optional_runtime_workers = workers,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed } },
+    };
+    var db = try DB.open(a, directory.path(), options);
+    defer db.close();
+    probe.db = &db;
+    const count = 64;
+    var writes: [count]types.BatchWrite = undefined;
+    var initialized: usize = 0;
+    defer for (writes[0..initialized]) |write| a.free(write.key);
+    for (&writes, 0..) |*write, i| {
+        write.* = .{ .key = try std.fmt.allocPrint(a, "doc:{d}", .{i}), .value = "{\"body\":\"short record\"}" };
+        initialized += 1;
+    }
+    try db.batch(.{ .writes = &writes, .sync_level = .write });
+    const previous = index_manager_mod.test_vector_block_primary_snapshot_builds;
+    defer index_manager_mod.test_vector_block_primary_snapshot_builds = previous;
+    for ([_][]const u8{ "A", "B" }) |name| {
+        const config = try std.fmt.allocPrint(a, "{{\"field\":\"embedding\",\"dims\":3,\"execution\":{{\"embedding\":{{\"batch_items\":1}}}},\"generator\":{{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"{s}\"}}}}", .{name});
+        defer a.free(config);
+        index_manager_mod.test_vector_block_primary_snapshot_builds = 0;
+        try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config });
+        try db.runUntilIdle();
+        // One genuine missing-generation repair is permitted at the idle
+        // boundary; a small replay batch must never trigger another scan.
+        try std.testing.expect(index_manager_mod.test_vector_block_primary_snapshot_builds <= 1);
+        try std.testing.expectEqual(@as(u64, count), db.core.index_manager.denseIndex(name).?.index.stats().active_count);
+    }
+    try std.testing.expectEqual(@as(usize, count * 2), probe.calls.load(.acquire));
+    for (0..2) |restart| {
+        if (restart != 0) {
+            index_manager_mod.test_vector_block_primary_snapshot_builds = 0;
+            db.close();
+            db = try DB.open(a, directory.path(), options);
+            try db.runUntilIdle();
+            try std.testing.expectEqual(@as(usize, 0), index_manager_mod.test_vector_block_primary_snapshot_builds);
+            try std.testing.expectEqual(@as(usize, count * 2), probe.calls.load(.acquire));
+        }
+        for ([_][]const u8{ "A", "B" }) |name| {
+            try std.testing.expect(db.core.index_manager.vectorBlockReadyForDenseIndex(name));
+            const query: []const f32 = if (std.mem.eql(u8, name, "A")) &.{ 1, 0, 0 } else &.{ 0, 1, 0 };
+            var result = try db.search(a, .{ .index_name = name, .query = .{ .dense_knn = .{ .vector = query, .k = 1 } }, .limit = 1 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+            try std.testing.expectApproxEqAbs(@as(f32, 0), result.hits[0].distance.?, 0.00001);
+        }
+    }
+}
+
 test "db templated dense backfill batches rendered text and preserves media" {
     const alloc = std.testing.allocator;
     const Probe = struct {
