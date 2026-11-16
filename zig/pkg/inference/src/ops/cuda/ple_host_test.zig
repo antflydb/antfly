@@ -142,3 +142,44 @@ test "Gemma4 CUDA host PLE preserves prefill device tokens and captured fused de
     defer a.free(duplicate_key);
     try std.testing.expectError(error.InvalidCudaState, compute.insertWeightFromLoaded(duplicate_key, &loaded));
 }
+
+test "Gemma4 CUDA host PLE failed physical free survives complete compute teardown" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const memory = @import("../../runtime/tier/memory.zig");
+    const retirement = @import("host_retirement.zig");
+    const driver = @import("driver.zig");
+    const FailOnce = struct {
+        var original: *const fn (?*anyopaque) callconv(.c) driver.CUresult = undefined;
+        var calls: usize = 0;
+        fn free(ptr: ?*anyopaque) callconv(.c) driver.CUresult {
+            calls += 1;
+            return if (calls == 1) 1 else original(ptr);
+        }
+    };
+    var controller = memory.AdmissionController{};
+    var lease: ?memory.AdmissionLease = try controller.tryAcquire(.gpu, .{}, .{ .host_weight_bytes = 4096 }, false);
+    defer if (lease) |*held| held.release();
+    var compute = try CudaCompute.init(std.testing.allocator);
+    var alive = true;
+    defer if (alive) compute.deinit();
+    compute.gemma4_ple_host = try buffer_mod.MappedHostBuffer.allocAdmitted(&compute.ctx, 4096, &lease);
+    try std.testing.expect(lease == null);
+    const owner = compute.gemma4_ple_host.owner.?;
+    FailOnce.original = owner.driver.fns.cuMemFreeHost.?;
+    FailOnce.calls = 0;
+    owner.driver.fns.cuMemFreeHost = FailOnce.free;
+    defer retirement.process.retry();
+    compute.deinit(); // Exercise the complete production destructor, not just clear().
+    alive = false;
+    try std.testing.expect(compute.ctx.ctx == null);
+    try std.testing.expect(compute.gemma4_ple_host.owner == null);
+    try std.testing.expect(retirement.process.head == owner);
+    try std.testing.expectEqual(@as(usize, 1), FailOnce.calls);
+    try std.testing.expectEqual(@as(usize, 4096), controller.snapshot().host_weight_bytes);
+    // Both driver functions and the exact primary remain usable after the
+    // original compute/context/library wrappers have been destroyed.
+    retirement.process.retry();
+    try std.testing.expect(retirement.process.head == null);
+    try std.testing.expectEqual(@as(usize, 2), FailOnce.calls);
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
