@@ -480,6 +480,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes", "standalone metadata" },
     });
+    const alias_receipt_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"standalone metadata HA preserves incremental jobs outbox recovery and full checkpoint authority"},
+    });
+    b.step("antfly-index-alias-receipt-test", "Verify nonwaiting receipt reconciliation preserves durable publication authority")
+        .dependOn(&b.addRunArtifact(alias_receipt_tests).step);
     const graph_authority_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{"system catalog graph authority probes"} });
     b.step("antfly-graph-authority-probe-test", "Verify bounded graph binding authority across catalog replacement")
         .dependOn(&b.addRunArtifact(graph_authority_tests).step);

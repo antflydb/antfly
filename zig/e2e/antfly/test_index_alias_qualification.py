@@ -86,6 +86,23 @@ def test_index_alias_cutovers_during_ingestion_and_metadata_failover(
         _seed_cluster_docs_when_writable(
             cluster, session, table, SEED, sync_level="full_index", timeout_s=60
         )
+        leader = cluster.metadata_stable_leader_id(timeout_s=30)
+        assert leader is not None
+        snapshot = cluster.metadata_snapshot(leader - 1)
+        ranges = sorted(
+            (
+                entry
+                for entry in snapshot["ranges"]
+                if int(entry["table_id"]) == cluster.table_ids[table]
+            ),
+            key=lambda entry: entry["start_key"],
+        )
+        assert len(ranges) == 3, ranges
+        for prefix, shard in zip(("0", "8", "z"), ranges, strict=True):
+            for suffix in ("a", "b"):
+                key = f"{prefix}:{suffix}"
+                assert shard["start_key"] <= key
+                assert shard["end_key"] is None or key < shard["end_key"]
         base = cluster.data_api_urls[0]
         for name in INDEXES:
             wait_for_target(session, base, table, name)
@@ -226,7 +243,10 @@ def test_index_alias_object_runtime_cutover_and_cold_restart(tmp_path, monkeypat
             checked(
                 session.post(
                     f"{base}/tables/{table}",
-                    json={"storage": {"engine": "object"}, "indexes": INDEXES},
+                    json={
+                        "storage": {"engine": "object"},
+                        "indexes": {**INDEXES, "text/model/v1": {"type": "full_text"}},
+                    },
                     timeout=30,
                 )
             )
@@ -244,6 +264,12 @@ def test_index_alias_object_runtime_cutover_and_cold_restart(tmp_path, monkeypat
             assert all(
                 statuses[name]["readiness"]["queryable"] is True for name in INDEXES
             ), listed
+            physical = checked(
+                session.get(
+                    f"{base}/tables/{table}/indexes/text%2Fmodel%2Fv1", timeout=30
+                )
+            )
+            assert physical["config"]["name"] == "text/model/v1", physical
             swap(session, base, table, "space_a", "initial")
             print(exercise_swaps(session, base, table, rounds=3))
             server.pause(crash=True)
@@ -335,6 +361,39 @@ def test_index_alias_replicates_restarts_and_survives_standby_promotion(ha_clust
         _wait_for_standby_applied(cluster, deleted_lsn, require_live_replication=True)
         assert session.get(alias_url(standby, table), timeout=30).status_code == 404
         swap(session, primary, table, "space_a", "recreated")
+        # A locally committed receipt must not bypass RemoteApply on retry.
+        cluster.standby.stop()
+        pending = {
+            "index": "space_b",
+            "expected_index": "space_a",
+            "idempotency_key": "outage-receipt",
+            "require": "queryable",
+        }
+        try:
+            for restart in (False, False, True):
+                if restart:
+                    cluster.primary.restart()
+                response = session.put(
+                    alias_url(primary, table), json=pending, timeout=30
+                )
+                assert (
+                    response.headers.get("X-Antfly-Raft-Mutation-Outcome")
+                    == "unknown-v1"
+                ), response.text
+                assert response.status_code == 503, response.text
+                assert response.json()["error"] == "MetadataMutationOutcomeUnknown", (
+                    response.text
+                )
+        finally:
+            cluster.standby.start()
+        _wait_for_standby_applied(
+            cluster, _primary_lsn(cluster), require_live_replication=True
+        )
+        recovered = checked(
+            session.put(alias_url(primary, table), json=pending, timeout=30)
+        )
+        assert recovered["index"] == "space_b", recovered
+        swap(session, primary, table, "space_a", "after-outage", "space_b")
         committed = swap(
             session, primary, table, "space_b", "before-promotion", "space_a"
         )

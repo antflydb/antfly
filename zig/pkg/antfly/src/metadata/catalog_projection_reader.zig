@@ -82,11 +82,13 @@ pub const CatalogProjectionReader = struct {
         index: metadata_api.CatalogProjectionIndex = .{},
         table_name_indexes: std.StringHashMapUnmanaged(usize) = .empty,
         privacy_policy_versions: []?[64]u8 = &.{},
+        execution_indexes_required: []bool = &.{},
         table_range_spans: std.AutoHashMapUnmanaged(u64, RangeSpan) = .empty,
 
         pub fn deinit(self: *Snapshot, alloc: std.mem.Allocator) void {
             self.table_name_indexes.deinit(alloc);
             alloc.free(self.privacy_policy_versions);
+            alloc.free(self.execution_indexes_required);
             self.table_range_spans.deinit(alloc);
             self.index.deinit(alloc);
             freeTables(alloc, self.tables);
@@ -538,7 +540,7 @@ pub const CatalogProjectionReader = struct {
         // full admin records) continued to pass.
         tables[0] = try clonePointRoutingTable(alloc, table);
         errdefer metadata_table_manager.freeTable(alloc, tables[0]);
-        if (std.mem.indexOf(u8, table.indexes_json, "\"projection_only\"") != null) {
+        if (snapshot.execution_indexes_required[table_index]) {
             const materialize = source.vtable.execution_indexes orelse return error.CatalogRoutingUnavailable;
             const indexes = try materialize(source.ptr, alloc, metadata_group_id, table.name, snapshot.catalog_revision);
             alloc.free(tables[0].indexes_json);
@@ -685,8 +687,10 @@ pub const CatalogProjectionReader = struct {
         try snapshot.table_name_indexes.ensureTotalCapacity(alloc, @intCast(snapshot.tables.len));
         try snapshot.table_range_spans.ensureTotalCapacity(alloc, @intCast(snapshot.tables.len));
         snapshot.privacy_policy_versions = try alloc.alloc(?[64]u8, snapshot.tables.len);
+        snapshot.execution_indexes_required = try alloc.alloc(bool, snapshot.tables.len);
         for (snapshot.tables, 0..) |table, index| {
             if (index % 64 == 0) try ensureBeforeDeadline(deadline_ns);
+            snapshot.execution_indexes_required[index] = try requiresExecutionIndexes(alloc, table);
             snapshot.privacy_policy_versions[index] = @import("antfly_local_sources").privacy_catalog.policyBinding(alloc, table.indexes_json) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => null, // A malformed policy fails only this table's fence.
@@ -743,6 +747,42 @@ fn waitForBuildFlightWithBudget(flight: *CatalogProjectionReader.BuildFlight, bu
         };
     }
     try budget.checkpoint();
+}
+
+// Compute once per immutable publication. Inspect only the typed materialized
+// resolver metadata, not alias names, readiness evidence or receipt contents.
+fn requiresExecutionIndexes(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord) !bool {
+    const bytes = if (table.query_indexes_json.len != 0) table.query_indexes_json else table.indexes_json;
+    if (std.mem.indexOf(u8, bytes, "\"projection_only\"") == null and std.mem.indexOfScalar(u8, bytes, '\\') == null) return false;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCatalogProjection;
+    // Retain the legacy root marker used by older projection providers.
+    if (parsed.value.object.get("projection_only")) |marker|
+        if (marker == .bool and marker.bool) return true;
+    const metadata = parsed.value.object.get("_resolver_curation") orelse return false;
+    if (metadata != .object) return error.InvalidCatalogProjection;
+    const identities = metadata.object.get("identities") orelse return false;
+    if (identities != .array) return error.InvalidCatalogProjection;
+    for (identities.array.items) |identity| {
+        if (identity != .object) return error.InvalidCatalogProjection;
+        if (identity.object.get("projection_only")) |marker| {
+            if (marker != .bool) return error.InvalidCatalogProjection;
+            if (marker.bool) return true;
+        }
+    }
+    return false;
+}
+
+test "index alias catalog projection materialization ignores names and receipt evidence" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"projection_only\":{},\"_index_aliases\":{\"projection_only\":{\"index\":\"a\"}}}",
+        "{\"_index_alias_receipts\":{\"live\":[{\"projection_only\":true}]}}",
+        "{\"_resolver_curation\":{\"identities\":[{\"projection_only\":false}]}}",
+    }) |bytes| try std.testing.expect(!try requiresExecutionIndexes(a, .{ .table_id = 1, .name = "docs", .indexes_json = bytes }));
+    try std.testing.expect(try requiresExecutionIndexes(a, .{ .table_id = 1, .name = "docs", .indexes_json = "{\"_resolver_curation\":{\"identities\":[{\"projection_only\":true}]}}" }));
+    try std.testing.expect(!try requiresExecutionIndexes(a, .{ .table_id = 1, .name = "docs", .indexes_json = "unparsed receipt history", .query_indexes_json = "{}" }));
 }
 
 // Point routing and physical-owner opens need index definitions and alias

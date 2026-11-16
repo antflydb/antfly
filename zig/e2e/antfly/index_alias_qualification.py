@@ -29,8 +29,8 @@ INDEXES = {
     for name in ("space_a", "space_b")
 }
 EXPECTED = {
-    "space_a": {"0:a", "8:a"},
-    "space_b": {"0:b", "z:b"},
+    "space_a": {"0:a", "8:a", "z:a"},
+    "space_b": {"0:b", "8:b", "z:b"},
 }
 SEED = {
     key: {
@@ -83,7 +83,7 @@ def query(session, base, table, availability=None):
             f"{base}/tables/{table}/query",
             json={
                 "embeddings": {"live": [1.0, 0.0]},
-                "limit": 2,
+                "limit": 3,
                 "fields": ["label"],
                 "search_effort": 1,
             },
@@ -107,13 +107,18 @@ def query(session, base, table, availability=None):
         assert time.monotonic() < deadline, response.text
         time.sleep(0.05)
     value = checked(response)["responses"][0]
+    return validate_result(value)
+
+
+def validate_result(value):
+    """Require a positive witness from every shard for the reported target."""
     resolved = value["resolved_indexes"]
     assert "live" not in resolved, value
     concrete = [name for name in resolved if name in EXPECTED]
     assert len(concrete) == 1, value
     target = concrete[0]
     ids = [hit["_id"] for hit in value["hits"]["hits"]]
-    assert len(ids) == 2 and set(ids) == EXPECTED[target], value
+    assert len(ids) == 3 and set(ids) == EXPECTED[target], value
     return target
 
 

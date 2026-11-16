@@ -1143,21 +1143,24 @@ pub const HttpHandler = struct {
     }
 
     fn handlePublicTableListIndexes(self: *HttpHandler, table_name: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableListIndexes(self.alloc, table_name, self.tableApi(.none));
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonSliceResponse(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
+        return self.handleIndexResource(table_name, null, .{});
     }
 
     fn handlePublicTableGetIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableGetIndex(self.alloc, table_name, index_name, self.tableApi(.none));
+        return self.handleIndexResource(table_name, index_name, .{});
+    }
+
+    /// Typed native hosting entry point: names are data, never URL fragments.
+    pub fn handleIndexResource(self: *HttpHandler, table_name: []const u8, index_name: ?[]const u8, context: api_operation.RequestContext) !HttpResponse {
+        const guard = http_types.RequestGuard{ .context = try context.platformDeadline() };
+        try guard.context.ensureActive();
+        var resp = if (index_name) |name|
+            try public_table_http.handleTableGetIndex(self.alloc, table_name, name, self.tableApi(guard.token()))
+        else
+            try public_table_http.handleTableListIndexes(self.alloc, table_name, self.tableApi(guard.token()));
         defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonSliceResponse(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
+        try guard.context.ensureActive();
+        return if (resp.json) try jsonSliceResponse(self.alloc, resp.status, resp.body) else try textResponse(self.alloc, resp.status, resp.body);
     }
 
     fn handlePublicTableCreateIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8, body: []const u8) !HttpResponse {
