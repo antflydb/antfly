@@ -631,6 +631,18 @@ pub const Owner = struct {
         return (try wire.decodeReply(alloc, response.bytes(), request)).observation;
     }
 
+    pub fn historyResolution(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.Request) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.Reply {
+        const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire;
+        try request.validate();
+        const json = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(json);
+        if (json.len > wire.max_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_history_resolution(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        return wire.decodeReply(alloc, response.bytes(), request);
+    }
+
     pub fn orderedHistoryOutcome(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, lookup: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Lookup) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered.Outcome {
         const ordered = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_ordered;
         const json = try std.json.Stringify.valueAlloc(alloc, lookup, .{});

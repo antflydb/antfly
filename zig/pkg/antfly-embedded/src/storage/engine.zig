@@ -554,6 +554,7 @@ pub const VTable = struct {
     orderedHistoryOutcome: *const fn (*DB, std.mem.Allocator, @import("history_ordered.zig").Lookup) Outcome(@import("history_ordered.zig").Outcome),
     nativeHistoryGrant: *const fn (*DB, @import("history_consumer.zig").GrantIdentity) Outcome(@import("history_consumer.zig").GrantObservation),
     orderedHistoryGrant: *const fn (*DB, @import("history_consumer.zig").GrantIdentity, u64) Outcome(@import("history_consumer.zig").GrantObservation),
+    historyResolution: *const fn (*DB, Allocator, @import("history_resolution_wire.zig").Request) Outcome(@import("history_resolution_wire.zig").Reply),
 };
 pub const Boundary = callback.Boundary(VTable);
 pub const FieldLayout = extern struct { name: [*:0]const u8, type_name: [*:0]const u8, offset: usize, size: usize, alignment: usize };
@@ -570,7 +571,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 38,
+    version: u32 = 39,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -746,7 +747,7 @@ pub fn descriptorForValidation() *const Descriptor {
     return antfly_storage_engine_get_descriptor_v29();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 38 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 39 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or

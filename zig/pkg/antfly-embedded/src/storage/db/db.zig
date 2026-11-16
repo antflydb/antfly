@@ -26063,6 +26063,36 @@ pub const DB = struct {
         return @import("../history_consumer.zig").observeGrant(&txn, requested);
     }
 
+    /// Read-only immutable participant receipt. Raft callers establish a
+    /// leader ReadIndex first; identity, authority, cut and receipt are read
+    /// from one snapshot. No primary coordinator record is needed after GC.
+    pub fn historyResolution(self: *DB, allocator: std.mem.Allocator, request: @import("../history_resolution_wire.zig").Request) !@import("../history_resolution_wire.zig").Reply {
+        if (comptime storage_engine.enabled) return storage_engine.call("historyResolution", .{ self, allocator, request });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        try request.validate();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &request.namespace)) return error.HistoryResynchronizationRequired;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const identity = (try doc_identity.loadNamespaceTxn(&txn)) orelse return error.HistoryResynchronizationRequired;
+        if (!identity.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        const kind: @import("../source_authority.zig").Kind = switch (request.authority) {
+            .native => .native,
+            .raft => .raft,
+        };
+        const owner = try @import("../source_authority.zig").require(&txn, kind, namespace);
+        var cut: @import("../history_resolution_wire.zig").Cut = .{};
+        if (kind == .raft) {
+            const applied = try orderedHistoryReadCut(&txn, request.minimum_applied_index);
+            cut = .{ .term = applied.term, .index = applied.index };
+        } else {
+            if (owner.sequence < request.minimum_native_sequence) return error.StorageReadTemporarilyUnavailable;
+            cut.native_sequence = owner.sequence;
+        }
+        return @import("../history_resolution_wire.zig").read(allocator, &txn, request, cut);
+    }
+
     fn orderedHistoryReadCut(txn: anytype, minimum_applied_index: u64) !OrderedApplyReceipt {
         const marker = txn.get(&internal_keys.ordered_document_applied_entry_key) catch |err| switch (err) {
             error.NotFound => return error.StorageReadTemporarilyUnavailable,

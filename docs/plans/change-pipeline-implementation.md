@@ -2111,6 +2111,41 @@ Public projection still rejects coordinated frames until that full integration
 and the required failure/recovery tests pass. The full public feed, bootstrap,
 destination, pgoutput and existing-client requirements remain outstanding.
 
+## In progress: compiled cut-bound participant receipt reads
+
+`history_resolution_wire.zig` defines bounded private request/reply binding for a
+namespace, transaction, original owner fence, manifest digest, committed version
+and minimum native/Raft cut. Replies include the actual observed storage cut.
+A positive receipt must match all expected identities and cannot be ahead of that
+cut; wrong authority domains and inconsistent Raft term/index pairs fail. A null
+receipt is unproven snapshot absence, never a zero-effect result or permission
+to replay an uncertain mutation. Stored receipt integrity can be validated
+independently of primary transaction/coordinator metadata.
+
+`DB.historyResolution` checks the physical identity, persisted namespace,
+authority, required applied marker/native sequence and receipt in one read
+transaction. Raft callers must establish ReadIndex before invoking it. The
+compiled engine and storage-owner client expose this operation under engine
+descriptor 39 and owner ABI 96, with strict 4096-byte bounds and owned response
+cleanup. This is a private compiled capability; no public HTTP handler was added.
+
+The compiled-owner gate passed in `history-resolution-owner-test.log` using
+`history-resolution-owner-test -Dstorage-owner-test-filter='compiled ordered
+history grant'`. It checks cut-bound absence, stale-cut rejection, namespace and
+authority mismatch, reopen and ABI/malformed-request guards. Ten physical history
+tests and the completion gate passed in `history-resolution-snapshot-test.log`,
+including receipt lookup in a snapshot with primary transaction metadata absent.
+The initial direct wire gate passed four tests in
+`history-resolution-wire-test.log`; source catalog generation completed.
+
+Routed strong-read integration and its before/after frozen-owner/catalog checks,
+signed network receipt transport, mutation-side input/owner validation and
+protocol activation, authenticated collection, complete certificate publication,
+retention/GC handoff and topology recovery still require implementation and
+qualification. The direct storage read does not itself establish leadership or
+authorize a public caller. Coordinated public feeds remain disabled, and the
+broader full issue acceptance requirements remain open.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

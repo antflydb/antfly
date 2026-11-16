@@ -3637,6 +3637,17 @@ test "committed history completion admission freezes the coordinator plan with b
         defer receipt.deinit();
         try std.testing.expectEqual(receipt_digest, receipt.value.digest);
         try std.testing.expectEqual(@as(u64, 20), receipt.value.resolution.commit_version);
+        {
+            const wire = @import("history_resolution_wire.zig");
+            var shadow_gc = try store.beginWriteTxn();
+            defer shadow_gc.abort();
+            try shadow_gc.delete(&makeRecordKey(admission.transaction_id));
+            try shadow_gc.delete(&(completion.admission_prefix.* ++ admission.transaction_id));
+            const current = (try @import("source_authority.zig").load(&shadow_gc)).?;
+            const request: wire.Request = .{ .authority = .native, .namespace = namespace, .transaction_id = admission.transaction_id, .owner_fence = admission.coordinator_fence, .manifest_digest = receipt.value.resolution.manifest_digest, .commit_version = 20 };
+            const historical = try wire.read(a, &shadow_gc, request, .{ .native_sequence = current.sequence });
+            try std.testing.expectEqualDeep(receipt.value.resolution, historical.resolution.?);
+        }
     }
 }
 

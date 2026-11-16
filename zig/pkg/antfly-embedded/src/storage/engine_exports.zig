@@ -1157,6 +1157,9 @@ fn applyOrderedHistoryConsumerControl(self: *DB, command: @import("history_consu
 fn nativeHistoryGrant(self: *DB, requested: @import("history_consumer.zig").GrantIdentity) engine.Outcome(@import("history_consumer.zig").GrantObservation) {
     return .{ .value = self.nativeHistoryGrant(requested) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn historyResolution(self: *DB, allocator: Allocator, request: @import("history_resolution_wire.zig").Request) engine.Outcome(@import("history_resolution_wire.zig").Reply) {
+    return .{ .value = self.historyResolution(allocator, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn orderedHistoryGrant(self: *DB, requested: @import("history_consumer.zig").GrantIdentity, minimum_applied_index: u64) engine.Outcome(@import("history_consumer.zig").GrantObservation) {
     return .{ .value = self.orderedHistoryGrant(requested, minimum_applied_index) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

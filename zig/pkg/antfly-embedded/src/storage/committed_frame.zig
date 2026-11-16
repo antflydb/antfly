@@ -24,6 +24,7 @@ pub const Namespace = [24]u8;
 pub const completion = @import("transaction_completion.zig");
 test "committed frame completion contract discovery" {
     _ = completion;
+    _ = @import("history_resolution_wire.zig");
 }
 pub const chunk_bytes = 1024 * 1024;
 pub const max_bytes = 256 * 1024 * 1024;

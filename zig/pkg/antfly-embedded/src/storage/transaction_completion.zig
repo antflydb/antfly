@@ -256,6 +256,14 @@ pub const Resolution = struct {
     commit_version: u64,
     source_position: Digest,
     outcome: Outcome,
+    pub fn validateStructural(self: Resolution) !void {
+        if (!nonzero(self.namespace) or !nonzero(self.owner_fence) or !nonzero(self.manifest_digest) or self.commit_version == 0) return error.InvalidTxnRecord;
+        try validatePosition(self.source_position);
+        switch (self.outcome) {
+            .effects => |effects| if (effects.sequence == 0 or !nonzero(effects.frame_digest)) return error.InvalidTxnRecord,
+            .no_effect => |proof| if (!nonzero(proof)) return error.InvalidTxnRecord,
+        }
+    }
     pub fn digest(self: Resolution) Digest {
         var sha = std.crypto.hash.sha2.Sha256.init(.{});
         sha.update("antfly:transaction-completion-resolution:v1");
@@ -277,6 +285,7 @@ pub const Resolution = struct {
         return error.InvalidTxnRecord;
     }
     fn validateBound(self: Resolution, manifest_digest: Digest, commit_version: u64, participant: Participant) !void {
+        try self.validateStructural();
         if (!same(self.namespace, participant.namespace) or !same(self.owner_fence, participant.owner_fence) or !same(self.manifest_digest, manifest_digest) or self.commit_version != commit_version) return error.InvalidTxnRecord;
         try validatePosition(self.source_position);
         switch (self.outcome) {
@@ -312,13 +321,21 @@ pub fn encodeResolution(a: A, manifest: Manifest, resolution: Resolution) ![]u8 
     return raw;
 }
 pub fn parseResolution(a: A, manifest: Manifest, raw: []const u8) !std.json.Parsed(ResolutionEnvelope) {
+    var parsed = try parseStoredResolution(a, raw);
+    errdefer parsed.deinit();
+    try parsed.value.resolution.validate(manifest);
+    return parsed;
+}
+/// A retained receipt is independent of primary transaction-record GC. The
+/// reader must additionally bind the expected namespace/owner/manifest/version.
+pub fn parseStoredResolution(a: A, raw: []const u8) !std.json.Parsed(ResolutionEnvelope) {
     if (raw.len == 0 or raw.len > max_resolution_bytes) return error.InvalidTxnRecord;
     var parsed = std.json.parseFromSlice(ResolutionEnvelope, a, raw, .{ .allocate = .alloc_always }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidTxnRecord,
     };
     errdefer parsed.deinit();
-    try parsed.value.resolution.validate(manifest);
+    try parsed.value.resolution.validateStructural();
     if (!same(parsed.value.digest, parsed.value.resolution.digest())) return error.InvalidTxnRecord;
     return parsed;
 }
