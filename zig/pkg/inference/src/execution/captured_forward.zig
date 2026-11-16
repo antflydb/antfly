@@ -286,14 +286,15 @@ pub const Cache = struct {
             for (outputs[0..count]) |*output| output.deinit();
             allocator.free(outputs);
         }
-        if (forward.output_names.len != result.outputs.len) return error.MissingProgramOutputABI;
+        const output_names = if (forward.output_abi) |resolve| try resolve(forward.context, inputs) else forward.output_names;
+        if (output_names.len != result.outputs.len) return error.MissingProgramOutputABI;
         for (result.outputs, entry.program.graph.outputs.items, 0..) |value, node, i| {
             const shape = entry.program.graph.node(node).output_shape;
             if (shape.dtype != .f32) return error.UnsupportedProgramOutputType;
 
             const owner = result.backendFor(&frame.executable.runtime, i);
             const data = try owner.toFloat32(value, allocator);
-            outputs[i] = Tensor.initFloat32Owned(allocator, forward.output_names[i], shape.dims[0..shape.rank()], data) catch |err| {
+            outputs[i] = Tensor.initFloat32Owned(allocator, output_names[i], shape.dims[0..shape.rank()], data) catch |err| {
                 allocator.free(data);
                 return err;
             };

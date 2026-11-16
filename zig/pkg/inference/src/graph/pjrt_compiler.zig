@@ -173,6 +173,15 @@ pub fn compilePartitionWithOptions(
     }
     defer b.deinit();
 
+    var recurrent_programs: std.ArrayListUnmanaged(*@import("pjrt_gated_delta.zig").Program) = .empty;
+    defer {
+        for (recurrent_programs.items) |program| {
+            program.deinit();
+            allocator.destroy(program);
+        }
+        recurrent_programs.deinit(allocator);
+    }
+
     var next_param: u32 = 0;
 
     // ── 1. Create HLO parameters for external inputs ────────────
@@ -261,6 +270,19 @@ pub fn compilePartitionWithOptions(
         const n = graph.node(node_id);
         errdefer if (log_lowering_errors) std.log.warn("PJRT HLO lowering failed: node={d} op={s} shape={any}", .{ node_id, @tagName(n.op), n.output_shape.dims[0..n.output_shape.rank()] });
         const ins = n.getInputs();
+        if (n.op == .fused_gated_delta) {
+            const program = try allocator.create(@import("pjrt_gated_delta.zig").Program);
+            program.* = .{ .condition = hlo.Builder.init(allocator, "delta_condition"), .body = hlo.Builder.init(allocator, "delta_body"), .condition_id = 0, .body_id = 0 };
+            recurrent_programs.append(allocator, program) catch |err| {
+                program.deinit();
+                allocator.destroy(program);
+                return err;
+            };
+            if (ins.len != 3) return error.UnsupportedShape;
+            node_map[nid] = try program.emit(allocator, &b, try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1]), try getHloId(node_map, ins[2]), n.op.fused_gated_delta, reducer_comp.id, recurrent_programs.items.len - 1);
+            needs_reducer = true;
+            continue;
+        }
         if (try emitPrimitiveNode(allocator, &b, n, node_map, nid, &reducer_comp, &max_reducer_comp, &needs_reducer, &needs_max_reducer)) continue;
 
         switch (n.op) {
@@ -546,6 +568,7 @@ pub fn compilePartitionWithOptions(
     defer aux_list.deinit(allocator);
     if (needs_reducer) try aux_list.append(allocator, reducer_comp);
     if (needs_max_reducer) try aux_list.append(allocator, max_reducer_comp);
+    for (recurrent_programs.items) |program| try aux_list.appendSlice(allocator, &program.computations());
     const module = hlo.Module.initWithAux("partition", comp, aux_list.items);
     const hlo_bytes = try module.serialize(allocator);
     errdefer allocator.free(hlo_bytes);
@@ -1006,11 +1029,15 @@ fn emitPrimitiveNode(
         .less_than => node_map[nid] = try b.lessThan(try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1])),
 
         // Select (where)
-        .where_select => node_map[nid] = try b.select(
-            try getHloId(node_map, ins[0]),
-            try getHloId(node_map, ins[1]),
-            try getHloId(node_map, ins[2]),
-        ),
+        .where_select => {
+            const shape = graphShapeToHlo(n);
+            var predicate = try getHloId(node_map, ins[0]);
+            if (b.getInst(predicate).shape.element_type != .pred) predicate = try b.convertType(predicate, .pred);
+            predicate = try broadcastSelectOperand(b, predicate, hlo.Shape.init(.pred, shape.dimensions));
+            const yes = try broadcastSelectOperand(b, try getHloId(node_map, ins[1]), shape);
+            const no = try broadcastSelectOperand(b, try getHloId(node_map, ins[2]), shape);
+            node_map[nid] = try b.select(predicate, yes, no);
+        },
 
         .reduce_sum, .reduce_mean, .reduce_max => |attrs| {
             const source = try getHloId(node_map, ins[0]);
@@ -1148,6 +1175,21 @@ fn emitPrimitiveNode(
 fn segmentMetadataLane(b: *hlo.Builder, metadata: hlo.Id, start: usize, limit: usize, stride: usize, count: usize, axis: i64, rows: i64, columns: i64) !hlo.Id {
     const lane = try b.slice(metadata, &.{@intCast(start)}, &.{@intCast(limit)}, &.{@intCast(stride)}, hlo.Shape.init(.s32, &.{@intCast(count)}));
     return b.broadcast(lane, &.{axis}, hlo.Shape.init(.s32, &.{ rows, columns }));
+}
+
+/// HLO select has no implicit broadcasting and requires a predicate operand.
+/// Preserve the semantic IR's trailing-axis broadcasting explicitly.
+fn broadcastSelectOperand(b: *hlo.Builder, input: hlo.Id, target: hlo.Shape) !hlo.Id {
+    const source = b.getInst(input).shape;
+    if (source.element_type != target.element_type or source.dimensions.len > target.dimensions.len or target.dimensions.len > 8) return error.UnsupportedShape;
+    if (std.mem.eql(i64, source.dimensions, target.dimensions)) return input;
+    var axes: [8]i64 = undefined;
+    const offset = target.dimensions.len - source.dimensions.len;
+    for (source.dimensions, 0..) |size, axis| {
+        if (size != 1 and size != target.dimensions[offset + axis]) return error.UnsupportedShape;
+        axes[axis] = @intCast(offset + axis);
+    }
+    return b.broadcast(input, axes[0..source.dimensions.len], target);
 }
 
 fn emitSegmentAttention(
@@ -1401,7 +1443,16 @@ fn hloShapeIsConcretePositive(shape: ml.graph.Shape) bool {
 }
 
 fn floatingConstant(b: *hlo.Builder, shape: hlo.Shape, values: []const f32) !hlo.Id {
-    const value = try b.constantF32(hlo.Shape.init(.f32, shape.dimensions), values);
+    // Uniform tensors retain a scalar literal plus a broadcast, including
+    // large masks/constants originating before semantic optimization.
+    var uniform = values.len > 16;
+    if (uniform) for (values[1..]) |value| {
+        if (@as(u32, @bitCast(value)) != @as(u32, @bitCast(values[0]))) {
+            uniform = false;
+            break;
+        }
+    };
+    const value = if (uniform) try b.broadcast(try b.constantScalarF32(values[0]), &.{}, hlo.Shape.init(.f32, shape.dimensions)) else try b.constantF32(hlo.Shape.init(.f32, shape.dimensions), values);
     return if (shape.element_type == .f32) value else b.convertType(value, shape.element_type);
 }
 
@@ -1409,7 +1460,7 @@ fn emitGraphConstant(b: *hlo.Builder, graph: *const Graph, n: *const Node) !hlo.
     const attrs = n.op.constant;
     const shape = graphShapeToHlo(n);
     return switch (n.output_shape.dtype) {
-        .f32 => b.constantF32(shape, graph.constantData(attrs.data_offset, attrs.data_len)),
+        .f32 => floatingConstant(b, shape, graph.constantData(attrs.data_offset, attrs.data_len)),
         .f16, .bf16 => floating: {
             const raw = graph.constantDataAs(u16, attrs.data_offset, attrs.data_len);
             const values = try b.allocator.alloc(f32, raw.len);
@@ -2044,4 +2095,21 @@ test "PJRT compiler semantic decode inputs cover normal cache-writing attention"
     try std.testing.expectEqualSlices(i64, &.{ 1, 8 }, decode_result.output_shapes[0]);
     try std.testing.expectEqualSlices(i64, &.{ 3, 4 }, decode_result.output_shapes[1]);
     try std.testing.expectEqualSlices(i64, &.{ 3, 4 }, decode_result.output_shapes[2]);
+}
+
+test "PJRT compiler keeps uniform activation constants compact" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = GraphBuilder.init(&graph);
+    const data = try a.alloc(f32, 512 * 512);
+    defer a.free(data);
+    @memset(data, -1e9);
+    const value = try builder.tensorConst(data, Shape.init(.f32, &.{ 512, 512 }));
+    try graph.outputs.append(a, value);
+    const partition = Partition{ .backend = .pjrt, .node_ids = &.{value}, .external_inputs = &.{} };
+    const backend: ComputeBackend = undefined;
+    var compiled = try compilePartition(a, &graph, &partition, &backend);
+    defer compiled.deinit();
+    try std.testing.expect(compiled.hlo_bytes.len < 4096);
 }

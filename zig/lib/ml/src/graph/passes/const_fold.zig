@@ -138,6 +138,20 @@ pub fn fold(allocator: std.mem.Allocator, graph: *const Graph) !ConstFoldResult 
         }
         if (!all_const) continue;
 
+        // Preserve compact broadcasts/replication as executable shape math.
+        // A per-node ceiling alone still permits hundreds of activation-sized
+        // blobs in one vision tower. Tiny shape expressions remain foldable.
+        const output_bytes: usize = @intCast(elements * @as(i64, @intCast(n.output_shape.dtype.byteSize())));
+        if (output_bytes > 4096) {
+            var input_bytes: usize = 0;
+            for (inputs) |input| {
+                const source = work.node(resolve(redirect, input));
+                const bytes = if (source.op == .constant) source.op.constant.data_len else 0;
+                input_bytes = std.math.add(usize, input_bytes, bytes) catch std.math.maxInt(usize);
+            }
+            if (output_bytes / 4 > input_bytes) continue;
+        }
+
         if (try foldShapeTransform(allocator, &work, n, redirect)) |new_id| {
             redirect[i] = new_id;
             is_const[i] = true;
@@ -1979,5 +1993,20 @@ test "fold leaves large reachable broadcasts symbolic in the F32 fallback" {
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 0), result.num_folded);
     try std.testing.expectEqual(@as(usize, @sizeOf(f32)), result.graph.constant_pool.items.len);
+    try std.testing.expect(result.graph.node(result.graph.outputs.items[0]).op == .broadcast_in_dim);
+}
+
+test "fold retains compact repeated broadcasts below the per-node byte ceiling" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = @import("../builder.zig").Builder.init(&graph);
+    const scalar = try builder.scalarConst(.f32, 3);
+    const shape = Shape.init(.f32, &.{ 512, 512 });
+    const value = try graph.addNode(.{ .op = .{ .broadcast_in_dim = .{ .target_shape = shape, .num_axes = 0 } }, .output_shape = shape, .inputs = .{ scalar, null_node, null_node, null_node }, .num_inputs = 1 });
+    try graph.outputs.append(a, value);
+    var result = try fold(a, &graph);
+    defer result.deinit();
+    try std.testing.expect(result.graph.constant_pool.items.len <= 16);
     try std.testing.expect(result.graph.node(result.graph.outputs.items[0]).op == .broadcast_in_dim);
 }

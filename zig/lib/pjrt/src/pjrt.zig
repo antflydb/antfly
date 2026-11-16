@@ -55,6 +55,7 @@ pub const PjrtError = error{
     UnsupportedPjrtFeature,
     InvalidMemoryStats,
     OutputCountMismatch,
+    ProgramTooLarge,
 };
 
 /// Compiler-reported single-device execution footprint. Keep inputs and
@@ -665,6 +666,10 @@ pub const Client = struct {
     }
 
     pub fn compileWithOptions(self: *const Client, hlo_bytes: []const u8, num_outputs: usize, target_device: *c.PjrtDevice, options: CompileOptions) PjrtError!LoadedExecutable {
+        // HloModuleProto uses protobuf's signed 32-bit message-size limit.
+        // Reject before the C boundary: some plugins throw a C++ exception
+        // while constructing the oversized program instead of returning Error.
+        if (hlo_bytes.len > std.math.maxInt(i32)) return error.ProgramTooLarge;
         const format = "hlo";
         var program = c.Program{
             .struct_size = @sizeOf(c.Program),
@@ -972,6 +977,53 @@ test "end-to-end: compile and execute HLO add via PJRT CPU plugin" {
     defer alloc.free(after);
     for (x_data, before) |x, value| try std.testing.expectEqual(x * @sqrt(@as(f32, 512)), value);
     try std.testing.expectEqualSlices(f32, &.{ 22.625, 45.25, 68.0, 90.5 }, after);
+}
+
+test "end-to-end: compact tuple loop dynamically publishes device rows" {
+    const a = std.testing.allocator;
+    var client = Client.initFromEnvWithMemoryPolicy(a, .cpu) catch |err| switch (err) {
+        error.PjrtPluginNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer client.deinit();
+    var entry = hlo.Builder.init(a, "entry");
+    defer entry.deinit();
+    const shape = hlo.Shape.init(.f32, &.{4});
+    const initial = try entry.tuple(&.{ try entry.constantS32(hlo.Shape.scalar(.s32), &.{0}), try entry.parameter(0, shape, "input") });
+    var condition = hlo.Builder.init(a, "condition");
+    defer condition.deinit();
+    condition.next_id = 1_000_000_001;
+    condition.base_id = condition.next_id;
+    const cs = try condition.tupleParameter(0, entry.getInst(initial).tuple_child_shapes.?);
+    _ = try condition.lessThan(try condition.tupleElement(cs, 0), try condition.constantS32(hlo.Shape.scalar(.s32), &.{3}));
+    var body = hlo.Builder.init(a, "body");
+    defer body.deinit();
+    body.next_id = 2_000_000_001;
+    body.base_id = body.next_id;
+    const bs = try body.tupleParameter(0, entry.getInst(initial).tuple_child_shapes.?);
+    const cursor = try body.tupleElement(bs, 0);
+    const output = try body.tupleElement(bs, 1);
+    const row = try body.reshape(try body.convertType(cursor, .f32), hlo.Shape.init(.f32, &.{1}));
+    const replaced = try body.dynamicUpdateSlice(output, row, &.{cursor});
+    const observed = try body.dynamicSlice(replaced, &.{cursor}, &.{1});
+    const published = try body.dynamicUpdateSlice(replaced, observed, &.{cursor});
+    _ = try body.tuple(&.{ try body.add(cursor, try body.constantS32(hlo.Shape.scalar(.s32), &.{1})), published });
+    const loop = try entry.whileLoop(initial, condition.build().id, body.build().id);
+    _ = try entry.tupleElement(loop, 1);
+    const bytes = try hlo.Module.initWithAux("loop", entry.build(), &.{ condition.build(), body.build() }).serialize(a);
+    defer a.free(bytes);
+    var executable = try client.compile(bytes, 1);
+    defer executable.deinit();
+    for ([_]f32{ 5, 19, -2 }) |last| {
+        var input = try client.bufferFromHostFloat32(&.{ 9, 8, 7, last }, &.{4});
+        defer input.deinit();
+        const outputs = try executable.execute(&.{input}, a);
+        defer a.free(outputs);
+        defer for (outputs) |*buffer| buffer.deinit();
+        const actual = try outputs[0].toFloat32(a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, last }, actual);
+    }
 }
 
 test "end-to-end: reduced-precision GELU retains finite extrema and negative tails" {
@@ -1547,4 +1599,12 @@ test "row major readback canonicalizes native layout and KV shape ignores paddin
     defer std.testing.allocator.free(values);
     try std.testing.expectEqualSlices(f32, &.{ 10, 0, 20, 1 }, values);
     try std.testing.expect(values[2] > values[3]);
+}
+
+test "oversized HLO is rejected before entering the plugin" {
+    const client: Client = undefined;
+    // Never read: the length must be rejected before any provider/API access.
+    const bytes = @as([*]const u8, @ptrFromInt(1))[0 .. @as(usize, std.math.maxInt(i32)) + 1];
+    try std.testing.expectError(error.ProgramTooLarge, client.compileForDevice(bytes, 1, @ptrFromInt(1)));
+    try std.testing.expectError(error.ProgramTooLarge, client.compileWithOptions(bytes, 1, @ptrFromInt(1), .{ .gpu_gemm = .vendor }));
 }

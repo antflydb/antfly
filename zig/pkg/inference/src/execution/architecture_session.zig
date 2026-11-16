@@ -420,7 +420,8 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
         // Do not publish a compiled target whose production forward has no
         // semantic frontend. Loading may fall back only before publication.
         const selected_task = sessionTaskForModelType(loaded_model.manifest.model_type, override);
-        if ((selected_task != .generic and !(selected_task == .extractor and decisionProgramEncoder(loaded_model.architecture, loaded_model.manifest.gliner_span_encoder_family) != null)) or loaded_model.manifest.glide_declared) return error.UnsupportedModelProgram;
+        const boundary_extraction = selected_task == .extractor and loaded_model.architecture == .gliner_boundary and loaded_model.architecture.gliner_boundary.encoder.family == .deberta;
+        if ((selected_task != .generic and !boundary_extraction and !(selected_task == .extractor and decisionProgramEncoder(loaded_model.architecture, loaded_model.manifest.gliner_span_encoder_family) != null)) or loaded_model.manifest.glide_declared) return error.UnsupportedModelProgram;
         if (loaded_model.architecture == .modern_bert and loaded_model.architecture.modern_bert.laya != null) return error.UnsupportedModelProgram;
         switch (loaded_model.architecture) {
             .bert, .modern_bert, .nomic_bert, .embedding_gemma2, .whisper, .gpt, .deberta, .gliner, .gliner_modern_bert => {},
@@ -428,7 +429,9 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
             else => return error.UnsupportedModelProgram,
         }
     }
-    var prepared = try host_weights.prepare(allocator, model_path, loaded_model, preparation.weights);
+    var host_preparation = preparation.weights;
+    host_preparation.include_auxiliary_tensors = preparation.backend == .pjrt;
+    var prepared = try host_weights.prepare(allocator, model_path, loaded_model, host_preparation);
     defer prepared.deinit();
     const mf = loaded_model.manifest;
     const arch_config = prepared.architecture;
@@ -7887,14 +7890,40 @@ fn forwardDecisionProgram(ptr: *anyopaque, cb: *const ops.ComputeBackend, alloca
     return @import("marker_classifier.zig").run(decisionProgramEncoder(self.arch_config, self.gliner_span_encoder_family) orelse return error.UnsupportedModelProgram, cb, allocator, inputs);
 }
 
+fn auxiliaryProjectorStore(self: *ArchSession) ?*tensor_store_mod.GgufStore {
+    const store = switch (self.backend_type) {
+        .native => self.backend_data.native.tensor_store,
+        .pjrt => self.backend_data.pjrt.native.tensor_store,
+        else => null,
+    } orelse return null;
+    return store.auxiliaryGgufStore();
+}
+
+pub fn getAuxiliaryProjectorMetadata(session: Session) ?*const gguf_mod.format.File {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const metadata = auxiliaryProjectorStore(self) orelse return null;
+    return &metadata.parsed;
+}
+
 fn resolveArchModelProgram(ptr: *anyopaque, stage: @import("model_frontend.zig").Stage) anyerror!?@import("capture.zig").Forward {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (self.task == .extractor and decisionProgramEncoder(self.arch_config, self.gliner_span_encoder_family) != null) return switch (stage) {
         .forward, .readout => .{ .context = self, .fingerprint = 4, .output_names = &.{"logits"}, .validate = validateDecisionProgram, .run = forwardDecisionProgram },
         else => null,
     };
-    if (self.task != .generic or self.glide_head != null) return null;
+    if (stage == .readout and self.arch_config == .gliner_boundary) return @import("boundary_head_frontend.zig").resolve(&self.arch_config.gliner_boundary);
+    if ((self.task != .generic and !(self.task == .extractor and self.arch_config == .gliner_boundary)) or self.glide_head != null) return null;
     if (self.arch_config == .whisper) return @import("whisper_frontend.zig").resolve(&self.arch_config.whisper, stage);
+    if (stage == .audio_projection and self.arch_config == .gpt) {
+        if (auxiliaryProjectorStore(self)) |metadata| return @import("projector_frontend.zig").audio(metadata);
+        return null;
+    }
+    if (stage == .image_projection and self.arch_config == .gpt) {
+        if (auxiliaryProjectorStore(self)) |metadata| return @import("projector_frontend.zig").image(metadata);
+        if (self.arch_config.gpt.hasQwen35VisionArchitectureContract()) return @import("patch_projector_frontend.zig").image(&self.arch_config.gpt);
+        return null;
+    }
     const encoder = switch (self.arch_config) {
         .bert, .modern_bert, .nomic_bert, .embedding_gemma2, .gpt, .deberta, .gliner => true,
         .gliner_boundary => |cfg| cfg.encoder.family == .deberta,
@@ -7902,6 +7931,7 @@ fn resolveArchModelProgram(ptr: *anyopaque, stage: @import("model_frontend.zig")
     };
     return switch (stage) {
         .forward => if (encoder) .{ .context = self, .fingerprint = 0, .output_names = &.{"last_hidden_state"}, .validate = archValidateProgramInputs, .run = archProgramForward } else null,
+        .decoder => if (self.arch_config == .gpt) @import("decoder_frontend.zig").resolve(&self.arch_config.gpt) else null,
         .embedding => if (self.arch_config == .embedding_gemma2) .{ .context = self, .fingerprint = 1, .output_names = &.{"sentence_embedding"}, .validate = archValidateProgramInputs, .run = archEmbeddingProgramForward } else null,
         else => null,
     };
@@ -8068,9 +8098,19 @@ fn runCapturedProgram(self: *ArchSession, inputs: []const Tensor, allocator: std
     const stage: @import("model_frontend.zig").Stage = if (self.arch_config == .whisper) stage: {
         for (inputs) |input| if (std.mem.eql(u8, input.name, "input_features")) break :stage .encoder;
         break :stage .decoder;
-    } else if (pooled) .embedding else .forward;
+    } else if (self.arch_config == .gpt and for (inputs) |input| {
+        if (std.mem.eql(u8, input.name, "audio_values")) break true;
+    } else false) .audio_projection else if (self.arch_config == .gpt and for (inputs) |input| {
+        if (std.mem.eql(u8, input.name, "pixel_values") or std.mem.eql(u8, input.name, "patch_values")) break true;
+    } else false) .image_projection else if (self.arch_config == .gliner_boundary and for (inputs) |input| {
+        if (std.mem.startsWith(u8, input.name, "head.")) break true;
+    } else false) .readout else if (self.arch_config == .gpt and for (inputs) |input| {
+        if (std.mem.eql(u8, input.name, "input_embeddings")) break true;
+    } else false) .decoder else if (pooled) .embedding else .forward;
     var forward = (try handle.model_programs.?.get(stage)) orelse return error.UnsupportedModelProgram;
-    forward.precision = self.backend_data.pjrt.precision;
+    // Authored graphs declare their arithmetic dtypes explicitly, including
+    // F32 task heads behind a BF16 encoder. Traced programs use session policy.
+    if (forward.author == null) forward.precision = self.backend_data.pjrt.precision;
     const client = if (comptime build_options.enable_pjrt) if (self.backend_data.pjrt.client) |*value| @as(*anyopaque, @ptrCast(value)) else return error.MissingPjrtClient else return error.PjrtNotEnabled;
     const declared = try allocator.alloc(@import("capture.zig").Input, inputs.len);
     defer allocator.free(declared);
@@ -8083,7 +8123,7 @@ fn runCapturedProgram(self: *ArchSession, inputs: []const Tensor, allocator: std
     };
     for (inputs, declared) |input, *value| value.* = .{
         .tensor = input,
-        .specialize = std.mem.eql(u8, input.name, "output_dimensions") or std.mem.eql(u8, input.name, "media_rows") or std.mem.eql(u8, input.name, "media_layout") or std.mem.startsWith(u8, input.name, "media_mask_") or
+        .specialize = std.mem.eql(u8, input.name, "audio_mask") or std.mem.eql(u8, input.name, "head.record.mode") or std.mem.eql(u8, input.name, "image_grid") or std.mem.eql(u8, input.name, "output_dimensions") or std.mem.eql(u8, input.name, "attention_or_mask") or std.mem.eql(u8, input.name, "position_ids") or std.mem.eql(u8, input.name, "media_rows") or std.mem.eql(u8, input.name, "media_layout") or std.mem.startsWith(u8, input.name, "media_mask_") or
             (specialize_masks and (std.mem.eql(u8, input.name, "attention_mask") or std.mem.eql(u8, input.name, "encoder_attention_mask"))),
     };
     return self.captured_programs.run(self.allocator, .{
@@ -9364,6 +9404,62 @@ fn maybeApplyPooler(
 fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").ShapeInputs, batch: usize) !?@import("../backends/session.zig").RunGeometry {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (inputs.len() == 0) return null;
+    if (self.backend_type == .pjrt and self.arch_config == .gliner_boundary) {
+        if (inputs.named("head.text_states")) |states| {
+            const queries = inputs.named("head.query_states") orelse return error.MissingInputs;
+            if (states.shape.len != 3 or queries.shape.len != 3 or states.shape[0] != batch or queries.shape[0] != batch or states.shape[1] <= 0 or queries.shape[1] <= 0) return error.InvalidInputShape;
+            const plan = try @import("../architectures/gliner/boundary_head.zig").planShape(&self.arch_config.gliner_boundary, .{ .batch = batch, .text_length = @intCast(states.shape[1]), .queries = @intCast(queries.shape[1]) }, .{});
+            return .{ .sequence = @intCast(states.shape[1]), .output_bytes = plan.intermediate_bytes, .workspace_bytes = plan.intermediate_bytes };
+        }
+        if (inputs.named("head.classification_states")) |states| {
+            const cfg = self.arch_config.gliner_boundary;
+            if (states.shape.len != 3 or states.shape[0] != batch or states.shape[1] <= 0 or states.shape[2] != cfg.encoder.hidden_size) return error.InvalidInputShape;
+            const count = std.math.mul(usize, batch, @intCast(states.shape[1])) catch return error.ResourceLimitExceeded;
+            const workspace = std.math.mul(usize, count, @as(usize, cfg.encoder.hidden_size) * 12) catch return error.ResourceLimitExceeded;
+            return .{ .sequence = 1, .output_bytes = std.math.mul(usize, count, @sizeOf(f32)) catch return error.ResourceLimitExceeded, .workspace_bytes = workspace };
+        }
+    }
+    if (self.backend_type == .pjrt and self.arch_config == .gpt) {
+        if (inputs.named("audio_values")) |audio| {
+            if (audio.dtype != .f32 or audio.shape.len != 3 or audio.shape[0] != 1 or audio.shape[1] <= 0 or audio.shape[2] <= 0 or batch != 1) return error.InvalidInputShape;
+            const metadata = auxiliaryProjectorStore(self) orelse return error.MissingProjector;
+            const frames: usize = @intCast(audio.shape[1]);
+            const layout = try @import("../architectures/gemma4_projector.zig").namedAudioLayout(&metadata.parsed, frames, @intCast(audio.shape[2]));
+            const bytes = std.math.mul(usize, layout.max_tokens, layout.hidden * @sizeOf(f32)) catch return error.ResourceLimitExceeded;
+            return .{ .sequence = frames, .output_bytes = bytes, .workspace_bytes = if (layout.raw) bytes * 4 else 768 * 1024 * 1024 };
+        }
+        if (inputs.named("patch_values")) |patches| {
+            const cfg = self.arch_config.gpt;
+            if (patches.dtype != .f32 or patches.shape.len != 3 or patches.shape[0] != 1 or patches.shape[1] <= 0 or patches.shape[2] != 3 * cfg.vision_patch_size * cfg.vision_patch_size or batch != 1) return error.InvalidInputShape;
+            const count: usize = @intCast(patches.shape[1]);
+            const merge: usize = cfg.vision_spatial_merge_size;
+            if (merge == 0 or count % (merge * merge) != 0 or count / (merge * merge) > 576) return error.VisionAdmissionExceeded;
+            const output = std.math.mul(usize, count / (merge * merge), @as(usize, cfg.hidden_size) * @sizeOf(f32)) catch return error.ResourceLimitExceeded;
+            return .{ .sequence = count, .output_bytes = std.math.add(usize, output, 2 * @sizeOf(i64)) catch return error.ResourceLimitExceeded, .workspace_bytes = try whisperStageWorkspace(1, count, count, cfg.vision_hidden_size, cfg.vision_num_attention_heads, cfg.vision_intermediate_size) };
+        }
+        if (inputs.named("pixel_values")) |pixels| {
+            if (pixels.dtype != .f32 or pixels.shape.len != 4 or pixels.shape[0] <= 0 or pixels.shape[1] != 3 or pixels.shape[2] <= 0 or pixels.shape[3] <= 0 or pixels.shape[0] != batch) return error.InvalidInputShape;
+            const metadata = auxiliaryProjectorStore(self) orelse return error.MissingProjector;
+            const projector = @import("../architectures/gemma4_projector.zig");
+            const w: usize = @intCast(pixels.shape[3]);
+            const h: usize = @intCast(pixels.shape[2]);
+            const layout = try projector.imageTensorLayout(&metadata.parsed, w, h, batch);
+            const count = std.math.mul(usize, (std.math.mul(usize, batch, layout.geometry.tokenCount()) catch return error.ResourceLimitExceeded), layout.hidden) catch return error.ResourceLimitExceeded;
+            return .{ .sequence = layout.geometry.grid_x * layout.geometry.grid_y, .output_bytes = (std.math.add(usize, (std.math.mul(usize, count, @sizeOf(f32)) catch return error.ResourceLimitExceeded), 3 * @sizeOf(i64)) catch return error.ResourceLimitExceeded), .workspace_bytes = try projector.imageTensorWorkspace(&metadata.parsed, w, h, batch) };
+        }
+        if (inputs.named("input_embeddings") != null) {
+            const ids = inputs.named("input_ids") orelse return error.MissingInputs;
+            if (ids.shape.len != 2 or ids.shape[0] != 1 or ids.shape[1] <= 0 or batch != 1) return error.InvalidInputShape;
+            const cfg = self.arch_config.gpt;
+            const rows: usize = @intCast(ids.shape[1]);
+            var workspace = try whisperStageWorkspace(1, rows, rows, cfg.hidden_size, cfg.num_attention_heads, cfg.intermediate_size);
+            if (cfg.qwen35_has_linear_attention) {
+                const matrix = try std.math.mul(usize, try std.math.mul(usize, cfg.qwen35_linear_num_value_heads, cfg.qwen35_linear_key_head_dim), cfg.qwen35_linear_value_head_dim);
+                workspace = try std.math.add(usize, workspace, try std.math.mul(usize, matrix, 2 * @sizeOf(f32)));
+            }
+            return .{ .sequence = rows, .output_bytes = try std.math.add(usize, try std.math.mul(usize, cfg.vocab_size, @sizeOf(f32)), 2 * @sizeOf(i64)), .workspace_bytes = workspace };
+        }
+    }
     const first = inputs.get(0);
     if (first.shape.len < 2 or first.shape[1] <= 0) return null;
     const input_seq: usize = @intCast(first.shape[1]);
@@ -9380,7 +9476,7 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
             if (self.task == .classifier) output_seq = 1;
             break :blk if (self.task == .classifier or self.task == .extractor) cfg.num_labels else cfg.hidden_size;
         },
-        .gliner_boundary => |cfg| if (self.task == .generic) cfg.encoder.hidden_size else return null,
+        .gliner_boundary => |cfg| if (self.task == .generic or self.backend_type == .pjrt) cfg.encoder.hidden_size else return null,
         .gliner => |cfg| if (self.task == .generic) cfg.hidden_size else return null,
         .modern_bert => |cfg| blk: {
             if (self.task == .extractor and self.gliner_span_encoder_family == .modern_bert) {

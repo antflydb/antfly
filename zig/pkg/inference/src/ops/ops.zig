@@ -36,6 +36,20 @@ const ml = @import("ml");
 /// (native CPU uses f32 slices, device backends use opaque handles). Tensors are always
 /// freed via the ComputeBackend that created them.
 pub const CT = backend_contracts.CT;
+pub const GatedDeltaParams = ml.graph.node.GatedDeltaAttrs;
+pub const DepthwiseGatedDeltaRequest = struct {
+    mixed: CT,
+    z: CT,
+    beta: CT,
+    a: CT,
+    conv_weight: CT,
+    a_log: CT,
+    dt_bias: CT,
+    norm_weight: CT,
+    geometry: GatedDeltaParams,
+    kernel: u32,
+    eps: f32,
+};
 pub const kernel_descriptor = @import("kernel_descriptor.zig");
 pub const physical_storage = @import("physical_storage.zig");
 pub const KernelBackend = @import("kernel_backend.zig").VTable;
@@ -2905,6 +2919,9 @@ pub const ComputeBackend = struct {
         /// Depthwise causal conv1d over `[rows, dim]` with a `[kernel_size, dim]`
         /// weight and `kernel_size - 1` implicit left padding.
         depthwiseCausalConv1d: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
+        /// Full-sequence zero-state recurrence: packed Q/K/V, sigmoid beta,
+        /// and exponential decay. Outputs F32 before gated normalization.
+        depthwiseGatedDelta: ?*const fn (ctx: *anyopaque, request: *const DepthwiseGatedDeltaRequest) anyerror!CT = null,
 
         /// `[channels, time_steps, freq_bins]` -> `[time_steps, freq_bins * channels]`
         /// (the Gemma 4 audio conv-stack flatten).
@@ -4592,6 +4609,7 @@ pub const ComputeBackend = struct {
         if (self.vtable.reshape2D) |reshape_2d| {
             return reshape_2d(self.ptr, input, old_rows, old_cols, new_rows, new_cols);
         }
+        if (self.vtable.reshapeOp != null) return self.primReshape(input, &.{ @intCast(new_rows), @intCast(new_cols) });
         const data = try self.toFloat32(input, allocator);
         defer allocator.free(data);
         if (data.len != old_rows * old_cols) return error.UnexpectedOutputShape;
@@ -5600,6 +5618,12 @@ pub const ComputeBackend = struct {
     pub fn depthwiseCausalConv1d(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, dim: usize, kernel_size: usize) !?CT {
         const op = self.vtable.depthwiseCausalConv1d orelse return null;
         return op(self.ptr, input, weight, rows, dim, kernel_size);
+    }
+
+    pub fn depthwiseGatedDelta(self: *const ComputeBackend, request: *const DepthwiseGatedDeltaRequest) !?CT {
+        const op = self.vtable.depthwiseGatedDelta orelse return null;
+        try self.checkExecutionControl();
+        return try op(self.ptr, request);
     }
 
     pub fn flattenChannelsTimeFreq(self: *const ComputeBackend, input: CT, time_steps: usize, freq_bins: usize, channels: usize) !?CT {

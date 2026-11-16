@@ -677,6 +677,7 @@ const ProjectorWeights = struct {
     allocator: std.mem.Allocator,
     gguf: ?*tensor_store_mod.GgufStore,
     huggingface: bool = false,
+    require_resident_weights: bool = false,
     /// The model-owned store when the request has one (its clamp-bound
     /// cache); null for callers that bring a bare GGUF store.
     owner: ?*ProjectorStore,
@@ -700,6 +701,7 @@ const ProjectorWeights = struct {
     }
 
     fn weightCt(self: *ProjectorWeights, tensor_name: []const u8) !CT {
+        if (self.require_resident_weights) return self.cb.getWeight(tensor_name);
         if (self.gguf) |gguf| return loadWeightCt(self.cb, self.allocator, gguf, tensor_name);
         const mapped = try @import("embedding_gemma2_media_weights.zig").name(self.allocator, tensor_name);
         defer self.allocator.free(mapped);
@@ -723,6 +725,28 @@ const ProjectorWeights = struct {
     }
 
     fn linearCt(self: *ProjectorWeights, tensor_name: []const u8, in_dim: usize, out_dim: usize) !CT {
+        if (self.require_resident_weights) {
+            const tensor = try self.cb.getWeight(tensor_name);
+            errdefer self.cb.free(tensor);
+            if ((try self.cb.tensorShapeMatches(tensor, &.{ @intCast(out_dim), @intCast(in_dim) })) orelse false) return tensor;
+            if ((try self.cb.tensorShapeMatches(tensor, &.{ @intCast(in_dim), @intCast(out_dim) })) orelse false) {
+                const transposed = try self.cb.primTranspose(tensor, &.{ 1, 0 }, &.{ @intCast(in_dim), @intCast(out_dim) });
+                self.cb.free(tensor);
+                return transposed;
+            }
+            const shape = try self.cb.tensorShape(tensor, self.allocator);
+            defer self.allocator.free(shape);
+            if (shape.len > 2 and shape[0] == out_dim) {
+                var width: usize = 1;
+                for (shape[1..]) |axis| width = try std.math.mul(usize, width, std.math.cast(usize, axis) orelse return error.InvalidTensorShape);
+                if (width == in_dim) {
+                    const flattened = try self.cb.primReshape(tensor, &.{ @intCast(out_dim), @intCast(in_dim) });
+                    self.cb.free(tensor);
+                    return flattened;
+                }
+            }
+            return error.InvalidTensorShape;
+        }
         if (self.gguf) |gguf| return loadLinearWeightCt(self.cb, self.allocator, gguf, tensor_name, in_dim, out_dim);
         const tensor = try self.weightCt(tensor_name);
         errdefer self.cb.free(tensor);
@@ -865,6 +889,65 @@ pub fn encodeEmbeddingGemma2VideoPatches(cb: *const ComputeBackend, allocator: s
 
 /// Device tensors can enter the patch projection without a prepared-pixel readback.
 pub const EncodedDeviceImage = struct { tensor: CT, tokens: usize };
+
+pub const ImageTensorLayout = struct { geometry: Geometry, hidden: usize, patch: usize };
+
+pub fn imageTensorLayout(file: *const gguf_format.File, width: usize, height: usize, batch: usize) !ImageTensorLayout {
+    if (width == 0 or height == 0 or width > std.math.maxInt(u32) or height > std.math.maxInt(u32) or batch == 0 or batch > 8) return error.InvalidImageBatch;
+    const cfg = try parseConfig(file);
+    const block = cfg.patch_size * cfg.spatial_merge_size;
+    if (block == 0 or width % block != 0 or height % block != 0) return error.InvalidTensorShape;
+    const geometry = Geometry{ .width = width, .height = height, .grid_x = width / cfg.patch_size, .grid_y = height / cfg.patch_size, .pooled_x = width / block, .pooled_y = height / block };
+    if (geometry.grid_x * geometry.grid_y > cfg.maxPatchCount()) return error.InvalidTensorShape;
+    if (cfg.position_embeddings_per_axis != 0 and (geometry.grid_x > cfg.position_embeddings_per_axis or geometry.grid_y > cfg.position_embeddings_per_axis)) return error.InvalidTensorShape;
+    return .{ .geometry = geometry, .hidden = cfg.text_hidden, .patch = cfg.patch_size };
+}
+
+pub fn imageTensorWorkspace(file: *const gguf_format.File, width: usize, height: usize, batch: usize) !usize {
+    const layout = try imageTensorLayout(file, width, height, batch);
+    const cfg = try parseConfig(file);
+    return std.math.mul(usize, batch, try imageScratchBytes(cfg, layout.geometry.grid_x * layout.geometry.grid_y));
+}
+
+/// Already preprocessed NCHW pixels remain runtime operands. Companion
+/// weights use the session's immutable inventory, never literal HLO tensors.
+pub fn encodeNamedPixelTensorResident(cb: *const ComputeBackend, a: std.mem.Allocator, metadata: *tensor_store_mod.GgufStore, pixels: CT, width: usize, height: usize, batch: usize) !EncodedDeviceImage {
+    const layout = try imageTensorLayout(&metadata.parsed, width, height, batch);
+    const cfg = try parseConfig(&metadata.parsed);
+    const geometry = layout.geometry;
+    var weights = ProjectorWeights{ .cb = cb, .allocator = a, .gguf = metadata, .owner = null, .require_resident_weights = true };
+    defer weights.deinit();
+    const patch = cfg.patch_size;
+    const dim = 3 * patch * patch;
+    const rows = batch * geometry.grid_x * geometry.grid_y;
+    const source = if (cfg.direct_unified) pixels else centered: {
+        const half = try cb.fromFloat32Shape(&.{0.5}, &.{});
+        defer cb.free(half);
+        const shifted = try cb.primSubtract(pixels, half);
+        defer cb.free(shifted);
+        break :centered (try cb.multiplyScalar(shifted, 2)) orelse return error.UnsupportedPrimitiveOp;
+    };
+    defer if (source != pixels) cb.free(source);
+    const physical = [_]i64{ @intCast(batch), 3, @intCast(geometry.grid_y), @intCast(patch), @intCast(geometry.grid_x), @intCast(patch) };
+    const shaped = try cb.primReshape(source, &physical);
+    defer cb.free(shaped);
+    // GGUF patch projections flatten channel before the two patch axes.
+    const ordered = try cb.primTranspose(shaped, &.{ 0, 2, 4, 1, 3, 5 }, &physical);
+    defer cb.free(ordered);
+    const patches = try cb.primReshape(ordered, &.{ @intCast(rows), @intCast(dim) });
+    defer cb.free(patches);
+    const encoded = if (cfg.direct_unified) unified: {
+        const normalized = try layerNormVisionTensor(cb, a, &weights, patches, rows, dim, "v.patch_norm.1");
+        defer cb.free(normalized);
+        break :unified try encodeUnifiedPatchesResident(cb, a, &weights, cfg, normalized, geometry, batch);
+    } else vision: {
+        const weight = try weights.linearCt("v.patch_embd.weight", dim, cfg.vision_hidden);
+        defer cb.free(weight);
+        const hidden = try cb.linearNoBias(patches, weight, rows, dim, cfg.vision_hidden);
+        break :vision try encodeVisionHiddenResident(cb, a, &weights, cfg, hidden, geometry, batch);
+    };
+    return .{ .tensor = encoded.embeddings, .tokens = batch * encoded.tokens };
+}
 
 /// Normalized NCHW pixels enter the existing image tower using only shared
 /// tensor operations. Spatial dimensions are processor-selected multiples of
@@ -2408,6 +2491,59 @@ pub fn prepareEmbeddingGemma2AudioFeatures(allocator: std.mem.Allocator, prepare
     return .{ .allocator = allocator, .data = out, .mask = mask, .frames = prepared.frames, .mel_bins = prepared.mel_bins };
 }
 
+pub const NamedAudioLayout = struct { width: usize, hidden: usize, max_tokens: usize, raw: bool };
+
+pub fn namedAudioLayout(file: *const gguf_format.File, frames: usize, width: usize) !NamedAudioLayout {
+    const cfg = try parseAudioConfig(file);
+    const expected = if (cfg.direct_unified) cfg.raw_samples_per_token else cfg.mel_bins;
+    const maximum = if (cfg.direct_unified) cfg.max_direct_audio_tokens else cfg.max_audio_samples / 160 + 4;
+    if (frames == 0 or frames > maximum or width != expected) return error.InvalidInputShape;
+    return .{ .width = expected, .hidden = cfg.text_hidden, .max_tokens = if (cfg.direct_unified) frames else (frames + 3) / 4, .raw = cfg.direct_unified };
+}
+
+/// Host-only waveform decoding and the checkpoint's existing feature policy.
+/// The returned values are supplied as runtime operands to the learned tower.
+pub fn prepareNamedAudio(a: std.mem.Allocator, file: *const gguf_format.File, input: AudioInput) !AudioFeatures {
+    const cfg = try parseAudioConfig(file);
+    if (cfg.direct_unified) {
+        const frames = switch (input) {
+            .encoded => |bytes| try prepareGemma4RawAudioFrames(a, bytes, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens),
+            .pcm => |pcm| try prepareGemma4RawAudioFramesPcm(a, pcm, cfg.raw_samples_per_token, cfg.max_direct_audio_tokens),
+        };
+        errdefer a.free(frames);
+        const count = frames.len / cfg.raw_samples_per_token;
+        const mask = try a.alloc(bool, count);
+        @memset(mask, true);
+        return .{ .allocator = a, .data = frames, .mask = mask, .frames = count, .mel_bins = cfg.raw_samples_per_token };
+    }
+    var prepared = switch (input) {
+        .encoded => |bytes| try prepareAudioCpuBounded(a, bytes, cfg.audio_decode_options, cfg.mel_bins, cfg.reject_audio_truncation, false, cfg.max_audio_samples, cfg.max_audio_decode_working_bytes, false),
+        .pcm => |pcm| try prepareAudioPcmBounded(a, pcm, cfg.mel_bins, cfg.reject_audio_truncation, false, cfg.max_audio_samples, false),
+    };
+    defer prepared.deinit();
+    return prepareEmbeddingGemma2AudioFeatures(a, &prepared);
+}
+
+pub fn encodeNamedAudioTensorResident(cb: *const ComputeBackend, a: std.mem.Allocator, metadata: *tensor_store_mod.GgufStore, input: CT, mask: []const bool, frames: usize, width: usize) !ResidentEncodedAudio {
+    const layout = try namedAudioLayout(&metadata.parsed, frames, width);
+    if (mask.len != frames) return error.InvalidInputShape;
+    const cfg = try parseAudioConfig(&metadata.parsed);
+    var weights = ProjectorWeights{ .cb = cb, .allocator = a, .gguf = metadata, .owner = null, .require_resident_weights = true };
+    defer weights.deinit();
+    if (layout.raw) {
+        for (mask) |valid| if (!valid) return error.InvalidAttentionMask;
+        const matrix = try cb.primReshape(input, &.{ @intCast(frames), @intCast(width) });
+        defer cb.free(matrix);
+        const normalized = try rmsNormNoScaleCt(cb, a, matrix, frames, width, cfg.layer_norm_eps);
+        defer cb.free(normalized);
+        const weight = try weights.linearCt("mm.a.input_projection.weight", width, cfg.text_hidden);
+        defer cb.free(weight);
+        return .{ .embeddings = try cb.linearNoBias(normalized, weight, frames, width, cfg.text_hidden), .tokens = frames };
+    }
+    var features = AudioFeatures{ .allocator = a, .data = &.{}, .resident = input, .backend = cb, .mask = @constCast(mask), .frames = frames, .mel_bins = width };
+    return encodeAudioFeaturesResident(cb, a, &weights, cfg, &features);
+}
+
 /// Borrow runtime log-mel values; projection stays in the captured program.
 pub fn encodeEmbeddingGemma2AudioFeatureTensorResident(cb: *const ComputeBackend, a: std.mem.Allocator, input: CT, mask: []const bool, frames: usize, mel_bins: usize) !ResidentEncodedAudio {
     if (frames == 0 or mel_bins != 128 or mask.len != frames) return error.InvalidInputShape;
@@ -3154,6 +3290,19 @@ fn prepareImageView(allocator: std.mem.Allocator, store: *ProjectorWeights, cfg:
 fn prepareImageViewAtGeometry(allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, decoded: image.ImageU8, geometry: Geometry) !PreparedImage {
     try decoded.validate();
     if (store.cb.kind() == .metal and store.gguf == null and cfg.embedding_gemma2_f32_attention) return .{ .allocator = allocator, .pixels = &.{}, .geometry = geometry, .source = decoded, .source_owned = false };
+    return prepareImagePixels(allocator, cfg, decoded, geometry, store.gguf == null);
+}
+
+/// Codec, resize and rescale only. Learned patch normalization remains in
+/// the semantic image stage, including unified projector checkpoints.
+pub fn prepareProjectorImage(allocator: std.mem.Allocator, metadata: *const gguf_format.File, bytes: []const u8) !PreparedImage {
+    const decoded = try image.decode(allocator, bytes);
+    defer decoded.deinit(allocator);
+    const cfg = try parseConfig(metadata);
+    return prepareImagePixels(allocator, cfg, .{ .data = decoded.data, .width = decoded.width, .height = decoded.height, .format = .rgb8 }, targetGeometry(cfg, decoded.width, decoded.height), false);
+}
+
+fn prepareImagePixels(allocator: std.mem.Allocator, cfg: Config, decoded: image.ImageU8, geometry: Geometry, huggingface: bool) !PreparedImage {
     const pixel_values = try image.preprocessImageViewRectScaledWithResample(
         allocator,
         decoded,
@@ -3162,7 +3311,7 @@ fn prepareImageViewAtGeometry(allocator: std.mem.Allocator, store: *ProjectorWei
         cfg.image_mean,
         cfg.image_std,
         1.0 / 255.0,
-        if (store.gguf == null) .torchvision_bicubic else .bilinear,
+        if (huggingface) .torchvision_bicubic else .bilinear,
     );
     return .{ .allocator = allocator, .pixels = pixel_values, .geometry = geometry };
 }
@@ -4919,7 +5068,7 @@ fn projectorConv2dWeightCt(
         in_channels: usize,
         out_channels: usize,
         fn call(self: @This()) !CT {
-            if (self.store.gguf == null) {
+            if (self.store.gguf == null or self.store.require_resident_weights) {
                 const tensor = try self.store.weightCt(self.name);
                 errdefer self.cb.free(tensor);
                 if (!(try self.cb.tensorShapeMatches(tensor, &.{ @intCast(self.out_channels), @intCast(self.in_channels), @intCast(self.kernel_h), @intCast(self.kernel_w) }) orelse false)) return error.InvalidTensorShape;

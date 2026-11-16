@@ -305,6 +305,7 @@ pub const TracingCompute = struct {
         .gluRows = &gluRowsOp,
         .clampScalar = &clampScalarOp,
         .depthwiseCausalConv1d = &depthwiseCausalOp,
+        .depthwiseGatedDelta = &depthwiseGatedDeltaOp,
         .regions = .{ .audio_attention = .{ .localRelative = &localRelativeOp } },
         .rope = &ropeOp,
         .ropePerItem = &ropePerItemOp,
@@ -550,8 +551,19 @@ pub const TracingCompute = struct {
         const shape = tc.graph.node(nodeIdFromCT(yes)).output_shape;
         const no_shape = tc.graph.node(nodeIdFromCT(no)).output_shape;
         const predicate = tc.graph.node(nodeIdFromCT(condition)).output_shape;
-        if (!shape.eq(no_shape) or !std.mem.eql(i64, shape.dims[0..shape.rank()], predicate.dims[0..predicate.rank()])) return error.UnsupportedSelectionBroadcast;
-        return tc.makeHandle(try tc.graph.addNode(.{ .op = .{ .where_select = {} }, .output_shape = shape, .inputs = .{ nodeIdFromCT(condition), nodeIdFromCT(yes), nodeIdFromCT(no), null_node }, .num_inputs = 3 }));
+        if (shape.dtype != no_shape.dtype) return error.UnsupportedSelectionBroadcast;
+        const rank = @max(@max(shape.rank(), no_shape.rank()), predicate.rank());
+        var dimensions: [8]i64 = @splat(1);
+        for ([_]Shape{ shape, no_shape, predicate }) |source| {
+            for (0..source.rank()) |axis| {
+                const size = source.dim(@intCast(axis));
+                const output_axis = rank - source.rank() + axis;
+                if (size < 0 or (size != dimensions[output_axis] and size != 1 and dimensions[output_axis] != 1)) return error.UnsupportedSelectionBroadcast;
+                if (dimensions[output_axis] == 1) dimensions[output_axis] = size;
+            }
+        }
+        const result_shape = Shape.init(shape.dtype, dimensions[0..rank]);
+        return tc.makeHandle(try tc.graph.addNode(.{ .op = .{ .where_select = {} }, .output_shape = result_shape, .inputs = .{ nodeIdFromCT(condition), nodeIdFromCT(yes), nodeIdFromCT(no), null_node }, .num_inputs = 3 }));
     }
 
     fn fromInt32ShapeOp(ctx: *anyopaque, data: []const i32, dims: []const i32) anyerror!?CT {
@@ -1160,6 +1172,7 @@ pub const TracingCompute = struct {
         // Paged attention records the same as GQA causal with the query
         // sequence length from the attention context.
         const tc = fromCtx(ctx);
+        if (attention.attn_or_mask != null) return tc.makeHandle(try @import("masked_grouped_attention.zig").emit(&tc.graph, nodeIdFromCT(Q), nodeIdFromCT(K), nodeIdFromCT(V), if (attn_bias) |bias| nodeIdFromCT(bias) else null, attention, batch, num_heads, num_kv_heads, head_dim));
         const q_id = nodeIdFromCT(Q);
         const out_shape = tc.graph.node(q_id).output_shape;
         var inputs: [4]NodeId = .{ q_id, nodeIdFromCT(K), nodeIdFromCT(V), null_node };
@@ -1405,6 +1418,12 @@ pub const TracingCompute = struct {
     fn depthwiseCausalOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, dim: usize, kernel: usize) anyerror!?CT {
         const tc = fromCtx(ctx);
         return tc.makeHandle(try @import("temporal_program.zig").depthwiseCausal(&tc.graph, nodeIdFromCT(input), nodeIdFromCT(weight), rows, dim, kernel));
+    }
+    fn depthwiseGatedDeltaOp(ctx: *anyopaque, request: *const ops.DepthwiseGatedDeltaRequest) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var nodes: [8]NodeId = undefined;
+        inline for (.{ "mixed", "z", "beta", "a", "conv_weight", "a_log", "dt_bias", "norm_weight" }, 0..) |field, i| nodes[i] = nodeIdFromCT(@field(request, field));
+        return tc.makeHandleExact(try @import("gated_delta_program.zig").emit(&tc.graph, nodes, request.geometry, request.kernel, request.eps));
     }
     fn localRelativeOp(ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, scales: CT, valid: CT, params: ops.Gemma4AudioLocalAttentionParams) anyerror!?CT {
         const tc = fromCtx(ctx);

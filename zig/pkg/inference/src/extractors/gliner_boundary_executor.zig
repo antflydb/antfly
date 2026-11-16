@@ -47,6 +47,9 @@ pub const ItemExecution = struct {
 };
 
 pub const Options = struct {
+    /// A real compiled session owns every encoder/head stage. Native callers
+    /// leave this null and retain their qualified eager program.
+    compiled_session: ?@import("../backends/session.zig").Session = null,
     /// Synchronous row consumer for independent broker callers. It owns
     /// serialization failures locally; the executor never builds a combined
     /// response when this sink is installed.
@@ -234,6 +237,10 @@ pub fn execute(cb: *const compute.ComputeBackend, allocator: Allocator, config: 
 /// Serving admission verifies the exact live artifact and complete feature union.
 /// Model/backend geometry and work budgets are planned before learned operations.
 pub fn executeQualified(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) ![]u8 {
+    // Native release rows cannot attest a compiled provider. The offline task
+    // path qualifies its real stages before a separate provider row is added.
+    if (options.compiled_session != null) return error.UnsupportedGlinerBoundaryRuntime;
+
     if (options.control) |control| try control.check();
     try cb.checkExecutionControl();
     if (cb.kind() != .native and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
@@ -490,6 +497,14 @@ fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, confi
 }
 
 fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options, gate: ?*qualification.Admission) ![]u8 {
+    if (options.compiled_session) |session| {
+        if (session.backend() != .pjrt) return error.UnsupportedGlinerBoundaryBackend;
+        if (options.identity) |expected| {
+            const actual = try @import("../architectures/session_factory.zig").getGlinerBoundaryIdentity(session);
+            if (!std.mem.eql(u8, &expected.fingerprint(), &actual.fingerprint())) return error.GlinerBoundaryArtifactMismatch;
+        }
+    }
+
     if (cb.kind() != .native and cb.kind() != .wasm and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     if (cb.kind() != .native and options.identity == null) return error.MissingGlinerBoundaryIdentity;
     if (options.identity) |identity| if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
@@ -524,6 +539,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             pipeline_options.control = options.control;
             pipeline_options.max_output_values = remaining_values;
             const long_options = long_executor.Options{
+                .compiled_session = options.compiled_session,
                 .preparations = options.preparations,
                 .identity = options.identity orelse return error.MissingGlinerBoundaryIdentity,
                 .processor = item.options.preprocessing(options.processor),
@@ -583,7 +599,9 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             row_check = .{ .sink = sink, .first = index };
             pipeline_options.independent_rows = .{ .errors = row_errors[0..prepared.samples.len], .context = &row_check, .check_fn = RowCheck.check };
         }
-        var result = switch (cb.kind()) {
+        var result = if (options.compiled_session) |session|
+            try @import("../execution/boundary_program_execution.zig").run(session, allocator, config, &prepared, schemas, pipeline_options, engine_options)
+        else switch (cb.kind()) {
             .native, .wasm => native: {
                 var encoded = try engine.encodeNative(cb, allocator, config, &prepared, engine_options);
                 defer encoded.deinit();

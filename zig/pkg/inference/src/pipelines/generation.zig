@@ -705,6 +705,14 @@ pub const ChatTemplate = struct {
                     };
                 }
                 parts = chat_parts;
+            } else if (m.video_bytes == null and (m.hasImages() or m.hasAudio())) {
+                const images = m.image_bytes orelse &.{};
+                const clips = m.audio_bytes orelse &.{};
+                const chat_parts = try arena.alloc(jinja.ChatContentPart, images.len + clips.len + 1);
+                for (chat_parts[0..images.len]) |*part| part.* = .image;
+                for (chat_parts[images.len..][0..clips.len]) |*part| part.* = .audio;
+                chat_parts[chat_parts.len - 1] = .{ .text = m.content };
+                parts = chat_parts;
             }
             chat_msgs[i] = .{
                 .role = m.role,
@@ -2603,6 +2611,7 @@ pub const NativeGenerationPipeline = struct {
     io: ?std.Io = null,
     cb: ComputeBackend,
     session: ?backends.Session = null,
+    compiled_media_prefix: ?*@import("../execution/media_prefix.zig").Prefix = null,
     /// Optional observation-only model capability; never changes provider,
     /// compiled graph, residency, numerical policy or Session attribution.
     diagnostics_binding: ?@import("../execution/invocation_observation.zig").Binding = null,
@@ -2995,6 +3004,13 @@ pub const NativeGenerationPipeline = struct {
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
     ) !GenerationResult {
+        var compiled_prefix: ?@import("../execution/media_prefix.zig").Prefix = null;
+        const previous_compiled_prefix = self.compiled_media_prefix;
+        self.compiled_media_prefix = null;
+        defer {
+            self.compiled_media_prefix = previous_compiled_prefix;
+            if (compiled_prefix) |*prefix| prefix.deinit(self.allocator);
+        }
         defer if (self.native_prefix_binding) |*binding| binding.deinit();
         try validateKvCachePolicy(config);
         const native_checkpoint = self.checkpoint_prepare != null or self.checkpoint_resume != null;
@@ -3365,7 +3381,7 @@ pub const NativeGenerationPipeline = struct {
                     const projector = self.projector_store orelse request_projector.?;
                     var projected_video = if (video_bytes) |bytes| try gemma4_video.encode(&self.cb, .{ .session = self.session, .run_budget = self.media_run_budget, .explicit_scratch_limit = self.explicit_scratch_limit }, allocator, projector, bytes) else null;
                     defer if (projected_video) |*video| video.deinit();
-                    var projected_images = try gemma4_projector.PromptImageInput.begin(&self.cb, allocator, projector, images);
+                    var projected_images = if (self.usesPjrtSession() and images.len != 0) gemma4_projector.PromptImageInput{ .backend = &self.cb, .allocator = allocator, .projector = projector, .images = images, .data = .{ .host = try @import("../execution/media_projection.zig").companionImages(self.session.?, allocator, images, self.execution_control) } } else try gemma4_projector.PromptImageInput.begin(&self.cb, allocator, projector, images);
                     defer projected_images.deinit();
                     const video_prompt = if (projected_video) |*video| try gemma4_mm.expandVideoPromptText(allocator, prompt, video.timestamps_us) else null;
                     defer if (video_prompt) |text| allocator.free(text);
@@ -3373,7 +3389,7 @@ pub const NativeGenerationPipeline = struct {
                     defer projected_images.releaseHost();
                     const image_rows: ?decoder_prefill.ProjectedInputRows = if (projected_video) |*video| video.images.promptRows() else try projected_images.rows();
                     var projected_audio = if (audio_clips.len > 0)
-                        try gemma4_projector.encodeProjectedAudioInputs(&self.cb, allocator, projector, audio_clips)
+                        (if (self.usesPjrtSession()) try @import("../execution/media_projection.zig").companionAudio(self.session.?, allocator, audio_clips, self.execution_control) else try gemma4_projector.encodeProjectedAudioInputs(&self.cb, allocator, projector, audio_clips))
                     else
                         null;
                     defer if (projected_audio) |*projected| projected.deinit();
@@ -3412,7 +3428,7 @@ pub const NativeGenerationPipeline = struct {
                 if (!self.gpt_config.isMultimodal()) return error.InvalidModelForGeneration;
                 const model_dir = self.model_dir orelse return error.MissingModelDirForMultimodal;
                 if (self.gpt_config.family == .qwen3_vl or self.gpt_config.hasQwen35VisionArchitectureContract()) {
-                    if (!decode_state.isPaged()) return error.InvalidModelForGeneration;
+                    if (!decode_state.isPaged() and !self.usesPjrtSession()) return error.InvalidModelForGeneration;
                     if (images.len == 0 or images.len > 8) return error.ImageLimitExceeded;
                     const per_image_budget = expanded_prompt_token_limit / images.len;
                     var vision_limits = try qwenVisionLimits(allocator, model_dir, self.gpt_config);
@@ -3650,7 +3666,18 @@ pub const NativeGenerationPipeline = struct {
         try setWorkloadProfileRegime(&self.cb, .prefill);
         const allow_prefill_greedy_token = !use_speculative or (use_speculative and draft_is_gemma4_mtp);
         const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
-        const prefill_output = if (self.checkpoint_resume) |request|
+        if (self.usesPjrtSession()) {
+            if (prepared_qwen3vl_prompt) |*prepared| {
+                if (prepared.deepstack_layer_count != 0) return error.UnsupportedResidentQwenVision;
+                compiled_prefix = try self.compileMediaPrefix(prepared.input_embeddings orelse return error.InvalidPreparedPrompt, prepared.token_ids.len, null, prepared.plan.mrope_positions, prepared.plan.mrope_position_delta, null);
+            } else if (prepared_multimodal_prompt) |*prepared| {
+                compiled_prefix = try self.compileMediaPrefix(prepared.input_embeddings orelse return error.InvalidPreparedPrompt, prepared.token_ids.len, prepared.ple_token_ids, null, 0, prepared.attn_or_mask);
+            }
+            if (compiled_prefix) |*prefix| self.compiled_media_prefix = prefix;
+        }
+        const prefill_output = if (self.compiled_media_prefix) |prefix|
+            PrefillOutput{ .last_logits = try prefix.run(self.session.?, token_ids[0..seq_len], allocator, self.execution_control) }
+        else if (self.checkpoint_resume) |request|
             try self.resumeNativeCheckpoint(request, token_ids[0..seq_len], max_tokens, decode_state, config)
         else if (prepared_qwen3vl_prompt) |*prepared|
             try self.executePreparedQwen3VlPrefill(prepared, seq_len, decode_state, shouldUsePreparedQwenPrefillGreedyToken(
@@ -5537,7 +5564,7 @@ pub const NativeGenerationPipeline = struct {
                     break :blk .{ .token = scheduled.token orelse return error.InvalidBatchDecodeState, .grammar_complete = false };
                 }
                 const allow_direct_device_decode = !route_decode_through_scheduler;
-                if (!has_cached_prefill_logits and allow_direct_device_decode) {
+                if (!has_cached_prefill_logits and allow_direct_device_decode and self.compiled_media_prefix == null) {
                     const direct_token = direct_token_blk: {
                         // Above the batching rollout cap the scheduler emits
                         // singleton work, but direct device decode must still
@@ -5596,6 +5623,11 @@ pub const NativeGenerationPipeline = struct {
                             );
                             break :logits_blk cached;
                         }
+                    }
+
+                    if (self.compiled_media_prefix) |prefix| {
+                        owns_last_logits = true;
+                        break :logits_blk try prefix.run(self.session.?, token_ids[0..seq_len.*], self.allocator, self.execution_control);
                     }
 
                     if (self.scheduler) |scheduler| {
@@ -7920,7 +7952,27 @@ pub const NativeGenerationPipeline = struct {
 
     const MtpMaterializedDeviceActivation = decoder_forward.Runtime.MtpMaterializedDeviceActivation;
 
+    fn usesPjrtSession(self: *const NativeGenerationPipeline) bool {
+        return if (self.session) |session| session.backend() == .pjrt else false;
+    }
+
+    fn compileMediaPrefix(self: *NativeGenerationPipeline, tensor: ops.CT, rows: usize, ple: ?[]const i64, positions: ?[]const u32, delta: i64, mask: ?[]const u8) !@import("../execution/media_prefix.zig").Prefix {
+        var scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (scope) |*held| held.deinit();
+        const values = try self.cb.toFloat32(tensor, self.allocator);
+        var values_owned = true;
+        errdefer if (values_owned) self.allocator.free(values);
+        var prefix = @import("../execution/media_prefix.zig").Prefix{ .embeddings = try backends.Tensor.initFloat32Owned(self.allocator, "input_embeddings", &.{ 1, @intCast(rows), self.gpt_config.hidden_size }, values), .position_delta = delta };
+        values_owned = false;
+        errdefer prefix.deinit(self.allocator);
+        if (ple) |ids| prefix.ple_ids = try self.allocator.dupe(i64, ids);
+        if (positions) |ids| prefix.axis_positions = try self.allocator.dupe(u32, ids);
+        if (mask) |visibility| prefix.visibility = try self.allocator.dupe(u8, visibility);
+        return prefix;
+    }
+
     fn encodeResidentProjected(self: *NativeGenerationPipeline, allocator: std.mem.Allocator, images: []const []const u8, limits: qwen3vl_projector.Limits) !qwen3vl_projector.ProjectedImages {
+        if (self.usesPjrtSession()) return @import("../execution/media_projection.zig").patchImages(self.session.?, allocator, self.gpt_config, images, limits, self.execution_control);
         if (comptime build_options.enable_cuda) if (self.vision_publication) |publication| {
             const owner = self.execution_cleanup_owner orelse return error.MissingCurrentCleanupEpoch;
             const current = @import("../execution/cleanup_context.zig").Context{ .boundary = owner.epoch(), .operation = self.cb.operationToken() };
@@ -12939,6 +12991,12 @@ pub fn formatMessages(allocator: std.mem.Allocator, messages: []const Message) !
                 }
             }
         } else {
+            if (msg.image_bytes) |images| for (images) |_| {
+                try buf.appendSlice(allocator, "<start_of_image>");
+            };
+            if (msg.audio_bytes) |clips| for (clips) |_| {
+                try buf.appendSlice(allocator, "<|audio|>");
+            };
             try buf.appendSlice(allocator, msg.content);
         }
         try buf.appendSlice(allocator, "\n\n");
@@ -15825,4 +15883,17 @@ test "generation failure diagnostics retain active phase and bounded decode prog
     const line = try trace.format(&buffer, error.Timeout, 20 * std.time.ns_per_ms);
     for ([_][]const u8{ "error=Timeout", "phase=decode", "total_ms=20", "prompt_format_ms=3", "prefill_ms=10", "decode_ms=7", "decoded_tokens=17" }) |expected|
         try std.testing.expect(std.mem.indexOf(u8, line, expected) != null);
+}
+
+test "multimodal messages preserve implicit image and audio parts" {
+    const a = std.testing.allocator;
+    const messages = [_]Message{.{ .role = "user", .content = "describe", .image_bytes = &.{ "image-one", "image-two" }, .audio_bytes = &.{"audio-one"} }};
+    const fallback = try formatMessages(a, &messages);
+    defer a.free(fallback);
+    try std.testing.expectEqualStrings("User: <start_of_image><start_of_image><|audio|>describe\n\nAssistant: ", fallback);
+    var template = try ChatTemplate.init(a, "{% for m in messages %}{% for part in m.content %}{% if part.type == 'image' %}I{% elif part.type == 'audio' %}A{% else %}{{part.text}}{% endif %}{% endfor %}{% endfor %}", "", "", "", "");
+    defer template.deinit();
+    const actual = try template.applyWithOptions(a, &messages, .{});
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("IIAdescribe", actual);
 }

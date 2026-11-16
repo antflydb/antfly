@@ -1165,6 +1165,7 @@ pub fn supportsPjrt(op: OpCode) bool {
         .reduce_mean,
         .reduce_max,
         .fused_segment_attention,
+        .fused_gated_delta,
         .fused_gelu_exact,
         .fused_softmax,
         .fused_linear,

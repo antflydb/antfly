@@ -36738,7 +36738,8 @@ fn allowsFutureAttention(attn_or_mask: ?[]const u8, total_sequence_len: usize, q
 }
 
 fn allowsPastAttention(sliding_window: usize, query_pos: usize, key_pos: usize) bool {
-    if (key_pos > query_pos) return false;
+    // Future-key permission is checked independently by the causal/block mask.
+    if (key_pos > query_pos) return true;
     if (sliding_window == 0) return true;
     return query_pos - key_pos < sliding_window;
 }

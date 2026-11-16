@@ -55,6 +55,92 @@ const LoadedWeight = @import("../models/weight_source.zig").LoadedWeight;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
+test "PJRT gated delta compact loop preserves reset and changed runtime inputs" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var client = try initClient();
+    defer client.deinit();
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const rows = 7;
+    const heads = 2;
+    const key = 3;
+    const value = 4;
+    const channels = 2 * key + heads * value;
+    const mixed = try builder.parameter("mixed", Shape.init(.f32, &.{ rows, channels }));
+    const beta = try builder.parameter("beta", Shape.init(.f32, &.{ rows, heads }));
+    const decay = try builder.parameter("decay", Shape.init(.f32, &.{ rows, heads }));
+    const output = try graph.addNode(.{ .op = .{ .fused_gated_delta = .{ .rows = rows, .key_heads = 1, .value_heads = heads, .key_dim = key, .value_dim = value } }, .output_shape = Shape.init(.f32, &.{ rows, heads * value }), .inputs = .{ mixed, beta, decay, ml.graph.null_node }, .num_inputs = 3 });
+    try graph.markOutput(output);
+    const second = try graph.addNode(graph.node(output).*);
+    try graph.markOutput(second);
+    const ids = [_]NodeId{ output, second };
+    const inputs = [_]partition_mod.ExternalInput{ .{ .node_id = mixed, .source_partition = 0 }, .{ .node_id = beta, .source_partition = 0 }, .{ .node_id = decay, .source_partition = 0 } };
+    const part = Partition{ .backend = .pjrt, .node_ids = &ids, .external_inputs = &inputs };
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var executable = try pjrt_executor.createExecutor(a, &graph, &part, &cb, &cb, &client);
+    defer executable.partitionExecutor().deinitExecutor();
+    var source: [rows * channels]f32 = undefined;
+    var betas: [rows * heads]f32 = undefined;
+    var decays: [rows * heads]f32 = undefined;
+    for (0..3) |round| {
+        for (&source, 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + round * 13) % 37)) - 18)) / 19;
+        for (&betas, &decays, 0..) |*b, *d, i| {
+            b.* = 0.1 + @as(f32, @floatFromInt((i + round) % 7)) / 10;
+            d.* = 0.7 + @as(f32, @floatFromInt((i + round) % 5)) / 20;
+        }
+        var expected: [rows * heads * value]f32 = undefined;
+        var state: [heads][key][value]f32 = @splat(@splat(@splat(0)));
+        for (0..rows) |t| for (0..heads) |h| {
+            const row = source[t * channels ..][0..channels];
+            var q: [key]f32 = undefined;
+            var k: [key]f32 = undefined;
+            var q_sum: f32 = 0;
+            var k_sum: f32 = 0;
+            for (0..key) |i| {
+                q_sum += row[i] * row[i];
+                k_sum += row[key + i] * row[key + i];
+            }
+            for (0..key) |i| {
+                q[i] = row[i] / @sqrt(q_sum + 1e-6) / @sqrt(@as(f32, key));
+                k[i] = row[key + i] / @sqrt(k_sum + 1e-6);
+            }
+            for (0..value) |col| {
+                var memory: f32 = 0;
+                for (0..key) |i| {
+                    state[h][i][col] *= decays[t * heads + h];
+                    memory += state[h][i][col] * k[i];
+                }
+                const delta = (row[2 * key + h * value + col] - memory) * betas[t * heads + h];
+                var out: f32 = 0;
+                for (0..key) |i| {
+                    state[h][i][col] += k[i] * delta;
+                    out += state[h][i][col] * q[i];
+                }
+                expected[(t * heads + h) * value + col] = out;
+            }
+        };
+        var values: [5]?CT = @splat(null);
+        defer for (values) |tensor| if (tensor) |x| cb.free(x);
+        values[mixed] = try cb.fromFloat32Shape(&source, &.{ rows, channels });
+        values[beta] = try cb.fromFloat32Shape(&betas, &.{ rows, heads });
+        values[decay] = try cb.fromFloat32Shape(&decays, &.{ rows, heads });
+        var devices: [5]device_mesh_mod.DeviceId = @splat(0);
+        try executable.partitionExecutor().execute(&values, &devices, &ids, 0, .{});
+        const actual = try cb.toFloat32(values[output].?, a);
+        defer a.free(actual);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-5);
+        const other = try cb.toFloat32(values[second].?, a);
+        defer a.free(other);
+        for (expected, other) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-5);
+    }
+}
+
 fn initClient() !pjrt_lib.pjrt.Client {
     return pjrt_lib.pjrt.Client.initFromEnv(std.testing.allocator) catch |err| switch (err) {
         error.PjrtPluginNotFound => error.SkipZigTest,

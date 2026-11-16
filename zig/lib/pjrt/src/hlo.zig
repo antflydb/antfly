@@ -134,6 +134,7 @@ pub const Builder = struct {
         operand_ids: []const Id,
         // Op-specific payloads (null if unused):
         parameter_number: ?u32 = null,
+        tuple_index: ?u32 = null,
         dot_dimension_numbers: ?DotDimensionNumbers = null,
         convolution: ?Convolution = null,
         strict_float32: bool = false,
@@ -769,6 +770,46 @@ pub const Builder = struct {
         });
     }
 
+    /// Loop-carried arrays use one flat tuple. Child dimensions are borrowed
+    /// from live instructions until module serialization, like tuple().
+    pub fn tupleParameter(self: *Builder, number: u32, shapes: []const Shape) !Id {
+        return self.addInst(.{ .id = self.nextId(), .opcode = "parameter", .name = "state", .shape = Shape.scalar(.f32), .operand_ids = &.{}, .parameter_number = number, .is_tuple_root = true, .tuple_child_shapes = shapes });
+    }
+
+    pub fn tupleElement(self: *Builder, operand: Id, index: u32) !Id {
+        const children = self.getInst(operand).tuple_child_shapes orelse return error.UnsupportedShape;
+        if (index >= children.len) return error.UnsupportedShape;
+        return self.addInst(.{ .id = self.nextId(), .opcode = "get-tuple-element", .name = "state_element", .shape = children[index], .operand_ids = &.{operand}, .tuple_index = index });
+    }
+
+    pub fn whileLoop(self: *Builder, initial: Id, condition: Id, body: Id) !Id {
+        const children = self.getInst(initial).tuple_child_shapes orelse return error.UnsupportedShape;
+        // XLA's wire ABI orders body before condition.
+        return self.addInst(.{ .id = self.nextId(), .opcode = "while", .name = "scan", .shape = Shape.scalar(.f32), .operand_ids = &.{initial}, .is_tuple_root = true, .tuple_child_shapes = children, .called_computation_ids = &.{ body, condition } });
+    }
+
+    pub fn dynamicSlice(self: *Builder, operand: Id, starts: []const Id, sizes: []const i64) !Id {
+        const shape = self.getInst(operand).shape;
+        if (starts.len != shape.dimensions.len or sizes.len != starts.len or starts.len > 8) return error.UnsupportedShape;
+        var operands: [9]Id = undefined;
+        operands[0] = operand;
+        @memcpy(operands[1..][0..starts.len], starts);
+        for (sizes, shape.dimensions) |size, bound| if (size <= 0 or size > bound) return error.UnsupportedShape;
+        return self.addInst(.{ .id = self.nextId(), .opcode = "dynamic-slice", .name = "scan_row", .shape = Shape.init(shape.element_type, sizes), .operand_ids = operands[0 .. 1 + starts.len], .dimensions = sizes });
+    }
+
+    pub fn dynamicUpdateSlice(self: *Builder, operand: Id, update: Id, starts: []const Id) !Id {
+        const shape = self.getInst(operand).shape;
+        const patch = self.getInst(update).shape;
+        if (starts.len != shape.dimensions.len or starts.len != patch.dimensions.len or starts.len > 8 or shape.element_type != patch.element_type) return error.UnsupportedShape;
+        var operands: [10]Id = undefined;
+        operands[0] = operand;
+        operands[1] = update;
+        @memcpy(operands[2..][0..starts.len], starts);
+        for (patch.dimensions, shape.dimensions) |size, bound| if (size <= 0 or size > bound) return error.UnsupportedShape;
+        return self.addInst(.{ .id = self.nextId(), .opcode = "dynamic-update-slice", .name = "scan_publish", .shape = shape, .operand_ids = operands[0 .. 2 + starts.len] });
+    }
+
     // ── Select ──────────────────────────────────────────────────────
 
     pub fn select(self: *Builder, pred: Id, on_true: Id, on_false: Id) !Id {
@@ -1078,7 +1119,7 @@ fn buildInstructionProto(alloc: Allocator, inst: Builder.Instruction) !xla.HloIn
         proto.operand_ids = try idsToI64s(alloc, inst.operand_ids);
     }
     if (inst.dimensions) |dims| {
-        proto.dimensions = try alloc.dupe(i64, dims);
+        if (std.mem.eql(u8, inst.opcode, "dynamic-slice")) proto.dynamic_slice_sizes = try alloc.dupe(i64, dims) else proto.dimensions = try alloc.dupe(i64, dims);
     }
     if (inst.dot_dimension_numbers) |dot_dims| {
         proto.dot_dimension_numbers = try buildDotDimensionNumbers(alloc, dot_dims);
@@ -1121,6 +1162,7 @@ fn buildInstructionProto(alloc: Allocator, inst: Builder.Instruction) !xla.HloIn
     if (inst.parameter_number) |pn| {
         proto.parameter_number = @intCast(pn);
     }
+    if (inst.tuple_index) |index| proto.tuple_index = index;
     if (inst.called_computation_ids) |comp_ids| {
         proto.called_computation_ids = try idsToI64s(alloc, comp_ids);
     }
@@ -1154,7 +1196,7 @@ fn buildProgramShapeProto(alloc: Allocator, comp: Computation) !xla.ProgramShape
         var names_written: usize = 0;
         for (comp.instructions) |inst| {
             if (inst.parameter_number == null) continue;
-            params[written] = try buildShapeProto(alloc, inst.shape);
+            params[written] = try buildInstructionShapeProto(alloc, inst);
             written += 1;
             // Borrow: Builder owns inst.name for the lifetime of serialization.
             names[names_written] = inst.name;
@@ -1227,10 +1269,77 @@ fn buildModuleProto(alloc: Allocator, module: Module) !xla.HloModuleProto {
     proto.computations = comps;
 
     proto.host_program_shape = try buildProgramShapeProto(alloc, module.entry);
+    try compactWireIds(alloc, &proto);
     return proto;
 }
 
+/// Builder-local IDs reserve disjoint ranges for auxiliary computations.
+/// XLA import indexes metadata by the maximum instruction ID; serialize a
+/// dense module namespace so import memory is O(instructions), not O(ranges).
+fn compactWireIds(alloc: Allocator, module: *xla.HloModuleProto) !void {
+    var computations: std.AutoHashMapUnmanaged(i64, i64) = .empty;
+    defer computations.deinit(alloc);
+    for (module.computations, 0..) |comp, i| {
+        const slot = try computations.getOrPut(alloc, comp.id);
+        if (slot.found_existing) return error.DuplicateComputationId;
+        slot.value_ptr.* = @intCast(i + 1);
+    }
+    module.entry_computation_id = computations.get(module.entry_computation_id) orelse return error.MissingComputation;
+    module.id = 1;
+    var next: i64 = 1;
+    for (module.computations) |*comp| {
+        var instructions: std.AutoHashMapUnmanaged(i64, i64) = .empty;
+        defer instructions.deinit(alloc);
+        for (comp.instructions) |inst| {
+            const slot = try instructions.getOrPut(alloc, inst.id);
+            if (slot.found_existing) return error.DuplicateInstructionId;
+            slot.value_ptr.* = next;
+            next = try std.math.add(i64, next, 1);
+        }
+        comp.id = computations.get(comp.id) orelse return error.MissingComputation;
+        comp.root_id = instructions.get(comp.root_id) orelse return error.MissingInstruction;
+        for (comp.instructions) |*inst| {
+            inst.id = instructions.get(inst.id) orelse return error.MissingInstruction;
+            const operands: []i64 = @constCast(inst.operand_ids);
+            for (operands) |*id| id.* = instructions.get(id.*) orelse return error.MissingInstruction;
+            const callees: []i64 = @constCast(inst.called_computation_ids);
+            for (callees) |*id| id.* = computations.get(id.*) orelse return error.MissingComputation;
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
+
+test "wire IDs stay dense across sparse tuple loop computations" {
+    const a = std.testing.allocator;
+    var entry = Builder.init(a, "entry");
+    defer entry.deinit();
+    const initial = try entry.tuple(&.{try entry.constantS32(Shape.scalar(.s32), &.{0})});
+    var condition = Builder.init(a, "condition");
+    defer condition.deinit();
+    condition.next_id = 1_000_000_001;
+    condition.base_id = condition.next_id;
+    const cs = try condition.tupleParameter(0, entry.getInst(initial).tuple_child_shapes.?);
+    _ = try condition.lessThan(try condition.tupleElement(cs, 0), try condition.constantS32(Shape.scalar(.s32), &.{3}));
+    var body = Builder.init(a, "body");
+    defer body.deinit();
+    body.next_id = 2_000_000_001;
+    body.base_id = body.next_id;
+    const bs = try body.tupleParameter(0, entry.getInst(initial).tuple_child_shapes.?);
+    _ = try body.tuple(&.{try body.add(try body.tupleElement(bs, 0), try body.constantS32(Shape.scalar(.s32), &.{1}))});
+    const loop = try entry.whileLoop(initial, condition.build().id, body.build().id);
+    _ = try entry.tupleElement(loop, 0);
+    var proto = try buildModuleProto(a, Module.initWithAux("loop", entry.build(), &.{ condition.build(), body.build() }));
+    defer proto.deinit(a);
+    var count: i64 = 0;
+    for (proto.computations) |comp| for (comp.instructions) |inst| {
+        count += 1;
+        try std.testing.expectEqual(count, inst.id);
+        if (std.mem.eql(u8, inst.opcode, "while")) try std.testing.expectEqualSlices(i64, &.{ 2, 1 }, inst.called_computation_ids);
+    };
+    try std.testing.expectEqual(@as(i64, 3), proto.entry_computation_id);
+    try std.testing.expect(count < 30);
+}
 
 test "build and serialize simple add" {
     const alloc = std.testing.allocator;

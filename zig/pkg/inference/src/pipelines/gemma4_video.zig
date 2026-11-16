@@ -330,6 +330,7 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
         .pool = &pool,
         .inspection_scope = &inspection,
     }) catch |err| return inputError(err);
+    if (admission.session) |session| if (session.backend() == .pjrt) return @import("../execution/media_projection.zig").companionVideoFrames(session, cb, a, frames.prepared, timestamps, control);
     return frames.project(timestamps);
 }
 

@@ -202,6 +202,23 @@ pub const TensorStore = struct {
         return result;
     }
 
+    /// Optional auxiliary checkpoint inventory. The default weight source
+    /// keeps its existing primary namespace; compiled media stages explicitly
+    /// register these operands under the same source/storage lifetime.
+    pub fn auxiliaryTensorNames(self: TensorStore, allocator: std.mem.Allocator) !?[][]const u8 {
+        if (self.vtable != &CompositeProjectorStore.vtable) return null;
+        const owner: *CompositeProjectorStore = @ptrCast(@alignCast(self.ptr));
+        return try ggufListNames(owner.projector, allocator);
+    }
+
+    /// Borrowed companion metadata. Numerical operands still enter through
+    /// the registered weight source and its ordinary acquisition controls.
+    pub fn auxiliaryGgufStore(self: TensorStore) ?*GgufStore {
+        if (self.vtable != &CompositeProjectorStore.vtable) return null;
+        const owner: *CompositeProjectorStore = @ptrCast(@alignCast(self.ptr));
+        return owner.projector;
+    }
+
     pub fn kind(self: TensorStore) StoreKind {
         return self.vtable.kind(self.ptr);
     }
@@ -1395,7 +1412,7 @@ pub const CompositeProjectorStore = struct {
     }
 
     fn hasProjectorTensor(self: *CompositeProjectorStore, name: []const u8) bool {
-        if (!isProjectorAudioName(name)) return false;
+        if (gguf_mod.tensor_catalog.Catalog.init(&self.primary.parsed).find(name) != null) return false;
         return gguf_mod.tensor_catalog.Catalog.init(&self.projector.parsed).find(name) != null;
     }
 
@@ -1833,8 +1850,14 @@ test "open gguf checkpoint with its gemma4 audio projector from manifest" {
     var primary_loaded = try store.loadTensorRef(&primary_ref);
     defer primary_loaded.deinit();
     try std.testing.expectEqualSlices(f32, &[_]f32{ 1.0, 2.0 }, primary_loaded.tensor.asFloat32());
-    // Vision tensors are not routed to the projector.
-    try std.testing.expectError(error.TensorNotFound, store.describeTensor(allocator, "v.blk.0.attn_q.weight"));
+    const auxiliary = (try store.auxiliaryTensorNames(allocator)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(auxiliary);
+    try std.testing.expectEqual(@as(usize, 2), auxiliary.len);
+    var vision_ref = try store.describeTensor(allocator, "v.blk.0.attn_q.weight");
+    defer vision_ref.deinit(allocator);
+    var vision = try store.loadTensorRef(&vision_ref);
+    defer vision.deinit();
+    try std.testing.expectEqual(@as(usize, 2), vision.tensor.asFloat32().len);
 
     // A plain checkpoint store is not a projector composite.
     var plain_manifest = manifest_mod.ModelManifest{

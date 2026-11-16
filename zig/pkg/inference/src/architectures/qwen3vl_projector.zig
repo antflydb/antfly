@@ -1700,6 +1700,96 @@ fn encodeSingleImage(
     return encodePreparedSingleImage(cb, allocator, weights, cfg, &prepared, limits, collect_preprocess_evidence, publication);
 }
 
+/// Validate the already selected spatial grid without resizing it again.
+pub fn patchTensorGeometry(config: gpt_config.Config, grid: []const i64) !Geometry {
+    const cfg = try configFromResidentModel(config);
+    if (cfg.deepstack_len != 0) return error.UnsupportedResidentQwenVision;
+    if (grid.len != 2 or grid[0] <= 0 or grid[1] <= 0) return error.InvalidInputShape;
+    const y = std.math.cast(usize, grid[0]) orelse return error.InvalidInputShape;
+    const x = std.math.cast(usize, grid[1]) orelse return error.InvalidInputShape;
+    if (y % cfg.spatial_merge != 0 or x % cfg.spatial_merge != 0) return error.InvalidInputShape;
+    const count = std.math.mul(usize, x, y) catch return error.VisionAdmissionExceeded;
+    if (count / (cfg.spatial_merge * cfg.spatial_merge) > 576) return error.VisionAdmissionExceeded;
+    return .{ .width = try std.math.mul(usize, x, cfg.patch_size), .height = try std.math.mul(usize, y, cfg.patch_size), .grid_x = x, .grid_y = y, .merged_x = x / cfg.spatial_merge, .merged_y = y / cfg.spatial_merge };
+}
+
+/// The same tower and merger as the native producer, with named weights and
+/// device-side positional interpolation. Still-frame temporal duplication is
+/// a layout operation, so the original Conv3D operand remains immutable.
+pub fn encodeNamedPatchTensorResident(cb: *const ComputeBackend, a: std.mem.Allocator, config: gpt_config.Config, patches: CT, geometry: Geometry) !CT {
+    const cfg = try configFromResidentModel(config);
+    if (cfg.deepstack_len != 0) return error.UnsupportedResidentQwenVision;
+    var weights = WeightCache{ .allocator = a, .cb = cb, .source = .{ .resident = cfg } };
+    defer weights.deinit();
+    const count = geometry.patchCount();
+    const area = cfg.patch_size * cfg.patch_size;
+    const shaped = try cb.primReshape(patches, &.{ @intCast(count), 3, 1, @intCast(area) });
+    defer cb.free(shaped);
+    const duplicate = try cb.primConcatPrim(shaped, shaped, 2, &.{ @intCast(count), 3, 1, @intCast(area) }, &.{ @intCast(count), 3, 1, @intCast(area) });
+    defer cb.free(duplicate);
+    const temporal = try cb.primReshape(duplicate, &.{ @intCast(count), @intCast(6 * area) });
+    defer cb.free(temporal);
+    const raw = (try weights.fullResidentPatch()) orelse return error.MissingWeight;
+    const matrix = try cb.primReshape(raw, &.{ @intCast(cfg.vision_hidden), @intCast(6 * area) });
+    defer cb.free(matrix);
+    const bias = try weights.weight("v.patch_embd.bias");
+    const embedded = try cb.linear(temporal, matrix, bias, count, 6 * area, cfg.vision_hidden);
+    defer cb.free(embedded);
+    const offsets = try interpolatedPositionTensor(cb, a, &weights, cfg, geometry);
+    defer cb.free(offsets);
+    var hidden = try cb.add(embedded, offsets);
+    defer cb.free(hidden);
+    const positions = try visionPositions(a, geometry, cfg.spatial_merge);
+    defer a.free(positions);
+    for (0..cfg.block_count) |layer| {
+        const next = try encoderBlock(cb, a, &weights, cfg, hidden, positions, count, layer, 1);
+        cb.free(hidden);
+        hidden = next;
+    }
+    const normalized = try layerNormNamed(cb, a, &weights, hidden, "v.post_ln", cfg.vision_hidden, cfg.layer_norm_eps);
+    defer cb.free(normalized);
+    return mergeProjectedNamed(cb, a, &weights, cfg, normalized, geometry, "mm.0", "mm.2");
+}
+
+fn interpolatedPositionTensor(cb: *const ComputeBackend, a: std.mem.Allocator, weights: *WeightCache, cfg: Config, geometry: Geometry) !CT {
+    const side = cfg.image_size / cfg.patch_size;
+    const count = geometry.patchCount();
+    const indices = try a.alloc(i64, count);
+    defer a.free(indices);
+    const coefficients = try a.alloc(f32, count);
+    defer a.free(coefficients);
+    const table = try weights.weight("v.position_embd.weight");
+    var output: ?CT = null;
+    errdefer if (output) |value| cb.free(value);
+    for (0..4) |corner| {
+        var token: usize = 0;
+        for (0..geometry.merged_y) |gy| for (0..geometry.merged_x) |gx| for (0..cfg.spatial_merge) |iy| for (0..cfg.spatial_merge) |ix| {
+            const fy = interpolationCoordinate(gy * cfg.spatial_merge + iy, geometry.grid_y, side);
+            const fx = interpolationCoordinate(gx * cfg.spatial_merge + ix, geometry.grid_x, side);
+            const y0: usize = @intFromFloat(@floor(fy));
+            const x0: usize = @intFromFloat(@floor(fx));
+            const wy = fy - @as(f32, @floatFromInt(y0));
+            const wx = fx - @as(f32, @floatFromInt(x0));
+            const right = corner % 2 != 0;
+            const bottom = corner >= 2;
+            indices[token] = @intCast((if (bottom) @min(y0 + 1, side - 1) else y0) * side + (if (right) @min(x0 + 1, side - 1) else x0));
+            coefficients[token] = (if (right) wx else 1 - wx) * (if (bottom) wy else 1 - wy);
+            token += 1;
+        };
+        const gathered = try cb.embeddingLookup(table, indices, count, cfg.vision_hidden);
+        defer cb.free(gathered);
+        const factors = try cb.fromFloat32Shape(coefficients, &.{ @intCast(count), 1 });
+        defer cb.free(factors);
+        const weighted = try cb.multiply(gathered, factors);
+        if (output) |previous| {
+            defer cb.free(previous);
+            defer cb.free(weighted);
+            output = try cb.add(previous, weighted);
+        } else output = weighted;
+    }
+    return output orelse error.InvalidPositionEmbeddingShape;
+}
+
 fn encodePreparedSingleImage(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,

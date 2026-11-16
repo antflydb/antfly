@@ -65,6 +65,7 @@ pub const Limits = struct {
     }
 };
 pub const Options = struct {
+    compiled_session: ?@import("../backends/session.zig").Session = null,
     preparations: ?*PreparationStore = null,
     identity: artifact.Identity,
     processor: processor.Options = .{},
@@ -947,7 +948,9 @@ fn encodeGroup(
     pipeline_options: pipeline.Options,
     control: ?Control,
     head_limits: head.Limits,
+    compiled_session: ?@import("../backends/session.zig").Session,
 ) !pipeline.WindowResult {
+    if (compiled_session) |session| return @import("../execution/boundary_program_execution.zig").runWindows(session, allocator, output_allocator, config, prepared, schemas, pipeline_options, engine_options);
     return switch (cb.kind()) {
         .native, .wasm => native: {
             var encoded = try engine.encodeNative(cb, allocator, config, prepared, engine_options);
@@ -1038,7 +1041,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
                 attempt_usage.attention > options.limits.max_total_attention_work.? - attention) return error.LongDocumentWorkLimitExceeded;
             encoded_tokens += attempt_usage.tokens;
             attention += attempt_usage.attention;
-            if (encodeGroup(cb, allocator, config, &prepared, engine_options, device_options, schemas, budget.allocator(), pipeline_options, options.control, options.pipeline.head_limits)) |value| {
+            if (encodeGroup(cb, allocator, config, &prepared, engine_options, device_options, schemas, budget.allocator(), pipeline_options, options.control, options.pipeline.head_limits, options.compiled_session)) |value| {
                 break :attempt value;
             } else |err| {
                 const classified = evidenceAllocationError(terminal, err);

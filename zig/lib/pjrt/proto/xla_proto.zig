@@ -170,6 +170,8 @@ pub const xla = struct {
         gather_slice_sizes: []const i64 = &.{},
         literal: ?LiteralProto = null,
         parameter_number: i64 = 0,
+        tuple_index: i64 = 0,
+        dynamic_slice_sizes: []const i64 = &.{},
         called_computation_ids: []const i64 = &.{},
         comparison_direction: []const u8 = "",
 
@@ -177,6 +179,7 @@ pub const xla = struct {
             self.shape.deinit(alloc);
             if (self.operand_ids.len > 0) alloc.free(self.operand_ids);
             if (self.dimensions.len > 0) alloc.free(self.dimensions);
+            if (self.dynamic_slice_sizes.len > 0) alloc.free(self.dynamic_slice_sizes);
             if (self.slice_dimensions.len > 0) alloc.free(self.slice_dimensions);
             if (self.dot_dimension_numbers) |*d| d.deinit(alloc);
             if (self.convolution_dimension_numbers) |*d| d.deinit(alloc);
@@ -356,6 +359,8 @@ fn encodeHloInstructionProto(alloc: Allocator, buf: *wire.Buf, value: xla.HloIns
     try encodeMessage(alloc, buf, 3, value.shape, encodeShapeProto);
     if (value.literal) |literal| try encodeMessage(alloc, buf, 8, literal, encodeLiteralProto);
     if (value.parameter_number != 0) try writeInt64(alloc, buf, 9, value.parameter_number);
+    if (value.tuple_index != 0) try writeInt64(alloc, buf, 13, value.tuple_index);
+    if (value.dynamic_slice_sizes.len > 0) try wire.writePackedInt64s(alloc, buf, 20, value.dynamic_slice_sizes);
     if (value.dimensions.len > 0) try wire.writePackedInt64s(alloc, buf, 14, value.dimensions);
     for (value.slice_dimensions) |dim| try encodeMessage(alloc, buf, 17, dim, encodeSliceDimensions);
     if (value.window) |window| try encodeMessage(alloc, buf, 15, window, encodeWindow);

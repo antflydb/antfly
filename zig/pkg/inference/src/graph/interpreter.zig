@@ -2737,6 +2737,19 @@ pub fn executeNode(
         },
 
         .fused_silu_backward, .fused_sigmoid_backward, .fused_prefix_scan_v1, .frozen_span_features_v1 => return error.UnsupportedPrimitiveOp,
+        .fused_gated_delta => |params| {
+            if (ins.len != 3) return error.InvalidInputShape;
+            const allocator = state.allocator orelse graph.allocator;
+            const mixed = try cb.toFloat32(V.get(ins[0]), allocator);
+            defer allocator.free(mixed);
+            const beta = try cb.toFloat32(V.get(ins[1]), allocator);
+            defer allocator.free(beta);
+            const decay = try cb.toFloat32(V.get(ins[2]), allocator);
+            defer allocator.free(decay);
+            const output = try @import("../ops/gated_delta_recurrence.zig").fullPrefix(allocator, mixed, beta, decay, params);
+            defer allocator.free(output);
+            return cb.fromFloat32Shape(output, &.{ @intCast(params.rows), @intCast(@as(usize, params.value_heads) * params.value_dim) });
+        },
         .fused_silu => {
             if (state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
                 if (try cb.unaryConsume(.silu, V.get(ins[0]))) |consumed| return consumed;

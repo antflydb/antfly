@@ -806,6 +806,17 @@ pub const SelectedTiedHeadAttrs = struct {
 // ── Node ───────────────────────────────────────────────────────────────
 
 /// Discriminated union of all ops in the graph IR.
+/// Zero-initialized full-sequence gated delta rule. Q/K are L2 normalized
+/// with epsilon 1e-6; query scaling follows normalization. Recurrence and
+/// publication accumulate in F32, independently of projection storage.
+pub const GatedDeltaAttrs = struct {
+    rows: u32,
+    key_heads: u32,
+    value_heads: u32,
+    key_dim: u32,
+    value_dim: u32,
+};
+
 pub const OpCode = union(enum) {
     // Primitives
     parameter: ParameterAttrs,
@@ -906,6 +917,7 @@ pub const OpCode = union(enum) {
     fused_from_float32: void,
     fused_to_float32: void,
     fused_zero_tensor: LinearAttrs,
+    fused_gated_delta: GatedDeltaAttrs,
     fused_eval_tensor: void,
     fused_argmax_last_row: ArgmaxAttrs,
     fused_softmax: SoftmaxAttrs,

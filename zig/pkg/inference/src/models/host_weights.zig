@@ -265,6 +265,7 @@ fn layaQ8Weight(allocator: std.mem.Allocator, store: tensor_store_mod.TensorStor
 /// would otherwise be lazy; ordinary execution retains its CPU policy.
 pub const HostPreparation = struct {
     intent: enum { execute, device_upload } = .execute,
+    include_auxiliary_tensors: bool = false,
 };
 
 /// Detect the model architecture from config.json.
@@ -2065,6 +2066,19 @@ pub fn prepare(allocator: std.mem.Allocator, model_path: []const u8, loaded_mode
         key_owned = false;
     }
 
+    if (preparation.include_auxiliary_tensors) {
+        if (try store.auxiliaryTensorNames(allocator)) |names| {
+            defer allocator.free(names);
+            for (names) |name| {
+                if (resident_weights.contains(name) or lazy_weights.contains(name)) return error.AuxiliaryWeightNameCollision;
+                var ref = try store.describeTensor(allocator, name);
+                errdefer ref.deinit(allocator);
+                const owned_name = try allocator.dupe(u8, name);
+                errdefer allocator.free(owned_name);
+                try lazy_weights.put(allocator, owned_name, .{ .tensor_ref = ref, .placement = runtime.tier.planner.planForContext(cpu_plan_context, name, ref.byte_len) });
+            }
+        }
+    }
     if (store.kind() != .gguf) {
         refineArchConfigFromWeights(&arch_config, &resident_weights);
     }

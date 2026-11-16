@@ -24,7 +24,11 @@ const Primitive = enum { norm_backward };
 
 const Options = struct {
     pjrt: @import("pjrt_options.zig").Options = .{},
+    extraction_request: ?[]const u8 = null,
     generate_text: ?[]const u8 = null,
+    generate_image: ?[]const u8 = null,
+    generate_audio: ?[]const u8 = null,
+    generate_video: ?[]const u8 = null,
     generate_tokens: usize = 8,
     primitive: ?Primitive = null,
     embedding_pool: ?inference.pipelines.embedding.PoolingStrategy = null,
@@ -88,8 +92,24 @@ pub fn main(init: std.process.Init) !void {
             options.transcribe_max_output_tokens = try std.fmt.parseInt(usize, value, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--extraction-request")) {
+            options.extraction_request = value;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--generate-text")) {
             options.generate_text = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--generate-image")) {
+            options.generate_image = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--generate-audio")) {
+            options.generate_audio = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--generate-video")) {
+            options.generate_video = value;
             continue;
         }
         if (std.mem.eql(u8, arg, "--generate-tokens")) {
@@ -101,6 +121,9 @@ pub fn main(init: std.process.Init) !void {
     if (options.generate_text != null and (options.generate_tokens == 0 or options.generate_tokens > 256 or options.batch != 1 or options.embedding_pool != null or options.primitive != null or options.resident or options.incremental_source or options.transcribe_audio.len != 0 or options.decoder_steps != 0 or options.soak_seconds != 0)) return error.InvalidGenerationGeometry;
     if (options.embedding_text != null and options.embedding_pool == null) return error.EmbeddingTextRequiresEmbeddingPool;
     if (options.embedding_text != null and (options.primitive != null or options.resident or options.incremental_source or options.transcribe_audio.len != 0 or options.decoder_steps != 0 or options.decoder_request_contexts or options.decoder_scheduled or options.soak_seconds != 0)) return error.InvalidEmbeddingTextGeometry;
+    if (options.extraction_request != null and (options.generate_text != null or options.embedding_pool != null or options.transcribe_audio.len != 0 or options.decoder_steps != 0 or options.primitive != null or options.resident or options.incremental_source or options.soak_seconds != 0)) return error.InvalidExtractionGeometry;
+    if ((options.generate_image != null or options.generate_audio != null or options.generate_video != null) and options.generate_text == null) return error.InvalidGenerationGeometry;
+    if (options.generate_video != null and (options.generate_image != null or options.generate_audio != null)) return error.InvalidGenerationGeometry;
     if (options.transcribe_audio.len == 0 and (options.transcribe_timestamps or options.transcribe_require_eos or options.transcribe_output_format != .json or options.transcribe_mode != .performance or options.transcribe_max_output_tokens != 0)) return error.InvalidTranscriptionGeometry;
     if (options.transcribe_audio.len != 0 and (options.incremental_source or (options.backend != .native and options.backend != .metal and options.backend != .cuda and options.backend != .xla) or options.batch != 1 or options.resident or options.primitive != null or options.embedding_pool != null or options.decoder_steps != 0 or options.decoder_request_contexts or options.decoder_scheduled or options.soak_seconds != 0 or options.source_proof != .off or options.source_trace_constructor or options.source_pipelined_steps != 0 or options.decoder_model_dir.len != 0)) return error.InvalidTranscriptionGeometry;
     if (options.source_metadata_proof and (!options.incremental_source or options.backend != .metal or options.source_policy != .qualified or !options.diagnostics or options.source_proof != .off or options.source_trace_constructor)) return error.InvalidMetadataProof;
@@ -143,6 +166,7 @@ pub fn main(init: std.process.Init) !void {
     const model = try manager.loadFromDir(options.model_dir);
     const model_loaded = inference.platform.time.awakeNs(init.io);
     const session = model.session;
+    if (options.extraction_request != null) return @import("extraction_task.zig").run(init, model, a, options);
     if (options.generate_text != null) return @import("generate_task.zig").run(init, model, a, options);
     if (options.incremental_source) return @import("incremental_source.zig").run(init, model, a, options);
     if (options.transcribe_audio.len != 0) return @import("transcribe_task.zig").run(init, model, a, options);

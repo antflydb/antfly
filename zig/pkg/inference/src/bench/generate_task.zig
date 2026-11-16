@@ -15,12 +15,14 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     if (is_pjrt and (model.session.backend() != .pjrt or client == null)) return error.GenerationBackendSelectionMismatch;
     var cb = try factory.getComputeBackend(model.session, a);
     defer cb.deinit();
+    cb.execution_control = .{ .native_call_policy = .in_process, .io = init.io };
     var cache = inference.graph.cache.GraphCache.init(a);
     defer cache.deinitWithBackend(&cb);
     var pipeline = generation.NativeGenerationPipeline{
         .allocator = a,
         .io = init.io,
         .cb = cb,
+        .execution_control = cb.execution_control,
         .gpt_config = config,
         .session = model.session,
         .tokenizer = model.getTokenizer(),
@@ -29,13 +31,22 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .chat_template = model.chat_tmpl,
         .return_raw_token_ids = true,
         .model_dir = options.model_dir,
+        .gguf_projector_path = model.manifest.gguf_projector_path,
         .graph_cache = if (is_pjrt) &cache else null,
         .compiled_partition_backend = if (is_pjrt) .pjrt else null,
         .compiled_attachment_target = .whole_model,
         .pjrt_client = client,
     };
     defer pipeline.deinit();
-    const messages = [_]generation.Message{.{ .role = "user", .content = options.generate_text.? }};
+    const image_bytes = if (options.generate_image) |path| try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(64 * 1024 * 1024)) else null;
+    defer if (image_bytes) |bytes| a.free(bytes);
+    const audio_bytes = if (options.generate_audio) |path| try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(64 * 1024 * 1024)) else null;
+    defer if (audio_bytes) |bytes| a.free(bytes);
+    const video_bytes = if (options.generate_video) |path| try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(256 * 1024 * 1024)) else null;
+    defer if (video_bytes) |bytes| a.free(bytes);
+    const image_inputs = [_][]const u8{image_bytes orelse &.{}};
+    const audio_inputs = [_][]const u8{audio_bytes orelse &.{}};
+    const messages = [_]generation.Message{.{ .role = "user", .content = options.generate_text.?, .image_bytes = if (image_bytes != null) &image_inputs else null, .audio_bytes = if (audio_bytes != null) &audio_inputs else null, .video_bytes = video_bytes }};
     const samples = try a.alloc(u64, options.iterations);
     defer a.free(samples);
     var reference: ?generation.GenerationResult = null;
@@ -63,6 +74,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .pjrt_device = if (is_pjrt) @tagName(options.pjrt.device) else null,
         .pjrt_precision = if (is_pjrt) @tagName(options.pjrt.precision) else null,
         .whole_model_required = is_pjrt,
+        .modalities = .{ .image = image_bytes != null, .audio = audio_bytes != null, .video = video_bytes != null },
         .decode_execution_scope = "offline_full_prefix_recomputation",
         .cached_serving_performance_qualified = false,
         .model_load_in_timing = false,

@@ -22,6 +22,9 @@ pub const Output = struct {
     name: []const u8,
     value: ops.CT,
     state: bool = false,
+    /// Public F32 transforms occur after model tensor publication and must
+    /// not inherit the internal BF16 rounding policy.
+    float32_transform: ?struct { scale: f32 = 1, softcap: f32 = 0 } = null,
 };
 
 pub const Forward = struct {
@@ -32,11 +35,20 @@ pub const Forward = struct {
     precision: @import("precision.zig").Policy = .f32,
     /// Public output ABI names retained by the model, independent of cache entries.
     output_names: []const []const u8 = &.{},
+    /// Static, model-owned names for authored stages with distinct phase ABIs.
+    output_abi: ?*const fn (*anyopaque, []const Input) anyerror![]const []const u8 = null,
     input_info: []const tensor.TensorInfo = &.{},
     /// Rechecked on every invocation, including cache hits with new values.
     validate: ?*const fn (*anyopaque, []const Input) anyerror!void = null,
-    run: *const fn (*anyopaque, *const ops.ComputeBackend, std.mem.Allocator, []const Input) anyerror![]Output,
+    /// Existing authored semantic graphs enter the same cache/executable path
+    /// directly, without recreating their arithmetic in backend wrappers.
+    author: ?*const fn (*anyopaque, std.mem.Allocator, []const Input) anyerror!program.ModelProgram = null,
+    run: *const fn (*anyopaque, *const ops.ComputeBackend, std.mem.Allocator, []const Input) anyerror![]Output = unsupportedForward,
 };
+
+fn unsupportedForward(_: *anyopaque, _: *const ops.ComputeBackend, _: std.mem.Allocator, _: []const Input) ![]Output {
+    return error.UnsupportedModelProgram;
+}
 
 pub fn inputShape(input: tensor.Tensor) !ml.graph.Shape {
     if (input.shape.len > ml.graph.shape.max_rank) return error.UnsupportedShape;
@@ -69,6 +81,7 @@ pub fn specializationKey(forward: Forward, inputs: []const Input) ![32]u8 {
 pub fn trace(allocator: std.mem.Allocator, forward: Forward, inputs: []const Input, weights: tracing.WeightShapeResolver) !program.ModelProgram {
     for (inputs) |input| _ = try inputShape(input.tensor);
     if (forward.validate) |validate| try validate(forward.context, inputs);
+    if (forward.author) |author| return author(forward.context, allocator, inputs);
     var tracer = tracing.TracingCompute.initWithWeightResolver(allocator, weights);
     defer tracer.deinit();
     tracer.require_resident_outputs = true;
@@ -85,11 +98,19 @@ pub fn trace(allocator: std.mem.Allocator, forward: Forward, inputs: []const Inp
     defer allocator.free(outputs);
     defer for (outputs) |output| backend.free(output.value);
     if (outputs.len == 0) return error.NoModelProgramOutputs;
-    for (outputs) |output| try bindings.append(allocator, .{
-        .name = output.name,
-        .node_id = try tracer.markOutput(output.value),
-        .kind = if (output.state) .state_output else .output,
-    });
+    for (outputs) |output| {
+        var id = try tracer.markOutput(output.value);
+        if (output.float32_transform) |transform| {
+            var builder = ml.graph.Builder.init(tracer.getGraphMut());
+            if (transform.scale != 1) id = try builder.mul(id, try builder.scalarConst(.f32, transform.scale));
+            if (transform.softcap > 0) {
+                const cap = try builder.scalarConst(.f32, transform.softcap);
+                id = try builder.mul(try builder.tanhOp(try builder.div(id, cap)), cap);
+            }
+            tracer.getGraphMut().outputs.items[tracer.getGraphMut().outputs.items.len - 1] = id;
+        }
+        try bindings.append(allocator, .{ .name = output.name, .node_id = id, .kind = if (output.state) .state_output else .output });
+    }
     const graph = tracer.getGraph();
     for (graph.parameters.items) |node| {
         var external = false;

@@ -2305,7 +2305,8 @@ fn allowsFutureAttention(attn_or_mask: ?[]const u8, total_sequence_len: usize, q
 }
 
 fn allowsPastAttention(sliding_window: usize, query_pos: usize, key_pos: usize) bool {
-    if (key_pos > query_pos) return false;
+    // Future-key permission is checked independently by the causal/block mask.
+    if (key_pos > query_pos) return true;
     if (sliding_window == 0) return true;
     return query_pos - key_pos < sliding_window;
 }
@@ -4409,4 +4410,19 @@ test "BF16 segment probabilities use global maxima across tiles and preserve emp
         try std.testing.expectApproxEqAbs(numerator / denominator, out[head], 1e-6);
     }
     try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, out[2..]);
+}
+
+test "causal attention block visibility keeps allowed future keys in the sliding overlay" {
+    const a = std.testing.allocator;
+    const zero = [_]f32{ 0, 0, 0 };
+    const values = [_]f32{ 2, 4, 8 };
+    const mask = [_]u8{ 0, 1, 0, 0, 0, 0, 0, 0, 0 };
+    for ([_]usize{ 0, 2 }) |window| {
+        const actual = try flashCausalAttentionHost(a, &zero, &zero, &values, null, &mask, window, 1, 3, 3, 0, 0, 1, 1, 1);
+        defer a.free(actual);
+        // Uniform scores: row zero sees self and the explicitly allowed next
+        // key; the window clips only old keys, never that future permission.
+        const expected = [_]f32{ 3, 3, if (window == 0) @as(f32, 14) / 3 else 6 };
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    }
 }

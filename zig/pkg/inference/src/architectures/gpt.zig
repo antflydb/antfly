@@ -1367,7 +1367,7 @@ pub fn forwardLastLogitsFromEmbeddingsWithLayer0Overrides(
     return allocator.dupe(f32, result[last_pos_offset..][0..vocab_size]);
 }
 
-pub fn forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
+pub fn forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     config: Config,
@@ -1377,7 +1377,7 @@ pub fn forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
     seq_len: usize,
     decode_context: ?*const DecodeContext,
     ple_vectors: ?CT,
-) ![]f32 {
+) !CT {
     const hidden_result = try forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
         cb,
         allocator,
@@ -1401,7 +1401,21 @@ pub fn forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
     const lm_w = try getLmHeadWeight(cb, config);
     defer cb.free(lm_w);
 
-    const logits = try cb.linearNoBias(last_hidden, lm_w, 1, config.hidden_size, config.vocab_size);
+    return cb.linearNoBias(last_hidden, lm_w, 1, config.hidden_size, config.vocab_size);
+}
+
+pub fn forwardLastLogitsLastRowFromEmbeddingsWithLayer0Overrides(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden_input: CT,
+    overrides: Layer0DecoderOverrides,
+    batch: usize,
+    seq_len: usize,
+    decode_context: ?*const DecodeContext,
+    ple_vectors: ?CT,
+) ![]f32 {
+    const logits = try forwardLastLogitsLastRowTensorFromEmbeddingsWithLayer0Overrides(cb, allocator, config, hidden_input, overrides, batch, seq_len, decode_context, ple_vectors);
     defer cb.free(logits);
     try maybeDebugTensor(cb, allocator, "lm_head", logits);
 
@@ -9212,6 +9226,24 @@ fn qwen35ProjectedCore(
     const conv_dim = key_heads * key_head_dim * 2 + value_dim;
     const conv_kernel: usize = @intCast(config.qwen35_linear_conv_kernel_dim);
     const total = seq_len;
+    // Full-prefix graph execution owns zero state for this invocation. Keep
+    // the complete F32 recurrent core behind its semantic operation, so
+    // capture cannot specialize host arithmetic on dummy tensor values.
+    if (maybe_state == null) {
+        if (try cb.depthwiseGatedDelta(&.{
+            .mixed = mixed,
+            .z = z,
+            .beta = beta_proj,
+            .a = a_proj,
+            .conv_weight = conv_w,
+            .a_log = a_log_w,
+            .dt_bias = dt_bias_w,
+            .norm_weight = norm_w,
+            .geometry = .{ .rows = @intCast(total), .key_heads = @intCast(key_heads), .value_heads = @intCast(value_heads), .key_dim = @intCast(key_head_dim), .value_dim = @intCast(value_head_dim) },
+            .kernel = @intCast(conv_kernel),
+            .eps = config.norm_eps,
+        })) |core| return core;
+    }
     if (comptime build_options.enable_cuda) {
         if (cb.kind() == .cuda and (config.qwen35_device_only_state or
             (maybe_state != null and (maybe_state.?.cuda_device.initialized or maybe_state.?.cuda_device.failed))))
@@ -9490,50 +9522,7 @@ fn qwen35RecurrentGatedDeltaRuleHost(
     }
 }
 
-// Work on eight adjacent value columns together so both state passes use
-// contiguous loads and SIMD. Each column retains the scalar key reduction
-// order; the tail handles arbitrary value-head dimensions.
-fn qwen35DeltaHead(state: []f32, key: []const f32, query: []const f32, value: []const f32, output: []f32, decay: f32, beta: f32) void {
-    const V = @Vector(8, f32);
-    var col: usize = 0;
-    while (col + 8 <= value.len) : (col += 8) {
-        var memory: V = @splat(0);
-        for (key, 0..) |k, row| {
-            const offset = row * value.len + col;
-            const old: V = state[offset..][0..8].*;
-            const decayed = old * @as(V, @splat(decay));
-            state[offset..][0..8].* = decayed;
-            memory += decayed * @as(V, @splat(k));
-        }
-        const v: V = value[col..][0..8].*;
-        const delta = (v - memory) * @as(V, @splat(beta));
-        var out: V = @splat(0);
-        for (key, query, 0..) |k, q, row| {
-            const offset = row * value.len + col;
-            const decayed: V = state[offset..][0..8].*;
-            const updated = decayed + @as(V, @splat(k)) * delta;
-            state[offset..][0..8].* = updated;
-            out += updated * @as(V, @splat(q));
-        }
-        output[col..][0..8].* = out;
-    }
-    while (col < value.len) : (col += 1) {
-        var memory: f32 = 0;
-        for (key, 0..) |k, row| {
-            const offset = row * value.len + col;
-            state[offset] *= decay;
-            memory += state[offset] * k;
-        }
-        const delta = (value[col] - memory) * beta;
-        var out: f32 = 0;
-        for (key, query, 0..) |k, q, row| {
-            const offset = row * value.len + col;
-            state[offset] += k * delta;
-            out += state[offset] * q;
-        }
-        output[col] = out;
-    }
-}
+const qwen35DeltaHead = @import("../ops/gated_delta_recurrence.zig").head;
 
 test "LightOnOCR3 Metal recurrent core matches CPU prefill continuation and reset without readbacks" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;

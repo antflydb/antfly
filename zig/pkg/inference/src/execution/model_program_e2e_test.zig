@@ -422,27 +422,19 @@ test "model program real EG2 public loaders preserve explicit BF16 precision" {
     }
 }
 
-test "model program real hybrid decoder rejects uncaptured host arithmetic" {
+test "model program real hybrid decoder serializes compact recurrent arithmetic through PJRT" {
     if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
     const model = platform.env.getenv("ANTFLY_PJRT_HYBRID_MODEL") orelse return error.SkipZigTest;
-    const a = std.testing.allocator;
-    const session = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
-    defer session.close();
-    var backend = try factory.getComputeBackend(session, a);
-    defer backend.deinit();
-    const cfg = factory.getGptConfig(session) orelse return error.WrongModelArchitecture;
-    const graph = @import("../graph/root.zig");
-    const context = graph.execution.Context{ .allocator = a, .cb = &backend, .gpt_config = &cfg, .compiled_partition_backend = .pjrt, .compiled_attachment_target = .whole_model, .pjrt_client = factory.getPjrtClientPtr(session) };
-    var cache = graph.cache.GraphCache.init(a);
-    defer cache.deinitWithBackend(&backend);
-    const decode = @import("../architectures/gpt.zig").DecodeContext{ .total_sequence_len = 2, .query_sequence_len = 2, .kv_sequence_len = 2 };
-    try std.testing.expectError(error.HostReadbackDuringCapture, graph.execution.ensureGraphEntry(&context, &cache, &.{ 1, 2 }, 1, 2, &decode));
-    try std.testing.expectEqual(@as(usize, 0), cache.count());
+    try expectRealDecoderHlo(model, &.{ 1, 2 }, true);
 }
 
 test "model program real shared KV decoder serializes positional tables through PJRT" {
     if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
     const model = platform.env.getenv("ANTFLY_PJRT_GEMMA4_QAT_MODEL") orelse return error.SkipZigTest;
+    try expectRealDecoderHlo(model, &.{ 2, 1234 }, false);
+}
+
+fn expectRealDecoderHlo(model: []const u8, tokens: []const i64, recurrent: bool) !void {
     const a = std.testing.allocator;
     const session = try factory.createNativeSessionWithTaskOverride(a, model, .generic);
     defer session.close();
@@ -454,10 +446,15 @@ test "model program real shared KV decoder serializes positional tables through 
     var cache = graph.cache.GraphCache.init(a);
     defer cache.deinitWithBackend(&backend);
     const decode = @import("../architectures/gpt.zig").DecodeContext{ .total_sequence_len = 2, .query_sequence_len = 2, .kv_sequence_len = 2 };
-    const entry = graph.execution.ensureGraphEntry(&context, &cache, &.{ 2, 1234 }, 1, 2, &decode) catch |err| {
+    const entry = graph.execution.ensureGraphEntry(&context, &cache, tokens, 1, tokens.len, &decode) catch |err| {
         std.debug.print("shared KV real checkpoint capture failed: {s}\n", .{@errorName(err)});
         return err;
     };
+    var recurrences: usize = 0;
+    for (entry.graph.nodes.items) |node| if (node.op == .fused_gated_delta) {
+        recurrences += 1;
+    };
+    try std.testing.expectEqual(recurrent, recurrences != 0);
     const ids = try a.alloc(@import("ml").graph.NodeId, entry.graph.nodeCount());
     defer a.free(ids);
     const mutable = try a.alloc(bool, ids.len);
@@ -475,4 +472,239 @@ test "model program real shared KV decoder serializes positional tables through 
     try std.testing.expect(compiled.hlo_bytes.len > 0);
     try std.testing.expect(compiled.hlo_bytes.len < 64 * 1024 * 1024);
     try std.testing.expectEqual(@as(usize, 1), compiled.output_node_ids.len);
+}
+
+test "model program public decoder prefix keeps new embeddings and token tails dynamic" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const model = platform.env.getenv("ANTFLY_PJRT_DECODER_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const native = try factory.createNativeSessionWithTaskOverride(a, model, .generic);
+    defer native.close();
+    const compiled = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
+    defer compiled.close();
+    var reference = try factory.getComputeBackend(native, a);
+    defer reference.deinit();
+    var config = factory.getGptConfig(native) orelse return error.WrongModelArchitecture;
+    const frontend = @import("decoder_frontend.zig").resolve(&config);
+    const prefix_values = try a.alloc(f32, 2 * config.hidden_size);
+    defer a.free(prefix_values);
+    for (0..2) |round| {
+        for (prefix_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((index * 7 + round * 3) % 19)) - 9)) / 10;
+        var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 3 }, &.{ 1, 2, @intCast(round + 3) });
+        defer ids.deinit();
+        var prefix = try Tensor.initFloat32(a, "input_embeddings", &.{ 1, 2, config.hidden_size }, prefix_values);
+        defer prefix.deinit();
+        const declared = [_]@import("capture.zig").Input{ .{ .tensor = ids }, .{ .tensor = prefix } };
+        const expected_outputs = try frontend.run(frontend.context, &reference, a, &declared);
+        defer a.free(expected_outputs);
+        defer for (expected_outputs) |output| reference.free(output.value);
+        const expected = try reference.toFloat32(expected_outputs[0].value, a);
+        defer a.free(expected);
+        @import("../architectures/gpt.zig").applyFinalLogitSoftcapInPlace(config, expected);
+        const actual = try compiled.runWithControl(&.{ ids, prefix }, a, .{ .native_call_policy = .in_process });
+        defer a.free(actual);
+        defer for (actual) |*output| output.deinit();
+        try std.testing.expectEqual(@as(usize, 1), actual.len);
+        try std.testing.expectEqualStrings("logits", actual[0].name);
+        try std.testing.expectEqualSlices(i64, &.{ 1, config.vocab_size }, actual[0].shape);
+        try std.testing.expectEqual(expected.len, actual[0].asFloat32().len);
+        var max_error: f32 = 0;
+        var square_error: f64 = 0;
+        for (expected, actual[0].asFloat32()) |want, got| {
+            try std.testing.expect(std.math.isFinite(want) and std.math.isFinite(got));
+            max_error = @max(max_error, @abs(want - got));
+            square_error += @as(f64, want - got) * @as(f64, want - got);
+        }
+        std.debug.print("decoder prefix round={d} max_abs={d} rms={d}\n", .{ round, max_error, @sqrt(square_error / @as(f64, @floatFromInt(expected.len))) });
+        // Independent native and XLA F32 reductions are not bitwise equal.
+        // Bound the entire vocabulary, not just the sampled top coordinate.
+        try std.testing.expect(max_error <= 1e-3);
+        try std.testing.expect(@sqrt(square_error / @as(f64, @floatFromInt(expected.len))) <= 2e-4);
+    }
+}
+
+test "model program real companion image stage preserves the GGUF projector reference" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const model = platform.env.getenv("ANTFLY_PJRT_GEMMA4_QAT_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const projector = @import("../architectures/gemma4_projector.zig");
+    var definition = try @import("../architectures/model_definition.zig").LoadedModel.open(a, model);
+    defer definition.deinit();
+    const path = definition.manifest.gguf_projector_path orelse return error.MissingProjector;
+    const oracle_store = try projector.ProjectorStore.open(a, path);
+    defer oracle_store.close();
+    var weights = @import("../ops/native_compute.zig").WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = @import("../ops/native_compute.zig").NativeCompute.init(a, &weights, null);
+    defer native.deinit();
+    const cb = native.computeBackend();
+    const encoded = @embedFile("../models/testdata/lightonocr3/invoice.png");
+    var expected = try projector.encodeProjectedImages(&cb, a, oracle_store, &.{encoded});
+    defer expected.deinit();
+    const session = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
+    defer session.close();
+    const metadata = factory.getAuxiliaryProjectorMetadata(session) orelse return error.MissingProjector;
+    const prepared = try projector.prepareProjectorImage(a, metadata, encoded);
+    defer prepared.deinit();
+    var pixels = try Tensor.initFloat32(a, "pixel_values", &.{ 1, 3, @intCast(prepared.geometry.height), @intCast(prepared.geometry.width) }, prepared.pixels);
+    defer pixels.deinit();
+    for (0..2) |_| {
+        const actual = try session.runWithControl(&.{pixels}, a, .{ .native_call_policy = .in_process });
+        defer a.free(actual);
+        defer for (actual) |*output| output.deinit();
+        try std.testing.expectEqual(@as(usize, 1), actual.len);
+        try std.testing.expectEqualStrings("image_features", actual[0].name);
+        try std.testing.expectEqualSlices(i64, &.{ 1, @intCast(expected.tokens_per_image[0]), @intCast(expected.hidden_size) }, actual[0].shape);
+        try std.testing.expectEqual(expected.embeddings.len, actual[0].asFloat32().len);
+        for (expected.embeddings, actual[0].asFloat32()) |want, got| try std.testing.expectApproxEqAbs(want, got, 5e-4 + @abs(want) * 1e-4);
+    }
+}
+
+test "model program real patch image stage preserves native vision features" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const model = platform.env.getenv("ANTFLY_PJRT_HYBRID_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const native = try factory.createNativeSessionWithTaskOverride(a, model, .generic);
+    defer native.close();
+    var cb = try factory.getComputeBackend(native, a);
+    defer cb.deinit();
+    const config = factory.getGptConfig(native) orelse return error.WrongModelArchitecture;
+    const projector = @import("../architectures/qwen3vl_projector.zig");
+    const limits = projector.Limits{ .max_merged_tokens = 64 };
+    const image = @embedFile("../models/testdata/lightonocr3/invoice.png");
+    var expected = try projector.encodeProjectedImagesResident(&cb, a, config, &.{image}, limits);
+    defer expected.deinit();
+    const compiled = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
+    defer compiled.close();
+    var actual = try @import("media_projection.zig").patchImages(compiled, a, config, &.{image}, limits, .{ .native_call_policy = .in_process });
+    defer actual.deinit();
+    try std.testing.expectEqualSlices(usize, expected.tokens_per_image, actual.tokens_per_image);
+    try std.testing.expectEqual(expected.embeddings.len, actual.embeddings.len);
+    for (expected.embeddings, actual.embeddings) |want, got| try std.testing.expectApproxEqAbs(want, got, 5e-4 + @abs(want) * 1e-4);
+}
+
+test "model program real boundary extraction executes compiled task graphs" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const model = platform.env.getenv("ANTFLY_PJRT_BOUNDARY_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const native = try factory.createNativeSessionWithTaskOverride(a, model, .generic);
+    defer native.close();
+    const compiled = try factory.createPjrtSessionWithOptions(a, model, .{ .memory_policy = .cpu });
+    defer compiled.close();
+    var cb = try factory.getComputeBackend(native, a);
+    defer cb.deinit();
+    const config = try factory.getGlinerBoundaryConfig(native);
+    const path = try std.fs.path.join(a, &.{ model, "tokenizer.json" });
+    defer a.free(path);
+    const bytes = try @import("../util/c_file.zig").readFile(a, path);
+    defer a.free(bytes);
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytesWithOptions(a, bytes, .{ .strict_unigram_normalizer = true });
+    defer tokenizer.tokenizer().deinitTokenizer();
+    const executor = @import("../extractors/gliner_boundary_executor.zig");
+    const wire = @import("../extractors/extraction_v2.zig");
+    for ([_][]const u8{ "natural", "latent", "anchorless" }) |mode| {
+        const request_bytes = try std.fmt.allocPrint(a,
+            \\{{"schema_version":2,"model":"fixture","schema":{{"entities":["person","company"],"entity_attributes":{{"status":{{"labels":["active","inactive"],"applies_to":["person"]}}}},"classifications":[{{"name":"sentiment","labels":["negative","positive"]}}],"structures":{{"employment":{{"mode":"{s}","fields":{{"name":{{"type":"str","cardinality":"required_one"}},"company":{{"type":"str","cardinality":"optional_one"}}}}}}}},"relations":[{{"type":"works_for","source":"person","target":"company"}}]}},"inputs":[{{"content":"Ada works at Antfly in Seattle."}}]}}
+        , .{mode});
+        defer a.free(request_bytes);
+        var request = try wire.parseJson(a, request_bytes, .{});
+        defer request.deinit();
+        const options = executor.Options{ .control = .{ .native_call_policy = .in_process }, .pipeline = .{ .threshold = 0.1 } };
+        const expected = try executor.execute(&cb, a, &config, tokenizer.tokenizer(), &request, options);
+        defer a.free(expected);
+        var selected = options;
+        selected.compiled_session = compiled;
+        for (0..2) |_| {
+            const actual = try executor.execute(&cb, a, &config, tokenizer.tokenizer(), &request, selected);
+            defer a.free(actual);
+            var left = try std.json.parseFromSlice(std.json.Value, a, expected, .{});
+            defer left.deinit();
+            var right = try std.json.parseFromSlice(std.json.Value, a, actual, .{});
+            defer right.deinit();
+            try expectTaskJsonParity(left.value, right.value);
+        }
+    }
+}
+
+fn expectTaskJsonParity(expected: std.json.Value, actual: std.json.Value) !void {
+    try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+    switch (expected) {
+        .object => |object| {
+            try std.testing.expectEqual(object.count(), actual.object.count());
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| try expectTaskJsonParity(entry.value_ptr.*, actual.object.get(entry.key_ptr.*) orelse return error.MissingTaskOutputKey);
+        },
+        .array => |array| {
+            try std.testing.expectEqual(array.items.len, actual.array.items.len);
+            for (array.items, actual.array.items) |left, right| try expectTaskJsonParity(left, right);
+        },
+        .float => |value| {
+            try std.testing.expect(std.math.isFinite(value) and std.math.isFinite(actual.float));
+            try std.testing.expectApproxEqAbs(value, actual.float, 2e-3);
+        },
+        .integer => |value| try std.testing.expectEqual(value, actual.integer),
+        .string => |value| try std.testing.expectEqualStrings(value, actual.string),
+        .bool => |value| try std.testing.expectEqual(value, actual.bool),
+        .null => {},
+        else => return error.UnexpectedTaskOutput,
+    }
+}
+
+test "model program real companion audio stage preserves the GGUF projector reference" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const model = platform.env.getenv("ANTFLY_PJRT_GEMMA4_QAT_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const projector = @import("../architectures/gemma4_projector.zig");
+    var definition = try @import("../architectures/model_definition.zig").LoadedModel.open(a, model);
+    defer definition.deinit();
+    const oracle_store = try projector.ProjectorStore.open(a, definition.manifest.gguf_projector_path orelse return error.MissingProjector);
+    defer oracle_store.close();
+    var weights = @import("../ops/native_compute.zig").WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = @import("../ops/native_compute.zig").NativeCompute.init(a, &weights, null);
+    defer native.deinit();
+    const cb = native.computeBackend();
+    const clip = @embedFile("../testdata/video/codecs/aac-lc-speech-en.m4a.reference.wav");
+    var expected = try projector.encodeProjectedAudio(&cb, a, oracle_store, &.{clip});
+    defer expected.deinit();
+    const session = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
+    defer session.close();
+    for (0..2) |_| {
+        var actual = try @import("media_projection.zig").companionAudio(session, a, &.{.{ .encoded = clip }}, .{ .native_call_policy = .in_process });
+        defer actual.deinit();
+        try std.testing.expectEqualSlices(usize, expected.tokens_per_audio, actual.tokens_per_audio);
+        try std.testing.expectEqual(expected.embeddings.len, actual.embeddings.len);
+        for (expected.embeddings, actual.embeddings) |want, got| try std.testing.expectApproxEqAbs(want, got, 5e-4 + @abs(want) * 1e-4);
+    }
+}
+
+test "model program real companion video stage preserves frame projection and timestamps" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const model = platform.env.getenv("ANTFLY_PJRT_GEMMA4_QAT_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const projector = @import("../architectures/gemma4_projector.zig");
+    var definition = try @import("../architectures/model_definition.zig").LoadedModel.open(a, model);
+    defer definition.deinit();
+    const oracle_store = try projector.ProjectorStore.open(a, definition.manifest.gguf_projector_path orelse return error.MissingProjector);
+    defer oracle_store.close();
+    var weights = @import("../ops/native_compute.zig").WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = @import("../ops/native_compute.zig").NativeCompute.init(a, &weights, null);
+    defer native.deinit();
+    var cb = native.computeBackend();
+    cb.execution_control = .{ .native_call_policy = .in_process };
+    const clip = @embedFile("../testdata/video/bframes.mp4");
+    var expected = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{}, a, oracle_store, clip);
+    defer expected.deinit();
+    const expected_values = try cb.toFloat32(expected.images.embeddings, a);
+    defer a.free(expected_values);
+    const session = try factory.createPjrtSessionWithOptions(a, model, .{ .task_override = .generic, .memory_policy = .cpu });
+    defer session.close();
+    for (0..2) |_| {
+        var actual = try @import("../pipelines/gemma4_video.zig").encode(&cb, .{ .session = session }, a, oracle_store, clip);
+        defer actual.deinit();
+        try std.testing.expectEqualSlices(i64, expected.timestamps_us, actual.timestamps_us);
+        try std.testing.expectEqualSlices(usize, expected.images.tokens_per_image, actual.images.tokens_per_image);
+        const actual_values = try cb.toFloat32(actual.images.embeddings, a);
+        defer a.free(actual_values);
+        try std.testing.expectEqual(expected_values.len, actual_values.len);
+        for (expected_values, actual_values) |want, got| try std.testing.expectApproxEqAbs(want, got, 5e-4 + @abs(want) * 1e-4);
+    }
 }

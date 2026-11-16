@@ -18,6 +18,7 @@
 //! and architecture execution in execution.architecture_session. New loading
 //! or kernel implementations belong to those owners.
 const implementation = @import("../execution/architecture_session.zig");
+pub const getAuxiliaryProjectorMetadata = implementation.getAuxiliaryProjectorMetadata;
 
 pub const CudaRuntimeStats = implementation.CudaRuntimeStats;
 pub const estimateNativeWeightBytes = implementation.estimateNativeWeightBytes;

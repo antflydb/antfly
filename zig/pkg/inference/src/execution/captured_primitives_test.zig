@@ -5,7 +5,7 @@ const ops = @import("../ops/ops.zig");
 const capture = @import("capture.zig");
 const prepared = @import("captured_forward.zig");
 const Tensor = @import("../backends/tensor.zig").Tensor;
-const Kind = enum { conv1d, conv2d, grid_grouped, grid_depthwise, sdpa_token, sdpa_heads, sdpa_bias, causal, cross, relative, gqa, marker_head, interleaved_pairs, segment_grouped, spatial_rotary };
+const Kind = enum { numeric_select, conv1d, conv2d, grid_grouped, grid_depthwise, sdpa_token, sdpa_heads, sdpa_bias, causal, cross, relative, gqa, gqa_or, gqa_or_window, marker_head, interleaved_pairs, segment_grouped, spatial_rotary };
 const Fixture = struct {
     kind: Kind,
     bf16_probability: bool = false,
@@ -28,7 +28,13 @@ const Fixture = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const x = try tensor(cb, inputs[0].tensor);
         defer cb.free(x);
-        const result = if (self.kind == .interleaved_pairs) paired: {
+        const result = if (self.kind == .numeric_select) selected: {
+            const condition = try cb.fromFloat32Shape(&.{ 0, 1, -1, 2, 0, -2 }, &.{ 2, 3 });
+            defer cb.free(condition);
+            const fallback = try cb.fromFloat32Shape(&.{-7}, &.{});
+            defer cb.free(fallback);
+            break :selected try cb.primWhereSelect(condition, x, fallback);
+        } else if (self.kind == .interleaved_pairs) paired: {
             const wa = try cb.getWeight("wa");
             defer cb.free(wa);
             const wb = try cb.getWeight("wb");
@@ -80,6 +86,7 @@ const Fixture = struct {
                     for (0..6) |row| ranges[row * 6 + 1] = 6;
                     break :attention (try cb.vtable.segmentAttentionGrouped.?(cb.ptr, x, key, value, &.{ .visibility = .{ .ranges = &ranges, .query_positions = &positions, .key_positions = &positions, .queries = 6, .keys = 6, .num_heads = 2, .head_dim = 2 }, .num_kv_heads = 1, .score_scale = 1, .bf16_probability = self.bf16_probability })).?;
                 }
+                if (self.kind == .gqa_or or self.kind == .gqa_or_window) break :attention try cb.gqaPagedAttention(x, key, value, null, .{ .total_sequence_len = 3, .query_sequence_len = 3, .kv_sequence_len = 3, .sliding_window = if (self.kind == .gqa_or_window) 2 else 0, .attn_or_mask = &.{ 0, 1, 0, 0, 0, 0, 0, 0, 0 } }, 1, 4, 2, 2);
                 if (self.kind == .gqa) break :attention try cb.gqaCausalAttention(x, key, value, null, 1, 3, 4, 2, 2);
                 if (self.kind == .causal) break :attention try cb.causalSelfAttention(x, key, value, null, 2, 3, 2, 2);
                 if (self.kind == .relative) {
@@ -141,12 +148,13 @@ fn qualifyProfile(kind: Kind, precision: @import("precision.zig").Policy, bf16_p
     defer inputs.deinit(a);
     defer for (inputs.items) |*input| input.tensor.deinit();
     const shape: []const i64 = switch (kind) {
+        .numeric_select => &.{ 2, 3 },
         .conv1d => &.{ 2, 2, 5 },
         .conv2d => &.{ 2, 4, 3, 4 },
         .grid_grouped, .grid_depthwise => &.{ 24, 4 },
         .sdpa_heads => &.{ 4, 3, 2 },
         .cross => &.{ 4, 4 },
-        .gqa => &.{ 3, 8 },
+        .gqa, .gqa_or, .gqa_or_window => &.{ 3, 8 },
         .marker_head => &.{ 6, 2 },
         .interleaved_pairs => &.{ 2, 4 },
         .spatial_rotary => &.{ 3, 16 },
@@ -154,7 +162,7 @@ fn qualifyProfile(kind: Kind, precision: @import("precision.zig").Policy, bf16_p
     };
     try inputs.append(a, .{ .tensor = try numbers(a, "x", shape, 0) });
     switch (kind) {
-        .spatial_rotary => {},
+        .spatial_rotary, .numeric_select => {},
         .conv1d => {
             try source.putWeight("weight", &.{ 4, 2, 3 });
             try source.putWeight("bias", &.{4});
@@ -182,14 +190,14 @@ fn qualifyProfile(kind: Kind, precision: @import("precision.zig").Policy, bf16_p
             try inputs.append(a, .{ .tensor = try Tensor.initInt64(a, "decision_marker_mask", &.{ 2, 2 }, &.{ 1, 0, 1, 1 }) });
         },
         else => {
-            const key_shape: []const i64 = if (kind == .cross) &.{ 6, 4 } else if (kind == .gqa) &.{ 3, 4 } else if (kind == .segment_grouped) &.{ 6, 2 } else shape;
+            const key_shape: []const i64 = if (kind == .cross) &.{ 6, 4 } else if (kind == .gqa or kind == .gqa_or or kind == .gqa_or_window) &.{ 3, 4 } else if (kind == .segment_grouped) &.{ 6, 2 } else shape;
             try inputs.append(a, .{ .tensor = try numbers(a, "key", key_shape, 1) });
             try inputs.append(a, .{ .tensor = try numbers(a, "value", key_shape, 2) });
             if (kind == .relative) {
                 try inputs.append(a, .{ .tensor = try numbers(a, "query_relative", &.{ 5, 4 }, -1) });
                 try inputs.append(a, .{ .tensor = try numbers(a, "key_relative", &.{ 5, 4 }, 3) });
                 try inputs.append(a, .{ .tensor = try Tensor.initInt64(a, "attention_mask", &.{ 2, 3 }, &.{ 1, 0, 1, 0, 0, 0 }) });
-            } else if (kind != .causal and kind != .gqa and kind != .segment_grouped) try inputs.append(a, .{ .tensor = try Tensor.initInt64(a, "attention_mask", &.{ 2, 3 }, &.{ 1, 0, 1, 1, 1, 0 }) });
+            } else if (kind != .causal and kind != .gqa and kind != .gqa_or and kind != .gqa_or_window and kind != .segment_grouped) try inputs.append(a, .{ .tensor = try Tensor.initInt64(a, "attention_mask", &.{ 2, 3 }, &.{ 1, 0, 1, 1, 1, 0 }) });
             if (kind == .sdpa_bias) try inputs.append(a, .{ .tensor = try numbers(a, "bias", &.{ 2, 3, 3 }, -1) });
         },
     }
@@ -294,4 +302,13 @@ test "captured primitive PJRT grouped segment descriptor preserves explicit scal
     try qualifyWithPrecision(.segment_grouped, .f32);
     try qualifyWithPrecision(.segment_grouped, .bf16);
     try qualifyProfile(.segment_grouped, .f32, true);
+}
+
+test "captured primitive PJRT blockwise grouped attention preserves future visibility" {
+    try qualify(.gqa_or);
+    try qualify(.gqa_or_window);
+}
+
+test "captured primitive PJRT numeric select broadcasts scalar fallback" {
+    try qualify(.numeric_select);
 }
