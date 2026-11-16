@@ -227,8 +227,15 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
         error.NotFound => null,
         else => return err,
     };
+    // Stashed as a fixed-size copy (not the borrowed slice -- several more
+    // `txn.get`/`txn.put` calls happen before it's used) so the `put` of
+    // this same key below can hand it to `artifact_inputs.touch` instead of
+    // that hook issuing its own second `txn.get` for the identical
+    // pre-write value. See `Capture.replay_meta_previous_hint`.
+    var previous_fixed: ?[8]u8 = null;
     if (previous) |raw| {
         if (raw.len != 8) return error.CorruptReplayMetadata;
+        previous_fixed = raw[0..8].*;
         if (sequence < std.mem.readInt(u64, raw[0..8], .little)) return error.InvalidBatchRequest;
     }
 
@@ -275,6 +282,7 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     // leaf for no reason after the first append ever made.
     if (!already_initialized) try txn.put(internal_keys.replay_meta_init_key[0..], "");
     const next_raw = encodeReplayNextSequence(sequence + 1);
+    txn.artifact_inputs.replay_meta_previous_hint = previous_fixed;
     try txn.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
     const latest_raw = encodeReplaySequence(sequence);
 
