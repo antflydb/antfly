@@ -381,15 +381,7 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_f32_tile4_w4(
         }
     }
 
-    #pragma unroll
-    for (unsigned int c = 0; c < 4u; ++c) {
-        float gate_sum = termite_warp_reduce_sum(gate_acc[c]);
-        float up_sum = termite_warp_reduce_sum(up_acc[c]);
-        if (lane == 0u && warp < 4u) {
-            gate_partial[c][warp] = gate_sum;
-            up_partial[c][warp] = up_sum;
-        }
-    }
+{{q4q8_pair_warp_scalar}}
     __syncthreads();
     if (tid == 0u) {
         #pragma unroll

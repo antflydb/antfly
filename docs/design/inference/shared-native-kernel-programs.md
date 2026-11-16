@@ -514,3 +514,31 @@ The private GPU checkout and probe binaries are removed after qualification.
 Both generator freshness checks, 52 core tests and seven ownership tests pass.
 The final ownership verifier accepts 859 emitted items and 65 canonical native
 files, classifying both stream exports as shared bodies.
+
+### Paired quantized projection schedules
+
+The ordinary fixed-row and L2-prefetch Q4/Q8 paired projections now share one
+four-column schedule in the existing `native/cuda_phases.zig` owner. Row-block
+count and prefetching are static arguments; production bindings retain 80
+blocks, their original warp extents and exact future-column prefetch issue
+points. Dense and routed variants reuse the matching two-plane warp publication
+and ordered partial-fold/activation phases. Their input traversal, caller-owned
+barriers, full/tail guards, U32 versus size_t indexing, const temporaries and
+induction literals remain distinct bindings. Historical exports retain their
+existing ABI callers; no new device entrypoint, native include or owner is added.
+
+The eight maintained implementation/binding/ownership files shrink by 581 bytes
+and 48 lines, counting the shared schedule and provenance. Generated copies and
+this qualification narrative earn no implementation-reduction credit. All 49
+native compiler input files retain identical tokens; only whitespace changes
+in the canonical CUDA translation unit and generated prefetch header. The 52
+core tests, seven ownership tests and both generator checks pass. Ownership
+verification accepts 859 emitted items and 65 canonical native files.
+
+Pinned CUDA 13.2 recompilation on Glowworm produces byte-identical portable PTX,
+seven-architecture fatbin and SM89 cubin. This preserves native instructions,
+resources and performance; it does not claim a new speedup or binary reduction.
+The first remote generator attempt failed fetching a Codeberg dependency; its
+receipt is retained. The completed local generator checks and direct pinned
+NVCC artifact commands provide qualification without further dependency fetches.
+Both private remote checkouts and all temporary artifact output are removed.

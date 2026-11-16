@@ -70,7 +70,7 @@ pub const source_1 = program.join(&.{
 });
 
 pub const source_2 = program.join(&.{
-    program.render(fixed_row_program, cuda_phases.projection),
+    fixed_row_program,
     program.render(program_1, .{ .name = "termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn", .literal_0 = "8u" }),
 
     \\
@@ -134,50 +134,5 @@ const fixed_row_program =
     \\    const unsigned char* weight_gate,
     \\    const unsigned char* weight_up,
     \\    unsigned int activation){
-    \\    const unsigned int cols = 4u;
-    \\    const unsigned int row_blocks = 80u;
-    \\    unsigned int col_tile = blockIdx.x * cols;
-    \\    unsigned int tid = threadIdx.x;
-    \\    unsigned int lane = tid & 31u;
-    \\    unsigned int warp = tid >> 5;
-    \\    __shared__ float gate_partial[4][Warps];
-    \\    __shared__ float up_partial[4][Warps];
-    \\    float gate_acc[4];
-    \\    float up_acc[4];
-    \\    #pragma unroll
-    \\    for (unsigned int c = 0; c < cols; ++c) {
-    \\        gate_acc[c] = 0.0f;
-    \\        up_acc[c] = 0.0f;
-    \\    }
     \\
-    \\    unsigned int iqs = (tid & 1u) * 2u;
-    \\    for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
-    \\        const unsigned char* q8_bp = q8_input + block * 36u;
-    \\#include "../kernels/q4_q8_half_block_load.cuh"
-    \\
-    \\        #pragma unroll
-    \\        for (unsigned int c = 0u; c < cols; ++c) {
-    \\            unsigned int col = col_tile + c;
-    \\{{q4q8_pair_dot_u32_full}}
-    \\        }
-    \\    }
-    \\
-    \\{{q4q8_pair_warp_fixed}}
-    \\    __syncthreads();
-    \\    if (tid == 0u) {
-    \\        #pragma unroll
-    \\        for (unsigned int c = 0; c < cols; ++c) {
-    \\            float gate_y = 0.0f;
-    \\            float up_y = 0.0f;
-    \\            #pragma unroll
-    \\            for (unsigned int w = 0; w < Warps; ++w) {
-    \\                gate_y += gate_partial[c][w];
-    \\                up_y += up_partial[c][w];
-    \\            }
-    \\            dst[col_tile + c] = termite_decoder_activation_f32(gate_y, activation) * up_y;
-    \\        }
-    \\    }
-    \\}
-    \\
-    \\
-;
+++ cuda_phases.fixedRowPair(80, false) ++ "\n}\n\n";

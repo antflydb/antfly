@@ -75,64 +75,7 @@ extern "C" __global__ void antfly_gemma4_e4b_pair_prefetch_l2(
     const unsigned char* weight_up,
     unsigned int activation
 ) {
-    const unsigned int cols = 4u;
-    const unsigned int row_blocks = 80u;
-    unsigned int col_tile = blockIdx.x * cols;
-    unsigned int tid = threadIdx.x;
-    unsigned int lane = tid & 31u;
-    unsigned int warp = tid >> 5;
-    __shared__ float gate_partial[4][8];
-    __shared__ float up_partial[4][8];
-    float gate_acc[4];
-    float up_acc[4];
-    #pragma unroll
-    for (unsigned int c = 0; c < cols; ++c) {
-        gate_acc[c] = 0.0f;
-        up_acc[c] = 0.0f;
-    }
-
-    unsigned int iqs = (tid & 1u) * 2u;
-    for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
-        const unsigned char* q8_bp = q8_input + block * 36u;
-#include "q4_q8_half_block_load.cuh"
-
-        #pragma unroll
-        for (unsigned int c = 0u; c < cols; ++c) {
-            if (c + 1u < cols && (tid & 1u) == 0u) {
-                antfly_quant_rows_prefetch_l2(weight_gate + ((col_tile + c + 1u) * row_blocks + block) * 18u);
-                antfly_quant_rows_prefetch_l2(weight_up + ((col_tile + c + 1u) * row_blocks + block) * 18u);
-            }
-            unsigned int col = col_tile + c;
-            const unsigned char* gate_bp = weight_gate + (col * row_blocks + block) * 18u;
-            const unsigned char* up_bp = weight_up + (col * row_blocks + block) * 18u;
-            gate_acc[c] += termite_q4_0_q8_1_partial_mmvq2(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-            up_acc[c] += termite_q4_0_q8_1_partial_mmvq2(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
-        }
-    }
-
-    #pragma unroll
-    for (unsigned int c = 0; c < cols; ++c) {
-        float gate_sum = termite_warp_reduce_sum(gate_acc[c]);
-        float up_sum = termite_warp_reduce_sum(up_acc[c]);
-        if (lane == 0u && warp < 8u) {
-            gate_partial[c][warp] = gate_sum;
-            up_partial[c][warp] = up_sum;
-        }
-    }
-    __syncthreads();
-    if (tid == 0u) {
-        #pragma unroll
-        for (unsigned int c = 0; c < cols; ++c) {
-            float gate_y = 0.0f;
-            float up_y = 0.0f;
-            #pragma unroll
-            for (unsigned int w = 0; w < 8u; ++w) {
-                gate_y += gate_partial[c][w];
-                up_y += up_partial[c][w];
-            }
-            dst[col_tile + c] = termite_decoder_activation_f32(gate_y, activation) * up_y;
-        }
-    }
+{{fixed_pair_prefetch}}
 }
 
 extern "C" __global__ void antfly_gemma4_e4b_down_prefetch_l2(

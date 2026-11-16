@@ -14,4 +14,4 @@
 // limitations under the License.
 
 //! Qualified operation/layout schedule; historical device symbols are ABI adapters.
-pub const source_0 = @embedFile("cuda/quant_rows_prefetch_l2.cu");
+pub const source_0 = @import("../../native_program.zig").render(@embedFile("cuda/quant_rows_prefetch_l2.cu"), .{ .fixed_pair_prefetch = @import("cuda_phases.zig").fixedRowPair(80, true) });

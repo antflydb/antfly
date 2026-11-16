@@ -45,29 +45,14 @@ extern "C" __global__ void termite_gemma4_a4b_q4_0_gate_up_rows_q8_1_f32(ANTFLY_
             }
         }
     }
-#pragma unroll
-    for (unsigned int c = 0u; c < cols; ++c) {
-        const float gate_sum = termite_warp_reduce_sum(gate_acc[c]);
-        const float up_sum = termite_warp_reduce_sum(up_acc[c]);
-        if (lane == 0u && warp < 8u) {
-            gate_partial[c][warp] = gate_sum;
-            up_partial[c][warp] = up_sum;
-        }
-    }
+{{q4q8_pair_warp_routed}}
     __syncthreads();
     if (tid == 0u) {
 #pragma unroll
         for (unsigned int c = 0u; c < cols; ++c) {
             const unsigned int col = col_tile + c;
             if (col < out_dim) {
-                float gate_y = 0.0f;
-                float up_y = 0.0f;
-#pragma unroll
-                for (unsigned int w = 0u; w < 8u; ++w) {
-                    gate_y += gate_partial[c][w];
-                    up_y += up_partial[c][w];
-                }
-                dst[(size_t)route * out_dim + col] = termite_decoder_activation_f32(gate_y, activation) * up_y;
+{{pair_result_routed}}
             }
         }
     }

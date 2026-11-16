@@ -10588,7 +10588,7 @@ extern "C" __global__ void termite_gemma4_a4b_q4_0_gate_up_rows_q8_1_f32(ANTFLY_
             }
         }
     }
-#pragma unroll
+    #pragma unroll
     for (unsigned int c = 0u; c < cols; ++c) {
         const float gate_sum = termite_warp_reduce_sum(gate_acc[c]);
         const float up_sum = termite_warp_reduce_sum(up_acc[c]);
@@ -10605,7 +10605,7 @@ extern "C" __global__ void termite_gemma4_a4b_q4_0_gate_up_rows_q8_1_f32(ANTFLY_
             if (col < out_dim) {
                 float gate_y = 0.0f;
                 float up_y = 0.0f;
-#pragma unroll
+                #pragma unroll
                 for (unsigned int w = 0u; w < 8u; ++w) {
                     gate_y += gate_partial[c][w];
                     up_y += up_partial[c][w];
@@ -10744,6 +10744,7 @@ __device__ __forceinline__ void termite_e4b_ffn_pair_impl(float* dst,
 
         #pragma unroll
         for (unsigned int c = 0u; c < cols; ++c) {
+
             unsigned int col = col_tile + c;
             const unsigned char* gate_bp = weight_gate + (col * row_blocks + block) * 18u;
             const unsigned char* up_bp = weight_up + (col * row_blocks + block) * 18u;
@@ -10765,14 +10766,14 @@ __device__ __forceinline__ void termite_e4b_ffn_pair_impl(float* dst,
     if (tid == 0u) {
         #pragma unroll
         for (unsigned int c = 0; c < cols; ++c) {
-            float gate_y = 0.0f;
-            float up_y = 0.0f;
-            #pragma unroll
-            for (unsigned int w = 0; w < Warps; ++w) {
-                gate_y += gate_partial[c][w];
-                up_y += up_partial[c][w];
-            }
-            dst[col_tile + c] = termite_decoder_activation_f32(gate_y, activation) * up_y;
+                float gate_y = 0.0f;
+                float up_y = 0.0f;
+                #pragma unroll
+                for (unsigned int w = 0; w < Warps; ++w) {
+                    gate_y += gate_partial[c][w];
+                    up_y += up_partial[c][w];
+                }
+                dst[col_tile + c] = termite_decoder_activation_f32(gate_y, activation) * up_y;
         }
     }
 }

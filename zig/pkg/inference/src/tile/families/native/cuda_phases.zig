@@ -172,10 +172,12 @@ pub const projection = .{
     .q4q8_pair_dot_u32_inner = program.render(q4q8_pair_dot, .{ .indent = "                ", .index_cast = "" }),
     .q4q8_pair_dot_u64_inner = program.render(q4q8_pair_dot, .{ .indent = "                ", .index_cast = "(size_t)" }),
     .q4q8_pair_dot_u32_tail = program.render(q4q8_pair_dot, .{ .indent = "                    ", .index_cast = "" }),
-    .q4q8_pair_dot_u32_full = program.render(q4q8_pair_dot, .{ .indent = "            ", .index_cast = "" }),
-    .q4q8_pair_warp_tile8 = program.render(q4q8_pair_warp, .{ .cols = "8u", .warps = "4u" }),
-    .q4q8_pair_warp_tile4 = program.render(q4q8_pair_warp, .{ .cols = "4u", .warps = "Warps" }),
-    .q4q8_pair_warp_fixed = program.render(q4q8_pair_warp, .{ .cols = "cols", .warps = "Warps" }),
+    .q4q8_pair_warp_tile8 = pairWarp("8u", "4u", false),
+    .q4q8_pair_warp_tile4 = pairWarp("4u", "Warps", false),
+    .q4q8_pair_warp_scalar = pairWarp("4u", "4u", false),
+    .q4q8_pair_warp_routed = pairWarp("cols", "8u", true),
+    .pair_result_row_warps = pairResult("Warps", "0", "dst[row * out_dim + col]"),
+    .pair_result_routed = pairResult("8u", "0u", "dst[(size_t)route * out_dim + col]"),
     .pair_projection_tile =
     \\    unsigned int global = blockIdx.x;
     \\    unsigned int row = global / tiles_per_row;
@@ -221,19 +223,12 @@ pub const projection = .{
     \\        }
     \\    }
     ,
-    .gate_up_warp_publish =
-    \\            unsigned int col = col_tile + c;
-    \\            if (col < out_dim) {
-    \\                float gate_y = 0.0f;
-    \\                float up_y = 0.0f;
-    \\                #pragma unroll
-    \\                for (unsigned int w = 0; w < 4u; ++w) {
-    \\                    gate_y += gate_partial[c][w];
-    \\                    up_y += up_partial[c][w];
-    \\                }
-    \\                dst[row * out_dim + col] = termite_decoder_activation_f32(gate_y, activation) * up_y;
-    \\            }
-    ,
+    .gate_up_warp_publish = program.render(
+        \\            unsigned int col = col_tile + c;
+        \\            if (col < out_dim) {
+        \\{{result}}
+        \\            }
+    , .{ .result = pairResult("4u", "0", "dst[row * out_dim + col]") }),
     .qkv_planes =
     \\    const unsigned char* weight;
     \\    float* dst;
@@ -289,17 +284,36 @@ const q4q8_pair_dot =
     \\{{indent}}up_acc[c] += termite_q4_0_q8_1_partial_mmvq2(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
 ;
 
-const q4q8_pair_warp =
-    \\    #pragma unroll
-    \\    for (unsigned int c = 0; c < {{cols}}; ++c) {
-    \\        float gate_sum = termite_warp_reduce_sum(gate_acc[c]);
-    \\        float up_sum = termite_warp_reduce_sum(up_acc[c]);
-    \\        if (lane == 0u && warp < {{warps}}) {
-    \\            gate_partial[c][warp] = gate_sum;
-    \\            up_partial[c][warp] = up_sum;
-    \\        }
-    \\    }
-;
+/// Original two-plane warp publication; barriers stay with each caller.
+/// Routed storage retains const temporaries and its unsigned loop literal.
+pub fn pairWarp(comptime cols: []const u8, comptime warps: []const u8, comptime routed: bool) []const u8 {
+    return program.render(
+        \\    #pragma unroll
+        \\    for (unsigned int c = {{zero}}; c < {{cols}}; ++c) {
+        \\        {{qualifier}}float gate_sum = termite_warp_reduce_sum(gate_acc[c]);
+        \\        {{qualifier}}float up_sum = termite_warp_reduce_sum(up_acc[c]);
+        \\        if (lane == 0u && warp < {{warps}}) {
+        \\            gate_partial[c][warp] = gate_sum;
+        \\            up_partial[c][warp] = up_sum;
+        \\        }
+        \\    }
+    , .{ .cols = cols, .warps = warps, .zero = if (routed) "0u" else "0", .qualifier = if (routed) "const " else "" });
+}
+
+/// Ordered warp-partial fold and fused activation/publication. Bounds and
+/// output index width belong to the schedule binding, outside this phase.
+pub fn pairResult(comptime warps: []const u8, comptime zero: []const u8, comptime destination: []const u8) []const u8 {
+    return program.render(
+        \\                float gate_y = 0.0f;
+        \\                float up_y = 0.0f;
+        \\                #pragma unroll
+        \\                for (unsigned int w = {{zero}}; w < {{warps}}; ++w) {
+        \\                    gate_y += gate_partial[c][w];
+        \\                    up_y += up_partial[c][w];
+        \\                }
+        \\                {{destination}} = termite_decoder_activation_f32(gate_y, activation) * up_y;
+    , .{ .warps = warps, .zero = zero, .destination = destination });
+}
 
 // Preserve the array extents, lane reductions, and full/tail paths of each schedule.
 const q4q8_rows =
@@ -502,4 +516,62 @@ fn relativeSoftmax(comptime training_mode: bool) []const u8 {
         .barrier = "__syncthreads();",
         .planes = &.{.{ .partial = "reduction", .value = "local_sum" }},
     }), .training = training_mode, .score_function = "antfly_relative_attention_score_f32", .denominator = if (training_mode) "denominator" else "denom" });
+}
+
+/// Four-column fixed-row Q4/Q8 paired projection. Static L2 prefetching
+/// preserves each future-column issue point; neither traversal nor folds move.
+pub fn fixedRowPair(comptime row_blocks: u32, comptime prefetch_l2: bool) []const u8 {
+    return program.render(
+        \\    const unsigned int cols = 4u;
+        \\    const unsigned int row_blocks = {{row_blocks}}u;
+        \\    unsigned int col_tile = blockIdx.x * cols;
+        \\    unsigned int tid = threadIdx.x;
+        \\    unsigned int lane = tid & 31u;
+        \\    unsigned int warp = tid >> 5;
+        \\    __shared__ float gate_partial[4][{{warps}}];
+        \\    __shared__ float up_partial[4][{{warps}}];
+        \\    float gate_acc[4];
+        \\    float up_acc[4];
+        \\    #pragma unroll
+        \\    for (unsigned int c = 0; c < cols; ++c) {
+        \\        gate_acc[c] = 0.0f;
+        \\        up_acc[c] = 0.0f;
+        \\    }
+        \\
+        \\    unsigned int iqs = (tid & 1u) * 2u;
+        \\    for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
+        \\        const unsigned char* q8_bp = q8_input + block * 36u;
+        \\#include "{{half_load_include}}"
+        \\
+        \\        #pragma unroll
+        \\        for (unsigned int c = 0u; c < cols; ++c) {
+        \\{{prefetch}}
+        \\            unsigned int col = col_tile + c;
+        \\{{dot}}
+        \\        }
+        \\    }
+        \\
+        \\{{warp_publish}}
+        \\    __syncthreads();
+        \\    if (tid == 0u) {
+        \\        #pragma unroll
+        \\        for (unsigned int c = 0; c < cols; ++c) {
+        \\{{result}}
+        \\        }
+        \\    }
+    , .{
+        .row_blocks = @import("std").fmt.comptimePrint("{d}", .{row_blocks}),
+        .half_load_include = if (prefetch_l2) "q4_q8_half_block_load.cuh" else "../kernels/q4_q8_half_block_load.cuh",
+        .warps = if (prefetch_l2) "8" else "Warps",
+        .warp_publish = pairWarp("cols", if (prefetch_l2) "8u" else "Warps", false),
+        .dot = program.render(q4q8_pair_dot, .{ .indent = "            ", .index_cast = "" }),
+        .result = pairResult(if (prefetch_l2) "8u" else "Warps", "0", "dst[col_tile + c]"),
+        .prefetch = if (prefetch_l2)
+            \\            if (c + 1u < cols && (tid & 1u) == 0u) {
+            \\                antfly_quant_rows_prefetch_l2(weight_gate + ((col_tile + c + 1u) * row_blocks + block) * 18u);
+            \\                antfly_quant_rows_prefetch_l2(weight_up + ((col_tile + c + 1u) * row_blocks + block) * 18u);
+            \\            }
+        else
+            "",
+    });
 }

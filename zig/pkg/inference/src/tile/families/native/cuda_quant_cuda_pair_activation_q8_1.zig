@@ -92,14 +92,7 @@ const pair_activation_program =
     \\        for (unsigned int c = 0; c < 4u; ++c) {
     \\            unsigned int col = col_tile + c;
     \\            if (full_tile || col < out_dim) {
-    \\                float gate_y = 0.0f;
-    \\                float up_y = 0.0f;
-    \\                #pragma unroll
-    \\                for (unsigned int w = 0; w < Warps; ++w) {
-    \\                    gate_y += gate_partial[c][w];
-    \\                    up_y += up_partial[c][w];
-    \\                }
-    \\                dst[row * out_dim + col] = termite_decoder_activation_f32(gate_y, activation) * up_y;
+    \\{{pair_result_row_warps}}
     \\            }
     \\        }
     \\    }

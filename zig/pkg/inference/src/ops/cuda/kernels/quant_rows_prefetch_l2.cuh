@@ -128,14 +128,14 @@ extern "C" __global__ void antfly_gemma4_e4b_pair_prefetch_l2(
     if (tid == 0u) {
         #pragma unroll
         for (unsigned int c = 0; c < cols; ++c) {
-            float gate_y = 0.0f;
-            float up_y = 0.0f;
-            #pragma unroll
-            for (unsigned int w = 0; w < 8u; ++w) {
-                gate_y += gate_partial[c][w];
-                up_y += up_partial[c][w];
-            }
-            dst[col_tile + c] = termite_decoder_activation_f32(gate_y, activation) * up_y;
+                float gate_y = 0.0f;
+                float up_y = 0.0f;
+                #pragma unroll
+                for (unsigned int w = 0; w < 8u; ++w) {
+                    gate_y += gate_partial[c][w];
+                    up_y += up_partial[c][w];
+                }
+                dst[col_tile + c] = termite_decoder_activation_f32(gate_y, activation) * up_y;
         }
     }
 }
