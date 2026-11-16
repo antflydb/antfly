@@ -25687,8 +25687,8 @@ pub const DB = struct {
     /// entry, after protocol/route admission; this method establishes no leader
     /// authority on its own. Plan, BEGIN, completion credits and applied marker
     /// are committed in the same native transaction.
-    pub fn beginReplicatedCompletionTransaction(self: *DB, encoded_plan: []const u8, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt) !transactions_mod.TxnId {
-        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedCompletionTransaction", .{ self, encoded_plan, timestamp_ns, created_at_ns, retain_terminal, identity });
+    pub fn beginReplicatedCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: ?@import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity });
         const completion = @import("../transaction_completion.zig");
         if (self.isClosed()) return error.StorageUnavailable;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -25701,6 +25701,11 @@ pub const DB = struct {
         if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
         const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
         _ = try plan.member(namespace);
+        if (plan.version == 2) {
+            const binding = owner orelse return error.InvalidHistoryAdmission;
+            try plan.requireRoutedOwner(binding);
+            if (!std.mem.eql(u8, &binding.namespace, &namespace) or binding.root_generation != self.core.root_generation) return error.HistoryResynchronizationRequired;
+        } else if (owner != null) return error.ChangefeedCapabilityUnsupported;
         {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();

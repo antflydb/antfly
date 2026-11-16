@@ -2373,6 +2373,37 @@ versioned BEGIN, verify physical identity at native apply, then complete the
 all-applying-member activation and production coordinator path. Full public
 feed, bootstrap, destination and existing CDC client qualification remain open.
 
+## In progress: carry and apply routed completion owner context
+
+Versioned private BEGIN now carries `completion_owner` for v2 admission. The
+codec requires it to match the frozen participant fence and BEGIN topology
+epoch, preserves its fixed-size fields through owned decode, and rejects the
+context on legacy BEGIN or legacy v1 admission. V1 low-level contracts retain
+their previous behavior without this field.
+
+The private native applying method now accepts that owner context and verifies
+the v2 plan binding plus the actual opened namespace and `core.root_generation`
+before admitting BEGIN or its applied marker. A matching plan/context for a
+replacement root still fails against the actual physical DB. The typed engine
+boundary is descriptor 42. Metadata cluster/table binding assertions still need
+trusted live catalog admission before proposal; the native check alone does
+not prove current catalog or leader authority.
+
+The source `ordered-history-consumer-test` passed all seven selected tests,
+and the completion BEGIN wire tests passed in `completion-owner-wire-test.log`.
+They cover owner round-trip, missing owner, changed root context, topology
+mismatch and a forged mutually matching plan/context for a different physical
+generation without advancing the applied cut. The combined command's
+`history-resolution-owner-test` also passed against descriptor 42, and the
+combined command completed with exit 0. Source catalog generation completed.
+
+Production dispatch remains disabled at the reserved protocol floor until live
+catalog/owner admission and activation are complete. PREPARE must also carry and
+check its current owner context against the frozen member and actual physical
+root on every vote/retry; an input digest alone cannot authorize a replacement
+owner after restore or movement. This still needs native/request wiring. All
+remaining full issue requirements remain outstanding.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

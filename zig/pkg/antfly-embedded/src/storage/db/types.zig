@@ -216,6 +216,7 @@ pub const TransactionMutation = union(enum) {
         participants: []const []const u8,
         /// Exact checksummed frozen plan; encoded only as begin_completion_v1.
         completion_admission: ?[]const u8 = null,
+        completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
     },
     prepare: struct {
         txn_id: TxnId,
