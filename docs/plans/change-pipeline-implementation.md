@@ -3241,3 +3241,70 @@ successful signed remote decision recovery and complete certificate assembly.
 OpenAPI generation, formatting, license and diff checks passed. The existing
 application/source coordinator and background completion driver still require
 integration; neither issue is ready to close.
+
+### Completion recovery from retained coordinator evidence
+
+A bounded recovery pass now consumes the qualified retained coordinator decision,
+validates every original participant route against one authoritative catalog
+generation before making recovery writes, and uses retained v3 owners throughout.
+Pending/absent observations never authorize a write. A positive durable commit
+can submit only the same terminal resolution or the complete certificate; this
+path cannot reconstruct BEGIN or PREPARE from current rows or routing.
+
+The pass collects qualified immutable resolutions for every member, including
+guard-only and checkpoint-only roots. Missing resolution evidence after one
+idempotent terminal attempt keeps the pass incomplete. It builds a certificate
+only after all positive receipts exist, then observes or publishes the exact
+certificate at every original owner. It reports completion only when all owners
+return matching publication evidence. Unknown mutation outcomes return immediately;
+a subsequent pass rereads the durable decision and reconciles retained receipts
+and publication journals instead of replaying an uncertain mutation in a loop.
+Completion is neither source ACK nor retention-release authority.
+
+The DataServer exposes the composed recovery source using its existing catalog,
+decision/resolution/publication ports and canonical routed Raft writer. The native
+Raft fixture invokes recovery over signed remote read/write ports before manual
+publication, then repeats it to verify journal reconciliation. A two-member
+stateful test covers guard/checkpoint participants, missing resolutions,
+publication applied before a lost reply, and non-committed decisions. Build and
+qualification results are pending. Background scheduling and application/source
+coordinator integration remain required.
+
+The first driver run in `completion-recovery-driver-test.log` passed all ten
+real-Raft and recovery cases with zero failures, skips or leaks. The native fixture
+published its certificate through recovery before the legacy/manual retry calls.
+The retained-terminal submission API takes the exact original decision query and
+observation, so it validates the original request digest rather than inventing a
+new lookup minimum. It now also supports an authoritative abort: it uses the
+record's original finalization time for terminal abort delivery, and cannot
+publish a certificate for an aborted decision. A final run verifies propagation
+to both original owners while publication counts remain unchanged.
+
+The remaining background hook is concrete: native transaction maintenance calls
+`transaction_recovery_source.Source` through the storage-owner callback bridge.
+Its existing resolver carries transaction ID, participant locator and terminal
+status, but lacks the retained original coordinator owner needed by this driver.
+Integration must carry that retained identity from the native admission, reread
+its decision through the qualified port, and execute on the elected control
+worker without retaining a native lease across Raft apply. It must preserve the
+legacy recovery path for transactions without a completion admission. Normal
+application/source admission and bounded fanout/recovery qualification remain
+outstanding; exposing the DataServer recovery composition alone does not finish
+those integrations.
+
+`completion-recovery-terminal-test.log` passed all ten recovery/Raft cases with
+exit 0 and zero failures, skips or leaks. The two-member case confirms abort
+delivery to both original owners without creating a certificate or advancing
+publication counts. A final cancellation guard now runs after the last resolution
+read before returning an incomplete result; its regression cancels precisely on
+the second, still-missing follower observation and verifies that no publication
+is submitted. Final qualification is pending.
+
+`completion-recovery-qualified-test.log` completed with exit 0: all ten
+recovery/Raft cases passed again, with no failures, skips or leaks. This includes
+the last-read cancellation regression, authoritative abort delivery to both
+members, guard/checkpoint completion, unknown publication reconciliation and
+native signed-HTTP certificate publication. Formatting, license, engine-error
+generation and diff checks passed. The full goal remains incomplete: scheduled
+recovery/admission integration, bounded fanout, destination/source wiring,
+retention/bootstrap, public feeds and actual CDC-client qualification remain.

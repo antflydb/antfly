@@ -55,16 +55,7 @@ pub const Port = struct {
         const owner = participant.owner;
         try plan.admission.requireRoutedOwner(owner);
         const locator = local.api_local_transaction_contract.parseParticipantRef(participant.locator) orelse return error.InvalidParticipant;
-        const identity = fence.route.identity_namespace;
-        var namespace: [24]u8 = undefined;
-        std.mem.writeInt(u64, namespace[0..8], identity.table_id, .big);
-        std.mem.writeInt(u64, namespace[8..16], identity.shard_id, .big);
-        std.mem.writeInt(u64, namespace[16..24], identity.range_id, .big);
-        if (fence.metadata_group_id != owner.metadata_group_id or fence.metadata_incarnation == null or
-            !std.mem.eql(u8, &fence.metadata_incarnation.?, &owner.metadata_incarnation) or
-            fence.table_id != identity.table_id or fence.topology_epoch != owner.topology_epoch or
-            fence.route.group_id != owner.group_id or locator.group_id != owner.group_id or
-            !std.mem.eql(u8, &namespace, &owner.namespace)) return error.TopologyChanged;
+        try validateParticipantFence(owner, locator.group_id, fence);
         var parsed_prepare: ?batch.OwnedBatchRequest = null;
         defer if (parsed_prepare) |*parsed| parsed.deinit(a);
         var parsed_certificate: ?std.json.Parsed(completion.Envelope) = null;
@@ -87,20 +78,66 @@ pub const Port = struct {
                 break :blk .{ .sync_level = .write, .transaction = .{ .publish_completion = .{ .txn_id = plan.admission.transaction_id, .completion_owner = owner, .certificate = bytes } } };
             },
         };
+        return self.writeRequest(a, fence, owner, locator.table_name, request, context, scope.deadline_ns);
+    }
+    /// Recovery submits only the already durable terminal decision or its full
+    /// certificate. It never reconstructs BEGIN/PREPARE from current rows.
+    pub fn submitRetained(self: Port, a: A, lookup: @import("history_decision_operations.zig").wire.Query, observation: @import("history_decision_operations.zig").wire.Reply, index: usize, fence: metadata.CatalogRouteFence, phase: union(enum) { resolve, publish: []const u8 }, original: operation.RequestContext) !void {
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
         try context.ensureActive();
-        const remaining = scope.deadline_ns -| time.monotonicNs();
+        const decision = observation.decision orelse return error.SourceOutcomeUnresolved;
+        const admission = decision.admission.admission;
+        try observation.validate(lookup);
+        if (decision.record.status == .pending) return error.SourceOutcomeUnresolved;
+        if (index >= admission.participants.len) return error.InvalidParticipant;
+        const member = admission.participants[index];
+        const owner = try admission.recoveryOwner(member.namespace);
+        const locator = local.api_local_transaction_contract.parseParticipantRef(member.locator) orelse return error.InvalidParticipant;
+        try validateParticipantFence(owner, locator.group_id, fence);
+        var parsed: ?std.json.Parsed(completion.Envelope) = null;
+        defer if (parsed) |*value| value.deinit();
+        const request: types.BatchRequest = switch (phase) {
+            .resolve => .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = owner, .txn_id = admission.transaction_id, .status = if (decision.record.status == .committed) .committed else .aborted, .commit_version = if (decision.record.status == .committed) decision.record.commit_version else decision.record.finalized_at_ns } } },
+            .publish => |bytes| blk: {
+                const manifest = try decision.committedManifest();
+                parsed = try completion.parse(a, bytes);
+                if (!std.mem.eql(u8, &parsed.?.value.certificate.manifest.digest(), &manifest.digest())) return error.SourceTransactionIdentityConflict;
+                break :blk .{ .sync_level = .write, .transaction = .{ .publish_completion = .{ .txn_id = admission.transaction_id, .completion_owner = owner, .certificate = bytes } } };
+            },
+        };
+        return self.writeRequest(a, fence, owner, locator.table_name, request, context, scope.deadline_ns);
+    }
+
+    fn writeRequest(self: Port, a: A, fence: metadata.CatalogRouteFence, owner: completion.RoutedOwner, table: []const u8, request: types.BatchRequest, context: operation.RequestContext, deadline_ns: u64) !void {
+        try context.ensureActive();
+        const remaining = deadline_ns -| time.monotonicNs();
         if (remaining == 0) return error.DeadlineExceeded;
         const budget_ms: u32 = @intCast(@min(@as(u64, forwarding_mod.max_remaining_ms), std.math.divCeil(u64, remaining, std.time.ns_per_ms) catch unreachable));
         var bounded_fence = fence;
-        bounded_fence.admission_deadline_ns = scope.deadline_ns;
+        bounded_fence.admission_deadline_ns = deadline_ns;
         bounded_fence.admission_deadline_io = null;
         bounded_fence.admission_cancellation = context.cancellation;
-        _ = (try self.writer.write(a, .{ .catalog = bounded_fence }, owner.group_id, locator.table_name, request, .{ .remaining_ms = budget_ms, .forwards_remaining = forwarding_mod.max_forwards, .campaign_allowed = false }, context)) orelse return error.UnknownGroup;
+        _ = (try self.writer.write(a, .{ .catalog = bounded_fence }, owner.group_id, table, request, .{ .remaining_ms = budget_ms, .forwards_remaining = forwarding_mod.max_forwards, .campaign_allowed = false }, context)) orelse return error.UnknownGroup;
         // A caller-scope failure after dispatch cannot be reported as a safe
         // pre-proposal failure, even when the transport returned normally.
         context.ensureActive() catch return error.RaftBatchWriteOutcomeUnknown;
     }
 };
+
+fn validateParticipantFence(owner: completion.RoutedOwner, locator_group: u64, fence: metadata.CatalogRouteFence) !void {
+    try fence.validate();
+    const identity = fence.route.identity_namespace;
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], identity.table_id, .big);
+    std.mem.writeInt(u64, namespace[8..16], identity.shard_id, .big);
+    std.mem.writeInt(u64, namespace[16..24], identity.range_id, .big);
+    if (fence.metadata_group_id != owner.metadata_group_id or fence.metadata_incarnation == null or
+        !std.mem.eql(u8, &fence.metadata_incarnation.?, &owner.metadata_incarnation) or
+        fence.table_id != identity.table_id or fence.topology_epoch != owner.topology_epoch or
+        fence.route.group_id != owner.group_id or locator_group != owner.group_id or
+        !std.mem.eql(u8, &namespace, &owner.namespace)) return error.TopologyChanged;
+}
 
 /// One signed HTTP attempt to the selected participant endpoint. Endpoint
 /// discovery belongs to the coordinator's original routing authority.

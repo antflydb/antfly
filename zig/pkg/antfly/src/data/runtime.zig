@@ -12275,6 +12275,10 @@ pub const DataServer = struct {
         return owner.restoreOwnerControl(alloc, group_id, table_name, descriptor, input, if (local_term != null) .{ .ptr = &proposal, .propose = Proposal.propose } else null, .{ .secret_store = self.api_server_cfg.secret_store, .node_config = self.api_server_cfg.node_config }, context);
     }
 
+    pub fn completionRecovery(self: *DataServer) @import("../api/completion_recovery.zig").Recovery {
+        return .{ .catalog = self.write_source.catalog, .decisions = self.historyDecisionPort(), .resolutions = self.historyResolutionPort(), .publications = self.historyPublicationPort(), .participants = self.completionParticipantPort() };
+    }
+
     pub fn completionParticipantPort(self: *DataServer) @import("../api/completion_participant.zig").Port {
         return .{ .writer = self.routedRaftBatchWriter() };
     }
@@ -44202,13 +44206,17 @@ fn consumerTests() type {
                 var checked_certificate = try completion_contract.parse(a, certificate_bytes);
                 defer checked_certificate.deinit();
                 try std.testing.expectEqual(@as(usize, 1), checked_certificate.value.certificate.resolutions.len);
-                try server.completionParticipantPort().submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
-                // Replay through signed HTTP preserves the immutable certificate
-                // and first publication position, rather than a legacy RPC.
+                // Recovery and replay use signed HTTP, preserving the immutable
+                // certificate and its first publication position.
                 var publication_client = antfly.public_api.ApiHttpClient.init(a, try origin.distributedReadExecutor());
                 _ = publication_client.withInternalServiceAuth(secret, "history-runtime");
                 var remote_writer: @import("../api/completion_participant.zig").HttpWriter = .{ .client = &publication_client, .base_uri = base };
                 const remote_participant: @import("../api/completion_participant.zig").Port = .{ .writer = remote_writer.writer() };
+                var recovery = origin.completionRecovery();
+                recovery.participants = remote_participant;
+                try std.testing.expectEqual(.complete, try recovery.run(a, current_owner, route.fence().?, "docs", txn_id, .{}));
+                try std.testing.expectEqual(.complete, try recovery.run(a, current_owner, route.fence().?, "docs", txn_id, .{}));
+                try server.completionParticipantPort().submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
                 try remote_participant.submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
                 try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
                 // An idle root must remain readable after an ordered protocol
