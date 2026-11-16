@@ -111,14 +111,34 @@ pub fn topologyJsonAlloc(alloc: Allocator, tables: []const TableInfo, collect: C
     return std.json.Stringify.valueAlloc(alloc, .{ .table_id = own_identity, .inbound = wire }, .{});
 }
 
+/// Maps a public (logical) table name to its storage name, authorizing the
+/// caller to read it. Returns null when no such table exists. Server catalog
+/// entries are keyed by storage name (`table:<hash>`), so admission must not
+/// match public names against them directly.
+pub const PublicNameResolver = struct {
+    ptr: *anyopaque,
+    resolve_fn: *const fn (ptr: *anyopaque, alloc: Allocator, public_name: []const u8) anyerror!?[]u8,
+};
+
+const NameLookup = struct {
+    tables: []const TableInfo,
+    names: ?PublicNameResolver,
+};
+
 /// Table-name resolution for admission.
-pub fn resolver(tables: *const []const TableInfo) ctx.TableResolver {
-    return .{ .ptr = @ptrCast(@constCast(tables)), .resolve_fn = resolveName };
+fn resolver(lookup: *const NameLookup) ctx.TableResolver {
+    return .{ .ptr = @ptrCast(@constCast(lookup)), .resolve_fn = resolveName };
 }
 
 fn resolveName(ptr: *anyopaque, alloc: Allocator, name: []const u8) anyerror!?[]u8 {
-    const tables: *const []const TableInfo = @ptrCast(@alignCast(ptr));
-    const found = findByName(tables.*, name) orelse return null;
+    const lookup: *const NameLookup = @ptrCast(@alignCast(ptr));
+    const names = lookup.names orelse {
+        const found = findByName(lookup.tables, name) orelse return null;
+        return try identityAlloc(alloc, found.table_id);
+    };
+    const storage = (try names.resolve_fn(names.ptr, alloc, name)) orelse return null;
+    defer alloc.free(storage);
+    const found = findByName(lookup.tables, storage) orelse return null;
     return try identityAlloc(alloc, found.table_id);
 }
 
@@ -135,12 +155,28 @@ pub fn admitAlloc(
     refresh_value: ?std.json.Value,
     lowering: ?ctx.FilterLowering,
 ) ![]u8 {
+    return admitResolvingAlloc(alloc, tables, collect, owner_table, enrichment_name, sources_value, refresh_value, lowering, null);
+}
+
+/// `admitAlloc` where `owner_table` is a storage name and declared source
+/// tables are public names mapped through `names`.
+pub fn admitResolvingAlloc(
+    alloc: Allocator,
+    tables: []const TableInfo,
+    collect: CollectEnrichments,
+    owner_table: []const u8,
+    enrichment_name: []const u8,
+    sources_value: std.json.Value,
+    refresh_value: ?std.json.Value,
+    lowering: ?ctx.FilterLowering,
+    names: ?PublicNameResolver,
+) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
     const owner = findByName(tables, owner_table) orelse return error.ContextSourceTableUnavailable;
-    var table_list = tables;
-    const stored = try ctx.canonicalFromPublicAlloc(a, sources_value, refresh_value, resolver(&table_list), lowering);
+    const lookup = NameLookup{ .tables = tables, .names = names };
+    const stored = try ctx.canonicalFromPublicAlloc(a, sources_value, refresh_value, resolver(&lookup), lowering);
     var config = try ctx.parseStoredJson(a, stored);
     defer config.deinit();
     const owner_identity = try identityAlloc(a, owner.table_id);
@@ -365,6 +401,46 @@ fn testCollect(a: Allocator, indexes_json: []const u8) anyerror![]const db_types
     const out = try a.alloc(db_types.EnrichmentConfig, parsed.enrichments.len);
     for (parsed.enrichments, out) |e, *c| c.* = .{ .name = e.name, .kind = .asset, .context_sources_json = e.context_sources_json, .source_artifact_name = e.source_artifact_name };
     return out;
+}
+
+test "context host admission maps public source names to storage names" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const collect = CollectEnrichments{ .collect_fn = testCollect };
+    // Server catalogs key tables by storage name, never by public name.
+    const tables = [_]TableInfo{
+        .{ .table_id = 7, .name = "table:aa", .indexes_json = "{}" },
+        .{ .table_id = 9, .name = "table:bb", .indexes_json = "{}" },
+    };
+    const Names = struct {
+        fn resolve(_: *anyopaque, ra: Allocator, public_name: []const u8) anyerror!?[]u8 {
+            if (std.mem.eql(u8, public_name, "orgs")) return try ra.dupe(u8, "table:aa");
+            if (std.mem.eql(u8, public_name, "secret")) return error.Forbidden;
+            return null;
+        }
+    };
+    var unused: u8 = 0;
+    const names = PublicNameResolver{ .ptr = &unused, .resolve_fn = Names.resolve };
+    const sources = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \{"org":{"document":{"table":"orgs","key_from":"/org"},"fields":["name"]}}
+    , .{});
+    const stored = try admitResolvingAlloc(alloc, &tables, collect, "table:bb", "summary", sources, null, null, names);
+    defer alloc.free(stored);
+    try std.testing.expect(std.mem.indexOf(u8, stored, "\"table_id\":\"srv:7\"") != null);
+    // Without the mapping the public name matches no catalog entry.
+    try std.testing.expectError(error.UnknownContextSourceTable, admitAlloc(alloc, &tables, collect, "table:bb", "summary", sources, null, null));
+    // A storage name is not accepted in place of a public name.
+    const by_storage = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \{"org":{"document":{"table":"table:aa","key_from":"/org"},"fields":["name"]}}
+    , .{});
+    try std.testing.expectError(error.UnknownContextSourceTable, admitResolvingAlloc(alloc, &tables, collect, "table:bb", "s", by_storage, null, null, names));
+    // Authorization failures surface instead of being treated as unknown.
+    const secret = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \{"org":{"document":{"table":"secret","key_from":"/org"},"fields":["name"]}}
+    , .{});
+    try std.testing.expectError(error.Forbidden, admitResolvingAlloc(alloc, &tables, collect, "table:bb", "s", secret, null, null, names));
 }
 
 test "context host admission resolves names, rejects cycles, and computes inbound topology" {
