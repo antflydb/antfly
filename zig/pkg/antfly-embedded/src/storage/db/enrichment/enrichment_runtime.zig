@@ -30897,7 +30897,11 @@ const OrderedDenseTextBatch = struct {
         const name = requestEmbeddingName(request);
         const limits: DenseBatchLimits = .{ .items = effectiveRequestEmbedBatchItems(runtime, request), .bytes = requestEmbedBatchBytes(runtime.alloc, request), .wave_owned_recovery = true };
         var planned = provider.withTextGeneration(self.generation);
-        const parallelism = if (runtime.dense_result_cache) |cache| (if (cache.concurrent) denseBatchParallelism(planned) else 1) else denseBatchParallelism(planned);
+        // Providers without computation keys never invoke memo callbacks.
+        // An attached unused memo must not restrict their execution slots.
+        const serial_memo = planned.computation_key_fn != null and
+            (if (runtime.dense_result_cache) |cache| !cache.concurrent else false);
+        const parallelism = if (serial_memo) 1 else denseBatchParallelism(planned);
         const max_items = if (self.generation.lease != null) planned.partBatchLimit(name, request.expected_dims, limits.items) catch |err| return self.failPlanning(runtime, err) else limits.items;
         // Each task owns one physical call. Its result survives sibling errors;
         // nested planners must not multiply the wave's concurrency allowance.
@@ -42844,6 +42848,7 @@ test "ordered materialized chunk embeddings preserve successful parallel sibling
 test "ordered materialized chunk embeddings honor memo callback concurrency" {
     try testOrderedChunkVectorCarry(true, .memo_serial);
     try testOrderedChunkVectorCarry(true, .memo_parallel);
+    try testOrderedChunkVectorCarry(true, .memo_unused);
 }
 
 test "ordered materialized chunk embeddings drain collection under memory pressure" {
@@ -42888,7 +42893,7 @@ test "ordered materialized chunk embeddings retain owners across planning failur
     try testOrderedChunkVectorCarry(true, .planning_retry);
 }
 
-const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, memo_serial, memo_parallel, parallel_capacity, parallel_capacity_cancel, planning_terminal, planning_retry, collection_multi, collection_contention, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current };
+const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, memo_serial, memo_parallel, memo_unused, parallel_capacity, parallel_capacity_cancel, planning_terminal, planning_retry, collection_multi, collection_contention, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current };
 
 fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
@@ -43413,10 +43418,10 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             request.* = vector_request;
             request.doc_key = key.*;
         }
-        harness.parallel = batching == .parallel or batching == .parallel_bytes or batching == .parallel_terminal or batching == .parallel_retry or batching == .parallel_cancel or batching == .memo_parallel or batching == .parallel_capacity or batching == .parallel_capacity_cancel;
+        harness.parallel = batching == .parallel or batching == .parallel_bytes or batching == .parallel_terminal or batching == .parallel_retry or batching == .parallel_cancel or batching == .memo_parallel or batching == .memo_unused or batching == .parallel_capacity or batching == .parallel_capacity_cancel;
         runtime.config.dense_embedder = .{ .dense_batch_concurrency = if (harness.parallel or batching == .parallel_oversize or batching == .memo_serial) 2 else 1, .ptr = &harness, .dense_embed_fn = Harness.embedDense, .dense_embed_batch_with_context_fn = Harness.embedDenseBatch, .cache_revision_fn = Harness.revision, .capabilities_fn = Harness.caps, .dense_embed_batch_planned_fn = Harness.planned };
-        if (batching == .memo_serial or batching == .memo_parallel) {
-            runtime.config.dense_embedder.?.computation_key_fn = Harness.computationKey;
+        if (batching == .memo_serial or batching == .memo_parallel or batching == .memo_unused) {
+            if (batching != .memo_unused) runtime.config.dense_embedder.?.computation_key_fn = Harness.computationKey;
             runtime.dense_result_cache = .{ .concurrent = batching == .memo_parallel, .ptr = &harness, .lookup = Harness.memoLookup, .remember = Harness.memoRemember };
         }
         if (batching == .parallel_capacity or batching == .parallel_capacity_cancel) {
@@ -43721,9 +43726,10 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             try std.testing.expectEqual(@as(usize, 0), harness.active.load(.acquire));
             try std.testing.expectEqual((harness.batches.items.len + 1) / 2 + 1, harness.capability_calls - capabilities_before);
         } else try std.testing.expectEqual(harness.batches.items.len + 1, harness.capability_calls - capabilities_before);
-        if (batching == .memo_serial or batching == .memo_parallel) {
-            try std.testing.expectEqual(@as(usize, count), harness.memo_lookups.load(.acquire));
-            try std.testing.expectEqual(@as(usize, count), harness.memo_writes.load(.acquire));
+        if (batching == .memo_serial or batching == .memo_parallel or batching == .memo_unused) {
+            const memo_calls: usize = if (batching == .memo_unused) 0 else count;
+            try std.testing.expectEqual(memo_calls, harness.memo_lookups.load(.acquire));
+            try std.testing.expectEqual(memo_calls, harness.memo_writes.load(.acquire));
             try std.testing.expectEqual(@as(usize, if (batching == .memo_serial) 1 else 2), harness.peak.load(.acquire));
         }
         try std.testing.expectEqual(@as(usize, count), harness.provider_calls);
