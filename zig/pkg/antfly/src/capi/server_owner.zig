@@ -1940,6 +1940,10 @@ pub fn metadataApplyStoreProjection(
             };
             break :blk metadataProjectionJson(alloc, out_json, result);
         },
+        .poll_ha_outbox => blk: {
+            handle.store.pollHotStandbyOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
         .flush_ha_outbox => blk: {
             handle.store.flushHotStandbyOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);

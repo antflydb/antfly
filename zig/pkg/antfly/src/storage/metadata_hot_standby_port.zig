@@ -25,7 +25,7 @@ pub const VTable = struct {
     identity: *const fn (*anyopaque) anyerror!Identity,
     /// On success retain the promotion lock until the native outbox deletion
     /// is durable. On error release every acquired lock and retain the outbox.
-    publish_and_lock: *const fn (*anyopaque, []const u8) anyerror!void,
+    publish_and_lock: *const fn (*anyopaque, []const u8, bool) anyerror!void,
 };
 pub const Boundary = callback.Boundary(VTable);
 pub const Port = struct {
@@ -46,7 +46,7 @@ pub const Port = struct {
     pub fn identity(self: Port) !Identity {
         return Boundary.call("identity", self.dispatch, self.vtable.identity, .{self.ptr});
     }
-    pub fn publishAndLock(self: Port, bytes: []const u8) !void {
-        try Boundary.call("publish_and_lock", self.dispatch, self.vtable.publish_and_lock, .{ self.ptr, bytes });
+    pub fn publishAndLock(self: Port, bytes: []const u8, wait_for_apply: bool) !void {
+        try Boundary.call("publish_and_lock", self.dispatch, self.vtable.publish_and_lock, .{ self.ptr, bytes, wait_for_apply });
     }
 };
