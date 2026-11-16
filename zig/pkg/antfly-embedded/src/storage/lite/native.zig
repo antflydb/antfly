@@ -8854,7 +8854,12 @@ pub const NativeFile = struct {
                     if (rc.outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
                 }
             };
-            var rctx: ReplayCtx = .{ .file = self, .io = io, .start_after_sequence = redo.durable_sequence };
+            // Records at or below the adopted checkpoint's fold boundary are
+            // already in its tree. Replaying from an older durable sequence
+            // instead walks into the sequence a deferred fold consumed
+            // without appending a record, which reads as a gap
+            // (`NativeRedoLogCorrupt`).
+            var rctx: ReplayCtx = .{ .file = self, .io = io, .start_after_sequence = @max(redo.durable_sequence, redo.checkpoint_sequence) };
             try inode_lock.withRedoOverlayLock(entry, io, &rctx, ReplayCtx.run);
 
             const outcome = rctx.outcome;
@@ -34213,6 +34218,93 @@ test "lite redo log cross-process: a forked child sees commits the parent makes 
     const go: [1]u8 = .{1};
     _ = std.c.write(go_fds[1], &go, go.len);
 
+    var report: [1]u8 = undefined;
+    try crossProcessReadBounded(result_fds[0], &report, cross_process_fork_read_timeout_ms);
+    try std.testing.expectEqual(@as(u8, 1), report[0]);
+
+    _ = std.c.kill(child_pid, std.c.SIG.KILL);
+    _ = try crossProcessReapBounded(child_pid, cross_process_fork_reap_timeout_ms);
+    child_reaped = true;
+}
+
+// A fold whose log reclaim is deferred (a reader in another process is
+// pinned behind it) consumes its checkpoint's sequence without appending a
+// record, so the log skips that sequence. Another process catching up from
+// before the fold must start after the checkpoint it adopts, not walk into
+// the skipped sequence and report the gap as `NativeRedoLogCorrupt`.
+test "lite redo log cross-process: a forked child catches up across a deferred fold's skipped sequence" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-fork-deferred-fold.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one");
+    try writer.commitTransaction();
+
+    var ready_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&ready_fds));
+    var go_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&go_fds));
+    var result_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&result_fds));
+
+    const child_pid = std.c.fork();
+    if (child_pid == 0) {
+        _ = std.posix.system.close(ready_fds[0]);
+        _ = std.posix.system.close(go_fds[1]);
+        _ = std.posix.system.close(result_fds[0]);
+        const io = std.testing.io;
+        var reader = NativeFile.openWithIo(a, io, path, .{ .read_only = true }) catch crossProcessParkForever();
+        const region = (reader.regionForInode() catch crossProcessParkForever()) orelse crossProcessParkForever();
+        region.reclaimLivenessAfterFork() catch crossProcessParkForever();
+        reader.refreshCrossProcessRedoOverlay() catch crossProcessParkForever(); // pins behind the coming fold
+        const ready: [1]u8 = .{1};
+        _ = std.c.write(ready_fds[1], &ready, ready.len);
+        var go: [1]u8 = undefined;
+        crossProcessReadBounded(go_fds[0], &go, cross_process_fork_read_timeout_ms) catch crossProcessParkForever();
+        const ok = blk: {
+            reader.refreshCrossProcessRedoOverlay() catch break :blk false;
+            const gamma = (reader.getDocumentAlloc(a, "gamma") catch break :blk false) orelse break :blk false;
+            break :blk std.mem.eql(u8, gamma, "three");
+        };
+        const report: [1]u8 = .{if (ok) 1 else 0};
+        _ = std.c.write(result_fds[1], &report, report.len);
+        crossProcessParkForever();
+    }
+    _ = std.posix.system.close(ready_fds[1]);
+    _ = std.posix.system.close(go_fds[0]);
+    _ = std.posix.system.close(result_fds[1]);
+    var child_reaped = false;
+    defer if (!child_reaped) {
+        _ = std.c.kill(child_pid, std.c.SIG.KILL);
+        _ = std.c.waitpid(child_pid, null, 0);
+    };
+    defer _ = std.posix.system.close(ready_fds[0]);
+    defer _ = std.posix.system.close(go_fds[1]);
+    defer _ = std.posix.system.close(result_fds[0]);
+
+    var ready: [1]u8 = undefined;
+    try crossProcessReadBounded(ready_fds[0], &ready, cross_process_fork_read_timeout_ms);
+
+    try writer.beginTransaction();
+    try writer.putDocument("beta", "two");
+    try writer.commitTransaction();
+    const tail_before = writer.redo.?.writer.tail;
+    try writer.checkpointRedoLog();
+    // Deferred: the child's pin is behind the fold, so the log keeps its
+    // bytes and the fold's sequence has no record.
+    try std.testing.expectEqual(tail_before, writer.redo.?.writer.tail);
+    try writer.beginTransaction();
+    try writer.putDocument("gamma", "three");
+    try writer.commitTransaction();
+
+    const go: [1]u8 = .{1};
+    _ = std.c.write(go_fds[1], &go, go.len);
     var report: [1]u8 = undefined;
     try crossProcessReadBounded(result_fds[0], &report, cross_process_fork_read_timeout_ms);
     try std.testing.expectEqual(@as(u8, 1), report[0]);
