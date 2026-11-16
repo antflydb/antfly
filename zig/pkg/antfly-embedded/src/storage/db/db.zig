@@ -85621,6 +85621,34 @@ test "producer readiness cached graph relations survive metadata overwrite and r
     try std.testing.expectEqual(@as(usize, 2), fake.extractor_calls);
 }
 
+test "producer readiness non-graph asset skips reextraction across an unrelated metadata edit" {
+    // Sibling of the graph test above: a plain asset enrichment that no
+    // graph index consumes keeps the narrower, declared-source-only reuse
+    // key (`artifactFeedsGraph` is false here), so an edit to a field the
+    // producer never reads must not force a second extractor call.
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db");
+    defer directory.cleanup();
+    var fake = TestAssetProducer{ .extractor_output = "{\"relations\":[]}" };
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{ .enrichment = .{ .asset_producer = fake.producer() } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "relations_v1",
+        .kind = .asset,
+        .field = "target_doc",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"extractor\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    for ([_][]const u8{
+        "{\"title\":\"before\",\"target_doc\":\"doc:b\"}",
+        "{\"title\":\"after\",\"target_doc\":\"doc:b\"}",
+    }) |value| {
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = value }}, .sync_level = .enrichments });
+        try db.runUntilIdle();
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+}
+
 test "db graph artifact external node targets return ids without document hydration" {
     const alloc = std.testing.allocator;
 

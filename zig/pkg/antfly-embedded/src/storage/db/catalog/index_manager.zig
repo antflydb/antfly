@@ -20582,6 +20582,24 @@ pub const IndexManager = struct {
         return null;
     }
 
+    /// True when some graph index extracts relations from this asset (or
+    /// chunk) artifact. Graph edge construction keys its producer
+    /// provenance to the exact primary-document revision it observed
+    /// (`artifact_producer_context.Token`/ordered publication's authority
+    /// path), so a local, revision-blind reuse receipt cannot stand in for
+    /// it: `reusableLocalAsset`'s skip-the-producer check must key on the
+    /// whole primary document here, not just the producer's declared
+    /// source field, even though the narrower key is otherwise correct and
+    /// avoids redundant producer calls on an unrelated-field edit.
+    pub fn artifactFeedsGraph(self: *const IndexManager, artifact_name: []const u8) bool {
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.artifact_sources) |source| {
+                if (std.mem.eql(u8, source.artifact_name, artifact_name)) return true;
+            }
+        }
+        return false;
+    }
+
     pub fn graphIndexConsumesAssetArtifact(self: *const IndexManager, index_name: []const u8, artifact_name: []const u8) bool {
         return self.graphArtifactSourceForArtifact(index_name, artifact_name) != null;
     }
