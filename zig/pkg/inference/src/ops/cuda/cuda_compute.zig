@@ -1208,6 +1208,7 @@ pub const RuntimeStats = struct {
     quant_kernel_fallback_unsupported: usize = 0,
     h2d_bytes: usize = 0,
     gemma4_mapped_upload_chunks: usize = 0,
+    gemma4_ple_host_weight_bytes: usize = 0,
     d2h_bytes: usize = 0,
     download_events: usize = 0,
     download_event_bytes: usize = 0,
@@ -4176,6 +4177,9 @@ pub const CudaCompute = struct {
     allocator: std.mem.Allocator,
     capability_profile: ?CapabilityProfile = null,
     gemma4_raw_q4_prefill: bool = false,
+    gemma4_ple_host_lease: ?@import("../../runtime/tier/memory.zig").AdmissionLease = null,
+    gemma4_ple_host_enabled: bool = false,
+    gemma4_ple_host: buffer_mod.MappedHostBuffer = .{},
     gemma4_request_replay_capacity: ?usize = null,
     gemma4_request_replay_disabled: bool = false,
     gemma4_dense_qualified: bool = false,
@@ -5525,6 +5529,7 @@ pub const CudaCompute = struct {
             self.gemma4_projector_weight_hits,  self.gemma4_projector_weight_misses,
         });
         logGemma4GemmPlans(self);
+        logGemma4Memory(self);
         if ((self.capability_profile == .lightonocr3 or self.capability_profile == .florence2) and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
             const stats = self.snapshotStats();
             const physical = self.ctx.device_allocations.snapshot();
@@ -5809,6 +5814,11 @@ pub const CudaCompute = struct {
             self.cublaslt = null;
         }
         self.kernels.unload(&self.ctx);
+        // Resident views and graph executables are gone. Keep host ownership
+        // through that boundary, then transfer any uncertain drain/free.
+        self.gemma4_ple_host.retire(&self.ctx);
+        if (self.gemma4_ple_host_lease) |*lease| lease.release();
+        self.gemma4_ple_host_lease = null;
         self.ctx.releaseResources();
         if (self.ocr_retained_cache_lease) |*lease| lease.release();
         self.ocr_retained_cache_lease = null;
@@ -6013,6 +6023,7 @@ pub const CudaCompute = struct {
 
     pub fn configureGemma4Dense(self: *CudaCompute, qualified: bool, e4b: bool) !void {
         self.gemma4_dense_qualified = qualified;
+        self.gemma4_ple_host_enabled = qualified and e4b and @import("ple_host.zig").requested();
         self.gemma4_e4b_sm89_qualified = qualified and e4b and self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9;
         self.gemma4_chunked_upload = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_CHUNKED_UPLOAD", true);
         self.gemma4_temp_lru = self.gemma4_e4b_sm89_qualified and platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GEMMA4_TEMP_LRU", true);
@@ -6842,6 +6853,10 @@ pub const CudaCompute = struct {
             return self.insertWeightFromTensor(owned_key, &converted);
         }
         if (loaded.quantized_storage) |storage| {
+            if (self.gemma4_ple_host_enabled and !self.resident_training_cache and
+                storage.shape.len == 2 and storage.shape[0] > 0 and storage.shape[1] > 0 and
+                @import("ple_host.zig").eligible(owned_key, @intCast(storage.shape[0]), @intCast(storage.shape[1]), storage.tensor_type))
+                return self.insertGemma4PleHostWeight(owned_key, storage);
             if (cudaShouldDequantizeQ4_0MatrixWeightToBf16OnUpload(owned_key, storage)) {
                 return self.insertBf16WeightFromQuantizedStorage(owned_key, storage);
             }
@@ -7007,6 +7022,33 @@ pub const CudaCompute = struct {
             return self.insertWeightFromTensor(owned_key, &converted);
         }
         try self.insertWeightFromTensor(owned_key, &loaded.tensor);
+    }
+
+    fn insertGemma4PleHostWeight(self: *CudaCompute, owned_key: []const u8, storage: weight_source_mod.QuantizedStorage) !void {
+        if (self.gemma4_ple_host.host.ptr != null or self.resident_weights.contains(owned_key)) return error.InvalidCudaState;
+        const count = try elementCountFromShape(storage.shape);
+        const expected = gguf_tensor_types.byteLen(storage.tensor_type, &.{ @intCast(storage.shape[0]), @intCast(storage.shape[1]) }) orelse return error.InvalidShape;
+        if (storage.raw_bytes.len != expected) return error.InvalidShape;
+        const shape = try self.allocator.dupe(i64, storage.shape);
+        errdefer self.allocator.free(shape);
+        try self.resident_weights.ensureUnusedCapacity(self.allocator, 1);
+        const mapped = try buffer_mod.MappedHostBuffer.allocAdmitted(&self.ctx, storage.raw_bytes.len, &self.gemma4_ple_host_lease);
+        // Own the original quantized bytes independently of the temporary
+        // native session. Existing device-token gathers need no host readback.
+        @memcpy(mapped.host.bytes(), storage.raw_bytes);
+        self.resident_weights.putAssumeCapacityNoClobber(owned_key, .{
+            .buffer = mapped.view(),
+            .dtype = .u8,
+            .shape = shape,
+            .elem_count = count,
+            .quant_type = storage.tensor_type,
+            .owns_buffer = false,
+            .owns_shape = false,
+            .owned_by_tensor = false,
+        });
+        self.gemma4_ple_host = mapped;
+        self.stats.gemma4_ple_host_weight_bytes = storage.raw_bytes.len;
+        std.log.info("cuda_gemma4_ple_placement storage=mapped_host bytes={d}", .{storage.raw_bytes.len});
     }
 
     fn prepareTensorCoreQuantOnUpload(
@@ -9213,9 +9255,22 @@ fn logGemma4GemmPlans(self: *const CudaCompute) void {
     });
 }
 
+fn logGemma4Memory(self: *CudaCompute) void {
+    if (self.capability_profile != .gemma4 or !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_GEMMA4_MEMORY_STATS")) return;
+    const physical = self.ctx.device_allocations.snapshot();
+    var pinned: usize = 0;
+    for (self.temp_pinned_slots.items) |slot| pinned +|= slot.buffer.allocation_bytes;
+    std.log.info("cuda_gemma4_memory device_live={d} device_peak={d} device_weights={d} host_ple={d} projector={d} idle_temp={d} pinned_temp={d} deferred={d}", .{
+        physical.live,                           physical.peak,                      self.stats.resident_weight_bytes,
+        self.stats.gemma4_ple_host_weight_bytes, self.gemma4_projector_weight_bytes, self.temp_buffers.bytes,
+        pinned,                                  self.deferred_device_free_bytes,
+    });
+}
+
 fn beginRequest(ctx: *anyopaque) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     self.cooperative_owner.reset();
+    logGemma4Memory(self);
     // Opt-in request-boundary observations also work for supervisors that
     // terminate a worker without running model destructors. Counters describe
     // completed previous requests and never alter descriptor ownership.
@@ -14024,6 +14079,10 @@ fn releaseDeviceBuffer(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) voi
     if (self.temp_scan_profile.enabled) self.temp_scan_profile.sections[3].operations += 1;
     if (lock_sample) |sample| self.temp_scan_profile.end(3, sample, 0);
     if (releasePinnedTempSlot(self, buffer)) return;
+    if (buffer.borrowed) {
+        buffer.* = .{};
+        return;
+    }
     if (buffer.allocation_bytes != 0) buffer.len = buffer.allocation_bytes;
     const cache_budget = cudaTempCacheBudgetBytes(self);
     const max_buffers = cudaTempCacheMaxBuffers(self);

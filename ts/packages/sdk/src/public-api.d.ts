@@ -1152,10 +1152,16 @@ export interface paths {
         put?: never;
         /**
          * Execute a SQL statement
-         * @description Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
-         *     subset through the current catalog and native row execution contracts.
-         *     Parameters are bound separately from statement text. Document, graph,
-         *     and lake SQL sources, DDL, and SQL sessions are not yet supported.
+         * @description Executes one statement of the implemented SQL dialect (SELECT, INSERT,
+         *     UPDATE, DELETE, transaction control, and DDL) through the current
+         *     catalog and native typed plans, including reads over read-only lake
+         *     attachments. Parameters are bound separately from statement text.
+         *     DDL returns a durable `ddl_receipt`; a 202 response means the
+         *     declaration was admitted and validation is pending, and admitted DDL
+         *     must not be replayed. BEGIN starts a SQL session: send the returned
+         *     `session_id` with later statements until COMMIT or ROLLBACK. Open a
+         *     connection with `/sql/connections` to keep scope and settings across
+         *     requests, and use `/sql/prepared` for prepared statements.
          *     Reads inherit native owner-local consistency, not a global SQL
          *     transaction snapshot. Statements requiring a retained multi-page
          *     statement snapshot fail when that capability is unavailable.
@@ -14238,8 +14244,12 @@ export interface components {
              *     This enables joining Antfly search results with structured relational data (customer records,
              *     product catalogs, etc.) without ingesting that data into Antfly.
              *
-             *     **Supported operations on foreign tables:** filter_query, field selection, limit/offset.
-             *     **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker.
+             *     **Supported operations on foreign tables:** filter_query, filter_prefix, field selection,
+             *     order_by, limit/offset, joins (including nested joins and joins between two foreign tables),
+             *     and the `stats`, `terms`, `count`, `sum`, `avg`, `min`, and `max` aggregations, which run as
+             *     SQL in PostgreSQL. Other aggregation types and sub-aggregations return 422.
+             *     **Not supported when the foreign table drives the query:** full_text_search, semantic_search,
+             *     graph_queries, reranker, search_after.
              *
              *     **Example - Join Antfly products with Postgres customers:**
              *     ```json
@@ -15698,7 +15708,7 @@ export interface components {
             postgres_table: string;
             /**
              * @description Optional column definitions for the foreign table. If omitted, columns are
-             *     auto-discovered from `information_schema.columns` on first query.
+             *     auto-discovered from the PostgreSQL catalog (`pg_attribute`) on first query.
              */
             columns?: components["schemas"]["ForeignColumn"][];
         };

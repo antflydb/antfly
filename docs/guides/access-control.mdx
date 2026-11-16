@@ -1,0 +1,201 @@
+---
+title: "Secure a Self-Hosted Antfly"
+description: "A self-hosted Antfly that requires credentials, gives each user and API key only the tables and rows it should see, and accepts sign-ins from your identity provider through a trusted gateway"
+order: 14
+---
+
+<Questions>
+- How do I turn on authentication in Antfly?
+- How do I create an API key that can only read one table?
+- How do I make each tenant see only its own rows?
+- Does Antfly support SSO or SAML?
+- Is it safe to expose Antfly on 0.0.0.0?
+</Questions>
+
+## The Result
+
+Every request to your instance carries a credential, and what it returns depends on who sent it. Here a read-only API key for `alice` queries `docs`, and Antfly returns only the rows her tenant and tier filters allow:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/db/v1/tables/docs/query \
+  -H "Authorization: Bearer $ALICE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"full_text_search": {"match_all": {}}, "limit": 10}'
+```
+
+```json
+{
+  "responses": [
+    {
+      "hits": {
+        "total": { "value": 1 },
+        "hits": [{ "_id": "doc:acme-gold" }]
+      }
+    }
+  ]
+}
+```
+
+## Before You Start
+
+Antfly installed and nothing else listening on port 8080:
+
+```bash
+antfly --version
+curl -s http://127.0.0.1:8080/db/v1/status || echo "port 8080 is free"
+```
+
+## Build It
+
+### 1. Start Antfly With Authentication
+
+Authentication is off by default. Turn it on with `--auth true`, or `"enable_auth": true` in the config file. The first authenticated start needs an administrator password of 12 to 72 bytes in `ANTFLY_BOOTSTRAP_ADMIN_PASSWORD`:
+
+```bash
+export ANTFLY_BOOTSTRAP_ADMIN_PASSWORD="$(openssl rand -base64 24)"
+echo "$ANTFLY_BOOTSTRAP_ADMIN_PASSWORD"   # store it in your password manager
+antfly standalone --auth true
+```
+
+The administrator is `admin`. Antfly stores the password as a hash and never logs it. Later starts keep the existing password even if the variable changes, so rotate it through `PUT /auth/v1/users/admin/password`. An instance that still has the legacy `admin:admin` credential refuses to start until you supply a bootstrap password.
+
+Confirm that anonymous requests are now rejected and the admin credential works:
+
+```bash
+export ANTFLY_ADMIN_PASSWORD="$ANTFLY_BOOTSTRAP_ADMIN_PASSWORD"
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/auth/v1/me    # 401
+curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" http://127.0.0.1:8080/auth/v1/me
+```
+
+The same check covers MCP: tools on `/mcp/v1` share the public port and its authentication.
+
+Antfly binds to `127.0.0.1` by default and does not terminate TLS itself. Before you pass `--host 0.0.0.0` or publish a Docker port beyond `127.0.0.1`, put a reverse proxy in front that terminates TLS, and keep the metrics port (4200) private. CORS settings control which browser origins may call Antfly; they are not authentication.
+
+### 2. Create a Table and a User
+
+Create `docs` with rows for two tenants, then a user who can read it. The `metadata` on the user is the value row filters will match against in the next step.
+
+```bash
+curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X POST http://127.0.0.1:8080/db/v1/tables/docs \
+  -H "Content-Type: application/json" -d '{}'
+
+curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X POST http://127.0.0.1:8080/db/v1/tables/docs/batch \
+  -H "Content-Type: application/json" \
+  -d '{"inserts": {
+        "doc:acme-gold":   {"title": "Acme renewal", "tenant_id": "acme",   "tier": "gold"},
+        "doc:acme-silver": {"title": "Acme draft",   "tenant_id": "acme",   "tier": "silver"},
+        "doc:globex-gold": {"title": "Globex plan",  "tenant_id": "globex", "tier": "gold"}
+      }, "sync_level": "full_index"}'
+```
+
+```bash
+curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X POST http://127.0.0.1:8080/auth/v1/users/alice \
+  -H "Content-Type: application/json" \
+  -d '{
+    "password": "change-me-alice-1",
+    "initial_policies": [{"resource": "docs", "resource_type": "table", "type": "read"}],
+    "metadata": {"tenant_id": "acme"}
+  }'
+```
+
+Permissions are `read`, `write`, `curator`, or `admin` on a `resource_type` of `table`, `database`, `namespace`, `tablespace`, `graph`, `user`, `inference`, or `*`. Grant `inference` with resource `*` to let a user call the `/ai/v1` routes. Add more grants later with `POST /auth/v1/users/{user}/permissions`.
+
+### 3. Restrict Rows With Filters
+
+A row filter is Antfly query JSON that every row the user reads must match. Put a tenant filter on every table (`*`) that references the user's metadata through `$auth`, and a tier filter on `docs`:
+
+```bash
+curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X PUT "http://127.0.0.1:8080/auth/v1/users/alice/row-filters/*" \
+  -H "Content-Type: application/json" \
+  -d '{"term": {"tenant_id": {"$auth": "metadata.tenant_id"}}}'
+
+curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X PUT http://127.0.0.1:8080/auth/v1/users/alice/row-filters/docs \
+  -H "Content-Type: application/json" \
+  -d '{"term": {"tier": "gold"}}'
+```
+
+Every matching filter applies with `AND`: the global `*` filter, a namespace filter (set with `?database=...&namespace=...&all_tables=true`), and the table filter. So do the filters of every role or group the user belongs to, and the filters on the API key in use. The result is then combined with the caller's own query, also with `AND`. A `null` filter adds no restriction and never cancels a broader one. `$auth` resolves `username`, `roles`, and `metadata.<path>`; a missing value denies the request instead of matching nothing.
+
+Filters apply to queries, lookups, scans, and retrieval-agent queries. A filtered-out document returns `404` on lookup:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -u "alice:change-me-alice-1" \
+  http://127.0.0.1:8080/db/v1/tables/docs/documents/doc:acme-silver   # 404
+```
+
+For many users with the same restriction, attach the filter to a role subject and assign the role. The member inherits the role's filters:
+
+```bash
+curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X PUT "http://127.0.0.1:8080/auth/v1/subjects/role:acme_reader/row-filters/docs" \
+  -H "Content-Type: application/json" -d '{"term": {"tenant_id": "acme"}}'
+curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X POST http://127.0.0.1:8080/auth/v1/users/alice/roles \
+  -H "Content-Type: application/json" -d '{"role": "role:acme_reader"}'
+```
+
+### 4. Issue a Narrower API Key
+
+An API key acts as its owner, narrowed by whatever `permissions` and `row_filter` you give it. Asking for a permission the owner does not hold returns `403`, and the narrowing is reapplied on every request.
+
+```bash
+curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X POST http://127.0.0.1:8080/auth/v1/users/alice/api-keys \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "reporting",
+    "expires_in": "720h",
+    "permissions": [{"resource": "docs", "resource_type": "table", "type": "read"}]
+  }'
+```
+
+The response holds `key_id`, `key_secret`, and `encoded`, which is `base64(key_id:key_secret)`. The secret is shown once. Send `encoded` as `Authorization: Bearer <encoded>` or `Authorization: ApiKey <encoded>`; the CLI reads it from `ANTFLY_TOKEN`. Revoke a key with `DELETE /auth/v1/users/alice/api-keys/{key_id}`. This key is the `$ALICE_KEY` in The Result above.
+
+### 5. Sign In Through Your Identity Provider
+
+Antfly does not speak SAML or OIDC itself. Single sign-on works through a trusted gateway: a proxy you run completes the sign-in with your identity provider, maps the user's groups to tables, operations, and row filters, and forwards each request with an HS256-signed JWT in the `X-Antfly-Trusted-Principal` header. Antfly verifies the signature and applies the claims as that request's identity.
+
+Give Antfly the shared secret and the issuer name. Set both or neither; one without the other fails at startup. The secret must differ from the internal-service key.
+
+```bash
+export ANTFLY_TRUSTED_PRINCIPAL_SECRET="$(openssl rand -base64 32)"
+export ANTFLY_TRUSTED_PRINCIPAL_ISSUER="sso-gateway"
+antfly standalone --auth true
+```
+
+They can also live in the secret store as `antfly.trusted_principal.secret` and `antfly.trusted_principal.issuer`. A configured verifier alone makes the public API require authentication. `--auth true` separately controls the local user store and its admin bootstrap, so keep it if you still want the users and keys from steps 1 to 4. The gateway signs claims like these:
+
+```json
+{
+  "iss": "sso-gateway",
+  "sub": "alice@acme.example",
+  "iat": 1789996400,
+  "exp": 1789996700,
+  "tables": ["docs"],
+  "operations": ["read"],
+  "row_filter": { "*": { "term": { "tenant_id": { "$auth": "metadata.tenant_id" } } } },
+  "metadata": { "tenant_id": "acme" }
+}
+```
+
+`sub` and `exp` are required, and an `iat` more than 60 seconds in the future is rejected. `operations` (`read`, `write`, `admin`, or `*`) applies to each table in `tables`, or to every table when `tables` is absent; `"admin": true` grants admin everywhere. Keep tokens short-lived and strip any incoming `X-Antfly-Trusted-Principal` header from clients at the gateway.
+
+## Tradeoffs
+
+The decision you own is how to widen access, because filters only ever narrow it. Every matching filter is joined with `AND`, so adding a role with a broader filter does not undo a stricter filter on the user; the user sees the intersection. Model access so the narrowest filter sits on the subject that actually needs it, and widen by removing a filter rather than adding one.
+
+Filters are checked per table. In a query with a `join`, the right table's filters apply too, so a user cannot reach restricted rows through a table they can read. Each stored filter is limited to 16,384 nodes and 64 levels of nesting, and the combined filter for one request to 32,768 JSON values. Exceeding the combined limit returns `403`, so many overlapping broad filters on one user eventually lock that user out rather than slowing queries down.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Enable authentication on my standalone Antfly, create a read-only API key for the docs table, and restrict it to rows where tenant_id matches the user's metadata", and use this page to judge the result.
+
+## Next Steps
+
+- [Authorization reference](/docs/reference/auth): every credential form, token claim, and row-filter limit in one place
+- [Connect agents over MCP](/docs/guides/mcp): the same credentials decide which MCP tools an agent is offered
+- [Find and redact sensitive data](/docs/guides/pii-redaction): keep personal data out of search and AI results even for users who can read the table
