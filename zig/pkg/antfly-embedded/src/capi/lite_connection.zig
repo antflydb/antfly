@@ -2707,7 +2707,7 @@ pub const Owner = struct {
             // same detached `self.current` instance next, which needs any
             // still-queued ride-along work on the file physically written
             // first so its own next commit's sequence check sees it.
-            if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
+            if (self.current) |current| if (current.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
             stats.recordAcquired(.uncontended, 0);
             break :blk held;
         };
