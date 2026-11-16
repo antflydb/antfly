@@ -129,3 +129,4 @@ zig-pkg/
 
 # Local native GPU benchmark artifacts and measurements.
 /evidence/
+/.cache/
