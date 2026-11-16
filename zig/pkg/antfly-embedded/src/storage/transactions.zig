@@ -1143,6 +1143,53 @@ pub const TxnManager = struct {
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
     }
 
+    /// Trusted ordered retirement after an independent qualified coordinator
+    /// read. The DB caller must hold the physical owner's apply fence throughout.
+    /// Missing local BEGIN fences the bounded scope floor; it never fabricates
+    /// a local transaction outcome or allocates per-attempt tombstones.
+    pub fn retireScopedSourceAttempt(self: *TxnManager, command: @import("source_scope_retirement.zig").Command, applied: source_scope.Cut, marker_writes: []const docstore.KVPair) !@import("source_scope_retirement.zig").Reply {
+        const retirement = @import("source_scope_retirement.zig");
+        const proof = try command.proof();
+        if (applied.term == 0 or applied.index == 0) return error.InvalidSourceAdmission;
+        const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
+        defer self.alloc.free(namespace);
+        if (!std.mem.eql(u8, namespace, &proof.root.namespace)) return error.HistoryResynchronizationRequired;
+        const existing = self.loadTransactionRecord(proof.slot.transaction_id) catch |err| switch (err) {
+            TxnError.TxnNotFound => null,
+            else => return err,
+        };
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        if (existing) |record| {
+            if (!sameSourceScope(record.source_scope, proof.slot.reference) or !samePurpose(record.source_purpose, proof.slot.source_purpose) or record.begin_timestamp != command.observation.decision.?.record.begin_timestamp) return error.SourceTransactionIdentityConflict;
+            if (record.status == .committed) return error.DecisionConflict;
+            var admission = (try self.getCompletionAdmission(self.alloc, proof.slot.transaction_id)) orelse return error.SourceOutcomeUnresolved;
+            defer admission.deinit();
+            if (!std.mem.eql(u8, &admission.value.digest, &proof.slot.admission_digest)) return error.SourceTransactionIdentityConflict;
+            const member = try admission.value.admission.member(proof.root.namespace);
+            const outcome = try self.resolveIntentsWithExtraBatch(proof.slot.transaction_id, .aborted, command.observation.decision.?.record.finalized_at_ns, .{
+                .completion_owner = command.intent.owner,
+                .source_purpose = proof.slot.source_purpose,
+                .source_scope = proof.slot.reference,
+                .source_scope_cut = applied,
+                .resolved_participant = member.locator,
+                .completion_writes = marker_writes,
+            });
+            var probe = try self.store.beginProbe();
+            defer probe.abort();
+            const scoped = (try source_scope.Store.readRecord(arena.allocator(), &probe, proof.slot.reference.domain)) orelse return error.SourceOutcomeUnresolved;
+            const reply: retirement.Reply = .{ .version = 1, .request_digest = command.intent.digest(), .coordinator_record_digest = proof.coordinator_record_digest, .cut = applied, .closed_through_token = scoped.closed_through_token, .disposition = if (outcome.applied) .fenced else .already_fenced };
+            try reply.validate(command.intent);
+            return reply;
+        }
+        var batch = try self.store.beginBatch();
+        errdefer batch.abort();
+        const reply = try retirement.applyUnenlisted(arena.allocator(), &batch, command, applied);
+        for (marker_writes) |write| try batch.put(write.key, write.value);
+        try batch.commit();
+        return reply;
+    }
+
     /// Resolve intents: commit applies them to real keys, abort deletes them.
     /// Conflicting terminal decisions return `TxnError.DecisionConflict`; callers
     /// should treat that as a protocol inconsistency / torn-state signal rather
@@ -1183,13 +1230,37 @@ pub const TxnManager = struct {
                     break;
                 }
             }
+            var durable_participant = participant;
+            if (!enlisted and record.coordinator_known and !record.coordinator and extra_batch.completion_owner != null) {
+                // Completion followers retain the original coordinator as their
+                // one durable recovery obligation. A qualified local resolution
+                // discharges that obligation after local intents drain. Preserve
+                // the persisted participant list and its legacy retry identity.
+                if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
+                    var admission = saved;
+                    defer admission.deinit();
+                    if (admission.value.admission.version == 3) {
+                        const owner = extra_batch.completion_owner.?;
+                        try admission.value.admission.requireRoutedOwner(owner);
+                        const namespace = try self.getAlloc(self.alloc, &internal_keys.identity_namespace_key);
+                        defer self.alloc.free(namespace);
+                        if (!std.mem.eql(u8, namespace, &owner.namespace)) return error.InvalidParticipant;
+                        const local = try admission.value.admission.member(owner.namespace);
+                        const coordinator = try admission.value.admission.member(admission.value.admission.coordinator_namespace);
+                        if (participants.len == 1 and std.mem.eql(u8, participants[0], coordinator.locator) and std.mem.eql(u8, participant, local.locator)) {
+                            durable_participant = participants[0];
+                            enlisted = true;
+                        }
+                    }
+                }
+            }
             if (!enlisted) return error.InvalidParticipant;
 
             const resolved = try self.getResolvedParticipants(self.alloc, txn_id);
             defer freeParticipantList(self.alloc, resolved);
             var already_resolved = false;
             for (resolved) |existing| {
-                if (std.mem.eql(u8, existing, participant)) {
+                if (std.mem.eql(u8, existing, durable_participant)) {
                     already_resolved = true;
                     break;
                 }
@@ -1198,7 +1269,7 @@ pub const TxnManager = struct {
                 const next = try self.alloc.alloc([]const u8, resolved.len + 1);
                 defer self.alloc.free(next);
                 for (resolved, 0..) |existing, i| next[i] = existing;
-                next[resolved.len] = participant;
+                next[resolved.len] = durable_participant;
                 resolved_participant_key = makeSidecarKey(resolved_participants_prefix, txn_id);
                 resolved_participant_value = try encodeParticipantList(self.alloc, next);
             }
@@ -6410,4 +6481,13 @@ test "transaction source purpose scoped reference survives restart and fences st
         try std.testing.expect(!try mgr.hasIntents(other_admission.transaction_id));
         _ = try mgr.resolveIntentsWithExtraBatch(other_admission.transaction_id, .aborted, 13_000, .{ .source_purpose = purpose, .source_scope = other_extra.source_scope, .completion_owner = owner, .source_scope_cut = .{ .term = 1, .index = 24 } });
     }
+}
+
+test "transaction source purpose retirement fences delayed BEGIN across real store reopen" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-source-retirement");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    try @import("source_scope_retirement_native_test.zig").run(a, path);
 }

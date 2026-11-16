@@ -1230,6 +1230,33 @@ pub const NativeSourcePlanStatus = struct {
     reclamation: NativeHistoryDigest,
 };
 
+/// Trusted ordered reducer command constructed only after an independent qualified coordinator read. Requires the retained original scoped ABORT and original participant membership. Never accept this command body as self-authenticating public or private HTTP evidence.
+pub const NativeSourceScopeAbortCommand = struct {
+    version: i64,
+    intent: NativeSourceScopeAbortIntent,
+    observation: NativeHistoryDecisionReply,
+};
+
+/// Private original-owner retirement intent. The receiving control owner must independently read the named coordinator through qualified ReadIndex; caller-supplied absence, a digest, or an outcome body is never abort authority.
+pub const NativeSourceScopeAbortIntent = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    coordinator: NativeHistoryDecisionRequest,
+    reference: NativeSourceScopeReference,
+    source_purpose: NativeHistoryDigest,
+    admission_digest: NativeHistoryDigest,
+};
+
+/// Local attempt fencing receipt, not a global commit, publication or all-owner ACK. The applying root atomically advances its bounded token floor before emitting this receipt; delayed BEGIN remains rejected after transaction record cleanup.
+pub const NativeSourceScopeAbortReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    coordinator_record_digest: NativeHistoryDigest,
+    cut: NativeHistoryPublicationCut,
+    closed_through_token: u64,
+    disposition: []const u8,
+};
+
 /// Immutable physical owner basis; schema/topology leases are qualified separately. All metadata indices in a registry share this metadata group/incarnation.
 pub const NativeSourceScopeBasis = struct {
     metadata_group_id: u64,

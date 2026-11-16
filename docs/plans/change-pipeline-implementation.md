@@ -4739,3 +4739,64 @@ positive coordinator-authorized ABORT-before-BEGIN floors and explicit source
 attempt retirement still need implementation and cross-node race tests. The
 full distributed source adapter and the public feeds/bootstrap/retention,
 production pgoutput and existing-client qualification contracts remain active.
+
+### Bounded coordinator-authorized retirement before local BEGIN
+
+Added `storage/source_scope_retirement.zig` and the internal abort
+intent/command/local-receipt schemas. The intent freezes the original local
+owner, coordinator query, scope reference, source purpose and admission digest.
+The ordered command requires a positive original scoped coordinator ABORT with
+resolved intents and verifies the original v3 participant membership and
+checkpoint coordinator. Absent/pending/committed coordinator observations and
+changed identities never grant retirement. Command validation is structural;
+its observation must originate in an independent qualified ReadIndex capture at
+the trusted proposal boundary, not an HTTP caller's asserted evidence.
+
+For a root that never installed BEGIN, the native operation atomically advances
+one cumulative token floor in its existing charged scope record. It creates no
+per-attempt transaction outcome or tombstone, does not infer an absent
+coordinator's abort, preserves a newer active slot, and refuses to skip an older
+unresolved slot. That floor rejects delayed BEGIN even after reopen. A local
+record that does exist must use intent drainage rather than this absent-record
+path. Native `TxnManager.retireScopedSourceAttempt` handles both cases, committing
+the caller's ordered apply marker with the floor or with local abort/intent
+retirement. Its receipt is explicitly local fencing, not global completion or
+all-owner ACK. Reply decoding binds both the intent and the exact observed
+coordinator record digest.
+
+Completion followers retain the original coordinator locator as their one
+persisted recovery obligation. Qualified v3 local resolution now normalizes the
+original local participant acknowledgement to that retained obligation after
+checking original owner membership and physical namespace. This preserves old
+participant-list retry identity and permits local drainage/acknowledgement
+without rewriting existing sidecars. Legacy v1 behavior remains unchanged.
+
+Ordinary scoped ABORT with no local transaction now returns unresolved rather
+than a successful not-enlisted no-op. A worker cannot acknowledge retirement
+until the dedicated positive fencing path completes. Registry operations also
+reject records whose charged strict header is missing or inconsistent, including
+partial restore; an orphan record cannot silently enable uncharged scope work.
+
+Qualification: direct model tests completed with exit zero
+(`source-abort-retirement-unit-test.log`): 22 tests, including six new retirement
+regressions and imported scope/checkpoint/decision contracts. Final native
+`docstore-history-test -j2` completed with exit zero
+(`source-abort-retirement-native-test.log`): all 15 native regressions passed,
+zero skips/failures/leaks. The new separate native fixture verifies atomic marker
+and floor persistence without a transaction tombstone, reopen and delayed-BEGIN
+rejection, a later legitimate attempt, real prepared-intent drainage, and the
+qualified follower acknowledgement. The store fixture supplies a synthetic
+coordinator observation to isolate reducers; it does not stand in for production
+ReadIndex provenance. Source-catalog, engine-error, OpenAPI, formatting and diff
+checks passed. API generation completed; a new schema reference and test helper
+sentinel-path signature were corrected before final checks, and unrelated
+model-explorer generation was restored.
+
+Still required: independently qualified coordinator capture, physical-root
+control/native outcome plumbing, routed retirement endpoints, worker/ACK
+integration and activation that excludes members retaining the old no-op
+behavior. Existing protocol-39 entries must retain replay compatibility; the
+new scope-control binding profile must establish the stronger capability before
+production admission. The coordinator-before-BEGIN case additionally needs
+qualified scope-closure/admission retirement, rather than fabricating ABORT from
+absence. No issue is complete and the full goal remains active.

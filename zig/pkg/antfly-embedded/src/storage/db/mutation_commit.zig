@@ -4096,6 +4096,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // never enlisted is already satisfied. Treat it as an
                     // idempotent no-op so coordinator recovery can acknowledge it.
                     transactions_mod.TxnError.TxnNotFound => {
+                        if (source_scope != null) return error.SourceOutcomeUnresolved;
                         if (marker_writes.len != 0) try S.ownerField(self, "core").*.store.putBatch(marker_writes, &.{});
                         return;
                     },

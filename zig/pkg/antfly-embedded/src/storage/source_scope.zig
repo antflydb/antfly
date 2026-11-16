@@ -125,6 +125,25 @@ pub const Record = struct {
         if (same(local, coordinator) and (self.last_committed_sequence == std.math.maxInt(u64) or slot.reference.sequence != self.last_committed_sequence + 1)) return error.SourceCheckpointConflict;
         self.slot = slot;
     }
+    /// Only an independently observed original coordinator ABORT may call this.
+    /// No local BEGIN/outcome is fabricated. One cumulative floor bounds storage.
+    pub fn retireUnenlisted(self: *Record, slot: Slot, coordinator: Basis, local: Basis, applied: Cut) !bool {
+        try self.matches(slot.reference);
+        if (!nonzero(slot.transaction_id) or !nonzero(slot.source_purpose) or !nonzero(slot.admission_digest) or applied.term == 0 or applied.index == 0 or !same(coordinator, self.spec.checkpoint_owner)) return error.InvalidSourceAdmission;
+        if (slot.reference.token <= self.closed_through_token) return false;
+        // A missing original coordinator record cannot establish its own abort.
+        if (same(local, coordinator)) return error.SourceOutcomeUnresolved;
+        if (self.slot) |active| {
+            if (active.reference.token <= slot.reference.token) return error.SourceTransactionIdentityConflict;
+        }
+        if (slot.reference.sequence <= self.last_committed_sequence) return error.SourceCheckpointConflict;
+        self.closed_through_token = slot.reference.token;
+        if (self.phase == .closing and self.slot == null) {
+            self.phase = .closed;
+            self.closed_at = applied;
+        }
+        return true;
+    }
     pub fn prepareAllowed(self: Record, slot: Slot) !void {
         if (self.phase != .active or self.slot == null or !same(self.slot.?, slot)) return error.SourceCheckpointConflict;
     }
@@ -174,6 +193,7 @@ pub const Header = struct {
         try cut.require(self.root);
         if (cut.index < self.metadata_floor) return error.SourceCheckpointConflict;
         if (old) |record| {
+            if (!self.strict or self.domains == 0) return error.SourceAdmissionCorrupt;
             if (!same(record.spec.domain(), spec.domain())) return error.SourceAdmissionCorrupt;
             if (same(record.spec, spec) and record.phase == .active) return record;
             if (spec.generation <= record.spec.generation or record.phase != .closed or record.slot != null or cut.index <= record.close_metadata_index) return error.SourceCheckpointConflict;
@@ -297,28 +317,36 @@ pub const Store = struct {
         try writeHeader(a, txn, header);
         return record;
     }
+    pub fn requireRecord(a: std.mem.Allocator, txn: anytype, root: Basis, domain: Digest) !Record {
+        const header = try readHeader(a, txn, root);
+        const record = (try readRecord(a, txn, domain)) orelse return error.SourceCheckpointConflict;
+        if (!header.strict or header.domains == 0) return error.SourceAdmissionCorrupt;
+        return record;
+    }
     pub fn enter(a: std.mem.Allocator, txn: anytype, root: Basis, slot: Slot, coordinator: Basis) !void {
-        _ = try readHeader(a, txn, root);
-        var record = (try readRecord(a, txn, slot.reference.domain)) orelse return error.SourceCheckpointConflict;
+        var record = try requireRecord(a, txn, root, slot.reference.domain);
         try record.enter(slot, coordinator, root);
         try writeRecord(a, txn, record);
     }
+    pub fn retireUnenlisted(a: std.mem.Allocator, txn: anytype, root: Basis, slot: Slot, coordinator: Basis, applied: Cut) !struct { changed: bool, floor: u64 } {
+        var record = try requireRecord(a, txn, root, slot.reference.domain);
+        const changed = try record.retireUnenlisted(slot, coordinator, root, applied);
+        if (changed) try writeRecord(a, txn, record);
+        return .{ .changed = changed, .floor = record.closed_through_token };
+    }
     pub fn prepareAllowed(a: std.mem.Allocator, txn: anytype, root: Basis, slot: Slot) !void {
-        _ = try readHeader(a, txn, root);
-        const record = (try readRecord(a, txn, slot.reference.domain)) orelse return error.SourceCheckpointConflict;
+        const record = try requireRecord(a, txn, root, slot.reference.domain);
         try record.prepareAllowed(slot);
     }
     pub fn close(a: std.mem.Allocator, txn: anytype, root: Basis, domain: Digest, expected_spec: Spec, cut: MetadataCut, applied: Cut) !Record {
-        _ = try readHeader(a, txn, root);
-        var record = (try readRecord(a, txn, domain)) orelse return error.SourceCheckpointConflict;
+        var record = try requireRecord(a, txn, root, domain);
         if (!same(record.spec, expected_spec)) return error.SourceCheckpointConflict;
         try record.close(root, cut, applied);
         try writeRecord(a, txn, record);
         return record;
     }
     pub fn finish(a: std.mem.Allocator, txn: anytype, root: Basis, slot: Slot, committed: bool, applied: Cut) !void {
-        _ = try readHeader(a, txn, root);
-        var record = (try readRecord(a, txn, slot.reference.domain)) orelse return error.SourceCheckpointConflict;
+        var record = try requireRecord(a, txn, root, slot.reference.domain);
         try record.finish(slot, committed, same(root, record.spec.checkpoint_owner), applied);
         try writeRecord(a, txn, record);
     }
