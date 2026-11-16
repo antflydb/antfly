@@ -44546,7 +44546,13 @@ fn consumerTests() type {
                         const source_locator = try @import("../api/distributed_txn.zig").participantIdForGroup(source_alloc, "docs", source_binding.group_id);
                         defer source_alloc.free(source_locator);
                         try std.testing.expectError(error.InvalidSourceAdmission, source_plans.Plan.freeze(source_alloc, source_id, @splat(118), source_binding, &.{.{ .owner = source_binding, .locator = source_locator, .roles = source_plans.completion.Roles.guards, .prepare = source_prepare }}, 4001));
-                        var source_plan = try source_plans.Plan.freeze(source_alloc, source_id, @splat(118), source_binding, &.{.{ .owner = source_binding, .locator = source_locator, .roles = source_plans.completion.Roles.checkpoint, .prepare = source_prepare }}, 4001);
+                        var source_plan = source_artifact: {
+                            var original_source_plan = try source_plans.Plan.freeze(source_alloc, source_id, @splat(118), source_binding, &.{.{ .owner = source_binding, .locator = source_locator, .roles = source_plans.completion.Roles.checkpoint, .prepare = source_prepare }}, 4001);
+                            defer original_source_plan.deinit();
+                            const frozen_source_bytes = try original_source_plan.encodeFrozen(source_alloc);
+                            defer source_alloc.free(frozen_source_bytes);
+                            break :source_artifact try source_plans.Plan.restoreFrozen(source_alloc, frozen_source_bytes, try source_plans.frozenDigest(frozen_source_bytes));
+                        };
                         defer source_plan.deinit();
                         try std.testing.expectEqual(source_purpose, source_plan.source_purpose.?);
                         try source_participant.submit(source_alloc, &source_plan, 0, source_fence, .begin, .{});

@@ -499,6 +499,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const history_control_entry_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{ "history control entry", "history root control outcome", "history root control driver", "history root control observation", "history root discovery", "history feed metadata port", "raft batch", "raft protocol barrier", "ordered artifact merge adoption" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const run_history_control_entry_tests = b.addRunArtifact(history_control_entry_tests);
     b.step("history-control-entry-test", "Verify bounded fail-closed ordered retention envelopes").dependOn(&run_history_control_entry_tests.step);
+    const completion_plan_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/completion_plan_test_root.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, completion_plan_mod, true, true);
+    completion_plan_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const completion_plan_tests = b.addTest(.{ .root_module = completion_plan_mod, .filters = &.{"completion frozen plan"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_completion_plan_tests = b.addRunArtifact(completion_plan_tests);
+    b.step("completion-frozen-plan-test", "Verify owned frozen completion artifacts without current routing or schema").dependOn(&run_completion_plan_tests.step);
     const transaction_completion_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/committed_frame.zig"), .target = target, .optimize = optimize });
     const transaction_completion_tests = b.addTest(.{ .root_module = transaction_completion_mod });
     const run_transaction_completion_tests = b.addRunArtifact(transaction_completion_tests);
@@ -3315,6 +3321,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const unit_test_step = b.step("antfly-unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
     unit_test_step.dependOn(&run_history_control_entry_tests.step);
     unit_test_step.dependOn(&run_transaction_completion_tests.step);
+    unit_test_step.dependOn(&run_completion_plan_tests.step);
     unit_test_step.dependOn(&run_changefeed_control_tests.step);
     unit_test_step.dependOn(&run_changefeed_delivery_tests.step);
     unit_test_step.dependOn(&run_changefeed_projection_tests.step);

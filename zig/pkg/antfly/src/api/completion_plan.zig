@@ -132,6 +132,117 @@ pub const Plan = struct {
         return plan;
     }
 
+    /// Versioned artifact encoding for the exact pre-admission plan. Callers
+    /// persist its digest/reference in source control before dispatch. This
+    /// codec supplies no storage, lease, source ACK, or commit authority.
+    pub fn encodeFrozen(self: *const Plan, a: A) ![]u8 {
+        try self.admission.validate();
+        if (self.admission.version != 3 or self.created_at_ns == 0 or self.begin_timestamp == 0 or self.participants.len != self.admission.participants.len or self.admission_bytes.len > completion.max_bytes) return error.InvalidTxnRecord;
+        var parsed_admission = try completion.parseAdmission(a, self.admission_bytes);
+        defer parsed_admission.deinit();
+        if (!std.mem.eql(u8, &parsed_admission.value.digest, &self.admission.digest())) return error.SourcePayloadConflict;
+        if (self.participant_ids.len != self.participants.len or !std.mem.eql(u8, self.participant_ids[0], (try self.admission.member(self.admission.coordinator_namespace)).locator)) return error.InvalidParticipant;
+        var follower: usize = 1;
+        var checkpoints: usize = 0;
+        for (self.participants, 0..) |participant, index| {
+            var request = try self.prepare(a, index);
+            defer request.deinit(a);
+            const mutation = request.req.transaction orelse return error.InvalidBatchRequest;
+            if (mutation != .prepare) return error.InvalidBatchRequest;
+            if (request.req.timestamp_ns != self.begin_timestamp or request.req.sync_level != .write or request.req.document_version_scheme != .revision_v1 or !std.meta.eql(mutation.prepare.source_purpose, self.source_purpose)) return error.SourcePayloadConflict;
+            if (!std.mem.eql(u8, &mutation.prepare.txn_id, &self.admission.transaction_id) or mutation.prepare.completion_owner == null or !std.mem.eql(u8, &mutation.prepare.completion_owner.?.digest(), &participant.owner.digest()) or mutation.prepare.topology_epoch != participant.owner.topology_epoch) return error.SourceTransactionIdentityConflict;
+            const member = try self.admission.member(participant.owner.namespace);
+            if (member.roles & completion.Roles.checkpoint != 0) checkpoints += 1;
+            if (!std.mem.eql(u8, &participant.owner.namespace, &self.admission.coordinator_namespace)) {
+                if (follower >= self.participant_ids.len or !std.mem.eql(u8, self.participant_ids[follower], participant.locator)) return error.InvalidParticipant;
+                follower += 1;
+            }
+        }
+        if (self.source_purpose != null and checkpoints != 1) return error.InvalidSourceAdmission;
+        var size: usize = frozen_header_bytes + self.admission_bytes.len;
+        var payload_bytes: usize = 0;
+        for (self.participants, self.admission.participants) |participant, member| {
+            try self.admission.requireRoutedOwner(participant.owner);
+            if (!std.mem.eql(u8, &participant.owner.namespace, &member.namespace) or !std.mem.eql(u8, participant.locator, member.locator)) return error.InvalidParticipant;
+            try self.admission.requirePreparedInput(participant.owner.namespace, participant.prepare_bytes);
+            if (participant.prepare_bytes.len > completion.max_bytes) return error.HistoryTooLarge;
+            payload_bytes = std.math.add(usize, payload_bytes, participant.prepare_bytes.len) catch return error.HistoryTooLarge;
+            size = std.math.add(usize, size, 4 + participant.prepare_bytes.len) catch return error.HistoryTooLarge;
+        }
+        if (payload_bytes > max_frozen_payload_bytes or size > max_frozen_bytes) return error.HistoryTooLarge;
+        const out = try a.alloc(u8, size);
+        errdefer a.free(out);
+        @memcpy(out[0..4], "AFP1");
+        std.mem.writeInt(u32, out[4..8], @intCast(self.participants.len), .little);
+        std.mem.writeInt(u64, out[8..16], self.begin_timestamp, .little);
+        std.mem.writeInt(u64, out[16..24], self.created_at_ns, .little);
+        std.mem.writeInt(u64, out[24..32], @intCast(self.admission_bytes.len), .little);
+        @memcpy(out[frozen_header_bytes..][0..self.admission_bytes.len], self.admission_bytes);
+        var cursor = frozen_header_bytes + self.admission_bytes.len;
+        for (self.participants) |participant| {
+            std.mem.writeInt(u32, out[cursor..][0..4], @intCast(participant.prepare_bytes.len), .little);
+            cursor += 4;
+            @memcpy(out[cursor..][0..participant.prepare_bytes.len], participant.prepare_bytes);
+            cursor += participant.prepare_bytes.len;
+        }
+        @memcpy(out[32..64], &try frozenDigest(out));
+        return out;
+    }
+
+    /// Restore solely from the retained artifact and trusted expected digest.
+    /// Never consult current routing, rows, schema, or provider configuration.
+    /// Version 1 requires its canonical private phase encoders to remain stable;
+    /// incompatible encoders must retain a versioned reader instead of replanning.
+    pub fn restoreFrozen(a: A, raw: []const u8, expected_digest: completion.Digest) !Plan {
+        if (raw.len < frozen_header_bytes or raw.len > max_frozen_bytes or !std.mem.eql(u8, raw[0..4], "AFP1")) return error.InvalidTxnRecord;
+        if (!std.mem.eql(u8, raw[32..64], &expected_digest) or !std.mem.eql(u8, &try frozenDigest(raw), &expected_digest)) return error.SourcePayloadConflict;
+        const count = std.mem.readInt(u32, raw[4..8], .little);
+        const begin_timestamp = std.mem.readInt(u64, raw[8..16], .little);
+        const created_at_ns = std.mem.readInt(u64, raw[16..24], .little);
+        const admission_len = std.mem.readInt(u64, raw[24..32], .little);
+        if (count == 0 or count > completion.max_participants or begin_timestamp == 0 or created_at_ns == 0 or admission_len == 0 or admission_len > completion.max_bytes or admission_len > raw.len - frozen_header_bytes) return error.InvalidTxnRecord;
+        const admission_bytes = raw[frozen_header_bytes..][0..@intCast(admission_len)];
+        var parsed = try completion.parseAdmission(a, admission_bytes);
+        defer parsed.deinit();
+        const admission = parsed.value.admission;
+        if (admission.version != 3 or admission.participants.len != count) return error.InvalidTxnRecord;
+        const coordinator = try admission.recoveryOwner(admission.coordinator_namespace);
+        const inputs = try a.alloc(Input, count);
+        defer a.free(inputs);
+        const requests = try a.alloc(batch.OwnedBatchRequest, count);
+        defer a.free(requests);
+        var initialized: usize = 0;
+        defer for (requests[0..initialized]) |*request| request.deinit(a);
+        var cursor = frozen_header_bytes + @as(usize, @intCast(admission_len));
+        var payload_bytes: usize = 0;
+        for (admission.participants, inputs, requests) |member, *input, *request| {
+            if (raw.len - cursor < 4) return error.InvalidTxnRecord;
+            const len = std.mem.readInt(u32, raw[cursor..][0..4], .little);
+            cursor += 4;
+            if (len == 0 or len > completion.max_bytes or len > raw.len - cursor) return error.InvalidTxnRecord;
+            payload_bytes = std.math.add(usize, payload_bytes, len) catch return error.HistoryTooLarge;
+            if (payload_bytes > max_frozen_payload_bytes) return error.HistoryTooLarge;
+            const bytes = raw[cursor..][0..len];
+            try admission.requirePreparedInput(member.namespace, bytes);
+            request.* = try batch.parseInternalBatchRequest(a, bytes);
+            initialized += 1;
+            input.* = .{ .owner = try admission.recoveryOwner(member.namespace), .locator = member.locator, .roles = member.roles, .prepare = request.req };
+            cursor += len;
+        }
+        if (cursor != raw.len) return error.InvalidTxnRecord;
+        var restored = try freeze(a, admission.transaction_id, admission.admission_digest, coordinator, inputs, created_at_ns);
+        errdefer restored.deinit();
+        if (restored.begin_timestamp != begin_timestamp or !std.mem.eql(u8, restored.admission_bytes, admission_bytes)) return error.SourcePayloadConflict;
+        cursor = frozen_header_bytes + @as(usize, @intCast(admission_len));
+        for (restored.participants) |participant| {
+            const len = std.mem.readInt(u32, raw[cursor..][0..4], .little);
+            cursor += 4;
+            if (!std.mem.eql(u8, participant.prepare_bytes, raw[cursor..][0..len])) return error.SourcePayloadConflict;
+            cursor += len;
+        }
+        return restored;
+    }
+
     /// The BEGIN request borrows this plan's admission and locator slices.
     /// Encode/submit it before destroying the plan; its timestamp never changes.
     pub fn begin(self: *const Plan, index: usize) !types.BatchRequest {
@@ -150,3 +261,112 @@ pub const Plan = struct {
         return batch.parseInternalBatchRequest(a, participant.prepare_bytes);
     }
 };
+
+pub const frozen_header_bytes: usize = 64;
+pub const max_frozen_payload_bytes: usize = 64 * 1024 * 1024;
+pub const max_frozen_bytes: usize = frozen_header_bytes + completion.max_bytes + max_frozen_payload_bytes + 4 * completion.max_participants;
+
+/// Domain-separated artifact identity. The checksum slot is excluded; every
+/// other byte, including lengths and admission timestamps, is authenticated.
+pub fn frozenDigest(raw: []const u8) !completion.Digest {
+    if (raw.len < frozen_header_bytes or raw.len > max_frozen_bytes) return error.InvalidTxnRecord;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly:frozen-completion-plan:v1");
+    hash.update(raw[0..32]);
+    hash.update(raw[frozen_header_bytes..]);
+    return hash.finalResult();
+}
+
+test "completion frozen plan artifacts retain complete owned inputs and reject substituted recovery" {
+    const a = std.testing.allocator;
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 9, .topology_epoch = 3 };
+    var follower = owner;
+    follower.namespace = @splat(3);
+    follower.group_id = 10;
+    const id: [16]u8 = @splat(4);
+    const purpose: [32]u8 = @splat(5);
+    const inputs = [_]Input{
+        .{ .owner = owner, .locator = "table2:00000004:docs:9", .roles = completion.Roles.checkpoint, .prepare = try (types.TransactionIntentRequest{ .completion_owner = owner, .completion_source_purpose = purpose }).completionBatch(id, 10, owner.topology_epoch) },
+        .{ .owner = follower, .locator = "table2:00000004:docs:10", .roles = completion.Roles.effects, .prepare = try (types.TransactionIntentRequest{ .completion_owner = follower, .completion_source_purpose = purpose, .writes = &.{.{ .key = "row", .value = "{\"v\":1}" }} }).completionBatch(id, 10, follower.topology_epoch) },
+    };
+    var plan = try Plan.freeze(a, id, @splat(6), owner, &inputs, 11);
+    defer plan.deinit();
+    const raw = try plan.encodeFrozen(a);
+    defer a.free(raw);
+    const digest = try frozenDigest(raw);
+    try std.testing.expectEqualSlices(u8, &digest, raw[32..64]);
+    var reversed = try Plan.freeze(a, id, @splat(6), owner, &.{ inputs[1], inputs[0] }, 11);
+    defer reversed.deinit();
+    const reordered = try reversed.encodeFrozen(a);
+    defer a.free(reordered);
+    try std.testing.expectEqualSlices(u8, raw, reordered);
+    var restored = try Plan.restoreFrozen(a, raw, digest);
+    defer restored.deinit();
+    try std.testing.expectEqual(plan.admission.digest(), restored.admission.digest());
+    try std.testing.expectEqualDeep(plan.participant_ids, restored.participant_ids);
+    try std.testing.expectEqual(purpose, restored.source_purpose.?);
+    try std.testing.expectEqual(@as(u64, 10), restored.begin_timestamp);
+    try std.testing.expectEqual(@as(u64, 11), restored.created_at_ns);
+
+    const damaged = try a.dupe(u8, raw);
+    defer a.free(damaged);
+    damaged[0] ^= 1;
+    try std.testing.expectError(error.InvalidTxnRecord, Plan.restoreFrozen(a, damaged, digest));
+    @memcpy(damaged, raw);
+    damaged[32] ^= 1;
+    try std.testing.expectError(error.SourcePayloadConflict, Plan.restoreFrozen(a, damaged, digest));
+    @memcpy(damaged, raw);
+    std.mem.writeInt(u32, damaged[4..8], 0, .little);
+    var changed_digest = try frozenDigest(damaged);
+    @memcpy(damaged[32..64], &changed_digest);
+    try std.testing.expectError(error.InvalidTxnRecord, Plan.restoreFrozen(a, damaged, changed_digest));
+    @memcpy(damaged, raw);
+    std.mem.writeInt(u64, damaged[24..32], std.math.maxInt(u64), .little);
+    changed_digest = try frozenDigest(damaged);
+    @memcpy(damaged[32..64], &changed_digest);
+    try std.testing.expectError(error.InvalidTxnRecord, Plan.restoreFrozen(a, damaged, changed_digest));
+    @memcpy(damaged, raw);
+    std.mem.writeInt(u64, damaged[8..16], 9, .little);
+    changed_digest = try frozenDigest(damaged);
+    @memcpy(damaged[32..64], &changed_digest);
+    try std.testing.expectError(error.SourcePayloadConflict, Plan.restoreFrozen(a, damaged, changed_digest));
+    @memcpy(damaged, raw);
+    const row = std.mem.indexOf(u8, damaged, "\"row\"") orelse return error.TestExpectedFrozenInput;
+    damaged[row + 1] = 's';
+    changed_digest = try frozenDigest(damaged);
+    @memcpy(damaged[32..64], &changed_digest);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, Plan.restoreFrozen(a, damaged, changed_digest));
+    @memcpy(damaged, raw);
+    const truncated = damaged[0 .. damaged.len - 1];
+    changed_digest = try frozenDigest(truncated);
+    @memcpy(truncated[32..64], &changed_digest);
+    try std.testing.expectError(error.InvalidTxnRecord, Plan.restoreFrozen(a, truncated, changed_digest));
+    const extended = try a.alloc(u8, raw.len + 1);
+    defer a.free(extended);
+    @memcpy(extended[0..raw.len], raw);
+    extended[raw.len] = 0;
+    changed_digest = try frozenDigest(extended);
+    @memcpy(extended[32..64], &changed_digest);
+    try std.testing.expectError(error.InvalidTxnRecord, Plan.restoreFrozen(a, extended, changed_digest));
+
+    plan.source_purpose = @splat(7);
+    try std.testing.expectError(error.SourcePayloadConflict, plan.encodeFrozen(a));
+    plan.source_purpose = purpose;
+    const Failure = struct {
+        fn encode(allocator: A, input: *const Plan) !void {
+            const bytes = try input.encodeFrozen(allocator);
+            defer allocator.free(bytes);
+        }
+        fn restore(allocator: A, bytes: []const u8, expected: completion.Digest) !void {
+            var value = try Plan.restoreFrozen(allocator, bytes, expected);
+            defer value.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.encode, .{&plan});
+    try std.testing.checkAllAllocationFailures(a, Failure.restore, .{ raw, digest });
+    @memset(raw, 0);
+    var owned_request = try restored.prepare(a, 1);
+    defer owned_request.deinit(a);
+    try std.testing.expectEqualStrings("row", owned_request.req.writes[0].key);
+    try std.testing.expectEqualStrings("{\"v\":1}", owned_request.req.writes[0].value);
+}

@@ -3752,3 +3752,42 @@ restart after lost replies, and transform replay protection. Both suites ended
 successfully with no skips, failures or leaks. Formatting and diff checks passed.
 These results do not claim that the production source worker now uses this
 transport or that its source-global checkpoint has been implemented.
+
+### Frozen completion artifact codec
+
+`completion_plan.Plan.encodeFrozen` and `restoreFrozen` define bounded AFP1
+artifacts for complete pre-admission inputs. The binary frame preserves the
+original v3 admission, namespace-ordered canonical PREPARE bytes, begin timestamp
+and creation time. Its domain-separated SHA-256 covers every header/payload
+byte except the checksum slot. Restore requires a trusted expected digest and
+validates lengths, participant count, original owners, input digests, source
+purpose, canonical encoding, timestamps and exact end-of-frame consumption.
+The original participant recovery locators are reconstructed without consulting
+current routing, schema, rows or source configuration. Output owns its inputs.
+The existing 64 MiB aggregate input and 16 MiB admission limits remain intact;
+metadata can retain an artifact reference instead of copying row WAL into its
+1 MiB reservation manifest. No artifact storage or durable pin is implied by
+encoding or decoding. Version-1 private encoders must remain stable; future
+incompatible formats require a retained versioned reader rather than replanning.
+
+The focused `completion-frozen-plan-test` target also joins `antfly-unit-test`.
+Its dedicated root supplies the normal source-owner imports without requiring
+a native-server link. Tests cover deterministic ordering, complete owned row
+inputs, corrupted checksum/magic, invalid counts/lengths/timestamps, substituted
+payloads even with a recomputed checksum, truncation, trailing bytes, mutated
+source purpose, and every allocation failure in encoding and restore.
+
+Qualification: `completion-frozen-plan-owned-test.log` passed both discovery
+and artifact tests. `completion-frozen-plan-raft-test.log`,
+`ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build completion-frozen-plan-test history-control-apply-test -j2`,
+passed all 15 cases (2 codec, 13 native/Raft) without skips, failures or leaks.
+The real signed HTTP/Raft source fixture now destroys the original plan and
+encoded buffer before BEGIN and completes PREPARE, COMMIT, repeated recovery
+and a later full-index barrier through the restored owned plan. An initial
+wrong-cwd edit caused an empty-test invocation; the edit and dedicated test-root
+setup were corrected before successful qualification. Formatting/diff checks pass.
+
+This supplies the artifact contract needed by the distributed source adapter.
+Persisting, pinning and reclaiming the artifact, binding its trusted reference
+into the source journal, source-global checkpoint integration, production worker
+wiring and every other outstanding requirement of the full goal remain required.
