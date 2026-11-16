@@ -28,7 +28,7 @@ default=> SELECT customer, id, total,
  customer |  id  | total | rank
 ----------+------+-------+------
  acme     | o-2  |  4200 |    1
- acme     | o-1  |  1200 |    2
+ acme     | o-1  |  1500 |    2
  globex   | o-3  |   900 |    1
 (3 rows)
 ```
@@ -40,9 +40,11 @@ The database in the URL is an Antfly database (`default` unless you created anot
 The `antfly` binary installed (see the [Quickstart](/docs/guides/quickstart)), `psql` from any recent PostgreSQL client package, and a strong administrator password in your shell:
 
 ```bash
-export ANTFLY_ADMIN_PASSWORD="$(openssl rand -base64 24)"
+export ANTFLY_ADMIN_PASSWORD="$(openssl rand -hex 24)"
 psql --version
 ```
+
+Use a hex password here: the password goes into a connection URL, where a `/` from base64 breaks parsing.
 
 ## Build It
 
@@ -164,12 +166,14 @@ curl -X POST http://127.0.0.1:8080/db/v1/sql \
 {
   "columns": [{"name": "id", "type": "string"}, {"name": "total", "type": "integer"}],
   "rows": [["o-1", "1600"], ["o-2", "4300"]],
+  "sql_nulls": [[false, false], [false, false]],
   "rows_affected": 0,
-  "command_tag": "SELECT 2"
+  "command_tag": "SELECT",
+  "transaction_status": "idle"
 }
 ```
 
-Rows are ordinal arrays, and integers arrive as decimal strings so no client loses precision. `limit` (default 128, maximum 4096) is an admission cap, not an implicit SQL `LIMIT`: a result larger than it fails instead of being truncated. `database` and `namespace` fields set the scope; the CLI reads `--database`, `--namespace`, or `ANTFLY_DATABASE` and `ANTFLY_NAMESPACE`.
+Rows are ordinal arrays, and integers arrive as decimal strings so no client loses precision. `sql_nulls` marks which cells are SQL `NULL`. `limit` (default 128, maximum 4096) is an admission cap, not an implicit SQL `LIMIT`: a result larger than it fails instead of being truncated. `database` and `namespace` fields set the scope; the CLI reads `--database`, `--namespace`, or `ANTFLY_DATABASE` and `ANTFLY_NAMESPACE`.
 
 `BEGIN` over HTTP returns a `session_id`; send it with each statement until `COMMIT` or `ROLLBACK`. For statements you run repeatedly, create a prepared resource and execute it by ID:
 

@@ -25,6 +25,7 @@ Your agent lists your tables, inspects their schemas, and runs queries against y
       { "name": "list_tables" },
       { "name": "describe_table" },
       { "name": "list_indexes" },
+      { "name": "describe_indexes" },
       { "name": "get_document" },
       { "name": "sample_documents" },
       { "name": "query" },
@@ -91,7 +92,7 @@ curl -s -X POST http://127.0.0.1:8080/mcp/v1 \
   -d '{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}'
 ```
 
-The second call returns the tool list from The Result. A `401` means the key is missing or malformed. A request with no session ID returns `400`, and one with an unknown session ID returns `404`; run `initialize` again. `DELETE /mcp/v1` with the session header closes the session.
+The second call returns the tool list from The Result. A `401` means the key is missing or wrong. A request with no session ID returns `400`, and one with an unknown session ID returns `404`; run `initialize` again. `DELETE /mcp/v1` with the session header closes the session.
 
 ### 3. Add Antfly to Your Agent
 
@@ -142,7 +143,7 @@ Agents do best with a discovery pass first: `describe_mcp_capabilities`, then `d
 | Permission needed | Tools |
 |---|---|
 | none | `describe_mcp_capabilities`, `describe_query_request` |
-| `read` | `list_tables` (calling it needs `read` on `*`), `describe_table`, `list_indexes`, `describe_indexes`, `get_document`, `sample_documents`, `query` |
+| `read` | `list_tables` (returns only the tables the key can read), `describe_table`, `list_indexes`, `describe_indexes`, `get_document`, `sample_documents`, `query` |
 | `write` | `batch` (inserts, deletes, and transforms) |
 | `admin` | `create_table`, `drop_table`, `create_index`, `drop_index`, `backup`, `restore` |
 

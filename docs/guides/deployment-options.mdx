@@ -87,6 +87,22 @@ Pick Cloud when you want Server's network APIs without running the process, the 
 
 Every move is a logical backup and restore. Documents, keys, schemas, index and enrichment definitions, and already-computed vectors and artifacts travel; storage-engine files such as text indexes and vector segments are rebuilt on the target.
 
+The server reads and writes backups through a named connection, so its config needs one before either direction works. `--connection archive-writer` below refers to an entry like this in the server's config file (`antfly standalone --config antfly.json`), which grants both backup and restore:
+
+```json
+{
+  "connections": {
+    "archive-writer": {
+      "kind": "external_io",
+      "capabilities": ["backup.write", "restore.read"],
+      "external_io": {"protocol": "filesystem", "root": "/"}
+    }
+  }
+}
+```
+
+The server resolves a `file://` location under the connection's `root`, and the CLI stages files at the literal path. A `root` of `/` lets both use the same absolute path when they share a host.
+
 **Lite to a running server.** `promote` opens the file read-only, stages a portable backup at a location the server can reach, restores it into a table, and leaves the `.aflite` in place:
 
 ```bash

@@ -88,28 +88,6 @@ curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X POST http://127.0.0.1:8080/db/v1/ta
       }, "sync_level": "full_index"}'
 ```
 
-<Tabs defaultValue="cli">
-  <TabsList>
-    <TabsTrigger value="cli">CLI</TabsTrigger>
-    <TabsTrigger value="curl">cURL</TabsTrigger>
-  </TabsList>
-
-  <TabsContent value="cli">
-```bash
-export ANTFLY_USERNAME=admin ANTFLY_PASSWORD="$ANTFLY_ADMIN_PASSWORD"
-cat > alice.json <<'EOF'
-{
-  "username": "alice",
-  "password": "change-me-alice-1",
-  "initial_policies": [{"resource": "docs", "resource_type": "table", "type": "read"}],
-  "metadata": {"tenant_id": "acme"}
-}
-EOF
-antfly auth users create alice --file alice.json
-```
-  </TabsContent>
-
-  <TabsContent value="curl">
 ```bash
 curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X POST http://127.0.0.1:8080/auth/v1/users/alice \
   -H "Content-Type: application/json" \
@@ -119,8 +97,6 @@ curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X POST http://127.0.0.1:8080/auth/v1/
     "metadata": {"tenant_id": "acme"}
   }'
 ```
-  </TabsContent>
-</Tabs>
 
 Permissions are `read`, `write`, `curator`, or `admin` on a `resource_type` of `table`, `database`, `namespace`, `tablespace`, `graph`, `user`, `inference`, or `*`. Grant `inference` with resource `*` to let a user call the `/ai/v1` routes. Add more grants later with `POST /auth/v1/users/{user}/permissions`.
 
