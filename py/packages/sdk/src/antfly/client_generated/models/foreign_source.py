@@ -30,7 +30,7 @@ class ForeignSource:
              Example: customers.
         columns (list[ForeignColumn] | Unset): Optional column definitions for the foreign table. If omitted, columns
             are
-            auto-discovered from `information_schema.columns` on first query.
+            auto-discovered from the PostgreSQL catalog (`pg_attribute`) on first query.
     """
 
     type_: ForeignSourceType

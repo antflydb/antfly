@@ -1205,17 +1205,24 @@ export interface paths {
         /**
          * Execute a SQL statement
          * @description Executes supported SQL statements through the current catalog and native
-         *     execution contracts. Stored views use CREATE [OR REPLACE] VIEW,
-         *     ALTER VIEW RENAME TO, and DROP VIEW [CASCADE | RESTRICT] on this same
-         *     endpoint. Views retain durable source identities; owner/invoker access
-         *     reuses native row policies and caller/owner filters without changing
-         *     the caller's SQL identity. Document fields can be projected with
-         *     jsonb_to_record and declared SQL types, including typed arrays.
-         *     Parameters are bound separately from statement text. Source, DDL,
-         *     session, and transaction capabilities are checked explicitly; not every
-         *     PostgreSQL statement or cross-source transaction is supported.
-         *     Reads require the native retained statement-snapshot capabilities of
-         *     their sources, not an implied global SQL transaction snapshot.
+         *     typed plans, including reads over read-only lake attachments. Stored
+         *     views use CREATE [OR REPLACE] VIEW, ALTER VIEW RENAME TO, and DROP VIEW
+         *     [CASCADE | RESTRICT] on this same endpoint. Views retain durable source
+         *     identities; owner/invoker access reuses native row policies and
+         *     caller/owner filters without changing the caller's SQL identity.
+         *     Document fields can be projected with jsonb_to_record and declared SQL
+         *     types, including typed arrays. Parameters are bound separately from
+         *     statement text. DDL returns a durable `ddl_receipt`; a 202 response
+         *     means the declaration was admitted and validation is pending, and
+         *     admitted DDL must not be replayed. BEGIN starts a SQL session: send the
+         *     returned `session_id` with later statements until COMMIT or ROLLBACK.
+         *     Open a connection with `/sql/connections` to keep scope and settings
+         *     across requests, and use `/sql/prepared` for prepared statements.
+         *     Source, DDL, session, and transaction capabilities are checked
+         *     explicitly; not every PostgreSQL statement or cross-source transaction
+         *     is supported. Reads require the native retained statement-snapshot
+         *     capabilities of their sources, not an implied global SQL transaction
+         *     snapshot.
          *     Unsupported statement shapes fail explicitly; the server never
          *     silently substitutes a different query or truncates the result.
          */
@@ -14556,8 +14563,12 @@ export interface components {
              *     This enables joining Antfly search results with structured relational data (customer records,
              *     product catalogs, etc.) without ingesting that data into Antfly.
              *
-             *     **Supported operations on foreign tables:** filter_query, field selection, limit/offset.
-             *     **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker.
+             *     **Supported operations on foreign tables:** filter_query, filter_prefix, field selection,
+             *     order_by, limit/offset, joins (including nested joins and joins between two foreign tables),
+             *     and the `stats`, `terms`, `count`, `sum`, `avg`, `min`, and `max` aggregations, which run as
+             *     SQL in PostgreSQL. Other aggregation types and sub-aggregations return 422.
+             *     **Not supported when the foreign table drives the query:** full_text_search, semantic_search,
+             *     graph_queries, reranker, search_after.
              *
              *     **Example - Join Antfly products with Postgres customers:**
              *     ```json
@@ -16016,7 +16027,7 @@ export interface components {
             postgres_table: string;
             /**
              * @description Optional column definitions for the foreign table. If omitted, columns are
-             *     auto-discovered from `information_schema.columns` on first query.
+             *     auto-discovered from the PostgreSQL catalog (`pg_attribute`) on first query.
              */
             columns?: components["schemas"]["ForeignColumn"][];
         };

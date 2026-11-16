@@ -1,0 +1,191 @@
+---
+title: "Find and Redact Sensitive Data"
+description: "A table whose emails, names, account numbers, and credentials are detected by a local model, reported as findings, and replaced in everything search and AI consume, while the original values stay stored"
+order: 15
+---
+
+<Questions>
+- How do I find PII in an Antfly table?
+- How do I keep emails and phone numbers out of search results and RAG answers?
+- Does Antfly delete the original values when it redacts them?
+- Which model does Antfly use to detect personal data?
+- Can I redact data before it is stored?
+</Questions>
+
+## The Result
+
+A privacy policy on the `body` field of `customers`. Antfly inspects every document with a local detector model, records where each email and name sits, and serves the redacted text to reads, full-text and vector search, and anything built on them:
+
+```bash
+curl -s http://127.0.0.1:8080/db/v1/tables/customers/documents/customer-1
+```
+
+```json
+{
+  "body": "Contact [PERSON] at [EMAIL] about the renewal."
+}
+```
+
+The stored source still holds `Maria Jensen` and `maria.jensen@example.dk`.
+
+## Before You Start
+
+Antfly running in standalone mode with the PII detector pulled:
+
+```bash
+antfly inference pull fastino/gliner2-privacy-filter-PII-multi --tasks extract
+antfly inference list
+curl -s http://127.0.0.1:8080/db/v1/status
+```
+
+Without a revision suffix, the pull resolves to the pinned revision `1cb4166094dc58fa8d836429f060d6c95f62b495`, the one privacy policies expect. If authentication is on, every privacy operation needs table `admin` permission; add `-u "admin:$ANTFLY_ADMIN_PASSWORD"` to the commands below.
+
+## Build It
+
+### 1. Load a Document Table
+
+Privacy policies run on tables in document storage without an external base source. A relational table or one backed by an external source returns `422` (`PrivacyRelationalStorageUnsupported`) before anything is inspected.
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/db/v1/tables/customers \
+  -H "Content-Type: application/json" -d '{}'
+
+curl -s -X POST http://127.0.0.1:8080/db/v1/tables/customers/batch \
+  -H "Content-Type: application/json" \
+  -d '{"inserts": {
+        "customer-1": {"body": "Contact Maria Jensen at maria.jensen@example.dk about the renewal."},
+        "customer-2": {"body": "Card ending 4242 was declined; call +45 20 12 34 56."}
+      }, "sync_level": "full_index"}'
+```
+
+### 2. Preview a Policy on a Sample
+
+A policy names the string fields to inspect, the categories to look for, and a mode. Preview it against up to 50 documents before installing anything:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/db/v1/tables/customers/privacy/preview \
+  -H "Content-Type: application/json" \
+  -d '{
+    "policy": {
+      "mode": "redact_for_search_and_ai",
+      "fields": ["body"],
+      "category_groups": ["contact_details", "financial"],
+      "categories": [{"name": "person"}],
+      "sensitivity": "balanced"
+    },
+    "sample": {"keys": ["customer-1", "customer-2"]}
+  }'
+```
+
+Each sampled field comes back with `original`, the redacted `text`, and `findings` with half-open UTF-8 byte offsets (trimmed):
+
+```json
+{
+  "sampled": 2,
+  "complete_table_scan": false,
+  "external_processing": false,
+  "documents": [{
+    "document": "customer-1",
+    "fields": [{
+      "field": "body",
+      "original": "Contact Maria Jensen at maria.jensen@example.dk about the renewal.",
+      "text": "Contact [PERSON] at [EMAIL] about the renewal.",
+      "findings": [
+        {"category": "person", "start": 8, "end": 20},
+        {"category": "email", "start": 24, "end": 47}
+      ]
+    }]
+  }]
+}
+```
+
+The response contains original values, which is why preview requires table admin. A clean sample is not a table-wide quality check.
+
+### 3. Install the Policy
+
+`PUT` the same policy object. The response is `202` with an `ETag` (also `etag` in the body), an immutable `policy_version`, and a `scan_id` for the backfill Antfly schedules over existing documents:
+
+```bash
+SCAN_ID=$(curl -s -X PUT http://127.0.0.1:8080/db/v1/tables/customers/privacy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "redact_for_search_and_ai",
+    "fields": ["body"],
+    "category_groups": ["contact_details", "financial"],
+    "categories": [{"name": "person"}]
+  }' | jq -r .scan_id)
+```
+
+Poll the scan until its `phase` is `succeeded`. It moves through `queued`, `running`, and `processing`, where Antfly confirms the redacted text has reached every index before reporting success:
+
+```bash
+curl -s "http://127.0.0.1:8080/db/v1/tables/customers/privacy/scans/$SCAN_ID" | jq .phase
+```
+
+New and updated documents are inspected through the normal write pipeline without another scan. While a document's inspection is pending, protected reads and searches return a retryable unavailable response instead of the original text.
+
+### 4. Review Findings and Coverage
+
+Findings list document, field, category, byte coordinates, policy version, and confidence when the model supplies it. They never include the matched value:
+
+```bash
+curl -s "http://127.0.0.1:8080/db/v1/tables/customers/privacy/findings?field=body&category=email&limit=100"
+```
+
+Follow `next_cursor` until it is absent, passing it back unchanged, even when a page holds no findings. For long cursors or filters, `POST` the same fields as JSON to `/privacy/findings`. `GET /db/v1/tables/customers/privacy` returns the policy, the resolved detector, and coverage counts (current, pending, failed, documents with findings, and per-category and per-field counts). Counts are `null`, not zero, until the first background census completes.
+
+### 5. Tune and Rescan
+
+Replacing a policy requires the current `ETag` in `If-Match`; a missing one returns `428` and a stale one `412`:
+
+```bash
+ETAG=$(curl -s http://127.0.0.1:8080/db/v1/tables/customers/privacy | jq -r .etag)
+curl -s -X PUT http://127.0.0.1:8080/db/v1/tables/customers/privacy \
+  -H "If-Match: $ETAG" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "redact_for_search_and_ai",
+    "fields": ["body"],
+    "category_groups": ["contact_details", "financial"],
+    "categories": [{"name": "person", "threshold": 0.8}],
+    "replacement": "mask"
+  }'
+```
+
+Changing fields, categories, thresholds, replacement, mode, or detector creates a new policy version and backfills under it. To retry failures or re-inspect a key range under the same policy, `POST /db/v1/tables/customers/privacy/scans` with optional `from_key`, `to_key`, and a page `limit` from 1 to 1,000.
+
+### Policy Options
+
+| Field | Values |
+|---|---|
+| `mode` | `monitor` records findings and changes nothing served. `redact_for_search_and_ai` serves redacted text to reads, full-text and vector indexes, chunking, and embeddings. `redact_before_storage` is rejected with `422` (`privacy_synchronous_ingestion_required`) on preview and install, before any sampling or model call |
+| `category_groups` | `contact_details` (email, phone number, addresses, IP address), `personal_identifiers` (names, dates of birth, government, passport, tax, and account IDs, usernames), `financial` (bank account, routing, IBAN, card number, expiry, CVV), `credentials` (password, secret, API key, access token, recovery code). All four apply when omitted |
+| `categories` | Extra or overriding categories, each with an optional `description` and `threshold` from 0 to 1. At most 128 categories after groups expand |
+| `sensitivity` | `conservative` (0.75), `balanced` (0.5, the default), or `thorough` (0.3) as the detection threshold |
+| `replacement` | `category` writes `[EMAIL]`, `mask` writes `[REDACTED]`, `remove` deletes the span |
+| `producer` | A different detector: an `extractor` or `generator` artifact producer with a mandatory immutable `revision` |
+
+## Tradeoffs
+
+The decision you own is which categories and thresholds to trust, because detection is probabilistic. A lower threshold catches more variants and also redacts more text that was never sensitive, which degrades search over that field. Preview against documents that look like your real data, check per-category counts in coverage after the backfill, and raise individual category thresholds rather than the global sensitivity when one category is noisy.
+
+Redaction changes what is served, not what is stored. Originals stay in the table, inspecting them takes separate administrator access, and table backups carry both the originals and the policy. If the requirement is that a value never reaches disk, `redact_for_search_and_ai` does not meet it, and Antfly rejects `redact_before_storage` rather than approximating it asynchronously.
+
+The default detector runs locally. A custom `producer` pointed at a remote provider receives the original selected text, and the preview and policy responses report that with `external_processing: true`. A protected table also limits what you can attach to it: original authored vectors and graph or relational consumers are rejected, and SQL writes to the table are unsupported (use the batch API).
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Preview a privacy policy that redacts emails, names, and card numbers in the body field of my customers table, then install it and wait for the backfill", and use this page to judge the result.
+
+## Next Steps
+
+- [Table privacy reference](/docs/reference/table-privacy): scan limits, checkpoint budgets, index migration under protection, and repair after an upgrade
+- [Secure a self-hosted Antfly](/docs/guides/access-control): control who can read the originals and administer the policy
+- [Hybrid search](/docs/guides/hybrid-search): tune retrieval over the redacted fields
