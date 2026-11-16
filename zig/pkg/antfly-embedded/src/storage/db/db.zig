@@ -32900,16 +32900,6 @@ pub const DB = struct {
         index_ref: index_manager_mod.ManagedIndexRef,
         applied_sequence: u64,
     ) !u64 {
-        const names = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_ref.name);
-        defer {
-            for (names) |name| alloc.free(name);
-            alloc.free(names);
-        }
-        if (names.len != 0) {
-            var read = try self.core.store.beginReadTxn();
-            defer read.abort();
-            if (try replay_source_mod.artifactTargetAtCut(alloc, &read, names, applied_sequence, null)) |target| return target;
-        }
         return try replay_source.latestMatchingSequence(
             alloc,
             applied_sequence,
@@ -39293,6 +39283,19 @@ pub const DB = struct {
         kind: types.IndexKind,
         applied_sequence: u64,
     ) !u64 {
+        // Query admission and public status use the selected source frontier.
+        // Replay/maintenance keep their kind-wide cursor: stable-tip physical
+        // publication certifies that complete journal boundary.
+        const names = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_name);
+        defer {
+            for (names) |name| alloc.free(name);
+            alloc.free(names);
+        }
+        if (names.len != 0) {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            if (try replay_source_mod.artifactTargetAtCut(alloc, &read, names, applied_sequence, null)) |target| return target;
+        }
         return try self.probeDerivedReplayTargetSequence(
             alloc,
             self.core.replaySource(),
