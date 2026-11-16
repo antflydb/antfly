@@ -3176,6 +3176,12 @@ pub const Store = struct {
     /// so callers override it only to test this barrier itself, never to
     /// tune write-amplification numbers for one caller's own benefit.
     ride_along_idle_ns: u64 = 50 * std.time.ns_per_ms,
+    /// Set while this Store's owner has handed its writer lane to a
+    /// maintenance turn. No foreground writer can lead a group then, so a
+    /// ride-along waiter must not sit out `ride_along_idle_ns` hoping one
+    /// will: it drives the group itself straight away (the same barrier
+    /// the idle window would have run, just without the wait).
+    writer_held_by_maintenance: std.atomic.Value(bool) = .init(false),
     /// How long `maybeCheckpointRedoLogOnIdleTurn`'s opportunistic fold
     /// (no byte-capacity pressure, `threshold_due` false) waits for
     /// genuine quiet before running, separate from `ride_along_idle_ns`
@@ -5276,7 +5282,15 @@ pub const Store = struct {
             const io = self.store.file.runtime();
             self.store.commit_mutex.lockUncancelable(io);
             while (!self.request.done) {
-                if (self.request.ride_along) {
+                if (self.request.ride_along and self.store.writer_held_by_maintenance.load(.acquire)) {
+                    self.store.commit_mutex.unlock(io);
+                    {
+                        const flush_scope = wal_trace.scope(.ride_along_flush);
+                        defer flush_scope.end();
+                        self.store.forceDrainDurable();
+                    }
+                    self.store.commit_mutex.lockUncancelable(io);
+                } else if (self.request.ride_along) {
                     // A ride-along ticket never leads its own group (see
                     // `ride_along`'s own doc comment), so its wait must
                     // never depend on anyone *else* existing to eventually

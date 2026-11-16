@@ -1103,6 +1103,11 @@ pub const WriterLane = struct {
     /// `othersWaiting`/fairness check needed) rather than racing a remote
     /// handoff decision against them.
     waiting: usize = 0,
+    /// Bumped (and futex-woken) whenever the lane becomes available:
+    /// `checked_out` cleared or a lease parked. Waiters read it under
+    /// `mutex` before sleeping on it, so a release between their check and
+    /// their sleep cannot be missed.
+    release_epoch: std.atomic.Value(u32) = .init(0),
     /// The root this lane handed out last, so a warm checkout can tell
     /// "nothing has replaced the generation since" by pointer identity
     /// alone -- see `checkout`'s fast path.
@@ -1238,6 +1243,7 @@ pub const WriterLane = struct {
                     self.mutex.lockUncancelable(io);
                     self.checked_out = false;
                     self.mutex.unlock(io);
+                    self.signalReleased(io);
                     return err;
                 };
                 connection.gate.mutex.unlock(io);
@@ -1267,6 +1273,7 @@ pub const WriterLane = struct {
                     self.mutex.lockUncancelable(io);
                     self.checked_out = false;
                     self.mutex.unlock(io);
+                    self.signalReleased(io);
                     return err;
                 };
                 const root = connection.refresh(&lease, intent, true) catch |err| {
@@ -1275,6 +1282,7 @@ pub const WriterLane = struct {
                     self.mutex.lockUncancelable(io);
                     self.checked_out = false;
                     self.mutex.unlock(io);
+                    self.signalReleased(io);
                     return err;
                 };
                 connection.gate.mutex.unlock(io);
@@ -1291,6 +1299,7 @@ pub const WriterLane = struct {
             // `checkin` checks `waiting` fresh every time, so arriving
             // late here is never fatal to getting the fast path.
             self.waiting += 1;
+            const epoch = self.release_epoch.load(.acquire);
             self.mutex.unlock(io);
             const remaining = local_wait_deadline - std.Io.Clock.awake.now(io).nanoseconds;
             if (remaining <= 0) {
@@ -1299,7 +1308,9 @@ pub const WriterLane = struct {
                 self.mutex.unlock(io);
                 return error.FileBusy;
             }
-            io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake) catch {};
+            // Woken by `signalReleased`; the timeout only bounds a path
+            // that frees the lane without signalling.
+            io.futexWaitTimeout(u32, &self.release_epoch.raw, epoch, .{ .duration = .{ .raw = .fromNanoseconds(@intCast(@min(backoff_ns, remaining))), .clock = .awake } }) catch {};
             backoff_ns = @min(backoff_ns * 2, poll_max_ns);
             self.mutex.lockUncancelable(io);
             self.waiting -= 1;
@@ -1425,17 +1436,20 @@ pub const WriterLane = struct {
     }
 
     /// Pairs with `markCheckedOutByMaintenance`; see its own doc comment.
-    /// A waiter here only ever polls `checked_out` with its own bounded
-    /// backoff (`waitParkedForStore`) rather than blocking on a condition
-    /// variable, so no wake is needed -- the next poll simply observes
-    /// `false` and (finding nothing parked, since the maintenance lease
-    /// this guarded was closed, never parked) falls through to its own
-    /// fresh kernel acquisition, which now safely succeeds.
+    /// Wakes waiters in `checkout`/`waitParkedForStore`; finding nothing
+    /// parked (this maintenance lease was closed, not parked), they fall
+    /// through to a fresh kernel acquisition, which now succeeds.
     pub fn clearCheckedOutByMaintenance(self: *WriterLane) void {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         self.checked_out = false;
         self.mutex.unlock(io);
+        self.signalReleased(io);
+    }
+
+    fn signalReleased(self: *WriterLane, io: std.Io) void {
+        _ = self.release_epoch.fetchAdd(1, .release);
+        io.futexWake(u32, &self.release_epoch.raw, std.math.maxInt(u32));
     }
 
     /// Like `takeParkedForStore`, but when nothing is parked *yet* only
@@ -1470,6 +1484,7 @@ pub const WriterLane = struct {
         self.mutex.lockUncancelable(io);
         while (self.checked_out) {
             self.waiting += 1;
+            const epoch = self.release_epoch.load(.acquire);
             self.mutex.unlock(io);
             const remaining = local_wait_deadline - std.Io.Clock.awake.now(io).nanoseconds;
             if (remaining <= 0) {
@@ -1478,7 +1493,9 @@ pub const WriterLane = struct {
                 self.mutex.unlock(io);
                 return null;
             }
-            io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake) catch {};
+            // Woken by `signalReleased`; the timeout only bounds a path
+            // that frees the lane without signalling.
+            io.futexWaitTimeout(u32, &self.release_epoch.raw, epoch, .{ .duration = .{ .raw = .fromNanoseconds(@intCast(@min(backoff_ns, remaining))), .clock = .awake } }) catch {};
             backoff_ns = @min(backoff_ns * 2, poll_max_ns);
             self.mutex.lockUncancelable(io);
             self.waiting -= 1;
@@ -1576,6 +1593,7 @@ pub const WriterLane = struct {
             self.parked_store = store;
             self.checked_out = false;
             self.mutex.unlock(io);
+            self.signalReleased(io);
             // A local waiter takes this immediately (its own poll, not
             // `maintainParkedLease`), so no wake is needed for its sake --
             // but see the doc comment below for why one still happens.
@@ -1590,6 +1608,7 @@ pub const WriterLane = struct {
             self.parked_store = store;
             self.checked_out = false;
             self.mutex.unlock(io);
+            self.signalReleased(io);
             // Bare `self.wake.set(io)` isn't enough: `Owner.maintenanceLoop`
             // may currently be parked indefinitely (no durable consumer
             // registered -- `no_scheduled_wait`), and nothing else ever
@@ -1605,6 +1624,7 @@ pub const WriterLane = struct {
         }
         self.checked_out = false;
         self.mutex.unlock(io);
+        self.signalReleased(io);
         store.sync() catch {};
         lease.close();
     }
@@ -2778,6 +2798,9 @@ pub const Owner = struct {
         // matching `maintenance_writer_references -> 0` transition.
         self.writer_lane.markCheckedOutByMaintenance();
         errdefer self.writer_lane.clearCheckedOutByMaintenance();
+        const maintenance_store = root.owned_lite_backend.?.native_docstore.?;
+        maintenance_store.writer_held_by_maintenance.store(true, .release);
+        errdefer maintenance_store.writer_held_by_maintenance.store(false, .release);
         // The hold starts here: admission checks and rebases run under it.
         const held_from = nowNs();
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
@@ -2859,6 +2882,7 @@ pub const Owner = struct {
         // call: this lease is fully released (never parked for reuse --
         // maintenance always closes, see `WriterLane.markCheckedOutByMaintenance`'s
         // own doc comment), so the lane is no longer busy on its account.
+        root.owned_lite_backend.?.native_docstore.?.writer_held_by_maintenance.store(false, .release);
         self.writer_lane.clearCheckedOutByMaintenance();
         // Status readers serialize publication_stats under the gate; record
         // before releasing it.

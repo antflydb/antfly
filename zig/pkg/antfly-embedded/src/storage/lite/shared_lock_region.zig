@@ -2147,6 +2147,25 @@ pub const Region = struct {
     /// narrower one. Name and semantics are relied on by more than one
     /// caller (page reclamation here, log-record retention elsewhere) --
     /// keep both stable.
+    /// `minimumPinnedSequence`, counting only readers in other processes.
+    /// The physical redo log is read back only by a reader in another
+    /// process catching its own overlay up; a reader in this process
+    /// resolves through the shared in-memory overlay, whose own pins keep
+    /// what it needs, so it must not hold the log's bytes hostage. Page
+    /// reuse still uses `minimumPinnedSequence`: every reader reads pages.
+    pub fn minimumForeignPinnedSequence(self: *Region, own_pid: u32) ?u64 {
+        var min: ?u64 = null;
+        for (self.readerSlots()) |*slot| {
+            if (slot.owner.load(.acquire) == 0) continue;
+            if (holderPid(slot.generation) == own_pid) continue;
+            if (self.isReferenceDead(holderLivenessSlot(slot.generation), holderClaimGeneration(slot.generation))) continue;
+            const seq = slot.pinned_sequence.load(.acquire);
+            if (seq == 0) continue;
+            if (min == null or seq < min.?) min = seq;
+        }
+        return min;
+    }
+
     pub fn minimumPinnedSequence(self: *Region) ?u64 {
         var min: ?u64 = null;
         for (self.readerSlots()) |*slot| {
