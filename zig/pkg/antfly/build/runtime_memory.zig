@@ -186,7 +186,9 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
             .cli => 3,
         } else switch (unit) {
             .api_kernel => 5,
-            .distributed => 5,
+            // Zig 0.17.0 cold build peaked at 6,841,577,472 bytes (6.37 GiB),
+            // over the old 5 GiB claim; 8 GiB keeps >=25% headroom.
+            .distributed => 8,
             .local_query => unreachable,
             .storage_kernel => 8,
             .enrichment_compute => 2,
@@ -871,6 +873,8 @@ test "native Linux LLVM fast API covers measured peak and preserves overlap" {
     try std.testing.expectEqual(8 * gib, claim);
     try std.testing.expect(claim >= peak + peak / 4);
     try std.testing.expect(claim + runtimeCompileMaxRss(.storage_kernel, profile) + 2 * gib <= 20 * gib);
+    const distributed_peak: usize = 6_841_577_472;
+    try std.testing.expect(runtimeCompileMaxRss(.distributed, profile) >= distributed_peak + distributed_peak / 4);
     profile.optimize = .safe;
     try std.testing.expectEqual(7 * gib, runtimeCompileMaxRss(.api_kernel, profile));
     profile.optimize = .fast;
