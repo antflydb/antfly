@@ -495,6 +495,45 @@ test "history control ingress mounted route rejects unsigned migration traffic" 
     }
 }
 
+test "history control ingress completion batches reject unsigned migration traffic" {
+    const a = std.testing.allocator;
+    var source: AuthStatusSource = .{};
+    const secret = "completion-batch-migration-secret-long-enough";
+    var api_server = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "history-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+    defer api_server.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api_server);
+    defer server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(a, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const url = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/17/tables/docs/batch-routed-v1", .{base});
+    defer a.free(url);
+    const body = try batch_api.encodeBatchRequest(a, .{ .timestamp_ns = 1, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = @splat(3), .topology_epoch = 1, .completion_owner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 17, .topology_epoch = 1 } } } });
+    defer a.free(body);
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer a.free(token);
+    const unsigned_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_batch_forwarding.remaining_ms_header, "1000" }, .{ internal_batch_forwarding.forwards_remaining_header, "0" }, .{ internal_batch_forwarding.campaign_allowed_header, "false" } };
+    var unsigned = try requestWithRetry(&client, client_io.io(), .POST, url, body, &unsigned_headers, 20);
+    defer unsigned.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unsigned.status.code);
+    const signed_headers = unsigned_headers ++ [_][2][]const u8{.{ internal_service_auth.header_name, token }};
+    var signed = try requestWithRetry(&client, client_io.io(), .POST, url, body, &signed_headers, 20);
+    defer signed.deinit();
+    // Reaches the configured writer boundary, which is deliberately absent.
+    try std.testing.expectEqual(@as(u16, 503), signed.status.code);
+    // The older endpoint also decodes canonical private batches. Completion
+    // commands cannot use its optional migration allowance to bypass auth.
+    const legacy_url = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/17/tables/docs/batch", .{base});
+    defer a.free(legacy_url);
+    var legacy_unsigned = try requestWithRetry(&client, client_io.io(), .POST, legacy_url, body, &.{.{ "content-type", "application/json" }}, 20);
+    defer legacy_unsigned.deinit();
+    try std.testing.expectEqual(@as(u16, 401), legacy_unsigned.status.code);
+}
+
 test "internal capabilities advertise only the serving history apply profile" {
     const a = std.testing.allocator;
     var request = try httpx.Request.init(a, .GET, "http://127.0.0.1/internal/v1/capabilities");
@@ -3805,6 +3844,12 @@ pub const AntflyApiHandler = struct {
             else => textResponse(ctx, 500, "internal server error"),
         };
         defer input.deinit(ctx.allocator);
+        if (batch_api.requiresCompletionProtocol(input.req)) {
+            const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+            var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+            defer identity.deinit(self.api_server.alloc);
+            if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        }
         if (input.req.relational_topology) |command| if (command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement)
             return textResponse(ctx, 403, "parent activation requires owner-local metadata proof");
         const result = self.internalGroupOperations().batch(
@@ -4390,6 +4435,14 @@ pub const AntflyApiHandler = struct {
             else => textResponse(ctx, 500, "internal server error"),
         };
         defer input.deinit(ctx.allocator);
+        if (batch_api.requiresCompletionProtocol(input.req)) {
+            // Completion v2 has no released unauthenticated transport. The
+            // legacy rolling-upgrade allowance must not grant this authority.
+            const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+            var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+            defer identity.deinit(self.api_server.alloc);
+            if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        }
         if (input.req.relational_topology) |command| if (command.action == .activate_parent_retirement or command.action == .acknowledge_parent_retirement)
             return textResponse(ctx, 403, "parent activation requires owner-local metadata proof");
         const result = self.internalGroupOperations().routedBatch(

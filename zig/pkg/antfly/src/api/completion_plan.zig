@@ -74,7 +74,7 @@ pub const Plan = struct {
             if (!std.mem.eql(u8, &vote.txn_id, &transaction_id)) return error.SourceTransactionIdentityConflict;
             if (!std.mem.eql(u8, &owner.digest(), &input.owner.digest()) or vote.topology_epoch != input.owner.topology_epoch) return error.TopologyChanged;
             // Normalizing either field after freezing changes the vote's hash.
-            if (input.prepare.timestamp_ns == 0 or input.prepare.document_version_scheme != .revision_v1 or input.prepare.restore_staging_scope != null or input.prepare.restore_staging_plan_id != null) return error.InvalidBatchRequest;
+            if (input.prepare.timestamp_ns == 0 or input.prepare.sync_level != .write or input.prepare.document_version_scheme != .revision_v1 or input.prepare.restore_staging_scope != null or input.prepare.restore_staging_plan_id != null) return error.InvalidBatchRequest;
             if (i == 0) begin_timestamp = input.prepare.timestamp_ns else if (begin_timestamp != input.prepare.timestamp_ns) return error.SourceTransactionIdentityConflict;
             if ((input.prepare.writes.len != 0 or input.prepare.deletes.len != 0 or input.prepare.transforms.len != 0 or input.prepare.graph_writes.len != 0 or input.prepare.graph_deletes.len != 0) and input.roles & completion.Roles.effects == 0) return error.InvalidTxnRecord;
             if ((input.prepare.predicates.len != 0 or input.prepare.range_guards.len != 0) and input.roles & completion.Roles.guards == 0) return error.InvalidTxnRecord;

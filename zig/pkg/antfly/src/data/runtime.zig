@@ -12273,6 +12273,10 @@ pub const DataServer = struct {
         return owner.restoreOwnerControl(alloc, group_id, table_name, descriptor, input, if (local_term != null) .{ .ptr = &proposal, .propose = Proposal.propose } else null, .{ .secret_store = self.api_server_cfg.secret_store, .node_config = self.api_server_cfg.node_config }, context);
     }
 
+    pub fn completionParticipantPort(self: *DataServer) @import("../api/completion_participant.zig").Port {
+        return .{ .writer = self.routedRaftBatchWriter() };
+    }
+
     fn routedRaftBatchWriter(self: *DataServer) antfly.public_api.internal_group_operations.RoutedRaftBatchWriter {
         return .{
             .ptr = self,
@@ -43315,6 +43319,130 @@ fn consumerTests() type {
             }
         }
 
+        test "data raft ordered history completion HTTP treats malformed mutation replies as unknown" {
+            const mod = @import("../api/completion_participant.zig");
+            const http = antfly.common.http;
+            const a = std.testing.allocator;
+            const Fake = struct {
+                const Mode = enum { valid, wrong_counts, malformed, duplicate, missing_ack, wrong_content_type, outcome_header, oversized, lost };
+                mode: Mode = .valid,
+                calls: usize = 0,
+                fn realtimeNs(_: *anyopaque) i128 {
+                    return 42 * std.time.ns_per_s;
+                }
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expectEqual(@as(?usize, 4096), request.max_response_bytes);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/docs%2Fa%3F/batch-routed-v1"));
+                    try internal_service_auth.verifyToken(alloc, request.header(internal_service_auth.header_name).?, .{ .secret = "completion-response-contract-secret-long-enough", .issuer = "history-test" }, 42);
+                    try std.testing.expect(request.header(antfly.metadata_api.catalog_route_fence_header) != null);
+                    try std.testing.expect(request.cancellation != null);
+                    try std.testing.expect(request.timeout_ms.? > 0 and request.timeout_ms.? <= 1000);
+                    if (request.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
+                    if (self.mode == .lost) return error.ConnectionResetByPeer;
+                    var response: http.HttpResponse = .{ .status = 201 };
+                    errdefer response.deinit(alloc);
+                    response.content_type = try alloc.dupe(u8, if (self.mode == .wrong_content_type) "text/plain" else "application/json");
+                    response.body = if (self.mode == .oversized) try alloc.alloc(u8, 4097) else try alloc.dupe(u8, switch (self.mode) {
+                        .malformed => "{",
+                        .duplicate => "{\"inserted\":0,\"inserted\":0,\"deleted\":0,\"transformed\":0}",
+                        .wrong_counts => "{\"inserted\":1,\"deleted\":0,\"transformed\":0}",
+                        else => "{\"inserted\":0,\"deleted\":0,\"transformed\":0}",
+                    });
+                    if (self.mode == .oversized) @memset(response.body, 'x');
+                    response.headers = try alloc.alloc(http.Header, if (self.mode == .missing_ack) 0 else if (self.mode == .outcome_header) 2 else 1);
+                    @memset(response.headers, .{ .name = &.{}, .value = &.{} });
+                    if (response.headers.len > 0) {
+                        response.headers[0].name = try alloc.dupe(u8, antfly.metadata_api.catalog_route_fence_ack_header);
+                        response.headers[0].value = try alloc.dupe(u8, antfly.metadata_api.catalog_route_fence_ack_value);
+                    }
+                    if (self.mode == .outcome_header) {
+                        response.headers[1].name = try alloc.dupe(u8, antfly.public_api.internal_batch_forwarding.outcome_header);
+                        response.headers[1].value = try alloc.dupe(u8, antfly.public_api.internal_batch_forwarding.outcome_unknown_v1);
+                    }
+                    return response;
+                }
+            };
+            var fake: Fake = .{};
+            var client = antfly.public_api.ApiHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute }, .realtime_ns_fn = Fake.realtimeNs });
+            _ = client.withInternalServiceAuth("completion-response-contract-secret-long-enough", "history-test");
+            var adapter: mod.HttpWriter = .{ .client = &client, .base_uri = "http://node.invalid" };
+            const fence: antfly.metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .catalog_revision = 9, .table_id = 7, .topology_epoch = 4, .route = .{ .group_id = 601, .range_id = 601, .identity_namespace = .{ .table_id = 7, .shard_id = 601, .range_id = 601 } } };
+            const forwarding: antfly.public_api.internal_batch_forwarding.Context = .{ .remaining_ms = 1000, .forwards_remaining = 0, .campaign_allowed = false };
+            _ = try adapter.writer().write(a, .{ .catalog = fence }, 601, "docs/a?", .{}, forwarding, .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s });
+            for ([_]Fake.Mode{ .wrong_counts, .malformed, .duplicate, .missing_ack, .wrong_content_type, .outcome_header, .oversized, .lost }) |mode| {
+                fake.mode = mode;
+                const before = fake.calls;
+                if (adapter.writer().write(a, .{ .catalog = fence }, 601, "docs/a?", .{}, forwarding, .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s })) |_| return error.TestExpectedError else |err| switch (err) {
+                    error.RaftBatchWriteOutcomeUnknown, error.RaftBatchWriteTransportOutcomeUnknown => {},
+                    else => return err,
+                }
+                try std.testing.expectEqual(before + 1, fake.calls);
+            }
+        }
+
+        test "data raft ordered history completion participant preserves command scopes and never retries mutations" {
+            const participant_mod = @import("../api/completion_participant.zig");
+            const completion = @import("../api/completion_plan.zig");
+            const a = std.testing.allocator;
+            var namespace: [24]u8 = undefined;
+            std.mem.writeInt(u64, namespace[0..8], 7, .big);
+            std.mem.writeInt(u64, namespace[8..16], 601, .big);
+            std.mem.writeInt(u64, namespace[16..24], 601, .big);
+            const binding: completion.completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(2), .root_generation = 3, .group_id = 601, .topology_epoch = 4 };
+            var frozen = try completion.Plan.freeze(a, @splat(5), @splat(6), binding, &.{.{ .owner = binding, .locator = "table2:00000004:docs:601", .roles = completion.completion.Roles.guards, .prepare = .{ .timestamp_ns = 1000, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = @splat(5), .topology_epoch = 4, .completion_owner = binding } } } }}, 1001);
+            defer frozen.deinit();
+            const fence: antfly.metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = binding.metadata_incarnation, .catalog_revision = 9, .table_id = 7, .topology_epoch = 4, .route = .{ .group_id = 601, .range_id = 601, .identity_namespace = .{ .table_id = 7, .shard_id = 601, .range_id = 601 } } };
+            const Fake = struct {
+                calls: usize = 0,
+                fail: bool = false,
+                cancel_after: ?*std.atomic.Value(bool) = null,
+                fn write(ptr: *anyopaque, _: std.mem.Allocator, authority: antfly.public_api.internal_group_operations.RoutedBatchAuthority, group: u64, table: []const u8, req: antfly.db.types.BatchRequest, forwarding: antfly.public_api.internal_batch_forwarding.Context, context: antfly.public_api.operation.RequestContext) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try context.ensureActive();
+                    try std.testing.expectEqual(@as(u64, 601), group);
+                    try std.testing.expectEqualStrings("docs", table);
+                    try std.testing.expect(authority == .catalog);
+                    try std.testing.expect(forwarding.remaining_ms > 0 and forwarding.remaining_ms <= 5000);
+                    try std.testing.expect(!forwarding.campaign_allowed);
+                    try std.testing.expectEqual(context.deadline_ns, authority.catalog.admission_deadline_ns);
+                    if (req.transaction.? == .prepare) {
+                        try std.testing.expectEqual(@as(u64, 1000), req.timestamp_ns);
+                        try std.testing.expectEqual(@as(u64, 3), req.transaction.?.prepare.completion_owner.?.root_generation);
+                        try std.testing.expectEqual(.revision_v1, req.document_version_scheme);
+                    }
+                    if (self.fail) return error.RaftBatchWriteOutcomeUnknown;
+                    if (self.cancel_after) |value| value.store(true, .release);
+                    return {};
+                }
+            };
+            var fake: Fake = .{};
+            const port: participant_mod.Port = .{ .writer = .{ .ptr = &fake, .write_fn = Fake.write } };
+            try port.submit(a, &frozen, 0, fence, .begin, .{});
+            try port.submit(a, &frozen, 0, fence, .prepare, .{});
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+            var wrong = fence;
+            wrong.topology_epoch += 1;
+            try std.testing.expectError(error.TopologyChanged, port.submit(a, &frozen, 0, wrong, .begin, .{}));
+            try std.testing.expectError(error.InvalidTxnRecord, port.submit(a, &frozen, 0, fence, .{ .resolve = .{ .status = .pending, .commit_version = 1002 } }, .{}));
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+            fake.fail = true;
+            try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, port.submit(a, &frozen, 0, fence, .prepare, .{}));
+            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+            fake.fail = false;
+            var cancelled = std.atomic.Value(bool).init(true);
+            var scoped = fence;
+            scoped.admission_cancellation = antfly.db.types.CancellationToken.fromAtomic(&cancelled);
+            try std.testing.expectError(error.Canceled, port.submit(a, &frozen, 0, scoped, .begin, .{}));
+            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+            cancelled.store(false, .release);
+            fake.cancel_after = &cancelled;
+            try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, port.submit(a, &frozen, 0, scoped, .begin, .{}));
+            try std.testing.expectEqual(@as(usize, 4), fake.calls);
+        }
+
         test "data raft ordered history frozen plan owns canonical payloads through allocation failures" {
             const Frozen = @import("../api/completion_plan.zig");
             const Fixture = struct {
@@ -43381,6 +43509,9 @@ fn consumerTests() type {
             try std.testing.expectError(error.InvalidBatchRequest, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{wrong}, 1001));
             wrong = good;
             wrong.prepare.document_version_scheme = .legacy;
+            try std.testing.expectError(error.InvalidBatchRequest, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{wrong}, 1001));
+            wrong = good;
+            wrong.prepare.sync_level = .propose;
             try std.testing.expectError(error.InvalidBatchRequest, Frozen.Plan.freeze(a, @splat(5), @splat(6), Fixture.owner(601), &.{wrong}, 1001));
         }
 
@@ -43562,7 +43693,7 @@ fn consumerTests() type {
                 };
                 const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
                 defer a.destroy(api_server);
-                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
                 var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
@@ -43596,6 +43727,11 @@ fn consumerTests() type {
                 const origin = try a.create(DataServer);
                 defer a.destroy(origin);
                 origin.* = .{ .alloc = a, .backend_runtime = runtime.ptr(), .remote_metadata = &metadata_source, .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(a), .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, catalog, antfly.raft.read_gate.unavailableReadSafetyBarrier()), .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, catalog), .status_source = undefined, .api_server_cfg = .{ .internal_service_secret = secret, .internal_service_issuer = "history-runtime" }, .query_async_limit = .nothing, .listener_cfg = undefined };
+                defer if (origin.distributed_read_http_executor) |executor| {
+                    executor.deinit();
+                    a.destroy(executor);
+                    origin.distributed_read_http_executor = null;
+                };
                 defer origin.provisioned_storage.deinit();
                 const before_remote = blk: {
                     lockAtomic(&server.data_raft_mutex);
@@ -43933,7 +44069,7 @@ fn consumerTests() type {
                 const CompletionAdmissionFixture = struct {
                     // Keep the large private batch temporaries off the parent
                     // HTTP/Raft fixture's already large stack frame.
-                    noinline fn run(fixture_alloc: std.mem.Allocator, fixture_server: *DataServer, fixture_owner: *antfly.public_api.ProvisionedKernelOwnerSource, fixture_catalog: antfly.public_api.table_catalog.CatalogSource, fence: antfly.metadata_api.CatalogRouteFence, fixture_namespace: [24]u8) !@import("../api/completion_plan.zig").Plan {
+                    noinline fn run(fixture_alloc: std.mem.Allocator, fixture_server: *DataServer, fixture_owner: *antfly.public_api.ProvisionedKernelOwnerSource, fixture_catalog: antfly.public_api.table_catalog.CatalogSource, fence: antfly.metadata_api.CatalogRouteFence, fixture_namespace: [24]u8, fixture_origin: *DataServer, fixture_endpoint: []const u8, fixture_credential: []const u8) !@import("../api/completion_plan.zig").Plan {
                         const fixture_completion = @import("../api/completion_plan.zig").completion;
                         var completion_descriptor = try fixture_owner.loadCompletionDescriptor(fixture_alloc, 601, "docs", .{});
                         defer completion_descriptor.deinit(fixture_alloc);
@@ -43947,17 +44083,19 @@ fn consumerTests() type {
                         var frozen = try @import("../api/completion_plan.zig").Plan.freeze(fixture_alloc, txn_id, @splat(96), current_owner, &.{.{ .owner = current_owner, .locator = locator, .roles = fixture_completion.Roles.effects, .prepare = prepare }}, platform_time.realtimeNs());
                         errdefer frozen.deinit();
                         const plan = frozen.admission;
-                        const begin = try frozen.begin(0);
-                        var frozen_prepare = try frozen.prepare(fixture_alloc, 0);
-                        defer frozen_prepare.deinit(fixture_alloc);
                         try plan.requirePreparedInput(fixture_namespace, prepare_bytes);
-                        for ([_]antfly.db.types.BatchRequest{ begin, frozen_prepare.req, .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = current_owner, .txn_id = txn_id, .status = .committed, .commit_version = 1001 } } } }) |command| {
-                            try fixture_server.proposeRaftBatchGroupWithLeaderWait(fixture_alloc, 601, "docs", command, .{ .discovery = .cached, .write_route_fence = fence, .admission_deadline_ns = fixture_server.dataRaftMonotonicNs() + 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
-                        }
+                        _ = fixture_server;
+                        var client = antfly.public_api.ApiHttpClient.init(fixture_alloc, try fixture_origin.distributedReadExecutor());
+                        _ = client.withInternalServiceAuth(fixture_credential, "history-runtime");
+                        var writer: @import("../api/completion_participant.zig").HttpWriter = .{ .client = &client, .base_uri = fixture_endpoint };
+                        const participant: @import("../api/completion_participant.zig").Port = .{ .writer = writer.writer() };
+                        try participant.submit(fixture_alloc, &frozen, 0, fence, .begin, .{});
+                        try participant.submit(fixture_alloc, &frozen, 0, fence, .prepare, .{});
+                        try participant.submit(fixture_alloc, &frozen, 0, fence, .{ .resolve = .{ .status = .committed, .commit_version = 1001 } }, .{});
                         return frozen;
                     }
                 };
-                var frozen = try CompletionAdmissionFixture.run(a, server, &owner, catalog, route.fence().?, namespace);
+                var frozen = try CompletionAdmissionFixture.run(a, server, &owner, catalog, route.fence().?, namespace, origin, base, secret);
                 defer frozen.deinit();
                 const plan = frozen.admission;
                 const current_owner = frozen.participants[0].owner;
@@ -43982,10 +44120,14 @@ fn consumerTests() type {
                 var checked_certificate = try completion_contract.parse(a, certificate_bytes);
                 defer checked_certificate.deinit();
                 try std.testing.expectEqual(@as(usize, 1), checked_certificate.value.certificate.resolutions.len);
-                const publication: antfly.db.types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .publish_completion = .{ .txn_id = txn_id, .completion_owner = current_owner, .certificate = certificate_bytes } } };
-                for (0..2) |_| {
-                    try server.proposeRaftBatchGroupWithLeaderWait(a, 601, "docs", publication, .{ .discovery = .cached, .write_route_fence = route.fence(), .admission_deadline_ns = server.dataRaftMonotonicNs() + 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
-                }
+                try server.completionParticipantPort().submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
+                // Replay through signed HTTP preserves the immutable certificate
+                // and first publication position, rather than a legacy RPC.
+                var publication_client = antfly.public_api.ApiHttpClient.init(a, try origin.distributedReadExecutor());
+                _ = publication_client.withInternalServiceAuth(secret, "history-runtime");
+                var remote_writer: @import("../api/completion_participant.zig").HttpWriter = .{ .client = &publication_client, .base_uri = base };
+                const remote_participant: @import("../api/completion_participant.zig").Port = .{ .writer = remote_writer.writer() };
+                try remote_participant.submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
                 try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
                 // An idle root must remain readable after an ordered protocol
                 // barrier, without requiring another document mutation.

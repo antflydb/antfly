@@ -1,0 +1,160 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Completion-aware participant commands use canonical private batches, not
+//! legacy phase RPCs which cannot carry the frozen owner and complete input.
+//! Each call makes one mutation attempt. Unknown outcomes require coordinator
+//! recovery; neither an error nor an absent observation authorizes resubmission.
+const std = @import("std");
+const local = @import("antfly_local_sources");
+const batch = local.api_internal_batch;
+const types = local.storage_db_selected_root.db.types;
+const plan_mod = @import("completion_plan.zig");
+const completion = plan_mod.completion;
+const metadata = @import("../metadata/api.zig");
+const operation = local.api_operation;
+const group_ops = @import("internal_group_operations.zig");
+const forwarding_mod = @import("internal_batch_forwarding.zig");
+const http = @import("../raft/transport/http_common.zig");
+const client_mod = @import("http_client.zig");
+const time = @import("antfly_platform").time;
+const A = std.mem.Allocator;
+
+pub const Phase = union(enum) {
+    begin,
+    prepare,
+    resolve: struct { status: types.TxnStatus, commit_version: u64 },
+    publish: []const u8,
+};
+
+pub const Port = struct {
+    writer: group_ops.RoutedRaftBatchWriter,
+
+    pub fn submit(self: Port, a: A, plan: *const plan_mod.Plan, index: usize, fence: metadata.CatalogRouteFence, phase: Phase, original: operation.RequestContext) !void {
+        // This scope owns both cancellation borrows for the synchronous call
+        // and preserves the earliest original clock/deadline, including time
+        // spent validating and encoding the immutable command.
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
+        try context.ensureActive();
+        try fence.validate();
+        if (index >= plan.participants.len) return error.InvalidParticipant;
+        const participant = plan.participants[index];
+        const owner = participant.owner;
+        try plan.admission.requireRoutedOwner(owner);
+        const locator = local.api_local_transaction_contract.parseParticipantRef(participant.locator) orelse return error.InvalidParticipant;
+        const identity = fence.route.identity_namespace;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], identity.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], identity.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], identity.range_id, .big);
+        if (fence.metadata_group_id != owner.metadata_group_id or fence.metadata_incarnation == null or
+            !std.mem.eql(u8, &fence.metadata_incarnation.?, &owner.metadata_incarnation) or
+            fence.table_id != identity.table_id or fence.topology_epoch != owner.topology_epoch or
+            fence.route.group_id != owner.group_id or locator.group_id != owner.group_id or
+            !std.mem.eql(u8, &namespace, &owner.namespace)) return error.TopologyChanged;
+        var parsed_prepare: ?batch.OwnedBatchRequest = null;
+        defer if (parsed_prepare) |*parsed| parsed.deinit(a);
+        var parsed_certificate: ?std.json.Parsed(completion.Envelope) = null;
+        defer if (parsed_certificate) |*parsed| parsed.deinit();
+        const request: types.BatchRequest = switch (phase) {
+            .begin => try plan.begin(index),
+            .prepare => blk: {
+                parsed_prepare = try plan.prepare(a, index);
+                if (parsed_prepare.?.req.sync_level != .write) return error.InvalidBatchRequest;
+                break :blk parsed_prepare.?.req;
+            },
+            .resolve => |terminal| blk: {
+                if (terminal.status == .pending or (terminal.status == .committed and terminal.commit_version <= plan.begin_timestamp)) return error.InvalidTxnRecord;
+                break :blk .{ .sync_level = .write, .transaction = .{ .resolve = .{ .completion_owner = owner, .txn_id = plan.admission.transaction_id, .status = terminal.status, .commit_version = terminal.commit_version } } };
+            },
+            .publish => |bytes| blk: {
+                parsed_certificate = try completion.parse(a, bytes);
+                const manifest = parsed_certificate.?.value.certificate.manifest;
+                if (manifest.commit_version <= plan.begin_timestamp or !std.mem.eql(u8, &manifest.admission().digest(), &plan.admission.digest())) return error.SourceTransactionIdentityConflict;
+                break :blk .{ .sync_level = .write, .transaction = .{ .publish_completion = .{ .txn_id = plan.admission.transaction_id, .completion_owner = owner, .certificate = bytes } } };
+            },
+        };
+        try context.ensureActive();
+        const remaining = scope.deadline_ns -| time.monotonicNs();
+        if (remaining == 0) return error.DeadlineExceeded;
+        const budget_ms: u32 = @intCast(@min(@as(u64, forwarding_mod.max_remaining_ms), std.math.divCeil(u64, remaining, std.time.ns_per_ms) catch unreachable));
+        var bounded_fence = fence;
+        bounded_fence.admission_deadline_ns = scope.deadline_ns;
+        bounded_fence.admission_deadline_io = null;
+        bounded_fence.admission_cancellation = context.cancellation;
+        _ = (try self.writer.write(a, .{ .catalog = bounded_fence }, owner.group_id, locator.table_name, request, .{ .remaining_ms = budget_ms, .forwards_remaining = forwarding_mod.max_forwards, .campaign_allowed = false }, context)) orelse return error.UnknownGroup;
+        // A caller-scope failure after dispatch cannot be reported as a safe
+        // pre-proposal failure, even when the transport returned normally.
+        context.ensureActive() catch return error.RaftBatchWriteOutcomeUnknown;
+    }
+};
+
+/// One signed HTTP attempt to the selected participant endpoint. Endpoint
+/// discovery belongs to the coordinator's original routing authority.
+pub const HttpWriter = struct {
+    client: *client_mod.ApiHttpClient,
+    base_uri: []const u8,
+    pub fn writer(self: *HttpWriter) group_ops.RoutedRaftBatchWriter {
+        return .{ .ptr = self, .write_fn = write };
+    }
+    fn write(ptr: *anyopaque, a: A, authority: group_ops.RoutedBatchAuthority, group: u64, table: []const u8, request: types.BatchRequest, forwarding: forwarding_mod.Context, context: operation.RequestContext) !?void {
+        const self: *HttpWriter = @ptrCast(@alignCast(ptr));
+        if (authority != .catalog or authority.catalog.route.group_id != group) return error.InvalidCatalogRouteFence;
+        try context.ensureActive();
+        const encoded = try batch.encodeBatchRequest(a, request);
+        defer a.free(encoded);
+        const fence = try std.json.Stringify.valueAlloc(a, authority.catalog, .{});
+        defer a.free(fence);
+        if (fence.len > 16384) return error.InvalidCatalogRouteFence;
+        // The shared batch client accepts an already encoded path component.
+        const table_path = try client_mod.percentEncodePathComponent(a, table);
+        defer a.free(table_path);
+        var limited: LimitedExecutor = .{ .upstream = self.client.executor };
+        var client = self.client.*;
+        client.alloc = a;
+        client.executor = .{ .ptr = &limited, .vtable = &.{ .execute = LimitedExecutor.execute }, .clock_io = self.client.executor.clock_io, .realtime_ns_fn = if (self.client.executor.realtime_ns_fn != null) LimitedExecutor.realtimeNs else null };
+        var cancellation = http.RequestCancellation.fromToken(context.cancellation);
+        const timeout = @min(try context.remainingTimeoutMs() orelse forwarding.remaining_ms, forwarding.remaining_ms);
+        try context.ensureActive();
+        var response = try client.fetchGroupBatchWithForwarding(self.base_uri, group, table_path, encoded, timeout, forwarding, &cancellation, fence);
+        defer response.deinit(a);
+        const Counts = struct { inserted: u64, deleted: u64, transformed: u64 };
+        var counts = std.json.parseFromSlice(Counts, a, response.body, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch return error.RaftBatchWriteOutcomeUnknown;
+        defer counts.deinit();
+        if (counts.value.inserted != request.writes.len or counts.value.deleted != request.deletes.len or counts.value.transformed != request.transforms.len) return error.RaftBatchWriteOutcomeUnknown;
+        return {};
+    }
+    const LimitedExecutor = struct {
+        upstream: http.RequestExecutor,
+        fn realtimeNs(ptr: *anyopaque) i128 {
+            const self: *LimitedExecutor = @ptrCast(@alignCast(ptr));
+            return self.upstream.realtimeNs().?;
+        }
+        fn execute(ptr: *anyopaque, a: A, request: http.HttpRequest) !http.HttpResponse {
+            const self: *LimitedExecutor = @ptrCast(@alignCast(ptr));
+            var bounded = request;
+            bounded.max_response_bytes = 4096;
+            var response = try self.upstream.execute(a, bounded);
+            errdefer response.deinit(a);
+            if (response.body.len > 4096) return error.RaftBatchWriteOutcomeUnknown;
+            if (response.status == 201) {
+                const content_type = response.header("Content-Type") orelse response.content_type orelse return error.RaftBatchWriteOutcomeUnknown;
+                if (!std.ascii.eqlIgnoreCase(content_type, "application/json") or response.header(forwarding_mod.outcome_header) != null) return error.RaftBatchWriteOutcomeUnknown;
+            }
+            return response;
+        }
+    };
+};

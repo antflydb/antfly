@@ -2938,3 +2938,71 @@ includes the complete signed HTTP recovery path and the owned-plan allocation
 failure test. Source/control catalog generation, formatting and diff checks
 also passed. The normal-stack fixture setup compile initially found parameter
 shadowing; the corrected helper passed this final run.
+
+## In progress: completion-aware participant dispatch
+
+`api/completion_participant.zig` dispatches BEGIN, the exact frozen PREPARE,
+owner-bound terminal RESOLVE, and complete-certificate publication through the
+existing canonical routed-batch writer. It does not add a parallel phase wire
+format or pass completion inputs through legacy participant RPCs which discard
+them. `DataServer.completionParticipantPort` binds the actual writer. The port
+validates the original metadata incarnation, namespace, group and topology
+against the frozen owner, checks publication against the complete frozen
+admission, and preserves the earliest caller/route deadline and both
+cancellation scopes. It makes one writer invocation and does not retry an
+unknown mutation. A scope failure after dispatch remains an unknown outcome.
+PREPARE input freeze now requires `.write`: proposal-only acknowledgement cannot
+serve as a prepared vote, and acknowledgement mode cannot change after hashing.
+
+The HTTP adapter uses the existing signed `/batch-routed-v1` transport and
+original catalog fence, percent-encodes the table path, and caps response bytes
+at 4096. It validates JSON success counts and refuses success with a mutation
+outcome header, missing/wrong fence acknowledgement, malformed JSON or wrong
+content type. The canonical handler explicitly requires service credentials
+for completion commands even when legacy unauthenticated migration is enabled.
+These commands have no legacy unauthenticated compatibility contract.
+
+The actual-Raft fixture now sends BEGIN/PREPARE/RESOLVE through signed HTTP and
+publishes the same certificate through the local participant port and signed
+HTTP adapter. Existing qualified native resolution/publication reads still
+verify immutable receipts and first publication positions. A focused port
+contract checks changed fences, pending terminal rejection, fence-only
+cancellation, cancellation after dispatch and exactly one writer invocation on
+unknown outcomes. A mounted HTTP test checks unsigned completion rejection in
+migration mode and that a signed request reaches the writer boundary.
+
+Source/control catalog generation and formatting/diff checks passed. Combined
+real-Raft and HTTP/authentication qualification results are recorded below.
+
+This provides the participant dispatch boundary, not a complete production
+coordinator. Normal application/source admission still needs owner capture,
+frozen-plan orchestration and durable decision/recovery integration; routed
+source acceptance still requires the single global checkpoint anchor. No new
+public destination capability is advertised. Retained evidence GC, coherent
+bootstrap, public feed scheduling/transports, typed pgoutput production and
+existing-client qualification remain required by the unchanged full objective.
+
+The first combined run passed all 19 HTTP/auth cases and all eight real-Raft
+assertions, but the fixture leaked its newly allocated reusable HTTP executor.
+The fixture now explicitly releases that executor and pool. Authentication was
+also qualified on the older `/batch` endpoint, which can decode private batches
+when routed forwarding is disabled; completion commands require service
+credentials there as well.
+
+`completion-participant-recovery-test.log` finished with exit 0: 19 HTTP/auth
+cases and nine actual-Raft cases passed with zero failures, skips or leaks.
+Additional fault responses cover missing acknowledgement, malformed/duplicate
+JSON, wrong counts/content type, an outcome header on success, oversized body
+and a lost response. Every case makes exactly one HTTP attempt and returns an
+unknown outcome. Final review added preservation of the upstream executor's
+clock authority; the response wrapper forwards its realtime clock and retains
+its monotonic Io borrow. A simulated-time token check verifies that signing does
+not silently escape to the host wall clock. Final qualification is recorded in
+`completion-participant-clock-qualified-test.log`.
+
+`completion-participant-clock-qualified-test.log` completed with exit 0: all
+19 HTTP/authentication cases and nine real-Raft cases passed, with zero failures,
+skips or leaks. This includes actual signed HTTP BEGIN/PREPARE/RESOLVE and
+certificate publication, the local publication port, immutable recovery reads,
+clock-preserving signing at simulated time, malformed-response unknown outcomes
+and both migration auth boundaries. Formatting and diff checks passed.
