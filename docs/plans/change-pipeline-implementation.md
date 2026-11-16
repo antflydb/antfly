@@ -4277,3 +4277,60 @@ kernel/layout/import cases pass without skips or leaks. The new reusable
 engine-error, C-header and OpenAPI checks successfully. All changed Zig files
 pass formatting checks; the diff check passes. Unrelated model-explorer JSON
 from generation was restored before committing.
+
+### Durable source checkpoint authority binding
+
+The source journal now binds its checkpoint authority before the first source
+reservation. Metadata protocol 103 gates binding and retirement-fence records;
+legacy commands retain their earlier floors and legacy state JSON omits the new
+field. Binding is immutable for the scope, enables retained-artifact admission,
+and cannot be added after pending/accepted work. Reordering source definitions
+preserves the binding. A different row-routing choice cannot select a new head.
+
+The stored full owner is the original physical reference. New attempts must
+capture a fresh qualified owner and use `requireOwner` to check the same metadata
+incarnation, namespace, group and physical root generation. Schema/topology
+lease fences may change without moving that physical authority. A changed root
+or metadata incarnation requires explicit recovery/migration; the reference is
+not provisioning or migration proof.
+
+Delivery passes the bound reference to planning. A new plan's candidate is bound
+through metadata CAS, then reloaded and confirmed before reservation, upload or
+BEGIN. A lost binding reply stops the pass. Subsequent planning must retain the
+binding and artifact contract; a plan that drops it is rejected. Replanning also
+checks the existing binding. Adapters must explicitly declare checkpoint
+support; legacy adapters cannot silently consume this profile.
+
+Retiring a bound scope leaves checkpoint-fencing work outstanding. Metadata
+requires an attested fencing proof for the exact original authority before
+reseed and keeps table-retention work counters charged until it is recorded.
+The proof is supplied by a qualified internal adapter, like artifact sealing
+and reclamation proofs; deterministic metadata apply does not perform native
+network reads. Binding apply verifies the metadata group/incarnation and live
+source definition. Retired cleanup remains possible after source definition
+replacement. A separate incarnation-key buffer preserves the source-state key.
+
+Qualification: `source-authority-qualified-test.log` completes
+`source-checkpoint-authority-test source-control-test` with exit 0. Its five
+selected suites pass 13, 12, 12, nine and three cases without skips or leaks.
+Coverage includes legacy behavior; immutable binding; refreshed owner fences
+versus changed physical generation; lost binding replies stopping before upload
+and admission; refusal to drop the checkpoint from a later plan; reuse of the
+bound owner when a candidate row group changes; explicit protocol-103 decoder
+classification; native metadata reopen; foreign-incarnation rejection; and
+snapshot restore retaining authority/retirement debt and table-retention work
+counters. Both legacy and authority-enabled artifact lifecycles run through
+reopen and reclamation. The initial broader API filter was narrowed to avoid
+unrelated delivery tests. The decoder-ceiling test was updated for protocol 103.
+
+`source-authority-generated-check.log` passes source-catalog, engine-error and
+OpenAPI checks. All changed Zig files pass formatting checks and the diff check
+passes. Unrelated model-explorer JSON from generation was restored.
+
+Physical checkpoint provisioning, native source-scope fencing, qualified
+migration and production adapter/worker wiring remain outstanding. The metadata
+fence record is a required attestation boundary, not an implementation of native
+fencing by itself. Historical retry bounds, cross-topology recovery, other
+destination integrations, public feeds, coherent bootstrap/retention, production
+pgoutput and existing-client qualification remain required. The full goal and
+both issues remain incomplete.

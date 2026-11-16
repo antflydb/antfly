@@ -132,7 +132,8 @@ const std = @import("std");
 /// Version 100 reconciles monotonic root effects without inventing command receipts.
 /// Version 101 records distinct retirement-fence attempts for unresolved controls.
 /// Version 102 reserves and seals quota for recoverable source-plan artifacts.
-pub const current_version: u16 = 102;
+/// Version 103 binds source checkpoint authority before reservation and retirement.
+pub const current_version: u16 = 103;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;

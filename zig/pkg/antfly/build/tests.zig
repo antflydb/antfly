@@ -412,8 +412,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .target = target,
             .optimize = optimize,
         }),
-        .filters = &.{"source control"},
+        .filters = &.{ "source control", "source checkpoint authority" },
     });
+    source_control_tests.root_module.addImport("antfly_local_sources", metadata_unit_baseline_mods[8].import_table.get("antfly_local_sources").?);
     const run_source_control_tests = b.addRunArtifact(source_control_tests);
     const source_delivery_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -423,6 +424,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         }),
         .filters = &.{"delivery recovers"},
     });
+    source_delivery_tests.root_module.addImport("antfly_local_sources", metadata_unit_baseline_mods[8].import_table.get("antfly_local_sources").?);
     const run_source_delivery_tests = b.addRunArtifact(source_delivery_tests);
     const source_control_storage_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],

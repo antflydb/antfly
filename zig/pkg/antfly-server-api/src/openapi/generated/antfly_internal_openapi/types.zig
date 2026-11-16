@@ -820,6 +820,36 @@ pub const NativeHistoryRetirement = struct {
     grant: u64,
 };
 
+/// Durable source-journal checkpoint authority, metadata protocol 103. Bind before the first source reservation; later batches reuse this full owner independently of row routing. Retirement proof must be supplied by qualified native fencing before reseeding; this record alone does not create or migrate a storage authority.
+pub const NativeSourceCheckpointAuthority = struct {
+    binding: NativeHistoryDigest,
+    table_name: []const u8,
+    owner: NativeHistoryPublicationOwner,
+    retirement: OpenApiOptionalNullable(NativeHistoryDigest) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("binding");
+        try jw.write(self.binding);
+        try jw.objectField("table_name");
+        try jw.write(self.table_name);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        switch (self.retirement) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("retirement");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("retirement");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 /// Private canonical prepare_source_checkpoint_v1 payload, admitted only with data-Raft protocol 37. This command is included in frozen PREPARE input and is never accepted from public batch JSON. The named checkpoint participant predicates on the previous head and commits the new head with transaction resolution. Physical checkpoint authority is routed and frozen separately; binding is the immutable logical source scope.
 pub const NativeSourceCheckpointCommand = struct {
     binding: NativeHistoryDigest,

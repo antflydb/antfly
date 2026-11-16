@@ -484,6 +484,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("completion-begin-wire-test", "Verify frozen completion BEGIN encoding and downgrade rejection").dependOn(&b.addRunArtifact(completion_begin_tests).step);
+    const source_authority_filters = &.{ "source checkpoint authority", "metadata.source_control.", "metadata.source_delivery." };
+    const source_authority_tests = b.addTest(.{
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api HTTP runtime discovery"}, source_authority_filters),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("source-checkpoint-authority-test", "Verify persistent checkpoint binding and confirmed metadata before admission").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, source_authority_tests, source_authority_filters).step);
     const api_kernel_abi_filters = &.{ "API kernel", "API imported runtime capability" };
     const api_kernel_abi_tests = b.addTest(.{
         .root_module = options.api_http_runtime_test_mod,

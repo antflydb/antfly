@@ -15388,7 +15388,7 @@ pub const RaftApplyStore = struct {
             if (!std.mem.eql(u8, &prior.identity(), &write.expected_binding)) return;
         } else if (write.mutation != .configure or !std.mem.eql(u8, &scope.identity(), &write.expected_binding)) return;
         switch (write.mutation) {
-            .configure, .reseed, .reserve, .replan => {
+            .configure, .reseed, .reserve, .replan, .bind_checkpoint => {
                 const definition = source_control.definitionDigest(a, table.replication_sources_json, scope.source_ordinal) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return,
@@ -15397,7 +15397,14 @@ pub const RaftApplyStore = struct {
             },
             // Already accepted work can drain after configuration replacement;
             // its current catalog CAS and original source binding still fence it.
-            .accept, .commit, .retire, .reject_and_retire, .seal_artifact, .retire_artifact, .reclaim_artifact => {},
+            .accept, .commit, .retire, .reject_and_retire, .seal_artifact, .retire_artifact, .reclaim_artifact, .fence_checkpoint => {},
+        }
+        if (write.mutation == .bind_checkpoint) {
+            const authority = write.mutation.bind_checkpoint;
+            if (authority.owner.metadata_group_id != group_id) return;
+            var incarnation_buffer: [160]u8 = undefined;
+            const incarnation_raw = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&incarnation_buffer, group_id))) orelse return;
+            if (!std.mem.eql(u8, &(try decodeMetadataIncarnationRecord(incarnation_raw)).incarnation, &authority.owner.metadata_incarnation)) return;
         }
         const next = write.mutation.apply(a, state) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -45884,79 +45891,114 @@ test "metadata changefeed control logical slot survives reopen snapshot failover
 }
 
 test "metadata source control artifact debt survives reopening and keeps table retention until storage reclamation" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-artifact", .{tmp.sub_path});
-    defer a.free(root);
-    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
-    var opened = true;
-    defer if (opened) store.deinit();
-    const group = group_ids.main_metadata_group_id;
-    const table: metadata.TableRecord = .{ .table_id = 7, .name = "docs", .schema_json = "{}", .replication_sources_json = "[{\"type\":\"postgres\",\"postgres_table\":\"users\"}]" };
-    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
-    const scope: source_control.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = try source_control.definitionDigest(a, table.replication_sources_json, 0), .provider = @splat(2), .destination = .native, .destination_binding = @splat(3) };
-    const Actor = struct {
-        a: std.mem.Allocator,
-        store: *RaftApplyStore,
-        group: u64,
-        scope: source_control.Scope,
-        catalog: source_control.Digest,
-        fn read(self: @This()) !std.json.Parsed(source_control.State) {
-            const bytes = try self.store.getSourceControl(self.a, self.group, self.scope.table_id, self.scope.source_id);
-            defer self.a.free(bytes);
-            return source_control.parse(self.a, bytes);
+    for ([_]bool{ false, true }) |checkpoint_mode| {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-artifact", .{tmp.sub_path});
+        defer a.free(root);
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        var opened = true;
+        defer if (opened) store.deinit();
+        const group = group_ids.main_metadata_group_id;
+        const incarnation = "01010101010101010101010101010101".*;
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+        const table: metadata.TableRecord = .{ .table_id = 7, .name = "docs", .schema_json = "{}", .replication_sources_json = "[{\"type\":\"postgres\",\"postgres_table\":\"users\"}]" };
+        try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+        const scope: source_control.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = try source_control.definitionDigest(a, table.replication_sources_json, 0), .provider = @splat(2), .destination = .native, .destination_binding = @splat(3) };
+        const Actor = struct {
+            a: std.mem.Allocator,
+            store: *RaftApplyStore,
+            group: u64,
+            scope: source_control.Scope,
+            catalog: source_control.Digest,
+            fn read(self: @This()) !std.json.Parsed(source_control.State) {
+                const bytes = try self.store.getSourceControl(self.a, self.group, self.scope.table_id, self.scope.source_id);
+                defer self.a.free(bytes);
+                return source_control.parse(self.a, bytes);
+            }
+            fn apply(self: @This(), mutation: source_control.Mutation) !void {
+                var before = try self.read();
+                defer before.deinit();
+                const bytes = try source_control.encodeWrite(self.a, .{ .table_id = self.scope.table_id, .source_id = self.scope.source_id, .expected_revision = before.value.revision, .expected_binding = self.scope.identity(), .expected_catalog_digest = self.catalog, .mutation = mutation });
+                defer self.a.free(bytes);
+                try self.store.applyStandaloneCommand(self.group, .{ .apply_source_control = bytes });
+            }
+            fn expectWork(self: @This(), expected: u64) !void {
+                var txn = try self.store.store.beginWriteTxn();
+                defer txn.abort();
+                var buffer: [256]u8 = undefined;
+                const count = try txn.get(try source_control.workKey(&buffer, self.group, self.scope.table_id));
+                try std.testing.expectEqual(expected, std.mem.readInt(u64, count[0..8], .little));
+                if (expected != 0) try std.testing.expectError(error.TableTransitionActive, self.store.removeTableTxn(&txn, self.group, self.scope.table_id, 0));
+            }
+        };
+        const actor: Actor = .{ .a = a, .store = &store, .group = group, .scope = scope, .catalog = source_control.digest(table.replication_sources_json) };
+        try actor.apply(.{ .configure = scope });
+        const authority: source_control.checkpoint_authority.Spec = .{ .binding = scope.identity(), .table_name = "checkpoint-owner", .owner = .{ .metadata_group_id = group, .metadata_incarnation = incarnation, .namespace = @splat(1), .table_binding = @splat(5), .root_generation = 0, .group_id = 17, .topology_epoch = 1 } };
+        if (checkpoint_mode) {
+            var foreign = authority;
+            foreign.owner.metadata_incarnation[0] = 'f';
+            try actor.apply(.{ .bind_checkpoint = foreign });
+            var rejected = try actor.read();
+            defer rejected.deinit();
+            try std.testing.expect(rejected.value.checkpoint_authority == null);
+            try actor.apply(.{ .bind_checkpoint = authority });
+            try std.testing.expectEqual(incarnation, (try store.getMetadataIncarnation(group)).?);
         }
-        fn apply(self: @This(), mutation: source_control.Mutation) !void {
-            var before = try self.read();
-            defer before.deinit();
-            const bytes = try source_control.encodeWrite(self.a, .{ .table_id = self.scope.table_id, .source_id = self.scope.source_id, .expected_revision = before.value.revision, .expected_binding = self.scope.identity(), .expected_catalog_digest = self.catalog, .mutation = mutation });
-            defer self.a.free(bytes);
-            try self.store.applyStandaloneCommand(self.group, .{ .apply_source_control = bytes });
+        const reservation: source_control.Reservation = .{ .sequence = 1, .batch_id = "batch", .checkpoint = "cp1", .accepted_at_ns = 1, .payload_digest = @splat(4), .plan_digest = @splat(5), .transaction_id = @splat(6), .destination = .native, .delivery_manifest = "frozen-reference", .artifact = .{ .namespace = @splat(9), .binding = scope.identity(), .domain = source_control.artifact_control.domainFor(scope.identity()), .attempt = .{ 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, .bytes = 1024, .checksum = @splat(10), .plan_digest = @splat(11) } };
+        const id = reservation.identity(scope);
+        try actor.apply(.{ .reserve = reservation });
+        try actor.expectWork(1);
+        try actor.apply(.{ .seal_artifact = .{ .reservation_digest = id, .stamp = @splat(12) } });
+        store.deinit();
+        opened = false;
+        store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        opened = true;
+        var sealed = try actor.read();
+        defer sealed.deinit();
+        try std.testing.expectEqual(.sealed, sealed.value.artifact_control.?.current.?.phase);
+        if (checkpoint_mode) try std.testing.expect(sealed.value.checkpoint_authority.?.sameAuthority(authority));
+        try std.testing.expectEqual(@as(u64, 1024), sealed.value.artifact_control.?.chargedBytes());
+        try actor.apply(.{ .accept = .{ .reservation_digest = id, .receipt = "native-receipt", .commit_reference = "native-commit" } });
+        // Committed source progress does not clear artifact retention debt.
+        try actor.expectWork(1);
+        try actor.apply(.{ .retire_artifact = .{ .reservation_digest = id, .proof = @splat(13), .reason = .committed } });
+        store.deinit();
+        opened = false;
+        store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        opened = true;
+        var garbage = try actor.read();
+        defer garbage.deinit();
+        try std.testing.expectEqual(.garbage, garbage.value.artifact_control.?.current.?.phase);
+        try std.testing.expectEqual(@as(u64, 1024), garbage.value.artifact_control.?.chargedBytes());
+        try actor.expectWork(1);
+        try actor.apply(.{ .reclaim_artifact = .{ .reservation_digest = id, .proof = @splat(14) } });
+        try actor.expectWork(0);
+        var reclaimed = try actor.read();
+        defer reclaimed.deinit();
+        try std.testing.expectEqual(@as(u64, 0), reclaimed.value.artifact_control.?.chargedBytes());
+        try std.testing.expectEqual(id, reclaimed.value.artifact_control.?.last_reclaimed.?.reservation);
+        try actor.apply(.{ .reclaim_artifact = .{ .reservation_digest = id, .proof = @splat(14) } });
+        try actor.expectWork(0);
+        if (checkpoint_mode) {
+            try actor.apply(.{ .retire = .{ .receipt = "qualified-source-retirement" } });
+            try actor.expectWork(1);
+            const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+            defer a.free(snapshot);
+            const target_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-checkpoint-snapshot", .{tmp.sub_path});
+            defer a.free(target_root);
+            var target = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+            defer target.deinit();
+            try RaftApplyStore.installSnapshotFromRaft(&target, a, group, 100, snapshot);
+            const restored: Actor = .{ .a = a, .store = &target, .group = group, .scope = scope, .catalog = actor.catalog };
+            var retirement = try restored.read();
+            defer retirement.deinit();
+            try std.testing.expect(retirement.value.checkpoint_authority.?.sameAuthority(authority));
+            try std.testing.expect(retirement.value.checkpoint_authority.?.retirement == null);
+            try restored.expectWork(1);
+            try restored.apply(.{ .fence_checkpoint = .{ .authority_digest = authority.digest(), .proof = @splat(17) } });
+            try restored.expectWork(0);
         }
-        fn expectWork(self: @This(), expected: u64) !void {
-            var txn = try self.store.store.beginWriteTxn();
-            defer txn.abort();
-            var buffer: [256]u8 = undefined;
-            const count = try txn.get(try source_control.workKey(&buffer, self.group, self.scope.table_id));
-            try std.testing.expectEqual(expected, std.mem.readInt(u64, count[0..8], .little));
-            if (expected != 0) try std.testing.expectError(error.TableTransitionActive, self.store.removeTableTxn(&txn, self.group, self.scope.table_id, 0));
-        }
-    };
-    const actor: Actor = .{ .a = a, .store = &store, .group = group, .scope = scope, .catalog = source_control.digest(table.replication_sources_json) };
-    try actor.apply(.{ .configure = scope });
-    const reservation: source_control.Reservation = .{ .sequence = 1, .batch_id = "batch", .checkpoint = "cp1", .accepted_at_ns = 1, .payload_digest = @splat(4), .plan_digest = @splat(5), .transaction_id = @splat(6), .destination = .native, .delivery_manifest = "frozen-reference", .artifact = .{ .namespace = @splat(9), .binding = scope.identity(), .domain = source_control.artifact_control.domainFor(scope.identity()), .attempt = .{ 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, .bytes = 1024, .checksum = @splat(10), .plan_digest = @splat(11) } };
-    const id = reservation.identity(scope);
-    try actor.apply(.{ .reserve = reservation });
-    try actor.expectWork(1);
-    try actor.apply(.{ .seal_artifact = .{ .reservation_digest = id, .stamp = @splat(12) } });
-    store.deinit();
-    opened = false;
-    store = try RaftApplyStore.init(a, .{ .root_dir = root });
-    opened = true;
-    var sealed = try actor.read();
-    defer sealed.deinit();
-    try std.testing.expectEqual(.sealed, sealed.value.artifact_control.?.current.?.phase);
-    try std.testing.expectEqual(@as(u64, 1024), sealed.value.artifact_control.?.chargedBytes());
-    try actor.apply(.{ .accept = .{ .reservation_digest = id, .receipt = "native-receipt", .commit_reference = "native-commit" } });
-    // Committed source progress does not clear artifact retention debt.
-    try actor.expectWork(1);
-    try actor.apply(.{ .retire_artifact = .{ .reservation_digest = id, .proof = @splat(13), .reason = .committed } });
-    store.deinit();
-    opened = false;
-    store = try RaftApplyStore.init(a, .{ .root_dir = root });
-    opened = true;
-    var garbage = try actor.read();
-    defer garbage.deinit();
-    try std.testing.expectEqual(.garbage, garbage.value.artifact_control.?.current.?.phase);
-    try std.testing.expectEqual(@as(u64, 1024), garbage.value.artifact_control.?.chargedBytes());
-    try actor.expectWork(1);
-    try actor.apply(.{ .reclaim_artifact = .{ .reservation_digest = id, .proof = @splat(14) } });
-    try actor.expectWork(0);
-    var reclaimed = try actor.read();
-    defer reclaimed.deinit();
-    try std.testing.expectEqual(@as(u64, 0), reclaimed.value.artifact_control.?.chargedBytes());
-    try std.testing.expectEqual(id, reclaimed.value.artifact_control.?.last_reclaimed.?.reservation);
-    try actor.apply(.{ .reclaim_artifact = .{ .reservation_digest = id, .proof = @splat(14) } });
-    try actor.expectWork(0);
+    }
 }

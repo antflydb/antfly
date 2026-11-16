@@ -182,3 +182,8 @@ test "source plan HTTP discovery" {
     _ = @import("api/source_plan_delivery.zig");
     _ = @import("data/source_plan_http_wire.zig");
 }
+
+test "source checkpoint authority discovery" {
+    _ = @import("metadata/source_control.zig");
+    _ = @import("metadata/source_delivery.zig");
+}

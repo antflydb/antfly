@@ -59,6 +59,7 @@ pub const NativeHistoryResolutionEvidence = types.NativeHistoryResolutionEvidenc
 pub const NativeHistoryResolutionReply = types.NativeHistoryResolutionReply;
 pub const NativeHistoryResolutionRequest = types.NativeHistoryResolutionRequest;
 pub const NativeHistoryRetirement = types.NativeHistoryRetirement;
+pub const NativeSourceCheckpointAuthority = types.NativeSourceCheckpointAuthority;
 pub const NativeSourceCheckpointCommand = types.NativeSourceCheckpointCommand;
 pub const NativeSourcePlanChunkQuery = types.NativeSourcePlanChunkQuery;
 pub const NativeSourcePlanChunkReply = types.NativeSourcePlanChunkReply;

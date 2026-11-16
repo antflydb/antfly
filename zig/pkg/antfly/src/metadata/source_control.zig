@@ -22,6 +22,7 @@ const A = std.mem.Allocator;
 const source_contract = @This();
 pub const Digest = [32]u8;
 pub const artifact_control = @import("source_artifact_control.zig");
+pub const checkpoint_authority = @import("source_checkpoint_authority.zig");
 pub const protocol_version: u16 = 90;
 pub const max_pending_bytes = 1024 * 1024;
 pub const max_state_bytes = 8 * 1024 * 1024;
@@ -191,6 +192,7 @@ pub const State = struct {
     retirement_receipt: []const u8 = "",
     retired_reservation_digest: Digest = @splat(0),
     artifact_control: ?@import("source_artifact_control.zig").State = null,
+    checkpoint_authority: ?source_contract.checkpoint_authority.Spec = null,
     pub fn jsonStringify(self: State, stream: anytype) @TypeOf(stream.*).Error!void {
         return writeArtifactFields(self, stream);
     }
@@ -198,7 +200,11 @@ pub const State = struct {
     pub fn validate(self: State) !void {
         if (self.version != 1 or self.outstanding.len > max_outstanding or !text(self.retirement_receipt, 8192, true)) return error.InvalidSourceControl;
         if (self.scope) |scope| try scope.validate() else {
-            if (self.revision != 0 or self.pending != null or self.artifact_control != null or self.accepted.sequence != 0 or self.committed.sequence != 0 or self.outstanding.len != 0 or self.retired) return error.InvalidSourceControl;
+            if (self.revision != 0 or self.pending != null or self.artifact_control != null or self.checkpoint_authority != null or self.accepted.sequence != 0 or self.committed.sequence != 0 or self.outstanding.len != 0 or self.retired) return error.InvalidSourceControl;
+        }
+        if (self.checkpoint_authority) |authority| {
+            try authority.validate();
+            if (self.scope == null or self.scope.?.destination != .native or self.artifact_control == null or !std.mem.eql(u8, &authority.binding, &self.scope.?.identity()) or (authority.retirement != null and !self.retired)) return error.InvalidSourceControl;
         }
         if (self.committed.sequence > self.accepted.sequence) return error.InvalidSourceControl;
         for ([_]Frontier{ self.accepted, self.committed }) |frontier| {
@@ -281,6 +287,8 @@ pub const Replan = struct {
 
 pub const Mutation = union(enum) {
     configure: Scope,
+    bind_checkpoint: checkpoint_authority.Spec,
+    fence_checkpoint: struct { authority_digest: Digest, proof: Digest },
     reserve: Reservation,
     /// The adapter proves old routes cannot admit a delayed original attempt.
     /// This changes delivery authority, not logical source progress or payload.
@@ -305,6 +313,11 @@ pub const Mutation = union(enum) {
     pub fn validate(self: Mutation) !void {
         switch (self) {
             .configure, .reseed => |scope| try scope.validate(),
+            .bind_checkpoint => |authority| {
+                try authority.validate();
+                if (authority.retirement != null) return error.InvalidSourceControl;
+            },
+            .fence_checkpoint => |fence| if (!nonzero(fence.authority_digest) or !nonzero(fence.proof)) return error.InvalidSourceControl,
             .reserve => |reservation| try reservation.validate(),
             .replan => |plan| {
                 if (plan.artifact) |spec| try spec.validate();
@@ -332,11 +345,35 @@ pub const Mutation = union(enum) {
                 if (state.scope) |prior| if (!prior.sameBinding(scope) or state.retired) return error.SourceBindingConflict;
                 next.scope = scope;
             },
+            .bind_checkpoint => |authority| {
+                const scope = state.scope orelse return error.SourceBindingConflict;
+                if (state.retired or scope.destination != .native or !std.mem.eql(u8, &scope.identity(), &authority.binding)) return error.SourceBindingConflict;
+                if (state.checkpoint_authority) |bound| {
+                    if (!bound.sameAuthority(authority) or bound.retirement != null) return error.SourceBindingConflict;
+                    return state;
+                }
+                if (state.pending != null or state.accepted.sequence != 0 or state.outstanding.len != 0) return error.SourcePendingWork;
+                if (state.artifact_control) |ledger| if (ledger.current != null) return error.SourcePendingWork;
+                next.checkpoint_authority = authority;
+                next.artifact_control = state.artifact_control orelse .{};
+            },
+            .fence_checkpoint => |fence| {
+                const authority = state.checkpoint_authority orelse return error.SourceBindingConflict;
+                if (!state.retired or !std.mem.eql(u8, &authority.digest(), &fence.authority_digest)) return error.SourceBindingConflict;
+                if (authority.retirement) |prior| {
+                    if (!std.mem.eql(u8, &prior, &fence.proof)) return error.SourcePayloadConflict;
+                    return state;
+                }
+                if (state.pending != null or state.outstanding.len != 0) return error.SourcePendingWork;
+                if (state.artifact_control) |ledger| if (ledger.current != null) return error.SourcePendingWork;
+                next.checkpoint_authority.?.retirement = fence.proof;
+            },
             .reseed => |scope| {
                 const prior = state.scope orelse return error.SourceBindingConflict;
                 if (!state.retired or scope.table_id != prior.table_id or !std.mem.eql(u8, &scope.source_id, &prior.source_id) or
                     scope.generation != (std.math.add(u64, prior.generation, 1) catch return error.SourceBindingConflict)) return error.SourceBindingConflict;
                 if (state.artifact_control) |ledger| if (ledger.current != null) return error.SourcePendingWork;
+                if (state.checkpoint_authority) |authority| if (authority.retirement == null) return error.SourcePendingWork;
                 // Preserve the negotiated artifact contract for the same destination.
                 // An explicit, fully drained destination migration renegotiates it.
                 const retain_profile = state.artifact_control != null and scope.destination == prior.destination and std.mem.eql(u8, &scope.destination_binding, &prior.destination_binding);
@@ -689,7 +726,7 @@ pub fn definitionDigest(a: A, sources_json: []const u8, ordinal: u32) !Digest {
     return hash.finalResult();
 }
 pub fn hasWork(state: State) bool {
-    return state.pending != null or state.outstanding.len != 0 or (if (state.artifact_control) |ledger| ledger.current != null else false);
+    return state.pending != null or state.outstanding.len != 0 or (if (state.artifact_control) |ledger| ledger.current != null else false) or (state.retired and if (state.checkpoint_authority) |authority| authority.retirement == null else false);
 }
 pub fn validateEncodedWrite(bytes: []const u8) !void {
     var parsed = try parseWrite(std.heap.page_allocator, bytes);
@@ -987,7 +1024,7 @@ test "source control replans only proven unadmitted delivery while retaining log
 fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
-        const include = if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control")) @field(value, name) != null else true;
+        const include = if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority")) @field(value, name) != null else true;
         if (include) {
             try stream.objectField(name);
             try stream.write(@field(value, name));
@@ -997,6 +1034,7 @@ fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!
 }
 pub fn requiredProtocol(mutation: Mutation) u16 {
     return switch (mutation) {
+        .bind_checkpoint, .fence_checkpoint => checkpoint_authority.protocol_version,
         .reserve => |reservation| if (reservation.artifact != null) artifact_control.protocol_version else protocol_version,
         .replan => |plan| if (plan.artifact != null) artifact_control.protocol_version else protocol_version,
         .seal_artifact, .retire_artifact, .reclaim_artifact => artifact_control.protocol_version,
@@ -1004,7 +1042,7 @@ pub fn requiredProtocol(mutation: Mutation) u16 {
     };
 }
 pub fn requiredProtocolEncoded(bytes: []const u8) u16 {
-    var write = parseWrite(std.heap.page_allocator, bytes) catch return artifact_control.protocol_version;
+    var write = parseWrite(std.heap.page_allocator, bytes) catch return checkpoint_authority.protocol_version;
     defer write.deinit();
     return requiredProtocol(write.value.mutation);
 }
@@ -1141,4 +1179,55 @@ test "source control artifact replanning requires fenced cleanup and never reuse
     lake_reservation.destination = .writable_iceberg;
     lake_reservation.artifact = null;
     _ = try (Mutation{ .reserve = lake_reservation }).apply(ca, migrated);
+}
+
+test "source checkpoint authority is immutable and retirement debt blocks reseeding" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var scope: Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
+    var state = try (Mutation{ .configure = scope }).apply(ca, .{});
+    const authority: checkpoint_authority.Spec = .{ .binding = scope.identity(), .table_name = "checkpoint-owner", .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(5), .root_generation = 0, .group_id = 17, .topology_epoch = 1 } };
+    const bind: Mutation = .{ .bind_checkpoint = authority };
+    var refreshed = authority.owner;
+    refreshed.topology_epoch += 1;
+    refreshed.table_binding = @splat(6);
+    try authority.requireOwner(refreshed);
+    refreshed.root_generation += 1;
+    try std.testing.expectError(error.SourceBindingConflict, authority.requireOwner(refreshed));
+    const legacy = try encode(a, state);
+    defer a.free(legacy);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "checkpoint_authority") == null);
+    state = try bind.apply(ca, state);
+    try std.testing.expect(state.artifact_control != null);
+    try std.testing.expect(!hasWork(state));
+    try std.testing.expectEqual(state.revision, (try bind.apply(ca, state)).revision);
+    var replaced = authority;
+    replaced.owner.group_id += 1;
+    try std.testing.expectError(error.SourceBindingConflict, (Mutation{ .bind_checkpoint = replaced }).apply(ca, state));
+    scope.source_ordinal = 9;
+    state = try (Mutation{ .configure = scope }).apply(ca, state);
+    try std.testing.expect(state.checkpoint_authority.?.sameAuthority(authority));
+    const bytes = try encode(a, state);
+    defer a.free(bytes);
+    var reopened = try parse(a, bytes);
+    defer reopened.deinit();
+    try std.testing.expect(reopened.value.checkpoint_authority.?.sameAuthority(authority));
+    const write = try encodeWrite(a, .{ .table_id = 7, .source_id = scope.source_id, .expected_revision = state.revision, .expected_binding = scope.identity(), .expected_catalog_digest = @splat(8), .mutation = bind });
+    defer a.free(write);
+    try std.testing.expectEqual(checkpoint_authority.protocol_version, requiredProtocolEncoded(write));
+    const fence: Mutation = .{ .fence_checkpoint = .{ .authority_digest = authority.digest(), .proof = @splat(9) } };
+    try std.testing.expectError(error.SourceBindingConflict, fence.apply(ca, state));
+    state = try (Mutation{ .retire = .{ .receipt = "qualified-source-retirement" } }).apply(ca, state);
+    try std.testing.expect(hasWork(state));
+    var next_scope = scope;
+    next_scope.generation += 1;
+    try std.testing.expectError(error.SourcePendingWork, (Mutation{ .reseed = next_scope }).apply(ca, state));
+    state = try fence.apply(ca, state);
+    try std.testing.expect(!hasWork(state));
+    try std.testing.expectEqual(state.revision, (try fence.apply(ca, state)).revision);
+    state = try (Mutation{ .reseed = next_scope }).apply(ca, state);
+    try std.testing.expect(state.checkpoint_authority == null);
+    try std.testing.expect(state.artifact_control != null);
 }
