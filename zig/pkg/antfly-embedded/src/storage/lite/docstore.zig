@@ -4076,6 +4076,59 @@ pub const Store = struct {
         try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
     }
 
+    // perf/lwa-reader-fence-share: for a store with page reuse disabled
+    // (`indexed_reclamation == false`), a plain (non-externally-locked)
+    // read generation's own open (`openWithRuntime`'s `plain_reader`
+    // branch, since `internal_reader` is false there) already registers
+    // a `NativeFile.reader_fence`/`reader_fence_lock` pair that is meant
+    // to live for this generation's whole life. `perf/lwa-xproc-pagekind`
+    // (4040e076bb) then made every `pin.kernel_reader` window *also* drive
+    // `acquireReaderFence`/`releaseReaderFence` on that same `NativeFile`
+    // regardless -- before the fix, `acquireReaderFence` overwrote
+    // `self.reader_fence` without unregistering the open-time one first,
+    // doubling the registration for this one inode and then, on the
+    // window's release, only unwinding the second (window-scoped) one,
+    // permanently leaking the first's region slot for the rest of this
+    // generation's life. Proven directly against the same two primitives
+    // the open-time and per-window registrations both drive: the
+    // coordinator's own reader count for this inode, and the shared
+    // region's `minimumPinnedSequence()`.
+    test "lite a page-reuse-disabled read generation's open-time fence is not doubled by its first kernel-reader pin" {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "reader-fence-share-open-vs-window.aflite");
+        defer a.free(path);
+
+        var coordinator = native.ReaderCoordinator.init(a, std.testing.io);
+        defer coordinator.deinit();
+        var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .page_reuse = false, .enabled = false } });
+        defer store.close();
+        store.file.reader_coordinator = &coordinator;
+        try std.testing.expect(!store.file.header.indexed_reclamation);
+        try store.file.putDocument("alpha", "one");
+
+        const inode = (try store.file.file.stat(std.testing.io)).inode;
+        const region = (try store.file.regionForInode()).?;
+        try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
+
+        var read = try Txn.openRead(&store);
+        var aborted = false;
+        errdefer if (!aborted) read.abort();
+        try std.testing.expect(!read.store.?.file.externally_locked);
+        // The bug: before the fix this generation's `NativeFile` carried
+        // two live fences on the one inode -- the open-time one
+        // (never released) and the window one `acquireReaderFence`
+        // installed over it.
+        try std.testing.expectEqual(@as(u64, 1), coordinator.readerStats(inode, region).count);
+        read.abort();
+        aborted = true;
+        // The bug: before the fix, the leaked open-time fence kept this
+        // non-null forever after, hiding behind the window fence's own
+        // (correct) release.
+        try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
+    }
+
     pub fn getCatalogRecordAlloc(self: *Store, a: Allocator, key: []const u8) !?[]u8 {
         lockStore(self);
         defer self.mutex.unlock();

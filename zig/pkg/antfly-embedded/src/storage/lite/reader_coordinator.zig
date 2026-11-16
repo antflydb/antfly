@@ -161,43 +161,69 @@ pub const Coordinator = struct {
     /// when it is unusable for this open (`inode_lock.isRegionUnusable`) or
     /// simply doesn't apply (no registry entry at all).
     pub fn registerEpoch(self: *Coordinator, file: std.Io.File, region: ?*shared_lock_region.Region, inode: u64, sequence: u64, tip: [32]u8, metadata: bool) !*Fence {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         var slot: ?u32 = null;
+        var shared = false;
         if (region) |r| {
-            const pid: u32 = @bitCast(std.c.getpid());
-            slot = r.claimReaderSlot(pid) catch null;
-            if (slot) |s| {
-                // The region's own convention (shared_lock_region.zig's
-                // `ReaderSlot.pinned_sequence` doc) is that 0 means "not
-                // pinned" and real sequence numbers start above 0. A
-                // caller can legitimately compute `sequence == 0` here
-                // (e.g. `metadataReuseFrontier()` mixing in a pristine,
-                // never-written checkpoint slot before this database's
-                // first real commit) meaning "protect everything, there
-                // is no floor yet" -- the most conservative frontier, not
-                // "nothing to protect." Floor it at 1 so that intent is
-                // never silently indistinguishable from an absent pin.
-                const pinned_sequence = @max(sequence, 1);
-                r.pinReader(s, pinned_sequence);
-                if (metadata) r.pinMetadataReader(s, pinned_sequence);
+            // The region's own convention (shared_lock_region.zig's
+            // `ReaderSlot.pinned_sequence` doc) is that 0 means "not
+            // pinned" and real sequence numbers start above 0. A
+            // caller can legitimately compute `sequence == 0` here
+            // (e.g. `metadataReuseFrontier()` mixing in a pristine,
+            // never-written checkpoint slot before this database's
+            // first real commit) meaning "protect everything, there
+            // is no floor yet" -- the most conservative frontier, not
+            // "nothing to protect." Floor it at 1 so that intent is
+            // never silently indistinguishable from an absent pin.
+            const pinned_sequence = @max(sequence, 1);
+            // Prefer sharing an already-claimed slot over claiming a new
+            // one whenever another fence already registered in this
+            // process is pinning the exact same floor on the same inode
+            // and region: it protects identically, so claiming a second
+            // slot only duplicates pressure on the fixed-capacity reader
+            // table (`max_readers`, deliberately not grown -- see its own
+            // doc comment) for zero additional protection.
+            // `perf/lwa-xproc-pagekind` put materially more load on that
+            // table by routing every plain read generation's own kernel-
+            // reader window through this call instead of only
+            // `externally_locked` ones. Scanning (and claiming/pinning)
+            // under `self.mutex` for this whole function, rather than
+            // re-locking around a separate append step the way this used
+            // to, closes the gap where a concurrent `unregister` could
+            // release the very slot just found sharable here before this
+            // call gets to alias it.
+            for (self.readers.items) |existing| {
+                if (existing.region == r and existing.inode == inode and existing.slot != null and
+                    existing.sequence == sequence and !existing.poisoned)
+                {
+                    slot = existing.slot;
+                    shared = true;
+                    if (metadata and !existing.metadata) r.pinMetadataReader(slot.?, pinned_sequence);
+                    break;
+                }
+            }
+            if (!shared) {
+                const pid: u32 = @bitCast(std.c.getpid());
+                slot = r.claimReaderSlot(pid) catch null;
+                if (slot) |s| {
+                    r.pinReader(s, pinned_sequence);
+                    if (metadata) r.pinMetadataReader(s, pinned_sequence);
+                }
             }
         }
-        errdefer if (slot) |s| if (region) |r| {
+        errdefer if (!shared) if (slot) |s| if (region) |r| {
             if (metadata) r.unpinMetadataReader(s);
             r.unpinReader(s);
             r.releaseReaderSlot(s);
         };
-        return self.registerWithScope(file, inode, sequence, tip, metadata, if (slot != null) region else null, slot);
-    }
-    fn registerWithScope(self: *Coordinator, file: std.Io.File, inode: u64, sequence: u64, tip: [32]u8, metadata: bool, region: ?*shared_lock_region.Region, slot: ?u32) !*Fence {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
         const fence = try self.allocator.create(Fence);
         errdefer self.allocator.destroy(fence);
         // The shared lock may have blocked physical reuse before registration,
         // while an external writer promoted retirement. A delayed old reader
         // must never become eligible merely by arriving after that detection.
         const stale = slot == null and if (self.known) |known| known.inode != inode or !std.mem.eql(u8, &known.tip, &tip) else false;
-        fence.* = .{ .file = file, .inode = inode, .sequence = sequence, .captured_at_ns = std.Io.Clock.awake.now(self.io).nanoseconds, .metadata = metadata, .poisoned = stale, .inode_only = slot == null, .region = region, .slot = slot };
+        fence.* = .{ .file = file, .inode = inode, .sequence = sequence, .captured_at_ns = std.Io.Clock.awake.now(self.io).nanoseconds, .metadata = metadata, .poisoned = stale, .inode_only = slot == null, .region = if (slot != null) region else null, .slot = slot };
         try self.readers.append(self.allocator, fence);
         _ = self.references.fetchAdd(1, .monotonic);
         if (self.known == null) self.known = .{ .inode = inode, .tip = tip };
@@ -210,12 +236,31 @@ pub const Coordinator = struct {
             const region = fence.region;
             const slot = fence.slot;
             const metadata = fence.metadata;
+            // A slot this fence shared with another still-registered
+            // fence (`registerEpoch`'s sharing path above) must not be
+            // unpinned/released out from under that other fence --
+            // computed here, still under `self.mutex`, so a concurrent
+            // `registerEpoch` can never observe this fence as a sharable
+            // owner of `slot` after it decides whether the slot is still
+            // in use.
+            var shared_by_others = false;
+            var metadata_still_needed = false;
+            if (region) |r| if (slot) |s| for (self.readers.items) |other| {
+                if (other.region == r and other.slot == s) {
+                    shared_by_others = true;
+                    if (other.metadata) metadata_still_needed = true;
+                }
+            };
             self.allocator.destroy(fence);
             self.mutex.unlock(self.io);
             if (region) |r| if (slot) |s| {
-                r.unpinReader(s);
-                if (metadata) r.unpinMetadataReader(s);
-                r.releaseReaderSlot(s);
+                if (shared_by_others) {
+                    if (metadata and !metadata_still_needed) r.unpinMetadataReader(s);
+                } else {
+                    r.unpinReader(s);
+                    if (metadata) r.unpinMetadataReader(s);
+                    r.releaseReaderSlot(s);
+                }
             };
             self.release();
             return;
@@ -445,6 +490,71 @@ test "lite reader registration falls back to inode-only fencing when no region i
     try std.testing.expectEqual(@as(?u64, null), fixture.region.minimumPinnedSequence());
     try std.testing.expect(!try fixture.data.tryLock(std.testing.io, .exclusive));
     try std.testing.expectEqual(@as(?u64, 20), fixture.coordinator.readerStats(fixture.inode, &fixture.region).frontier.data);
+}
+
+// perf/lwa-reader-fence-share: `docstore.zig`'s `Store.pinInitializedReadGeneration`
+// now drives `NativeFile.acquireReaderFence` for every plain (non-
+// `externally_locked`) kernel-reader read generation, not just
+// `externally_locked` ones (`perf/lwa-xproc-pagekind`) -- materially more
+// callers claiming a region slot per inode. Several same-process fences
+// pinned at the exact identical sequence on one inode protect exactly the
+// same floor, so `registerEpoch` shares one slot across them instead of
+// claiming one each, to avoid making the fixed-capacity reader table's
+// exhaustion (`shared_lock_region.Region.ReaderError.ReadersExhausted`,
+// which degrades a reader to an inode-only fence with no cross-process
+// protection at all) worse than it has to be. A region sized to exactly
+// one slot proves the sharing: two fences at the same sequence coexist on
+// it, a third at a different sequence genuinely cannot, and releasing one
+// sharer never drops the other's still-needed pin.
+test "lite reader registration shares one region slot across same-process fences pinned at the identical sequence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shared-slot.aflite", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const data = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true });
+    defer data.close(std.testing.io);
+    const inode = (try data.stat(std.testing.io)).inode;
+    var region = try shared_lock_region.Region.openSized(std.testing.allocator, std.testing.io, path, 1);
+    defer region.close();
+    var coordinator = Coordinator.init(std.testing.allocator, std.testing.io);
+    defer coordinator.deinit();
+
+    const file_a = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+    try file_a.lock(std.testing.io, .shared);
+    const fence_a = try coordinator.registerEpoch(file_a, &region, inode, 10, @splat(0), false);
+    try std.testing.expect(fence_a.slot != null);
+
+    // Same inode, same region, the identical sequence -- shares `fence_a`'s
+    // slot rather than needing the table's only other one.
+    const file_b = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+    try file_b.lock(std.testing.io, .shared);
+    const fence_b = try coordinator.registerEpoch(file_b, &region, inode, 10, @splat(0), true);
+    try std.testing.expectEqual(fence_a.slot, fence_b.slot);
+    try std.testing.expectEqual(@as(?u64, 10), region.minimumMetadataPinnedSequence());
+
+    // A different sequence cannot share -- and this one-slot table really
+    // is exhausted by the shared pair above, proving sharing did not
+    // silently grow its capacity.
+    const file_c = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+    try file_c.lock(std.testing.io, .shared);
+    const fence_c = try coordinator.registerEpoch(file_c, &region, inode, 30, @splat(0), false);
+    try std.testing.expect(fence_c.slot == null);
+    try std.testing.expect(fence_c.inode_only);
+
+    coordinator.unregister(fence_b);
+    file_b.close(std.testing.io);
+    // `fence_a` still shares the slot: releasing one sharer must not
+    // unpin or free it out from under the other.
+    try std.testing.expectEqual(@as(?u64, 10), region.minimumPinnedSequence());
+    // `fence_b` was the only sharer that needed the metadata pin.
+    try std.testing.expectEqual(@as(?u64, null), region.minimumMetadataPinnedSequence());
+
+    coordinator.unregister(fence_a);
+    file_a.close(std.testing.io);
+    try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
+
+    coordinator.unregister(fence_c);
+    file_c.close(std.testing.io);
 }
 
 test "lite reader registration begin/end windows combine region and inode-only frontiers and poison stale inode-only fences" {

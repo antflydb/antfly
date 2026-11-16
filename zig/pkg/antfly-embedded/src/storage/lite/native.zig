@@ -10165,6 +10165,21 @@ pub const NativeFile = struct {
         // whole call, only to fence more conservatively (the kernel lock
         // below still blocks this process's own exclusive reuse either
         // way).
+        // `self.reader_fence` is a single field, not a list: a plain
+        // read-only open (`openWithRuntime`'s `plain_reader` branch) may
+        // already have registered one here before this call ever runs,
+        // and -- since every `pin.kernel_reader` read-generation window
+        // now reaches this call regardless (`perf/lwa-xproc-pagekind`
+        // dropped the old `scoped_reader_lock` restriction) -- a second
+        // window on the same already-fenced `NativeFile` would otherwise
+        // overwrite that live registration without ever unregistering it,
+        // leaking the old `Fence` (and its region slot) for the rest of
+        // this `NativeFile`'s life. Release it first, exactly the hazard
+        // the `reader_fence_lock` overwrite below already guards against.
+        if (self.reader_fence) |stale| {
+            self.reader_coordinator.?.unregister(stale);
+            self.reader_fence = null;
+        }
         if (self.reader_coordinator) |coordinator| {
             self.reader_fence = try coordinator.registerEpoch(self.file, try self.regionForInode(), (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false);
         }
