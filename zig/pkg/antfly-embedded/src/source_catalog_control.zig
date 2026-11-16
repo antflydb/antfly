@@ -903,5 +903,6 @@ pub const storage_source_checkpoint = @import("storage/source_checkpoint.zig");
 pub const storage_source_plan_storage = @import("storage/source_plan_storage.zig");
 
 pub const storage_source_plan_control = @import("storage/source_plan_control.zig");
+pub const storage_source_checkpoint_read = @import("storage/source_checkpoint_read.zig");
 
 pub const storage_source_plan_wire = @import("storage/source_plan_wire.zig");

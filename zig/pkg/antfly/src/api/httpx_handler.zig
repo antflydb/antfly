@@ -1907,6 +1907,7 @@ pub const AntflyApiHandler = struct {
         inline for (.{
             .{ routes.source_plan_control_suffix, internalSourcePlanControl },
             .{ routes.source_plan_observe_suffix, internalSourcePlanObserve },
+            .{ routes.source_checkpoint_observe_suffix, internalSourceCheckpointObserve },
             .{ routes.source_plan_chunk_suffix, internalSourcePlanChunk },
         }) |route| {
             if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit"))
@@ -4201,7 +4202,7 @@ pub const AntflyApiHandler = struct {
         if (mutation) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
         const status: u16 = switch (err) {
             error.ChangefeedCapabilityUnsupported => 501,
-            error.TopologyChanged, error.HistoryResynchronizationRequired, error.SourceReceiptExpired, error.SourcePayloadConflict, error.ConflictingOrderedApplyReceipt => 409,
+            error.TopologyChanged, error.HistoryResynchronizationRequired, error.SourceReceiptExpired, error.SourcePayloadConflict, error.SourceCheckpointConflict, error.ConflictingOrderedApplyReceipt => 409,
             error.GroupLeaderUnavailable, error.LeaderUnavailable, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ReadUnavailable, error.ResourceBudgetExceeded, error.Canceled, error.Cancelled, error.DeadlineExceeded, error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout => 503,
             error.InvalidCatalogRouteFence, error.InvalidSourcePlanWire, error.InvalidSourceAdmission, error.InvalidTxnRecord, error.InvalidCatalogRouteFenceProtocol, error.UnsupportedCatalogRouteFence, error.MissingField, error.UnknownField, error.DuplicateField, error.UnexpectedToken, error.SyntaxError, error.Overflow => 400,
             else => 500,
@@ -4211,13 +4212,16 @@ pub const AntflyApiHandler = struct {
     fn internalSourcePlanControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.internalSourcePlan(ctx, .control);
     }
+    fn internalSourceCheckpointObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .checkpoint);
+    }
     fn internalSourcePlanObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.internalSourcePlan(ctx, .observe);
     }
     fn internalSourcePlanChunk(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.internalSourcePlan(ctx, .chunk);
     }
-    fn internalSourcePlan(self: *AntflyApiHandler, ctx: *httpx.Context, comptime kind: enum { control, observe, chunk }) !httpx.Response {
+    fn internalSourcePlan(self: *AntflyApiHandler, ctx: *httpx.Context, comptime kind: enum { control, observe, chunk, checkpoint }) !httpx.Response {
         const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
         var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
         defer identity.deinit(self.api_server.alloc);
@@ -4226,13 +4230,15 @@ pub const AntflyApiHandler = struct {
         defer params.deinit(ctx.allocator);
         const operations = @import("source_plan_operations.zig");
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing source plan request");
-        if (body.len > operations.wire.max_bytes) return textResponse(ctx, 413, "source plan request exceeds byte limit");
+        const maximum = if (kind == .checkpoint) @import("source_checkpoint_operations.zig").wire.max_request_bytes else operations.wire.max_bytes;
+        if (body.len > maximum) return textResponse(ctx, 413, "source recovery request exceeds byte limit");
         switch (kind) {
             .control => {
                 const result = operations.executeControl(self.api_server.cfg.native_source_plan_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, true);
                 if (!result.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
                 return ctx.json(result);
             },
+            .checkpoint => return ctx.json(@import("source_checkpoint_operations.zig").execute(self.api_server.cfg.native_source_checkpoint_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
             .observe => return ctx.json(operations.executeObserve(self.api_server.cfg.native_source_plan_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
             .chunk => {
                 const result = operations.executeChunk(self.api_server.cfg.native_source_plan_chunk, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false);

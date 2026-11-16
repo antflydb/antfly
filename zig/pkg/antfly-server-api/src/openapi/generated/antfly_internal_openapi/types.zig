@@ -910,6 +910,59 @@ pub const NativeSourceCheckpointCommand = struct {
     }
 };
 
+/// Request-bound observation. Head and receipt are canonical base64 of checksummed SCP1/SCP2 records, at most 1196 decoded bytes each; validate complete command identity and retention window. Absence is unproven. No coordinator decision, completion, replan, source ACK or reclamation authority is implied.
+pub const NativeSourceCheckpointReadReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    cut: std.json.Value,
+    disposition: []const u8,
+    head: OpenApiOptionalNullable([]const u8) = .absent,
+    receipt: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("disposition");
+        try jw.write(self.disposition);
+        switch (self.head) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("head");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("head");
+                try jw.write(value);
+            },
+        }
+        switch (self.receipt) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("receipt");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("receipt");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const NativeSourceCheckpointReadRequest = struct {
+    version: i64,
+    source_owner: NativeHistoryPublicationOwner,
+    transaction_id: NativeHistoryConsumerId,
+    command: NativeSourceCheckpointCommand,
+    minimum_applied_index: u64,
+};
+
 pub const NativeSourcePlanChunkQuery = struct {
     root: NativeSourcePlanRoot,
     spec: NativeSourcePlanSpec,

@@ -30,7 +30,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 96 adds cut-bound immutable participant resolution reads.
 // Version 105 fences source-checkpoint failure statuses across owner calls.
 // Version 106 adds source checkpoint receipt-window mutation layouts.
-pub const abi_version: u32 = 106;
+// Version 107 adds qualified checkpoint receipt observations.
+pub const abi_version: u32 = 107;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1985,6 +1986,7 @@ pub extern fn antfly_storage_owner_replicated_batch_at_raft_entry_json(
 /// native-owner callers may invoke them after qualifying the physical root.
 pub extern fn antfly_storage_owner_native_source_plan_control(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_ordered_source_plan_control(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_source_checkpoint_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_source_plan_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_source_plan_chunk(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_ordered_source_plan_outcome(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;

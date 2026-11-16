@@ -4463,3 +4463,62 @@ completion/GC ownership remain required. A checkpoint receipt does not by itself
 prove every participant's completion or authorize source acknowledgment, artifact
 reclamation, public event delivery, or index coverage. The full #1698/#1639
 requirements remain active; both issues and draft PR #1700 remain open.
+
+### Qualified read-only checkpoint receipt recovery
+
+`POST /internal/v1/groups/{group_id}/tables/{table}/source-checkpoint/observe-v1`
+now exposes private checkpoint observations through the actual native owner.
+The service-principal handler and signed client enforce bounded request/reply
+sizes (16 KiB / 8 KiB), strict JSON, route acknowledgement, content type and
+request identity. The routed DataServer port uses only a known eligible leader
+and bounded compact peer discovery. HTTP callbacks are local native callbacks,
+so forwarding does not recursively route back through the same endpoint.
+
+Native identity, root generation, persisted Raft authority, actual sparse apply
+cut, checkpoint head and retained sequence receipt are observed in one storage
+snapshot. The serving owner independently captures/revalidates the full catalog
+owner, ReadIndex proof, route, namespace, deadline and cancellation before and
+after the native call. Reads do not submit BEGIN/PREPARE, propose control entries,
+advance checkpoints, or create retention/ACK authority.
+
+Observations distinguish absent (unproven), committed (local checkpoint receipt)
+and expired (outside the retained window). They bind the full request and owner;
+SCP2 receipts verify the full command digest, including the original predecessor.
+SCP1 retains its original source-purpose/current-head semantics rather than
+acquiring a historical receipt window. Missing/corrupt in-window evidence fails
+closed. A changed window or input is rejected. A checkpoint receipt alone is not
+proof of global participant completion and cannot authorize source ACK, replan,
+artifact reclamation, public event delivery, or index publication.
+
+Evidence is a fixed owned bounded value internally, encoded as canonical base64
+of checksummed SCP records over JSON. Neither read buffers nor parsed JSON are
+borrowed after teardown. Common source owner/route admission moved into
+`api/source_owner_scope.zig`, shared with source-plan operations. The engine
+descriptor is 54, storage-owner ABI 107, API-kernel ABI 28; no new Raft mutation
+format or failure-envelope version was introduced.
+
+Qualification:
+- Direct storage contracts: all ten tests passed, including binary evidence
+  round trips, exact historical receipts, expiry, changed predecessors/windows,
+  missing evidence, corrupted records, wrong owner/request, strict JSON and
+  unproven absence (`source-checkpoint-read-contract-test.log`).
+- `source-checkpoint-read-test source-plan-http-test history-control-apply-test
+  api-kernel-abi-test -j2` exited zero (`source-checkpoint-read-native-test.log`).
+  Two storage observation tests, two API ingress/discovery checks, nine existing
+  source-plan HTTP regressions, eight API ABI checks and thirteen native Raft
+  checks passed with zero skips/failures/leaks.
+- The real cross-node native fixture reads the retained sequence-1 receipt after
+  sequence 2 commits, checks exact head/receipt identity across repeated reads,
+  rejects pre-cancelled reads, and reports a future sequence as absent without
+  claiming not-admitted authority. The native assertions live in a separate
+  test helper rather than expanding the runtime owner's inline fixture.
+- make generate, source-catalog-check, engine-errors-check, openapi-check,
+  changed Zig formatting and git diff checks passed. Unrelated generated
+  model-explorer data was restored.
+
+Physical checkpoint provisioning, native source-scope fencing, qualified
+migration/retired-root recovery, production destination adapter/worker wiring,
+completion/GC ownership, and all remaining public feed/bootstrap/pgoutput/client
+qualification requirements are still outstanding. These private reads are an
+input to that integration, not a replacement for it. Both issues remain open
+and PR #1700 remains draft.

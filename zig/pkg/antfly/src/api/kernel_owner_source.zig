@@ -1823,10 +1823,11 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     const source_plan_http = @import("../data/source_plan_http_wire.zig");
-    const SourcePlanReadKind = enum { observation, chunk, outcome };
+    const SourcePlanReadKind = enum { observation, chunk, outcome, checkpoint };
     fn SourcePlanReadInput(comptime kind: SourcePlanReadKind) type {
         return switch (kind) {
             .observation => source_plan_http.ObserveRequest,
+            .checkpoint => @import("antfly_local_sources").storage_source_checkpoint_read.Request,
             .chunk => source_plan_http.ChunkRequest,
             .outcome => source_plan_http.ControlRequest,
         };
@@ -1834,9 +1835,13 @@ pub const ProvisionedKernelOwnerSource = struct {
     fn SourcePlanReadResult(comptime kind: SourcePlanReadKind) type {
         return switch (kind) {
             .observation => source_plan_http.control.Observation,
+            .checkpoint => @import("antfly_local_sources").storage_source_checkpoint_read.Reply,
             .chunk => source_plan_http.control.Read,
             .outcome => source_plan_http.control.Outcome,
         };
+    }
+    pub fn sourceCheckpointObservationRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_checkpoint_read.Request) !@import("antfly_local_sources").storage_source_checkpoint_read.Reply {
+        return self.sourcePlanReadRouted(a, fence, table, .checkpoint, request);
     }
     pub fn sourcePlanObservationRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: source_plan_http.ObserveRequest) !source_plan_http.control.Observation {
         return self.sourcePlanReadRouted(a, fence, table, .observation, request);
@@ -1871,6 +1876,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (proof.incarnation == 0 or proof.term == 0 or proof.applied_index == 0) return error.ReadUnavailable;
         const minimum = switch (kind) {
             .observation => request.query.minimum_applied_index,
+            .checkpoint => request.minimum_applied_index,
             .chunk => request.request.query.minimum_applied_index,
             .outcome => request.receipt.?.index,
         };
@@ -1883,6 +1889,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.validateRoutedRead(a, fence, group, table);
         const result = switch (kind) {
             .observation => try lease.owner().sourcePlanObservation(a, table, request.query),
+            .checkpoint => try lease.owner().sourceCheckpointObservation(a, table, request),
             .chunk => try lease.owner().sourcePlanChunk(a, table, request.request),
             .outcome => try lease.owner().sourcePlanOutcome(a, table, .{ .command = request.command, .entry = request.receipt.?, .minimum_applied_index = minimum }),
         };

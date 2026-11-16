@@ -4592,6 +4592,19 @@ pub fn storageOwnerOrderedSourcePlanControl(owner: ?*anyopaque, request: *const 
     const result = handle.db.applyOrderedSourcePlanControl(decoded.request, .{ .term = request.raft_term, .index = request.raft_index }, true) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
     return sourcePlanResponse(out, result);
 }
+pub fn storageOwnerSourceCheckpointObservation(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const wire = @import("antfly_local_sources").storage_source_checkpoint_read;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > wire.max_request_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(wire.Request, handle.alloc, request.request_json.slice(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return storageOwnerStatusFromError(if (err == error.OutOfMemory) err else error.InvalidSourceAdmission);
+    defer parsed.deinit();
+    const result = handle.db.sourceCheckpointObservation(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    result.validate(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    return sourcePlanResponse(out, result);
+}
 pub fn storageOwnerSourcePlanObservation(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     out.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;

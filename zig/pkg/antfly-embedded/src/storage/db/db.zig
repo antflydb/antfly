@@ -26078,6 +26078,19 @@ pub const DB = struct {
 
     /// Serving Raft owners establish ReadIndex before this snapshot is opened.
     /// A native root may return sequence zero before its first staging write.
+    /// The serving owner establishes and revalidates ReadIndex and the full
+    /// catalog owner. Native identity, mode, cut and receipts share one snapshot.
+    pub fn sourceCheckpointObservation(self: *DB, request: @import("../source_checkpoint_read.zig").Request) !@import("../source_checkpoint_read.zig").Reply {
+        if (comptime storage_engine.enabled) return storage_engine.call("sourceCheckpointObservation", .{ self, request });
+        try request.validate();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = request.source_owner.namespace, .generation = request.source_owner.root_generation, .fence = request.source_owner.digest() });
+        const cut = try orderedHistoryReadCut(&txn, request.minimum_applied_index);
+        return @import("../source_checkpoint_read.zig").read(&txn, request, .{ .term = cut.term, .index = cut.index });
+    }
+
     pub fn sourcePlanObservation(self: *DB, query: source_plan_control.Query) !source_plan_control.Observation {
         if (comptime storage_engine.enabled) return storage_engine.call("sourcePlanObservation", .{ self, query });
         try self.requireSourcePlanAvailable();

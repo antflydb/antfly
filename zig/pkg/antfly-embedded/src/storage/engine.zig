@@ -552,6 +552,7 @@ pub const VTable = struct {
     writeValidateGroupedSourceBatch: *const fn (std.mem.Allocator, *DB, []const types.BatchWrite, []const []const u8, []const types.DocumentTransform) Outcome(void),
     nativeSourcePlanControl: *const fn (*DB, @import("source_plan_control.zig").Request) Outcome(@import("source_plan_storage.zig").Status),
     applyOrderedSourcePlanControl: *const fn (*DB, @import("source_plan_control.zig").Request, types.OrderedApplyReceipt, bool) Outcome(@import("source_plan_control.zig").Outcome),
+    sourceCheckpointObservation: *const fn (*DB, @import("source_checkpoint_read.zig").Request) Outcome(@import("source_checkpoint_read.zig").Reply),
     sourcePlanObservation: *const fn (*DB, @import("source_plan_control.zig").Query) Outcome(@import("source_plan_control.zig").Observation),
     sourcePlanChunk: *const fn (*DB, std.mem.Allocator, @import("source_plan_control.zig").ReadRequest) Outcome(@import("source_plan_control.zig").Read),
     orderedSourcePlanOutcome: *const fn (*DB, @import("source_plan_control.zig").Recovery) Outcome(@import("source_plan_control.zig").Outcome),
@@ -591,7 +592,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 51 adds native/ordered frozen source-plan control and qualified reads.
 /// Version 52 adds source-global checkpoint BEGIN/PREPARE contracts.
 /// Version 53 adds bounded checkpoint receipt-window command layouts.
-pub const descriptor_version: u32 = 53;
+/// Version 54 adds qualified source checkpoint observations.
+pub const descriptor_version: u32 = 54;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

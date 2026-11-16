@@ -187,3 +187,7 @@ test "source checkpoint authority discovery" {
     _ = @import("metadata/source_control.zig");
     _ = @import("metadata/source_delivery.zig");
 }
+
+test "source checkpoint observation discovery" {
+    _ = @import("api/source_checkpoint_operations.zig");
+}

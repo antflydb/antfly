@@ -88,6 +88,17 @@ pub fn parseReadNativeTransactionCompletionResolutionBody(allocator: std.mem.All
     return std.json.parseFromSlice(types.NativeHistoryResolutionRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Read bounded retained source checkpoint receipts at a qualified native cut
+pub const ObserveNativeSourceCheckpointPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for observeNativeSourceCheckpoint.
+pub fn parseObserveNativeSourceCheckpointBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourceCheckpointReadRequest) {
+    return std.json.parseFromSlice(types.NativeSourceCheckpointReadRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Read one authenticated sealed source-plan chunk
 pub const ReadNativeSourcePlanChunkPathParams = struct {
     group_id: []const u8,
@@ -156,6 +167,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/page-v1", .operation_id = "readNativeRetainedHistoryPage", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/publication-v1", .operation_id = "readNativeTransactionCompletionPublication", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/history/resolution-v1", .operation_id = "readNativeTransactionCompletionResolution", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-checkpoint/observe-v1", .operation_id = "observeNativeSourceCheckpoint", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/chunk-v1", .operation_id = "readNativeSourcePlanChunk", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/control-v1", .operation_id = "controlNativeSourcePlan", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/observe-v1", .operation_id = "observeNativeSourcePlan", .request_body = .buffered, .streaming_response = false },
@@ -184,6 +196,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "readNativeRetainedHistoryPage")) @compileError("ServerRouter: Impl missing required method 'readNativeRetainedHistoryPage'");
         if (!@hasDecl(Impl, "readNativeTransactionCompletionPublication")) @compileError("ServerRouter: Impl missing required method 'readNativeTransactionCompletionPublication'");
         if (!@hasDecl(Impl, "readNativeTransactionCompletionResolution")) @compileError("ServerRouter: Impl missing required method 'readNativeTransactionCompletionResolution'");
+        if (!@hasDecl(Impl, "observeNativeSourceCheckpoint")) @compileError("ServerRouter: Impl missing required method 'observeNativeSourceCheckpoint'");
         if (!@hasDecl(Impl, "readNativeSourcePlanChunk")) @compileError("ServerRouter: Impl missing required method 'readNativeSourcePlanChunk'");
         if (!@hasDecl(Impl, "controlNativeSourcePlan")) @compileError("ServerRouter: Impl missing required method 'controlNativeSourcePlan'");
         if (!@hasDecl(Impl, "observeNativeSourcePlan")) @compileError("ServerRouter: Impl missing required method 'observeNativeSourcePlan'");
@@ -210,6 +223,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/groups/:group_id/tables/:table_name/history/page-v1", httpx.Handler.bind(self.impl, readNativeRetainedHistoryPage));
             try server.post("/groups/:group_id/tables/:table_name/history/publication-v1", httpx.Handler.bind(self.impl, readNativeTransactionCompletionPublication));
             try server.post("/groups/:group_id/tables/:table_name/history/resolution-v1", httpx.Handler.bind(self.impl, readNativeTransactionCompletionResolution));
+            try server.post("/groups/:group_id/tables/:table_name/source-checkpoint/observe-v1", httpx.Handler.bind(self.impl, observeNativeSourceCheckpoint));
             try server.post("/groups/:group_id/tables/:table_name/source-plan/chunk-v1", httpx.Handler.bind(self.impl, readNativeSourcePlanChunk));
             try server.post("/groups/:group_id/tables/:table_name/source-plan/control-v1", httpx.Handler.bind(self.impl, controlNativeSourcePlan));
             try server.post("/groups/:group_id/tables/:table_name/source-plan/observe-v1", httpx.Handler.bind(self.impl, observeNativeSourcePlan));
@@ -281,6 +295,14 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.readNativeTransactionCompletionResolution(ctx, group_id, table_name);
         }
 
+        /// Read bounded retained source checkpoint receipts at a qualified native cut
+        /// POST /groups/{group_id}/tables/{table_name}/source-checkpoint/observe-v1
+        fn observeNativeSourceCheckpoint(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.observeNativeSourceCheckpoint(ctx, group_id, table_name);
+        }
+
         /// Read one authenticated sealed source-plan chunk
         /// POST /groups/{group_id}/tables/{table_name}/source-plan/chunk-v1
         fn readNativeSourcePlanChunk(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -341,6 +363,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn readNativeRetainedHistoryPage(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn readNativeTransactionCompletionPublication(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn readNativeTransactionCompletionResolution(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn observeNativeSourceCheckpoint(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn readNativeSourcePlanChunk(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn controlNativeSourcePlan(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn observeNativeSourcePlan(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response

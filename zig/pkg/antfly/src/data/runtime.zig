@@ -7138,6 +7138,7 @@ pub const DataServer = struct {
             null;
         api_server_cfg.native_source_plan_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = sourcePlanControlOperation } else null;
         api_server_cfg.native_source_plan_observe = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourcePlanObserveOperation } else null;
+        api_server_cfg.native_source_checkpoint_observe = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourceCheckpointObserveOperation } else null;
         api_server_cfg.native_source_plan_chunk = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = sourcePlanChunkOperation } else null;
         api_server_cfg.native_history_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = historyControlOperation } else null;
         api_server_cfg.native_history_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPageOperation } else null;
@@ -13533,7 +13534,7 @@ pub const DataServer = struct {
         return .{ .ptr = self, .read_fn = historyPublicationRoutedOperation };
     }
 
-    const HistoryOperation = enum { control, page, grant, resolution, publication, owner, decision, source_plan_control, source_plan_observe, source_plan_chunk };
+    const HistoryOperation = enum { control, page, grant, resolution, publication, owner, decision, source_plan_control, source_plan_observe, source_plan_chunk, source_checkpoint_observe };
     fn historyRequestType(comptime kind: HistoryOperation) type {
         return switch (kind) {
             .control => @import("../api/history_control_operations.zig").wire.Request,
@@ -13545,6 +13546,7 @@ pub const DataServer = struct {
             .publication => @import("../api/history_publication_operations.zig").Request,
             .source_plan_control => SourcePlanHttp.ControlRequest,
             .source_plan_observe => SourcePlanHttp.ObserveRequest,
+            .source_checkpoint_observe => CheckpointRead.Request,
             .source_plan_chunk => SourcePlanHttp.ChunkRequest,
         };
     }
@@ -13559,6 +13561,7 @@ pub const DataServer = struct {
             .publication => @import("../api/history_publication_operations.zig").Reply,
             .source_plan_control => SourcePlanHttp.ControlReply,
             .source_plan_observe => SourcePlanHttp.control.Observation,
+            .source_checkpoint_observe => CheckpointRead.Reply,
             .source_plan_chunk => SourcePlanHttp.control.Read,
         };
     }
@@ -13595,10 +13598,10 @@ pub const DataServer = struct {
         std.mem.writeInt(u64, namespace[16..24], original_fence.route.identity_namespace.range_id, .big);
         if (comptime kind == .source_plan_control) {
             try input.validate(alloc);
-        } else if (comptime kind == .source_plan_observe or kind == .source_plan_chunk) {
+        } else if (comptime kind == .source_plan_observe or kind == .source_plan_chunk or kind == .source_checkpoint_observe) {
             try input.validate();
         } else try input.validate(namespace);
-        if (comptime kind == .source_plan_control or kind == .source_plan_observe or kind == .source_plan_chunk) {
+        if (comptime kind == .source_plan_control or kind == .source_plan_observe or kind == .source_plan_chunk or kind == .source_checkpoint_observe) {
             const incarnation = original_fence.metadata_incarnation orelse return error.InvalidCatalogRouteFence;
             if (input.source_owner.group_id != original_fence.route.group_id or
                 input.source_owner.metadata_group_id != original_fence.metadata_group_id or
@@ -13636,6 +13639,7 @@ pub const DataServer = struct {
             .publication => historyPublicationOperation(self, alloc, fence, table, input, context),
             .source_plan_control => sourcePlanControlOperation(self, alloc, fence, table, input, context),
             .source_plan_observe => sourcePlanObserveOperation(self, alloc, fence, table, input, context),
+            .source_checkpoint_observe => sourceCheckpointObserveOperation(self, alloc, fence, table, input, context),
             .source_plan_chunk => sourcePlanChunkOperation(self, alloc, fence, table, input, context),
         };
         // Only a compact, deadline-aware peer capture may discover a remote
@@ -13665,6 +13669,7 @@ pub const DataServer = struct {
             .publication => client.fetchGroupHistoryPublication(uri, group, table, input, fence, context),
             .source_plan_control => client.fetchGroupSourcePlanControl(uri, group, table, input, fence, context),
             .source_plan_observe => client.fetchGroupSourcePlanObservation(uri, group, table, input, fence, context),
+            .source_checkpoint_observe => client.fetchGroupSourceCheckpointObservation(uri, group, table, input, fence, context),
             .source_plan_chunk => client.fetchGroupSourcePlanChunk(uri, group, table, input, fence, context),
         };
     }
@@ -13747,7 +13752,7 @@ pub const DataServer = struct {
                 .decision => owner.orderedHistoryDecisionRouted(alloc, fence, table, input.binding()),
                 .owner => captureHistoryOwner(owner, alloc, fence, table, input, context),
                 .publication => owner.orderedHistoryPublicationRouted(alloc, fence, table, input.binding()),
-                .control, .source_plan_control, .source_plan_observe, .source_plan_chunk => unreachable,
+                .control, .source_plan_control, .source_plan_observe, .source_plan_chunk, .source_checkpoint_observe => unreachable,
             }) catch |err| switch (err) {
                 error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.StorageKernelOwnerTransitionRequired, error.StorageOwnerAdmissionPending, error.ResourceBudgetExceeded => {
                     try self.sleepDataRaftRetry(std.time.ns_per_ms);
@@ -13794,8 +13799,19 @@ pub const DataServer = struct {
             .recover => .{ .request_digest = digest, .receipt = request.receipt, .outcome = try self.recoverSourcePlanControlLocal(a, fence, table, request) },
         };
     }
-    const SourcePlanReadKind = enum { observe, chunk };
-    fn sourcePlanLocalRead(self: *DataServer, a: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, comptime kind: SourcePlanReadKind, request: if (kind == .observe) SourcePlanHttp.ObserveRequest else SourcePlanHttp.ChunkRequest, original: antfly.public_api.operation.RequestContext) !(if (kind == .observe) SourcePlanHttp.control.Observation else SourcePlanHttp.control.Read) {
+    pub fn sourceCheckpointObservationPort(self: *DataServer) @import("../api/source_checkpoint_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = sourceCheckpointObserveRoutedOperation };
+    }
+    fn sourceCheckpointObserveRoutedOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: CheckpointRead.Request, context: antfly.public_api.operation.RequestContext) !CheckpointRead.Reply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(a, fence, table, .source_checkpoint_observe, request, context);
+    }
+    fn sourceCheckpointObserveOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: CheckpointRead.Request, context: antfly.public_api.operation.RequestContext) !CheckpointRead.Reply {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.sourcePlanLocalRead(a, fence, table, .checkpoint, request, context);
+    }
+    const SourcePlanReadKind = enum { observe, chunk, checkpoint };
+    fn sourcePlanLocalRead(self: *DataServer, a: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, comptime kind: SourcePlanReadKind, request: if (kind == .observe) SourcePlanHttp.ObserveRequest else if (kind == .checkpoint) CheckpointRead.Request else SourcePlanHttp.ChunkRequest, original: antfly.public_api.operation.RequestContext) !(if (kind == .observe) SourcePlanHttp.control.Observation else if (kind == .checkpoint) CheckpointRead.Reply else SourcePlanHttp.control.Read) {
         if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
         const apply = self.data_raft_apply orelse return error.ChangefeedCapabilityUnsupported;
         const owner = apply.kernel_owner_source orelse return error.ChangefeedCapabilityUnsupported;
@@ -13813,6 +13829,7 @@ pub const DataServer = struct {
             try context.ensureActive();
             const result = (switch (kind) {
                 .observe => owner.sourcePlanObservationRouted(a, fence, table, request),
+                .checkpoint => owner.sourceCheckpointObservationRouted(a, fence, table, request),
                 .chunk => owner.sourcePlanChunkRouted(a, fence, table, request),
             }) catch |err| switch (err) {
                 error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.StorageKernelOwnerTransitionRequired, error.StorageOwnerAdmissionPending, error.ResourceBudgetExceeded => {
@@ -13848,6 +13865,7 @@ pub const DataServer = struct {
     }
 
     const SourcePlanHttp = @import("source_plan_http_wire.zig");
+    const CheckpointRead = @import("antfly_local_sources").storage_source_checkpoint_read;
     const NativeControlKind = enum { history, source_plan };
     fn NativeControlCommand(comptime kind: NativeControlKind) type {
         return switch (kind) {
@@ -44227,7 +44245,7 @@ fn consumerTests() type {
                 };
                 const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
                 defer a.destroy(api_server);
-                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .internal_service_accept_legacy_unauthenticated = true, .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_source_plan_control = .{ .ptr = server, .execute_fn = DataServer.sourcePlanControlOperation }, .native_source_plan_observe = .{ .ptr = server, .read_fn = DataServer.sourcePlanObserveOperation }, .native_source_plan_chunk = .{ .ptr = server, .read_fn = DataServer.sourcePlanChunkOperation }, .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_decision = .{ .ptr = server, .read_fn = DataServer.historyDecisionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .internal_service_accept_legacy_unauthenticated = true, .routed_raft_batch_writer = server.routedRaftBatchWriter(), .native_source_plan_control = .{ .ptr = server, .execute_fn = DataServer.sourcePlanControlOperation }, .native_source_plan_observe = .{ .ptr = server, .read_fn = DataServer.sourcePlanObserveOperation }, .native_source_checkpoint_observe = .{ .ptr = server, .read_fn = DataServer.sourceCheckpointObserveOperation }, .native_source_plan_chunk = .{ .ptr = server, .read_fn = DataServer.sourcePlanChunkOperation }, .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_decision = .{ .ptr = server, .read_fn = DataServer.historyDecisionOperation }, .native_history_owner = .{ .ptr = server, .read_fn = DataServer.historyOwnerOperation }, .native_history_publication = .{ .ptr = server, .read_fn = DataServer.historyPublicationOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
                 var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
@@ -44939,6 +44957,8 @@ fn consumerTests() type {
                             const attempt_recovery = try source_recovery.run(source_alloc, source_binding, source_fence, "docs", @splat(attempt_id), .{});
                             try std.testing.expectEqual(@as(@TypeOf(attempt_recovery), if (attempt_id == 128) .complete else .aborted), attempt_recovery);
                         }
+                        origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
+                        try @import("../api/source_checkpoint_native_test.zig").verify(source_alloc, origin_server.sourceCheckpointObservationPort(), source_fence, .{ .version = 1, .source_owner = source_binding, .transaction_id = source_id, .command = source_prepare.transaction.?.prepare.source_checkpoint.?, .minimum_applied_index = 1 });
                     }
                 };
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();

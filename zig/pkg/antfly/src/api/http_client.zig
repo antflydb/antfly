@@ -3113,11 +3113,13 @@ pub const ApiHttpClient = struct {
     /// unconfirmed, including malformed success replies. Recovery retains its
     /// original receipt and is never rewritten into submission.
     const SourcePlanWire = @import("../data/source_plan_http_wire.zig");
-    const SourcePlanOperation = enum { control, observe, chunk };
+    const CheckpointRead = @import("antfly_local_sources").storage_source_checkpoint_read;
+    const SourcePlanOperation = enum { control, observe, chunk, checkpoint };
     fn sourcePlanInput(comptime kind: SourcePlanOperation) type {
         return switch (kind) {
             .control => SourcePlanWire.ControlRequest,
             .observe => SourcePlanWire.ObserveRequest,
+            .checkpoint => CheckpointRead.Request,
             .chunk => SourcePlanWire.ChunkRequest,
         };
     }
@@ -3125,11 +3127,15 @@ pub const ApiHttpClient = struct {
         return switch (kind) {
             .control => SourcePlanWire.ControlReply,
             .observe => SourcePlanWire.control.Observation,
+            .checkpoint => CheckpointRead.Reply,
             .chunk => SourcePlanWire.control.Read,
         };
     }
     pub fn fetchGroupSourcePlanControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: SourcePlanWire.ControlRequest, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !SourcePlanWire.ControlReply {
         return self.fetchGroupSourcePlan(base_uri, group_id, table, .control, input, fence, context);
+    }
+    pub fn fetchGroupSourceCheckpointObservation(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: CheckpointRead.Request, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !CheckpointRead.Reply {
+        return self.fetchGroupSourcePlan(base_uri, group_id, table, .checkpoint, input, fence, context);
     }
     pub fn fetchGroupSourcePlanObservation(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: SourcePlanWire.ObserveRequest, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !SourcePlanWire.control.Observation {
         return self.fetchGroupSourcePlan(base_uri, group_id, table, .observe, input, fence, context);
@@ -3162,6 +3168,7 @@ pub const ApiHttpClient = struct {
         const suffix = switch (kind) {
             .control => routes.Routes.source_plan_control_suffix,
             .observe => routes.Routes.source_plan_observe_suffix,
+            .checkpoint => routes.Routes.source_checkpoint_observe_suffix,
             .chunk => routes.Routes.source_plan_chunk_suffix,
         };
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, table, suffix });
@@ -3170,6 +3177,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(uri);
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
+        if (kind == .checkpoint and body.len > CheckpointRead.max_request_bytes) return error.InvalidSourceAdmission;
         if (body.len > SourcePlanWire.max_bytes) return error.InvalidSourcePlanWire;
         const route_json = try std.json.Stringify.valueAlloc(self.alloc, fence, .{});
         defer self.alloc.free(route_json);
@@ -3178,7 +3186,7 @@ pub const ApiHttpClient = struct {
         var timeout_buffer: [10]u8 = undefined;
         const timeout_text = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{timeout});
         var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
-        const max_reply = if (kind == .chunk) SourcePlanWire.max_bytes else SourcePlanWire.max_control_reply_bytes;
+        const max_reply = if (kind == .chunk) SourcePlanWire.max_bytes else if (kind == .checkpoint) CheckpointRead.max_reply_bytes else SourcePlanWire.max_control_reply_bytes;
         try context.ensureActive();
         // A mutation has one transport attempt. Any post-dispatch ambiguity
         // preserves only original recovery authority; callers must not replay.
@@ -3227,6 +3235,7 @@ pub const ApiHttpClient = struct {
             if (response.header(internal_batch_forwarding.outcome_header) != null) return error.InvalidRemoteResponse;
             const result = switch (kind) {
                 .observe => try SourcePlanWire.native.decodeObservation(self.alloc, input.query, response.body),
+                .checkpoint => try CheckpointRead.decodeReply(self.alloc, input, response.body),
                 .chunk => try SourcePlanWire.native.decodeChunkReply(self.alloc, input.request, response.body),
                 .control => unreachable,
             };

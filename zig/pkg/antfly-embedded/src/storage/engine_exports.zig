@@ -1160,6 +1160,9 @@ fn nativeSourcePlanControl(self: *DB, request: @import("source_plan_control.zig"
 fn applyOrderedSourcePlanControl(self: *DB, request: @import("source_plan_control.zig").Request, entry: types.OrderedApplyReceipt, bypass_write_gate: bool) engine.Outcome(@import("source_plan_control.zig").Outcome) {
     return .{ .value = self.applyOrderedSourcePlanControl(request, entry, bypass_write_gate) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn sourceCheckpointObservation(self: *DB, request: @import("source_checkpoint_read.zig").Request) engine.Outcome(@import("source_checkpoint_read.zig").Reply) {
+    return .{ .value = self.sourceCheckpointObservation(request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn sourcePlanObservation(self: *DB, query: @import("source_plan_control.zig").Query) engine.Outcome(@import("source_plan_control.zig").Observation) {
     return .{ .value = self.sourcePlanObservation(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

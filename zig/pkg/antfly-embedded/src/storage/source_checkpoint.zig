@@ -24,6 +24,7 @@ pub const prefix = "\x00\x00__metadata__:source_checkpoint:";
 pub const max_checkpoint_bytes = 1024;
 const header_bytes = 136;
 const receipt_header_bytes = 172;
+pub const max_record_bytes = receipt_header_bytes + max_checkpoint_bytes;
 pub const max_receipt_window: u32 = 65536;
 const receipt_prefix = prefix ++ "receipt:";
 fn nonzero(value: anytype) bool {
@@ -146,7 +147,7 @@ pub const Head = struct {
         try result.validate();
         return result;
     }
-    fn requireRetry(self: Head, transaction_id: [16]u8, command: Command) !void {
+    pub fn requireRetry(self: Head, transaction_id: [16]u8, command: Command) !void {
         if (!std.mem.eql(u8, &self.binding, &command.binding) or self.sequence != command.sequence or self.receipt_window != command.receipt_window) return error.SourceAdmissionCorrupt;
         if (!std.mem.eql(u8, &self.purpose, &command.purpose) or !std.mem.eql(u8, &self.transaction_id, &transaction_id) or !std.mem.eql(u8, self.checkpoint, command.checkpoint) or self.accepted_at_ns != command.accepted_at_ns or (self.receipt_window != 0 and !std.mem.eql(u8, &self.request_digest, &command.digest()))) return error.SourcePayloadConflict;
     }
