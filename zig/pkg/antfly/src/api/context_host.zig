@@ -424,21 +424,21 @@ test "context host admission maps public source names to storage names" {
     var unused: u8 = 0;
     const names = PublicNameResolver{ .ptr = &unused, .resolve_fn = Names.resolve };
     const sources = try std.json.parseFromSliceLeaky(std.json.Value, a,
-        \{"org":{"document":{"table":"orgs","key_from":"/org"},"fields":["name"]}}
+        \\{"org":{"document":{"table":"orgs","key_from":"/org"},"fields":["name"]}}
     , .{});
     const stored = try admitResolvingAlloc(alloc, &tables, collect, "table:bb", "summary", sources, null, null, names);
     defer alloc.free(stored);
     try std.testing.expect(std.mem.indexOf(u8, stored, "\"table_id\":\"srv:7\"") != null);
     // Without the mapping the public name matches no catalog entry.
     try std.testing.expectError(error.UnknownContextSourceTable, admitAlloc(alloc, &tables, collect, "table:bb", "summary", sources, null, null));
-    // A storage name is not accepted in place of a public name.
+    // A storage name is not a valid public name.
     const by_storage = try std.json.parseFromSliceLeaky(std.json.Value, a,
-        \{"org":{"document":{"table":"table:aa","key_from":"/org"},"fields":["name"]}}
+        \\{"org":{"document":{"table":"table:aa","key_from":"/org"},"fields":["name"]}}
     , .{});
-    try std.testing.expectError(error.UnknownContextSourceTable, admitResolvingAlloc(alloc, &tables, collect, "table:bb", "s", by_storage, null, null, names));
+    try std.testing.expectError(error.InvalidContextSourcesConfig, admitResolvingAlloc(alloc, &tables, collect, "table:bb", "s", by_storage, null, null, names));
     // Authorization failures surface instead of being treated as unknown.
     const secret = try std.json.parseFromSliceLeaky(std.json.Value, a,
-        \{"org":{"document":{"table":"secret","key_from":"/org"},"fields":["name"]}}
+        \\{"org":{"document":{"table":"secret","key_from":"/org"},"fields":["name"]}}
     , .{});
     try std.testing.expectError(error.Forbidden, admitResolvingAlloc(alloc, &tables, collect, "table:bb", "s", secret, null, null, names));
 }
