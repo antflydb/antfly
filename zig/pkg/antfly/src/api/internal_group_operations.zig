@@ -60,6 +60,8 @@ pub const Error = @import("external_transaction_errors.zig").Error || operation.
     TopologyChanged,
     IdentityReadGenerationChanged,
     IndexGenerationMismatch,
+    IndexRebuilding,
+    IncompletePublishedSnapshot,
     GenerationTransitionActive,
     HierarchyCursorStale,
     DocumentArtifactPublicationFailed,
@@ -325,6 +327,8 @@ pub const Operations = struct {
             error.TopologyChanged => error.TopologyChanged,
             error.IdentityReadGenerationChanged => error.IdentityReadGenerationChanged,
             error.IndexGenerationMismatch => error.IndexGenerationMismatch,
+            error.IndexRebuilding => error.IndexRebuilding,
+            error.IncompletePublishedSnapshot => error.IncompletePublishedSnapshot,
             error.GenerationTransitionActive => error.GenerationTransitionActive,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
             error.DocumentArtifactPublicationFailed => error.DocumentArtifactPublicationFailed,
@@ -2374,12 +2378,14 @@ fn consumerTests() type {
                     return null;
                 }
 
-                fn groupQuery(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
-                    return error.StorageReadTemporarilyUnavailable;
+                fn groupQuery(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.scan_error;
                 }
 
-                fn groupPreflight(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency, _: u32) !?runtime_preflight.RuntimePreflightSummary {
-                    return error.StorageReadTemporarilyUnavailable;
+                fn groupPreflight(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency, _: u32) !?runtime_preflight.RuntimePreflightSummary {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.scan_error;
                 }
 
                 fn groupScan(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
@@ -2431,6 +2437,11 @@ fn consumerTests() type {
                 mapLookupError(error.ResourceBudgetExceeded),
             );
             try std.testing.expectEqual(error.Internal, mapLookupError(error.CorruptInput));
+            for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot }) |failure| {
+                fake.scan_error = failure;
+                try std.testing.expectError(failure, operations.query(alloc, .{}, 7, "docs", .{}));
+                try std.testing.expectError(failure, operations.queryPreflight(alloc, .{}, 7, "docs", .{}, 0));
+            }
             for (storage_descriptor_errors.failures) |failure| {
                 fake.scan_error = failure;
                 try std.testing.expectEqual(error.StorageReadTemporarilyUnavailable, Operations.mapCommonReadError(failure).?);

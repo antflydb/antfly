@@ -2182,6 +2182,7 @@ pub const StatusSource = struct {
         privacy_authority_term: ?*const fn (*anyopaque) anyerror!?u64 = null,
         privacy_work: ?*const fn (*anyopaque, std.mem.Allocator, i64) anyerror!?metadata_table_manager.PrivacyWork = null,
         table_record: ?*const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!?metadata_table_manager.TableRecord = null,
+        acknowledge_catalog_replay: ?*const fn (*anyopaque, api_operation.RequestContext) anyerror!void = null,
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         /// Exact native control destination, owned by caller; never a row or Raft route capability.
@@ -2272,6 +2273,12 @@ pub const StatusSource = struct {
         const call = self.vtable.privacy_work orelse return null;
         return BoundaryAbi.call("privacy_work", self.boundary_dispatch, call, .{ self.ptr, a, now });
     }
+    pub fn acknowledgeCatalogReplay(self: StatusSource, context: api_operation.RequestContext) !void {
+        try context.ensureActive();
+        if (self.vtable.acknowledge_catalog_replay) |call|
+            try BoundaryAbi.call("acknowledge_catalog_replay", self.boundary_dispatch, call, .{ self.ptr, context });
+    }
+
     pub fn tableRecord(self: StatusSource, a: std.mem.Allocator, name: []const u8) !?metadata_table_manager.TableRecord {
         if (self.vtable.table_record) |call| return BoundaryAbi.call("table_record", self.boundary_dispatch, call, .{ self.ptr, a, name });
         var snapshot = (try self.adminSnapshot()) orelse return null;
@@ -2965,6 +2972,9 @@ pub const StatusSource = struct {
             fn nextPrivacyWork(ptr: *anyopaque, a: std.mem.Allocator, now: i64) anyerror!?metadata_table_manager.PrivacyWork {
                 return cast(ptr).nextPrivacyWork(a, now);
             }
+            fn acknowledgeCatalogReplay(ptr: *anyopaque, context: api_operation.RequestContext) anyerror!void {
+                return cast(ptr).acknowledgeCatalogReplay(context);
+            }
             fn tableRecord(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) anyerror!?metadata_table_manager.TableRecord {
                 return cast(ptr).tableRecord(a, name);
             }
@@ -3083,6 +3093,7 @@ pub const StatusSource = struct {
             .privacy_authority_term = if (@hasDecl(T, "privacyAuthorityTerm")) Gen.privacyAuthorityTerm else null,
             .privacy_work = if (@hasDecl(T, "nextPrivacyWork")) Gen.nextPrivacyWork else null,
             .table_record = if (@hasDecl(T, "tableRecord")) Gen.tableRecord else null,
+            .acknowledge_catalog_replay = if (@hasDecl(T, "acknowledgeCatalogReplay")) Gen.acknowledgeCatalogReplay else null,
             .wait_table_projection = Gen.waitTableProjection,
             .run_round = Gen.runRound,
             .get_join_shuffle_lease = Gen.getJoinShuffleLease,
@@ -11425,6 +11436,10 @@ pub const ApiHttpServer = struct {
         return group_ids;
     }
 
+    pub fn acknowledgeIndexAliasReplay(self: *ApiHttpServer, context: api_operation.RequestContext) !void {
+        try self.source.acknowledgeCatalogReplay(context);
+    }
+
     pub fn loadOwnedTableRecord(
         self: *ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -17880,6 +17895,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn renderPublicTableListIndexes(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, request: api_operation.RequestContext, snapshot: *const metadata_api.AdminSnapshot, table: *const metadata_table_manager.TableRecord) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
+        if (try self.nativeObjectIndexResource(alloc, table.*, .list, request)) |resource| return resource;
         if (table.schema_json.len > 0) {
             var schema = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
             defer schema.deinit(alloc);
@@ -17949,18 +17965,31 @@ pub const ApiHttpServer = struct {
         return result;
     }
 
+    // Native object indexes are owned by the incarnation-fenced object runtime,
+    // rather than resident Raft shards. Share its observation across list, GET
+    // and alias admission so these contracts cannot disagree about readiness.
+    fn nativeObjectIndexResource(self: *ApiHttpServer, alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, resource: @import("object_table_runtime.zig").IndexResource, request: api_operation.RequestContext) public_table_http.TableApi.ExecuteGetIndexError!?[]u8 {
+        if (table.storage.engine != .object) return null;
+        var schema = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
+        defer schema.deinit(alloc);
+        if (schema.external_base_source != null) return null;
+        var response = (self.tryObjectTableRequestWithOptions(table.name, .get, "indexes", "", null, request, .{ .index_resource = resource, .incarnation = .{ .table_id = table.table_id, .generation = table.object_storage_generation } }) catch {
+            try ensureTableOperationActive(request);
+            return error.Unavailable;
+        }) orelse return error.Unavailable;
+        defer response.deinit(self.alloc);
+        try ensureTableOperationActive(request);
+        if (response.status == 404) return error.NotFound;
+        if (response.status != 200) return error.Unavailable;
+        return alloc.dupe(u8, response.body) catch return error.InternalFailure;
+    }
+
     pub fn indexAliasTargetResource(self: *ApiHttpServer, alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, index: []const u8, request: api_operation.RequestContext) ![]u8 {
         if (table.storage.engine == .object) {
-            var schema = try schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
-            defer schema.deinit(alloc);
-            if (schema.external_base_source == null) {
-                const suffix = try std.fmt.allocPrint(alloc, "indexes/{s}", .{index});
-                defer alloc.free(suffix);
-                var response = (try self.tryObjectTableRequestWithOptions(table.name, .get, suffix, "", null, request, .{ .incarnation = .{ .table_id = table.table_id, .generation = table.object_storage_generation } })) orelse return error.UnsupportedOperation;
-                defer response.deinit(self.alloc);
-                if (response.status != 200) return error.IndexAliasTargetNotReady;
-                return alloc.dupe(u8, response.body);
-            }
+            if (self.nativeObjectIndexResource(alloc, table, .{ .get = index }, request) catch |err| switch (err) {
+                error.NotFound, error.Unavailable => return error.IndexAliasTargetNotReady,
+                else => return err,
+            }) |resource| return resource;
         }
         return getIndexResourceWithExpected(self, alloc, table.name, index, request, table);
     }
@@ -17995,6 +18024,9 @@ pub const ApiHttpServer = struct {
     }
 
     fn renderPublicTableGetIndex(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, request: api_operation.RequestContext, snapshot: *const metadata_api.AdminSnapshot, table: *const metadata_table_manager.TableRecord) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
+        if (table.storage.engine == .object) {
+            if (try self.nativeObjectIndexResource(alloc, table.*, .{ .get = index_name }, request)) |resource| return resource;
+        }
         if (table.schema_json.len != 0) {
             var parsed = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
             defer parsed.deinit(alloc);
@@ -24618,6 +24650,7 @@ pub const ApiHttpServer = struct {
     /// adapter exposes only data operations; object catalogs cannot create or
     /// drop native tables or alter their definitions.
     const ObjectTableRequestOptions = struct {
+        index_resource: ?@import("object_table_runtime.zig").IndexResource = null,
         lookup_consistency: raft_mod.ReadConsistency = .read_index,
         has_join: bool = false,
         resolver: ?*CatalogQueryResolver = null,
@@ -24697,14 +24730,18 @@ pub const ApiHttpServer = struct {
         alias_resolver.query_cancellation = context.cancellation;
         const alias_body = if (std.mem.eql(u8, suffix, "query")) try SemanticStatusResolver.bindIndexAliases(&alias_resolver, self.alloc, table_name, body) else null;
         defer if (alias_body) |value| value.deinit(self.alloc);
-        var response = self.object_tables.handle(self.owner_alloc, self.embedding_provider_runtime.io, bound, .{
+        const runtime_options: @import("object_table_runtime.zig").Options = .{
             .config = self.cfg.node_config,
             .secrets = self.cfg.secret_store,
             .deployment = self.cfg.deployment_mode,
             .local_base_dir = self.cfg.native_lake_artifact_base_dir,
             .graph_execution_limits = self.cfg.graph_execution_limits,
             .remote_content = self.cfg.remote_content,
-        }, method, suffix, if (alias_body) |value| value.body else body, context) catch |err| switch (err) {
+        };
+        var response = (if (options.index_resource) |resource|
+            self.object_tables.handleIndexResource(self.owner_alloc, self.embedding_provider_runtime.io, bound, runtime_options, resource, context)
+        else
+            self.object_tables.handle(self.owner_alloc, self.embedding_provider_runtime.io, bound, runtime_options, method, suffix, if (alias_body) |value| value.body else body, context)) catch |err| switch (err) {
             error.ObjectTableStorageBindingChanged => return try contextual_operations.textAlloc(self.alloc, 409, "object table storage binding differs from its durable catalog binding"),
             error.ObjectTableDefinitionConflict => return try contextual_operations.textAlloc(self.alloc, 409, "object table definition is immutable; use a new table and explicit migration"),
             error.ObjectTableRuntimeCapacityExceeded => return try contextual_operations.textAlloc(self.alloc, 503, "object table runtime capacity exhausted"),

@@ -531,7 +531,9 @@ pub const MetadataProjectionKind = enum(u32) {
     lake_source_owner = 75,
     /// Raw binary schema-publication command; read-only preflight returns JSON
     /// acceptance intent. No ASVI frame is escaped into a JSON envelope.
-    schema_validation_preflight = 76,
+    schema_validation_preflight = 77,
+    /// Nonwaiting observation/reconciliation of the shared durable HA outbox.
+    poll_ha_outbox = 76,
 };
 
 pub const MetadataHABindRequest = extern struct {
@@ -2732,3 +2734,9 @@ pub extern fn antfly_storage_wal_append_idempotent(
 
 /// Snapshot JSON uses an independent version so cache/budget ABI layouts do not change.
 pub extern fn antfly_storage_context_pipeline_metrics_json(context: ?*anyopaque, version: u32, out_json: *OwnedBytes) callconv(.c) Status;
+
+test "published metadata outbox polling ordinal remains stable" {
+    const std = @import("std");
+    try std.testing.expectEqual(@as(u32, 76), @backingInt(MetadataProjectionKind.poll_ha_outbox));
+    try std.testing.expectEqual(@as(u32, 77), @backingInt(MetadataProjectionKind.schema_validation_preflight));
+}

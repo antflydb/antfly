@@ -7322,12 +7322,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
         table_name: []const u8,
-        descriptor: descriptor_contract.Descriptor,
+        raw_descriptor: descriptor_contract.Descriptor,
         needs_index_catalog: bool,
     ) !Lease {
         // Native-local owners are never data-Raft participants, including
         // warm owners that happen to share this registry.
-        if (descriptor.sql_persistence != null) return error.SqlRelationOwnerChanged;
+        if (raw_descriptor.sql_persistence != null) return error.SqlRelationOwnerChanged;
+        const physical = @import("antfly_local_sources").api_index_metadata.aliases.physicalProjectionIfNeeded(self.alloc, raw_descriptor.indexes_json) catch |err|
+            return if (err == error.OutOfMemory) error.RaftApplyWriterUnavailable else err;
+        defer if (physical) |bytes| self.alloc.free(bytes);
+        var descriptor = raw_descriptor;
+        descriptor.indexes_json = physical orelse raw_descriptor.indexes_json;
+
         if (!self.mutex.tryLock()) return error.RaftApplyWriterUnavailable;
         const initial = self.tryAcquireWarmApplyLocked(group_id, table_name, descriptor, needs_index_catalog);
         const may_queue = !self.quiescing and !self.apply_control_stopping and
@@ -7403,15 +7409,20 @@ pub const ProvisionedKernelOwnerSource = struct {
         group_id: u64,
         table_name: []const u8,
         path: []const u8,
-        descriptor: descriptor_contract.Descriptor,
+        raw_descriptor: descriptor_contract.Descriptor,
         admission: LeaseAdmission,
         residency: Residency,
         controls: ReadControls,
     ) !Lease {
-        if (descriptor.sql_persistence != null and controls.historical_raft_apply) return error.InvalidSqlRelationPersistence;
+        if (raw_descriptor.sql_persistence != null and controls.historical_raft_apply) return error.InvalidSqlRelationPersistence;
         if (controls.native_published_restore) |published| {
             if (published.admission == null or controls.native_initialized == null or !controls.native_boot_observed) return error.InvalidSqlRelationPersistence;
         }
+        const physical = try @import("antfly_local_sources").api_index_metadata.aliases.physicalProjectionIfNeeded(self.alloc, raw_descriptor.indexes_json);
+        defer if (physical) |bytes| self.alloc.free(bytes);
+        var descriptor = raw_descriptor;
+        descriptor.indexes_json = physical orelse raw_descriptor.indexes_json;
+
         const exclusive = admission != .shared;
         if (!self.mutex.tryLock()) return error.StorageKernelOwnerTransitionRequired;
         defer self.mutex.unlock();
@@ -12323,6 +12334,49 @@ test "storage owner rejects prior ABI before reading deferred-output field" {
     };
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_open(&old_request, &owner));
     try std.testing.expect(owner == null);
+}
+
+test "owner descriptor alias swaps retain a warm leased physical owner across catalog observations" {
+    const a = std.testing.allocator;
+    const Source = ProvisionedKernelOwnerSource;
+    var source = Source.init(a, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.entries.deinit(a);
+    defer source.catalog_observations.deinit(a);
+    var entry: Source.Entry = .{
+        .group_id = 1,
+        .table_name = @constCast("docs"),
+        .generation = 7,
+        .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        .schema_json = @constCast("{}"),
+        .indexes_json = @constCast("{\"a\":{},\"b\":{}}"),
+        .restore_bootstrap_json = @constCast(""),
+        .initial_child_bootstrap_json = @constCast(""),
+        .owner = undefined,
+        .resident = true,
+    };
+    try source.entries.append(a, &entry);
+    var descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = entry.generation,
+        .identity = entry.identity,
+        .schema_json = entry.schema_json,
+        .indexes_json = "{\"a\":{},\"b\":{},\"_index_aliases\":{\"live\":{\"index\":\"a\"}},\"_index_alias_epoch\":\"one\"}",
+    };
+    var controls: Source.ReadControls = .{ .catalog_observation = .{ .metadata_group_id = 11, .revision = 42 } };
+    var first = try source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, .shared, .resident, controls);
+    defer first.deinit();
+    descriptor.indexes_json = "{\"a\":{},\"b\":{},\"_index_aliases\":{\"live\":{\"index\":\"b\"}},\"_index_alias_receipts\":{},\"_index_alias_epoch\":\"two\"}";
+    for ([_]u64{ 43, 41 }) |revision| {
+        controls.catalog_observation.?.revision = revision;
+        var lease = try source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, .shared, .resident, controls);
+        defer lease.deinit();
+        try std.testing.expect(lease.entry == &entry);
+        try std.testing.expect(!entry.retired);
+        try std.testing.expectEqual(@as(usize, 2), entry.active_users);
+    }
+    var apply = try source.acquireApplyOnlyWithCatalog(1, "docs", descriptor, false);
+    defer apply.deinit();
+    try std.testing.expect(apply.entry == &entry);
+    try std.testing.expectEqual(@as(u64, 0), source.owner_cache_misses.load(.monotonic));
 }
 
 test "owner descriptor catalog watermark fences index-only regressions across owner close" {

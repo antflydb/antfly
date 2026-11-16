@@ -1196,6 +1196,22 @@ const LocalStandaloneMetadata = struct {
         const table = self.manager.tables.get(id) orelse return error.InvalidPrivacyCatalog;
         return .{ .term = if (self.hot_standby_mirror) |mirror| mirror.publisher.identity().epoch else @as(u64, 1), .table = try antfly.metadata.table_manager.cloneTable(a, table) };
     }
+    fn acknowledgeCatalogReplay(ptr: *anyopaque, context: antfly.public_api.operation.RequestContext) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        try lockAtomicForRequest(&self.mutex, context);
+        defer self.mutex.unlock();
+        // Visibility is not a durability or RemoteApply receipt. Poll the
+        // original publication, never propose a replacement on replay. Applied
+        // receipts on a promoted standby have no local outbox and remain readable.
+        if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
+        if (self.lifecycle_store) |store|
+            store.pollHotStandbyOutbox() catch return error.MetadataMutationOutcomeUnknown
+        else if (self.hot_standby_catalog_server) |server|
+            server.pollHotStandbyExistingCatalog() catch return error.MetadataMutationOutcomeUnknown;
+        try context.ensureActive();
+    }
+
     fn tableRecord(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8) !?antfly.metadata.TableRecord {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
@@ -1229,6 +1245,7 @@ const LocalStandaloneMetadata = struct {
                 .privacy_authority_term = privacyAuthorityTerm,
                 .privacy_work = nextPrivacyWork,
                 .table_record = tableRecord,
+                .acknowledge_catalog_replay = acknowledgeCatalogReplay,
                 .system_catalog = systemCatalog,
                 .tracks_sql_submission = true,
                 .supports_query_definitions = true,

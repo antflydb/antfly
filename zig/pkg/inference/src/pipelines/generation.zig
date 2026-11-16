@@ -2462,6 +2462,23 @@ fn isPureGreedyConfig(config: GenerationConfig) bool {
     return config.temperature <= 0 and !hasSamplingPenalties(config);
 }
 
+fn gemma4DefaultReplayConfigEligible(config: GenerationConfig, fit_probe: bool) bool {
+    return isPureGreedyConfig(config) and config.grammar == null and
+        config.cache_compaction_ratio == null and config.token_observer == null and !fit_probe;
+}
+
+test "Gemma4 CUDA default replay declines sampling transforms and compaction probes" {
+    try std.testing.expect(gemma4DefaultReplayConfigEligible(.{ .temperature = 0 }, false));
+    try std.testing.expect(!gemma4DefaultReplayConfigEligible(.{ .temperature = 0 }, true));
+    for ([_]GenerationConfig{
+        .{ .temperature = 0.2 },
+        .{ .temperature = 0, .grammar = "json" },
+        .{ .temperature = 0, .repetition_penalty = 1.1 },
+        .{ .temperature = 0, .presence_penalty = 1 },
+        .{ .temperature = 0, .cache_compaction_ratio = 0.5 },
+    }) |config| try std.testing.expect(!gemma4DefaultReplayConfigEligible(config, false));
+}
+
 fn metalRingDecodeRequestEligible(config: GenerationConfig) bool {
     return metalRingDecodeRequestEligibleWithQualification(config, exact_hybrid_sampled_ring_qualification_override);
 }
@@ -2871,6 +2888,7 @@ pub const NativeDecodeState = struct {
     sequence_id: ?runtime.kv.manager.SequenceId = null,
     pool_id: ?runtime.kv.block.KvPoolId = null,
     total_tokens: usize = 0,
+    cuda_request_replay_capacity: ?usize = null,
     kv_view: ?KvView = null,
     kv_compacted: bool = false,
     kv_block_ids: std.ArrayListUnmanaged(runtime.kv.block.KvBlockId) = .empty,
@@ -2930,6 +2948,7 @@ pub const NativeDecodeState = struct {
 
     pub fn configureForGptConfig(self: *NativeDecodeState, config: gpt_mod.Config) void {
         self.force_full_recompute = false;
+        self.cuda_request_replay_capacity = null;
         if (self.total_tokens == 0) self.kv_max_inflight_tokens = 0;
         self.allow_swa_ring = config.supportsSplitSwaGlobalKvRing();
         if (config.family != .gemma) self.gemma4_layer_spec_cache.reset();
@@ -3271,8 +3290,9 @@ pub const NativeDecodeState = struct {
             .f16, .polar4, .turbo3 => {},
             else => return null,
         }
-        const forced = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse return null;
-        return if (forced == 0) null else forced;
+        if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY")) |forced|
+            return if (forced == 0) null else forced;
+        return self.cuda_request_replay_capacity;
     }
 
     fn reservePagedKvReplayCapacity(self: *NativeDecodeState) !void {
@@ -6158,6 +6178,25 @@ pub const NativeGenerationPipeline = struct {
         const max_tokens = requested_max_tokens;
         const spec_slack: usize = if (use_speculative and config.speculative_k > 0) 1 else 0;
         const max_seq = prompt_token_count + max_tokens + spec_slack;
+        // The server holds the model lock for this owner. Interleaved owners,
+        // compiled execution, speculation, shared prefixes and checkpoints
+        // retain their existing capacity contracts. No process env is mutated.
+        if (comptime build_options.enable_cuda) {
+            if (self.cb.kind() == .cuda and self.cb.execution_owner == 0 and self.execution_lock == null and
+                self.graph_cache == null and self.compiled_partition_backend == null and
+                self.draft_cb == null and !config.speculation_requested and self.prompt_cache == null and
+                !config.prompt_cache_enabled and !native_checkpoint and config.kv_cache_mode == .exact_hybrid and
+                decode_state.isPaged() and decode_state.total_tokens == 0 and decode_state.sequence_id == null and
+                self.kv_dtype == .f16)
+            {
+                decode_state.cuda_request_replay_capacity = try cuda_compute.CudaCompute.configureGemma4RequestReplayCapacity(
+                    &self.cb,
+                    prompt_token_count,
+                    max_tokens,
+                    gemma4DefaultReplayConfigEligible(config, platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE")),
+                );
+            }
+        }
         if (config.kv_cache_mode == .select_v1 and
             try runtime.kv.selection.mandatoryRowCount(runtime.kv.selection.defaults, @intCast(max_seq), config.kv_protected_spans) > runtime.kv.selection.defaults.target_rows)
         {
@@ -9642,7 +9681,7 @@ pub const NativeGenerationPipeline = struct {
             if (enableCudaGreedyDeviceTokenHandoff()) {
                 decoder_runtime_debug_stats.device_token_handoff_attempts += 1;
                 if (enableCudaGatedTokenTensorDecode() and
-                    (backend_kind != .cuda or !gpt_arch.cudaDecodeGraphReplayRequired()))
+                    (backend_kind != .cuda or !gpt_arch.cudaDecodeGraphReplayPrefersGraph(&self.cb)))
                 {
                     if (try decoder_gated_runtime.forwardGreedyTokenFromTokenTensor(
                         &self.cb,
@@ -9735,7 +9774,7 @@ pub const NativeGenerationPipeline = struct {
         self.cb.drainPrefetchBudget(prefetch_drain_budget_per_step);
         const decode_context = decode_runtime.makeDecodeContext(seq_len, 1);
         decoder_runtime_debug_stats.device_token_handoff_attempts += 1;
-        if (enableCudaGatedTokenTensorDecode() and !gpt_arch.cudaDecodeGraphReplayRequired()) {
+        if (enableCudaGatedTokenTensorDecode() and !gpt_arch.cudaDecodeGraphReplayPrefersGraph(&self.cb)) {
             if (try decoder_gated_runtime.forwardGreedyTokenTensorOnlyFromTokenTensor(
                 &self.cb,
                 self.allocator,

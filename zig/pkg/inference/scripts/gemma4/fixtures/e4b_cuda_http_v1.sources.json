@@ -1,0 +1,15 @@
+{
+  "seed": 20261103,
+  "darwin_sha256": "362142cb7c6f90850477520cfe2a62fe423ae92ea8eb6d9cd8b30ddb39de60b9",
+  "source_url": "https://www.gutenberg.org/cache/epub/1228/pg1228.txt",
+  "media_note": "Repository fixtures substitute for the unavailable release media snapshots.",
+  "media_sha256": {
+    "zig/pkg/inference/scripts/lightonocr3/corpus/letter.png": "24e54193d36349212ef3cad911016efaf48837934305759817525f03be003737",
+    "zig/pkg/inference/scripts/lightonocr3/corpus/receipt.png": "4ccfc5a949e85643492606a95832a3f7630877fd334fece0b4fe4dc6a3291e03",
+    "zig/pkg/inference/scripts/lightonocr3/corpus/shipping.png": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007",
+    "zig/e2e/inference/testdata/whisper_quality.wav": "904c039735a6eec4186bed49369408638421937fb02104729afafea8c41b266d",
+    "zig/e2e/inference/testdata/whisper_spanish_quality.wav": "c656aaeeb98a4239f9f0f6ab05eed6e76424b9b073caa0090ac6ac35d7312b35"
+  },
+  "fixture_sha256": "c46577ba5f20a8638fb753b3d3bfdc4fe3076747f42bd27be52720da34dd0476",
+  "text_note": "Public-domain Darwin text sampled from the retained source; this is not a claim to reproduce the unavailable release corpus snapshot."
+}

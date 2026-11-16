@@ -1143,21 +1143,24 @@ pub const HttpHandler = struct {
     }
 
     fn handlePublicTableListIndexes(self: *HttpHandler, table_name: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableListIndexes(self.alloc, table_name, self.tableApi(.none));
-        defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonSliceResponse(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
+        return self.handleIndexResource(table_name, null, .{});
     }
 
     fn handlePublicTableGetIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8) !HttpResponse {
-        var resp = try public_table_http.handleTableGetIndex(self.alloc, table_name, index_name, self.tableApi(.none));
+        return self.handleIndexResource(table_name, index_name, .{});
+    }
+
+    /// Typed native hosting entry point: names are data, never URL fragments.
+    pub fn handleIndexResource(self: *HttpHandler, table_name: []const u8, index_name: ?[]const u8, context: api_operation.RequestContext) !HttpResponse {
+        const guard = http_types.RequestGuard{ .context = try context.platformDeadline() };
+        try guard.context.ensureActive();
+        var resp = if (index_name) |name|
+            try public_table_http.handleTableGetIndex(self.alloc, table_name, name, self.tableApi(guard.token()))
+        else
+            try public_table_http.handleTableListIndexes(self.alloc, table_name, self.tableApi(guard.token()));
         defer resp.deinit(self.alloc);
-        return switch (resp.status) {
-            200 => try jsonSliceResponse(self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
+        try guard.context.ensureActive();
+        return if (resp.json) try jsonSliceResponse(self.alloc, resp.status, resp.body) else try textResponse(self.alloc, resp.status, resp.body);
     }
 
     fn handlePublicTableCreateIndex(self: *HttpHandler, table_name: []const u8, index_name: []const u8, body: []const u8) !HttpResponse {
@@ -1920,7 +1923,12 @@ pub const HttpHandler = struct {
             .profile = execution.profile_requested,
             .aggregations_json = aggregations_json orelse "",
         };
-        var meta: query_api.QueryResponseMeta = .{};
+        // The native request adapter below intentionally omits execution
+        // operators. Attribute the result from this pinned, resolved plan.
+        var selected: [3][]const u8 = undefined;
+        const sources = execution.plan.sources.asSlice();
+        for (sources, 0..) |source, i| selected[i] = source.indexName();
+        var meta: query_api.QueryResponseMeta = .{ .resolved_indexes = selected[0..sources.len] };
         defer meta.deinit(self.alloc);
         var total_hits_u32: u32 = @intCast(@min(execution.hits.len, std.math.maxInt(u32)));
 

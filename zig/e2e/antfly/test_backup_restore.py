@@ -638,10 +638,21 @@ def _create_cluster_table_when_admitted(
 
 
 def _seed_cluster_docs_when_writable(
-    cluster, session: requests.Session, table_name: str, docs: dict, *, timeout_s=30.0
+    cluster,
+    session: requests.Session,
+    table_name: str,
+    docs: dict,
+    *,
+    timeout_s=30.0,
+    sync_level="write",
 ) -> dict | None:
     return _batch_cluster_docs_when_writable(
-        cluster, session, table_name, inserts=docs, timeout_s=timeout_s
+        cluster,
+        session,
+        table_name,
+        inserts=docs,
+        timeout_s=timeout_s,
+        sync_level=sync_level,
     )
 
 
@@ -869,6 +880,7 @@ def _batch_cluster_docs_when_writable(
     inserts: dict | None = None,
     deletes: tuple[str, ...] = (),
     timeout_s=30.0,
+    sync_level="write",
 ) -> dict | None:
     # Replication status is an observation, not a lease on the data leader or
     # its routing catalog. Mutate through the write API's admission contract.
@@ -878,7 +890,7 @@ def _batch_cluster_docs_when_writable(
     docs = inserts or {}
     assert docs or deletes, "expected a nonempty batch"
     assert not docs.keys() & set(deletes), "ambiguous insert/delete expectation"
-    mutation = {"sync_level": "write"}
+    mutation = {"sync_level": sync_level}
     if docs:
         mutation["inserts"] = docs
     if deletes:

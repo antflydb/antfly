@@ -32,6 +32,8 @@ pub fn storeIdentity(a: A, store: *const Store) ![32]u8 {
     return digest;
 }
 
+pub const IndexResource = union(enum) { list, get: []const u8 };
+
 pub const Options = struct {
     config: ?*const local.common_config.Config = null,
     secrets: ?*local.common_secrets.FileStore = null,
@@ -137,11 +139,28 @@ pub const Manager = struct {
     }
     /// Caller has resolved and authorized a fresh native catalog binding.
     pub fn handle(self: *Manager, a: A, io: std.Io, table: metadata.TableRecord, options: Options, method: @import("../serverless/api/http_routes.zig").HttpMethod, suffix: []const u8, body: []const u8, context: local.api_operation.RequestContext) !http.HttpResponse {
+        return self.handleRequest(a, io, table, options, method, suffix, body, context, null);
+    }
+
+    pub fn handleIndexResource(self: *Manager, a: A, io: std.Io, table: metadata.TableRecord, options: Options, resource: IndexResource, context: local.api_operation.RequestContext) !http.HttpResponse {
+        return self.handleRequest(a, io, table, options, .get, "indexes", "", context, resource);
+    }
+
+    fn handleRequest(self: *Manager, a: A, io: std.Io, table: metadata.TableRecord, options: Options, method: @import("../serverless/api/http_routes.zig").HttpMethod, suffix: []const u8, body: []const u8, context: local.api_operation.RequestContext, index_resource: ?IndexResource) !http.HttpResponse {
         const guard = http.RequestGuard{ .context = try context.platformDeadline() };
         const cancellation = guard.token();
         try guard.context.ensureActive();
         const entry = try self.acquire(a, io, table, options, guard.context);
         try guard.context.ensureActive();
+        if (index_resource) |resource| {
+            var response = try entry.stack.handler.handleIndexResource("data", switch (resource) {
+                .list => null,
+                .get => |name| name,
+            }, guard.context);
+            errdefer response.deinit(a);
+            try guard.context.ensureActive();
+            return response;
+        }
         if (method == .get and std.mem.eql(u8, suffix, "lookup")) {
             var table_binding = (try entry.stack.catalog.getTableAlloc(a, "data")) orelse return error.TableNotFound;
             defer table_binding.deinit(a);
