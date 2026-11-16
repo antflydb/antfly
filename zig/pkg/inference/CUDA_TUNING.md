@@ -43,11 +43,18 @@ For the qualified E4B artifact the table occupies 2,312,110,080 bytes. Host
 placement removes that device allocation and retains the same number of
 pinned host bytes. This shifts memory between domains; it does not establish
 a reduction in total physical memory. Construction admission covers the
-source mapping and pinned copy simultaneously. A separate host lease owns
-that table through its physical free, including failed construction or unload.
+source mapping and pinned copy simultaneously in one atomic reservation, then
+splits out an independently owned host lease without acquiring capacity again.
+External process budgets see the full peak once and retain one receipt through
+both owners. That host lease owns the table through its physical free, including
+failed construction or unload.
 Failed waits/frees retain the allocation, accounting domain, driver library and
-exact primary-context reference in a process retirement queue, retried on later
-CUDA initialization or mapped-host allocation. Device construction admission
+exact primary-context reference in a process retirement queue. Host-pressure
+admission reclaims that queue before evicting useful models, under protected
+native cleanup or the embedded host's explicit in-process policy. CUDA
+initialization and mapped-host allocation also retry it. Driver waits and budget
+callbacks run outside the queue metadata lock; an empty queue has an atomic
+fast path. Device construction admission
 excludes the offloaded table using the same model geometry and residency policy
 as upload. A host budget that fits the device-only profile may
 need additional capacity. Missing mapped-host driver support or allocation

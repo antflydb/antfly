@@ -62,6 +62,7 @@ test "CUDA process allocation budget declarations compile" {
 }
 
 test "Gemma4 CUDA host PLE declarations compile" {
+    _ = @import("backends/admitted_allocator.zig");
     _ = @import("ops/cuda/host_retirement.zig");
     _ = @import("ops/cuda/buffer.zig");
     _ = @import("ops/cuda/ple_host.zig");

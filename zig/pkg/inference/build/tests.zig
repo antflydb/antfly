@@ -204,7 +204,7 @@ pub fn create(ctx: Context) Suite {
 
     const gemma_ple_host_tests = b.addTest(.{
         .root_module = tests.root_module,
-        .filters = &.{ "Gemma4 CUDA host PLE", "admission lease releases transient", "admission resource budget mirrors" },
+        .filters = &.{ "Gemma4 CUDA host PLE", "admission lease releases transient", "admission resource budget mirrors", "embeddinggemma2 stage supplements", "embeddinggemma2 stage admission reduces", "reader admitted owner caches domain" },
         .test_runner = runtime_filter_test_runner,
         .max_rss = @as(usize, if (ctx.backend.enable_cuda and ctx.target.result.cpu.arch == .aarch64) 16 else 7) * 1024 * 1024 * 1024,
     });

@@ -5724,6 +5724,7 @@ pub const ModelManager = struct {
     /// Test-only stable-limit provider, allowing unified-CUDA coverage without
     /// opening a driver or adding per-allocation instrumentation in production.
     test_unified_limit_probe: if (builtin.is_test) ?*const fn (usize, usize) usize else void = if (builtin.is_test) null else {},
+    test_cuda_host_retirement_queue: if (builtin.is_test) ?*@import("../ops/cuda/host_retirement.zig").Queue else void = if (builtin.is_test) null else {},
     resource_ownership: ResourceOwnership = .local,
     tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
     loaded: std.StringHashMapUnmanaged(*LoadedModel),
@@ -6898,10 +6899,31 @@ pub const ModelManager = struct {
         return true;
     }
 
+    fn reclaimRetiredCudaHostForAdmission(self: *ModelManager) bool {
+        const retirement = @import("../ops/cuda/host_retirement.zig");
+        const queue = if (builtin.is_test) self.test_cuda_host_retirement_queue orelse blk: {
+            if (comptime !build_options.enable_cuda) return false;
+            break :blk &retirement.process;
+        } else blk: {
+            if (comptime !build_options.enable_cuda) return false;
+            break :blk &retirement.process;
+        };
+        if (!queue.hasPending()) return false;
+        // Retired owners can outlive every session. Reuse the independently
+        // owned native-close watchdog before entering any driver or queue wait.
+        // An embedded host must have explicitly accepted in-process native calls.
+        const protection = self.prepareSessionClose(.{ .backend = .cuda }) catch return false;
+        defer if (protection) |ticket| ticket.release();
+        var scope = if (protection) |ticket| ticket.begin() else backends.Session.CloseScope{};
+        defer scope.deinit();
+        return queue.reclaim() != 0;
+    }
+
     fn reclaimOneForAdmission(
         self: *ModelManager,
         pressure: runtime.tier.memory.AdmissionPressure,
     ) bool {
+        if (pressureCanBeRelievedByHostCache(pressure) and self.reclaimRetiredCudaHostForAdmission()) return true;
         const cold_host_cache_can_help = switch (pressure) {
             .domain_scratch => true, // retained preflight/index leases
             else => pressureCanBeRelievedByHostCache(pressure),
@@ -7070,6 +7092,42 @@ pub const ModelManager = struct {
                 return first_err;
             },
         };
+    }
+
+    /// Validate all unavoidable construction bytes before evicting anything.
+    /// An atomic peak reservation is split into independently owned leases so
+    /// pinned storage can survive teardown without another capacity acquisition.
+    fn acquireModelLoadAdmission(
+        self: *ModelManager,
+        plan: ModelLoadAdmissionPlan,
+        backend_runtime: backends.BackendRuntime,
+        limits: runtime.tier.memory.Limits,
+        required_residency: runtime.tier.memory.Residency,
+        control: ?InferenceExecutionControl,
+    ) !ModelLoadReservations {
+        if (control) |active| try active.check();
+        try self.ensureResourceOwnerReady();
+        const backend_class = admissionBackendClassForRuntime(backend_runtime);
+        if (plan.mapped_host_weight_bytes > plan.peak.host_weight_bytes or
+            plan.mapped_host_weight_bytes > plan.resident.host_weight_bytes or
+            (plan.mapped_host_weight_bytes != 0 and backend_runtime.backend != .cuda)) return error.ResourceLimitExceeded;
+        var result = ModelLoadReservations{};
+        errdefer result.deinit();
+        // One atomic reservation also lets opaque external process budgets
+        // reject an impossible total before any eviction or partial acquisition.
+        result.model = try self.acquireRequestsWithEviction(&.{.{
+            .backend_class = backend_class,
+            .limits = limits,
+            .amounts = plan.peak,
+            .required_residency = required_residency,
+            .failure = if (control) |active| active.admission_failure else null,
+        }});
+        if (control) |active| try active.check();
+        if (plan.mapped_host_weight_bytes != 0) {
+            result.host = try result.model.?.split(.{ .host_weight_bytes = plan.mapped_host_weight_bytes });
+            result.host.?.lifetime = (try self.retainResourceLifetime()).leaseLifetime();
+        }
+        return result;
     }
 
     /// Keep client responses deliberately generic while leaving enough
@@ -7795,31 +7853,12 @@ pub const ModelManager = struct {
                     continue;
                 };
                 mapped_host_bytes = admission_plan.mapped_host_weight_bytes;
-                var model_peak = admission_plan.peak;
-                model_peak.host_weight_bytes -= mapped_host_bytes;
-                resource_lease = self.acquireRequestsWithEviction(&.{.{
-                    .backend_class = admissionBackendClassForRuntime(backend_runtime),
-                    .limits = admission_limits,
-                    .amounts = model_peak,
-                    .required_residency = required_residency,
-                    .failure = if (control) |active| active.admission_failure else null,
-                }}) catch |err| {
+                var reservations = self.acquireModelLoadAdmission(admission_plan, backend_runtime, admission_limits, required_residency, control) catch |err| {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
-                if (mapped_host_bytes != 0) {
-                    host_weight_lease = self.acquireRequestsWithEviction(&.{.{
-                        .backend_class = admissionBackendClassForRuntime(backend_runtime),
-                        .limits = admission_limits,
-                        .amounts = .{ .host_weight_bytes = mapped_host_bytes },
-                        .required_residency = required_residency,
-                        .failure = if (control) |active| active.admission_failure else null,
-                    }}) catch |err| {
-                        rememberPreferredLoadError(&first_err, err);
-                        continue;
-                    };
-                    host_weight_lease.?.lifetime = (try self.retainResourceLifetime()).leaseLifetime();
-                }
+                defer reservations.deinit();
+                reservations.take(&resource_lease, &host_weight_lease);
             }
 
             var construction = enterSessionConstruction(control, backend_runtime) catch |err| {
@@ -11639,6 +11678,24 @@ pub const GenerationAdmissionLease = struct {
     }
 };
 
+const ModelLoadReservations = struct {
+    model: ?runtime.tier.memory.AdmissionLease = null,
+    host: ?runtime.tier.memory.AdmissionLease = null,
+
+    fn deinit(self: *@This()) void {
+        if (self.host) |*lease| lease.release();
+        if (self.model) |*lease| lease.release();
+        self.* = .{};
+    }
+
+    fn take(self: *@This(), model: *?runtime.tier.memory.AdmissionLease, host: *?runtime.tier.memory.AdmissionLease) void {
+        std.debug.assert(model.* == null and host.* == null);
+        model.* = self.model;
+        host.* = self.host;
+        self.* = .{};
+    }
+};
+
 const ModelLoadAdmissionPlan = struct {
     /// Maximum simultaneous bytes while parsing/importing/repacking.
     peak: runtime.tier.memory.AdmissionAmounts,
@@ -12635,15 +12692,7 @@ fn loadSessionForPreferredBackendsWithArtifactsImpl(
             };
             if (control) |active| try active.check();
             mapped_host_bytes = admission_plan.mapped_host_weight_bytes;
-            var model_peak = admission_plan.peak;
-            model_peak.host_weight_bytes -= mapped_host_bytes;
-            resource_lease = manager.acquireRequestsWithEviction(&.{.{
-                .backend_class = admissionBackendClassForRuntime(backend_runtime),
-                .limits = admission_limits,
-                .amounts = model_peak,
-                .required_residency = required_residency,
-                .failure = if (control) |active| active.admission_failure else null,
-            }}) catch |err| {
+            var reservations = manager.acquireModelLoadAdmission(admission_plan, backend_runtime, admission_limits, required_residency, control) catch |err| {
                 std.log.warn(
                     "loadModel({s}) backend {s} admission failed: {s}; peak_host={d} peak_backend={d} host_limit={d} backend_limit={d} combined_limit={d}",
                     .{
@@ -12660,19 +12709,8 @@ fn loadSessionForPreferredBackendsWithArtifactsImpl(
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
-            if (mapped_host_bytes != 0) {
-                host_weight_lease = manager.acquireRequestsWithEviction(&.{.{
-                    .backend_class = admissionBackendClassForRuntime(backend_runtime),
-                    .limits = admission_limits,
-                    .amounts = .{ .host_weight_bytes = mapped_host_bytes },
-                    .required_residency = required_residency,
-                    .failure = if (control) |active| active.admission_failure else null,
-                }}) catch |err| {
-                    rememberPreferredLoadError(&first_err, err);
-                    continue;
-                };
-                host_weight_lease.?.lifetime = (try manager.retainResourceLifetime()).leaseLifetime();
-            }
+            defer reservations.deinit();
+            reservations.take(&resource_lease, &host_weight_lease);
         }
         var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
             if (err == error.ProcessIsolationRequired) {
@@ -20925,3 +20963,221 @@ test "Gemma4 CUDA host PLE admission lifetime survives the model manager" {
     pinned.release(); // Last domain reference; the testing allocator checks destruction.
     pinned.release();
 }
+
+const RetiredHostAdmissionFixture = struct {
+    var fail_free: bool = true;
+    var frees: usize = 0;
+    fn current(ptr: *@import("../ops/cuda/driver.zig").CUcontext) callconv(.c) c_int {
+        ptr.* = null;
+        return 0;
+    }
+    fn setCurrent(_: @import("../ops/cuda/driver.zig").CUcontext) callconv(.c) c_int {
+        return 0;
+    }
+    fn wait() callconv(.c) c_int {
+        return 0;
+    }
+    fn free(_: ?*anyopaque) callconv(.c) c_int {
+        frees += 1;
+        return if (fail_free) 1 else 0;
+    }
+    fn release(_: c_int) callconv(.c) c_int {
+        return 0;
+    }
+    fn retire(manager: *ModelManager, queue: *@import("../ops/cuda/host_retirement.zig").Queue) !void {
+        const retirement = @import("../ops/cuda/host_retirement.zig");
+        var lease = try manager.admissionController().tryAcquire(.gpu, .{}, .{ .host_weight_bytes = 30 }, false);
+        errdefer lease.release();
+        lease.lifetime = (try manager.retainResourceLifetime()).leaseLifetime();
+        const owner = try queue.allocator.create(retirement.Owner);
+        owner.* = .{ .queue = queue, .driver = undefined, .owns_library = false, .primary = @ptrFromInt(1), .device = 0, .ptr = @ptrFromInt(0x1000), .bytes = 30, .lease = lease };
+        owner.driver.fns.cuCtxGetCurrent = current;
+        owner.driver.fns.cuCtxSetCurrent = setCurrent;
+        owner.driver.fns.cuCtxSynchronize = wait;
+        owner.driver.fns.cuMemFreeHost = free;
+        owner.driver.fns.cuDevicePrimaryCtxRelease = release;
+        fail_free = true;
+        frees = 0;
+        owner.retire(true); // Session/import owner is gone; only retirement owns it.
+    }
+};
+
+test "Gemma4 CUDA host PLE impossible combined construction preserves idle models" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 100 });
+    try manager.ensureResourceOwnerReady();
+    var probe = TeardownTestProbe{};
+    const resident = try teardownTestModelWithHostLimit(&manager, &probe, 100);
+    try manager.loaded.put(a, try a.dupe(u8, "resident"), resident);
+    const plan = ModelLoadAdmissionPlan{
+        .peak = .{ .host_weight_bytes = 110 }, // Previously acquired as 80 + 30.
+        .resident = .{ .host_weight_bytes = 30 },
+        .mapped_host_weight_bytes = 30,
+    };
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireModelLoadAdmission(plan, .{ .backend = .cuda }, .{ .host_limit_bytes = 100 }, .{}, null));
+    try std.testing.expect(!probe.closed);
+    try std.testing.expectEqual(@as(usize, 1), manager.loaded.count());
+    try std.testing.expectEqual(@as(usize, 64), manager.admissionController().snapshot().host_weight_bytes);
+    const diagnostic = manager.memoryAdmissionDiagnostic();
+    try std.testing.expect(!diagnostic.retryable);
+    try std.testing.expectEqualStrings("ResourceLimitExceeded", diagnostic.error_code);
+    try std.testing.expectEqual(@as(usize, 110), diagnostic.requested_host_bytes);
+}
+
+test "Gemma4 CUDA host PLE model admission recovers retired storage before a tight-budget reload" {
+    _ = CudaHostAdmissionTests;
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.native}, .process_termination_available = false, .native_call_policy = .in_process });
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 100 });
+    try manager.ensureResourceOwnerReady();
+    var queue = @import("../ops/cuda/host_retirement.zig").Queue{ .allocator = a };
+    manager.test_cuda_host_retirement_queue = &queue;
+    try RetiredHostAdmissionFixture.retire(&manager, &queue);
+    defer {
+        RetiredHostAdmissionFixture.fail_free = false;
+        queue.retry();
+    }
+    const plan = ModelLoadAdmissionPlan{ .peak = .{ .host_weight_bytes = 80 }, .resident = .{ .host_weight_bytes = 30 }, .mapped_host_weight_bytes = 30 };
+    // A persistent driver failure remains charged and cannot produce an
+    // endless eviction/retry loop or report progress that never happened.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireModelLoadAdmission(plan, .{ .backend = .cuda }, .{ .host_limit_bytes = 100 }, .{}, null));
+    try std.testing.expectEqual(@as(usize, 30), manager.admissionController().snapshot().host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 2), RetiredHostAdmissionFixture.frees);
+    RetiredHostAdmissionFixture.fail_free = false;
+    // No direct retry or CUDA initialization here. The production admission
+    // reclaimer must retire the old allocation before this reservation can fit.
+    var reservations = try manager.acquireModelLoadAdmission(plan, .{ .backend = .cuda }, .{ .host_limit_bytes = 100 }, .{}, null);
+    defer reservations.deinit();
+    try std.testing.expectEqual(@as(usize, 3), RetiredHostAdmissionFixture.frees);
+    try std.testing.expect(!queue.hasPending());
+    try std.testing.expectEqual(@as(usize, 80), manager.admissionController().snapshot().host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 50), reservations.model.?.amounts.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 30), reservations.host.?.amounts.host_weight_bytes);
+    reservations.deinit();
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+}
+
+test "Gemma4 CUDA host PLE admission cleanup honors native isolation policy across backends" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.native}, .process_termination_available = false, .native_call_policy = .require_supervision });
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 100 });
+    try manager.ensureResourceOwnerReady();
+    var queue = @import("../ops/cuda/host_retirement.zig").Queue{ .allocator = a };
+    manager.test_cuda_host_retirement_queue = &queue;
+    try RetiredHostAdmissionFixture.retire(&manager, &queue);
+    defer {
+        RetiredHostAdmissionFixture.fail_free = false;
+        queue.retry();
+    }
+    RetiredHostAdmissionFixture.fail_free = false;
+    // A CPU request also encounters the shared host charge, but may not enter
+    // an uninterruptible driver without supervision or explicit host acceptance.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireAmountsWithEvictionMode(.cpu, .{ .host_limit_bytes = 100 }, .{ .host_weight_bytes = 80 }, false));
+    try std.testing.expectEqual(@as(usize, 1), RetiredHostAdmissionFixture.frees);
+    try std.testing.expect(queue.hasPending());
+    manager.session_manager.native_call_policy = .in_process;
+    var recovered = try manager.acquireAmountsWithEvictionMode(.cpu, .{ .host_limit_bytes = 100 }, .{ .host_weight_bytes = 80 }, false);
+    defer recovered.release();
+    try std.testing.expectEqual(@as(usize, 2), RetiredHostAdmissionFixture.frees);
+    try std.testing.expect(!queue.hasPending());
+}
+
+test "Gemma4 CUDA host PLE external process budget sees one atomic construction peak" {
+    const memory = runtime.tier.memory;
+    const Budget = struct {
+        limit: usize = 100,
+        current: memory.AdmissionAmounts = .{},
+        reserves: usize = 0,
+        releases: usize = 0,
+        fn reserve(context: *anyopaque, amounts: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.reserves += 1;
+            if (amounts.host_weight_bytes > self.limit) return error.ResourceLimitExceeded;
+            self.current = amounts;
+            return 9;
+        }
+        fn retain(context: *anyopaque, token: usize, amounts: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(token == 9);
+            self.current = amounts;
+        }
+        fn release(context: *anyopaque, token: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(token == 9);
+            self.releases += 1;
+            self.current = .{};
+        }
+    };
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 1000 });
+    try manager.ensureResourceOwnerReady();
+    var budget = Budget{};
+    try manager.admissionController().configureResourceBudget(.{ .context = &budget, .try_reserve = Budget.reserve, .retain = Budget.retain, .release = Budget.release });
+    const impossible = ModelLoadAdmissionPlan{ .peak = .{ .host_weight_bytes = 110 }, .resident = .{ .host_weight_bytes = 30 }, .mapped_host_weight_bytes = 30 };
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireModelLoadAdmission(impossible, .{ .backend = .cuda }, .{}, .{}, null));
+    try std.testing.expectEqual(@as(usize, 1), budget.reserves);
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+    const possible = ModelLoadAdmissionPlan{ .peak = .{ .host_weight_bytes = 80 }, .resident = .{ .host_weight_bytes = 30 }, .mapped_host_weight_bytes = 30 };
+    var reservations = try manager.acquireModelLoadAdmission(possible, .{ .backend = .cuda }, .{}, .{}, null);
+    defer reservations.deinit();
+    try std.testing.expectEqual(@as(usize, 2), budget.reserves); // No second capacity acquisition for the host slice.
+    try std.testing.expectEqual(possible.peak, budget.current);
+    reservations.model.?.release();
+    try std.testing.expectEqual(possible.resident, budget.current);
+    reservations.host.?.release();
+    try std.testing.expectEqual(@as(usize, 1), budget.releases);
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, budget.current);
+}
+
+const CudaHostAdmissionTests = if (build_options.enable_cuda) struct {
+    test "Gemma4 CUDA host PLE real failed teardown reload is recovered through model admission" {
+        const memory = runtime.tier.memory;
+        const retirement = @import("../ops/cuda/host_retirement.zig");
+        const buffer = @import("../ops/cuda/buffer.zig");
+        const driver = @import("../ops/cuda/driver.zig");
+        const FailOnce = struct {
+            var original: *const fn (?*anyopaque) callconv(.c) driver.CUresult = undefined;
+            var calls: usize = 0;
+            fn free(ptr: ?*anyopaque) callconv(.c) driver.CUresult {
+                calls += 1;
+                return if (calls == 1) 1 else original(ptr);
+            }
+        };
+        const a = std.testing.allocator;
+        var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.cuda}, .process_termination_available = false, .native_call_policy = .in_process });
+        defer manager.deinit();
+        manager.configureAdmissionLimits(.{ .host_limit_bytes = 12288 });
+        try manager.ensureResourceOwnerReady();
+        var host: ?memory.AdmissionLease = try manager.admissionController().tryAcquire(.gpu, .{}, .{ .host_weight_bytes = 4096 }, false);
+        defer if (host) |*lease| lease.release();
+        host.?.lifetime = (try manager.retainResourceLifetime()).leaseLifetime();
+        var compute = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.init(a);
+        var alive = true;
+        defer {
+            if (alive) compute.deinit();
+            retirement.process.retry();
+        }
+        compute.gemma4_ple_host = try buffer.MappedHostBuffer.allocAdmitted(&compute.ctx, 4096, &host);
+        const owner = compute.gemma4_ple_host.owner.?;
+        FailOnce.original = owner.driver.fns.cuMemFreeHost.?;
+        FailOnce.calls = 0;
+        owner.driver.fns.cuMemFreeHost = FailOnce.free;
+        compute.deinit();
+        alive = false;
+        try std.testing.expectEqual(@as(usize, 4096), manager.admissionController().snapshot().host_weight_bytes);
+        // This peak fits alone but not alongside the retired allocation. No
+        // context initialization or direct retirement retry occurs after failure.
+        const plan = ModelLoadAdmissionPlan{ .peak = .{ .host_weight_bytes = 10240 }, .resident = .{ .host_weight_bytes = 4096 }, .mapped_host_weight_bytes = 4096 };
+        var reservations = try manager.acquireModelLoadAdmission(plan, .{ .backend = .cuda }, .{ .host_limit_bytes = 12288 }, .{}, null);
+        defer reservations.deinit();
+        try std.testing.expectEqual(@as(usize, 2), FailOnce.calls);
+        try std.testing.expect(!retirement.process.hasPending());
+        try std.testing.expectEqual(plan.peak, manager.admissionController().snapshot());
+    }
+} else struct {};

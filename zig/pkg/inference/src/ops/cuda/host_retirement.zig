@@ -78,18 +78,17 @@ pub const Owner = struct {
     pub fn retire(self: *Owner, readers_done: bool) void {
         self.readers_done = readers_done;
         const queue = self.queue;
-        queue.lock();
-        defer queue.mutex.unlock();
+        // Driver waits and external-budget callbacks never run under the
+        // queue's metadata lock. This owner is exclusively ours until enqueue.
         if (self.release()) {
             if (self.owns_library) self.driver.deinit();
-            self.queue.allocator.destroy(self);
+            queue.allocator.destroy(self);
             return;
         }
         std.log.warn("CUDA mapped host retirement deferred: host_bytes={d} readers_done={} primary_retained=true", .{
             if (self.ptr != null) self.bytes else 0, self.readers_done,
         });
-        self.next = self.queue.head;
-        self.queue.head = self;
+        queue.enqueue(self);
     }
 
     fn release(self: *Owner) bool {
@@ -117,26 +116,53 @@ pub const Queue = struct {
     allocator: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     head: ?*Owner = null,
+    pending: std.atomic.Value(bool) = .init(false),
+
+    pub fn hasPending(self: *const Queue) bool {
+        return self.pending.load(.acquire);
+    }
 
     fn lock(self: *Queue) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
     pub fn retry(self: *Queue) void {
-        self.lock();
-        defer self.mutex.unlock();
-        self.retryUnlocked();
+        _ = self.reclaim();
     }
 
-    fn retryUnlocked(self: *Queue) void {
-        var link = &self.head;
-        while (link.*) |owner| {
-            if (owner.release()) {
-                link.* = owner.next;
+    /// Physical host bytes or their still-held admission credit actually
+    /// released by this pass. A failed primary release alone is not progress
+    /// against host pressure. Callers can re-probe the authoritative budget.
+    fn enqueue(self: *Queue, owner: *Owner) void {
+        self.lock();
+        defer self.mutex.unlock();
+        owner.next = self.head;
+        self.head = owner;
+        self.pending.store(true, .release);
+    }
+
+    pub fn reclaim(self: *Queue) usize {
+        if (!self.hasPending()) return 0;
+        self.lock();
+        var remaining = self.head;
+        self.head = null;
+        self.pending.store(false, .release);
+        self.mutex.unlock();
+        var released_bytes: usize = 0;
+        while (remaining) |owner| {
+            const next = owner.next;
+            owner.next = null;
+            const held_host = owner.ptr != null or owner.lease != null;
+            const retired = owner.release();
+            if (held_host and owner.ptr == null and owner.lease == null)
+                released_bytes +|= owner.bytes;
+            if (retired) {
                 if (owner.owns_library) owner.driver.deinit();
                 self.allocator.destroy(owner);
-            } else link = &owner.next;
+            } else self.enqueue(owner);
+            remaining = next;
         }
+        return released_bytes;
     }
 };
 
@@ -148,6 +174,8 @@ const Fake = struct {
     var waits: usize = 0;
     var frees: usize = 0;
     var releases: usize = 0;
+    var checked_queue: ?*Queue = null;
+    var driver_lock_free: bool = true;
 
     fn getCurrent(ptr: *driver.CUcontext) callconv(.c) driver.CUresult {
         ptr.* = current;
@@ -166,6 +194,11 @@ const Fake = struct {
     }
     fn free(_: ?*anyopaque) callconv(.c) driver.CUresult {
         frees += 1;
+        if (checked_queue) |queue| {
+            const unlocked = queue.mutex.tryLock();
+            driver_lock_free = driver_lock_free and unlocked;
+            if (unlocked) queue.mutex.unlock();
+        }
         return if (fail_free) 1 else driver.CUDA_SUCCESS;
     }
     fn release(_: driver.CUdevice) callconv(.c) driver.CUresult {
@@ -180,6 +213,8 @@ const Fake = struct {
         waits = 0;
         frees = 0;
         releases = 0;
+        checked_queue = null;
+        driver_lock_free = true;
         const result = try queue.allocator.create(Owner);
         result.* = .{
             .queue = queue,
@@ -261,4 +296,24 @@ test "Gemma4 CUDA host PLE failed construction rollback retains admission until 
     try std.testing.expect(queue.head == null);
     try std.testing.expectEqual(frees, Fake.frees); // No double free on retain retry.
     try std.testing.expectEqual(@as(usize, 0xbeef), @intFromPtr(Fake.current));
+}
+
+test "Gemma4 CUDA host PLE retirement does not hold queue metadata across driver callbacks" {
+    var controller = memory.AdmissionController{};
+    var queue = Queue{ .allocator = std.testing.allocator };
+    const owner = try Fake.owner(&queue, try controller.tryAcquire(.gpu, .{}, .{ .host_weight_bytes = 64 }, false));
+    Fake.checked_queue = &queue;
+    Fake.fail_free = true;
+    owner.retire(true);
+    try std.testing.expect(queue.hasPending());
+    Fake.fail_free = false;
+    Fake.fail_release = true;
+    try std.testing.expectEqual(@as(usize, 64), queue.reclaim());
+    try std.testing.expect(queue.hasPending()); // Only the primary retain remains.
+    try std.testing.expectEqual(@as(usize, 0), queue.reclaim());
+    Fake.fail_release = false;
+    try std.testing.expectEqual(@as(usize, 0), queue.reclaim());
+    try std.testing.expect(!queue.hasPending());
+    try std.testing.expect(Fake.driver_lock_free);
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
 }

@@ -986,6 +986,58 @@ pub const LeaseLifetime = struct {
     release: *const fn (*anyopaque) void,
 };
 
+/// Partitions keep one exactly-once external receipt. Reductions publish the
+/// sum of the remaining partitions, never a second independent acquisition.
+const ExternalLeasePartitions = struct {
+    allocator: std.mem.Allocator,
+    controller: *AdmissionController,
+    token: ?usize,
+    wanted: AdmissionAmounts,
+    references: usize = 2,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn fork(self: *@This()) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        self.references = std.math.add(usize, self.references, 1) catch return error.ResourceLimitExceeded;
+    }
+
+    fn retain(self: *@This(), previous: AdmissionAmounts, retained: AdmissionAmounts) !void {
+        const released = subtractAdmissionAmounts(previous, retained) orelse return error.InvalidAdmissionLeaseReduction;
+        self.lock();
+        defer self.mutex.unlock();
+        const wanted = subtractAdmissionAmounts(self.wanted, released) orelse return error.InvalidAdmissionLeaseReduction;
+        try self.controller.retainExternalLease(self.token, wanted);
+        self.wanted = wanted;
+    }
+
+    fn release(self: *@This(), amounts: AdmissionAmounts) void {
+        self.lock();
+        self.wanted = subtractAdmissionAmounts(self.wanted, amounts) orelse @panic("invalid admission partition release");
+        std.debug.assert(self.references != 0);
+        self.references -= 1;
+        if (self.token) |token| {
+            if (self.references == 0) {
+                self.controller.releaseExternalLease(token);
+                self.token = null;
+            } else {
+                // release() cannot fail. An external reduction failure keeps
+                // conservative excess credit there until another reduction or
+                // the final exactly-once receipt release; ownership is not lost.
+                self.controller.retainExternalLease(token, self.wanted) catch {};
+            }
+        }
+        const destroy = self.references == 0;
+        if (destroy) std.debug.assert(self.token == null);
+        self.mutex.unlock();
+        if (destroy) self.allocator.destroy(self);
+    }
+};
+
 pub const AdmissionLease = struct {
     lifetime: ?LeaseLifetime = null,
     controller: ?*AdmissionController,
@@ -995,6 +1047,7 @@ pub const AdmissionLease = struct {
     /// Opaque exactly-once ownership token returned by the external process
     /// manager. Byte totals are never reconstructed for release.
     external_lease: ?usize = null,
+    external_partitions: ?*ExternalLeasePartitions = null,
     /// Bytes committed against the current live-memory pressure epoch. This is
     /// deliberately separate from policy accounting: the kernel/cgroup probe
     /// reflects physical pressure, while AdmissionAmounts tracks ownership.
@@ -1004,6 +1057,71 @@ pub const AdmissionLease = struct {
     /// receive credit for memory they may already have observed as free.
     live_settled_bytes: usize = 0,
     live_settled_epoch: u64 = 0,
+
+    /// Transfer a nonempty part of a single-backend reservation without
+    /// acquiring capacity again. Split before attaching an owner lifetime;
+    /// callers attach independent publisher references to the resulting owners.
+    /// Live-memory headroom/credits and an external receipt remain conserved.
+    pub fn split(self: *AdmissionLease, part: AdmissionAmounts) !AdmissionLease {
+        return self.splitWithAllocator(std.heap.smp_allocator, part);
+    }
+
+    fn splitWithAllocator(self: *AdmissionLease, allocator: std.mem.Allocator, part: AdmissionAmounts) !AdmissionLease {
+        const controller = self.controller orelse return error.AdmissionLeaseReleased;
+        const backend_class = self.retain_backend_class orelse return error.InvalidAdmissionLeaseReduction;
+        if (self.lifetime != null or std.meta.eql(part, AdmissionAmounts{})) return error.InvalidAdmissionLeaseReduction;
+        const remaining = subtractAdmissionAmounts(self.amounts, part) orelse return error.InvalidAdmissionLeaseReduction;
+        const host_bytes = try liveHostBytes(part);
+        if (self.live_reserved_bytes != 0 and host_bytes > self.live_reserved_bytes) return error.InvalidAdmissionLeaseReduction;
+        const pending = if (self.live_reserved_bytes != 0) host_bytes else 0;
+        const settled = @min(host_bytes, self.live_settled_bytes);
+        var partitions = self.external_partitions;
+        if (partitions) |group| {
+            try group.fork();
+        } else if (self.external_lease) |token| {
+            const group = try allocator.create(ExternalLeasePartitions);
+            group.* = .{ .allocator = allocator, .controller = controller, .token = token, .wanted = self.amounts };
+            partitions = group;
+        }
+        var by_backend = emptyAdmissionAmountsByBackend();
+        by_backend[backendClassIndex(backend_class)] = part;
+        const result = AdmissionLease{
+            .controller = controller,
+            .amounts = part,
+            .amounts_by_backend = by_backend,
+            .retain_backend_class = backend_class,
+            .external_partitions = partitions,
+            .live_reserved_bytes = pending,
+            .live_settled_bytes = settled,
+            .live_settled_epoch = self.live_settled_epoch,
+        };
+        self.amounts = remaining;
+        self.amounts_by_backend[backendClassIndex(backend_class)] = remaining;
+        self.external_lease = null;
+        self.external_partitions = partitions;
+        self.live_reserved_bytes -= pending;
+        self.live_settled_bytes -= settled;
+        return result;
+    }
+
+    pub fn hasExternalReceipt(self: *const AdmissionLease) bool {
+        return self.external_lease != null or self.external_partitions != null;
+    }
+
+    /// Shared partitions remain one external receipt. Consumers that require
+    /// independent receipts must not mistake a split token for unowned credit.
+    pub fn sharesExternalReceipt(self: *const AdmissionLease, other: *const AdmissionLease) bool {
+        if (self.controller == null or self.controller != other.controller) return false;
+        const token = self.externalToken() orelse return false;
+        return other.externalToken() == token;
+    }
+
+    fn externalToken(self: *const AdmissionLease) ?usize {
+        if (self.external_lease) |token| return token;
+        // A live partition owns a reference, so its receipt cannot retire
+        // concurrently with this query. A lease itself has a single owner.
+        return if (self.external_partitions) |group| group.token else null;
+    }
 
     /// Reduce a peak reservation to the bytes that remain resident after a
     /// construction/import phase. This never acquires new capacity, so the
@@ -1016,7 +1134,7 @@ pub const AdmissionLease = struct {
             return error.InvalidAdmissionLeaseReduction;
         const retained_live_bytes = liveHostBytes(retained) catch
             return error.InvalidAdmissionLeaseReduction;
-        try controller.retainExternalLease(self.external_lease, retained);
+        if (self.external_partitions) |group| try group.retain(self.amounts, retained) else try controller.retainExternalLease(self.external_lease, retained);
         controller.releaseSingle(backend_class, released);
         if (self.live_reserved_bytes != 0) {
             self.live_settled_epoch = controller.settleLiveReservation(self.live_reserved_bytes, retained_live_bytes);
@@ -1034,12 +1152,14 @@ pub const AdmissionLease = struct {
         const controller = self.controller orelse return;
         controller.releaseLiveReservation(self.live_reserved_bytes);
         controller.releaseSettledResidency(self.live_settled_epoch, self.live_settled_bytes);
+        if (self.external_partitions) |group| group.release(self.amounts);
         controller.release(self.amounts_by_backend, self.amounts, self.external_lease);
         self.controller = null;
         self.amounts = .{};
         self.amounts_by_backend = emptyAdmissionAmountsByBackend();
         self.retain_backend_class = null;
         self.external_lease = null;
+        self.external_partitions = null;
         self.live_reserved_bytes = 0;
         self.live_settled_bytes = 0;
         self.live_settled_epoch = 0;
@@ -1108,6 +1228,10 @@ pub const AdmissionController = struct {
     process_memory_limit_bytes: usize = 0,
     process_memory_limit_provenance: ProcessMemoryLimitProvenance = .automatic,
     resource_budget: ?AdmissionResourceBudget = null,
+    /// A zero-byte lease still owns its external receipt. Track receipt
+    /// lifetimes independently of bytes so capability replacement cannot route
+    /// a pending release to a different budget, including across split owners.
+    external_receipts: std.atomic.Value(usize) = .init(0),
     /// Opt-in fault injection for live server regression tests. Production
     /// callers leave this at zero, so normal admission behavior is unchanged.
     forced_run_denials_for_testing: std.atomic.Value(usize) = .init(0),
@@ -1207,7 +1331,7 @@ pub const AdmissionController = struct {
         }
         errdefer if (resource_budget) |budget| budget.releaseContext();
         spinLockAdmission(&self.mutex);
-        if (!std.meta.eql(self.admitted, AdmissionAmounts{})) {
+        if (!std.meta.eql(self.admitted, AdmissionAmounts{}) or self.external_receipts.load(.acquire) != 0) {
             self.mutex.unlock();
             return error.ResourceBudgetInUse;
         }
@@ -1322,6 +1446,7 @@ pub const AdmissionController = struct {
         const request_combined = std.math.add(usize, request_host, request_backend) catch
             return error.ResourceLimitExceeded;
 
+        var external_budget: ?AdmissionResourceBudget = null;
         // Publish a provisional reservation while holding only the in-memory
         // accounting lock. The potentially blocking OS/cgroup probe runs after
         // unlock; concurrent requests see the provisional bytes and therefore
@@ -1440,19 +1565,26 @@ pub const AdmissionController = struct {
                 );
                 next_by_backend[index] = domain_next;
             }
+            external_budget = self.resource_budget;
+            if (external_budget != null) {
+                if (self.external_receipts.load(.monotonic) == std.math.maxInt(usize)) return error.ResourceLimitExceeded;
+                _ = self.external_receipts.fetchAdd(1, .release);
+            }
             self.admitted = next;
             self.admitted_by_backend = next_by_backend;
         }
 
         var external_lease: ?usize = null;
-        if (self.resource_budget) |resource_budget| {
+        if (external_budget) |resource_budget| {
             const token = resource_budget.try_reserve(resource_budget.context, amounts) catch |err| {
                 if (err == error.ResourceTemporarilyUnavailable)
                     pressure.* = .external_budget;
+                _ = self.external_receipts.fetchSub(1, .acq_rel);
                 self.releaseLocal(amounts_by_backend, amounts);
                 return err;
             };
             if (token == 0) {
+                _ = self.external_receipts.fetchSub(1, .acq_rel);
                 self.releaseLocal(amounts_by_backend, amounts);
                 return error.ResourceLimitExceeded;
             }
@@ -1532,17 +1664,17 @@ pub const AdmissionController = struct {
         amounts: AdmissionAmounts,
         external_lease: ?usize,
     ) void {
-        if (external_lease) |token| {
-            // Keep the local reservation published until the external owner has
-            // consumed its exactly-once token. configureResourceBudget() uses
-            // that reservation as its exclusion condition, so releasing local
-            // accounting first would let a concurrent reconfiguration detach
-            // the old context and route this token to a different capability.
-            const resource_budget = self.resource_budget orelse
-                @panic("external admission lease lost its resource budget");
-            resource_budget.release(resource_budget.context, token);
-        }
+        if (external_lease) |token| self.releaseExternalLease(token);
         self.releaseLocal(amounts_by_backend, amounts);
+    }
+
+    fn releaseExternalLease(self: *AdmissionController, token: usize) void {
+        // Keep local counters published until the external receipt is consumed.
+        // They exclude reconfiguration/detachment of its capability context.
+        const resource_budget = self.resource_budget orelse @panic("external admission lease lost its resource budget");
+        resource_budget.release(resource_budget.context, token);
+        const previous = self.external_receipts.fetchSub(1, .acq_rel);
+        std.debug.assert(previous != 0);
     }
 
     fn retainExternalLease(
@@ -5205,4 +5337,161 @@ test "CPU scratch scales with the safe pool while total reservations remain boun
         if (limits.host_limit_bytes == 0) continue;
         try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = limits.host_limit_bytes }, false));
     }
+}
+
+const PartitionBudgetFixture = struct {
+    current: AdmissionAmounts = .{},
+    reserves: usize = 0,
+    releases: usize = 0,
+    fail_retain: bool = false,
+    controller: *AdmissionController,
+    blocked_reconfiguration: bool = false,
+
+    fn reserve(context: *anyopaque, amounts: AdmissionAmounts) AdmissionResourceError!usize {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.reserves += 1;
+        std.debug.assert(std.meta.eql(self.current, AdmissionAmounts{}));
+        self.current = amounts;
+        return 17;
+    }
+    fn retain(context: *anyopaque, token: usize, amounts: AdmissionAmounts) AdmissionResourceError!void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        std.debug.assert(token == 17);
+        if (self.fail_retain) return error.ResourceTemporarilyUnavailable;
+        _ = subtractAdmissionAmounts(self.current, amounts) orelse return error.ResourceLimitExceeded;
+        self.current = amounts;
+    }
+    fn release(context: *anyopaque, token: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        std.debug.assert(token == 17);
+        self.releases += 1;
+        self.controller.configureResourceBudget(null) catch |err| {
+            self.blocked_reconfiguration = err == error.ResourceBudgetInUse;
+        };
+        self.current = .{};
+    }
+    fn budget(self: *@This()) AdmissionResourceBudget {
+        return .{ .context = self, .try_reserve = reserve, .retain = retain, .release = release };
+    }
+};
+
+test "Gemma4 CUDA host PLE partitions conserve pending and settled live-memory credits" {
+    var controller = AdmissionController{};
+    var model = try controller.tryAcquire(.gpu, .{}, .{ .host_weight_bytes = 100 }, false);
+    defer model.release();
+    // A deterministic pressure epoch, including another owner's 20-byte
+    // reservation, keeps returned residency credit observable through release.
+    controller.live_capacity_bytes = 1000;
+    controller.live_pending_bytes = 120;
+    controller.live_epoch = 7;
+    model.live_reserved_bytes = 100;
+    var host = try model.split(.{ .host_weight_bytes = 40 });
+    defer host.release();
+    try std.testing.expectEqual(@as(usize, 60), model.live_reserved_bytes);
+    try std.testing.expectEqual(@as(usize, 40), host.live_reserved_bytes);
+    try std.testing.expectEqual(@as(usize, 120), controller.live_pending_bytes);
+    try host.retain(.{ .host_weight_bytes = 30 });
+    var fragment = try host.split(.{ .host_weight_bytes = 10 });
+    defer fragment.release();
+    try std.testing.expectEqual(@as(usize, 20), host.live_settled_bytes);
+    try std.testing.expectEqual(@as(usize, 10), fragment.live_settled_bytes);
+    model.release();
+    try std.testing.expectEqual(@as(usize, 20), controller.live_pending_bytes);
+    fragment.release();
+    host.release();
+    try std.testing.expectEqual(@as(usize, 1000), controller.live_capacity_bytes);
+    controller.releaseLiveReservation(20);
+    try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
+    try std.testing.expectEqual(AdmissionAmounts{}, controller.snapshot());
+}
+
+test "Gemma4 CUDA host PLE external partitions share one receipt through nested splits and zero retention" {
+    var controller = AdmissionController{};
+    var fixture = PartitionBudgetFixture{ .controller = &controller };
+    try controller.configureResourceBudget(fixture.budget());
+    defer controller.deinit();
+    var model = try controller.tryAcquire(.gpu, .{}, .{ .host_weight_bytes = 100, .backend_weight_bytes = 80 }, false);
+    defer model.release();
+    const borrowed_before_split = model;
+    var host = try model.splitWithAllocator(std.testing.allocator, .{ .host_weight_bytes = 40 });
+    defer host.release();
+    try std.testing.expect(model.hasExternalReceipt() and host.hasExternalReceipt());
+    try std.testing.expect(model.sharesExternalReceipt(&host));
+    try std.testing.expect(host.sharesExternalReceipt(&borrowed_before_split));
+    var fragment = try model.splitWithAllocator(std.testing.allocator, .{ .host_weight_bytes = 20 });
+    defer fragment.release();
+    try std.testing.expectEqual(@as(usize, 1), fixture.reserves);
+    try host.retain(.{ .host_weight_bytes = 30 });
+    try model.retain(.{ .host_weight_bytes = 20, .backend_weight_bytes = 60 });
+    try std.testing.expectEqual(controller.snapshot(), fixture.current);
+    fragment.release();
+    host.release();
+    try std.testing.expectEqual(model.amounts, fixture.current);
+    try model.retain(.{});
+    try std.testing.expectEqual(@as(usize, 0), fixture.releases);
+    // Zero bytes do not end the receipt's lifetime. Its final owner must
+    // consume it before resource-budget replacement becomes legal.
+    try std.testing.expectError(error.ResourceBudgetInUse, controller.configureResourceBudget(null));
+    model.release();
+    try std.testing.expect(fixture.blocked_reconfiguration);
+    try controller.configureResourceBudget(null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+    try std.testing.expectEqual(AdmissionAmounts{}, controller.snapshot());
+}
+
+test "Gemma4 CUDA host PLE partition failures preserve receipts and conservatively retire reductions" {
+    var controller = AdmissionController{};
+    var fixture = PartitionBudgetFixture{ .controller = &controller };
+    try controller.configureResourceBudget(fixture.budget());
+    defer controller.deinit();
+    var model = try controller.tryAcquire(.gpu, .{}, .{ .host_weight_bytes = 100 }, false);
+    defer model.release();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, model.splitWithAllocator(failing.allocator(), .{ .host_weight_bytes = 40 }));
+    try std.testing.expectEqual(@as(?usize, 17), model.external_lease);
+    try std.testing.expect(model.external_partitions == null);
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, model.split(.{ .host_weight_bytes = 101 }));
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, model.split(.{}));
+    var host = try model.splitWithAllocator(std.testing.allocator, .{ .host_weight_bytes = 40 });
+    defer host.release();
+    fixture.fail_retain = true;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, host.retain(.{ .host_weight_bytes = 30 }));
+    try std.testing.expectEqual(@as(usize, 40), host.amounts.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 100), fixture.current.host_weight_bytes);
+    model.release(); // Failed external reduction must not lose its receipt.
+    try std.testing.expectEqual(@as(usize, 40), controller.snapshot().host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 100), fixture.current.host_weight_bytes);
+    fixture.fail_retain = false;
+    try host.retain(host.amounts);
+    try std.testing.expectEqual(host.amounts, fixture.current);
+    host.release();
+    try std.testing.expectEqual(@as(usize, 1), fixture.reserves);
+    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+    try std.testing.expectEqual(AdmissionAmounts{}, controller.snapshot());
+}
+
+test "Gemma4 CUDA host PLE partition owners can retain and release concurrently" {
+    const Worker = struct {
+        fn run(lease: *AdmissionLease) void {
+            lease.retain(.{ .host_weight_bytes = 10 }) catch @panic("partition retain failed");
+            lease.release();
+        }
+    };
+    var controller = AdmissionController{};
+    var fixture = PartitionBudgetFixture{ .controller = &controller };
+    try controller.configureResourceBudget(fixture.budget());
+    defer controller.deinit();
+    var model = try controller.tryAcquire(.gpu, .{}, .{ .host_weight_bytes = 100 }, false);
+    defer model.release();
+    var host = try model.splitWithAllocator(std.testing.allocator, .{ .host_weight_bytes = 40 });
+    defer host.release();
+    const first = try std.Thread.spawn(.{}, Worker.run, .{&model});
+    const second = std.Thread.spawn(.{}, Worker.run, .{&host}) catch |err| {
+        first.join();
+        return err;
+    };
+    second.join();
+    first.join();
+    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+    try std.testing.expectEqual(AdmissionAmounts{}, controller.snapshot());
 }
