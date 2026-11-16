@@ -42898,8 +42898,11 @@ const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legac
 fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const inventory = @import("../artifact_chunk_manifest.zig");
-    const alloc = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const alloc = checked_allocator.allocator();
     const Harness = struct {
+        alloc: Allocator,
         encoded: ?[]u8 = null,
         provider_calls: usize = 0,
         capability_calls: usize = 0,
@@ -42968,7 +42971,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             var txn = try self.cleanup_db.?.core.store.beginWriteTxn();
             errdefer txn.abort();
             try validateRuntimeStoreWriteFenceTxn(self.cleanup_runtime.?, &txn, fence);
-            for (guards) |guard| try validateGeneratedSourceGuard(std.testing.allocator, &txn, guard);
+            for (guards) |guard| try validateGeneratedSourceGuard(self.alloc, &txn, guard);
             for (deletes) |key| {
                 try std.testing.expect(guards.len > 0);
                 try std.testing.expectEqualStrings(self.cleanup_stale_key, key);
@@ -42994,7 +42997,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             const call = call: {
                 self.mutex.lockUncancelable(std.testing.io);
                 defer self.mutex.unlock(std.testing.io);
-                try self.batches.append(std.testing.allocator, texts.len);
+                try self.batches.append(self.alloc, texts.len);
                 break :call self.batches.items.len;
             };
             const active = self.active.fetchAdd(1, .acq_rel) + 1;
@@ -43050,11 +43053,11 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         }
         fn enqueue(ptr: *anyopaque, _: ordered_publication.Namespace, bytes: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const copy = try std.testing.allocator.dupe(u8, bytes);
-            if (self.encoded) |old| std.testing.allocator.free(old);
+            const copy = try self.alloc.dupe(u8, bytes);
+            if (self.encoded) |old| self.alloc.free(old);
             self.encoded = copy;
             self.publications += 1;
-            try self.queued.append(std.testing.allocator, try std.testing.allocator.dupe(u8, bytes));
+            try self.queued.append(self.alloc, try self.alloc.dupe(u8, bytes));
         }
         fn embedSparse(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -43093,12 +43096,12 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             return processMaterializedChunkSparseRequest(runtime, request, "chunks", "model", .{ .ptr = self, .sparse_embed_fn = embedSparse, .cache_revision_fn = revision }, &.{"vector"}, window);
         }
         fn apply(self: *@This(), db: *db_mod.DB, index: u64) !void {
-            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, self.encoded.?);
+            var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(self.alloc, self.encoded.?);
             defer decoded.deinit();
             try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = index });
         }
     };
-    var harness: Harness = .{};
+    var harness: Harness = .{ .alloc = alloc };
     defer if (harness.encoded) |bytes| alloc.free(bytes);
     defer harness.batches.deinit(alloc);
     defer {

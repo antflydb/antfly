@@ -155212,7 +155212,9 @@ test "privacy protected model migration multi chunk output" {
 // Exercise the local producer path here; the companion HTTP fixture runs the
 // ordered standalone path, holds B while querying A, and crashes/reopens both.
 fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_size: u32) !void {
-    const a = std.testing.allocator;
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
     const workers = document_count >= 4095;
     const privacy = @import("../../privacy/document.zig");
     const catalog = @import("../../privacy/catalog.zig");
