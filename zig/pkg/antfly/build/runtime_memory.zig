@@ -192,7 +192,9 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
             // over the old 5 GiB claim; 8 GiB keeps >=25% headroom.
             .distributed => 8,
             .local_query => unreachable,
-            .storage_kernel => 8,
+            // Zig 0.17.0 cold build with context sources peaked at
+            // 8,626,855,936 bytes, over the old 8 GiB claim. Peak + 10%.
+            .storage_kernel => 10,
             .enrichment_compute => 2,
             .serverless => 4,
             .inference => 8,
