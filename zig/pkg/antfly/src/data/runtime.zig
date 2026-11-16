@@ -43903,11 +43903,47 @@ fn consumerTests() type {
                     try server.proposeRaftBatchGroupWithLeaderWait(a, 601, "docs", publication, .{ .discovery = .cached, .write_route_fence = route.fence(), .admission_deadline_ns = server.dataRaftMonotonicNs() + 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
                 }
                 try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                // An idle root must remain readable after an ordered protocol
+                // barrier, without requiring another document mutation.
+                const idle_barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version);
+                defer a.free(idle_barrier);
+                const idle_barrier_index = blk: {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    var index: ?u64 = null;
+                    try http.proposeWithReceipt(601, idle_barrier, &index);
+                    break :blk index orelse return error.GroupLeaderUnavailable;
+                };
+                const idle_apply_deadline = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+                while (sm.appliedIndex(601) < idle_barrier_index) {
+                    if (platform_time.monotonicNs() >= idle_apply_deadline) return error.Timeout;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                }
                 const retained_history = @import("antfly_local_sources").storage_committed_history;
                 const publication_query: retained_history.CompletionPublicationQuery = .{ .owner = current_owner, .transaction_id = txn_id, .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
                 const publication_input: @import("../api/history_publication_operations.zig").Request = .{ .version = 1, .owner = current_owner, .transaction_id = txn_id, .manifest_digest = publication_query.manifest_digest, .commit_version = 1001, .minimum_applied_index = 1 };
                 const observed_publication = try server.historyPublicationPort().read(a, route.fence().?, "docs", publication_input, .{});
                 try observed_publication.validate(publication_query);
+                // Recovery must not manufacture a native write for a no-op.
+                try std.testing.expect(observed_publication.cut.index < idle_barrier_index);
+                const idle_resolution = try server.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
+                try idle_resolution.validate(positive_input.binding());
+                try std.testing.expectEqualDeep(positive.resolution, idle_resolution.resolution);
+                try std.testing.expect(idle_resolution.cut.index < idle_barrier_index);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                var idle_page = try origin.historyPagePort().read(a, route.fence().?, "docs", page_input, .{});
+                defer idle_page.deinit();
+                try std.testing.expectEqualDeep(first_page.events, idle_page.events);
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const idle_grant = try origin.historyGrantPort().read(a, route.fence().?, "docs", grant_input, .{});
+                try std.testing.expectEqualDeep(actual_grant, idle_grant);
+                // All recovery operations remain reads: no Raft entry was
+                // submitted to make the native cut catch up with the no-op.
+                {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    try std.testing.expectEqual(idle_barrier_index, host.raftStatus(601).?.last_index);
+                }
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const remote_publication = try origin.historyPublicationPort().read(a, route.fence().?, "docs", publication_input, .{});
                 try remote_publication.validate(publication_query);

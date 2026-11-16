@@ -2726,9 +2726,10 @@ compiled export and native reducer use the same query/observation types.
 `orderedHistoryPublicationRouted` captures one bounded original deadline, checks
 the complete original routed owner against authoritative catalog and descriptor,
 uses the frozen leader ReadIndex path, and revalidates owner/catalog/proof after
-the native read. Only then does it rebind the native reply from the stronger
-actual ReadIndex request to the caller's original request, preserving the actual
-observed cut and immutable first publication position.
+the native read. The quorum frontier and actual persisted native frontier are
+separate: the native read enforces the caller's requested native minimum and
+returns its real persisted cut and immutable first publication position. The
+quorum proof is never relabelled as a native write.
 
 Source/control catalog generation passed. `completion-publication-routed-test.log`
 finished with exit 0: the compiled ABI-101 scope and all six real-Raft cases passed.
@@ -2856,3 +2857,33 @@ opaque checkpoints, encode snapshot/LSN phases into numeric ranges, or advance
 destination progress only for polls containing rows. Preserve old key/row and
 unchanged-TOAST information from pgoutput; source transforms and route
 enter/leave/key changes must use source images with declared completeness.
+
+## In progress: idle completion recovery and sparse native cuts
+
+The real-Raft idle regression commits a protocol barrier after certificate
+publication, waits for group apply, then reads without another document write.
+`completion-idle-barrier-regression.log` reproduced a bounded read failure:
+forcing the root's minimum index to the group ReadIndex waited for a native
+mutation which the no-op entry never performed.
+
+Resolution and publication recovery now retain the caller's native minimum.
+The native transaction still checks its persisted marker against that minimum;
+the reply still contains the actual native marker. The leader barrier precedes
+opening that transaction, and the same frozen leader/quorum proof and complete
+owner/catalog fences are validated afterward. `applyReady` publishes group
+progress only after each prior native effect has completed, so observing the
+barrier establishes freshness without requiring a write for every Raft no-op.
+A concurrent commit invalidates the frozen proof and forces bounded recovery.
+This does not create evidence for a missing publication or permit resubmission.
+
+`completion-idle-sparse-cut-test.log` completed with exit 0: all six real-Raft
+cases passed, including that resolution and publication cuts remain below the
+idle barrier. Page and grant reads now require a positive native authority marker
+under the same quorum/owner fences; exact control-outcome reads preserve the
+caller's minimum, which must cover its actual accepted receipt. The expanded
+signed-HTTP page/grant idle regression also checks that these reads append no
+Raft entries. `completion-idle-all-reads-test.log` completed with exit 0: all six
+real-Raft cases passed, including the expanded signed-HTTP page/grant checks.
+Formatting and diff checks passed. Restart, snapshot and leader-election
+recovery qualification remain required. Full production coordinator,
+retention, bootstrap, public feeds and existing-client qualification remain open.

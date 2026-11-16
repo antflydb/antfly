@@ -1885,31 +1885,28 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (lease.entry.identity.table_id != identity.table_id or lease.entry.identity.shard_id != identity.shard_id or lease.entry.identity.range_id != identity.range_id) return error.HistoryResynchronizationRequired;
         try self.validateRoutedRead(alloc, fence, group, table_name);
         var result = switch (kind) {
-            .page => try lease.owner().orderedHistoryPage(alloc, table_name, request, proof.applied_index),
-            .outcome => blk: {
-                var recovery = request;
-                recovery.minimum_applied_index = proof.applied_index;
-                break :blk try lease.owner().orderedHistoryOutcome(alloc, table_name, recovery);
-            },
-            .grant => try lease.owner().orderedHistoryGrant(alloc, table_name, request, proof.applied_index),
-            .resolution => blk: {
-                var qualified = request;
-                qualified.minimum_applied_index = proof.applied_index;
-                break :blk try lease.owner().historyResolution(alloc, table_name, qualified);
-            },
-            .publication => blk: {
-                var qualified = request;
-                qualified.minimum_applied_index = proof.applied_index;
-                break :blk try lease.owner().historyPublication(alloc, table_name, qualified);
-            },
+            // Page/grant requests have no caller-supplied native index: a
+            // positive persisted marker establishes native Raft authority.
+            // The quorum/owner fences establish freshness for all five reads.
+            .page => try lease.owner().orderedHistoryPage(alloc, table_name, request, 1),
+            .outcome => try lease.owner().orderedHistoryOutcome(alloc, table_name, request),
+            .grant => try lease.owner().orderedHistoryGrant(alloc, table_name, request, 1),
+            // ReadIndex includes no-ops and protocol barriers which never
+            // mutate this root. Its persisted marker is deliberately sparse.
+            // applyReady publishes group progress only after native effects
+            // finish, so a read transaction opened after the barrier observes
+            // those effects. Keep the caller's native minimum; final quorum
+            // and owner validation reject concurrent commits or replacement.
+            .resolution => try lease.owner().historyResolution(alloc, table_name, request),
+            .publication => try lease.owner().historyPublication(alloc, table_name, request),
         };
         errdefer if (comptime kind == .page) result.deinit();
         if (comptime kind == .publication) try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), request.owner, context);
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
         try self.validateRoutedRead(alloc, fence, group, table_name);
-        // The compiled owner validated the stronger actual ReadIndex request.
-        // Preserve its observed cut while binding the outward reply to the
-        // original logical request, only after every final fence passes.
+        // Preserve the actual persisted native cut. Quorum progress is a
+        // separate proof and must never be relabelled as a native mutation.
+        // Return only after every final owner and quorum fence passes.
         if (comptime kind == .resolution) return table_write_source.history_resolution_wire.Reply.init(request, result.cut, result.resolution);
         if (comptime kind == .publication) return completion_history.CompletionPublicationObservation.init(request, result.cut, result.publication);
         return result;
