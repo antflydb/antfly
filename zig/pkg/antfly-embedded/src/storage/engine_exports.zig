@@ -1154,6 +1154,21 @@ fn retireSourceAttempt(self: *DB, command: @import("source_admission.zig").Comma
 fn beginSourceTransaction(self: *DB, command: @import("source_admission.zig").Command, created_at_ns: u64, participants: []const []const u8) engine.Outcome(types.TxnId) {
     return .{ .value = self.beginSourceTransaction(command, created_at_ns, participants) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn nativeSourcePlanControl(self: *DB, request: @import("source_plan_control.zig").Request) engine.Outcome(@import("source_plan_storage.zig").Status) {
+    return .{ .value = self.nativeSourcePlanControl(request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn applyOrderedSourcePlanControl(self: *DB, request: @import("source_plan_control.zig").Request, entry: types.OrderedApplyReceipt, bypass_write_gate: bool) engine.Outcome(@import("source_plan_control.zig").Outcome) {
+    return .{ .value = self.applyOrderedSourcePlanControl(request, entry, bypass_write_gate) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn sourcePlanObservation(self: *DB, query: @import("source_plan_control.zig").Query) engine.Outcome(@import("source_plan_control.zig").Observation) {
+    return .{ .value = self.sourcePlanObservation(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn sourcePlanChunk(self: *DB, allocator: Allocator, request: @import("source_plan_control.zig").ReadRequest) engine.Outcome(@import("source_plan_control.zig").Read) {
+    return .{ .value = self.sourcePlanChunk(allocator, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn orderedSourcePlanOutcome(self: *DB, recovery: @import("source_plan_control.zig").Recovery) engine.Outcome(@import("source_plan_control.zig").Outcome) {
+    return .{ .value = self.orderedSourcePlanOutcome(recovery) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn nativeHistoryConsumerControl(self: *DB, command: @import("history_consumer.zig").Command) engine.Outcome(@import("history_consumer.zig").Result) {
     return .{ .value = self.nativeHistoryConsumerControl(command) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

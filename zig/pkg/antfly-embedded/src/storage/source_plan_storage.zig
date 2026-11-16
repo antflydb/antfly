@@ -186,6 +186,23 @@ pub fn hasActive(txn: anytype, root: Root) !bool {
     return (try readQuota(txn, root)).active != 0;
 }
 
+/// Topology drain is a cold path, like the retained transaction scan. Include
+/// every retained physical generation: a stale generation may still owe cleanup.
+/// No payload chunks or manifests are read by this accounting check.
+pub fn hasRetainedArtifacts(txn: anytype) !bool {
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var entry = try cursor.seekAtOrAfter(quota_prefix);
+    while (entry) |item| {
+        if (!std.mem.startsWith(u8, item.key, quota_prefix)) break;
+        if (item.key.len != quota_prefix.len + 32) return error.SourceAdmissionCorrupt;
+        const root: Root = .{ .authority = .native, .namespace = item.key[quota_prefix.len..][0..24].*, .generation = std.mem.readInt(u64, item.key[quota_prefix.len + 24 ..][0..8], .big), .fence = @splat(1) };
+        if (try hasActive(txn, root)) return true;
+        entry = try cursor.next();
+    }
+    return false;
+}
+
 const Record = struct {
     spec: Spec,
     received: [16]u8 = @splat(0),
@@ -248,6 +265,35 @@ fn loadRecord(a: A, txn: anytype, root: Root, spec: Spec) !?std.json.Parsed(Enve
 
 /// A persistent root epoch fences old, absent grants without per-upload tombstones.
 /// Existing active records survive another upload's epoch advance.
+pub const Status = struct {
+    present: bool = false,
+    received: [16]u8 = @splat(0),
+    sealed_position: ?Digest = null,
+    fenced_position: ?Digest = null,
+    seal: ?Digest = null,
+    fence: ?Digest = null,
+    reclamation: ?Digest = null,
+};
+/// A snapshot observation, not authority by itself. The serving facade binds
+/// it to its independently qualified root and actual native/Raft read cut.
+pub fn inspect(a: A, txn: anytype, root: Root, spec: Spec) !Status {
+    try spec.validate(root);
+    if (try loadRecord(a, txn, root, spec)) |saved| {
+        var owned = saved;
+        defer owned.deinit();
+        const record = owned.value.record;
+        return .{
+            .present = true,
+            .received = record.received,
+            .sealed_position = record.sealed_position,
+            .fenced_position = record.fenced_position,
+            .seal = if (record.sealed_position) |position| sealProof(spec, position) else null,
+            .fence = if (record.fenced_position != null) fenceProof(spec) else null,
+        };
+    }
+    return .{ .reclamation = if (try reclaimed(txn, root, spec)) try reclamationProof(txn, root, spec) else null };
+}
+
 pub fn stageBegin(a: A, txn: anytype, root: Root, spec: Spec) !void {
     try spec.validate(root);
     if (try loadRecord(a, txn, root, spec)) |saved| {
@@ -332,6 +378,18 @@ pub fn readSealedAlloc(a: A, txn: anytype, root: Root, spec: Spec, expected_seal
     if (!same(checksum, spec.checksum) or !same(try frozenDigest(out), spec.plan_digest)) return error.SourceAdmissionCorrupt;
     return out;
 }
+pub fn readSealedChunkAlloc(a: A, txn: anytype, root: Root, spec: Spec, expected_seal: Digest, ordinal: usize) ![]u8 {
+    try spec.validate(root);
+    const expected_len = try spec.chunkLen(ordinal);
+    const status = try inspect(a, txn, root, spec);
+    if (status.fenced_position != null or status.reclamation != null) return error.SourceReceiptExpired;
+    const seal = status.seal orelse return error.SourcePendingWork;
+    if (!same(seal, expected_seal)) return error.SourcePayloadConflict;
+    const bytes = (try optionalGet(txn, &try chunkKey(root, spec.id(), ordinal))) orelse return error.SourceAdmissionCorrupt;
+    if (bytes.len != expected_len or !same(chunkDigest(ordinal, bytes), spec.chunk_hashes[ordinal])) return error.SourceAdmissionCorrupt;
+    return a.dupe(u8, bytes);
+}
+
 pub fn stageFence(a: A, txn: anytype, root: Root, spec: Spec, position: Digest) !Digest {
     try spec.validate(root);
     try validatePosition(root, position);

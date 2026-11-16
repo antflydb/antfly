@@ -1684,6 +1684,8 @@ pub const TxnManager = struct {
         var read = try self.store.beginRead();
         defer read.abort();
 
+        if (try @import("source_plan_storage.zig").hasRetainedArtifacts(&read)) return true;
+
         // Resolution normally removes intents and HA outboxes atomically before
         // a transaction becomes quiescent. Check the global prefixes once rather
         // than opening an intent cursor for every retained terminal record.

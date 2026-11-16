@@ -25946,6 +25946,168 @@ pub const DB = struct {
         return bytes;
     }
 
+    pub const source_plan_control = @import("../source_plan_control.zig");
+
+    fn requireSourcePlanAvailable(self: *DB) !void {
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (self.local_execution.replication_async_batch_mirror != null) return error.HistoryAuthorityRequired;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
+    }
+
+    /// The trusted serving owner independently qualifies the full catalog fence.
+    /// Native storage checks the physical namespace/generation and durable mode
+    /// from the same transaction that observes or changes the artifact.
+    fn requireSourcePlanPhysicalRoot(self: *DB, root: source_plan_control.storage.Root) !void {
+        try root.validate();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        if (!std.mem.eql(u8, &namespace, &root.namespace) or root.generation != self.core.root_generation) return error.HistoryResynchronizationRequired;
+    }
+
+    fn requireSourcePlanRoot(self: *DB, txn: anytype, root: source_plan_control.storage.Root) !@import("../source_authority.zig").State {
+        try self.requireSourcePlanPhysicalRoot(root);
+        const namespace = root.namespace;
+        const persisted = (try doc_identity.loadNamespaceTxn(txn)) orelse return error.HistoryResynchronizationRequired;
+        if (!persisted.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        return @import("../source_authority.zig").require(txn, if (root.authority == .native) .native else .raft, namespace);
+    }
+
+    fn applySourcePlanControlInTxn(self: *DB, txn: anytype, request: source_plan_control.Request, position: [32]u8) !source_plan_control.storage.Status {
+        try request.validate();
+        if (request.action == .begin and !(try source_plan_control.storage.inspect(self.alloc, txn, request.root, request.spec)).present)
+            try @import("relational_integrity_topology.zig").requireUnfenced(txn);
+        return source_plan_control.apply(self.alloc, txn, request, position);
+    }
+
+    pub fn nativeSourcePlanControl(self: *DB, request: source_plan_control.Request) !source_plan_control.storage.Status {
+        if (comptime storage_engine.enabled) return storage_engine.call("nativeSourcePlanControl", .{ self, request });
+        try request.validate();
+        if (request.root.authority != .native) return error.HistoryAuthorityRequired;
+        try self.requireSourcePlanAvailable();
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, request.root);
+        const sequence = try @import("../source_authority.zig").advance(&txn, request.root.namespace, null);
+        var position: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, position[0..8], sequence, .little);
+        position[31] = 2;
+        const result = try self.applySourcePlanControlInTxn(&txn, request, position);
+        try txn.commit();
+        return result;
+    }
+
+    /// Every deterministic rejection commits with the actual Raft apply marker.
+    /// Failed reducers are aborted before the rejection is written separately.
+    pub fn applyOrderedSourcePlanControl(self: *DB, request: source_plan_control.Request, entry: OrderedApplyReceipt, bypass_write_gate: bool) !source_plan_control.Outcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedSourcePlanControl", .{ self, request, entry, bypass_write_gate });
+        if (request.root.authority != .raft) return error.HistoryAuthorityRequired;
+        try self.requireSourcePlanAvailable();
+        var replication_mutation = if (bypass_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!bypass_write_gate) try self.enforceReplicationWriteGate();
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.requireSourcePlanAvailable();
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+            .already_applied => {
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                _ = try self.requireSourcePlanRoot(&read, request.root);
+                return source_plan_control.replay(self.alloc, &read, request, .{ .term = entry.term, .index = entry.index });
+            },
+            .apply => {},
+        }
+        var rejection: ?source_plan_control.Rejection = null;
+        while (true) {
+            var txn = try self.core.store.beginWriteTxn();
+            var txn_open = true;
+            defer if (txn_open) txn.abort();
+            try self.requireSourcePlanPhysicalRoot(request.root);
+            if (try doc_identity.loadNamespaceTxn(&txn)) |persisted| {
+                if (!persisted.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+            } else try doc_identity.writeNamespaceTxn(&txn, self.core.identity_namespace);
+            try @import("../source_authority.zig").bind(&txn, .raft, request.root.namespace);
+            _ = try self.requireSourcePlanRoot(&txn, request.root);
+            var position: [32]u8 = @splat(0);
+            std.mem.writeInt(u64, position[0..8], entry.term, .little);
+            std.mem.writeInt(u64, position[8..16], entry.index, .little);
+            position[31] = 1;
+            const outcome: source_plan_control.Outcome = if (rejection) |reason| .{ .rejected = reason } else .{
+                .applied = self.applySourcePlanControlInTxn(&txn, request, position) catch |err| {
+                    rejection = source_plan_control.Rejection.fromError(err) orelse return err;
+                    continue;
+                },
+            };
+            try source_plan_control.stageOutcome(self.alloc, &txn, request, .{ .term = entry.term, .index = entry.index }, outcome);
+            var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+            try txn.put(marker.key, marker.value);
+            try txn.commit();
+            txn_open = false;
+            return outcome;
+        }
+    }
+
+    fn sourcePlanObservationInTxn(self: *DB, txn: anytype, query: source_plan_control.Query) !source_plan_control.Observation {
+        try query.validate();
+        const authority = try self.requireSourcePlanRoot(txn, query.root);
+        var position: [32]u8 = @splat(0);
+        if (query.root.authority == .raft) {
+            const cut = try orderedHistoryReadCut(txn, query.minimum_applied_index);
+            std.mem.writeInt(u64, position[0..8], cut.term, .little);
+            std.mem.writeInt(u64, position[8..16], cut.index, .little);
+            position[31] = 1;
+        } else {
+            if (authority.sequence < query.minimum_native_sequence) return error.StorageReadTemporarilyUnavailable;
+            std.mem.writeInt(u64, position[0..8], authority.sequence, .little);
+            position[31] = 2;
+        }
+        return .{ .root = query.root, .cut = position, .quota = try source_plan_control.storage.readQuota(txn, query.root), .status = if (query.spec) |spec| try source_plan_control.storage.inspect(self.alloc, txn, query.root, spec) else null };
+    }
+
+    /// Serving Raft owners establish ReadIndex before this snapshot is opened.
+    /// A native root may return sequence zero before its first staging write.
+    pub fn sourcePlanObservation(self: *DB, query: source_plan_control.Query) !source_plan_control.Observation {
+        if (comptime storage_engine.enabled) return storage_engine.call("sourcePlanObservation", .{ self, query });
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        return self.sourcePlanObservationInTxn(&txn, query);
+    }
+
+    pub fn sourcePlanChunk(self: *DB, allocator: Allocator, request: source_plan_control.ReadRequest) !source_plan_control.Read {
+        if (comptime storage_engine.enabled) return storage_engine.call("sourcePlanChunk", .{ self, allocator, request });
+        try request.validate();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const observation = try self.sourcePlanObservationInTxn(&txn, request.query);
+        return .{ .observation = observation, .bytes = try source_plan_control.storage.readSealedChunkAlloc(allocator, &txn, request.query.root, request.query.spec.?, request.seal, request.ordinal) };
+    }
+
+    pub fn orderedSourcePlanOutcome(self: *DB, recovery: source_plan_control.Recovery) !source_plan_control.Outcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedSourcePlanOutcome", .{ self, recovery });
+        try self.requireSourcePlanAvailable();
+        if (recovery.request.root.authority != .raft or recovery.entry.term == 0 or recovery.entry.index == 0 or recovery.minimum_applied_index < recovery.entry.index) return error.InvalidSourceAdmission;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, recovery.request.root);
+        const cut = try orderedHistoryReadCut(&txn, recovery.minimum_applied_index);
+        if (cut.index == recovery.entry.index and cut.term != recovery.entry.term) return error.ConflictingOrderedApplyReceipt;
+        return source_plan_control.replay(self.alloc, &txn, recovery.request, recovery.entry);
+    }
+
     pub const HistoryConsumerGrant = @import("../history_consumer.zig").Grant;
     pub const HistoryConsumerReference = @import("../history_consumer.zig").Reference;
     pub const ordered_history = @import("../history_ordered.zig");

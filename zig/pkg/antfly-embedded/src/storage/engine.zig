@@ -550,6 +550,11 @@ pub const VTable = struct {
     runBackgroundMaintenanceWithCancellation: *const fn (*DB, types.CancellationToken) Outcome(bool),
     registry: *const fn () Outcome(*anyopaque),
     writeValidateGroupedSourceBatch: *const fn (std.mem.Allocator, *DB, []const types.BatchWrite, []const []const u8, []const types.DocumentTransform) Outcome(void),
+    nativeSourcePlanControl: *const fn (*DB, @import("source_plan_control.zig").Request) Outcome(@import("source_plan_storage.zig").Status),
+    applyOrderedSourcePlanControl: *const fn (*DB, @import("source_plan_control.zig").Request, types.OrderedApplyReceipt, bool) Outcome(@import("source_plan_control.zig").Outcome),
+    sourcePlanObservation: *const fn (*DB, @import("source_plan_control.zig").Query) Outcome(@import("source_plan_control.zig").Observation),
+    sourcePlanChunk: *const fn (*DB, std.mem.Allocator, @import("source_plan_control.zig").ReadRequest) Outcome(@import("source_plan_control.zig").Read),
+    orderedSourcePlanOutcome: *const fn (*DB, @import("source_plan_control.zig").Recovery) Outcome(@import("source_plan_control.zig").Outcome),
     nativeHistoryConsumerControl: *const fn (self: *DB, command: @import("history_consumer.zig").Command) Outcome(@import("history_consumer.zig").Result),
     nativeHistoryPage: *const fn (self: *DB, allocator: std.mem.Allocator, request: @import("history_page.zig").Request) Outcome(@import("history_page.zig").Page),
     provisionNativeHistoryAuthority: *const fn (self: *DB, expected_namespace: [24]u8) Outcome(void),
@@ -583,7 +588,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// called with the new union tags or enlarged result layout.
 /// Version 50 adds source-purpose completion methods and changes the by-value
 /// transaction intent/mutation layouts. Version 49 callers cannot share it.
-pub const descriptor_version: u32 = 50;
+/// Version 51 adds native/ordered frozen source-plan control and qualified reads.
+pub const descriptor_version: u32 = 51;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

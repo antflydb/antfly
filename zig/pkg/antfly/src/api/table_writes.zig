@@ -44957,6 +44957,13 @@ fn implementationTests() type {
             try std.testing.expectError(error.SourceBindingConflict, adapter.inner.validateScope(wrong));
         }
 
+        test "native source plan control persists exact seal cuts across the engine boundary" {
+            try @import("source_plan_native_test.zig").run(false);
+        }
+        test "native source plan control ordered apply retains rejection and reclamation cuts" {
+            try @import("source_plan_native_test.zig").run(true);
+        }
+
         test "native history consumer control persists leases and rejects Raft and foreign roots" {
             const a = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});

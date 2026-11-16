@@ -3887,3 +3887,52 @@ topology admission hooks, source-delivery adapters, and production worker wiring
 remain outstanding. It does not establish a public feed, coherent bootstrap,
 production pgoutput, or qualification with an existing CDC client. The full
 objective remains active and both issues remain incomplete.
+
+### Native source-plan owner facade and topology debt
+
+Added typed private commands and bounded status/owned-chunk observations around
+native artifact staging. `DB.nativeSourcePlanControl` verifies the persisted
+namespace, physical generation and native source authority, and advances its
+native source clock in the same transaction as the staging effect. Failed
+commands abort that clock advance. The first seal retains its original sequence.
+`DB.applyOrderedSourcePlanControl` accepts only Raft authority and commits the
+artifact effect or a deterministic typed rejection with the ordinary Raft apply
+marker. A reducer that rejects after staging writes is aborted before the
+rejection is recorded in a fresh transaction. Only the latest command outcome
+is retained; superseded outcomes require a qualified live observation rather
+than re-proposal. Exact-entry command/term conflicts fail closed.
+
+Observation and chunk reads verify physical identity, persisted authority and
+actual read cut in the same snapshot. A caller requesting a native sequence or
+Raft index ahead of that snapshot receives temporary unavailability. Chunk bytes
+are independently owned and bounded to 1 MiB. Full catalog-fence qualification
+remains the responsibility of the trusted serving owner; a supplied digest
+alone is insufficient. These methods reject unsupported mirrored-writer,
+hidden-child and active-restore profiles instead of silently omitting their
+required durability. Native engine descriptor version 51 includes the new
+methods; the opaque owner JSON ABI remains unchanged at this stage.
+
+Retained upload quota now contributes to the existing topology-sensitive-work
+scan. It inspects quota metadata, including retained physical generations, and
+never reads payloads. New upload admission requires an unfenced topology; exact
+retries and existing payloads can finish while topology waits for their debt.
+Cleanup must drain before the existing snapshot/cutover checks can succeed.
+
+Qualification: `source-plan-control-native-test.log` passes both actual linked
+engine cases for native and ordered commands. The subsequent broader
+`source-plan-control-qualified-test.log` command completed with exit 0:
+`zig build native-source-plan-control-test source-plan-storage-test source-plan-native-storage-test completion-frozen-plan-test source-admission-test -j2`.
+It reports both engine cases (including topology-fence admission), five existing
+bound-source admission regressions, both frozen-plan codec cases and the native
+DocStore recovery case passing, with no skips or leaks. The pure storage target
+also completed successfully. Native and Raft seal clocks, rejected-command
+rollback, lost-result recovery, command substitution, minimum-cut rejection,
+reopen, quota drain and post-reclamation late admission are checked. Formatting
+and diff checks passed. An initial compile-time name collision was corrected
+before qualification.
+
+Opaque-owner JSON transport, dedicated version-gated Raft dispatch, serving
+route qualification, source worker adapters and source-global checkpoint/head
+integration remain outstanding. Public feeds, coherent bootstrap/retention,
+production pgoutput and qualification with an existing CDC client remain part
+of the unchanged full goal. This does not complete either issue.
