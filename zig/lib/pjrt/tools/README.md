@@ -53,9 +53,10 @@ JAX_PLATFORMS=cpu JAX_ENABLE_X64=1 python zig/lib/pjrt/tools/prepare_embedding.p
   --model-dir "$EMBEDDING_MODEL_DIR" --out evidence/embedding
 ```
 
-Gemma's retained fixture contains the three text prompts, exact token IDs,
-output budgets and diagnostic Torchax reference token sequences. The model
-configuration is for Gemma 4 E4B. Stream the exact benchmark Q4 GGUF; the native
+Gemma's retained fixture contains only the three text prompts, exact input token
+IDs and output budgets. The configuration retains only the Gemma 4 E4B text
+backbone settings consumed by the exporter. Generated reference tokens and logit
+oracles stay in ignored evidence directories. Stream the exact benchmark Q4 GGUF; the native
 runner receives its **dequantized BF16** parameters, not Q4 device weights.
 The source file SHA256 is
 `676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee`.

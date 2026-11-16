@@ -145,9 +145,11 @@ The earlier Gemma native CUDA control remains in the neighboring
 `perf-gemma4-cuda/evidence/xla/native-text-v1/` worktree. Its relevant aggregate
 metrics and binary identity are copied into `results-l4.json`.
 
-## Follow-up GPU profiling
+## Current CUDA qualification
 
-The [matched direct GPU profiles](../../../pkg/inference/scripts/embeddinggemma2/profiling/README.md) remove HTTP overhead, identify the native attention hotspot and retain a faster isolated CUDA candidate. The updated direct timings narrow the short-request gap; the earlier tables above retain their original HTTP timing scope.
+The [CUDA qualification index](../../../pkg/inference/scripts/embeddinggemma2/profiling/README.md)
+links the final operator, media and automatic-default campaigns. The earlier
+tables above retain their original HTTP timing scope and explicit configurations.
 
 The [native global-attention follow-up](../../../pkg/inference/scripts/embeddinggemma2/profiling/GLOBAL_ATTENTION.md)
 records the opt-in CUDA implementation, final paired timings, memory and vector

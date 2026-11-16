@@ -124,7 +124,7 @@ component error 0.000591271.
 This does not resolve the separately documented strict CPU BF16 audio failures.
 
 Validation: 15 focused Zig tests pass in both CUDA and CPU builds; the complete
-CUDA inference type check and release benchmark build pass; 14 Python tests,
+CUDA inference type check and release benchmark build pass; 11 Python tests,
 Ruff and whitespace/format checks pass. The watch process panics after reporting
 successful tests with this Zig toolchain; a subsequent one-shot CUDA test/type
 check completes successfully. See the [machine-readable results](automatic-defaults-l4.json)
