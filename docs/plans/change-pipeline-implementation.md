@@ -2682,6 +2682,42 @@ independent metadata GC, owner-fenced retained-evidence GC, original-root topolo
 handoff and all public/source/bootstrap/pgoutput/client requirements remain
 outstanding.
 
+## In progress: read-only publication recovery observations
+
+Before enabling independent primary metadata GC, recovery needs a qualified read
+of the retained publication. `CompletionPublicationQuery` carries the complete
+original routed owner, transaction ID, manifest digest, commit version and
+positive minimum applied index. Its versioned request digest binds all those
+fields, and the observation validates that binding, actual cut, positive retained
+charge and first publication position. A claimed publication beyond the observed
+cut is rejected. `DB.historyCompletionPublication` checks the
+physical identity and reads one snapshot; it rejects hidden/restore scopes.
+The observation returns the actual persisted read cut and the immutable first
+publication position, certificate digest and retained charge. Missing publication
+is unproven, never permission to replay effects or release retention obligations.
+
+The publication reducer's retained-evidence checks are shared by a compile-time
+read-only branch: that branch can be instantiated with a read transaction which
+has no mutation methods. It validates the certificate, frozen plan, local receipt,
+CRT1 ledger, journal and accounting; it cannot create evidence or advance an apply
+marker. An orphaned retained ledger without its certificate is corruption, not
+absence. Engine descriptor 46 and owner ABI 100 cover the new native read entry.
+Source/control catalog generation passed. The first source native run passed
+all seven history-consumer cases and local storage discovery. The expanded run
+in `completion-publication-read-test.log` completed with exit 0, including the
+compiled-owner ABI-100 scope and all source consumer cases. It covers unproven
+absence, lagging cut, wrong physical root, wrong manifest, forged request digest,
+future publication position, positive no-effect publication and stable
+observations/accounting after reopen. A further source run in
+`completion-publication-read-recovery-test.log` passed all seven consumer cases
+and local storage discovery after removing the primary transaction record in the
+fixture and injecting ledger corruption: retained publication verification and
+idempotent replay still work without that record; corruption is rejected without
+repair or marker/accounting changes. This is evidence of storage independence,
+not qualification of a production GC policy. Routed/HTTP recovery qualification
+remains pending.
+No primary or retained-evidence GC has been enabled by this read-only primitive.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

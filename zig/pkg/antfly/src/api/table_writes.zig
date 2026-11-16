@@ -40589,6 +40589,10 @@ fn implementationTests() type {
                 }
             };
             const before_publication = try StateReader.read(&db);
+            var publication_query: retained_history.CompletionPublicationQuery = .{ .owner = routed_owner, .transaction_id = v2_id, .manifest_digest = (try v2.manifest(40)).digest(), .commit_version = 40, .minimum_applied_index = 13 };
+            const not_published = try db.historyCompletionPublication(a, publication_query);
+            try std.testing.expect(not_published.publication == null);
+            try std.testing.expectEqual(@as(u64, 13), not_published.cut.index);
             const certificate = try completion.encode(a, .{ .manifest = try v2.manifest(40), .resolutions = &.{receipt.resolution.?} });
             defer a.free(certificate);
             try std.testing.expectError(error.SourceOutcomeUnresolved, db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 13 }));
@@ -40603,6 +40607,25 @@ fn implementationTests() type {
             const publication = try db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 14 });
             const after_publication = try StateReader.read(&db);
             try std.testing.expectEqual(@as(u64, 14), publication.position.index);
+            const publication_observation = try db.historyCompletionPublication(a, publication_query);
+            try publication_observation.validate(publication_query);
+            var forged_observation = publication_observation;
+            forged_observation.request_digest[0] ^= 1;
+            try std.testing.expectError(error.HistoryCorrupt, forged_observation.validate(publication_query));
+            forged_observation = publication_observation;
+            forged_observation.publication.?.position.index += 1;
+            try std.testing.expectError(error.HistoryCorrupt, forged_observation.validate(publication_query));
+            try std.testing.expectEqualDeep(publication, publication_observation.publication.?);
+            try std.testing.expectEqual(@as(u64, 14), publication_observation.cut.index);
+            publication_query.minimum_applied_index = 15;
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.historyCompletionPublication(a, publication_query));
+            publication_query.minimum_applied_index = 14;
+            publication_query.owner = replacement_owner;
+            try std.testing.expectError(error.HistoryResynchronizationRequired, db.historyCompletionPublication(a, publication_query));
+            publication_query.owner = routed_owner;
+            publication_query.manifest_digest[0] ^= 1;
+            try std.testing.expectError(error.HistoryCorrupt, db.historyCompletionPublication(a, publication_query));
+            publication_query.manifest_digest[0] ^= 1;
             const publication_record_raw = try db.core.store.get(a, &retained_history.completionPublicationKey(14));
             defer a.free(publication_record_raw);
             const publication_record = try retained_history.CompletionPublicationRecord.decode(publication_record_raw);
@@ -40626,6 +40649,11 @@ fn implementationTests() type {
             try std.testing.expectEqualDeep(publication, try db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 14 }));
             try std.testing.expectEqualDeep(after_publication, try StateReader.read(&db));
             try std.testing.expectEqual(@as(u64, 15), (try db.orderedApplyReceipt()).?.index);
+            publication_query.minimum_applied_index = 15;
+            const reopened_publication = try db.historyCompletionPublication(a, publication_query);
+            try std.testing.expectEqualDeep(publication, reopened_publication.publication.?);
+            try std.testing.expectEqual(@as(u64, 15), reopened_publication.cut.index);
+            try std.testing.expectEqualDeep(after_publication, try StateReader.read(&db));
             var committed_guard_plan = guard_plan;
             committed_guard_plan.transaction_id = guard_id;
             const guard_certificate = try completion.encode(a, .{ .manifest = try committed_guard_plan.manifest(52), .resolutions = &.{guard_receipt.resolution.?} });
@@ -40633,6 +40661,8 @@ fn implementationTests() type {
             const guard_publication = try db.publishReplicatedCompletionCertificate(guard_certificate, routed_owner, .{ .term = 1, .index = 16 });
             const after_guard_publication = try StateReader.read(&db);
             try std.testing.expectEqual(@as(u64, 16), guard_publication.position.index);
+            const guard_observation = try db.historyCompletionPublication(a, .{ .owner = routed_owner, .transaction_id = guard_id, .manifest_digest = (try committed_guard_plan.manifest(52)).digest(), .commit_version = 52, .minimum_applied_index = 16 });
+            try std.testing.expectEqualDeep(guard_publication, guard_observation.publication.?);
             const guard_record_raw = try db.core.store.get(a, &retained_history.completionPublicationKey(16));
             defer a.free(guard_record_raw);
             const guard_record = try retained_history.CompletionPublicationRecord.decode(guard_record_raw);
@@ -40640,6 +40670,37 @@ fn implementationTests() type {
             try std.testing.expectEqual(after_publication.reserved_bytes - try committed_guard_plan.reservationBytes(guard_bytes.len), after_guard_publication.reserved_bytes);
             try std.testing.expectEqual(after_publication.retained_bytes + guard_publication.retained_bytes, after_guard_publication.retained_bytes);
             try std.testing.expectEqual(before_publication.latest, after_guard_publication.latest);
+
+            // Simulate a primary metadata compaction independently of the
+            // retained completion material; this does not enable GC policy.
+            try db.core.store.delete(&(completion.record_prefix.* ++ v2_id));
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(v2_id));
+            publication_query.minimum_applied_index = 16;
+            const without_primary = try db.historyCompletionPublication(a, publication_query);
+            try without_primary.validate(publication_query);
+            try std.testing.expectEqualDeep(publication, without_primary.publication.?);
+            try std.testing.expectEqual(@as(u64, 16), without_primary.cut.index);
+            try std.testing.expectEqualDeep(publication, try db.publishReplicatedCompletionCertificate(certificate, routed_owner, .{ .term = 1, .index = 14 }));
+            try std.testing.expectEqualDeep(after_guard_publication, try StateReader.read(&db));
+
+            // A corrupt retained ledger must neither become absence nor be
+            // repaired by this read-only path.
+            const retained_record_key = try std.fmt.allocPrint(a, "\x00\x00__committed_history__:completion_retained:{s}", .{&v2_id});
+            defer a.free(retained_record_key);
+            const retained_record = try db.core.store.get(a, retained_record_key);
+            defer a.free(retained_record);
+            retained_record[4] ^= 1;
+            try db.core.store.putBatch(&.{.{ .key = retained_record_key, .value = retained_record }}, &.{});
+            try std.testing.expectError(error.HistoryCorrupt, db.historyCompletionPublication(a, publication_query));
+            const still_corrupt = try db.core.store.get(a, retained_record_key);
+            defer a.free(still_corrupt);
+            try std.testing.expectEqualStrings(retained_record, still_corrupt);
+            retained_record[4] ^= 1;
+            try db.core.store.putBatch(&.{.{ .key = retained_record_key, .value = retained_record }}, &.{});
+            const restored_publication = try db.historyCompletionPublication(a, publication_query);
+            try std.testing.expectEqualDeep(publication, restored_publication.publication.?);
+            try std.testing.expectEqual(@as(u64, 16), (try db.orderedApplyReceipt()).?.index);
+            try std.testing.expectEqualDeep(after_guard_publication, try StateReader.read(&db));
         }
 
         test "ordered history consumer grant wire contracts" {

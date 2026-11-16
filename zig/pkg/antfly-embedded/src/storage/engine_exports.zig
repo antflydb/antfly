@@ -1165,6 +1165,10 @@ fn publishReplicatedCompletionCertificate(self: *DB, raw: []const u8, owner: @im
     return .{ .value = self.publishReplicatedCompletionCertificate(raw, owner, entry) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn historyCompletionPublication(self: *DB, allocator: Allocator, query: @import("committed_history.zig").CompletionPublicationQuery) engine.Outcome(@import("committed_history.zig").CompletionPublicationObservation) {
+    return .{ .value = self.historyCompletionPublication(allocator, query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn historyResolution(self: *DB, allocator: Allocator, request: @import("history_resolution_wire.zig").Request) engine.Outcome(@import("history_resolution_wire.zig").Reply) {
     return .{ .value = self.historyResolution(allocator, request) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

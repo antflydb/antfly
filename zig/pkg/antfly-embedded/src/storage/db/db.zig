@@ -26025,6 +26025,22 @@ pub const DB = struct {
         return result;
     }
 
+    /// ReadIndex must already be established by the serving owner. Publication,
+    /// ledger, local receipt and actual cut are verified in one read snapshot.
+    pub fn historyCompletionPublication(self: *DB, allocator: std.mem.Allocator, query: @import("../committed_history.zig").CompletionPublicationQuery) !@import("../committed_history.zig").CompletionPublicationObservation {
+        if (comptime storage_engine.enabled) return storage_engine.call("historyCompletionPublication", .{ self, allocator, query });
+        if (self.isClosed()) return error.StorageUnavailable;
+        if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (self.local_execution.restore_staging_required.load(.acquire)) return error.ChangefeedCapabilityUnsupported;
+        try query.validate();
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        const identity = (try doc_identity.loadNamespaceTxn(&txn)) orelse return error.HistoryResynchronizationRequired;
+        if (!identity.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+        return @import("../committed_history.zig").readCompletionPublication(allocator, &txn, namespace, self.core.root_generation, query);
+    }
+
     /// Authenticated native owner provisioning for a resident managed writer.
     /// The serving owner must already have resolved this exact namespace from
     /// its linearizable catalog. This cannot convert a Raft-owned artifact.

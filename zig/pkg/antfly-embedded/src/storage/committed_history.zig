@@ -35,6 +35,51 @@ pub const completion_certificate_prefix = "\x00\x00__committed_history__:complet
 const completion_retained_prefix = "\x00\x00__committed_history__:completion_retained:";
 pub const CompletionPublicationPosition = struct { term: u64, index: u64 };
 pub const CompletionPublication = struct { digest: completion.Digest, retained_bytes: u64, position: CompletionPublicationPosition };
+pub const CompletionPublicationQuery = struct {
+    version: u8 = 1,
+    owner: completion.RoutedOwner,
+    transaction_id: [16]u8,
+    manifest_digest: completion.Digest,
+    commit_version: u64,
+    minimum_applied_index: u64,
+    pub fn validate(self: CompletionPublicationQuery) !void {
+        try self.owner.validate();
+        if (self.version != 1 or self.commit_version == 0 or self.minimum_applied_index == 0 or std.mem.allEqual(u8, &self.transaction_id, 0) or std.mem.allEqual(u8, &self.manifest_digest, 0)) return error.InvalidHistoryAdmission;
+    }
+    pub fn digest(self: CompletionPublicationQuery) completion.Digest {
+        var sha = std.crypto.hash.sha2.Sha256.init(.{});
+        sha.update("antfly:history-completion-publication-read:v1");
+        sha.update(&.{self.version});
+        sha.update(&self.owner.digest());
+        sha.update(&self.transaction_id);
+        sha.update(&self.manifest_digest);
+        for ([_]u64{ self.commit_version, self.minimum_applied_index }) |value| {
+            var raw: [8]u8 = undefined;
+            std.mem.writeInt(u64, &raw, value, .little);
+            sha.update(&raw);
+        }
+        return sha.finalResult();
+    }
+};
+pub const CompletionPublicationObservation = struct {
+    version: u8 = 1,
+    request_digest: completion.Digest,
+    cut: CompletionPublicationPosition,
+    publication: ?CompletionPublication,
+    pub fn init(query: CompletionPublicationQuery, cut: CompletionPublicationPosition, publication: ?CompletionPublication) !CompletionPublicationObservation {
+        const result: CompletionPublicationObservation = .{ .request_digest = query.digest(), .cut = cut, .publication = publication };
+        try result.validate(query);
+        return result;
+    }
+    pub fn validate(self: CompletionPublicationObservation, query: CompletionPublicationQuery) !void {
+        try query.validate();
+        if (self.version != 1 or !std.mem.eql(u8, &self.request_digest, &query.digest()) or self.cut.term == 0 or self.cut.index < query.minimum_applied_index) return error.HistoryCorrupt;
+        if (self.publication) |publication| {
+            if (std.mem.allEqual(u8, &publication.digest, 0) or publication.retained_bytes == 0 or publication.retained_bytes > 2 * completion.max_bytes + 128 or publication.position.term == 0 or publication.position.index == 0 or publication.position.index > self.cut.index or publication.position.term > self.cut.term or (publication.position.index == self.cut.index and publication.position.term != self.cut.term)) return error.HistoryCorrupt;
+        }
+    }
+};
+
 pub const completion_publication_prefix = "\x00\x00__committed_history__:completion_publication:";
 pub fn completionPublicationKey(index: u64) [completion_publication_prefix.len + 8]u8 {
     var key: [completion_publication_prefix.len + 8]u8 = undefined;
@@ -316,6 +361,34 @@ const RetainedCompletion = struct {
 /// The caller holds native apply admission and commits this transaction together
 /// with its ordered marker; failures require aborting the entire transaction.
 pub fn publishCompletion(a: A, txn: anytype, physical_namespace: frame.Namespace, physical_root_generation: u64, owner: completion.RoutedOwner, raw: []const u8, position: CompletionPublicationPosition, allow_create: bool) !CompletionPublication {
+    return completionPublication(a, txn, physical_namespace, physical_root_generation, owner, raw, position, allow_create, true);
+}
+
+/// A read snapshot can verify the same immutable evidence without acquiring a
+/// write transaction, advancing a marker or recreating a missing publication.
+pub fn readCompletionPublication(a: A, txn: anytype, physical_namespace: frame.Namespace, physical_root_generation: u64, query: CompletionPublicationQuery) !CompletionPublicationObservation {
+    try query.validate();
+    if (!std.mem.eql(u8, &physical_namespace, &query.owner.namespace) or query.owner.root_generation != physical_root_generation) return error.HistoryResynchronizationRequired;
+    const state = (try load(txn)) orelse return error.HistoryResynchronizationRequired;
+    try requireNamespace(txn, state, physical_namespace);
+    _ = try authority.require(txn, .raft, physical_namespace);
+    const marker = (try optional(txn, &keys.ordered_document_applied_entry_key)) orelse return error.StorageReadTemporarilyUnavailable;
+    if (marker.len != 16) return error.HistoryCorrupt;
+    const cut: CompletionPublicationPosition = .{ .term = std.mem.readInt(u64, marker[0..8], .little), .index = std.mem.readInt(u64, marker[8..16], .little) };
+    if (cut.term == 0 or cut.index == 0) return error.HistoryCorrupt;
+    if (cut.index < query.minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
+    const raw = (try optional(txn, &completionCertificateKey(query.transaction_id))) orelse {
+        if (try optional(txn, &completionRetainedKey(query.transaction_id)) != null) return error.HistoryCorrupt;
+        return CompletionPublicationObservation.init(query, cut, null);
+    };
+    var certificate = try completion.parse(a, raw);
+    defer certificate.deinit();
+    const manifest = certificate.value.certificate.manifest;
+    if (!std.mem.eql(u8, &manifest.transaction_id, &query.transaction_id) or !std.mem.eql(u8, &manifest.digest(), &query.manifest_digest) or manifest.commit_version != query.commit_version) return error.HistoryCorrupt;
+    return CompletionPublicationObservation.init(query, cut, try completionPublication(a, txn, physical_namespace, physical_root_generation, query.owner, raw, cut, false, false));
+}
+
+fn completionPublication(a: A, txn: anytype, physical_namespace: frame.Namespace, physical_root_generation: u64, owner: completion.RoutedOwner, raw: []const u8, position: CompletionPublicationPosition, allow_create: bool, comptime writable: bool) !CompletionPublication {
     try owner.validate();
     if (position.term == 0 or position.index == 0) return error.InvalidHistoryAdmission;
     if (!std.mem.eql(u8, &physical_namespace, &owner.namespace) or owner.root_generation != physical_root_generation) return error.HistoryResynchronizationRequired;
@@ -372,21 +445,23 @@ pub fn publishCompletion(a: A, txn: anytype, physical_namespace: frame.Namespace
         if (!std.mem.eql(u8, &index_record.transaction_id, &id) or !std.mem.eql(u8, &index_record.certificate_digest, &previous.certificate_digest) or !std.meta.eql(index_record.position, previous.position) or previous.position.index > std.mem.readInt(u64, marker[8..16], .little) or previous.position.term > std.mem.readInt(u64, marker[0..8], .little)) return error.HistoryCorrupt;
         return .{ .digest = previous.certificate_digest, .retained_bytes = previous.bytes, .position = previous.position };
     }
-    if (!allow_create) return error.SourceOutcomeUnresolved;
-    if (position.index <= std.mem.readInt(u64, marker[8..16], .little) or position.term < std.mem.readInt(u64, marker[0..8], .little)) return error.HistoryAuthorityRequired;
-    if (try optional(txn, &publication_key) != null) return error.HistoryCorrupt;
-    const reserved = try plan.value.admission.reservationBytes(plan_raw.len);
-    if (credit.bytes != reserved or !std.mem.eql(u8, &credit.digest, &plan.value.digest) or charge > reserved or state.reserved_bytes < reserved) return error.HistoryCorrupt;
-    state.reserved_bytes -= reserved;
-    state.retained_bytes = std.math.add(u64, state.retained_bytes, charge) catch return error.HistoryFull;
-    if (state.retained_bytes > state.limit or state.reserved_bytes > state.limit - state.retained_bytes) return error.HistoryFull;
-    const index_record: CompletionPublicationRecord = .{ .transaction_id = id, .position = position, .certificate_digest = retained.certificate_digest };
-    try txn.put(&publication_key, &index_record.encode());
-    try txn.put(&certificate_key, canonical);
-    try txn.put(&retained_key, &retained.encode());
-    try txn.delete(&completionCreditKey(id));
-    try save(txn, state);
-    return .{ .digest = retained.certificate_digest, .retained_bytes = retained.bytes, .position = position };
+    if (comptime writable) {
+        if (!allow_create) return error.SourceOutcomeUnresolved;
+        if (position.index <= std.mem.readInt(u64, marker[8..16], .little) or position.term < std.mem.readInt(u64, marker[0..8], .little)) return error.HistoryAuthorityRequired;
+        if (try optional(txn, &publication_key) != null) return error.HistoryCorrupt;
+        const reserved = try plan.value.admission.reservationBytes(plan_raw.len);
+        if (credit.bytes != reserved or !std.mem.eql(u8, &credit.digest, &plan.value.digest) or charge > reserved or state.reserved_bytes < reserved) return error.HistoryCorrupt;
+        state.reserved_bytes -= reserved;
+        state.retained_bytes = std.math.add(u64, state.retained_bytes, charge) catch return error.HistoryFull;
+        if (state.retained_bytes > state.limit or state.reserved_bytes > state.limit - state.retained_bytes) return error.HistoryFull;
+        const index_record: CompletionPublicationRecord = .{ .transaction_id = id, .position = position, .certificate_digest = retained.certificate_digest };
+        try txn.put(&publication_key, &index_record.encode());
+        try txn.put(&certificate_key, canonical);
+        try txn.put(&retained_key, &retained.encode());
+        try txn.delete(&completionCreditKey(id));
+        try save(txn, state);
+        return .{ .digest = retained.certificate_digest, .retained_bytes = retained.bytes, .position = position };
+    } else return error.SourceOutcomeUnresolved;
 }
 
 /// Called under the native prepare/apply fence, before publishing the vote.
