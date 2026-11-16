@@ -1069,6 +1069,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             payload: []const u8,
             sequence: u64,
             writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+            deleted_keys: []const []const u8,
             owned_keys: *std.ArrayListUnmanaged([]u8),
             owned_values: *std.ArrayListUnmanaged([]u8),
         ) !void {
@@ -1096,7 +1097,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }.lessThan);
 
-            if (decoded.record.changed_doc_keys.len != 0 or decoded.record.deleted_doc_keys.len != 0 or decoded.record.overwritten_doc_keys.len != 0) {
+            // A replay notification can name existing documents merely to
+            // reconsider a new producer. Only actual stored-row mutations
+            // advance the primary frontier; artifact-only work must not.
+            var primary_changed = false;
+            for (writes.items) |write| if (internal_keys.isStoredDocumentRowKey(write.key)) {
+                primary_changed = true;
+                break;
+            };
+            if (!primary_changed) for (deleted_keys) |key| if (internal_keys.isStoredDocumentRowKey(key)) {
+                primary_changed = true;
+                break;
+            };
+            if (primary_changed) {
                 const key = try alloc.dupe(u8, &internal_keys.primary_source_revision_key);
                 try appendSourceRevisionWrite(alloc, key, sequence, writes, owned_keys, owned_values);
             }

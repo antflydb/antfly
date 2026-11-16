@@ -8953,6 +8953,7 @@ pub const DB = struct {
             replay_payload,
             sequence,
             &store_writes,
+            delete_keys.items,
             &owned_store_keys,
             &owned_store_values,
         );
@@ -32637,7 +32638,7 @@ pub const DB = struct {
             for (revision_values.items) |value| self.alloc.free(value);
             revision_values.deinit(self.alloc);
         }
-        try appendArtifactSourceRevisionWritesFromReplay(self.alloc, replay, sequence, &writes, &revision_keys, &revision_values);
+        try appendArtifactSourceRevisionWritesFromReplay(self.alloc, replay, sequence, &writes, mutation.deletes.items, &revision_keys, &revision_values);
         var context = self.batchContext();
         var primary_replication = try PrimaryReplicationEffect.prepare(&context, writes.items, mutation.deletes.items, replay);
         defer primary_replication.deinit(self.alloc);
@@ -55360,7 +55361,7 @@ fn appendReplicatedDerivedEffectContext(ctx: *const BatchExecutionContext, chang
         try appendAssetArtifactSourceIndexMutations(ctx.alloc, &writes, artifact_deletes.items, &deletes, &owned_keys, &owned_values, &owned_deletes);
         try appendRetiredDirectGraphTtlDueDeletes(ctx.alloc, ctx.store, ctx.index_manager, writes.items, deletes.items, &deletes, &owned_deletes);
     }
-    try appendArtifactSourceRevisionWritesFromReplay(ctx.alloc, payload, sequence, &writes, &owned_keys, &owned_values);
+    try appendArtifactSourceRevisionWritesFromReplay(ctx.alloc, payload, sequence, &writes, deletes.items, &owned_keys, &owned_values);
     const summary = try doc_identity.visibilitySummaryFromWrites(writes.items);
     var catalog: ?table_catalog_mod.Catalog = null;
     for (writes.items) |write| if (std.mem.eql(u8, write.key, table_catalog_mod.key)) {
@@ -55397,6 +55398,7 @@ fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionCont
         payload,
         sequence,
         &writes,
+        &.{},
         &owned_keys,
         &owned_values,
     );
@@ -155485,7 +155487,8 @@ test "privacy scoped readiness serves A while sibling B backfills" {
     const a_applied = try db.core.loadAppliedSequence(a, "A");
     const sibling_tail = try appendDerivedBatchRecord(&db, .{ .documents = &.{.{
         .key = "doc",
-        .action = .preserve_base_document,
+        .action = .upsert,
+        .cleaned_value = "{\"body\":\"Orchard guidance.\"}",
         .targets = &.{.{ .kind = .dense_vector, .index_name = "B" }},
     }} });
     try std.testing.expect(sibling_tail > a_applied);

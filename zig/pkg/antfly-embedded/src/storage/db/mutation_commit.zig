@@ -2867,6 +2867,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     replay_payload,
                     sequence,
                     &write_buffers.store_writes,
+                    write_buffers.delete_keys.items,
                     &write_buffers.owned_store_keys,
                     &write_buffers.owned_store_values,
                 );
