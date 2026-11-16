@@ -40,12 +40,12 @@ const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
 
 const Allocator = std.mem.Allocator;
-// CDC checkpoints are external resume positions. Only publish progress after
-// the applied row is visible through query/index paths. This level is safe
-// for streaming apply and for any snapshot write outside an open bulk-ingest
-// window, because the embedding/enrichment runtime can always see the write
-// it is asked to wait on.
-const cdc_apply_sync_level = db_mod.types.SyncLevel.full_index;
+// Provider resume progress follows durable destination completion. Derived
+// indexes publish their own frontiers and may be unavailable independently;
+// waiting for them here would retain provider WAL after the rows are committed.
+// requireReplicationCommitComplete still rejects unresolved destination votes
+// and propagation. This level alone does not supply durable retry identity.
+const cdc_apply_sync_level = db_mod.types.SyncLevel.write;
 // Snapshot batches applied *inside* a table's bulk-ingest window
 // (`beginBackfillBulkIngestWindow`..`finishBackfillBulkIngestWindow`) must
 // not request `.full_index`/`.enrichments`. Those levels wait on the
@@ -1847,8 +1847,8 @@ pub const StreamingReplicationRunner = struct {
                     status,
                 );
             }
-            // Streaming apply happens outside any bulk-ingest window, so the
-            // enrichment runtime can always see the row being waited on here.
+            // Advance the provider frontier after complete durable effects;
+            // index visibility is an independent publication obligation.
             const apply_summary = try applyReplicationTransaction(self.alloc, self.write_source, table.name, transaction, parsed, cdc_apply_sync_level);
             for (transaction) |member| {
                 try self.reachLifecycle(
@@ -7083,7 +7083,7 @@ test "metadata replication stream rejects a later invalid member without applyin
     try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("count").?.integer);
 }
 
-test "metadata replication stream resumes a whole transaction after a later member fails" {
+test "metadata replication stream resumes complete durable transactions while derived indexes are unavailable" {
     const alloc = std.testing.allocator;
     const State = struct {
         const Self = @This();
@@ -7092,7 +7092,10 @@ test "metadata replication stream resumes a whole transaction after a later memb
         polls: usize = 0,
         resumed: bool = false,
 
-        fn batch(ptr: *anyopaque, _: Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+        fn batch(ptr: *anyopaque, _: Allocator, _: []const u8, request: db_mod.types.BatchRequest) !?void {
+            // Model a permanently unavailable derived index. The real stream
+            // runner must still commit rows and persist its provider frontier.
+            if (request.sync_level != .write) return error.EnrichmentWorkerFailed;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             if (!self.failed and self.calls == 2) {

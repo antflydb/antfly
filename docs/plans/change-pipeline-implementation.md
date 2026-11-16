@@ -4334,3 +4334,25 @@ fencing by itself. Historical retry bounds, cross-topology recovery, other
 destination integrations, public feeds, coherent bootstrap/retention, production
 pgoutput and existing-client qualification remain required. The full goal and
 both issues remain incomplete.
+
+### PostgreSQL stream progress independent of derived indexes
+
+Production `StreamingReplicationRunner` now requests `.write` for complete
+source transactions, matching the durable snapshot apply level. Provider resume
+progress no longer waits on the embedding/index publication frontier. Atomic
+commit capability, conflicts, unresolved propagation, and unexpected unresolved
+visibility results still fail closed before the status checkpoint advances.
+This change does not add stable batch identity, destination checkpoint intents,
+or lost-reply recovery to this existing production runner.
+
+Qualification: `ZIG_GLOBAL_CACHE_DIR=.zig-cache/global zig build
+source-transaction-test -j2` completed with exit zero
+(`source-stream-durable-test.log`). The 30 CDC/provider transaction checks and
+three lake native row-commit checks passed with zero skips/failures/leaks, as
+did the shared source-envelope and effect-plan checks. The runner recovery
+fixture models a permanently unavailable derived index, injects a destination
+failure in a later transaction, verifies that the failed transaction's checkpoint
+was never persisted, and resumes the complete transaction from the prior durable
+checkpoint while index waits remain unavailable. Native distributed destination
+admission, stable retry identity, and the full retained-history/pgoutput production
+integration remain required under the overall issue contracts.
