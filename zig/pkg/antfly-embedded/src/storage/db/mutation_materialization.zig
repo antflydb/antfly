@@ -1064,35 +1064,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendKeysForPrefixDeleteInStore(alloc, store, deletes, owned_keys, rebuild_prefix);
         }
 
-        pub fn appendArtifactSourceRevisionWritesFromReplay(
+        pub fn appendSourceRevisionWritesForEffects(
             alloc: Allocator,
-            payload: []const u8,
             sequence: u64,
             writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
             deleted_keys: []const []const u8,
+            promotions: []const docstore_mod.DocStore.KeyPromotion,
+            previously_written_keys: []const []const u8,
             owned_keys: *std.ArrayListUnmanaged([]u8),
             owned_values: *std.ArrayListUnmanaged([]u8),
         ) !void {
-            var decoded = try change_journal_mod.decodeBinaryRecordBorrowed(alloc, payload);
-            defer decoded.deinit();
-            if (decoded.record.sequence != sequence) return error.InvalidDerivedSequence;
-
             var artifact_names = std.ArrayListUnmanaged([]u8).empty;
             defer {
                 for (artifact_names.items) |name| alloc.free(name);
                 artifact_names.deinit(alloc);
             }
-            inline for (.{ decoded.record.changed_artifact_keys, decoded.record.deleted_doc_keys }) |artifact_keys| {
-                for (artifact_keys) |artifact_key| {
-                    if (try internal_keys.artifactNameView(artifact_key)) |artifact_name| {
-                        try appendUniqueOwnedKey(alloc, &artifact_names, artifact_name);
-                        continue;
-                    }
-                    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
-                    defer artifact_ref.deinit(alloc);
-                    try appendUniqueOwnedKey(alloc, &artifact_names, artifact_ref.name);
-                }
-            }
+            // Replay records also contain cached vectors queued for projection.
+            // Only actual source effects may move a consumer's source frontier.
+            // Legacy producers supply explicit keys written before this append;
+            // promotions name their final (rather than scratch) identities.
+            for (writes.items) |write| try appendArtifactSourceName(alloc, &artifact_names, write.key);
+            for (deleted_keys) |key| try appendArtifactSourceName(alloc, &artifact_names, key);
+            for (promotions) |promotion| try appendArtifactSourceName(alloc, &artifact_names, promotion.destination_key);
+            for (previously_written_keys) |key| try appendArtifactSourceName(alloc, &artifact_names, key);
             std.mem.sortUnstable([]u8, artifact_names.items, {}, struct {
                 fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
                     return std.mem.order(u8, lhs, rhs) == .lt;
@@ -1119,6 +1113,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const key = try internal_keys.artifactSourceRevisionKeyAlloc(alloc, artifact_name);
                 try appendSourceRevisionWrite(alloc, key, sequence, writes, owned_keys, owned_values);
             }
+        }
+
+        fn appendArtifactSourceName(alloc: Allocator, names: *std.ArrayListUnmanaged([]u8), key: []const u8) !void {
+            if (try internal_keys.artifactNameView(key)) |name| return appendUniqueOwnedKey(alloc, names, name);
+            var artifact = (try decodeArtifactRefIfKnownAlloc(alloc, key)) orelse return;
+            defer artifact.deinit(alloc);
+            try appendUniqueOwnedKey(alloc, names, artifact.name);
         }
 
         fn appendSourceRevisionWrite(

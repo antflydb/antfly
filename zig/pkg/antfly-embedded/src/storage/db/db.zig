@@ -8948,12 +8948,13 @@ pub const DB = struct {
         const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), derived_batch, sequence);
         defer self.alloc.free(replay_payload);
 
-        try appendArtifactSourceRevisionWritesFromReplay(
+        try appendSourceRevisionWritesForEffects(
             self.alloc,
-            replay_payload,
             sequence,
             &store_writes,
             delete_keys.items,
+            &.{},
+            &.{},
             &owned_store_keys,
             &owned_store_values,
         );
@@ -28706,7 +28707,7 @@ pub const DB = struct {
         for (command.mutations) |effect| {
             if (effect.value) |value| try writes.append(self.alloc, .{ .key = effect.key, .value = value }) else try deletes.append(self.alloc, effect.key);
         }
-        try appendArtifactSourceRevisionWritesFromReplay(self.alloc, replay, sequence, &writes, deletes.items, &owned_keys, &owned_values);
+        try appendSourceRevisionWritesForEffects(self.alloc, sequence, &writes, deletes.items, &.{}, &.{}, &owned_keys, &owned_values);
         try appendDenseArtifactCounterMutations(self.alloc, self.core.store, self.core.index_manager, &writes, deletes.items, &owned_keys, &owned_values);
         var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         try writes.append(self.alloc, orderedApplyReceiptWrite(entry, &marker_buf));
@@ -32639,7 +32640,7 @@ pub const DB = struct {
             for (revision_values.items) |value| self.alloc.free(value);
             revision_values.deinit(self.alloc);
         }
-        try appendArtifactSourceRevisionWritesFromReplay(self.alloc, replay, sequence, &writes, mutation.deletes.items, &revision_keys, &revision_values);
+        try appendSourceRevisionWritesForEffects(self.alloc, sequence, &writes, mutation.deletes.items, &.{}, &.{}, &revision_keys, &revision_values);
         var context = self.batchContext();
         var primary_replication = try PrimaryReplicationEffect.prepare(&context, writes.items, mutation.deletes.items, replay);
         defer primary_replication.deinit(self.alloc);
@@ -50836,7 +50837,7 @@ fn encodeDirectChangeRecordPayload(
 
 const encodeThinReplayRecordPayload = local_mutation.encodeThinReplayRecordPayload;
 
-const appendArtifactSourceRevisionWritesFromReplay = local_mutation.appendArtifactSourceRevisionWritesFromReplay;
+const appendSourceRevisionWritesForEffects = local_mutation.appendSourceRevisionWritesForEffects;
 
 const appendUniqueOwnedKey = @import("owned_keys.zig").appendUniqueOwnedKey;
 
@@ -54493,7 +54494,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
-    try appendArtifactSourceRevisionWritesFromReplay(ctx.alloc, replay_payload, sequence, &store_writes, delete_keys.items, &owned_store_keys, &owned_store_values);
+    try appendSourceRevisionWritesForEffects(ctx.alloc, sequence, &store_writes, delete_keys.items, &.{}, &.{}, &owned_store_keys, &owned_store_values);
     var primary_replication = try PrimaryReplicationEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
     defer primary_replication.deinit(ctx.alloc);
     try primary_replication.stage(ctx, &store_writes);
@@ -55249,7 +55250,7 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
         };
         var guard: Guard = .{ .required = required };
         _ = try ctx.store.putBatchWithPromotionsReplayAndBuiltWrite(ctx.io, &.{}, &.{}, &.{}, .{ .sequence = sequence, .payload = payload }, null, .{ .ptr = &guard, .validate = Guard.validate });
-    } else try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence, batch.generated_enrichment_refs);
+    } else try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence, batch);
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
@@ -55367,7 +55368,7 @@ fn appendReplicatedDerivedEffectContext(ctx: *const BatchExecutionContext, chang
         try appendAssetArtifactSourceIndexMutations(ctx.alloc, &writes, artifact_deletes.items, &deletes, &owned_keys, &owned_values, &owned_deletes);
         try appendRetiredDirectGraphTtlDueDeletes(ctx.alloc, ctx.store, ctx.index_manager, writes.items, deletes.items, &deletes, &owned_deletes);
     }
-    try appendArtifactSourceRevisionWritesFromReplay(ctx.alloc, payload, sequence, &writes, deletes.items, &owned_keys, &owned_values);
+    try appendSourceRevisionWritesForEffects(ctx.alloc, sequence, &writes, deletes.items, &.{}, &.{}, &owned_keys, &owned_values);
     const summary = try doc_identity.visibilitySummaryFromWrites(writes.items);
     var catalog: ?table_catalog_mod.Catalog = null;
     for (writes.items) |write| if (std.mem.eql(u8, write.key, table_catalog_mod.key)) {
@@ -55386,7 +55387,8 @@ fn appendReplicatedDerivedEffectContext(ctx: *const BatchExecutionContext, chang
     return sequence;
 }
 
-fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionContext, payload: []const u8, sequence: u64, requests: []const enrichment_types.GeneratedEnrichmentRef) !void {
+fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionContext, payload: []const u8, sequence: u64, batch: derived_types.DerivedBatch) !void {
+    const requests = batch.generated_enrichment_refs;
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer writes.deinit(ctx.alloc);
     var owned_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -55399,12 +55401,13 @@ fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionCont
         for (owned_values.items) |value| ctx.alloc.free(value);
         owned_values.deinit(ctx.alloc);
     }
-    try appendArtifactSourceRevisionWritesFromReplay(
+    try appendSourceRevisionWritesForEffects(
         ctx.alloc,
-        payload,
         sequence,
         &writes,
+        batch.deleted_keys,
         &.{},
+        batch.changed_artifact_keys,
         &owned_keys,
         &owned_values,
     );
@@ -57004,7 +57007,7 @@ fn appendResolutionRecordWithProjection(
         for (revision_values.items) |value| batch_ctx.alloc.free(value);
         revision_values.deinit(batch_ctx.alloc);
     }
-    try appendArtifactSourceRevisionWritesFromReplay(batch_ctx.alloc, payload, sequence, &revision_writes, store_deletes.items, &revision_keys, &revision_values);
+    try appendSourceRevisionWritesForEffects(batch_ctx.alloc, sequence, &revision_writes, store_deletes.items, &.{}, &.{}, &revision_keys, &revision_values);
     try batch_ctx.store.putBatchWithReplay(batch_ctx.io, revision_writes.items, store_deletes.items, .{
         .sequence = sequence,
         .payload = payload,
@@ -57549,7 +57552,7 @@ fn appendGeneratedBatchFromEnrichment(
         for (owned_counter_values.items) |value| batch_ctx.alloc.free(value);
         owned_counter_values.deinit(batch_ctx.alloc);
     }
-    try appendArtifactSourceRevisionWritesFromReplay(batch_ctx.alloc, payload, sequence, &store_writes, store_delete_keys.items, &owned_counter_keys, &owned_counter_values);
+    try appendSourceRevisionWritesForEffects(batch_ctx.alloc, sequence, &store_writes, store_delete_keys.items, store_promotions, &.{}, &owned_counter_keys, &owned_counter_values);
     try DB.appendDenseArtifactCounterMutationsWithPromotions(
         batch_ctx.alloc,
         batch_ctx.store,
@@ -155409,7 +155412,30 @@ fn waitForProtectedBackfillWithoutDrain(a: Allocator, db: *DB, name: []const u8,
             var result = db.search(a, .{ .index_name = "A", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 }) catch |err| {
                 const applied = try db.core.loadAppliedSequence(a, "A");
                 const target = try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, applied);
-                std.debug.print("PROTECTED-BACKFILL A unavailable during {s}: {s} applied={d} target={d} tail={d}\n", .{ name, @errorName(err), applied, target, db.core.store.lastReplaySequence(0) });
+                std.debug.print("PROTECTED-BACKFILL A unavailable during {s}: {s} applied={d} target={d} tail={d} live={?d}\n", .{ name, @errorName(err), applied, target, db.core.store.lastReplaySequence(0), db.executor.appliedSequence("A") });
+                const names = try db.core.index_manager.artifactSourceNamesForIndexAlloc(a, "A");
+                defer {
+                    for (names) |source| a.free(source);
+                    a.free(names);
+                }
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                const scoped = try replay_source_mod.artifactTargetAtCut(a, &read, names, applied, null);
+                std.debug.print("PROTECTED-BACKFILL A scoped_target={?d}\n", .{scoped});
+                for (names) |source| {
+                    const key = try internal_keys.artifactSourceRevisionKeyAlloc(a, source);
+                    defer a.free(key);
+                    const raw = read.get(key) catch |failure| switch (failure) {
+                        error.NotFound => null,
+                        else => return failure,
+                    };
+                    std.debug.print("PROTECTED-BACKFILL A source={s} revision={?d}\n", .{ source, if (raw) |bytes| std.mem.readInt(u64, bytes[0..8], .big) else @as(?u64, null) });
+                }
+                const primary = read.get(&internal_keys.primary_source_revision_key) catch |failure| switch (failure) {
+                    error.NotFound => null,
+                    else => return failure,
+                };
+                std.debug.print("PROTECTED-BACKFILL primary_revision={?d}\n", .{if (primary) |bytes| std.mem.readInt(u64, bytes[0..8], .big) else @as(?u64, null)});
                 return err;
             };
             defer result.deinit();
@@ -155519,6 +155545,15 @@ test "privacy scoped readiness serves A while sibling B backfills" {
     }} });
     try std.testing.expect(sibling_tail > a_applied);
     try std.testing.expectEqual(sibling_tail, try db.core.replaySource().latestMatchingSequence(a, a_applied, .dense_vector));
+    try std.testing.expectEqual(a_applied, try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, a_applied));
+    // Cached projection work is a replay hint, not a mutation to A's source.
+    // The journal intentionally expands its artifact key for replay routing.
+    const a_chunks = try std.fmt.allocPrint(scratch, "{s}_chunks", .{embeddings[0]});
+    const a_chunk = try internal_keys.chunkArtifactKeyAlloc(scratch, "doc", a_chunks, 0);
+    const a_artifact = try expectedChunkEmbeddingArtifactKeyAlloc(scratch, "doc", a_chunks, 0, embeddings[0]);
+    const cached_tail = try appendDerivedBatchRecord(&db, .{ .dense_embeddings = &.{.{ .index_name = "A", .parent_doc_key = "doc", .doc_key = a_chunk, .artifact_key = a_artifact, .vector = &.{} }} });
+    try std.testing.expect(cached_tail > sibling_tail);
+    try std.testing.expectEqual(cached_tail, try db.core.replaySource().latestMatchingSequence(a, a_applied, .dense_vector));
     try std.testing.expectEqual(a_applied, try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, a_applied));
     const calls = embedder.calls;
     var result = try db.search(a, req);

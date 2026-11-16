@@ -29886,7 +29886,7 @@ fn appendCachedChunkDenseEmbeddingToWindow(
         for (expanded_cached) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
         if (expanded_cached.len > 0) runtime.alloc.free(expanded_cached);
     }
-    try appendOwnedDenseEmbeddingsToWindow(runtime, window, &expanded_cached);
+    try appendOwnedDenseEmbeddingsToWindow(runtime, window, &expanded_cached, false);
     return true;
 }
 
@@ -30438,7 +30438,7 @@ fn flushChunkedDenseItems(
         for (expanded) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
         if (expanded.len > 0) runtime.alloc.free(expanded);
     }
-    try appendOwnedDenseEmbeddingsToWindow(runtime, window, &expanded);
+    try appendOwnedDenseEmbeddingsToWindow(runtime, window, &expanded, true);
 
     clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
     return true;
@@ -31684,7 +31684,7 @@ fn flushMaterializedSparseChunkSources(
         for (expanded) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
         if (expanded.len > 0) runtime.alloc.free(expanded);
     }
-    try appendOwnedSparseEmbeddingsToWindow(runtime, window, &expanded);
+    try appendOwnedSparseEmbeddingsToWindow(runtime, window, &expanded, true);
 }
 
 fn processCachedChunkSparseItems(
@@ -32081,7 +32081,7 @@ fn flushPlainDenseItems(
             for (embeddings) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
             if (embeddings.len > 0) runtime.alloc.free(embeddings);
         }
-        try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings);
+        try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings, true);
     }
 }
 
@@ -33234,9 +33234,16 @@ fn appendOwnedDenseEmbeddingsToWindow(
     runtime: *EnrichmentRuntime,
     window: *GeneratedReplayWindow,
     embeddings: *[]derived_types.DerivedDenseEmbeddingWrite,
+    source_changed: bool,
 ) !void {
     if (embeddings.*.len == 0) return;
-    for (embeddings.*) |embedding| try markWindowPublishing(runtime, window, &.{embedding.index_name});
+    for (embeddings.*) |embedding| {
+        try markWindowPublishing(runtime, window, &.{embedding.index_name});
+        // The journal also routes cached vectors. Preserve the distinction
+        // between new legacy source output and projection-only replay hints.
+        if (source_changed) if (embedding.artifact_key) |key|
+            try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
+    }
     try window.dense_embeddings.appendSlice(runtime.alloc, embeddings.*);
     runtime.alloc.free(embeddings.*);
     embeddings.* = &.{};
@@ -33246,9 +33253,16 @@ fn appendOwnedSparseEmbeddingsToWindow(
     runtime: *EnrichmentRuntime,
     window: *GeneratedReplayWindow,
     embeddings: *[]derived_types.DerivedSparseEmbeddingWrite,
+    source_changed: bool,
 ) !void {
     if (embeddings.*.len == 0) return;
-    for (embeddings.*) |embedding| try markWindowPublishing(runtime, window, &.{embedding.index_name});
+    for (embeddings.*) |embedding| {
+        try markWindowPublishing(runtime, window, &.{embedding.index_name});
+        // The journal also routes cached vectors. Preserve the distinction
+        // between new legacy source output and projection-only replay hints.
+        if (source_changed) if (embedding.artifact_key) |key|
+            try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
+    }
     try window.sparse_embeddings.appendSlice(runtime.alloc, embeddings.*);
     runtime.alloc.free(embeddings.*);
     embeddings.* = &.{};
@@ -33263,7 +33277,7 @@ fn appendCachedDenseEmbeddingToWindow(
 ) !bool {
     if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return false;
     var embeddings = try singleDenseEmbeddingForConsumers(runtime, doc_key, artifact_key, &.{}, consumer_indexes);
-    try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings);
+    try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings, false);
     return true;
 }
 
@@ -33276,7 +33290,7 @@ fn appendCachedSparseEmbeddingToWindow(
 ) !bool {
     if (generatedArtifactAlreadyPublished(runtime, artifact_key)) return false;
     var embeddings = try singleSparseEmbeddingForConsumers(runtime, doc_key, artifact_key, &.{}, &.{}, consumer_indexes);
-    try appendOwnedSparseEmbeddingsToWindow(runtime, window, &embeddings);
+    try appendOwnedSparseEmbeddingsToWindow(runtime, window, &embeddings, false);
     return true;
 }
 
@@ -35365,7 +35379,7 @@ fn processDenseTemplateParts(
         for (embeddings) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
         if (embeddings.len > 0) runtime.alloc.free(embeddings);
     }
-    try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings);
+    try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings, true);
     return;
 }
 
@@ -35486,7 +35500,7 @@ fn processDenseEmbedding(
         for (embeddings) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
         if (embeddings.len > 0) runtime.alloc.free(embeddings);
     }
-    try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings);
+    try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings, true);
 }
 
 fn processSparseEmbedding(
@@ -35548,7 +35562,7 @@ fn processSparseEmbedding(
             if (expanded.len > 0) runtime.alloc.free(expanded);
         }
         try mergeGuardedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes, source_key, source_set.source_record_digest, request);
-        try appendOwnedSparseEmbeddingsToWindow(runtime, window, &expanded);
+        try appendOwnedSparseEmbeddingsToWindow(runtime, window, &expanded, true);
         return;
     }
 
@@ -35626,7 +35640,7 @@ fn processSparseEmbedding(
         for (embeddings) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
         if (embeddings.len > 0) runtime.alloc.free(embeddings);
     }
-    try appendOwnedSparseEmbeddingsToWindow(runtime, window, &embeddings);
+    try appendOwnedSparseEmbeddingsToWindow(runtime, window, &embeddings, true);
 }
 
 fn buildChunkDenseEmbeddingsFromSources(
