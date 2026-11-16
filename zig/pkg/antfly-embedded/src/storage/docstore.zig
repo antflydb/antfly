@@ -257,10 +257,17 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     const mask = mask_all & consumer_mask;
     const lane_count: u64 = 1 + @popCount(mask);
     const upper_bound_charge: u64 = lane_count * (internal_keys.replay_key_len + payload.len);
+    // Loaded once here for the admission check and reused below for the
+    // final charge instead of a second `txn.get` of the same key: nothing
+    // in between writes `journal_credit_ledger_key` (the puts above are to
+    // unrelated replay-journal keys), so the bytes read here are still
+    // exactly what a second read would return.
+    var reserved_ledger: ?internal_keys.JournalCreditLedger = null;
     if (txn.owner) |owner| {
         const ledger = try loadJournalCreditLedger(txn);
         const admissible = owner.journal_credit_capacity_bytes -| owner.journal_credit_progress_reserve_bytes;
         if (ledger.bytes + upper_bound_charge > admissible) return error.JournalCreditCapacityExceeded;
+        reserved_ledger = ledger;
     }
 
     // The init marker's value never changes once set; rewriting the same
@@ -304,7 +311,7 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     }
 
     if (txn.owner != null) {
-        var ledger = try loadJournalCreditLedger(txn);
+        var ledger = reserved_ledger.?;
         ledger = ledger.charged(charged_bytes, charged_records);
         try storeJournalCreditLedger(txn, ledger);
     }
