@@ -97,7 +97,7 @@ paths:
           in: header
           required: true
           schema: {type: string, minLength: 1, maxLength: 16384}
-        - name: X-Antfly-Routing-Remaining-Ms
+        - name: X-Antfly-Catalog-Route-Deadline-Ms
           in: header
           required: true
           schema: {type: integer, minimum: 1, maximum: 5000}
