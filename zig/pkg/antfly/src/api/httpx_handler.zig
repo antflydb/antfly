@@ -365,6 +365,7 @@ fn requiresInternalServicePrincipal(path: []const u8) bool {
 
 test "history grant ingress operation contracts" {
     _ = @import("history_grant_operations.zig");
+    _ = @import("history_resolution_operations.zig");
 }
 
 test "history page ingress operation contracts" {
@@ -480,7 +481,7 @@ test "history control ingress mounted route rejects unsigned migration traffic" 
     defer a.free(base);
     const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "history-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
     defer a.free(token);
-    for ([_][]const u8{ "control-v1", "page-v1", "grant-v1" }) |leaf| {
+    for ([_][]const u8{ "control-v1", "page-v1", "grant-v1", "resolution-v1" }) |leaf| {
         const url = try std.fmt.allocPrint(a, "{s}/internal/v1/groups/17/tables/docs/history/{s}", .{ base, leaf });
         defer a.free(url);
         var unsigned = try requestWithRetry(&client, client_io.io(), .POST, url, "{}", &.{.{ "content-type", "application/json" }}, 20);
@@ -1778,6 +1779,9 @@ pub const AntflyApiHandler = struct {
         if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
             try server.postWithBodyLimit(table_prefix ++ routes.history_grant_suffix, @import("history_grant_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryGrant));
         } else try server.post(table_prefix ++ routes.history_grant_suffix, httpx.Handler.bind(self, internalHistoryGrant));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit")) {
+            try server.postWithBodyLimit(table_prefix ++ routes.history_resolution_suffix, @import("history_resolution_operations.zig").max_bytes, httpx.Handler.bind(self, internalHistoryResolution));
+        } else try server.post(table_prefix ++ routes.history_resolution_suffix, httpx.Handler.bind(self, internalHistoryResolution));
         try self.registerInternalSqlRoutes(server);
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
@@ -3861,6 +3865,28 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("Retry-After", "1");
         if (batch) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
         return textResponse(ctx, 429, "RetainedEffectsFull");
+    }
+
+    fn internalHistoryResolution(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const operations = @import("history_resolution_operations.zig");
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        const remaining = ctx.header(metadata_api.catalog_route_deadline_ms_header) orelse return historyResolutionFailure(ctx, error.InvalidHistoryAdmission);
+        _ = @import("antfly_public_limits").Execution.positive(remaining, 5000) catch return historyResolutionFailure(ctx, error.InvalidHistoryAdmission);
+        var params = (try internalGroupTableParams(ctx)) orelse return historyResolutionFailure(ctx, error.InvalidHistoryAdmission);
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return historyResolutionFailure(ctx, error.InvalidHistoryAdmission);
+        if (body.len > operations.max_bytes) return textResponse(ctx, 413, "history resolution request exceeds byte limit");
+        const result = operations.execute(self.api_server.cfg.native_history_resolution, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return historyResolutionFailure(ctx, err);
+        try ctx.setHeader("Cache-Control", "no-store");
+        return ctx.json(result);
+    }
+    fn historyResolutionFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        const failure = @import("history_resolution_operations.zig").ErrorResponse.fromError(err);
+        _ = ctx.status(failure.status());
+        return ctx.json(failure);
     }
 
     fn internalHistoryGrant(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

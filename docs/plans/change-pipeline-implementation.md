@@ -2179,6 +2179,48 @@ bindings. Unrelated model-explorer generation drift was removed. This is the
 specification and generated binding stage only: the signed handler, HTTP client,
 DataServer port and real network receipt qualification remain to be implemented.
 
+## In progress: completion receipt transport implementation
+
+The private ingress now validates explicit request version, frozen namespace,
+Raft authority and positive minimum applied index before invoking a callback.
+It validates the returned receipt digest/cut against the original request after
+checking cancellation, so forged or late results cannot escape. The HTTP route
+requires signed service authority even during migration, a positive remaining
+routing budget and a bounded body. The client sends the catalog fence and
+remaining budget, verifies the protocol acknowledgment and content type, rejects
+mutation-outcome headers and validates the entire receipt reply.
+
+DataServer now has a resolution port using the existing one-budget known-leader
+routing path. Local reads invoke the previously qualified frozen-owner method;
+remote reads use the signed bounded client. These changes are not yet qualified:
+The first `history-retained-rpc-test` attempt stopped at the test-selection audit
+because the newly registered client filter had no test yet. The client test now
+covers positive effects, positive no-effect and absent replies, forged binding,
+stale cut, missing acknowledgment, wrong content type, typed topology errors,
+malformed error status, connection loss and cancellation. The native Raft fixture
+now registers the resolution handler and exercises signed network absence with
+an actual qualified cut, checking that the read appends no proposal. It does not
+yet exercise a positive durable completion receipt across the network.
+
+The combined `history-retained-rpc-test native-history-consumer-test` gate
+completed with exit 0 in `history-resolution-network-test.log`: all fifteen
+HTTP transport/auth/ingress/client tests and three storage-side native consumer
+tests passed. The initial attempt had a new-test syntax error, corrected before
+the passing run. The storage-side native gate does not include the DataServer
+Raft fixture; its results do not qualify the actual network receipt path.
+
+`history-control-apply-test` completed with exit 0 in
+`history-resolution-raft-network-test.log`: all five real DataServer/native
+Raft tests passed. The extended local-submission fixture routes a completion
+receipt request from a caller with no replica over signed HTTP to the actual
+leader, validates the qualified storage cut and original request digest, and
+confirms that no proposal was appended. This proves the network absence-read
+path, not positive durable receipt collection or global completion.
+
+Positive durable native network receipts, mutation-side plan/input activation,
+certificate collection/publication and the broader full issue requirements
+still require implementation and qualification.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

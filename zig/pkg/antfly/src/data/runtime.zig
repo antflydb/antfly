@@ -7067,6 +7067,7 @@ pub const DataServer = struct {
         api_server_cfg.native_history_control = if (linked_storage and self.data_raft != null) .{ .ptr = self, .execute_fn = historyControlOperation } else null;
         api_server_cfg.native_history_page = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyPageOperation } else null;
         api_server_cfg.native_history_grant = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyGrantOperation } else null;
+        api_server_cfg.native_history_resolution = if (linked_storage and self.data_raft != null) .{ .ptr = self, .read_fn = historyResolutionOperation } else null;
         api_server_cfg.native_history_roots = if (linked_storage and (self.data_raft != null or self.remote_metadata != null)) self.historyRootsSource() else null;
         api_server_cfg.backend_runtime = self.backend_runtime;
         api_server_cfg.restore_owner = .{ .ptr = self, .execute_fn = restoreOwnerControl };
@@ -13352,16 +13353,21 @@ pub const DataServer = struct {
         return .{ .ptr = self, .read_fn = historyPageRoutedOperation };
     }
 
+    pub fn historyResolutionPort(self: *DataServer) @import("../api/history_resolution_operations.zig").Port {
+        return .{ .ptr = self, .read_fn = historyResolutionRoutedOperation };
+    }
+
     pub fn historyGrantPort(self: *DataServer) @import("../api/history_grant_operations.zig").Port {
         return .{ .ptr = self, .read_fn = historyGrantRoutedOperation };
     }
 
-    const HistoryOperation = enum { control, page, grant };
+    const HistoryOperation = enum { control, page, grant, resolution };
     fn historyRequestType(comptime kind: HistoryOperation) type {
         return switch (kind) {
             .control => @import("../api/history_control_operations.zig").wire.Request,
             .page => @import("../api/history_page_operations.zig").Request,
             .grant => @import("../api/history_grant_operations.zig").Request,
+            .resolution => @import("../api/history_resolution_operations.zig").Request,
         };
     }
     fn historyResultType(comptime kind: HistoryOperation) type {
@@ -13369,6 +13375,7 @@ pub const DataServer = struct {
             .control => @import("../api/history_control_operations.zig").wire.Response,
             .page => @import("../api/history_page_operations.zig").pages.Page,
             .grant => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.GrantObservation,
+            .resolution => @import("../api/history_resolution_operations.zig").wire.Reply,
         };
     }
     fn historyControlRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.control), context: antfly.public_api.operation.RequestContext) !historyResultType(.control) {
@@ -13378,6 +13385,10 @@ pub const DataServer = struct {
     fn historyPageRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.page), context: antfly.public_api.operation.RequestContext) !historyResultType(.page) {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         return self.historyRoutedOperation(alloc, fence, table, .page, input, context);
+    }
+    fn historyResolutionRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.resolution), context: antfly.public_api.operation.RequestContext) !historyResultType(.resolution) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyRoutedOperation(alloc, fence, table, .resolution, input, context);
     }
     fn historyGrantRoutedOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.grant), context: antfly.public_api.operation.RequestContext) !historyResultType(.grant) {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
@@ -13417,6 +13428,7 @@ pub const DataServer = struct {
             .control => historyControlOperation(self, alloc, fence, table, input, context),
             .page => historyPageOperation(self, alloc, fence, table, input, context),
             .grant => historyGrantOperation(self, alloc, fence, table, input, context),
+            .resolution => historyResolutionOperation(self, alloc, fence, table, input, context),
         };
         // Only a compact, deadline-aware peer capture may discover a remote
         // endpoint. Never use the generic admin-snapshot routing fallback or
@@ -13439,7 +13451,13 @@ pub const DataServer = struct {
             .control => client.fetchGroupHistoryControl(uri, group, table, input, fence, context),
             .page => client.fetchGroupHistoryPage(uri, group, table, input, fence, context),
             .grant => client.fetchGroupHistoryGrant(uri, group, table, input, fence, context),
+            .resolution => client.fetchGroupHistoryResolution(uri, group, table, input, fence, context),
         };
+    }
+
+    fn historyResolutionOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.resolution), context: antfly.public_api.operation.RequestContext) !historyResultType(.resolution) {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.historyLocalRead(alloc, fence, table, .resolution, input, context);
     }
 
     fn historyGrantOperation(ptr: *anyopaque, alloc: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, input: historyRequestType(.grant), context: antfly.public_api.operation.RequestContext) !historyResultType(.grant) {
@@ -13476,6 +13494,7 @@ pub const DataServer = struct {
             var result = (switch (kind) {
                 .page => owner.orderedHistoryPageRouted(alloc, fence, table, input.request),
                 .grant => owner.orderedHistoryGrantRouted(alloc, fence, table, input.identity),
+                .resolution => owner.orderedHistoryResolutionRouted(alloc, fence, table, input.binding()),
                 .control => unreachable,
             }) catch |err| switch (err) {
                 error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.StorageKernelOwnerTransitionRequired, error.StorageOwnerAdmissionPending, error.ResourceBudgetExceeded => {
@@ -43403,7 +43422,7 @@ fn consumerTests() type {
                 };
                 const api_server = try a.create(antfly.public_api.kernel_bridge.ApiHttpServer);
                 defer a.destroy(api_server);
-                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
+                api_server.* = try antfly.public_api.kernel_bridge.ApiHttpServer.initWithConfig(a, .{ .backend_runtime = runtime.ptr(), .internal_service_secret = secret, .internal_service_issuer = "history-runtime", .native_history_control = .{ .ptr = server, .execute_fn = DataServer.historyControlOperation }, .native_history_page = .{ .ptr = server, .read_fn = DataServer.historyPageOperation }, .native_history_grant = .{ .ptr = server, .read_fn = DataServer.historyGrantOperation }, .native_history_resolution = .{ .ptr = server, .read_fn = DataServer.historyResolutionOperation }, .native_history_roots = server.historyRootsSource() }, .{ .ptr = server, .vtable = &.{ .status = Status.read } }, null, null);
                 defer api_server.deinit();
                 var handler = try antfly.public_api.kernel_bridge.createHandler(api_server);
                 defer antfly.public_api.kernel_bridge.deinitHandler(&handler);
@@ -43505,6 +43524,23 @@ fn consumerTests() type {
                 absent_grant.identity.consumer = @splat(4);
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 try std.testing.expectEqual(@as(u64, 0), (try origin.historyGrantPort().read(a, route.fence().?, "docs", absent_grant, .{})).absent);
+                const resolution_operations = @import("../api/history_resolution_operations.zig");
+                const resolution_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = @splat(91), .owner_fence = @splat(92), .manifest_digest = @splat(93), .commit_version = 94, .minimum_applied_index = 1 };
+                const before_resolution = blk: {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    break :blk managed.host.http_host.host.raftStatus(601).?.last_index;
+                };
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                const remote_resolution = try origin.historyResolutionPort().read(a, route.fence().?, "docs", resolution_input, .{});
+                try remote_resolution.validate(resolution_input.binding());
+                try std.testing.expect(remote_resolution.resolution == null);
+                try std.testing.expect(remote_resolution.cut.index >= before_resolution);
+                {
+                    lockAtomic(&server.data_raft_mutex);
+                    defer server.data_raft_mutex.unlock();
+                    try std.testing.expectEqual(before_resolution, managed.host.http_host.host.raftStatus(601).?.last_index);
+                }
                 remote_input.operation = .recover;
                 remote_input.receipt = unknown_remote.receipt;
                 const recover_body = try std.json.Stringify.valueAlloc(a, remote_input, .{});

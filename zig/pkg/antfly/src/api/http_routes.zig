@@ -20,7 +20,7 @@ pub const sql_max_request_body_bytes: usize = 4 << 20;
 /// Transport admission shared by native and linked-kernel registrars. Resolve
 /// before buffering so a SQL request cannot consume the much larger batch cap.
 pub fn publicPostBodyLimit(path: []const u8) ?usize {
-    if (isInternalHistoryControlPath(path) or isInternalHistoryPagePath(path) or isInternalHistoryGrantPath(path)) return 4096;
+    if (isInternalHistoryControlPath(path) or isInternalHistoryPagePath(path) or isInternalHistoryGrantPath(path) or isInternalHistoryResolutionPath(path)) return 4096;
     if (isInternalDocumentReadPath(path)) return @import("antfly_public_limits").max_document_read_body_bytes;
     if (isPrivacyFindingsPath(path)) return @import("antfly_public_limits").max_privacy_findings_body_bytes;
     if (privacyMutationBodyLimit(path)) |limit| return limit;
@@ -74,6 +74,9 @@ pub fn isInternalHistoryControlPath(path: []const u8) bool {
 }
 pub fn isInternalHistoryPagePath(path: []const u8) bool {
     return isInternalHistoryPath(path, "page-v1");
+}
+pub fn isInternalHistoryResolutionPath(path: []const u8) bool {
+    return isInternalHistoryPath(path, "resolution-v1");
 }
 pub fn isInternalHistoryGrantPath(path: []const u8) bool {
     return isInternalHistoryPath(path, "grant-v1");
@@ -222,6 +225,7 @@ pub const Routes = struct {
     pub const history_control_suffix = "/history/control-v1";
     pub const history_page_suffix = "/history/page-v1";
     pub const history_grant_suffix = "/history/grant-v1";
+    pub const history_resolution_suffix = "/history/resolution-v1";
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const backup_shard_suffix = "/backup-shard";

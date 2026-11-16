@@ -1715,6 +1715,7 @@ pub const ApiHttpServerConfig = struct {
     native_history_control: ?@import("history_control_operations.zig").Port = null,
     native_history_page: ?@import("history_page_operations.zig").Port = null,
     native_history_grant: ?@import("history_grant_operations.zig").Port = null,
+    native_history_resolution: ?@import("history_resolution_operations.zig").Port = null,
     /// Internal owner discovery and routed history transport; not public feed capability.
     native_history_roots: ?@import("history_roots.zig").Source = null,
     /// Borrowed metadata receipt/topology notification generation. It affects

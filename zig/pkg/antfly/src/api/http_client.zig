@@ -2667,6 +2667,77 @@ pub const ApiHttpClient = struct {
         return self.fetchGroupBatchWithForwarding(base_uri, group_id, table_name, body, timeout_ms, null, null, null);
     }
 
+    pub fn fetchGroupHistoryResolution(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        input: @import("history_resolution_operations.zig").Request,
+        fence: route_metadata_api.CatalogRouteFence,
+        context: @import("antfly_local_sources").api_operation.RequestContext,
+    ) !@import("history_resolution_operations.zig").wire.Reply {
+        const contract = @import("history_resolution_operations.zig");
+        try context.ensureActive();
+        if (self.internal_service == null) return error.Unauthorized;
+        try fence.validate();
+        if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], fence.route.identity_namespace.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], fence.route.identity_namespace.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], fence.route.identity_namespace.range_id, .big);
+        try input.validate(namespace);
+        const table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, table, routes.Routes.history_resolution_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
+        defer self.alloc.free(body);
+        if (body.len > contract.max_bytes) return error.InvalidHistoryAdmission;
+        const encoded_fence = try std.json.Stringify.valueAlloc(self.alloc, fence, .{});
+        defer self.alloc.free(encoded_fence);
+        if (encoded_fence.len > 16384) return error.InvalidCatalogRouteFence;
+        const timeout = @min(try context.remainingTimeoutMs() orelse route_metadata_api.catalog_route_default_deadline_ms, 5000);
+        var buffer: [10]u8 = undefined;
+        const budget = try std.fmt.bufPrint(&buffer, "{d}", .{timeout});
+        var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
+        try context.ensureActive();
+        var response = self.executeRequest(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .headers = &.{
+            .{ .name = route_metadata_api.catalog_route_fence_header, .value = encoded_fence },
+            .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = budget },
+        }, .timeout_ms = timeout, .cancellation = &cancellation, .max_response_bytes = contract.max_bytes }) catch |err| return switch (err) {
+            error.OutOfMemory, error.Canceled, error.Cancelled, error.DeadlineExceeded => err,
+            else => error.ReadUnavailable,
+        };
+        defer response.deinit(self.alloc);
+        try context.ensureActive();
+        if (response.body.len > contract.max_bytes) return error.InvalidRemoteResponse;
+        if (response.status != 200) {
+            if (response.status == 401) return error.Unauthorized;
+            if (response.status == 403) return error.Forbidden;
+            var parsed = std.json.parseFromSlice(contract.ErrorResponse, self.alloc, response.body, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch return error.InvalidRemoteResponse;
+            defer parsed.deinit();
+            if (parsed.value.version != 1 or parsed.value.status() != response.status) return error.InvalidRemoteResponse;
+            return switch (parsed.value.code) {
+                .invalid_request => error.InvalidHistoryAdmission,
+                .resynchronization_required => error.HistoryResynchronizationRequired,
+                .topology_changed => error.TopologyChanged,
+                .unsupported => error.ChangefeedCapabilityUnsupported,
+                .unavailable => error.ReadUnavailable,
+                .corrupt_resolution => error.HistoryCorrupt,
+                .internal_error => error.UnexpectedHttpStatus,
+            };
+        }
+        const ack = response.header(route_metadata_api.catalog_route_fence_ack_header) orelse return error.InvalidRemoteResponse;
+        if (!std.mem.eql(u8, ack, route_metadata_api.catalog_route_fence_ack_value) or response.header(internal_batch_forwarding.outcome_header) != null) return error.InvalidRemoteResponse;
+        const content_type = response.header("Content-Type") orelse response.content_type orelse return error.InvalidRemoteResponse;
+        if (!std.ascii.eqlIgnoreCase(content_type, "application/json")) return error.InvalidRemoteResponse;
+        const result = try contract.wire.decodeReply(self.alloc, response.body, input.binding());
+        try context.ensureActive();
+        return result;
+    }
+
     pub fn fetchGroupHistoryGrant(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -7278,6 +7349,81 @@ test "history grant client preserves observations and rejects mismatched replies
             .scope, .floor => try std.testing.expectError(error.HistoryCorrupt, result),
             .missing_ack, .wrong_type, .wrong_error => try std.testing.expectError(error.InvalidRemoteResponse, result),
             .conflict => try std.testing.expectError(error.HistoryConsumerConflict, result),
+            .lost => try std.testing.expectError(error.ReadUnavailable, result),
+            .cancelled => try std.testing.expectError(error.Canceled, result),
+        }
+    }
+}
+
+test "history resolution client preserves qualified receipts and rejects mismatched replies" {
+    const a = std.testing.allocator;
+    const contract = @import("history_resolution_operations.zig");
+    const secret = "history-resolution-client-secret-long-enough";
+    const Fake = struct {
+        const Mode = enum { absent, effects, no_effect, scope, floor, missing_ack, wrong_type, conflict, wrong_error, lost, cancelled };
+        mode: Mode = .absent,
+        input: contract.Request,
+        calls: usize = 0,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("http://node:8080/internal/v1/groups/17/tables/docs%2Ftenant/history/resolution-v1", request.uri);
+            try std.testing.expectEqual(@as(?usize, contract.max_bytes), request.max_response_bytes);
+            try std.testing.expect(request.timeout_ms.? > 0 and request.timeout_ms.? <= 5000);
+            try std.testing.expect(request.cancellation != null);
+            try std.testing.expectEqualDeep(self.input, try contract.decode(alloc, request.body, self.input.namespace));
+            try internal_service_auth.verifyToken(alloc, request.header(internal_service_auth.header_name).?, .{ .secret = secret, .issuer = "resolution-test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            if (self.mode == .lost) return error.ConnectionResetByPeer;
+            if (self.mode == .conflict or self.mode == .wrong_error) {
+                const failure = contract.ErrorResponse.fromError(error.TopologyChanged);
+                const body = try std.json.Stringify.valueAlloc(alloc, failure, .{});
+                defer alloc.free(body);
+                return http_route_helpers.textResponseWithHeaders(alloc, if (self.mode == .wrong_error) 500 else 409, body, &.{});
+            }
+            var position: [32]u8 = @splat(0);
+            std.mem.writeInt(u64, position[0..8], 2, .little);
+            std.mem.writeInt(u64, position[8..16], 7, .little);
+            position[31] = 1;
+            const receipt: contract.wire.completion.Resolution = .{ .namespace = self.input.namespace, .owner_fence = self.input.owner_fence, .manifest_digest = self.input.manifest_digest, .commit_version = self.input.commit_version, .source_position = position, .outcome = if (self.mode == .effects) .{ .effects = .{ .sequence = 3, .frame_digest = @splat(9) } } else .{ .no_effect = @splat(8) } };
+            var reply = try contract.wire.Reply.init(self.input.binding(), .{ .term = 2, .index = 10 }, if (self.mode == .absent) null else receipt);
+            if (self.mode == .scope) reply.request_digest[0] ^= 1;
+            if (self.mode == .floor) reply.cut.index = 1;
+            const body = try std.json.Stringify.valueAlloc(alloc, reply, .{});
+            defer alloc.free(body);
+            if (self.mode == .cancelled) self.cancelled.store(true, .release);
+            return http_route_helpers.textResponseWithHeaders(alloc, 200, body, if (self.mode == .missing_ack) &.{.{ .name = "Content-Type", .value = "application/json" }} else &.{
+                .{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = "1" },
+                .{ .name = "Content-Type", .value = if (self.mode == .wrong_type) "text/html" else "application/json" },
+            });
+        }
+    };
+    const fence: route_metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 17, .big);
+    std.mem.writeInt(u64, namespace[16..24], 19, .big);
+    const input: contract.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = @splat(1), .owner_fence = @splat(2), .manifest_digest = @splat(3), .commit_version = 4, .minimum_applied_index = 5 };
+    var fake: Fake = .{ .input = input };
+    var client = ApiHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    try std.testing.expectError(error.Unauthorized, client.fetchGroupHistoryResolution("http://node:8080", 17, "docs/tenant", input, fence, .{}));
+    _ = client.withInternalServiceAuth(secret, "resolution-test");
+    try std.testing.expectError(error.InvalidCatalogRouteFence, client.fetchGroupHistoryResolution("http://node:8080", 18, "docs/tenant", input, fence, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    for (std.meta.tags(Fake.Mode)) |mode| {
+        fake.mode = mode;
+        fake.cancelled.store(false, .release);
+        const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&fake.cancelled) };
+        const calls = fake.calls;
+        const result = client.fetchGroupHistoryResolution("http://node:8080", 17, "docs/tenant", input, fence, context);
+        try std.testing.expectEqual(calls + 1, fake.calls);
+        switch (mode) {
+            .absent => try std.testing.expect((try result).resolution == null),
+            .effects => try std.testing.expectEqual(@as(u64, 3), (try result).resolution.?.outcome.effects.sequence),
+            .no_effect => try std.testing.expect(std.mem.allEqual(u8, &(try result).resolution.?.outcome.no_effect, 8)),
+            .scope, .floor => try std.testing.expectError(error.HistoryCorrupt, result),
+            .missing_ack, .wrong_type, .wrong_error => try std.testing.expectError(error.InvalidRemoteResponse, result),
+            .conflict => try std.testing.expectError(error.TopologyChanged, result),
             .lost => try std.testing.expectError(error.ReadUnavailable, result),
             .cancelled => try std.testing.expectError(error.Canceled, result),
         }
