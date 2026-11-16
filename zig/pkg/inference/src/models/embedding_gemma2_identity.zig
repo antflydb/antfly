@@ -40,6 +40,7 @@ pub fn forCudaPolicy(artifact_identity: [64]u8, policy: @import("../ops/cuda/emb
         hash.update(&.{@as(u8, @truncate(bits))});
         if (bits > 255) hash.update(&.{@as(u8, @intCast(bits >> 8))});
     }
+    if (policy.global_gemm) hash.update("\x00global-packed-mqa-bf16-softmax-adaptive-v1");
     if (policy.extended_flash) hash.update("\x00extended-dispatch-v3");
     if (policy.packed_projections) hash.update("\x00packed-consumers-v3");
     if (policy.fused_backbone) hash.update("\x00vision-residual-v2");
@@ -303,7 +304,7 @@ test "embeddinggemma2 precision identities preserve F32 pins and isolate CUDA re
 
 test "embeddinggemma2 CUDA optimized identities isolate every arithmetic profile" {
     const Policy = @import("../ops/cuda/embedding_gemma2_policy.zig").Policy;
-    const profiles = [_]Policy{ .{}, .{ .extended_flash = true }, .{ .fused_vision = true }, .{ .packed_projections = true }, .{ .graph_replay = true }, .{ .image_batch = true }, .{ .native_vision = true }, .{ .media_batch = true }, .{ .fused_backbone = true }, .{ .tuned_gemm = true }, .{ .spatial_pool = true }, .{ .audio_conv_gemm = true }, .{ .audio_conv_bf16 = true }, .{ .audio_fft = true }, .{ .audio_frontend_fused = true }, .{ .audio_graph = true }, .{ .tuned_gemm = true, .packed_projections = true }, .{ .tuned_gemm = true, .fused_backbone = true, .graph_replay = true } };
+    const profiles = [_]Policy{ .{}, .{ .global_gemm = true }, .{ .extended_flash = true }, .{ .fused_vision = true }, .{ .packed_projections = true }, .{ .graph_replay = true }, .{ .image_batch = true }, .{ .native_vision = true }, .{ .media_batch = true }, .{ .fused_backbone = true }, .{ .tuned_gemm = true }, .{ .spatial_pool = true }, .{ .audio_conv_gemm = true }, .{ .audio_conv_bf16 = true }, .{ .audio_fft = true }, .{ .audio_frontend_fused = true }, .{ .audio_graph = true }, .{ .tuned_gemm = true, .packed_projections = true }, .{ .tuned_gemm = true, .fused_backbone = true, .graph_replay = true } };
     const artifacts = fromDigests(@splat(@splat(7)));
     for (profiles, 0..) |left, i| for (profiles[i + 1 ..]) |right| try std.testing.expect(!std.mem.eql(u8, &forCudaPolicy(artifacts, left), &forCudaPolicy(artifacts, right)));
 }

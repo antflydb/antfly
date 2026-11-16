@@ -32,6 +32,8 @@ pub const Arena = struct {
     batch: usize = 0,
     mask_kind: u8 = 0,
     attention_workspace: usize = 0,
+    global_attention_workspace: usize = 0,
+    blas_workspace: usize = 0,
     weight_generation: usize = 0,
     buffers: [11]Buffer = @splat(.{}),
     lease: ?memory.AdmissionLease = null,
@@ -50,6 +52,14 @@ pub const Arena = struct {
     completion: driver.CUevent = null,
     pending: bool = false,
     fence_valid: bool = false,
+    pub fn attentionWorkspacesMatch(self: *const Arena, attention: usize, global_attention: usize, blas: usize) bool {
+        return self.attention_workspace == attention and self.global_attention_workspace == global_attention and self.blas_workspace == blas;
+    }
+    pub fn setAttentionWorkspaces(self: *Arena, attention: usize, global_attention: usize, blas: usize) void {
+        self.attention_workspace = attention;
+        self.global_attention_workspace = global_attention;
+        self.blas_workspace = blas;
+    }
     pub fn noteUse(self: *Arena, ctx: *Context) void {
         self.pending = true;
         self.fence_valid = false;
@@ -460,4 +470,13 @@ test "embeddinggemma2 graph retention keeps mixed stages and fences only replace
     try std.testing.expectEqual(@as(usize, 1), Mock.waits);
     try std.testing.expectEqual(@as(usize, 0), Mock.barriers);
     try std.testing.expectEqual(first, (try cache.arena(&ctx, 1, 1, 0, sizes)).?.buffers[0].ptr);
+}
+
+test "encoder replay invalidates when attention or BLAS workspace moves" {
+    var arena = Arena{};
+    arena.setAttentionWorkspaces(11, 22, 33);
+    try std.testing.expect(arena.attentionWorkspacesMatch(11, 22, 33));
+    try std.testing.expect(!arena.attentionWorkspacesMatch(12, 22, 33));
+    try std.testing.expect(!arena.attentionWorkspacesMatch(11, 23, 33));
+    try std.testing.expect(!arena.attentionWorkspacesMatch(11, 22, 34));
 }

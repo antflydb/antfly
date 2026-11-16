@@ -1,0 +1,172 @@
+{
+  "date": "2026-11-16",
+  "gpu": "NVIDIA L4",
+  "source_base": "3682e4426baf3d7891a4b0ffbd34ca76bf7aef7e",
+  "native_cuda_source": "9f775620c84be17414fe5c07990956287b4e1d56",
+  "native_cuda_sha256": "2c1b08ce31d7b6a30be9051497afe1542d60e74d73b43cbffb1d6327b648e7dc",
+  "pjrt_embedding_measured_sha256": "013c2548aa22423c4c866d2418dca6f08d878b5e6c1ca06c59defadb4f2b29ba",
+  "pjrt_gemma4_measured_sha256": "b6ab56e55b1fff131ac1a5cc3fd6ce784563a21f49d786732b477b539c1b056d",
+  "embedding": [
+    {
+      "tokens": 128,
+      "pjrt_ms": 3.728778,
+      "cuda_default_http_ms": 14.563889999408275,
+      "cuda_opt_http_ms": 11.004114494426176,
+      "pjrt_speedup_vs_default": 3.9058077470442796,
+      "pjrt_speedup_vs_opt": 2.951131575659955,
+      "pjrt_oracle_cosine_min": 1.0,
+      "cuda_default_oracle_cosine_min": 0.9999373792044927,
+      "cuda_opt_oracle_cosine_min": 0.9999432290919407
+    },
+    {
+      "tokens": 512,
+      "pjrt_ms": 6.944406000000001,
+      "cuda_default_http_ms": 26.32524850196205,
+      "cuda_opt_http_ms": 22.014295987901278,
+      "pjrt_speedup_vs_default": 3.7908567704656164,
+      "pjrt_speedup_vs_opt": 3.1700761717994705,
+      "pjrt_oracle_cosine_min": 1.0,
+      "cuda_default_oracle_cosine_min": 0.9998767653159483,
+      "cuda_opt_oracle_cosine_min": 0.9998787785387756
+    },
+    {
+      "tokens": 2048,
+      "pjrt_ms": 32.9701145,
+      "cuda_default_http_ms": 243.53315150074195,
+      "cuda_opt_http_ms": 89.88891399349086,
+      "pjrt_speedup_vs_default": 7.386481824342525,
+      "pjrt_speedup_vs_opt": 2.7263755481798784,
+      "pjrt_oracle_cosine_min": 1.0,
+      "cuda_default_oracle_cosine_min": 0.9998176333420207,
+      "cuda_opt_oracle_cosine_min": 0.9998907540228591
+    },
+    {
+      "tokens": 8192,
+      "pjrt_ms": 333.1192975,
+      "cuda_default_http_ms": 2970.137017997331,
+      "cuda_opt_http_ms": 659.9658084887778,
+      "pjrt_speedup_vs_default": 8.91613617189899,
+      "pjrt_speedup_vs_opt": 1.981169549292706,
+      "pjrt_oracle_cosine_min": 1.0,
+      "cuda_default_oracle_cosine_min": 0.9996149224408423,
+      "cuda_opt_oracle_cosine_min": 0.999595051090435
+    }
+  ],
+  "gemma4": [
+    {
+      "cell": "text_short_256",
+      "prompt_tokens": 32,
+      "output_tokens": 256,
+      "pjrt_ms": 11705.308473500001,
+      "cuda_http_ms": 3629.0507494850317,
+      "cuda_speedup": 3.225446344381104,
+      "pjrt_decode_tok_s": 21.866428256127875,
+      "cuda_decode_tok_s": 71.50737241691625,
+      "pjrt_ttft_ms": 43.670738,
+      "cuda_ttft_ms": 63.115960991126485
+    },
+    {
+      "cell": "page_summary_128",
+      "prompt_tokens": 419,
+      "output_tokens": 128,
+      "pjrt_ms": 5993.267772499999,
+      "cuda_http_ms": 1907.1098920103395,
+      "cuda_speedup": 3.1425917287767424,
+      "pjrt_decode_tok_s": 21.48958580730828,
+      "cuda_decode_tok_s": 70.75231795302852,
+      "pjrt_ttft_ms": 83.4277565,
+      "cuda_ttft_ms": 113.43981650134083
+    },
+    {
+      "cell": "long2k_summary_64",
+      "prompt_tokens": 1775,
+      "output_tokens": 64,
+      "pjrt_ms": 3231.7534735,
+      "cuda_http_ms": 1233.8800305005861,
+      "cuda_speedup": 2.6191796557310965,
+      "pjrt_decode_tok_s": 20.764746649655358,
+      "cuda_decode_tok_s": 69.78729367165641,
+      "pjrt_ttft_ms": 197.8552775,
+      "cuda_ttft_ms": 331.17730599769857
+    }
+  ],
+  "gemma4_logit_validation": {
+    "steps": 216,
+    "min_cosine": 0.9999479739113495,
+    "max_relative_l2": 0.011663638222507896,
+    "max_abs": 0.3722016513347626,
+    "argmax_mismatches": 0,
+    "compiler_options": "explicit JAX SPMD/Shardy options and CUDA 12.8 tool directory; performance campaign used defaults"
+  },
+  "pjrt_compilation_ms": {
+    "gemma4": 224388.07584499998,
+    "embedding": 191932.860975
+  },
+  "memory": {
+    "gemma4_pjrt": {
+      "peak_rss_bytes": 6190800896,
+      "peak_gpu_bytes": 19587399680,
+      "peak_pss_bytes": 6186302464,
+      "peak_footprint_bytes": 22585420800,
+      "samples": 2090,
+      "errors": [],
+      "valid": true,
+      "method": "process-tree smaps_rollup PSS plus NVML; 0.2s polling"
+    },
+    "embedding_pjrt": {
+      "peak_rss_bytes": 2256543744,
+      "peak_gpu_bytes": 4538236928,
+      "peak_pss_bytes": 2249415680,
+      "peak_footprint_bytes": 5848084480,
+      "samples": 869,
+      "errors": [],
+      "valid": true,
+      "method": "process-tree smaps_rollup PSS plus NVML; 0.2s polling"
+    },
+    "embedding_cuda_default": {
+      "peak_rss_bytes": 1867505664,
+      "peak_gpu_bytes": 2013265920,
+      "peak_pss_bytes": 1861848064,
+      "peak_footprint_bytes": 3692661760,
+      "samples": 298,
+      "errors": [],
+      "valid": true,
+      "method": "process-tree smaps_rollup PSS plus NVML; 0.2s polling"
+    },
+    "embedding_cuda_opt": {
+      "peak_rss_bytes": 1849577472,
+      "peak_gpu_bytes": 2344615936,
+      "peak_pss_bytes": 1844118528,
+      "peak_footprint_bytes": 3674932224,
+      "samples": 145,
+      "errors": [],
+      "valid": true,
+      "method": "process-tree smaps_rollup PSS plus NVML; 0.2s polling"
+    },
+    "gemma4_cuda": {
+      "peak_gpu_bytes": 7086276608,
+      "peak_footprint_bytes": 8124113920
+    }
+  },
+  "embedding_opt_env": {
+    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_GRAPH_REPLAY": "1",
+    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_TUNED_GEMM": "1",
+    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_FUSED_BACKBONE": "1",
+    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_PACKED_PROJECTIONS": "1",
+    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_EXTENDED_FLASH": "1",
+    "ANTFLY_INFERENCE_CUDA_EMBEDDING_GEMMA2_STATS": "1"
+  },
+  "limitations": [
+    "PJRT is a new prepared-HLO native runner; no production server integration",
+    "PJRT pretokenized direct timings versus CUDA HTTP timings",
+    "Gemma CUDA Q4/F16 KV versus PJRT dense BF16/BF16 KV from the same GGUF",
+    "Embedding CUDA full multimodal checkpoint versus PJRT text tower only",
+    "One process lifecycle, fixed batch one, synthetic repeated-word embedding inputs; warm timing excludes compilation"
+  ],
+  "embedding_checkpoint": {
+    "bytes": 1488915288,
+    "sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79"
+  },
+  "gpu_memory_total_mib": 23034,
+  "final_gpu_compute_processes": 0
+}

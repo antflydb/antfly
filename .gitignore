@@ -126,3 +126,6 @@ zig-pkg/
 /qualification-server/
 # Local LangChain integration validation state
 /.state/
+
+# Local native GPU benchmark artifacts and measurements.
+/evidence/

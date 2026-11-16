@@ -1,0 +1,1218 @@
+{
+  "date": "2026-11-16",
+  "gpu": "NVIDIA L4 SM89",
+  "nsys": "2025.6.3",
+  "ncu": "2026.1.1",
+  "capture": "5 warmed forwards; cudaProfilerApi range; CUDA graph nodes; no CPU context-switch sampling",
+  "counter_status": "ERR_NVGPUCTRPERM: SM, Tensor Core and memory-throughput counters unavailable; timeline activity fraction is not SM utilization",
+  "source_base": "3682e4426baf3d7891a4b0ffbd34ca76bf7aef7e",
+  "native_benchmark_sha256": "5f15dd59a6a3a676946e21532e383e5984c190ca0f8e0be507582c17dd97a646",
+  "pjrt_runner_sha256": "eb07884cfcf240d12e3354994f4586c1666fb58515ed6c4dd535f9bae2902178",
+  "records": [
+    {
+      "tokens": 512,
+      "cuda_profile": {
+        "median": {
+          "gpu_span_ms": 15.44905,
+          "gpu_activity_ms": 15.115323,
+          "gpu_gap_ms": 0.328512,
+          "gpu_activity_fraction": 0.9787357798699596,
+          "kernel_count": 365
+        },
+        "categories_ms": {
+          "other_fusion_or_pointwise": 1.264378,
+          "norm_rope": 0.5736872,
+          "gemm": 2.8495486,
+          "attention": 10.4244456
+        },
+        "top_kernels": [
+          {
+            "name": "termite_embedding_gemma2_attention_local_flash_bf16",
+            "calls": 120,
+            "total_ms": 52.122228,
+            "per_forward_ms": 10.4244456,
+            "kernel_time_fraction": 0.6898097290432832,
+            "registers_per_thread": 64,
+            "block": [
+              512,
+              1,
+              1
+            ],
+            "grid": [
+              4,
+              8,
+              1
+            ],
+            "shared_bytes": 27392,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_tn",
+            "calls": 120,
+            "total_ms": 4.900971,
+            "per_forward_ms": 0.9801942,
+            "kernel_time_fraction": 0.0648617222878306,
+            "registers_per_thread": 254,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              32,
+              4,
+              1
+            ],
+            "shared_bytes": 32768,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_stages_32x6_tn",
+            "calls": 385,
+            "total_ms": 4.740938,
+            "per_forward_ms": 0.9481876,
+            "kernel_time_fraction": 0.06274377137506487,
+            "registers_per_thread": 142,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              4,
+              8,
+              1
+            ],
+            "shared_bytes": 73728,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "termite_embedding_gemma2_packed_heads_bf16",
+            "calls": 120,
+            "total_ms": 4.024012,
+            "per_forward_ms": 0.8048024,
+            "kernel_time_fraction": 0.05325564032655933,
+            "registers_per_thread": 36,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              512,
+              8,
+              1
+            ],
+            "shared_bytes": 1088,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_tn",
+            "calls": 100,
+            "total_ms": 2.368053,
+            "per_forward_ms": 0.47361060000000005,
+            "kernel_time_fraction": 0.03133991122348288,
+            "registers_per_thread": 210,
+            "block": [
+              64,
+              1,
+              1
+            ],
+            "grid": [
+              16,
+              8,
+              1
+            ],
+            "shared_bytes": 24576,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "termite_embedding_gemma2_norm_residual_bf16",
+            "calls": 360,
+            "total_ms": 1.782906,
+            "per_forward_ms": 0.35658120000000004,
+            "kernel_time_fraction": 0.02359580455328279,
+            "registers_per_thread": 22,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              512,
+              1,
+              1
+            ],
+            "shared_bytes": 64,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "termite_embedding_gemma2_packed_gelu_bf16",
+            "calls": 120,
+            "total_ms": 1.243257,
+            "per_forward_ms": 0.24865140000000002,
+            "kernel_time_fraction": 0.016453839507803946,
+            "registers_per_thread": 16,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              4096,
+              1,
+              1
+            ],
+            "shared_bytes": 0,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_stages_64x3_tn",
+            "calls": 100,
+            "total_ms": 1.219994,
+            "per_forward_ms": 0.24399880000000002,
+            "kernel_time_fraction": 0.016145966181154634,
+            "registers_per_thread": 158,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              4,
+              8,
+              1
+            ],
+            "shared_bytes": 73728,
+            "local_bytes_per_thread": 0
+          }
+        ]
+      },
+      "pjrt_profile": {
+        "median": {
+          "gpu_span_ms": 5.719101,
+          "gpu_activity_ms": 5.308032,
+          "gpu_gap_ms": 0.40211,
+          "gpu_activity_fraction": 0.9296899984805305,
+          "kernel_count": 569
+        },
+        "categories_ms": {
+          "other_fusion_or_pointwise": 1.948859,
+          "gemm": 3.3584313999999997
+        },
+        "top_kernels": [
+          {
+            "name": "gemm_fusion_dot_220",
+            "calls": 120,
+            "total_ms": 5.013124,
+            "per_forward_ms": 1.0026248,
+            "kernel_time_fraction": 0.1889146295819803,
+            "registers_per_thread": 234,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              128,
+              1,
+              1
+            ],
+            "shared_bytes": 98304,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_389",
+            "calls": 140,
+            "total_ms": 2.777354,
+            "per_forward_ms": 0.5554707999999999,
+            "kernel_time_fraction": 0.10466184401742931,
+            "registers_per_thread": 164,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              128,
+              1,
+              1
+            ],
+            "shared_bytes": 49152,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_219",
+            "calls": 100,
+            "total_ms": 2.048438,
+            "per_forward_ms": 0.4096876,
+            "kernel_time_fraction": 0.07719336405635539,
+            "registers_per_thread": 128,
+            "block": [
+              64,
+              1,
+              1
+            ],
+            "grid": [
+              256,
+              1,
+              1
+            ],
+            "shared_bytes": 8192,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "fusion_1843",
+            "calls": 85,
+            "total_ms": 1.930579,
+            "per_forward_ms": 0.3861158,
+            "kernel_time_fraction": 0.07275196397770131,
+            "registers_per_thread": 217,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              64,
+              1,
+              1
+            ],
+            "shared_bytes": 32768,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_7",
+            "calls": 240,
+            "total_ms": 1.737267,
+            "per_forward_ms": 0.34745339999999997,
+            "kernel_time_fraction": 0.0654671920722484,
+            "registers_per_thread": 128,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              32,
+              1,
+              1
+            ],
+            "shared_bytes": 49152,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_388",
+            "calls": 100,
+            "total_ms": 1.20182,
+            "per_forward_ms": 0.24036400000000002,
+            "kernel_time_fraction": 0.045289400406655723,
+            "registers_per_thread": 87,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              128,
+              1,
+              1
+            ],
+            "shared_bytes": 16384,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_general_271",
+            "calls": 100,
+            "total_ms": 1.12908,
+            "per_forward_ms": 0.22581600000000002,
+            "kernel_time_fraction": 0.04254826530690689,
+            "registers_per_thread": 80,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              128,
+              1,
+              1
+            ],
+            "shared_bytes": 16384,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_general_270",
+            "calls": 100,
+            "total_ms": 1.001338,
+            "per_forward_ms": 0.20026760000000002,
+            "kernel_time_fraction": 0.03773443412857152,
+            "registers_per_thread": 91,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              256,
+              1,
+              1
+            ],
+            "shared_bytes": 8192,
+            "local_bytes_per_thread": 0
+          }
+        ]
+      },
+      "cuda_attention_breakdown": [
+        {
+          "dynamic_shared_bytes": 27392,
+          "layers_per_forward": 20.0,
+          "ms_per_forward": 7.6882916
+        },
+        {
+          "dynamic_shared_bytes": 35584,
+          "layers_per_forward": 4.0,
+          "ms_per_forward": 2.736154
+        }
+      ],
+      "cuda_unprofiled_median_ms": 15.3165235,
+      "pjrt_prior_unprofiled_median_ms": 6.944406000000001,
+      "cuda_direct_oracle_cosine": 0.9998767653159483,
+      "pjrt_profile_oracle_cosine_min": 0.9999999999999978
+    },
+    {
+      "tokens": 2048,
+      "cuda_profile": {
+        "median": {
+          "gpu_span_ms": 83.076271,
+          "gpu_activity_ms": 82.679314,
+          "gpu_gap_ms": 0.400542,
+          "gpu_activity_fraction": 0.9952217763842578,
+          "kernel_count": 367
+        },
+        "categories_ms": {
+          "other_fusion_or_pointwise": 6.5992024,
+          "norm_rope": 1.8593524,
+          "gemm": 9.618664200000001,
+          "attention": 63.807173
+        },
+        "top_kernels": [
+          {
+            "name": "termite_embedding_gemma2_attention_local_flash_bf16",
+            "calls": 120,
+            "total_ms": 319.035865,
+            "per_forward_ms": 63.807173,
+            "kernel_time_fraction": 0.7792348632203314,
+            "registers_per_thread": 64,
+            "block": [
+              512,
+              1,
+              1
+            ],
+            "grid": [
+              4,
+              32,
+              1
+            ],
+            "shared_bytes": 27392,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_tn",
+            "calls": 155,
+            "total_ms": 18.678897,
+            "per_forward_ms": 3.7357793999999998,
+            "kernel_time_fraction": 0.045622606564630776,
+            "registers_per_thread": 254,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              32,
+              16,
+              1
+            ],
+            "shared_bytes": 32768,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "termite_embedding_gemma2_packed_heads_bf16",
+            "calls": 120,
+            "total_ms": 18.337203,
+            "per_forward_ms": 3.6674406,
+            "kernel_time_fraction": 0.04478802993371435,
+            "registers_per_thread": 36,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              2048,
+              8,
+              1
+            ],
+            "shared_bytes": 1088,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "ampere_bf16_s1688gemm_bf16_128x64_sliced1x2_ldg8_f2f_tn",
+            "calls": 340,
+            "total_ms": 11.307117,
+            "per_forward_ms": 2.2614234,
+            "kernel_time_fraction": 0.027617270456132836,
+            "registers_per_thread": 230,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              4,
+              32,
+              1
+            ],
+            "shared_bytes": 32768,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_stages_32x6_tn",
+            "calls": 140,
+            "total_ms": 11.038345,
+            "per_forward_ms": 2.207669,
+            "kernel_time_fraction": 0.02696080347033657,
+            "registers_per_thread": 142,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              4,
+              32,
+              1
+            ],
+            "shared_bytes": 73728,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "termite_embedding_gemma2_packed_gelu_bf16",
+            "calls": 120,
+            "total_ms": 10.072748,
+            "per_forward_ms": 2.0145496,
+            "kernel_time_fraction": 0.024602363781366297,
+            "registers_per_thread": 16,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              16384,
+              1,
+              1
+            ],
+            "shared_bytes": 0,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_stages_32x1_tn",
+            "calls": 100,
+            "total_ms": 6.921762,
+            "per_forward_ms": 1.3843524,
+            "kernel_time_fraction": 0.016906181583420683,
+            "registers_per_thread": 234,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              16,
+              16,
+              1
+            ],
+            "shared_bytes": 32768,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "termite_embedding_gemma2_norm_residual_bf16",
+            "calls": 360,
+            "total_ms": 5.770054,
+            "per_forward_ms": 1.1540108,
+            "kernel_time_fraction": 0.014093171748774785,
+            "registers_per_thread": 22,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              2048,
+              1,
+              1
+            ],
+            "shared_bytes": 64,
+            "local_bytes_per_thread": 0
+          }
+        ]
+      },
+      "pjrt_profile": {
+        "median": {
+          "gpu_span_ms": 29.01187,
+          "gpu_activity_ms": 28.354273,
+          "gpu_gap_ms": 0.43939,
+          "gpu_activity_fraction": 0.9850211583510272,
+          "kernel_count": 548
+        },
+        "categories_ms": {
+          "other_fusion_or_pointwise": 10.5102562,
+          "gemm": 17.5507262
+        },
+        "top_kernels": [
+          {
+            "name": "gemm_fusion_dot_220",
+            "calls": 120,
+            "total_ms": 16.771205,
+            "per_forward_ms": 3.3542409999999996,
+            "kernel_time_fraction": 0.11953398324358024,
+            "registers_per_thread": 234,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              512,
+              1,
+              1
+            ],
+            "shared_bytes": 98304,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_general_271",
+            "calls": 100,
+            "total_ms": 14.841076,
+            "per_forward_ms": 2.9682152,
+            "kernel_time_fraction": 0.10577730878018013,
+            "registers_per_thread": 168,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              256,
+              1,
+              1
+            ],
+            "shared_bytes": 49152,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "fusion_1275",
+            "calls": 100,
+            "total_ms": 14.789425,
+            "per_forward_ms": 2.957885,
+            "kernel_time_fraction": 0.10540917484057864,
+            "registers_per_thread": 90,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              1024,
+              1,
+              1
+            ],
+            "shared_bytes": 128,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_general_270",
+            "calls": 100,
+            "total_ms": 13.153076,
+            "per_forward_ms": 2.6306152000000003,
+            "kernel_time_fraction": 0.09374636862321684,
+            "registers_per_thread": 208,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              1024,
+              1,
+              1
+            ],
+            "shared_bytes": 49152,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_6",
+            "calls": 140,
+            "total_ms": 11.658942,
+            "per_forward_ms": 2.3317883999999998,
+            "kernel_time_fraction": 0.08309717624141341,
+            "registers_per_thread": 128,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              128,
+              1,
+              1
+            ],
+            "shared_bytes": 49152,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_219",
+            "calls": 100,
+            "total_ms": 7.72348,
+            "per_forward_ms": 1.544696,
+            "kernel_time_fraction": 0.0550478232722173,
+            "registers_per_thread": 126,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              512,
+              1,
+              1
+            ],
+            "shared_bytes": 24576,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_7",
+            "calls": 240,
+            "total_ms": 5.861182,
+            "per_forward_ms": 1.1722364,
+            "kernel_time_fraction": 0.04177460301603696,
+            "registers_per_thread": 128,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              128,
+              1,
+              1
+            ],
+            "shared_bytes": 49152,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "fusion_1892",
+            "calls": 85,
+            "total_ms": 5.310786,
+            "per_forward_ms": 1.0621572000000001,
+            "kernel_time_fraction": 0.037851746772771575,
+            "registers_per_thread": 217,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              256,
+              1,
+              1
+            ],
+            "shared_bytes": 32768,
+            "local_bytes_per_thread": 0
+          }
+        ]
+      },
+      "cuda_attention_breakdown": [
+        {
+          "dynamic_shared_bytes": 27392,
+          "layers_per_forward": 20.0,
+          "ms_per_forward": 33.7364198
+        },
+        {
+          "dynamic_shared_bytes": 35584,
+          "layers_per_forward": 4.0,
+          "ms_per_forward": 30.0707532
+        }
+      ],
+      "cuda_unprofiled_median_ms": 85.182283,
+      "pjrt_prior_unprofiled_median_ms": 32.9701145,
+      "cuda_direct_oracle_cosine": 0.9998619198200833,
+      "pjrt_profile_oracle_cosine_min": 0.9998935501713508
+    },
+    {
+      "tokens": 8192,
+      "cuda_profile": {
+        "median": {
+          "gpu_span_ms": 624.957204,
+          "gpu_activity_ms": 624.593077,
+          "gpu_gap_ms": 0.400608,
+          "gpu_activity_fraction": 0.99934563855227,
+          "kernel_count": 376
+        },
+        "categories_ms": {
+          "other_fusion_or_pointwise": 33.056737,
+          "norm_rope": 8.6781378,
+          "gemm": 34.7815114,
+          "attention": 545.9314115999999
+        },
+        "top_kernels": [
+          {
+            "name": "termite_embedding_gemma2_attention_local_flash_bf16",
+            "calls": 120,
+            "total_ms": 2729.657058,
+            "per_forward_ms": 545.9314115999999,
+            "kernel_time_fraction": 0.8770718018917537,
+            "registers_per_thread": 64,
+            "block": [
+              512,
+              1,
+              1
+            ],
+            "grid": [
+              4,
+              128,
+              1
+            ],
+            "shared_bytes": 27392,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "termite_embedding_gemma2_packed_heads_bf16",
+            "calls": 120,
+            "total_ms": 84.319667,
+            "per_forward_ms": 16.8639334,
+            "kernel_time_fraction": 0.027092928048913407,
+            "registers_per_thread": 36,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              8192,
+              8,
+              1
+            ],
+            "shared_bytes": 1088,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_stages_32x1_tn",
+            "calls": 405,
+            "total_ms": 64.375934,
+            "per_forward_ms": 12.8751868,
+            "kernel_time_fraction": 0.020684765606861305,
+            "registers_per_thread": 234,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              4,
+              64,
+              1
+            ],
+            "shared_bytes": 32768,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "ampere_bf16_s1688gemm_bf16_128x256_ldg8_f2f_stages_32x1_tn",
+            "calls": 120,
+            "total_ms": 63.032011,
+            "per_forward_ms": 12.6064022,
+            "kernel_time_fraction": 0.020252946905036026,
+            "registers_per_thread": 234,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              32,
+              32,
+              1
+            ],
+            "shared_bytes": 65536,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "termite_embedding_gemma2_packed_gelu_bf16",
+            "calls": 120,
+            "total_ms": 50.965071,
+            "per_forward_ms": 10.1930142,
+            "kernel_time_fraction": 0.016375693248536705,
+            "registers_per_thread": 16,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              65536,
+              1,
+              1
+            ],
+            "shared_bytes": 0,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_tn",
+            "calls": 260,
+            "total_ms": 46.499612,
+            "per_forward_ms": 9.2999224,
+            "kernel_time_fraction": 0.014940887304718488,
+            "registers_per_thread": 254,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              16,
+              64,
+              1
+            ],
+            "shared_bytes": 32768,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "termite_embedding_gemma2_norm_residual_bf16",
+            "calls": 360,
+            "total_ms": 29.612785,
+            "per_forward_ms": 5.922556999999999,
+            "kernel_time_fraction": 0.00951494570457616,
+            "registers_per_thread": 22,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              8192,
+              1,
+              1
+            ],
+            "shared_bytes": 64,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "termite_embedding_gemma2_mean_l2_f32",
+            "calls": 5,
+            "total_ms": 23.676323,
+            "per_forward_ms": 4.7352646,
+            "kernel_time_fraction": 0.007607488719112631,
+            "registers_per_thread": 40,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              1,
+              1,
+              1
+            ],
+            "shared_bytes": 64,
+            "local_bytes_per_thread": 0
+          }
+        ]
+      },
+      "pjrt_profile": {
+        "median": {
+          "gpu_span_ms": 322.437782,
+          "gpu_activity_ms": 322.061495,
+          "gpu_gap_ms": 0.400031,
+          "gpu_activity_fraction": 0.998767434326418,
+          "kernel_count": 609
+        },
+        "categories_ms": {
+          "other_fusion_or_pointwise": 149.9577942,
+          "gemm": 173.14865
+        },
+        "top_kernels": [
+          {
+            "name": "fusion_1155",
+            "calls": 100,
+            "total_ms": 452.089303,
+            "per_forward_ms": 90.4178606,
+            "kernel_time_fraction": 0.2798392363354788,
+            "registers_per_thread": 178,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              16384,
+              1,
+              1
+            ],
+            "shared_bytes": 8192,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_general_271",
+            "calls": 100,
+            "total_ms": 257.722917,
+            "per_forward_ms": 51.5445834,
+            "kernel_time_fraction": 0.1595281812704867,
+            "registers_per_thread": 168,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              1024,
+              1,
+              1
+            ],
+            "shared_bytes": 98304,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_general_270",
+            "calls": 100,
+            "total_ms": 247.764496,
+            "per_forward_ms": 49.5528992,
+            "kernel_time_fraction": 0.15336400771173478,
+            "registers_per_thread": 122,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              16384,
+              1,
+              1
+            ],
+            "shared_bytes": 49152,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "ampere_bf16_s16816gemm_bf16_256x128_ldg8_f2f_stages_32x3_nn",
+            "calls": 40,
+            "total_ms": 171.351124,
+            "per_forward_ms": 34.2702248,
+            "kernel_time_fraction": 0.10606481367108554,
+            "registers_per_thread": 218,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              32,
+              64,
+              4
+            ],
+            "shared_bytes": 73728,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "fusion_1160",
+            "calls": 20,
+            "total_ms": 91.956283,
+            "per_forward_ms": 18.3912566,
+            "kernel_time_fraction": 0.05692011697735121,
+            "registers_per_thread": 84,
+            "block": [
+              256,
+              1,
+              1
+            ],
+            "grid": [
+              16384,
+              1,
+              1
+            ],
+            "shared_bytes": 8192,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_tn",
+            "calls": 140,
+            "total_ms": 76.40337,
+            "per_forward_ms": 15.280674,
+            "kernel_time_fraction": 0.04729300289207912,
+            "registers_per_thread": 254,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              32,
+              64,
+              1
+            ],
+            "shared_bytes": 32768,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "loop_convert_fusion_23",
+            "calls": 120,
+            "total_ms": 48.724398,
+            "per_forward_ms": 9.7448796,
+            "kernel_time_fraction": 0.030159966707343066,
+            "registers_per_thread": 29,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              32768,
+              1,
+              1
+            ],
+            "shared_bytes": 0,
+            "local_bytes_per_thread": 0
+          },
+          {
+            "name": "gemm_fusion_dot_6",
+            "calls": 140,
+            "total_ms": 39.816923,
+            "per_forward_ms": 7.9633846,
+            "kernel_time_fraction": 0.024646319325871247,
+            "registers_per_thread": 234,
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "grid": [
+              256,
+              1,
+              1
+            ],
+            "shared_bytes": 49152,
+            "local_bytes_per_thread": 0
+          }
+        ]
+      },
+      "cuda_attention_breakdown": [
+        {
+          "dynamic_shared_bytes": 27392,
+          "layers_per_forward": 20.0,
+          "ms_per_forward": 142.3103976
+        },
+        {
+          "dynamic_shared_bytes": 35584,
+          "layers_per_forward": 4.0,
+          "ms_per_forward": 403.621014
+        }
+      ],
+      "cuda_unprofiled_median_ms": 630.1210954999999,
+      "pjrt_prior_unprofiled_median_ms": 333.1192975,
+      "cuda_direct_oracle_cosine": 0.999595051090435,
+      "pjrt_profile_oracle_cosine_min": 0.9999999999999991
+    }
+  ],
+  "attention_candidate": [
+    {
+      "sequence": 512,
+      "dim": 256,
+      "radius": 512,
+      "mask_holes": false,
+      "old_ms": 0.38809600472450256,
+      "new_ms": 0.2170879989862442,
+      "speedup": 1.787735879168034,
+      "cosine": 0.9999988876371187,
+      "max_abs": 0.001953125
+    },
+    {
+      "sequence": 512,
+      "dim": 256,
+      "radius": 512,
+      "mask_holes": true,
+      "old_ms": 0.37785598635673523,
+      "new_ms": 0.20377600193023682,
+      "speedup": 1.854271272267355,
+      "cosine": 0.999998951555841,
+      "max_abs": 0.001953125
+    },
+    {
+      "sequence": 512,
+      "dim": 512,
+      "radius": 0,
+      "mask_holes": false,
+      "old_ms": 0.694240003824234,
+      "new_ms": 0.3891200125217438,
+      "speedup": 1.7841282418889732,
+      "cosine": 0.9999989339130747,
+      "max_abs": 0.001953125
+    },
+    {
+      "sequence": 512,
+      "dim": 512,
+      "radius": 0,
+      "mask_holes": true,
+      "old_ms": 0.6763520240783691,
+      "new_ms": 0.3680800050497055,
+      "speedup": 1.8375136242106784,
+      "cosine": 0.999998924578696,
+      "max_abs": 0.001953125
+    },
+    {
+      "sequence": 2048,
+      "dim": 256,
+      "radius": 512,
+      "mask_holes": false,
+      "old_ms": 1.3900319933891296,
+      "new_ms": 0.9533439874649048,
+      "speedup": 1.4580592227632847,
+      "cosine": 0.9999990648673501,
+      "max_abs": 0.001953125
+    },
+    {
+      "sequence": 2048,
+      "dim": 512,
+      "radius": 0,
+      "mask_holes": false,
+      "old_ms": 6.667776107788086,
+      "new_ms": 4.381136178970337,
+      "speedup": 1.5219285215998832,
+      "cosine": 0.9999992959292604,
+      "max_abs": 0.0009765625
+    },
+    {
+      "sequence": 8192,
+      "dim": 256,
+      "radius": 512,
+      "mask_holes": false,
+      "old_ms": 6.205440044403076,
+      "new_ms": 4.487168073654175,
+      "speedup": 1.3829301560682588,
+      "cosine": 0.9999991167254838,
+      "max_abs": 0.001953125
+    },
+    {
+      "sequence": 8192,
+      "dim": 512,
+      "radius": 0,
+      "mask_holes": false,
+      "old_ms": 94.42303848266602,
+      "new_ms": 58.94860649108887,
+      "speedup": 1.6017857605665324,
+      "cosine": 0.9999995520182879,
+      "max_abs": 0.00048828125
+    }
+  ],
+  "candidate_status": "Isolated benchmark prototype only, not in production dispatch; no whole-model speedup claim",
+  "numerical_note": "One instrumented XLA compilation failed the strict 0.9999 vector-cosine oracle gate before capture. Subsequent profiling retained vectors and evaluated numerical drift after capture; 2048-token cosine is about 0.999894. Prior unprofiled campaign vectors matched its reference. These traces diagnose performance, not release qualification."
+}
