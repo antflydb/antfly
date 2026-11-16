@@ -204,7 +204,7 @@ complete merely because a shared primitive exists.
 The common-program tests pass, including the admission contract that preserves
 A100/L4 baselines. Ownership verification checks emitted regions/files, actual
 shared-source fingerprints and include closure. The direct annotations cover
-116 of 643 Tile regions; this is provenance at the annotated region, not a
+119 of 645 Tile regions; this is provenance at the annotated region, not a
 percentage of serving kernels or a transitive call-graph coverage metric.
 Unclassified regions are not evidence of dead code or duplicated algorithms.
 
