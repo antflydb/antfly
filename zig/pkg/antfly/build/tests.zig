@@ -505,6 +505,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const completion_plan_tests = b.addTest(.{ .root_module = completion_plan_mod, .filters = &.{"completion frozen plan"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const run_completion_plan_tests = b.addRunArtifact(completion_plan_tests);
     b.step("completion-frozen-plan-test", "Verify owned frozen completion artifacts without current routing or schema").dependOn(&run_completion_plan_tests.step);
+    const source_plan_storage_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_plan_storage.zig"), .target = target, .optimize = optimize });
+    const source_plan_storage_tests = b.addTest(.{ .root_module = source_plan_storage_mod });
+    const run_source_plan_storage_tests = b.addRunArtifact(source_plan_storage_tests);
+    b.step("source-plan-storage-test", "Verify bounded native source artifacts, seal cuts and explicit reclamation fences").dependOn(&run_source_plan_storage_tests.step);
     const transaction_completion_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/committed_frame.zig"), .target = target, .optimize = optimize });
     const transaction_completion_tests = b.addTest(.{ .root_module = transaction_completion_mod });
     const run_transaction_completion_tests = b.addRunArtifact(transaction_completion_tests);
@@ -6342,6 +6346,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_docstore_unit_tests = addCuratedTestRunArtifact(b, docstore_unit_tests, &.{ "storage.docstore.", "storage.transactions." });
+
+    const source_plan_native_tests = b.addTest(.{
+        .root_module = docstore_test_mod,
+        .filters = &.{"docstore source artifact"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_source_plan_native_tests = addFilteredTestRunArtifact(b, source_plan_native_tests);
+    b.step("source-plan-native-storage-test", "Verify native artifact abort, reopen, persistent fences and reclamation").dependOn(&run_source_plan_native_tests.step);
 
     const committed_history_tests = b.addTest(.{
         .root_module = docstore_test_mod,

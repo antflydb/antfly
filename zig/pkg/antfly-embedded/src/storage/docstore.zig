@@ -7010,3 +7010,85 @@ test "docstore committed history consumer retirement before enrollment and rollb
         try std.testing.expectError(error.HistoryMixedControl, control.retire(&txn, closed));
     }
 }
+
+test "docstore source artifact abort reopen and bounded reclamation preserve authority" {
+    const artifact = @import("source_plan_storage.zig");
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(a, path, .{});
+    var open = true;
+    defer if (open) store.close();
+    var root: artifact.Root = .{ .authority = .native, .namespace = @splat(0), .generation = 0, .fence = @splat(4) };
+    std.mem.writeInt(u64, root.namespace[0..8], 1, .big);
+    var frame: [128]u8 = @splat(0);
+    @memcpy(frame[0..4], "AFP1");
+    std.mem.writeInt(u32, frame[4..8], 1, .little);
+    std.mem.writeInt(u64, frame[8..16], 10, .little);
+    std.mem.writeInt(u64, frame[16..24], 11, .little);
+    std.mem.writeInt(u64, frame[24..32], 1, .little);
+    const digest = try artifact.frozenDigest(&frame);
+    @memcpy(frame[32..64], &digest);
+    var checksum: artifact.Digest = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&frame, &checksum, .{});
+    const hashes = [_]artifact.Digest{artifact.chunkDigest(0, &frame)};
+    var attempt: [16]u8 = @splat(1);
+    std.mem.writeInt(u64, attempt[0..8], 1, .big);
+    const spec: artifact.Spec = .{ .namespace = artifact.namespaceFor(root, 1), .storage_epoch = 1, .binding = @splat(2), .domain = artifact.domainFor(@splat(2)), .attempt = attempt, .bytes = frame.len, .checksum = checksum, .plan_digest = digest, .chunk_hashes = &hashes };
+    var position: artifact.Digest = @splat(0);
+    std.mem.writeInt(u64, position[0..8], 1, .little);
+    position[31] = 2;
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try artifact.stageBegin(a, &txn, root, spec);
+        try artifact.stageChunk(a, &txn, root, spec, 0, &frame);
+    }
+    var seal: artifact.Digest = undefined;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(u16, 0), (try artifact.readQuota(&txn, root)).active);
+        try artifact.stageBegin(a, &txn, root, spec);
+        try artifact.stageChunk(a, &txn, root, spec, 0, &frame);
+        seal = try artifact.stageSeal(a, &txn, root, spec, position);
+        try txn.commit();
+    }
+    store.close();
+    open = false;
+    store = try DocStore.open(a, path, .{});
+    open = true;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const bytes = try artifact.readSealedAlloc(a, &txn, root, spec, seal);
+        defer a.free(bytes);
+        try std.testing.expectEqualSlices(u8, &frame, bytes);
+        std.mem.writeInt(u64, position[0..8], 2, .little);
+        _ = try artifact.stageFence(a, &txn, root, spec, position);
+        try txn.commit();
+    }
+    store.close();
+    open = false;
+    store = try DocStore.open(a, path, .{});
+    open = true;
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectError(error.SourceReceiptExpired, artifact.stageBegin(a, &txn, root, spec));
+        try std.testing.expect(try artifact.stageReclaim(a, &txn, root, spec, 1));
+        try txn.commit();
+    }
+    store.close();
+    open = false;
+    store = try DocStore.open(a, path, .{});
+    open = true;
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expect(try artifact.reclaimed(&txn, root, spec));
+        try std.testing.expectEqual(@as(u64, 0), (try artifact.readQuota(&txn, root)).reserved);
+        try std.testing.expectError(error.SourceReceiptExpired, artifact.stageBegin(a, &txn, root, spec));
+    }
+}

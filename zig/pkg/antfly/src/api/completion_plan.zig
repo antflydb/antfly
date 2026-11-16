@@ -21,6 +21,7 @@ const batch = local.api_internal_batch;
 const types = local.storage_db_selected_root.db.types;
 pub const completion = local.api_local_table_writes.table_write_source.history_resolution_wire.completion;
 const locators = local.api_local_transaction_contract;
+const frozen_storage = local.storage_source_plan_storage;
 const A = std.mem.Allocator;
 
 pub const Input = struct {
@@ -262,19 +263,20 @@ pub const Plan = struct {
     }
 };
 
-pub const frozen_header_bytes: usize = 64;
-pub const max_frozen_payload_bytes: usize = 64 * 1024 * 1024;
+pub const frozen_header_bytes = frozen_storage.frozen_header_bytes;
+pub const max_frozen_payload_bytes = frozen_storage.max_participant_inputs_bytes;
 pub const max_frozen_bytes: usize = frozen_header_bytes + completion.max_bytes + max_frozen_payload_bytes + 4 * completion.max_participants;
+
+comptime {
+    std.debug.assert(completion.max_bytes == frozen_storage.max_admission_bytes);
+    std.debug.assert(completion.max_participants == frozen_storage.max_participants);
+    std.debug.assert(max_frozen_bytes == frozen_storage.max_bytes);
+}
 
 /// Domain-separated artifact identity. The checksum slot is excluded; every
 /// other byte, including lengths and admission timestamps, is authenticated.
 pub fn frozenDigest(raw: []const u8) !completion.Digest {
-    if (raw.len < frozen_header_bytes or raw.len > max_frozen_bytes) return error.InvalidTxnRecord;
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly:frozen-completion-plan:v1");
-    hash.update(raw[0..32]);
-    hash.update(raw[frozen_header_bytes..]);
-    return hash.finalResult();
+    return frozen_storage.frozenDigest(raw);
 }
 
 test "completion frozen plan artifacts retain complete owned inputs and reject substituted recovery" {

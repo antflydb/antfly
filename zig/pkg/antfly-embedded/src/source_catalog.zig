@@ -914,3 +914,5 @@ pub const storage_embedded_graph_catalog = @import("storage/embedded_graph_catal
 pub const storage_read_session_contract = @import("storage/read_session_contract.zig");
 
 pub const storage_read_session_values = @import("storage/read_session_values.zig");
+
+pub const storage_source_plan_storage = @import("storage/source_plan_storage.zig");

@@ -3850,3 +3850,40 @@ source-global checkpoint/head and production source-worker integration remain
 unfinished. Native completion-obligation release, public feeds, coherent
 bootstrap/retention, production pgoutput and existing-client qualification also
 remain required by the unchanged full goal. Neither issue is complete.
+
+### Native frozen-plan KV storage primitive
+
+`source_plan_storage.zig` stages frozen AFP1 payloads in the caller's native
+transaction. It charges an 8-upload / 256 MiB root quota before accepting chunks,
+limits payloads to the existing codec bound, authenticates each 1 MiB chunk and
+the whole object, and retains the first seal position on retries. The storage
+seal authenticates bytes; semantic restoration still validates the completion
+admission and every participant input. Native and Raft position encodings cannot
+be interchanged. Root namespace, generation, fence, and storage epoch bind each
+upload grant.
+
+Explicit fencing advances a persistent root epoch. Already active uploads can
+finish across another upload's retirement, while absent older grants cannot be
+restarted. Cleanup deletes at most eight chunks per transaction and releases
+quota only after the record and all chunks are removed. Interrupted partial
+uploads can be reclaimed without treating absent chunks as corruption. There
+is no timer expiry or accumulating per-upload tombstone. Missing quota under an
+existing record and corrupted chunks fail closed. The frozen completion codec
+now uses the same bounded digest implementation, with compile-time agreement
+on its admission and participant bounds.
+
+Qualification: `source-plan-storage-test.log` reports 11 passing pure storage /
+completion contract tests. `source-plan-storage-qualified-test.log` completes
+`source-plan-storage-test completion-frozen-plan-test` successfully, including
+the two existing frozen-plan codec cases. `source-plan-native-storage-test.log`
+reports one passing native DocStore case: aborted writes leave no quota, sealed
+bytes survive close/reopen, fencing survives another reopen, reclamation releases
+quota, and the old grant remains rejected after a final reopen. No skips or
+leaks were reported; formatting and diff checks passed.
+
+This is the transactional KV primitive, not the production staging facade.
+Native DB/engine and ordered Raft commands, qualified read/fence/GC proof ports,
+topology admission hooks, source-delivery adapters, and production worker wiring
+remain outstanding. It does not establish a public feed, coherent bootstrap,
+production pgoutput, or qualification with an existing CDC client. The full
+objective remains active and both issues remain incomplete.
