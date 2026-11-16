@@ -3,6 +3,7 @@
 import json
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
 import httpx
@@ -1122,7 +1123,7 @@ def test_transaction_models_preserve_commit_requirement_defaults(requirement):
     from antfly.client_generated.models.transaction_commit_request import TransactionCommitRequest
 
     for model in (MultiBatchRequest, TransactionCommitRequest):
-        body = {"tables": {"docs": {"inserts": {"a": {}}}, "audit": {"commit_requires": "none"}}}
+        body: dict[str, Any] = {"tables": {"docs": {"inserts": {"a": {}}}, "audit": {"commit_requires": "none"}}}
         if model is TransactionCommitRequest:
             body["read_set"] = []
         if requirement is not None:

@@ -2265,7 +2265,7 @@ pub const ObjectStorageLocation = struct {
     }
 };
 
-/// Optional PostgreSQL wire listener. Requires authentication. Transactions remain unsupported. Remote bindings require externally protected transport.
+/// Optional PostgreSQL wire listener. Requires authentication. Supports explicit transactions and savepoints. The listener does not terminate TLS, so remote bindings require externally_protected_transport with a TLS proxy or authenticated private transport in front.
 pub const PgwireConfig = struct {
     enabled: ?bool = null,
     bind_host: ?[]const u8 = null,

@@ -28,29 +28,73 @@ class CampaignTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.fixture = self.root / "fixtures.json"
-        self.fixture.write_text(json.dumps([{"id": "image", "max_tokens": 64, "calls": [{"text": "describe"}, {"text": "read"}]}]))
-        self.provenance = {"arguments": {"arms": ["antfly", "llama"], "lifecycles": 2, "repeats": 1, "fixtures": str(self.fixture)},
-                           "hashes": {"fixtures": hashlib.sha256(self.fixture.read_bytes()).hexdigest()}}
-        self.rows = [{"arm": arm, "lc": lc, "cell": "image", "repeat": 0, "index": i,
-                      "usage": {"prompt_tokens": 284, "completion_tokens": 64},
-                      "ms": 100 if arm == "antfly" else 110, "ttft_ms": 10, "decode_tok_s": 700,
-                      "text": str(i)} for arm in ("antfly", "llama") for lc in range(2) for i in range(2)]
-        self.memory = {"valid": True, "errors": [], "samples": 20,
-                       "peak_footprint_bytes": 1000, "peak_gpu_bytes": 700, "peak_pss_bytes": 600}
+        self.fixture.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "image",
+                        "max_tokens": 64,
+                        "calls": [{"text": "describe"}, {"text": "read"}],
+                    }
+                ]
+            )
+        )
+        self.provenance = {
+            "arguments": {
+                "arms": ["antfly", "llama"],
+                "lifecycles": 2,
+                "repeats": 1,
+                "fixtures": str(self.fixture),
+            },
+            "hashes": {
+                "fixtures": hashlib.sha256(self.fixture.read_bytes()).hexdigest()
+            },
+        }
+        self.rows = [
+            {
+                "arm": arm,
+                "lc": lc,
+                "cell": "image",
+                "repeat": 0,
+                "index": i,
+                "usage": {"prompt_tokens": 284, "completion_tokens": 64},
+                "ms": 100 if arm == "antfly" else 110,
+                "ttft_ms": 10,
+                "decode_tok_s": 700,
+                "text": str(i),
+            }
+            for arm in ("antfly", "llama")
+            for lc in range(2)
+            for i in range(2)
+        ]
+        self.memory = {
+            "valid": True,
+            "errors": [],
+            "samples": 20,
+            "peak_footprint_bytes": 1000,
+            "peak_gpu_bytes": 700,
+            "peak_pss_bytes": 600,
+        }
         self.save()
 
     def save(self):
         (self.root / "provenance.json").write_text(json.dumps(self.provenance))
-        (self.root / "calls.jsonl").write_text("".join(json.dumps(r) + "\n" for r in self.rows))
+        (self.root / "calls.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in self.rows)
+        )
         for arm in ("antfly", "llama"):
             for lc in range(2):
-                (self.root / f"lc{lc}-{arm}.json").write_text(json.dumps({"memory": self.memory}))
+                (self.root / f"lc{lc}-{arm}.json").write_text(
+                    json.dumps({"memory": self.memory})
+                )
 
     def test_complete_pair_uses_simultaneous_memory_peak(self):
         result = validate_campaign(self.root)
         self.assertEqual(result["calls_per_arm"], 4)
         self.assertTrue(result["all_cells_faster"])
-        self.assertEqual(result["memory"]["antfly"]["peak_footprint_bytes"], [1000, 1000])
+        self.assertEqual(
+            result["memory"]["antfly"]["peak_footprint_bytes"], [1000, 1000]
+        )
         self.assertFalse(result["combined_memory_lower"])
 
     def test_receipt_patch_grid_mismatch_rejects_summary(self):
