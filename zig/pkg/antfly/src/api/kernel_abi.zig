@@ -30,7 +30,8 @@ pub const StatusDetail = error_abi.Detail;
 /// an older context before the callee reads beyond its layout.
 // Version 25 includes qualified source-plan callback ports in server config.
 // Version 26 changes routed batch callbacks with source checkpoint mutations.
-pub const abi_version: u32 = 26;
+// Version 27 adds bounded source checkpoint receipt-window batch layouts.
+pub const abi_version: u32 = 27;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

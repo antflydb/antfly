@@ -44886,7 +44886,7 @@ fn consumerTests() type {
                         const source_native_types = antfly.db.types;
                         const source_id: [16]u8 = @splat(116);
                         const source_purpose: [32]u8 = @splat(117);
-                        const source_prepare = try (source_native_types.TransactionIntentRequest{ .completion_owner = source_binding, .completion_source_purpose = source_purpose, .completion_source_checkpoint = .{ .binding = @splat(121), .purpose = source_purpose, .sequence = 1, .checkpoint = "source:1", .accepted_at_ns = 4001 } }).completionBatch(source_id, 4000, source_binding.topology_epoch);
+                        const source_prepare = try (source_native_types.TransactionIntentRequest{ .completion_owner = source_binding, .completion_source_purpose = source_purpose, .completion_source_checkpoint = .{ .binding = @splat(121), .purpose = source_purpose, .sequence = 1, .checkpoint = "source:1", .accepted_at_ns = 4001, .receipt_window = 3 } }).completionBatch(source_id, 4000, source_binding.topology_epoch);
                         const source_locator = try @import("../api/distributed_txn.zig").participantIdForGroup(source_alloc, "docs", source_binding.group_id);
                         defer source_alloc.free(source_locator);
                         try std.testing.expectError(error.InvalidSourceAdmission, source_plans.Plan.freeze(source_alloc, source_id, @splat(118), source_binding, &.{.{ .owner = source_binding, .locator = source_locator, .roles = source_plans.completion.Roles.guards, .prepare = source_prepare }}, 4001));
@@ -44900,7 +44900,8 @@ fn consumerTests() type {
                         defer source_plan.deinit();
                         try std.testing.expectEqual(source_purpose, source_plan.source_purpose.?);
                         try std.testing.expect(source_plan.source_checkpoint);
-                        try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_source_checkpoint_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(source_alloc, try source_plan.begin(0)));
+                        try std.testing.expect(source_plan.source_checkpoint_receipts);
+                        try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_source_checkpoint_receipts_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(source_alloc, try source_plan.begin(0)));
                         try source_participant.submit(source_alloc, &source_plan, 0, source_fence, .begin, .{});
                         const source_query: @import("../api/history_decision_operations.zig").Request = .{ .version = 1, .owner = source_binding, .transaction_id = source_id, .minimum_applied_index = 1 };
                         var source_pending = try origin_server.historyDecisionPort().read(source_alloc, source_fence, "docs", source_query, .{});
@@ -44925,7 +44926,7 @@ fn consumerTests() type {
                             const attempt_purpose: [32]u8 = @splat(attempt_id + 1);
                             const conflict = attempt_id == 122;
                             const gap = attempt_id == 124;
-                            const attempt_prepare = try (source_native_types.TransactionIntentRequest{ .completion_owner = source_binding, .completion_source_purpose = attempt_purpose, .completion_source_checkpoint = .{ .binding = @splat(121), .purpose = attempt_purpose, .sequence = if (conflict) 1 else if (gap) 3 else 2, .checkpoint = if (attempt_id == 126) "source:aborted" else "source:2", .expected_checkpoint = if (conflict) null else "source:1", .accepted_at_ns = 4101 + @as(u64, attempt_id) } }).completionBatch(@splat(attempt_id), 4100 + @as(u64, attempt_id), source_binding.topology_epoch);
+                            const attempt_prepare = try (source_native_types.TransactionIntentRequest{ .completion_owner = source_binding, .completion_source_purpose = attempt_purpose, .completion_source_checkpoint = .{ .binding = @splat(121), .purpose = attempt_purpose, .sequence = if (conflict) 1 else if (gap) 3 else 2, .checkpoint = if (attempt_id == 126) "source:aborted" else "source:2", .expected_checkpoint = if (conflict) null else "source:1", .accepted_at_ns = 4101 + @as(u64, attempt_id), .receipt_window = 3 } }).completionBatch(@splat(attempt_id), 4100 + @as(u64, attempt_id), source_binding.topology_epoch);
                             var attempt_plan = try source_plans.Plan.freeze(source_alloc, @splat(attempt_id), @splat(attempt_id + 2), source_binding, &.{.{ .owner = source_binding, .locator = source_locator, .roles = source_plans.completion.Roles.checkpoint, .prepare = attempt_prepare }}, 4101 + @as(u64, attempt_id));
                             defer attempt_plan.deinit();
                             try std.testing.expect(attempt_plan.source_checkpoint);
@@ -45058,7 +45059,7 @@ fn consumerTests() type {
             try std.testing.expect(policy_applied.outcome.?.applied.consumer == null);
             const policy_observed = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect_policy = .{ .namespace = namespace, .authority = ref.authority } });
             try std.testing.expectEqualDeep(policy_applied.outcome.?.applied.policy, policy_observed.outcome.?.applied.policy);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_source_checkpoint_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_source_checkpoint_receipts_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
         }
 
         test "data raft ordered history proposal authority fences term membership and missing owners" {
@@ -45131,7 +45132,7 @@ fn consumerTests() type {
         }
 
         test "data raft ordered history protocol preflight distinguishes incompatible and unavailable peers" {
-            inline for (.{ @import("history_control_entry.zig").required_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version, @import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_completion_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_plan_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_checkpoint_protocol_version }) |required| {
+            inline for (.{ @import("history_control_entry.zig").required_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, @import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version, @import("../common/data_raft_protocol.zig").batch_history_policy_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_completion_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_plan_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_checkpoint_protocol_version, @import("../common/data_raft_protocol.zig").batch_source_checkpoint_receipts_protocol_version }) |required| {
                 const a = std.testing.allocator;
                 const Fake = struct {
                     versions: [3]u16 = .{ required, required - 1, required },

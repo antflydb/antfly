@@ -219,6 +219,7 @@ pub const TransactionMutation = union(enum) {
         completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
         source_purpose: ?[32]u8 = null,
         source_checkpoint: bool = false,
+        source_checkpoint_receipts: bool = false,
     },
     prepare: struct {
         txn_id: TxnId,

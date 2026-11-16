@@ -4407,3 +4407,59 @@ and no remaining drain work. The group-bound fixture leaves the 1,025th empty
 transaction for the next pass with its predecessor intact. Production PostgreSQL
 worker integration with stable durable source identity/checkpoint authority,
 native scope fencing and the remaining full issue contracts are still required.
+
+### Bounded native checkpoint receipt windows
+
+Private checkpoint commands now support an immutable positive `receipt_window`
+(up to 65,536 slots). The native transaction predicates on the original head
+and atomically resolves both the next head and its sequence slot. Slots are
+overwritten in a fixed ring rather than accumulating one key per batch. Exact
+historical retries inside the window return SourceAlreadyCommitted; altered
+input returns SourcePayloadConflict, and older sequences return
+SourceReceiptExpired. Missing/corrupt evidence inside the retained window fails
+closed. Changing the window on an existing source binding is rejected.
+
+SCP2 heads/receipts retain a domain-separated digest of the entire checkpoint
+command, including its exact predecessor and window, with checksummed bounded
+encoding. Probe results are owned before another lookup can reuse read scratch.
+SCP1 decoding and protocol-37 replay remain unchanged; zero windows are omitted
+from canonical legacy JSON. Private receipt keys use the same protected raw
+metadata-intent path and checkpoint-participant authorization as the head.
+
+New begin_source_checkpoint_v2 / prepare_source_checkpoint_v2 tags require
+protocol 38. Frozen plans derive and revalidate the receipt profile from their
+original PREPARE bytes and set the BEGIN marker for every participant, ensuring
+activation precedes admission. Tag downgrade or stripped checkpoint fields are
+rejected. The engine descriptor is 53, storage-owner ABI 106, API-kernel ABI 27;
+the stable failure envelope is unchanged. The OpenAPI command spec and generated
+internal type include the bounded optional window.
+
+Qualification:
+- Direct checkpoint contracts: two tests passed, covering bounded key count,
+  cyclic positions, historical exact retries, altered predecessors, immutable
+  windows, expiry, missing evidence, size limits, and omitted legacy JSON fields.
+- Direct data-Raft protocol contracts: three tests passed, covering legacy
+  layouts and separate protocol-37/38 BEGIN/PREPARE classification.
+- Final completion-begin-wire-test / history-control-apply-test /
+  api-kernel-abi-test run exited zero: 29 codec, six API-boundary, eight ABI, and
+  13 native Raft checks passed with zero skips/failures/leaks. The actual native
+  checkpoint fixture restores a receipt-profile frozen plan, activates protocol
+  38 before BEGIN, commits a first sequence, rejects conflicting/gapped input,
+  aborts a prepared second sequence, and commits a different second attempt.
+- make generate, source-catalog-check, engine-errors-check, openapi-check,
+  changed-source zig fmt --check and git diff --check passed. Unrelated generated
+  model-explorer artifacts were restored.
+
+Evidence: source-checkpoint-receipts-{contract,protocol}-test.log,
+source-checkpoint-receipts-native-final-test.log,
+source-checkpoint-receipts-generated-check.log and
+source-checkpoint-receipts-generate.log.
+
+This is the native receipt storage/activation contract, not a claim of complete
+production source recovery. Qualified read-only receipt observation, physical
+checkpoint provisioning, native source-scope retirement/migration and bounded
+reclamation of retired bindings, source-worker/destination integration, and
+completion/GC ownership remain required. A checkpoint receipt does not by itself
+prove every participant's completion or authorize source acknowledgment, artifact
+reclamation, public event delivery, or index coverage. The full #1698/#1639
+requirements remain active; both issues and draft PR #1700 remain open.

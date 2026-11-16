@@ -40,7 +40,7 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 37;
+pub const batch_protocol_version: u16 = 38;
 /// Frozen completion BEGIN and owner/input-fenced PREPARE require durable
 /// activation across every applying member before proposal or native apply.
 pub const batch_completion_admission_protocol_version: u16 = 31;
@@ -58,6 +58,15 @@ pub const batch_source_completion_protocol_version: u16 = 35;
 pub const batch_source_plan_protocol_version: u16 = 36;
 /// Version 37 admits atomic source-global checkpoint head intents.
 pub const batch_source_checkpoint_protocol_version: u16 = 37;
+/// Version 38 admits immutable bounded receipt windows before source BEGIN.
+pub const batch_source_checkpoint_receipts_protocol_version: u16 = 38;
+fn checkpointProtocol(value: anytype) u16 {
+    // Generic callers may deliberately model older request layouts. This
+    // branch is never selected by hasCheckpoint for those shapes.
+    if (comptime !@hasField(@TypeOf(value), "source_checkpoint")) return batch_source_checkpoint_protocol_version;
+    if (comptime @TypeOf(value.source_checkpoint) == bool) return if (value.source_checkpoint_receipts) batch_source_checkpoint_receipts_protocol_version else batch_source_checkpoint_protocol_version;
+    return if (value.source_checkpoint.?.receipt_window != 0) batch_source_checkpoint_receipts_protocol_version else batch_source_checkpoint_protocol_version;
+}
 fn hasCheckpoint(value: anytype) bool {
     if (comptime !@hasField(@TypeOf(value), "source_checkpoint")) return false;
     return if (@TypeOf(value.source_checkpoint) == bool) value.source_checkpoint else value.source_checkpoint != null;
@@ -74,8 +83,8 @@ pub fn completionProtocolVersion(a: @import("std").mem.Allocator, request: anyty
     const mutation = request.transaction orelse return null;
     return switch (mutation) {
         .publish_completion => |value| if (try completionEnvelopeVersion(a, value.certificate, true) >= 3) batch_completion_recovery_protocol_version else batch_completion_publication_protocol_version,
-        .begin => |value| if (hasCheckpoint(value)) batch_source_checkpoint_protocol_version else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_admission) |bytes| (if (try completionEnvelopeVersion(a, bytes, false) >= 3) batch_completion_recovery_protocol_version else batch_completion_admission_protocol_version) else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
-        .prepare => |value| if (hasCheckpoint(value)) batch_source_checkpoint_protocol_version else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
+        .begin => |value| if (hasCheckpoint(value)) checkpointProtocol(value) else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_admission) |bytes| (if (try completionEnvelopeVersion(a, bytes, false) >= 3) batch_completion_recovery_protocol_version else batch_completion_admission_protocol_version) else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
+        .prepare => |value| if (hasCheckpoint(value)) checkpointProtocol(value) else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
         .resolve => |value| if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
         else => null,
     };
@@ -180,4 +189,23 @@ test "completion recovery protocol classifies decoded envelope versions without 
         }
     };
     try std.testing.checkAllAllocationFailures(a, Failure.run, .{});
+}
+
+test "source checkpoint receipt windows require activation before every BEGIN" {
+    const std = @import("std");
+    const Mutation = union(enum) {
+        begin: struct { completion_admission: ?[]const u8 = null, completion_owner: ?u8 = null, source_purpose: ?[32]u8 = @splat(1), source_checkpoint: bool = true, source_checkpoint_receipts: bool = false },
+        prepare: struct { completion_owner: ?u8 = null, source_purpose: ?[32]u8 = @splat(1), source_checkpoint: ?struct { receipt_window: u32 = 0 } = .{} },
+        resolve: struct { completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
+        publish_completion: struct { certificate: []const u8 },
+        other,
+    };
+    const Request = struct { transaction: ?Mutation };
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(@as(?u16, 37), try completionProtocolVersion(a, Request{ .transaction = .{ .begin = .{} } }));
+    try std.testing.expectEqual(@as(?u16, 38), try completionProtocolVersion(a, Request{ .transaction = .{ .begin = .{ .source_checkpoint_receipts = true } } }));
+    try std.testing.expectEqual(@as(?u16, 37), try completionProtocolVersion(a, Request{ .transaction = .{ .prepare = .{} } }));
+    try std.testing.expectEqual(@as(?u16, 38), try completionProtocolVersion(a, Request{ .transaction = .{ .prepare = .{ .source_checkpoint = .{ .receipt_window = 3 } } } }));
+    try std.testing.expectEqual(@as(?u16, 35), try completionProtocolVersion(a, Request{ .transaction = .{ .begin = .{ .source_checkpoint = false } } }));
+    try std.testing.expectEqual(@as(?u16, 35), try completionProtocolVersion(a, Request{ .transaction = .{ .prepare = .{ .source_checkpoint = null } } }));
 }

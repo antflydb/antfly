@@ -850,7 +850,7 @@ pub const NativeSourceCheckpointAuthority = struct {
     }
 };
 
-/// Private canonical prepare_source_checkpoint_v1 payload, admitted only with data-Raft protocol 37. This command is included in frozen PREPARE input and is never accepted from public batch JSON. The named checkpoint participant predicates on the previous head and commits the new head with transaction resolution. Physical checkpoint authority is routed and frozen separately; binding is the immutable logical source scope.
+/// Private canonical prepare_source_checkpoint_v1 payload, admitted only with data-Raft protocol 37. This command is included in frozen PREPARE input and is never accepted from public batch JSON. The named checkpoint participant predicates on the previous head and commits the new head with transaction resolution. Physical checkpoint authority is routed and frozen separately; binding is the immutable logical source scope. Receipt-window commands use prepare_source_checkpoint_v2 and data-Raft protocol 38; matching BEGIN uses begin_source_checkpoint_v2 before any participant admission. A positive immutable receipt_window retains exactly that many sequence slots, each with the complete command digest; omitted or zero retains legacy protocol-37 behavior. Window changes require a new source binding, never reinterpretation of existing history.
 pub const NativeSourceCheckpointCommand = struct {
     binding: NativeHistoryDigest,
     purpose: NativeHistoryDigest,
@@ -858,6 +858,26 @@ pub const NativeSourceCheckpointCommand = struct {
     checkpoint: []const u8,
     expected_checkpoint: OpenApiOptionalNullable([]const u8) = .absent,
     accepted_at_ns: u64,
+    receipt_window: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "binding", "binding", false },
+        .{ "purpose", "purpose", false },
+        .{ "sequence", "sequence", false },
+        .{ "checkpoint", "checkpoint", false },
+        .{ "expected_checkpoint", "expected_checkpoint", false },
+        .{ "accepted_at_ns", "accepted_at_ns", false },
+        .{ "receipt_window", "receipt_window", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -882,6 +902,10 @@ pub const NativeSourceCheckpointCommand = struct {
         }
         try jw.objectField("accepted_at_ns");
         try jw.write(self.accepted_at_ns);
+        if (self.receipt_window) |value| {
+            try jw.objectField("receipt_window");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

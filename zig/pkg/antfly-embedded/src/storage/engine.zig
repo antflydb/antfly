@@ -590,7 +590,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// transaction intent/mutation layouts. Version 49 callers cannot share it.
 /// Version 51 adds native/ordered frozen source-plan control and qualified reads.
 /// Version 52 adds source-global checkpoint BEGIN/PREPARE contracts.
-pub const descriptor_version: u32 = 52;
+/// Version 53 adds bounded checkpoint receipt-window command layouts.
+pub const descriptor_version: u32 = 53;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

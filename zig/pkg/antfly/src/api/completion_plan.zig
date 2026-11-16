@@ -47,6 +47,7 @@ pub const Plan = struct {
     created_at_ns: u64,
     source_purpose: ?[32]u8,
     source_checkpoint: bool = false,
+    source_checkpoint_receipts: bool = false,
 
     pub fn deinit(self: *Plan) void {
         self.arena.deinit();
@@ -67,6 +68,7 @@ pub const Plan = struct {
         var source_purpose: ?[32]u8 = null;
         var checkpoint_count: usize = 0;
         var source_checkpoint = false;
+        var source_checkpoint_receipts = false;
         var total_payload_bytes: usize = 0;
         var unique_locators: std.StringHashMapUnmanaged(void) = .empty;
         for (inputs, 0..) |input, i| {
@@ -82,6 +84,7 @@ pub const Plan = struct {
                 try checkpoint.validate();
                 if (vote.source_purpose == null or !std.mem.eql(u8, &checkpoint.purpose, &vote.source_purpose.?) or input.roles & completion.Roles.checkpoint == 0) return error.InvalidSourceAdmission;
                 source_checkpoint = true;
+                source_checkpoint_receipts = checkpoint.receipt_window != 0;
             }
             const owner = vote.completion_owner orelse return error.InvalidBatchRequest;
             if (!std.mem.eql(u8, &vote.txn_id, &transaction_id)) return error.SourceTransactionIdentityConflict;
@@ -124,7 +127,7 @@ pub const Plan = struct {
             ids[follower] = participant.locator;
             follower += 1;
         }
-        return .{ .arena = arena, .admission = admission, .admission_bytes = encoded, .participants = participants, .participant_ids = ids, .begin_timestamp = begin_timestamp, .created_at_ns = created_at_ns, .source_purpose = source_purpose, .source_checkpoint = source_checkpoint };
+        return .{ .arena = arena, .admission = admission, .admission_bytes = encoded, .participants = participants, .participant_ids = ids, .begin_timestamp = begin_timestamp, .created_at_ns = created_at_ns, .source_purpose = source_purpose, .source_checkpoint = source_checkpoint, .source_checkpoint_receipts = source_checkpoint_receipts };
     }
 
     /// Derive a retry identity from canonical namespace order and the complete
@@ -153,6 +156,7 @@ pub const Plan = struct {
         var follower: usize = 1;
         var checkpoints: usize = 0;
         var has_checkpoint_command = false;
+        var has_checkpoint_receipts = false;
         for (self.participants, 0..) |participant, index| {
             var request = try self.prepare(a, index);
             defer request.deinit(a);
@@ -166,13 +170,14 @@ pub const Plan = struct {
                 try checkpoint.validate();
                 if (self.source_purpose == null or !std.mem.eql(u8, &checkpoint.purpose, &self.source_purpose.?) or member.roles & completion.Roles.checkpoint == 0) return error.InvalidSourceAdmission;
                 has_checkpoint_command = true;
+                has_checkpoint_receipts = checkpoint.receipt_window != 0;
             }
             if (!std.mem.eql(u8, &participant.owner.namespace, &self.admission.coordinator_namespace)) {
                 if (follower >= self.participant_ids.len or !std.mem.eql(u8, self.participant_ids[follower], participant.locator)) return error.InvalidParticipant;
                 follower += 1;
             }
         }
-        if (has_checkpoint_command != self.source_checkpoint) return error.SourcePayloadConflict;
+        if (has_checkpoint_command != self.source_checkpoint or has_checkpoint_receipts != self.source_checkpoint_receipts) return error.SourcePayloadConflict;
         if (self.source_purpose != null and checkpoints != 1) return error.InvalidSourceAdmission;
         var size: usize = frozen_header_bytes + self.admission_bytes.len;
         var payload_bytes: usize = 0;
@@ -264,7 +269,7 @@ pub const Plan = struct {
         if (index >= self.participants.len) return error.InvalidTxnRecord;
         const owner = self.participants[index].owner;
         try self.admission.requireRoutedOwner(owner);
-        return .{ .sync_level = .write, .transaction = .{ .begin = .{ .txn_id = self.admission.transaction_id, .begin_timestamp = self.begin_timestamp, .created_at_ns = self.created_at_ns, .topology_epoch = owner.topology_epoch, .retain_terminal = true, .participants = self.participant_ids, .completion_admission = self.admission_bytes, .completion_owner = owner, .source_purpose = self.source_purpose, .source_checkpoint = self.source_checkpoint } } };
+        return .{ .sync_level = .write, .transaction = .{ .begin = .{ .txn_id = self.admission.transaction_id, .begin_timestamp = self.begin_timestamp, .created_at_ns = self.created_at_ns, .topology_epoch = owner.topology_epoch, .retain_terminal = true, .participants = self.participant_ids, .completion_admission = self.admission_bytes, .completion_owner = owner, .source_purpose = self.source_purpose, .source_checkpoint = self.source_checkpoint, .source_checkpoint_receipts = self.source_checkpoint_receipts } } };
     }
 
     /// Parsed retry input has independent ownership and can outlive this plan.

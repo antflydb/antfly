@@ -26856,6 +26856,7 @@ pub const DB = struct {
             defer checkpoint_read.abort();
             const checkpoint_plan = try @import("../source_checkpoint.zig").prepare(source_arena.allocator(), &checkpoint_read, txn_id, source_purpose.?, checkpoint);
             try intents.append(preparation_alloc, .{ .key = checkpoint_plan.key, .value = checkpoint_plan.value });
+            if (checkpoint_plan.receipt_key) |receipt_key| try intents.append(preparation_alloc, .{ .key = receipt_key, .value = checkpoint_plan.value });
             try predicates.append(preparation_alloc, .{ .key = checkpoint_plan.key, .comparison = .exact_value, .expected_value = checkpoint_plan.before });
         }
         if (row_policy_principal) |principal| {
