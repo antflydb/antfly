@@ -1,0 +1,2132 @@
+{
+  "scope": "GB10 unified-memory functional validation and contended same-binary placement diagnostic; no L4 performance qualification",
+  "base_commit": "fe684c146478f3e7c29b658c212701030aec1ff5",
+  "source_sha256": {
+    "zig/pkg/inference/build/tests.zig": "0d9799acd31b7c493bb1e02043e118fe7b6380fca6135d3dde3748c10aaa2d24",
+    "zig/pkg/inference/src/inference.zig": "03993e783b87dee5a09f0a1dbc1e50d49ddf2929fd058377052c648a7680bcbd",
+    "zig/pkg/inference/src/ops/cuda/buffer.zig": "e81d7a7dcb2baf41f7652aff9fd9bc82c29b2a9e2ddd833f2b5cd62c08f3014e",
+    "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "16a6e2ba9670b6ab43ceb504580c8ebf898004e70f5223d5733ae71cc0b79e47",
+    "zig/pkg/inference/src/ops/cuda/driver.zig": "1e11b516a423593dd6e8c35c9ed81f8cebf62bd2e3464b5e05e7c26b0fc62f3e",
+    "zig/pkg/inference/src/ops/cuda/ple_host.zig": "d9b307c79af3fd2706d0e43c775a39a5f2bfd12e3c29c3167fa00718901f2587",
+    "zig/pkg/inference/src/ops/cuda/ple_host_test.zig": "f73279fc62becd9f6a23be9fa85b64ad83a1189543f8f4a1be517d6dac9aba24",
+    "zig/pkg/inference/src/server/model_manager.zig": "0db2b4c542f5bbded7f7725f7838e564eb2d21ffca9e18c8509dcce26ea02dd5",
+    "zig/pkg/inference/scripts/gemma4/benchmark_cuda_ple_host.py": "39ea383170c0bf665d69de1553c9a76d9d61b042644416b5d435f0a3deba173c"
+  },
+  "provenance": {
+    "arguments": {
+      "server": "zig-out/bin/antfly-inference-bench-server",
+      "model": "/home/ajroetker/.antfly/inference/models/google/gemma-4-E4B-it-qat-q4_0-gguf/gemma-4-E4B_q4_0-it.gguf",
+      "fixtures": "zig/pkg/inference/scripts/gemma4/fixtures/e4b_cuda_http_v1.json",
+      "output": ".benchmark-results/ple-host/campaign-v2",
+      "lifecycles": 3,
+      "host_budget_mb": 12288,
+      "calls_per_cell": 2,
+      "env": [],
+      "allow_cotenant": true
+    },
+    "server_sha256": "3492d927b0dc270b7b6d15b76b04bfd500f361c69e0a91c42816b0553b7e1b99",
+    "model_sha256": "676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee",
+    "fixtures_sha256": "c46577ba5f20a8638fb753b3d3bfdc4fe3076747f42bd27be52720da34dd0476",
+    "harness_sha256": "39ea383170c0bf665d69de1553c9a76d9d61b042644416b5d435f0a3deba173c",
+    "inherited_cuda_env": {},
+    "selected_call_indices": {
+      "text_short_256": [
+        0,
+        11
+      ],
+      "page_summary_128": [
+        0,
+        11
+      ],
+      "long2k_summary_64": [
+        0,
+        5
+      ],
+      "image_describe_64": [
+        0,
+        2
+      ],
+      "audio_transcribe_64": [
+        0,
+        1
+      ]
+    },
+    "gpu": "NVIDIA GB10, 580.178.04, [N/A], 12.1",
+    "media_sha256": {
+      "../../../../../e2e/inference/testdata/whisper_quality.wav": "904c039735a6eec4186bed49369408638421937fb02104729afafea8c41b266d",
+      "../../../../../e2e/inference/testdata/whisper_spanish_quality.wav": "c656aaeeb98a4239f9f0f6ab05eed6e76424b9b073caa0090ac6ac35d7312b35",
+      "../../lightonocr3/corpus/letter.png": "24e54193d36349212ef3cad911016efaf48837934305759817525f03be003737",
+      "../../lightonocr3/corpus/shipping.png": "3bfab6d55f212b14fcd91a4663e2a7aa9e031ccd1242fd236728af99836d0007"
+    },
+    "mmproj_sha256": "7498a37cb619e55f2fcf87eb931f56e99389ed6d432e4c5c66110694c0d65578"
+  },
+  "validation": {
+    "cuda_focused": {
+      "selected": 45,
+      "passed": 45,
+      "skipped": 0
+    },
+    "metal_enabled_focused": {
+      "selected": 44,
+      "passed": 44,
+      "skipped": 0
+    },
+    "compute_sanitizer": {
+      "errors": 0,
+      "leaked_bytes": 0,
+      "leaked_allocations": 0
+    },
+    "http_exact_text_reasoning_and_usage": true,
+    "logs_sha256": {
+      "cuda-ple-tests.log": "cb470a86e01d5540a1b57f4b8c8c942b335010279628843707e7f696d6c99929",
+      "cuda-memcheck.log": "a4c1173c21f7f47293711c0d7b751f4fb84f92409e42a975c7fc6672a64dd51b",
+      "metal-ple.log": "a77f6252b50513f8c11e4816ce0390973abd2306475ac8906864e242ef6096b7"
+    }
+  },
+  "summary": {
+    "exact_output_parity": true,
+    "uncontended": false,
+    "calls_per_placement": 30,
+    "cells": [
+      {
+        "cell": "text_short_256",
+        "device": {
+          "ms": 17678.723339005955,
+          "ttft_ms": 483.57784950349014,
+          "decode_tok_s": 14.836054899970918,
+          "lifecycle_median_ms": [
+            17296.79549302091,
+            17480.275378009537,
+            18784.06111849472
+          ]
+        },
+        "host": {
+          "ms": 18313.788478510105,
+          "ttft_ms": 544.3797530024312,
+          "decode_tok_s": 14.387766254492568,
+          "lifecycle_median_ms": [
+            18148.642042506253,
+            18351.380683496245,
+            18324.553225495038
+          ]
+        },
+        "host_over_device_latency_ratio": 1.035922567898495
+      },
+      {
+        "cell": "page_summary_128",
+        "device": {
+          "ms": 14787.366607502918,
+          "ttft_ms": 2641.596980000031,
+          "decode_tok_s": 10.47224793193363,
+          "lifecycle_median_ms": [
+            14787.366607502918,
+            16968.88209748431,
+            14289.949227008037
+          ]
+        },
+        "host": {
+          "ms": 14930.40784249024,
+          "ttft_ms": 2655.082442506682,
+          "decode_tok_s": 10.274130500437114,
+          "lifecycle_median_ms": [
+            14700.718122490798,
+            16428.925861997413,
+            14448.459995997837
+          ]
+        },
+        "host_over_device_latency_ratio": 1.0096732054316382
+      },
+      {
+        "cell": "long2k_summary_64",
+        "device": {
+          "ms": 25840.78770650376,
+          "ttft_ms": 22343.162002507597,
+          "decode_tok_s": 17.598081725773625,
+          "lifecycle_median_ms": [
+            26042.80016949633,
+            26506.694299998344,
+            25840.78770650376
+          ]
+        },
+        "host": {
+          "ms": 25722.24632400321,
+          "ttft_ms": 22062.170821998734,
+          "decode_tok_s": 17.371764794646218,
+          "lifecycle_median_ms": [
+            26569.731270501507,
+            26072.714285488473,
+            25612.023529509315
+          ]
+        },
+        "host_over_device_latency_ratio": 0.9954126250388754
+      },
+      {
+        "cell": "image_describe_64",
+        "device": {
+          "ms": 12185.489835508633,
+          "ttft_ms": 6689.6971664973535,
+          "decode_tok_s": 11.498831051481048,
+          "lifecycle_median_ms": [
+            12050.011713508866,
+            11997.126683505485,
+            13857.364345501992
+          ]
+        },
+        "host": {
+          "ms": 12491.529450009693,
+          "ttft_ms": 7022.938548499951,
+          "decode_tok_s": 11.400518557819069,
+          "lifecycle_median_ms": [
+            12322.610239498317,
+            12446.259400006966,
+            12689.635675502359
+          ]
+        },
+        "host_over_device_latency_ratio": 1.0251150851243795
+      },
+      {
+        "cell": "audio_transcribe_64",
+        "device": {
+          "ms": 5953.530719489208,
+          "ttft_ms": 2144.625400498626,
+          "decode_tok_s": 16.49142018170112,
+          "lifecycle_median_ms": [
+            6162.422105495352,
+            6122.712683514692,
+            5840.59449598135
+          ]
+        },
+        "host": {
+          "ms": 6175.913557992317,
+          "ttft_ms": 2274.5755825017113,
+          "decode_tok_s": 16.200675673952613,
+          "lifecycle_median_ms": [
+            6329.1014619899215,
+            6237.513679006952,
+            5953.3992689976
+          ]
+        },
+        "host_over_device_latency_ratio": 1.0373531017107422
+      }
+    ],
+    "cuda_allocation_maxima": {
+      "device": {
+        "device_live": 8487666124,
+        "device_peak": 9641201356,
+        "device_weights": 7413380264,
+        "host_ple": 0,
+        "projector": 0,
+        "idle_temp": 1073740800,
+        "pinned_temp": 0,
+        "deferred": 442368
+      },
+      "host": {
+        "device_live": 6175556044,
+        "device_peak": 7329091276,
+        "device_weights": 5101270184,
+        "host_ple": 2312110080,
+        "projector": 0,
+        "idle_temp": 1073740800,
+        "pinned_temp": 0,
+        "deferred": 442368
+      }
+    },
+    "managed_device_peak_saved_bytes": 2312110080
+  },
+  "sample_columns": [
+    "placement",
+    "lifecycle",
+    "cell",
+    "index",
+    "ms",
+    "ttft_ms",
+    "decode_tok_s",
+    "prompt_tokens",
+    "completion_tokens"
+  ],
+  "samples": [
+    [
+      "device",
+      0,
+      "text_short_256",
+      0,
+      16431.479492021026,
+      350.32273302203976,
+      15.857068233434294,
+      32,
+      256
+    ],
+    [
+      "device",
+      0,
+      "text_short_256",
+      1,
+      18162.11149402079,
+      612.9672440001741,
+      14.530623053012993,
+      77,
+      256
+    ],
+    [
+      "device",
+      0,
+      "page_summary_128",
+      0,
+      14895.84395600832,
+      2639.720475010108,
+      10.36216714011569,
+      419,
+      128
+    ],
+    [
+      "device",
+      0,
+      "page_summary_128",
+      1,
+      14678.889258997515,
+      2677.750065980945,
+      10.582328723751571,
+      424,
+      128
+    ],
+    [
+      "device",
+      0,
+      "long2k_summary_64",
+      0,
+      24093.2853249833,
+      20445.700059004594,
+      17.27170042811764,
+      1775,
+      64
+    ],
+    [
+      "device",
+      0,
+      "long2k_summary_64",
+      1,
+      27992.315014009364,
+      23978.268984006718,
+      15.694887285574668,
+      1867,
+      64
+    ],
+    [
+      "device",
+      0,
+      "image_describe_64",
+      0,
+      11940.5869510083,
+      6598.061577009503,
+      11.792176094588296,
+      278,
+      64
+    ],
+    [
+      "device",
+      0,
+      "image_describe_64",
+      1,
+      12159.436476009432,
+      6747.251071006758,
+      11.640399447839846,
+      273,
+      64
+    ],
+    [
+      "device",
+      0,
+      "audio_transcribe_64",
+      0,
+      5655.922784993891,
+      2038.37235699757,
+      17.41509932036919,
+      80,
+      64
+    ],
+    [
+      "device",
+      0,
+      "audio_transcribe_64",
+      1,
+      6668.921425996814,
+      2409.925532992929,
+      14.792219007181497,
+      142,
+      64
+    ],
+    [
+      "host",
+      0,
+      "text_short_256",
+      0,
+      16965.089128992986,
+      310.6864069995936,
+      15.311266591581415,
+      32,
+      256
+    ],
+    [
+      "host",
+      0,
+      "text_short_256",
+      1,
+      19332.19495601952,
+      686.3168520212639,
+      13.675944816206862,
+      77,
+      256
+    ],
+    [
+      "host",
+      0,
+      "page_summary_128",
+      0,
+      15101.23739897972,
+      2709.689309995156,
+      10.248921207261935,
+      419,
+      128
+    ],
+    [
+      "host",
+      0,
+      "page_summary_128",
+      1,
+      14300.198846001877,
+      2657.765856012702,
+      10.908372855502094,
+      424,
+      128
+    ],
+    [
+      "host",
+      0,
+      "long2k_summary_64",
+      0,
+      25599.163247999968,
+      21989.66149199987,
+      17.453932497823185,
+      1775,
+      64
+    ],
+    [
+      "host",
+      0,
+      "long2k_summary_64",
+      1,
+      27540.299293003045,
+      23949.180513998726,
+      17.543279372526776,
+      1867,
+      64
+    ],
+    [
+      "host",
+      0,
+      "image_describe_64",
+      0,
+      12204.195773985703,
+      6907.513779995497,
+      11.89423870858812,
+      278,
+      64
+    ],
+    [
+      "host",
+      0,
+      "image_describe_64",
+      1,
+      12441.024705010932,
+      6720.126041007461,
+      11.012255888467836,
+      273,
+      64
+    ],
+    [
+      "host",
+      0,
+      "audio_transcribe_64",
+      0,
+      5759.761589986738,
+      2080.2362840040587,
+      17.121773805323723,
+      80,
+      64
+    ],
+    [
+      "host",
+      0,
+      "audio_transcribe_64",
+      1,
+      6898.441333993105,
+      2580.1283799810335,
+      14.589030640187335,
+      142,
+      64
+    ],
+    [
+      "host",
+      1,
+      "text_short_256",
+      0,
+      17295.38200100069,
+      407.50365701387636,
+      15.099587692778274,
+      32,
+      256
+    ],
+    [
+      "host",
+      1,
+      "text_short_256",
+      1,
+      19407.3793659918,
+      714.7178440063726,
+      13.641717082400545,
+      77,
+      256
+    ],
+    [
+      "host",
+      1,
+      "page_summary_128",
+      0,
+      15367.899687989848,
+      2652.3990290006623,
+      9.987809635338088,
+      419,
+      128
+    ],
+    [
+      "host",
+      1,
+      "page_summary_128",
+      1,
+      17489.95203600498,
+      3011.7007990193088,
+      8.771777607752096,
+      424,
+      128
+    ],
+    [
+      "host",
+      1,
+      "long2k_summary_64",
+      0,
+      24622.95264599379,
+      20877.37407698296,
+      16.81983139300096,
+      1775,
+      64
+    ],
+    [
+      "host",
+      1,
+      "long2k_summary_64",
+      1,
+      27522.475924983155,
+      23878.66631700308,
+      17.28959709146925,
+      1867,
+      64
+    ],
+    [
+      "host",
+      1,
+      "image_describe_64",
+      0,
+      12854.098195006372,
+      7168.749502015999,
+      11.081114528238958,
+      278,
+      64
+    ],
+    [
+      "host",
+      1,
+      "image_describe_64",
+      1,
+      12038.420605007559,
+      6818.038121011341,
+      12.068081255182918,
+      273,
+      64
+    ],
+    [
+      "host",
+      1,
+      "audio_transcribe_64",
+      0,
+      5333.974940003827,
+      1805.281279986957,
+      17.853632553554906,
+      80,
+      64
+    ],
+    [
+      "host",
+      1,
+      "audio_transcribe_64",
+      1,
+      7141.0524180100765,
+      2720.657169993501,
+      14.252119203202023,
+      142,
+      64
+    ],
+    [
+      "device",
+      1,
+      "text_short_256",
+      0,
+      15854.675664013484,
+      320.70159999420866,
+      16.41563188847124,
+      32,
+      256
+    ],
+    [
+      "device",
+      1,
+      "text_short_256",
+      1,
+      19105.87509200559,
+      645.5998710007407,
+      13.813445192293269,
+      77,
+      256
+    ],
+    [
+      "device",
+      1,
+      "page_summary_128",
+      0,
+      16491.647992981598,
+      2643.473484989954,
+      9.170883853803948,
+      419,
+      128
+    ],
+    [
+      "device",
+      1,
+      "page_summary_128",
+      1,
+      17446.116201987024,
+      3498.2590499857906,
+      9.105341316302345,
+      424,
+      128
+    ],
+    [
+      "device",
+      1,
+      "long2k_summary_64",
+      0,
+      25506.723225989845,
+      21954.35167098185,
+      17.734631365118627,
+      1775,
+      64
+    ],
+    [
+      "device",
+      1,
+      "long2k_summary_64",
+      1,
+      27506.665374006843,
+      23905.502128996886,
+      17.49434716332217,
+      1867,
+      64
+    ],
+    [
+      "device",
+      1,
+      "image_describe_64",
+      0,
+      11782.710172003135,
+      6439.024747989606,
+      11.789616154590558,
+      278,
+      64
+    ],
+    [
+      "device",
+      1,
+      "image_describe_64",
+      1,
+      12211.543195007835,
+      6632.143261987949,
+      11.291536859932686,
+      273,
+      64
+    ],
+    [
+      "device",
+      1,
+      "audio_transcribe_64",
+      0,
+      5553.904409025563,
+      1898.3111650159117,
+      17.23386487357062,
+      80,
+      64
+    ],
+    [
+      "device",
+      1,
+      "audio_transcribe_64",
+      1,
+      6691.520958003821,
+      2402.889508026419,
+      14.690000932659292,
+      142,
+      64
+    ],
+    [
+      "device",
+      2,
+      "text_short_256",
+      0,
+      17195.33518399112,
+      354.1884550068062,
+      15.141486746928843,
+      32,
+      256
+    ],
+    [
+      "device",
+      2,
+      "text_short_256",
+      1,
+      20372.78705299832,
+      955.7924999971874,
+      13.13282543824923,
+      77,
+      256
+    ],
+    [
+      "device",
+      2,
+      "page_summary_128",
+      0,
+      14249.302254000213,
+      2482.2663749800995,
+      10.792862476644014,
+      419,
+      128
+    ],
+    [
+      "device",
+      2,
+      "page_summary_128",
+      1,
+      14330.596200015862,
+      2377.3979840043467,
+      10.624771521807554,
+      424,
+      128
+    ],
+    [
+      "device",
+      2,
+      "long2k_summary_64",
+      0,
+      25539.347609999822,
+      21980.390779004665,
+      17.701816288225082,
+      1775,
+      64
+    ],
+    [
+      "device",
+      2,
+      "long2k_summary_64",
+      1,
+      26142.2278030077,
+      22705.93322601053,
+      18.333701779156833,
+      1867,
+      64
+    ],
+    [
+      "device",
+      2,
+      "image_describe_64",
+      0,
+      12641.548299987335,
+      7007.663606986171,
+      11.182337487003123,
+      278,
+      64
+    ],
+    [
+      "device",
+      2,
+      "image_describe_64",
+      1,
+      15073.180391016649,
+      9526.069092011312,
+      11.357262655122252,
+      273,
+      64
+    ],
+    [
+      "device",
+      2,
+      "audio_transcribe_64",
+      0,
+      5430.050337978173,
+      1898.7878539774101,
+      17.84064489270812,
+      80,
+      64
+    ],
+    [
+      "device",
+      2,
+      "audio_transcribe_64",
+      1,
+      6251.138653984526,
+      2250.8784439996816,
+      15.748975489831619,
+      142,
+      64
+    ],
+    [
+      "host",
+      2,
+      "text_short_256",
+      0,
+      17276.501193991862,
+      423.8931150175631,
+      15.131189119513428,
+      32,
+      256
+    ],
+    [
+      "host",
+      2,
+      "text_short_256",
+      1,
+      19372.605256998213,
+      664.8663909872994,
+      13.630722655814692,
+      77,
+      256
+    ],
+    [
+      "host",
+      2,
+      "page_summary_128",
+      0,
+      14137.341705994913,
+      2444.2601159971673,
+      10.861123222524652,
+      419,
+      128
+    ],
+    [
+      "host",
+      2,
+      "page_summary_128",
+      1,
+      14759.57828600076,
+      2428.690817003371,
+      10.299339793612294,
+      424,
+      128
+    ],
+    [
+      "host",
+      2,
+      "long2k_summary_64",
+      0,
+      25378.71765901218,
+      21897.909232997335,
+      18.0992437070512,
+      1775,
+      64
+    ],
+    [
+      "host",
+      2,
+      "long2k_summary_64",
+      1,
+      25845.32940000645,
+      22134.6801519976,
+      16.978160906425224,
+      1867,
+      64
+    ],
+    [
+      "host",
+      2,
+      "image_describe_64",
+      0,
+      12837.237155996263,
+      7138.363317004405,
+      11.054815702174734,
+      278,
+      64
+    ],
+    [
+      "host",
+      2,
+      "image_describe_64",
+      1,
+      12542.034195008455,
+      7166.572068003006,
+      11.71992258739918,
+      273,
+      64
+    ],
+    [
+      "host",
+      2,
+      "audio_transcribe_64",
+      0,
+      5314.733011997305,
+      1916.5645789762493,
+      18.53939886787526,
+      80,
+      64
+    ],
+    [
+      "host",
+      2,
+      "audio_transcribe_64",
+      1,
+      6592.065525997896,
+      2468.914880999364,
+      15.279577542581501,
+      142,
+      64
+    ]
+  ],
+  "responses": [
+    {
+      "cell": "audio_transcribe_64",
+      "sample_index": 0,
+      "fixture_index": 0,
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "reasoning": "",
+      "usage": {
+        "prompt_tokens": 80,
+        "completion_tokens": 64,
+        "total_tokens": 144
+      }
+    },
+    {
+      "cell": "audio_transcribe_64",
+      "sample_index": 1,
+      "fixture_index": 1,
+      "text": "Buenos d\u00edas. Esta es una prueba de reconocimiento autom\u00e1tico de audio.",
+      "reasoning": "",
+      "usage": {
+        "prompt_tokens": 142,
+        "completion_tokens": 64,
+        "total_tokens": 206
+      }
+    },
+    {
+      "cell": "image_describe_64",
+      "sample_index": 0,
+      "fixture_index": 0,
+      "text": "This image is a simple text-based notification providing delivery confirmation details. It states that the delivery confirmation is for order number ORDER-76291, and informs the recipient that the replacement parts are scheduled to arrive on Friday, requesting that the package be left at reception. Finally, it provides contact information for Morgan",
+      "reasoning": "",
+      "usage": {
+        "prompt_tokens": 278,
+        "completion_tokens": 64,
+        "total_tokens": 342
+      }
+    },
+    {
+      "cell": "image_describe_64",
+      "sample_index": 1,
+      "fixture_index": 2,
+      "text": "This image is a text-based receipt or shipping label detailing a delivery. It specifies that the delivery method is \"EXPRESS DELIVERY\" and provides the shipping destination as \"Avery Chen\" at \"184 Cedar Street, Portland OR 97205.\" Further tracking information is included, showing a tracking",
+      "reasoning": "",
+      "usage": {
+        "prompt_tokens": 273,
+        "completion_tokens": 64,
+        "total_tokens": 337
+      }
+    },
+    {
+      "cell": "long2k_summary_64",
+      "sample_index": 0,
+      "fixture_index": 0,
+      "text": "The author argues that the distribution of species and geological evidence suggests that life has evolved from common ancestors rather than being independently created. He proposes that the mechanism driving this change is \"Natural Selection,\" where individuals with advantageous variations survive and reproduce, leading to the modification and divergence of species.",
+      "reasoning": "",
+      "usage": {
+        "prompt_tokens": 1775,
+        "completion_tokens": 64,
+        "total_tokens": 1839
+      }
+    },
+    {
+      "cell": "long2k_summary_64",
+      "sample_index": 1,
+      "fixture_index": 5,
+      "text": "The author argues that all domestic pigeon breeds must have descended from the wild rock-pigeon (*Columba livia*) rather than from multiple distinct ancestral species. This conclusion is supported by the perfect fertility of hybrid offspring and the observable tendency for traits to revert to ancestral forms, despite the common belief among breeders that each breed",
+      "reasoning": "",
+      "usage": {
+        "prompt_tokens": 1867,
+        "completion_tokens": 64,
+        "total_tokens": 1931
+      }
+    },
+    {
+      "cell": "page_summary_128",
+      "sample_index": 0,
+      "fixture_index": 0,
+      "text": "The passage describes the intricate process by which bees construct honeycomb cells, detailing that they begin by creating a rough, circumferential wall around a growing comb, which they then gnaw into from opposite sides while working circularly to deepen each cell. The construction is incremental, with bees only forming parts of the pyramidal base at a time, and the initial rough wall is significantly thicker than the final, thin cell wall. The author argues that while some previous theories, like those of Huber, may be slightly inaccurate regarding the very first cell, the bees are capable of building precise wax walls along the intersection planes of adjoining cells, a process that can be likened to",
+      "reasoning": "",
+      "usage": {
+        "prompt_tokens": 419,
+        "completion_tokens": 128,
+        "total_tokens": 547
+      }
+    },
+    {
+      "cell": "page_summary_128",
+      "sample_index": 1,
+      "fixture_index": 11,
+      "text": "The passage argues that the historical relationship between the flora and fauna of Europe and America was much closer in the warmer periods of the late Tertiary, when land bridges allowed for continuous migration. As the climate cooled during the Pliocene, these populations were separated, leading to significant evolutionary divergence as they adapted to their respective environments\u2014competing with native species in both the Old and New Worlds. This long period of isolation and adaptation, unlike the more recent isolation of Alpine species, resulted in the current diversity of forms, including numerous geographical races and distinct species, in the temperate regions of both continents, a pattern that is also theorized to explain the",
+      "reasoning": "",
+      "usage": {
+        "prompt_tokens": 424,
+        "completion_tokens": 128,
+        "total_tokens": 552
+      }
+    },
+    {
+      "cell": "text_short_256",
+      "sample_index": 0,
+      "fixture_index": 0,
+      "text": "Imagine you're a super-curious scientist, and you've traveled to a really special, remote place called the **Galapagos Islands**. These islands are famous because they are like a giant, natural science experiment\u2014they have unique animals and plants that you don't see anywhere else in the world!\n\nNow, the sentence starts with: **\"In the plants of the Galapagos Islands, Dr...\"**\n\nHere is what that means, broken down:\n\n### \ud83c\udf3f **\"In the plants...\"**\nThis tells us that the story or the science we are talking about is happening *inside* or *about* the **vegetation**\u2014the grass, the bushes, the trees, and all the green stuff growing on those islands.\n\n### \ud83c\udfdd\ufe0f **\"...of the Galapagos Islands...\"**\nThis is the **location**. The Galapagos Islands are a specific, amazing place in the ocean off the coast of Ecuador. They are famous because of how unique their wildlife is. Think of them as a natural laboratory where nature has been experimenting for millions of years.\n\n### \ud83e\uddd1\u200d\ud83d\udd2c **\"...Dr...\"**\nThis tells us who is doing the work. **\"Dr.\"** is short for **Doctor**. This means the person is",
+      "reasoning": "",
+      "usage": {
+        "prompt_tokens": 32,
+        "completion_tokens": 256,
+        "total_tokens": 288
+      }
+    },
+    {
+      "cell": "text_short_256",
+      "sample_index": 1,
+      "fixture_index": 11,
+      "text": "Imagine you're looking at a picture, and someone says, \"This view is supported by a parallelism of another kind.\" That sounds super fancy, but it basically means: **\"This idea makes sense because of a pattern that shows up in other things.\"**\n\nLet's break down the rest of the sentence, because it's talking about two specific patterns:\n\n### Part 1: \"The crossing of forms only slightly different is favourable to the vigour and fertility of their offspring.\"\n\n**Think of it like this:** Imagine you have two types of plants. One is a little bit taller, and the other is a little bit wider. If you let them \"cross\" (which in science means they reproduce together), the babies they make are often *stronger* and *healthier* than either parent alone.\n\n* **\"Crossing of forms only slightly different\"** = Mixing things that are almost the same, but have tiny differences (like two slightly different types of flowers).\n* **\"Favourable to the vigour and fertility of their offspring\"** = The babies that come out are stronger, healthier, and more likely to have lots of babies themselves.\n\n**The simple idea here is: Mixing things that are *almost* the same",
+      "reasoning": "",
+      "usage": {
+        "prompt_tokens": 77,
+        "completion_tokens": 256,
+        "total_tokens": 333
+      }
+    }
+  ],
+  "lifecycle_allocations": [
+    {
+      "lifecycle": 0,
+      "placement": "device",
+      "observations": [
+        {
+          "device_live": 7413906600,
+          "device_peak": 7413906600,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 0,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 7453965740,
+          "device_peak": 7483327664,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 40058880,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 7474544044,
+          "device_peak": 7510852784,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 60571648,
+          "pinned_temp": 0,
+          "deferred": 65536
+        },
+        {
+          "device_live": 7501457940,
+          "device_peak": 7698303732,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 87419648,
+          "pinned_temp": 0,
+          "deferred": 131072
+        },
+        {
+          "device_live": 7616784580,
+          "device_peak": 8187174504,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 202710784,
+          "pinned_temp": 0,
+          "deferred": 163840
+        },
+        {
+          "device_live": 7602226372,
+          "device_peak": 8187174504,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 188054272,
+          "pinned_temp": 0,
+          "deferred": 262144
+        },
+        {
+          "device_live": 7610206700,
+          "device_peak": 8187174504,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 196034560,
+          "pinned_temp": 0,
+          "deferred": 262144
+        },
+        {
+          "device_live": 8006167332,
+          "device_peak": 8818449740,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 591918848,
+          "pinned_temp": 0,
+          "deferred": 327680
+        },
+        {
+          "device_live": 8061290788,
+          "device_peak": 8818449740,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 646927616,
+          "pinned_temp": 0,
+          "deferred": 442368
+        },
+        {
+          "device_live": 8287477764,
+          "device_peak": 8836764820,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 873113856,
+          "pinned_temp": 0,
+          "deferred": 442368
+        },
+        {
+          "device_live": 8474594508,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1060374272,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 8476372428,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1062152192,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 8478033356,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1063813120,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 8487632332,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1073707008,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 8487646668,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1073721344,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 8487666124,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1073740800,
+          "pinned_temp": 0,
+          "deferred": 0
+        }
+      ]
+    },
+    {
+      "lifecycle": 0,
+      "placement": "host",
+      "observations": [
+        {
+          "device_live": 5101796520,
+          "device_peak": 5101796520,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 0,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 5141855660,
+          "device_peak": 5171217584,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 40058880,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 5162433964,
+          "device_peak": 5198742704,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 60571648,
+          "pinned_temp": 0,
+          "deferred": 65536
+        },
+        {
+          "device_live": 5189347860,
+          "device_peak": 5386193652,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 87419648,
+          "pinned_temp": 0,
+          "deferred": 131072
+        },
+        {
+          "device_live": 5304674500,
+          "device_peak": 5875064424,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 202710784,
+          "pinned_temp": 0,
+          "deferred": 163840
+        },
+        {
+          "device_live": 5290116292,
+          "device_peak": 5875064424,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 188054272,
+          "pinned_temp": 0,
+          "deferred": 262144
+        },
+        {
+          "device_live": 5298096620,
+          "device_peak": 5875064424,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 196034560,
+          "pinned_temp": 0,
+          "deferred": 262144
+        },
+        {
+          "device_live": 5694057252,
+          "device_peak": 6506339660,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 591918848,
+          "pinned_temp": 0,
+          "deferred": 327680
+        },
+        {
+          "device_live": 5749180708,
+          "device_peak": 6506339660,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 646927616,
+          "pinned_temp": 0,
+          "deferred": 442368
+        },
+        {
+          "device_live": 5975367684,
+          "device_peak": 6524654740,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 873113856,
+          "pinned_temp": 0,
+          "deferred": 442368
+        },
+        {
+          "device_live": 6162484428,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1060374272,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 6164262348,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1062152192,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 6165923276,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1063813120,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 6175522252,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1073707008,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 6175536588,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1073721344,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 6175556044,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1073740800,
+          "pinned_temp": 0,
+          "deferred": 0
+        }
+      ]
+    },
+    {
+      "lifecycle": 1,
+      "placement": "device",
+      "observations": [
+        {
+          "device_live": 7413906600,
+          "device_peak": 7413906600,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 0,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 7453965740,
+          "device_peak": 7483327664,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 40058880,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 7474544044,
+          "device_peak": 7510852784,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 60571648,
+          "pinned_temp": 0,
+          "deferred": 65536
+        },
+        {
+          "device_live": 7501457940,
+          "device_peak": 7698303732,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 87419648,
+          "pinned_temp": 0,
+          "deferred": 131072
+        },
+        {
+          "device_live": 7616784580,
+          "device_peak": 8187174504,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 202710784,
+          "pinned_temp": 0,
+          "deferred": 163840
+        },
+        {
+          "device_live": 7602226372,
+          "device_peak": 8187174504,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 188054272,
+          "pinned_temp": 0,
+          "deferred": 262144
+        },
+        {
+          "device_live": 7610206700,
+          "device_peak": 8187174504,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 196034560,
+          "pinned_temp": 0,
+          "deferred": 262144
+        },
+        {
+          "device_live": 8006167332,
+          "device_peak": 8818449740,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 591918848,
+          "pinned_temp": 0,
+          "deferred": 327680
+        },
+        {
+          "device_live": 8061290788,
+          "device_peak": 8818449740,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 646927616,
+          "pinned_temp": 0,
+          "deferred": 442368
+        },
+        {
+          "device_live": 8287477764,
+          "device_peak": 8836764820,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 873113856,
+          "pinned_temp": 0,
+          "deferred": 442368
+        },
+        {
+          "device_live": 8474594508,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1060374272,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 8476372428,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1062152192,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 8478033356,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1063813120,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 8487632332,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1073707008,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 8487646668,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1073721344,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 8487666124,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1073740800,
+          "pinned_temp": 0,
+          "deferred": 0
+        }
+      ]
+    },
+    {
+      "lifecycle": 1,
+      "placement": "host",
+      "observations": [
+        {
+          "device_live": 5101796520,
+          "device_peak": 5101796520,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 0,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 5141855660,
+          "device_peak": 5171217584,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 40058880,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 5162433964,
+          "device_peak": 5198742704,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 60571648,
+          "pinned_temp": 0,
+          "deferred": 65536
+        },
+        {
+          "device_live": 5189347860,
+          "device_peak": 5386193652,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 87419648,
+          "pinned_temp": 0,
+          "deferred": 131072
+        },
+        {
+          "device_live": 5304674500,
+          "device_peak": 5875064424,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 202710784,
+          "pinned_temp": 0,
+          "deferred": 163840
+        },
+        {
+          "device_live": 5290116292,
+          "device_peak": 5875064424,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 188054272,
+          "pinned_temp": 0,
+          "deferred": 262144
+        },
+        {
+          "device_live": 5298096620,
+          "device_peak": 5875064424,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 196034560,
+          "pinned_temp": 0,
+          "deferred": 262144
+        },
+        {
+          "device_live": 5694057252,
+          "device_peak": 6506339660,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 591918848,
+          "pinned_temp": 0,
+          "deferred": 327680
+        },
+        {
+          "device_live": 5749180708,
+          "device_peak": 6506339660,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 646927616,
+          "pinned_temp": 0,
+          "deferred": 442368
+        },
+        {
+          "device_live": 5975367684,
+          "device_peak": 6524654740,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 873113856,
+          "pinned_temp": 0,
+          "deferred": 442368
+        },
+        {
+          "device_live": 6162484428,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1060374272,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 6164262348,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1062152192,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 6165923276,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1063813120,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 6175522252,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1073707008,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 6175536588,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1073721344,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 6175556044,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1073740800,
+          "pinned_temp": 0,
+          "deferred": 0
+        }
+      ]
+    },
+    {
+      "lifecycle": 2,
+      "placement": "device",
+      "observations": [
+        {
+          "device_live": 7413906600,
+          "device_peak": 7413906600,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 0,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 7453965740,
+          "device_peak": 7483327664,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 40058880,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 7474544044,
+          "device_peak": 7510852784,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 60571648,
+          "pinned_temp": 0,
+          "deferred": 65536
+        },
+        {
+          "device_live": 7501457940,
+          "device_peak": 7698303732,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 87419648,
+          "pinned_temp": 0,
+          "deferred": 131072
+        },
+        {
+          "device_live": 7616784580,
+          "device_peak": 8187174504,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 202710784,
+          "pinned_temp": 0,
+          "deferred": 163840
+        },
+        {
+          "device_live": 7602226372,
+          "device_peak": 8187174504,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 188054272,
+          "pinned_temp": 0,
+          "deferred": 262144
+        },
+        {
+          "device_live": 7610206700,
+          "device_peak": 8187174504,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 196034560,
+          "pinned_temp": 0,
+          "deferred": 262144
+        },
+        {
+          "device_live": 8006167332,
+          "device_peak": 8818449740,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 591918848,
+          "pinned_temp": 0,
+          "deferred": 327680
+        },
+        {
+          "device_live": 8061290788,
+          "device_peak": 8818449740,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 646927616,
+          "pinned_temp": 0,
+          "deferred": 442368
+        },
+        {
+          "device_live": 8287477764,
+          "device_peak": 8836764820,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 873113856,
+          "pinned_temp": 0,
+          "deferred": 442368
+        },
+        {
+          "device_live": 8474594508,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1060374272,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 8476372428,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1062152192,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 8478033356,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1063813120,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 8487632332,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1073707008,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 8487646668,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1073721344,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 8487666124,
+          "device_peak": 9641201356,
+          "device_weights": 7413380264,
+          "host_ple": 0,
+          "projector": 0,
+          "idle_temp": 1073740800,
+          "pinned_temp": 0,
+          "deferred": 0
+        }
+      ]
+    },
+    {
+      "lifecycle": 2,
+      "placement": "host",
+      "observations": [
+        {
+          "device_live": 5101796520,
+          "device_peak": 5101796520,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 0,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 5141855660,
+          "device_peak": 5171217584,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 40058880,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 5162433964,
+          "device_peak": 5198742704,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 60571648,
+          "pinned_temp": 0,
+          "deferred": 65536
+        },
+        {
+          "device_live": 5189347860,
+          "device_peak": 5386193652,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 87419648,
+          "pinned_temp": 0,
+          "deferred": 131072
+        },
+        {
+          "device_live": 5304674500,
+          "device_peak": 5875064424,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 202710784,
+          "pinned_temp": 0,
+          "deferred": 163840
+        },
+        {
+          "device_live": 5290116292,
+          "device_peak": 5875064424,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 188054272,
+          "pinned_temp": 0,
+          "deferred": 262144
+        },
+        {
+          "device_live": 5298096620,
+          "device_peak": 5875064424,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 196034560,
+          "pinned_temp": 0,
+          "deferred": 262144
+        },
+        {
+          "device_live": 5694057252,
+          "device_peak": 6506339660,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 591918848,
+          "pinned_temp": 0,
+          "deferred": 327680
+        },
+        {
+          "device_live": 5749180708,
+          "device_peak": 6506339660,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 646927616,
+          "pinned_temp": 0,
+          "deferred": 442368
+        },
+        {
+          "device_live": 5975367684,
+          "device_peak": 6524654740,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 873113856,
+          "pinned_temp": 0,
+          "deferred": 442368
+        },
+        {
+          "device_live": 6162484428,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1060374272,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 6164262348,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1062152192,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 6165923276,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1063813120,
+          "pinned_temp": 0,
+          "deferred": 294912
+        },
+        {
+          "device_live": 6175522252,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1073707008,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 6175536588,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1073721344,
+          "pinned_temp": 0,
+          "deferred": 0
+        },
+        {
+          "device_live": 6175556044,
+          "device_peak": 7329091276,
+          "device_weights": 5101270184,
+          "host_ple": 2312110080,
+          "projector": 0,
+          "idle_temp": 1073740800,
+          "pinned_temp": 0,
+          "deferred": 0
+        }
+      ]
+    }
+  ],
+  "separate_memory_sampler_maxima": [
+    {
+      "lifecycle": 0,
+      "placement": "device",
+      "pss_bytes": 5629154304,
+      "nvml_bytes": 9844080640,
+      "samples": 1145,
+      "cotenants_before": [
+        "2595291"
+      ],
+      "cotenants_after": [
+        "2595291"
+      ]
+    },
+    {
+      "lifecycle": 0,
+      "placement": "host",
+      "pss_bytes": 7980599296,
+      "nvml_bytes": 7436222464,
+      "samples": 1067,
+      "cotenants_before": [
+        "2595291"
+      ],
+      "cotenants_after": [
+        "2595291"
+      ]
+    },
+    {
+      "lifecycle": 1,
+      "placement": "device",
+      "pss_bytes": 5202678784,
+      "nvml_bytes": 9865707520,
+      "samples": 1158,
+      "cotenants_before": [
+        "2595291"
+      ],
+      "cotenants_after": [
+        "2595291"
+      ]
+    },
+    {
+      "lifecycle": 1,
+      "placement": "host",
+      "pss_bytes": 7911380992,
+      "nvml_bytes": 7583744000,
+      "samples": 1074,
+      "cotenants_before": [
+        "2595291"
+      ],
+      "cotenants_after": [
+        "2595291"
+      ]
+    },
+    {
+      "lifecycle": 2,
+      "placement": "device",
+      "pss_bytes": 5613969408,
+      "nvml_bytes": 9865707520,
+      "samples": 1092,
+      "cotenants_before": [
+        "2595291"
+      ],
+      "cotenants_after": [
+        "2595291"
+      ]
+    },
+    {
+      "lifecycle": 2,
+      "placement": "host",
+      "pss_bytes": 7998035968,
+      "nvml_bytes": 7495139328,
+      "samples": 1008,
+      "cotenants_before": [
+        "2595291"
+      ],
+      "cotenants_after": [
+        "2595291"
+      ]
+    }
+  ],
+  "memory_caveat": "Do not sum GB10 PSS and NVML into physical RAM or dedicated-VRAM claims. Managed CUDA allocation counters exclude vendor-internal allocations.",
+  "raw_artifacts": ".benchmark-results/ple-host/campaign-v2 on local worktree and glowworm; aborted campaign-v1 excluded",
+  "final_source_sha256": {
+    "zig/pkg/inference/build/tests.zig": "0d9799acd31b7c493bb1e02043e118fe7b6380fca6135d3dde3748c10aaa2d24",
+    "zig/pkg/inference/src/inference.zig": "03993e783b87dee5a09f0a1dbc1e50d49ddf2929fd058377052c648a7680bcbd",
+    "zig/pkg/inference/src/ops/cuda/buffer.zig": "e81d7a7dcb2baf41f7652aff9fd9bc82c29b2a9e2ddd833f2b5cd62c08f3014e",
+    "zig/pkg/inference/src/ops/cuda/cuda_compute.zig": "16a6e2ba9670b6ab43ceb504580c8ebf898004e70f5223d5733ae71cc0b79e47",
+    "zig/pkg/inference/src/ops/cuda/driver.zig": "1e11b516a423593dd6e8c35c9ed81f8cebf62bd2e3464b5e05e7c26b0fc62f3e",
+    "zig/pkg/inference/src/ops/cuda/ple_host.zig": "7c0598bae0069b13ddc13df0c5f770776032ad417fe87d59803fa2a22fe71ca8",
+    "zig/pkg/inference/src/ops/cuda/ple_host_test.zig": "9840de92d9cabcf1047a4e786e661393cc7ae43a261b4be3aa124176ff90d6bb",
+    "zig/pkg/inference/src/server/model_manager.zig": "0db2b4c542f5bbded7f7725f7838e564eb2d21ffca9e18c8509dcce26ea02dd5",
+    "zig/pkg/inference/scripts/gemma4/benchmark_cuda_ple_host.py": "db7382ed2478f885b3e519eac57f046f5064562a5705e4fc36c5c915a644bcd6"
+  },
+  "post_validation_changes": {
+    "kind": "Apache license headers expanded in three new files; Python harness formatted by the required pre-commit hook; Zig executable bodies and Python AST unchanged",
+    "executable_body_sha256": {
+      "zig/pkg/inference/src/ops/cuda/ple_host.zig": "7b70a3ecce25d8dec1eeea0501411710c728bfa1ec55af2d24ce471845515e0e",
+      "zig/pkg/inference/src/ops/cuda/ple_host_test.zig": "d09fad6d46c68a9e64dbdbac4817a397ff45005dcf284ed9513b933782b304bb"
+    },
+    "python_ast_sha256": {
+      "zig/pkg/inference/scripts/gemma4/benchmark_cuda_ple_host.py": "7ca2dd5bc356555e4e714d3ac287bb82aa6bc2157e76699b4ae08444abb9f069"
+    }
+  }
+}
