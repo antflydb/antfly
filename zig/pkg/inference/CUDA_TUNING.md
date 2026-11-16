@@ -30,6 +30,44 @@ profile before starting a dedicated E4B process; the report includes the
 paired runner and strict validation commands. This evidence is scoped to the
 E4B/L4 HTTP configuration and does not replace the E2B or GB10 promotion gates.
 
+## Optional E4B PLE host placement
+
+`ANTFLY_INFERENCE_CUDA_GEMMA4_PLE_HOST=1` keeps the dense E4B Q6_K
+per-layer token-embedding table in mapped, pinned host memory. Existing CUDA
+prefill and device-token decode gathers read the original quantized bytes;
+no CPU token readback or new quantization is introduced. Other weights and
+Metal placement retain their existing policy. The default is off pending
+latency qualification on a discrete GPU.
+
+For the qualified E4B artifact the table occupies 2,312,110,080 bytes. Host
+placement removes that device allocation and retains the same number of
+pinned host bytes. This shifts memory between domains; it does not establish
+a reduction in total physical memory. Construction admission covers the
+source mapping and pinned copy simultaneously, then retains the host table
+with the model lease. A host budget that fits the device-only profile may
+need additional capacity. Missing mapped-host driver support or allocation
+failure rejects the explicit placement rather than bypassing admission.
+
+Use `ANTFLY_INFERENCE_CUDA_GEMMA4_MEMORY_STATS=1` to log device allocation
+live/peak bytes, resident device weights, host PLE bytes, projector cache,
+idle temporaries, pinned temporaries and deferred frees at request boundaries.
+These managed allocation counters exclude CUDA/vendor-internal allocations;
+retain NVML process measurements as well on discrete GPUs.
+
+`test-gemma4-ple-host` checks host-buffer retirement, GGUF/admission accounting,
+bitwise prefill/device-token gathers and captured fused PLE decode. The
+same-binary comparison runner `scripts/gemma4/benchmark_cuda_ple_host.py`
+alternates fresh device/host lifecycles on the portable HTTP fixtures and
+requires identical output text, reasoning and token counts. It refuses GPU
+cotenants unless explicitly requested as a diagnostic. GB10 has unified
+memory, so its allocation counters and timings cannot qualify L4 VRAM or PCIe
+latency; do not add its PSS and NVML figures into a combined footprint claim.
+
+The [GB10 validation report](scripts/gemma4/qualification/e4b-ple-host-gb10-20261115.md)
+records 60 exact-match HTTP responses and a 2,312,110,080-byte reduction in
+managed CUDA peak allocations. Its latency measurements were contended and
+do not qualify L4 performance; host placement remains opt-in.
+
 ## EmbeddingGemma 2 CUDA image residency
 
 Pure-image groups and the direct image embedding pipeline retain resized patches,

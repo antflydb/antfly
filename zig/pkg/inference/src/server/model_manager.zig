@@ -7768,7 +7768,7 @@ pub const ModelManager = struct {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
-                const admission_plan = (if (source.kind == .onnx) base_plan else withJinaAdapterAdmission(source.manifest.?.*, backend, base_plan)) catch |err| {
+                const admission_plan = (if (source.kind == .onnx) base_plan else withNativeAuxiliaryAdmission(source.manifest.?.*, backend, base_plan)) catch |err| {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
@@ -11928,15 +11928,19 @@ pub fn projectorRunAdmissionAmounts(
     };
 }
 
-fn withJinaAdapterAdmission(man: manifest_mod.ModelManifest, backend: backends.BackendType, base: ModelLoadAdmissionPlan) !ModelLoadAdmissionPlan {
-    if (!session_factory.usesJinaRetrievalAdapter(man, backend)) return base;
-    const adapter = (try man.jinaRetrievalAdapter()) orelse return base;
+fn withNativeAuxiliaryAdmission(man: manifest_mod.ModelManifest, backend: backends.BackendType, base: ModelLoadAdmissionPlan) !ModelLoadAdmissionPlan {
+    var result = base;
+    if (backend == .cuda) {
+        const host_bytes = try @import("../ops/cuda/ple_host.zig").estimateGgufBytes(man.allocator, man.gguf_path);
+        try addResidentHostSource(&result, host_bytes);
+    }
+    if (!session_factory.usesJinaRetrievalAdapter(man, backend)) return result;
+    const adapter = (try man.jinaRetrievalAdapter()) orelse return result;
     const weights = std.math.cast(usize, try c_file.fileSize(man.allocator, adapter.weights)) orelse return error.ResourceLimitExceeded;
     const config = std.math.cast(usize, try c_file.fileSize(man.allocator, adapter.config)) orelse return error.ResourceLimitExceeded;
     // Mapping/header parsing and F32 staging are temporary on CPU/CUDA. Metal
     // retains the adapter reader for lazy merges; its encoded mapping stays live.
     const peak = try checkedScaledBytes(weights, 5, try checkedScaledBytes(config, 13, 0));
-    var result = base;
     result.peak.host_weight_bytes = std.math.add(usize, result.peak.host_weight_bytes, peak) catch return error.ResourceLimitExceeded;
     if (backend == .metal) result.resident.host_weight_bytes = std.math.add(usize, result.resident.host_weight_bytes, weights) catch return error.ResourceLimitExceeded;
     return result;
@@ -11950,7 +11954,7 @@ fn estimateModelLoadAdmission(
     laya_packed: bool,
 ) !ModelLoadAdmissionPlan {
     const base = try estimateBaseModelLoadAdmission(model_path, man, backend_runtime, a4b_request, laya_packed);
-    return withJinaAdapterAdmission(man, backend_runtime.backend, base);
+    return withNativeAuxiliaryAdmission(man, backend_runtime.backend, base);
 }
 
 fn estimateBaseModelLoadAdmission(
@@ -12003,7 +12007,7 @@ fn estimateBaseModelLoadAdmission(
     var plan = try nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
     if (backend_runtime.backend == .metal) {
         const host_source_bytes = metalQualifiedSpecialtyF32HostSourceBytes(man, weights);
-        try addMetalResidentHostSource(&plan, host_source_bytes);
+        try addResidentHostSource(&plan, host_source_bytes);
     }
     return plan;
 }
@@ -12034,7 +12038,7 @@ fn metalQualifiedSpecialtyF32HostSourceBytes(
     return if (size_profile == declared) artifact_bytes else 0;
 }
 
-fn addMetalResidentHostSource(plan: *ModelLoadAdmissionPlan, bytes: usize) !void {
+fn addResidentHostSource(plan: *ModelLoadAdmissionPlan, bytes: usize) !void {
     if (bytes == 0) return;
     const resident_host = std.math.add(
         usize,
@@ -15034,7 +15038,7 @@ test "qualified F32 GLiNER specialty Metal admission retains host source without
 
     var plan = try nativeModelLoadAdmission(1024, .metal, .{ .backend_scratch_bytes = 64 });
     const old_peak_host = plan.peak.host_weight_bytes;
-    try addMetalResidentHostSource(&plan, pii_bytes);
+    try addResidentHostSource(&plan, pii_bytes);
     try std.testing.expectEqual(pii_bytes, plan.resident.host_weight_bytes);
     try std.testing.expectEqual(old_peak_host + pii_bytes, plan.peak.host_weight_bytes);
     try std.testing.expectEqual(@as(usize, 64), plan.resident.backend_scratch_bytes);
@@ -15043,7 +15047,7 @@ test "qualified F32 GLiNER specialty Metal admission retains host source without
         .peak = .{ .host_weight_bytes = std.math.maxInt(usize) },
         .resident = .{},
     };
-    try std.testing.expectError(error.ResourceLimitExceeded, addMetalResidentHostSource(&overflow, 1));
+    try std.testing.expectError(error.ResourceLimitExceeded, addResidentHostSource(&overflow, 1));
     try std.testing.expectEqual(@as(usize, 0), overflow.resident.host_weight_bytes);
     try std.testing.expectEqual(std.math.maxInt(usize), overflow.peak.host_weight_bytes);
 }
@@ -19941,8 +19945,8 @@ test "model selection Jina adapters authenticate both files and account backend 
     try std.testing.expectEqual(native.manifest, (try bound.forBackend(&proof, .native)).?.manifest);
     try std.testing.expectEqual(native.manifest, (try bound.forBackend(&proof, .metal)).?.manifest);
     const empty = ModelLoadAdmissionPlan{ .peak = .{}, .resident = .{} };
-    const cpu = try withJinaAdapterAdmission(native.manifest.?.*, .native, empty);
-    const gpu = try withJinaAdapterAdmission(native.manifest.?.*, .metal, empty);
+    const cpu = try withNativeAuxiliaryAdmission(native.manifest.?.*, .native, empty);
+    const gpu = try withNativeAuxiliaryAdmission(native.manifest.?.*, .metal, empty);
     const encoded = try c_file.fileSize(a, adapter.weights);
     try std.testing.expect(cpu.peak.host_weight_bytes > encoded);
     try std.testing.expectEqual(@as(usize, 0), cpu.resident.host_weight_bytes);
@@ -20752,4 +20756,20 @@ test "host preflight records policy denials and temporary contention" {
     var recovered = try manager.admitHostPreflightChecked(30, false);
     recovered.release();
     try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
+}
+
+test "Gemma4 CUDA host PLE admission reserves both construction copies and retained host bytes" {
+    const memory = runtime.tier.memory;
+    var plan = try nativeModelLoadAdmission(1024, .cuda, .{});
+    const gpu_bytes = plan.resident.backend_weight_bytes;
+    try addResidentHostSource(&plan, 256);
+    try std.testing.expectEqual(@as(usize, 1280), plan.peak.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 256), plan.resident.host_weight_bytes);
+    try std.testing.expectEqual(gpu_bytes, plan.resident.backend_weight_bytes);
+    var controller = memory.AdmissionController{};
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.gpu, .{ .host_limit_bytes = 1279 }, plan.peak, false));
+    var lease = try controller.tryAcquire(.gpu, .{ .host_limit_bytes = 1280 }, plan.peak, false);
+    defer lease.release();
+    try lease.retain(plan.resident);
+    try std.testing.expectEqual(@as(usize, 256), lease.amounts.host_weight_bytes);
 }

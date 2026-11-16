@@ -74,6 +74,43 @@ pub const HostBuffer = struct {
     }
 };
 
+/// Immutable checkpoint storage accessible to device-side gathers without a
+/// full VRAM copy. The owner outlives every resident descriptor and graph.
+/// Host bytes belong to the model load lease, never the device scratch pool.
+pub const MappedHostBuffer = struct {
+    host: HostBuffer = .{},
+    device_ptr: driver_mod.CUdeviceptr = 0,
+
+    pub fn alloc(ctx: *context_mod.CudaContext, len: usize) driver_mod.Error!MappedHostBuffer {
+        if (len == 0) return error.InvalidCudaState;
+        const alloc_host = ctx.driver.fns.cuMemHostAlloc orelse return error.CudaSymbolMissing;
+        const device_pointer = ctx.driver.fns.cuMemHostGetDevicePointer orelse return error.CudaSymbolMissing;
+        if (ctx.driver.fns.cuMemFreeHost == null) return error.CudaSymbolMissing;
+        try ctx.makeCurrent();
+        var host = HostBuffer{ .len = len };
+        // CU_MEMHOSTALLOC_DEVICEMAP; preserve ordinary cached CPU stores.
+        if (alloc_host(&host.ptr, len, 0x02) != driver_mod.CUDA_SUCCESS) return error.CudaHostAllocationFailed;
+        errdefer host.free(ctx);
+        var device_ptr: driver_mod.CUdeviceptr = 0;
+        try ctx.driver.check(device_pointer(&device_ptr, host.ptr, 0));
+        if (device_ptr == 0) return error.InvalidCudaState;
+        return .{ .host = host, .device_ptr = device_ptr };
+    }
+
+    pub fn view(self: MappedHostBuffer) DeviceBuffer {
+        return .{ .ptr = self.device_ptr, .len = self.host.len, .borrowed = true };
+    }
+
+    pub fn clear(self: *MappedHostBuffer, ctx: *context_mod.CudaContext) driver_mod.Error!void {
+        if (self.host.ptr == null) return;
+        // Readers may be asynchronous, including captured decode kernels.
+        // A failed wait/free must leave ownership intact for a later retry.
+        try ctx.synchronize();
+        try self.host.freeChecked(ctx);
+        self.* = .{};
+    }
+};
+
 pub const DeviceBuffer = struct {
     ptr: driver_mod.CUdeviceptr = 0,
     len: usize = 0,
@@ -356,4 +393,63 @@ test "CUDA quarantine pins primary lifetime across external final release and ha
     successor.releaseResources();
     try std.testing.expectEqual(@as(usize, 0), Mock.references);
     try std.testing.expectEqual(before.live, shared.snapshot().live);
+}
+
+test "Gemma4 CUDA host PLE mapped allocation waits for readers and retains failed frees" {
+    const Fake = struct {
+        var bytes: [64]u8 = undefined;
+        var waits: usize = 0;
+        var frees: usize = 0;
+        var fail_free: bool = false;
+        fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn alloc(ptr: *?*anyopaque, len: usize, flags: c_uint) callconv(.c) driver_mod.CUresult {
+            if (len != bytes.len or flags != 2) return 1;
+            ptr.* = &bytes;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn device(ptr: *driver_mod.CUdeviceptr, _: ?*anyopaque, flags: c_uint) callconv(.c) driver_mod.CUresult {
+            if (flags != 0) return 1;
+            ptr.* = 0x123456;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn wait(_: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            waits += 1;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn free(_: ?*anyopaque) callconv(.c) driver_mod.CUresult {
+            frees += 1;
+            return if (fail_free) 1 else driver_mod.CUDA_SUCCESS;
+        }
+    };
+    var ctx: context_mod.CudaContext = undefined;
+    ctx.ctx = @ptrFromInt(1);
+    ctx.stream = null;
+    ctx.stats = .{};
+    ctx.driver.fns.cuCtxSetCurrent = Fake.current;
+    ctx.driver.fns.cuMemHostAlloc = Fake.alloc;
+    ctx.driver.fns.cuMemHostGetDevicePointer = Fake.device;
+    ctx.driver.fns.cuMemFreeHost = Fake.free;
+    ctx.driver.fns.cuStreamSynchronize = Fake.wait;
+    Fake.waits = 0;
+    Fake.frees = 0;
+    Fake.fail_free = false;
+    var mapped = try MappedHostBuffer.alloc(&ctx, 64);
+    var view = mapped.view();
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x123456), view.ptr);
+    try std.testing.expect(view.borrowed and view.allocation_token == null);
+    view.free(&ctx);
+    try std.testing.expectEqual(@as(usize, 0), Fake.frees);
+    Fake.fail_free = true;
+    try std.testing.expectError(error.CudaDriverError, mapped.clear(&ctx));
+    try std.testing.expect(mapped.host.ptr != null and mapped.device_ptr != 0);
+    try std.testing.expectEqual(@as(usize, 1), Fake.waits);
+    Fake.fail_free = false;
+    try mapped.clear(&ctx);
+    try std.testing.expect(mapped.host.ptr == null and mapped.device_ptr == 0);
+    try std.testing.expectEqual(@as(usize, 2), Fake.waits);
+    try std.testing.expectEqual(@as(usize, 2), Fake.frees);
+    ctx.driver.fns.cuMemHostGetDevicePointer = null;
+    try std.testing.expectError(error.CudaSymbolMissing, MappedHostBuffer.alloc(&ctx, 64));
 }
