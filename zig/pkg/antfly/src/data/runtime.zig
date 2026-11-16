@@ -43884,6 +43884,66 @@ fn consumerTests() type {
                     try server.proposeRaftBatchGroupWithLeaderWait(a, 601, "docs", publication, .{ .discovery = .cached, .write_route_fence = route.fence(), .admission_deadline_ns = server.dataRaftMonotonicNs() + 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
                 }
                 try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_publication_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                const retained_history = @import("antfly_local_sources").storage_committed_history;
+                const publication_query: retained_history.CompletionPublicationQuery = .{ .owner = current_owner, .transaction_id = txn_id, .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
+                const observed_publication = try owner.orderedHistoryPublicationRouted(a, route.fence().?, "docs", publication_query);
+                try observed_publication.validate(publication_query);
+                try std.testing.expect(observed_publication.publication != null);
+                try std.testing.expectEqualDeep(checked_certificate.value.digest, observed_publication.publication.?.digest);
+                const retried_publication = try owner.orderedHistoryPublicationRouted(a, route.fence().?, "docs", publication_query);
+                try std.testing.expectEqualDeep(observed_publication.publication, retried_publication.publication);
+                var replaced_publication_query = publication_query;
+                replaced_publication_query.owner.root_generation += 1;
+                try std.testing.expectError(error.TopologyChanged, owner.orderedHistoryPublicationRouted(a, route.fence().?, "docs", replaced_publication_query));
+                var expired_publication_fence = route.fence().?;
+                expired_publication_fence.admission_deadline_ns = platform_time.monotonicNs() -| 1;
+                expired_publication_fence.admission_deadline_io = null;
+                try std.testing.expectError(error.DeadlineExceeded, owner.orderedHistoryPublicationRouted(a, expired_publication_fence, "docs", publication_query));
+                const ExpiredPublicationScope = struct {
+                    fn check(_: *const anyopaque) !void {
+                        return error.DeadlineExceeded;
+                    }
+                    fn cancelled(_: *const anyopaque) bool {
+                        return false;
+                    }
+                };
+                var scoped_publication_fence = route.fence().?;
+                scoped_publication_fence.admission_cancellation = .{ .ptr = &publication_query, .check_fn = ExpiredPublicationScope.check, .is_cancelled_fn = ExpiredPublicationScope.cancelled };
+                try std.testing.expectError(error.DeadlineExceeded, owner.orderedHistoryPublicationRouted(a, scoped_publication_fence, "docs", publication_query));
+                {
+                    const Barrier = antfly.raft.read_gate.ReadSafetyBarrier;
+                    const LatePublicationFence = struct {
+                        inner: Barrier,
+                        validations: usize = 0,
+                        fn wait(ptr: *anyopaque, group: u64, ctx: []const u8) !void {
+                            const self: *@This() = @ptrCast(@alignCast(ptr));
+                            return self.inner.waitReadSafe(group, ctx);
+                        }
+                        fn controlled(ptr: *anyopaque, group: u64, ctx: []const u8, controls: Barrier.Controls) !void {
+                            const self: *@This() = @ptrCast(@alignCast(ptr));
+                            return self.inner.waitReadSafeControlled(group, ctx, controls);
+                        }
+                        fn capture(ptr: *anyopaque, group: u64) !Barrier.FrozenProof {
+                            const self: *@This() = @ptrCast(@alignCast(ptr));
+                            return self.inner.vtable.capture_frozen.?(self.inner.ptr, group);
+                        }
+                        fn validate(ptr: *anyopaque, group: u64, proof: Barrier.FrozenProof, deadline: ?u64, cancellation: antfly.db.types.CancellationToken) !void {
+                            const self: *@This() = @ptrCast(@alignCast(ptr));
+                            try self.inner.vtable.validate_frozen.?(self.inner.ptr, group, proof, deadline, cancellation);
+                            self.validations += 1;
+                            if (self.validations == 2) return error.NotLeader;
+                        }
+                        fn barrier(self: *@This()) Barrier {
+                            return .{ .ptr = self, .vtable = &.{ .wait_read_safe = wait, .wait_read_safe_controlled = controlled, .capture_frozen = capture, .validate_frozen = validate } };
+                        }
+                    };
+                    const original_barrier = server.dataReadSafetyBarrier();
+                    var late_fence: LatePublicationFence = .{ .inner = original_barrier };
+                    _ = owner.withReadSafetyBarrier(late_fence.barrier());
+                    defer _ = owner.withReadSafetyBarrier(original_barrier);
+                    try std.testing.expectError(error.NotLeader, owner.orderedHistoryPublicationRouted(a, route.fence().?, "docs", publication_query));
+                    try std.testing.expectEqual(@as(usize, 2), late_fence.validations);
+                }
             }
             const rejected = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .acknowledge = .{ .reference = ref, .previous = 0, .next = 99 } });
             try std.testing.expectEqual(.checkpoint_conflict, rejected.outcome.?.rejected);

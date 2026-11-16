@@ -61,6 +61,18 @@ test "compiled ordered history grant observations preserve scope and survive reo
     const absent_resolution = try owner.historyResolution(a, "docs", resolution_request);
     try std.testing.expect(absent_resolution.resolution == null);
     try std.testing.expectEqual(@as(u64, 2), absent_resolution.cut.index);
+    const history = @import("antfly_local_sources").storage_committed_history;
+    const publication_query: history.CompletionPublicationQuery = .{ .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(2), .root_generation = 0, .group_id = 7001, .topology_epoch = 1 }, .transaction_id = @splat(9), .manifest_digest = @splat(5), .commit_version = 6, .minimum_applied_index = 2 };
+    const absent_publication = try owner.historyPublication(a, "docs", publication_query);
+    try absent_publication.validate(publication_query);
+    try std.testing.expect(absent_publication.publication == null);
+    try std.testing.expectEqual(@as(u64, 2), absent_publication.cut.index);
+    var invalid_publication = publication_query;
+    invalid_publication.minimum_applied_index = 3;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.historyPublication(a, "docs", invalid_publication));
+    invalid_publication = publication_query;
+    invalid_publication.owner.root_generation += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, owner.historyPublication(a, "docs", invalid_publication));
     var ahead_resolution = resolution_request;
     ahead_resolution.minimum_applied_index = 3;
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.historyResolution(a, "docs", ahead_resolution));
@@ -91,6 +103,7 @@ test "compiled ordered history grant observations preserve scope and survive reo
     opened = true;
     try std.testing.expectEqualDeep(active, try owner.orderedHistoryGrant(a, "docs", identity, 2));
     try std.testing.expectEqualDeep(absent_resolution, try owner.historyResolution(a, "docs", resolution_request));
+    try std.testing.expectEqualDeep(absent_publication, try owner.historyPublication(a, "docs", publication_query));
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.orderedHistoryGrant(a, "docs", identity, 3));
     const retired: control.Command = .{ .retire = .{ .namespace = namespace, .authority = grant.authority, .consumer = grant.consumer, .definition = grant.definition, .sequence = 2, .grant = 1 } };
     const retirement = try std.json.Stringify.valueAlloc(a, retired, .{});
@@ -103,6 +116,10 @@ test "compiled ordered history grant observations preserve scope and survive reo
     const recovered = try owner.orderedHistoryOutcome(a, "docs", .{ .command = retired, .entry = .{ .term = 1, .index = 3 }, .minimum_applied_index = 3 });
     try std.testing.expect(recovered == .applied);
     var response: abi.OwnedBytes = .{};
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_history_publication(owner.handle, &.{ .version = abi.abi_version - 1 }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_history_publication(owner.handle, &.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice("{}") }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_history_grant(owner.handle, &.{ .version = abi.abi_version - 1 }, &response));
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_history_resolution(owner.handle, &.{ .version = abi.abi_version - 1 }, &response));

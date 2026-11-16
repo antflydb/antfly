@@ -2718,6 +2718,37 @@ not qualification of a production GC policy. Routed/HTTP recovery qualification
 remains pending.
 No primary or retained-evidence GC has been enabled by this read-only primitive.
 
+## In progress: routed publication observation
+
+ABI 101 adds a bounded (4096-byte) JSON publication observation operation with
+strict field/duplicate validation and request-bound reply validation. The client,
+compiled export and native reducer use the same query/observation types.
+`orderedHistoryPublicationRouted` captures one bounded original deadline, checks
+the complete original routed owner against authoritative catalog and descriptor,
+uses the frozen leader ReadIndex path, and revalidates owner/catalog/proof after
+the native read. Only then does it rebind the native reply from the stronger
+actual ReadIndex request to the caller's original request, preserving the actual
+observed cut and immutable first publication position.
+
+Source/control catalog generation passed. `completion-publication-routed-test.log`
+finished with exit 0: the compiled ABI-101 scope and all six real-Raft cases passed.
+The compiled fixture checks qualified absence, lagging cut, wrong physical root,
+reopen, invalid ABI and malformed input. The actual-Raft fixture reads/retries a
+positive publication for its complete certificate after publication through the
+general proposer. The additional negative run in
+`completion-publication-routed-fence-test.log` finished with exit 0: all six
+real-Raft cases passed, including changed owner context, expired original
+deadline, fallible scoped expiry despite a false cancellation probe, and injected
+final frozen-leader failure after the native read (both proof validations were
+observed). HTTP transport and production coordinator integration remain pending.
+
+An additional recovery case needs qualification: protocol barriers currently
+advance the group projection watermark while skipping document DB apply. The
+native reader correctly refuses to serve a requested cut beyond its persisted
+marker. Leadership/no-op/idle-root progress must be tested and implemented with
+real durable source authority; a group ReadIndex is not a substitute for a
+native persisted cut. This remains part of the full recovery/bootstrap work.
+
 ## Working constraints
 
 Use this worktree and its `zig/.zig-cache` and `zig/zig-out`; no temporary build

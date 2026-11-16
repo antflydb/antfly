@@ -29,6 +29,7 @@ const data_apply_client = @import("../storage/data_raft_apply_client.zig");
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const backend_types = @import("antfly_local_sources").storage_backend_types;
 const db_types = @import("antfly_local_sources").storage_db_types;
+const completion_history = @import("antfly_local_sources").storage_committed_history;
 const runtime_callbacks = @import("antfly_local_sources").storage_db_runtime_callbacks;
 const replication_contract = @import("antfly_local_sources").storage_db_replication_contract;
 const document_artifact_child_range = @import("antfly_local_sources").storage_db_document_artifact_child_range;
@@ -1788,13 +1789,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         return parsed.value;
     }
 
-    const HistoryReadKind = enum { page, outcome, grant, resolution };
+    const HistoryReadKind = enum { page, outcome, grant, resolution, publication };
     fn HistoryReadInput(comptime kind: HistoryReadKind) type {
         return switch (kind) {
             .page => table_write_source.history_page.Request,
             .outcome => table_write_source.history_ordered.Lookup,
             .grant => table_write_source.history_consumer.GrantIdentity,
             .resolution => table_write_source.history_resolution_wire.Request,
+            .publication => completion_history.CompletionPublicationQuery,
         };
     }
     fn HistoryReadResult(comptime kind: HistoryReadKind) type {
@@ -1803,6 +1805,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .outcome => table_write_source.history_ordered.Outcome,
             .grant => table_write_source.history_consumer.GrantObservation,
             .resolution => table_write_source.history_resolution_wire.Reply,
+            .publication => completion_history.CompletionPublicationObservation,
         };
     }
 
@@ -1824,6 +1827,16 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self.historyReadRouted(alloc, fence, table_name, .resolution, request);
     }
 
+    pub fn orderedHistoryPublicationRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, query: completion_history.CompletionPublicationQuery) !completion_history.CompletionPublicationObservation {
+        try query.validate();
+        if (query.owner.group_id != fence.route.group_id) return error.TopologyChanged;
+        const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
+        var bounded = fence;
+        bounded.admission_deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), platform_time.monotonicNs() +| 5 * std.time.ns_per_s);
+        bounded.admission_deadline_io = null;
+        return self.historyReadRouted(alloc, bounded, table_name, .publication, query);
+    }
+
     fn historyReadRouted(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table_name: []const u8, comptime kind: HistoryReadKind, request: HistoryReadInput(kind)) !HistoryReadResult(kind) {
         if (self.online_source_authority != .raft) return error.ChangefeedCapabilityUnsupported;
         const barrier = self.read_safety_barrier;
@@ -1841,6 +1854,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .outcome => request.command.namespace(),
             .grant => request.namespace,
             .resolution => request.namespace,
+            .publication => request.owner.namespace,
         };
         if (comptime kind == .grant) try request.validate();
         if (comptime kind == .resolution) {
@@ -1850,6 +1864,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!std.mem.eql(u8, &namespace, &requested_namespace)) return error.HistoryResynchronizationRequired;
         const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
         const opts: db_types.ScanOptions = .{ .execution_deadline_ns = context.deadline_ns, .cancellation = fence.admission_cancellation };
+        var publication_descriptor: ?LoadedDescriptor = if (comptime kind == .publication) try self.loadCompletionDescriptor(alloc, group, table_name, context) else null;
+        defer if (publication_descriptor) |*owned| owned.deinit(alloc);
+        if (comptime kind == .publication) {
+            try request.validate();
+            try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), request.owner, context);
+        }
         try self.prepareRetainedScanRead(group, "", "", opts, .read_index);
         const proof = try capture(barrier.ptr, group);
         if (proof.incarnation == 0 or proof.term == 0 or proof.applied_index == 0) return error.ReadUnavailable;
@@ -1858,7 +1878,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (request.minimum_applied_index < request.entry.index) return error.InvalidHistoryAdmission;
             if (proof.applied_index < request.minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
         }
-        if (comptime kind == .resolution) if (proof.applied_index < request.minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
+        if (comptime kind == .resolution or kind == .publication) if (proof.applied_index < request.minimum_applied_index) return error.StorageReadTemporarilyUnavailable;
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
         var lease = try self.acquireWithControls(group, table_name, .from(opts));
         defer lease.deinit();
@@ -1877,14 +1897,21 @@ pub const ProvisionedKernelOwnerSource = struct {
                 qualified.minimum_applied_index = proof.applied_index;
                 break :blk try lease.owner().historyResolution(alloc, table_name, qualified);
             },
+            .publication => blk: {
+                var qualified = request;
+                qualified.minimum_applied_index = proof.applied_index;
+                break :blk try lease.owner().historyPublication(alloc, table_name, qualified);
+            },
         };
         errdefer if (comptime kind == .page) result.deinit();
+        if (comptime kind == .publication) try @import("completion_owner_admission.zig").require(alloc, self.catalog, table_name, fence, publication_descriptor.?.view(), request.owner, context);
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
         try self.validateRoutedRead(alloc, fence, group, table_name);
         // The compiled owner validated the stronger actual ReadIndex request.
         // Preserve its observed cut while binding the outward reply to the
         // original logical request, only after every final fence passes.
         if (comptime kind == .resolution) return table_write_source.history_resolution_wire.Reply.init(request, result.cut, result.resolution);
+        if (comptime kind == .publication) return completion_history.CompletionPublicationObservation.init(request, result.cut, result.publication);
         return result;
     }
 

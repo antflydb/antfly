@@ -80,6 +80,21 @@ pub const CompletionPublicationObservation = struct {
     }
 };
 
+pub const publication_read_max_bytes: usize = 4096;
+pub fn decodeCompletionPublicationQuery(a: A, raw: []const u8) !CompletionPublicationQuery {
+    if (raw.len == 0 or raw.len > publication_read_max_bytes) return error.InvalidHistoryAdmission;
+    var parsed = std.json.parseFromSlice(CompletionPublicationQuery, a, raw, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidHistoryAdmission;
+    defer parsed.deinit();
+    try parsed.value.validate();
+    return parsed.value;
+}
+pub fn decodeCompletionPublicationObservation(a: A, raw: []const u8, query: CompletionPublicationQuery) !CompletionPublicationObservation {
+    if (raw.len == 0 or raw.len > publication_read_max_bytes) return error.HistoryCorrupt;
+    var parsed = std.json.parseFromSlice(CompletionPublicationObservation, a, raw, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.HistoryCorrupt;
+    defer parsed.deinit();
+    try parsed.value.validate(query);
+    return parsed.value;
+}
 pub const completion_publication_prefix = "\x00\x00__committed_history__:completion_publication:";
 pub fn completionPublicationKey(index: u64) [completion_publication_prefix.len + 8]u8 {
     var key: [completion_publication_prefix.len + 8]u8 = undefined;

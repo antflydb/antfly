@@ -631,6 +631,18 @@ pub const Owner = struct {
         return (try wire.decodeReply(alloc, response.bytes(), request)).observation;
     }
 
+    pub fn historyPublication(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, query: @import("antfly_local_sources").storage_committed_history.CompletionPublicationQuery) !@import("antfly_local_sources").storage_committed_history.CompletionPublicationObservation {
+        const history = @import("antfly_local_sources").storage_committed_history;
+        try query.validate();
+        const json = try std.json.Stringify.valueAlloc(alloc, query, .{});
+        defer alloc.free(json);
+        if (json.len > history.publication_read_max_bytes) return error.InvalidArgument;
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_history_publication(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json) }, &response.buffer));
+        return history.decodeCompletionPublicationObservation(alloc, response.bytes(), query);
+    }
+
     pub fn historyResolution(self: *Owner, alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.Request) !@import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.Reply {
         const wire = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire;
         try request.validate();
