@@ -4356,3 +4356,23 @@ was never persisted, and resumes the complete transaction from the prior durable
 checkpoint while index waits remain unavailable. Native distributed destination
 admission, stable retry identity, and the full retained-history/pgoutput production
 integration remain required under the overall issue contracts.
+
+### Replication owner SQLSTATE preservation
+
+The production pgwire error boundary now maps retained-history and changefeed
+capability failures to `0A000`, expired/fenced/conflicting history authority to
+`55000`, history capacity limits to `53300`, oversized history to `54000`, and
+unknown commit/source outcomes to `40003`. History corruption remains `XX000`.
+These mappings preserve the existing distinction between replication owner
+uncertainty and SQL transaction completion; they do not authorize replay.
+
+Qualification: the full 151-test `pgwire-test` target completed with exit zero
+(`source-pgwire-errors-test.log`). Its wire-level regression injects 17 different
+owner failures during CREATE_REPLICATION_SLOT, checks the exact ErrorResponse
+SQLSTATE and reason, then executes IDENTIFY_SYSTEM on the same connection. It
+verifies one dispatch per command, no successful slot result, no SQL execution,
+no SQL completion debt, and owner release. The initial sandboxed run passed 143
+checks but denied local socket binds for eight listener/CopyBoth checks; the
+unchanged target passed when rerun with loopback listener permission. No external
+PostgreSQL CDC client was exercised by this test and production logical
+replication owner integration remains outstanding.

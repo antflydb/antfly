@@ -23,6 +23,7 @@ const Mock = struct {
     replication_denied: bool = false,
     replication_revoke_after_command: bool = false,
     replication_unknown: bool = false,
+    replication_error: ?anyerror = null,
     replication_opens: usize = 0,
     replication_closes: usize = 0,
     replication_checks: usize = 0,
@@ -203,6 +204,10 @@ const Mock = struct {
         try request.check();
         self.replication_commands += 1;
         if (self.replication_unknown) return error.MetadataMutationOutcomeUnknown;
+        if (self.replication_error) |err| {
+            self.replication_error = null;
+            return err;
+        }
         const rows = try a.alloc([]const std.json.Value, if (command == .drop_slot) 0 else 1);
         if (command == .identify_system) {
             rows[0] = try a.dupe(std.json.Value, &.{ .{ .string = "123456789" }, .{ .integer = 1 }, .{ .string = "0/1" }, .{ .string = request.database orelse "db" } });
@@ -2889,6 +2894,52 @@ test "pgwire replication results recheck authorization and uncertain slots do no
         try std.testing.expectEqual(@as(usize, 1), mock.replication_commands);
     }
 }
+test "pgwire replication owner failures preserve actionable SQLSTATEs without replay or SQL completion debt" {
+    const Case = struct { failure: anyerror, code: []const u8 };
+    for ([_]Case{
+        .{ .failure = error.ChangefeedCapabilityUnsupported, .code = "0A000" },
+        .{ .failure = error.ChangefeedResynchronizationRequired, .code = "55000" },
+        .{ .failure = error.ChangefeedLeaseExpired, .code = "55000" },
+        .{ .failure = error.ChangefeedConflict, .code = "55000" },
+        .{ .failure = error.HistoryResynchronizationRequired, .code = "55000" },
+        .{ .failure = error.HistoryCheckpointConflict, .code = "55000" },
+        .{ .failure = error.HistoryConsumerConflict, .code = "55000" },
+        .{ .failure = error.HistoryAuthorityRequired, .code = "55000" },
+        .{ .failure = error.HistoryPreparedTransactionsPresent, .code = "55000" },
+        .{ .failure = error.ChangefeedBackpressure, .code = "53300" },
+        .{ .failure = error.HistoryFull, .code = "53300" },
+        .{ .failure = error.HistoryConsumerLimit, .code = "53300" },
+        .{ .failure = error.HistoryTooLarge, .code = "54000" },
+        .{ .failure = error.MetadataMutationOutcomeUnknown, .code = "40003" },
+        .{ .failure = error.CommitDecisionUnknown, .code = "40003" },
+        .{ .failure = error.SourceOutcomeUnresolved, .code = "40003" },
+        // Corruption remains an internal error, never a retry/capacity signal.
+        .{ .failure = error.HistoryCorrupt, .code = "XX000" },
+    }) |case| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, "replication\x00database\x00");
+        try frame(&input.writer, 'Q', "CREATE_REPLICATION_SLOT s LOGICAL pgoutput\x00");
+        // A subsequent read-only command can inspect state after uncertainty.
+        try frame(&input.writer, 'Q', "IDENTIFY_SYSTEM\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .replication_enabled = true, .replication_error = case.failure };
+        var out = try run(&mock, input.written(), .{});
+        defer out.deinit();
+        var expected: [7]u8 = undefined;
+        expected[0] = 'C';
+        @memcpy(expected[1..6], case.code);
+        expected[6] = 0;
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), &expected) != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), @errorName(case.failure)) != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "snapshot-fixture") == null);
+        try std.testing.expectEqual(@as(usize, 2), mock.replication_commands);
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_closes);
+        try std.testing.expect(mock.completion_safe_after_run);
+    }
+}
+
 test "pgwire replication commands require logical startup while false preserves ordinary SQL" {
     var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer input.deinit();
