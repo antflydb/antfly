@@ -1180,6 +1180,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         resolution.commit_version,
                         .{
                             .source_purpose = resolution.source_purpose,
+                            .source_scope = resolution.source_scope,
+                            .source_scope_cut = if (opts.ordered_apply_receipt) |entry| .{ .term = entry.term, .index = entry.index } else null,
                             .completion_owner = resolution.completion_owner,
                             .completion_writes = completion_writes,
                             .resolved_participant = resolution.resolved_participant,
@@ -3191,6 +3193,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     resolution.commit_version,
                     .{
                         .source_purpose = resolution.source_purpose,
+                        .source_scope = resolution.source_scope,
+                        .source_scope_cut = if (opts.ordered_apply_receipt) |entry| .{ .term = entry.term, .index = entry.index } else null,
                         .completion_owner = resolution.completion_owner,
                         .commit_participant = if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
                         .writes = write_buffers.store_writes.items,
@@ -3990,10 +3994,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             source_purpose: ?[32]u8,
             completion_owner: ?@import("../transaction_completion.zig").RoutedOwner,
         ) !void {
+            return resolveTransactionIntentsInternalScoped(self, txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, source_purpose, completion_owner, null);
+        }
+
+        pub fn resolveTransactionIntentsInternalScoped(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            source_purpose: ?[32]u8,
+            completion_owner: ?@import("../transaction_completion.zig").RoutedOwner,
+            source_scope: ?@import("../source_scope.zig").Reference,
+        ) !void {
             var preparation: RequestPreparationContext = undefined;
             preparation.init(self);
             defer preparation.deinit();
-            self.resolveTransactionIntentsPrepared(
+            resolveTransactionIntentsPreparedScoped(
+                self,
                 txn_id,
                 status,
                 commit_version,
@@ -4004,6 +4025,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 source_purpose,
                 completion_owner,
                 &preparation.guard,
+                source_scope,
             ) catch |err| return preparation.mapError(err);
         }
 
@@ -4019,6 +4041,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             source_purpose: ?[32]u8,
             completion_owner: ?@import("../transaction_completion.zig").RoutedOwner,
             preparation: *PreparedRowAllocator,
+        ) !void {
+            return resolveTransactionIntentsPreparedScoped(self, txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, source_purpose, completion_owner, preparation, null);
+        }
+
+        pub fn resolveTransactionIntentsPreparedScoped(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            source_purpose: ?[32]u8,
+            completion_owner: ?@import("../transaction_completion.zig").RoutedOwner,
+            preparation: *PreparedRowAllocator,
+            source_scope: ?@import("../source_scope.zig").Reference,
         ) !void {
             const alloc = preparation.allocator();
             // Ordered apply must never await work whose publication needs a
@@ -4047,6 +4086,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 } else &.{};
                 _ = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
                     .source_purpose = source_purpose,
+                    .source_scope = source_scope,
+                    .source_scope_cut = if (ordered_receipt) |entry| .{ .term = entry.term, .index = entry.index } else null,
                     .completion_owner = completion_owner,
                     .completion_writes = marker_writes,
                     .resolved_participant = resolved_participant,
@@ -4102,6 +4143,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         commit_version,
                         .{
                             .source_purpose = source_purpose,
+                            .source_scope = source_scope,
+                            .source_scope_cut = if (ordered_receipt) |entry| .{ .term = entry.term, .index = entry.index } else null,
                             .completion_owner = completion_owner,
                             .completion_writes = marker_writes,
                             .resolved_participant = resolved_participant,
@@ -4143,6 +4186,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .durable_rows = &durable_rows,
                     .transaction_resolution = .{
                         .source_purpose = source_purpose,
+                        .source_scope = source_scope,
                         .completion_owner = completion_owner,
                         .txn_id = txn_id,
                         .status = status,

@@ -100,7 +100,10 @@ pub fn applyReplicatedTransactionMutationInternal(
                 if (!std.mem.eql(u8, member.locator, local_participant)) return error.InvalidParticipant;
                 if (begin.source_purpose) |purpose| {
                     if (!begin.retain_terminal) return error.InvalidBatchRequest;
-                    _ = try db.beginReplicatedSourceCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, entry, purpose);
+                    if (begin.source_scope) |scope|
+                        _ = try db.beginReplicatedScopedSourceCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, entry, purpose, scope)
+                    else
+                        _ = try db.beginReplicatedSourceCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, entry, purpose);
                 } else _ = try db.beginReplicatedCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, begin.retain_terminal, entry);
                 return;
             }
@@ -141,6 +144,7 @@ pub fn applyReplicatedTransactionMutationInternal(
             const intents: db_mod.types.TransactionIntentRequest = .{
                 .completion_owner = prepare.completion_owner,
                 .completion_source_purpose = prepare.source_purpose,
+                .completion_source_scope = prepare.source_scope,
                 .completion_source_checkpoint = prepare.source_checkpoint,
                 .completion_input_digest = completion.preparedInputDigest(namespace, encoded_input),
                 .document_version_scheme = req.document_version_scheme,
@@ -187,10 +191,12 @@ pub fn applyReplicatedTransactionMutationInternal(
                 if (resolve.completion_owner) |binding| {
                     try @import("antfly_local_sources").api_internal_batch.validateCompletionControlRequest(req);
                     if (req.restore_staging_scope != null or binding.group_id != group_id) return error.TopologyChanged;
-                    if (resolve.source_purpose) |purpose|
-                        try db.resolveReplicatedSourceCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding, purpose)
-                    else
-                        try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding);
+                    if (resolve.source_purpose) |purpose| {
+                        if (resolve.source_scope) |scope|
+                            try db.resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding, purpose, scope)
+                        else
+                            try db.resolveReplicatedSourceCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding, purpose);
+                    } else try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(resolve.txn_id, resolve.status, resolve.commit_version, entry, if (defer_coordinator_ack) null else local_participant, binding);
                     return;
                 }
                 try db.resolveReplicatedTransactionAtOrderedReceipt(

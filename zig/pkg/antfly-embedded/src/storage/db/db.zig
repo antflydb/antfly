@@ -25689,16 +25689,23 @@ pub const DB = struct {
     /// are committed in the same native transaction.
     pub fn beginReplicatedCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: ?@import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity });
-        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity, null);
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity, null, null);
     }
 
     pub fn beginReplicatedSourceCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: OrderedApplyReceipt, purpose: [32]u8) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedSourceCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, identity, purpose });
         if (std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
-        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, true, identity, purpose);
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, true, identity, purpose, null);
     }
 
-    fn beginReplicatedCompletionTransactionInternal(self: *DB, encoded_plan: []const u8, owner: ?@import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt, purpose: ?[32]u8) !transactions_mod.TxnId {
+    pub fn beginReplicatedScopedSourceCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: OrderedApplyReceipt, purpose: [32]u8, scope: @import("../source_scope.zig").Reference) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedScopedSourceCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, identity, purpose, scope });
+        try scope.validate();
+        if (std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, true, identity, purpose, scope);
+    }
+
+    fn beginReplicatedCompletionTransactionInternal(self: *DB, encoded_plan: []const u8, owner: ?@import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt, purpose: ?[32]u8, scope: ?@import("../source_scope.zig").Reference) !transactions_mod.TxnId {
         const completion = @import("../transaction_completion.zig");
         if (self.isClosed()) return error.StorageUnavailable;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -25740,13 +25747,14 @@ pub const DB = struct {
                 defer saved.deinit();
                 if (!std.mem.eql(u8, &saved.value.digest, &parsed.value.digest)) return error.DecisionConflict;
                 if (!std.meta.eql(try manager.getSourcePurpose(plan.transaction_id), purpose)) return error.SourceTransactionIdentityConflict;
+                if (!std.meta.eql(try manager.getSourceScope(plan.transaction_id), scope)) return error.SourceTransactionIdentityConflict;
                 return plan.transaction_id;
             },
             .apply => {},
         }
         var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker = orderedApplyReceiptWrite(identity, &value_buf);
-        const extra: transactions_mod.MutationExtraBatch = .{ .writes = &.{marker}, .source_purpose = purpose };
+        const extra: transactions_mod.MutationExtraBatch = .{ .writes = &.{marker}, .source_purpose = purpose, .source_scope = scope };
         if (std.mem.eql(u8, &namespace, &plan.coordinator_namespace))
             try manager.initTransactionWithCompletionAdmission(plan, timestamp_ns, created_at_ns, retain_terminal, extra)
         else
@@ -26601,7 +26609,7 @@ pub const DB = struct {
             }
             var manager = try self.core.initTxnManager();
             defer manager.deinit();
-            if (try manager.completionPrepareStatus(txn_id, req.completion_input_digest, source_purpose, req.completion_owner)) |prepared| {
+            if (try manager.completionPrepareScopedStatus(txn_id, req.completion_input_digest, source_purpose, req.completion_owner, req.completion_source_scope)) |prepared| {
                 if (ordered_receipt == null) {
                     var read = try self.core.store.beginReadTxn();
                     defer read.abort();
@@ -27018,13 +27026,14 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .completion_owner = req.completion_owner, .completion_input_digest = req.completion_input_digest, .source_purpose = source_purpose, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .completion_owner = req.completion_owner, .completion_input_digest = req.completion_input_digest, .source_purpose = source_purpose, .source_scope = req.completion_source_scope, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
                 .completion_owner = req.completion_owner,
                 .completion_input_digest = req.completion_input_digest,
                 .source_purpose = source_purpose,
+                .source_scope = req.completion_source_scope,
                 .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
@@ -27463,6 +27472,13 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("resolveReplicatedSourceCompletionTransactionAtOrderedReceipt", .{ self, txn_id, status, commit_version, identity, resolved_participant, owner, purpose });
         if (std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
         try self.resolveTransactionIntentsInternal(txn_id, status, commit_version, .write, .none, identity, resolved_participant, purpose, owner);
+    }
+
+    pub fn resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt(self: *DB, txn_id: types.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, identity: OrderedApplyReceipt, resolved_participant: ?[]const u8, owner: @import("../transaction_completion.zig").RoutedOwner, purpose: [32]u8, scope: @import("../source_scope.zig").Reference) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt", .{ self, txn_id, status, commit_version, identity, resolved_participant, owner, purpose, scope });
+        try scope.validate();
+        if (std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
+        try local_mutation.resolveTransactionIntentsInternalScoped(self, txn_id, status, commit_version, .write, .none, identity, resolved_participant, purpose, owner, scope);
     }
 
     pub const resolveTransactionIntentsInternal = local_mutation.resolveTransactionIntentsInternal;

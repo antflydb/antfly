@@ -40,7 +40,7 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 38;
+pub const batch_protocol_version: u16 = 39;
 /// Frozen completion BEGIN and owner/input-fenced PREPARE require durable
 /// activation across every applying member before proposal or native apply.
 pub const batch_completion_admission_protocol_version: u16 = 31;
@@ -60,6 +60,12 @@ pub const batch_source_plan_protocol_version: u16 = 36;
 pub const batch_source_checkpoint_protocol_version: u16 = 37;
 /// Version 38 admits immutable bounded receipt windows before source BEGIN.
 pub const batch_source_checkpoint_receipts_protocol_version: u16 = 38;
+/// Version 39 retains and fences original source scope/attempt identity.
+pub const batch_source_attempt_protocol_version: u16 = 39;
+fn hasSourceScope(value: anytype) bool {
+    if (comptime !@hasField(@TypeOf(value), "source_scope")) return false;
+    return value.source_scope != null;
+}
 fn checkpointProtocol(value: anytype) u16 {
     // Generic callers may deliberately model older request layouts. This
     // branch is never selected by hasCheckpoint for those shapes.
@@ -83,9 +89,9 @@ pub fn completionProtocolVersion(a: @import("std").mem.Allocator, request: anyty
     const mutation = request.transaction orelse return null;
     return switch (mutation) {
         .publish_completion => |value| if (try completionEnvelopeVersion(a, value.certificate, true) >= 3) batch_completion_recovery_protocol_version else batch_completion_publication_protocol_version,
-        .begin => |value| if (hasCheckpoint(value)) checkpointProtocol(value) else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_admission) |bytes| (if (try completionEnvelopeVersion(a, bytes, false) >= 3) batch_completion_recovery_protocol_version else batch_completion_admission_protocol_version) else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
-        .prepare => |value| if (hasCheckpoint(value)) checkpointProtocol(value) else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
-        .resolve => |value| if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
+        .begin => |value| if (hasSourceScope(value)) batch_source_attempt_protocol_version else if (hasCheckpoint(value)) checkpointProtocol(value) else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_admission) |bytes| (if (try completionEnvelopeVersion(a, bytes, false) >= 3) batch_completion_recovery_protocol_version else batch_completion_admission_protocol_version) else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
+        .prepare => |value| if (hasSourceScope(value)) batch_source_attempt_protocol_version else if (hasCheckpoint(value)) checkpointProtocol(value) else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
+        .resolve => |value| if (hasSourceScope(value)) batch_source_attempt_protocol_version else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
         else => null,
     };
 }
@@ -208,4 +214,19 @@ test "source checkpoint receipt windows require activation before every BEGIN" {
     try std.testing.expectEqual(@as(?u16, 38), try completionProtocolVersion(a, Request{ .transaction = .{ .prepare = .{ .source_checkpoint = .{ .receipt_window = 3 } } } }));
     try std.testing.expectEqual(@as(?u16, 35), try completionProtocolVersion(a, Request{ .transaction = .{ .begin = .{ .source_checkpoint = false } } }));
     try std.testing.expectEqual(@as(?u16, 35), try completionProtocolVersion(a, Request{ .transaction = .{ .prepare = .{ .source_checkpoint = null } } }));
+}
+
+test "raft batch scoped source attempts require protocol 39 before every phase" {
+    const Request = struct {
+        transaction: ?union(enum) {
+            begin: struct { completion_admission: ?[]const u8 = null, completion_owner: ?u8 = 1, source_purpose: ?[32]u8 = @splat(1), source_scope: ?u8 = 1 },
+            prepare: struct { completion_owner: ?u8 = 1, source_purpose: ?[32]u8 = @splat(1), source_scope: ?u8 = 1 },
+            resolve: struct { completion_owner: ?u8 = 1, source_purpose: ?[32]u8 = @splat(1), source_scope: ?u8 = 1 },
+            publish_completion: struct { certificate: []const u8 },
+            ordinary: void,
+        },
+    };
+    const a = @import("std").testing.allocator;
+    for ([_]Request{ .{ .transaction = .{ .begin = .{} } }, .{ .transaction = .{ .prepare = .{} } }, .{ .transaction = .{ .resolve = .{} } } }) |request|
+        try @import("std").testing.expectEqual(@as(?u16, 39), try completionProtocolVersion(a, request));
 }

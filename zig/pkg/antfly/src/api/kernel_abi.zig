@@ -32,7 +32,7 @@ pub const StatusDetail = error_abi.Detail;
 // Version 26 changes routed batch callbacks with source checkpoint mutations.
 // Version 27 adds bounded source checkpoint receipt-window batch layouts.
 // Version 28 includes qualified checkpoint observation callback ports.
-pub const abi_version: u32 = 28;
+pub const abi_version: u32 = 29;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

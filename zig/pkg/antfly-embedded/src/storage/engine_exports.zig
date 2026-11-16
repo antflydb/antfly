@@ -1125,8 +1125,14 @@ fn beginTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, 
 fn beginReplicatedSourceCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: db.OrderedApplyReceipt, purpose: [32]u8) engine.Outcome(@import("transactions.zig").TxnId) {
     return .{ .value = self.beginReplicatedSourceCompletionTransaction(encoded_plan, owner, timestamp_ns, created_at_ns, identity, purpose) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn beginReplicatedScopedSourceCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: db.OrderedApplyReceipt, purpose: [32]u8, scope: @import("source_scope.zig").Reference) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginReplicatedScopedSourceCompletionTransaction(encoded_plan, owner, timestamp_ns, created_at_ns, identity, purpose, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn resolveReplicatedSourceCompletionTransactionAtOrderedReceipt(self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8, owner: @import("transaction_completion.zig").RoutedOwner, purpose: [32]u8) engine.Outcome(void) {
     return .{ .value = self.resolveReplicatedSourceCompletionTransactionAtOrderedReceipt(txn_id, status, commit_version, identity, resolved_participant, owner, purpose) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt(self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8, owner: @import("transaction_completion.zig").RoutedOwner, purpose: [32]u8, scope: @import("source_scope.zig").Reference) engine.Outcome(void) {
+    return .{ .value = self.resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt(txn_id, status, commit_version, identity, resolved_participant, owner, purpose, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 fn beginReplicatedCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: ?@import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: db.OrderedApplyReceipt) engine.Outcome(@import("transactions.zig").TxnId) {
     return .{ .value = self.beginReplicatedCompletionTransaction(encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };

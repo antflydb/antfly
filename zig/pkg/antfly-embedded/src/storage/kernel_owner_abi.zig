@@ -31,7 +31,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 105 fences source-checkpoint failure statuses across owner calls.
 // Version 106 adds source checkpoint receipt-window mutation layouts.
 // Version 107 adds qualified checkpoint receipt observations.
-pub const abi_version: u32 = 107;
+pub const abi_version: u32 = 108;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

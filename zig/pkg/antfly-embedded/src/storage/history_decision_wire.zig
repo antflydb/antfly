@@ -52,10 +52,11 @@ pub const Record = struct {
     digest: [32]u8,
     /// Retained source ownership, independent of ordinary expiry/recovery jobs.
     source_purpose: ?[32]u8 = null,
+    source_scope: ?@import("source_scope.zig").Reference = null,
     pub fn jsonStringify(self: Record, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (@typeInfo(Record).@"struct".field_names) |name| {
-            if (!std.mem.eql(u8, name, "source_purpose") or self.source_purpose != null) {
+            if ((!std.mem.eql(u8, name, "source_purpose") or self.source_purpose != null) and (!std.mem.eql(u8, name, "source_scope") or self.source_scope != null)) {
                 try stream.objectField(name);
                 try stream.write(@field(self, name));
             }
@@ -65,6 +66,10 @@ pub const Record = struct {
     pub fn validate(self: Record) !void {
         if (self.begin_timestamp == 0 or self.created_at_ns == 0 or std.mem.allEqual(u8, &self.digest, 0)) return error.HistoryCorrupt;
         if (self.source_purpose) |purpose| if (std.mem.allEqual(u8, &purpose, 0)) return error.HistoryCorrupt;
+        if (self.source_scope) |scope| {
+            scope.validate() catch return error.HistoryCorrupt;
+            if (self.source_purpose == null) return error.HistoryCorrupt;
+        }
         switch (self.status) {
             .pending => if (self.commit_version != 0 or self.finalized_at_ns != 0 or self.intents_resolved) return error.HistoryCorrupt,
             .committed => if (self.commit_version <= self.begin_timestamp or self.finalized_at_ns == 0 or !self.prepared) return error.HistoryCorrupt,

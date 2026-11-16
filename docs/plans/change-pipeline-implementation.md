@@ -4671,3 +4671,71 @@ commands are not enabled yet: private wire tags/activation floors, API/opaque
 owner plumbing, independently qualified metadata actor/cut capture, control
 endpoints and managed legacy migration remain required. Production source adapter
 and the remaining full issue contracts remain unfinished and active.
+
+### Required recovery edge: scoped ABORT before original BEGIN
+
+The existing not-enlisted ABORT no-op is insufficient for scoped attempts. A
+participant that has a bound domain but has not installed this attempt's BEGIN
+can still receive that delayed BEGIN after the coordinator records ABORT and
+private transaction metadata is collected. Its local attempt floor must advance
+before the original participant can ACK retirement; absence alone must never
+supply a positive abort or not-admitted proof. The original frozen admission,
+qualified positive coordinator outcome and original physical owner must authorize
+that floor transition, without clearing a newer slot. If the coordinator itself
+has never admitted BEGIN, recovery needs an explicitly qualified source-attempt
+abort/admission retirement transition rather than assuming absence is ABORT.
+Scope control/metadata retirement and the production source adapter must cover
+these cases before protocol-39 source admission is enabled for production.
+
+### Routed scoped transaction profile and retained decision identity
+
+Added private `begin_source_scope_v1`, `prepare_source_scope_v1` and
+`resolve_source_scope_v1` tags carrying the exact retained scope reference.
+Stripping that reference or substituting an older phase is rejected. Scoped BEGIN
+requires the checkpoint/receipt profile; the checkpoint PREPARE binds the same
+binding and sequence and requires bounded receipts, while row-only participants
+carry the reference without inventing a checkpoint command. Public batch parsing
+rejects all of these private phases.
+
+Frozen plan construction requires every original participant to carry the same
+reference and makes the unique checkpoint participant the coordinator. The
+reference is authenticated in the canonical original PREPARE bytes and restored
+from the retained artifact without provider rows. BEGIN and terminal propagation
+preserve it. The qualified decision-read record now returns the retained
+reference (omitted for legacy records), so replacement-worker resolution also
+uses the original attempt identity rather than an unscoped command.
+
+Native BEGIN/first-materialization/PREPARE dispatch carries the reference into
+v9 transaction records and atomic registry transitions. Ordered resolution
+threads it through abort, terminal and materialized commit paths, deriving the
+slot-release cut from the actual ordered Raft receipt. Legacy method signatures
+retain compatibility wrappers. The source attempt profile requires data-Raft 39
+for each of BEGIN/PREPARE/resolve; the pre-existing version-12 restore/source-pin
+constant retains its original meaning. Engine descriptor is 55, opaque storage
+owner ABI 108 and API-kernel ABI 29 for the changed native layouts/contracts.
+
+Qualification: `completion-frozen-plan-test completion-begin-wire-test
+docstore-history-test history-control-apply-test -j2` completed with exit zero
+(`source-attempt-native-final-test.log`): suites of 3, 30, 6, 14 and 13 tests,
+zero skips/failures/leaks. The linked real-Raft/ReadIndex and signed cross-node
+legacy source fixture passed across the new native ABI boundaries. New codec
+cases cover checkpoint and row-only PREPARE, all three phase round-trips,
+downgrade/stripping/public-parser rejection and mismatched checkpoint identity.
+The frozen-plan case covers providerless restore, mixed attempts and incorrect
+checkpoint coordinator rejection. Native v9 recovery verifies that decision-read
+extraction retains its scope reference. Four direct protocol tests passed,
+including protocol-39 classification for every scoped phase. Source catalog,
+engine-error, OpenAPI, formatting and diff checks passed. API regeneration
+completed and unrelated generated model-explorer data was restored. An initial
+sandboxed native run passed 12/13 Raft tests but denied the real loopback bind;
+the unchanged cached fixture passed all 13 after enabling local TCP access.
+Two new frozen-fixture call signature errors were corrected before the final
+passing run.
+
+This qualifies command/retained-identity plumbing and preserves existing native
+behavior. It does not qualify production scoped admission: physical registry
+control endpoints, independent metadata actor/cut capture, managed legacy drain,
+positive coordinator-authorized ABORT-before-BEGIN floors and explicit source
+attempt retirement still need implementation and cross-node race tests. The
+full distributed source adapter and the public feeds/bootstrap/retention,
+production pgoutput and existing-client qualification contracts remain active.

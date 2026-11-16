@@ -46,6 +46,7 @@ pub const Plan = struct {
     begin_timestamp: u64,
     created_at_ns: u64,
     source_purpose: ?[32]u8,
+    source_scope: ?@import("antfly_local_sources").storage_source_scope.Reference = null,
     source_checkpoint: bool = false,
     source_checkpoint_receipts: bool = false,
 
@@ -66,6 +67,7 @@ pub const Plan = struct {
         const members = try owned.alloc(completion.Participant, inputs.len);
         var begin_timestamp: u64 = 0;
         var source_purpose: ?[32]u8 = null;
+        var source_scope: ?@import("antfly_local_sources").storage_source_scope.Reference = null;
         var checkpoint_count: usize = 0;
         var source_checkpoint = false;
         var source_checkpoint_receipts = false;
@@ -79,9 +81,16 @@ pub const Plan = struct {
             if (mutation != .prepare) return error.InvalidBatchRequest;
             const vote = mutation.prepare;
             if (i == 0) source_purpose = vote.source_purpose else if (!std.meta.eql(source_purpose, vote.source_purpose)) return error.SourceTransactionIdentityConflict;
+            if (i == 0) source_scope = vote.source_scope else if (!std.meta.eql(source_scope, vote.source_scope)) return error.SourceTransactionIdentityConflict;
+            if (vote.source_scope) |scope| {
+                try scope.validate();
+                if (vote.source_purpose == null) return error.InvalidSourceAdmission;
+                if (input.roles & completion.Roles.checkpoint != 0 and (!std.mem.eql(u8, &input.owner.digest(), &coordinator.digest()) or vote.source_checkpoint == null)) return error.InvalidSourceAdmission;
+            }
             if (input.roles & completion.Roles.checkpoint != 0) checkpoint_count += 1;
             if (vote.source_checkpoint) |checkpoint| {
                 try checkpoint.validate();
+                if (vote.source_scope) |scope| if (checkpoint.receipt_window == 0 or !std.mem.eql(u8, &scope.binding, &checkpoint.binding) or scope.sequence != checkpoint.sequence) return error.SourceTransactionIdentityConflict;
                 if (vote.source_purpose == null or !std.mem.eql(u8, &checkpoint.purpose, &vote.source_purpose.?) or input.roles & completion.Roles.checkpoint == 0) return error.InvalidSourceAdmission;
                 source_checkpoint = true;
                 source_checkpoint_receipts = checkpoint.receipt_window != 0;
@@ -103,6 +112,7 @@ pub const Plan = struct {
             members[i] = .{ .namespace = input.owner.namespace, .owner_fence = input.owner.digest(), .roles = input.roles, .input_digest = completion.preparedInputDigest(input.owner.namespace, bytes), .locator = name, .routed_owner = input.owner };
         }
         if (source_purpose != null and checkpoint_count != 1) return error.InvalidSourceAdmission;
+        if (source_scope != null and (!source_checkpoint or !source_checkpoint_receipts)) return error.InvalidSourceAdmission;
         // Admission order is canonical, independent of route enumeration or
         // fanout completion order. Keep the corresponding payloads together.
         for (1..participants.len) |i| {
@@ -127,7 +137,7 @@ pub const Plan = struct {
             ids[follower] = participant.locator;
             follower += 1;
         }
-        return .{ .arena = arena, .admission = admission, .admission_bytes = encoded, .participants = participants, .participant_ids = ids, .begin_timestamp = begin_timestamp, .created_at_ns = created_at_ns, .source_purpose = source_purpose, .source_checkpoint = source_checkpoint, .source_checkpoint_receipts = source_checkpoint_receipts };
+        return .{ .arena = arena, .admission = admission, .admission_bytes = encoded, .participants = participants, .participant_ids = ids, .begin_timestamp = begin_timestamp, .created_at_ns = created_at_ns, .source_purpose = source_purpose, .source_scope = source_scope, .source_checkpoint = source_checkpoint, .source_checkpoint_receipts = source_checkpoint_receipts };
     }
 
     /// Derive a retry identity from canonical namespace order and the complete
@@ -162,7 +172,7 @@ pub const Plan = struct {
             defer request.deinit(a);
             const mutation = request.req.transaction orelse return error.InvalidBatchRequest;
             if (mutation != .prepare) return error.InvalidBatchRequest;
-            if (request.req.timestamp_ns != self.begin_timestamp or request.req.sync_level != .write or request.req.document_version_scheme != .revision_v1 or !std.meta.eql(mutation.prepare.source_purpose, self.source_purpose)) return error.SourcePayloadConflict;
+            if (request.req.timestamp_ns != self.begin_timestamp or request.req.sync_level != .write or request.req.document_version_scheme != .revision_v1 or !std.meta.eql(mutation.prepare.source_purpose, self.source_purpose) or !std.meta.eql(mutation.prepare.source_scope, self.source_scope)) return error.SourcePayloadConflict;
             if (!std.mem.eql(u8, &mutation.prepare.txn_id, &self.admission.transaction_id) or mutation.prepare.completion_owner == null or !std.mem.eql(u8, &mutation.prepare.completion_owner.?.digest(), &participant.owner.digest()) or mutation.prepare.topology_epoch != participant.owner.topology_epoch) return error.SourceTransactionIdentityConflict;
             const member = try self.admission.member(participant.owner.namespace);
             if (member.roles & completion.Roles.checkpoint != 0) checkpoints += 1;
@@ -179,6 +189,12 @@ pub const Plan = struct {
         }
         if (has_checkpoint_command != self.source_checkpoint or has_checkpoint_receipts != self.source_checkpoint_receipts) return error.SourcePayloadConflict;
         if (self.source_purpose != null and checkpoints != 1) return error.InvalidSourceAdmission;
+        if (self.source_scope) |scope| {
+            try scope.validate();
+            if (self.source_purpose == null or !has_checkpoint_command or !has_checkpoint_receipts) return error.InvalidSourceAdmission;
+            const coordinator = try self.admission.member(self.admission.coordinator_namespace);
+            if (coordinator.roles & completion.Roles.checkpoint == 0) return error.InvalidSourceAdmission;
+        }
         var size: usize = frozen_header_bytes + self.admission_bytes.len;
         var payload_bytes: usize = 0;
         for (self.participants, self.admission.participants) |participant, member| {
@@ -269,7 +285,7 @@ pub const Plan = struct {
         if (index >= self.participants.len) return error.InvalidTxnRecord;
         const owner = self.participants[index].owner;
         try self.admission.requireRoutedOwner(owner);
-        return .{ .sync_level = .write, .transaction = .{ .begin = .{ .txn_id = self.admission.transaction_id, .begin_timestamp = self.begin_timestamp, .created_at_ns = self.created_at_ns, .topology_epoch = owner.topology_epoch, .retain_terminal = true, .participants = self.participant_ids, .completion_admission = self.admission_bytes, .completion_owner = owner, .source_purpose = self.source_purpose, .source_checkpoint = self.source_checkpoint, .source_checkpoint_receipts = self.source_checkpoint_receipts } } };
+        return .{ .sync_level = .write, .transaction = .{ .begin = .{ .txn_id = self.admission.transaction_id, .begin_timestamp = self.begin_timestamp, .created_at_ns = self.created_at_ns, .topology_epoch = owner.topology_epoch, .retain_terminal = true, .participants = self.participant_ids, .completion_admission = self.admission_bytes, .completion_owner = owner, .source_purpose = self.source_purpose, .source_scope = self.source_scope, .source_checkpoint = self.source_checkpoint, .source_checkpoint_receipts = self.source_checkpoint_receipts } } };
     }
 
     /// Parsed retry input has independent ownership and can outlive this plan.
@@ -390,4 +406,39 @@ test "completion frozen plan artifacts retain complete owned inputs and reject s
     defer owned_request.deinit(a);
     try std.testing.expectEqualStrings("row", owned_request.req.writes[0].key);
     try std.testing.expectEqualStrings("{\"v\":1}", owned_request.req.writes[0].value);
+}
+
+test "completion frozen plan scoped attempts bind checkpoint coordinator and survive providerless restore" {
+    const a = std.testing.allocator;
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 9, .topology_epoch = 3 };
+    var follower = owner;
+    follower.namespace = @splat(3);
+    follower.group_id = 10;
+    const id: [16]u8 = @splat(4);
+    const purpose: [32]u8 = @splat(5);
+    const scope: @import("antfly_local_sources").storage_source_scope.Reference = .{ .domain = @splat(6), .binding = @splat(7), .generation = 2, .token = 3, .sequence = 1 };
+    var inputs = [_]Input{
+        .{ .owner = owner, .locator = "table2:00000004:docs:9", .roles = completion.Roles.checkpoint, .prepare = try (types.TransactionIntentRequest{ .completion_owner = owner, .completion_source_purpose = purpose, .completion_source_scope = scope, .completion_source_checkpoint = .{ .binding = scope.binding, .purpose = purpose, .sequence = 1, .checkpoint = "start", .accepted_at_ns = 11, .receipt_window = 3 } }).completionBatch(id, 10, owner.topology_epoch) },
+        .{ .owner = follower, .locator = "table2:00000004:docs:10", .roles = completion.Roles.effects, .prepare = try (types.TransactionIntentRequest{ .completion_owner = follower, .completion_source_purpose = purpose, .completion_source_scope = scope, .writes = &.{.{ .key = "row", .value = "{\"v\":1}" }} }).completionBatch(id, 10, follower.topology_epoch) },
+    };
+    var plan = try Plan.freezeDerived(a, id, owner, &inputs, 11);
+    defer plan.deinit();
+    const bytes = try plan.encodeFrozen(a);
+    defer a.free(bytes);
+    var restored = try Plan.restoreFrozen(a, bytes, try frozenDigest(bytes));
+    defer restored.deinit();
+    try std.testing.expectEqualDeep(scope, restored.source_scope.?);
+    for (restored.participants, 0..) |_, i| {
+        const begin = try restored.begin(i);
+        try std.testing.expectEqualDeep(scope, begin.transaction.?.begin.source_scope.?);
+        var prepare = try restored.prepare(a, i);
+        defer prepare.deinit(a);
+        try std.testing.expectEqualDeep(scope, prepare.req.transaction.?.prepare.source_scope.?);
+    }
+    inputs[1].prepare.transaction.?.prepare.source_scope.?.token += 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, Plan.freezeDerived(a, id, owner, &inputs, 11));
+    inputs[1].prepare.transaction.?.prepare.source_scope = scope;
+    try std.testing.expectError(error.InvalidSourceAdmission, Plan.freezeDerived(a, id, follower, &inputs, 11));
+    inputs[0].prepare.transaction.?.prepare.source_checkpoint.?.binding = @splat(8);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, Plan.freezeDerived(a, id, owner, &inputs, 11));
 }

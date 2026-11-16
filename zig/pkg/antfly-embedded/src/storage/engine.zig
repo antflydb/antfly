@@ -333,7 +333,9 @@ pub const VTable = struct {
     beginTransactionWithIdAndParticipantsCreatedAtAndRole: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool) Outcome(@import("transactions.zig").TxnId),
     beginTransactionScoped: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) Outcome(@import("transactions.zig").TxnId),
     beginReplicatedSourceCompletionTransaction: *const fn (self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: db.OrderedApplyReceipt, purpose: [32]u8) Outcome(@import("transactions.zig").TxnId),
+    beginReplicatedScopedSourceCompletionTransaction: *const fn (self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: db.OrderedApplyReceipt, purpose: [32]u8, scope: @import("source_scope.zig").Reference) Outcome(@import("transactions.zig").TxnId),
     resolveReplicatedSourceCompletionTransactionAtOrderedReceipt: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8, owner: @import("transaction_completion.zig").RoutedOwner, purpose: [32]u8) Outcome(void),
+    resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8, owner: @import("transaction_completion.zig").RoutedOwner, purpose: [32]u8, scope: @import("source_scope.zig").Reference) Outcome(void),
     beginReplicatedCompletionTransaction: *const fn (self: *DB, encoded_plan: []const u8, owner: ?@import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: db.OrderedApplyReceipt) Outcome(@import("transactions.zig").TxnId),
     beginReplicatedTransactionScoped: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8) Outcome(@import("transactions.zig").TxnId),
     writeIntents: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, intents: []const @import("transactions.zig").WriteIntent, predicates: []const @import("transactions.zig").VersionPredicate) Outcome(void),
@@ -593,7 +595,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 52 adds source-global checkpoint BEGIN/PREPARE contracts.
 /// Version 53 adds bounded checkpoint receipt-window command layouts.
 /// Version 54 adds qualified source checkpoint observations.
-pub const descriptor_version: u32 = 54;
+pub const descriptor_version: u32 = 55;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

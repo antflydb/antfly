@@ -1143,6 +1143,7 @@ pub const BatchExecutionOptions = struct {
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
 
 pub const TransactionResolution = struct {
+    source_scope: ?@import("../source_scope.zig").Reference = null,
     completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
     source_purpose: ?[32]u8 = null,
     txn_id: transactions_mod.TxnId,

@@ -280,6 +280,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const rememberBulkIngestAllNewIdentityUpserts = commit.rememberBulkIngestAllNewIdentityUpserts;
         pub const replicationMutationBarrier = commit.replicationMutationBarrier;
         pub const resolveTransactionIntentsInternal = commit.resolveTransactionIntentsInternal;
+        pub const resolveTransactionIntentsInternalScoped = commit.resolveTransactionIntentsInternalScoped;
         pub const resolveTransactionIntentsPrepared = commit.resolveTransactionIntentsPrepared;
         pub const restoreStagingStatus = commit.restoreStagingStatus;
         pub const shouldApplySplitReplicationLocked = commit.shouldApplySplitReplicationLocked;
@@ -841,6 +842,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const rememberBulkIngestAllNewIdentityUpserts = Implementation.rememberBulkIngestAllNewIdentityUpserts;
             pub const replicationMutationBarrier = Implementation.replicationMutationBarrier;
             pub const resolveTransactionIntentsInternal = Implementation.resolveTransactionIntentsInternal;
+            pub const resolveTransactionIntentsInternalScoped = Implementation.resolveTransactionIntentsInternalScoped;
             pub const resolveTransactionIntentsPrepared = Implementation.resolveTransactionIntentsPrepared;
             pub const restoreStagingStatus = Implementation.restoreStagingStatus;
             pub const shouldApplySplitReplicationLocked = Implementation.shouldApplySplitReplicationLocked;
@@ -998,6 +1000,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const rememberBulkIngestAllNewIdentityUpserts = Implementation.rememberBulkIngestAllNewIdentityUpserts;
             pub const replicationMutationBarrier = Implementation.replicationMutationBarrier;
             pub const resolveTransactionIntentsInternal = Implementation.resolveTransactionIntentsInternal;
+            pub const resolveTransactionIntentsInternalScoped = Implementation.resolveTransactionIntentsInternalScoped;
             pub const resolveTransactionIntentsPrepared = Implementation.resolveTransactionIntentsPrepared;
             pub const restoreStagingStatus = Implementation.restoreStagingStatus;
             pub const shouldApplySplitReplicationLocked = Implementation.shouldApplySplitReplicationLocked;

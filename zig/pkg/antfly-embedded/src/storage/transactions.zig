@@ -2551,6 +2551,10 @@ pub const TxnManager = struct {
         if (record.status != .pending or !record.prepared_known or record.prepared or record.intent_revision != 0) return error.SourcePendingWork;
     }
 
+    pub fn getSourceScope(self: *TxnManager, txn_id: TxnId) !?source_scope.Reference {
+        return (try self.loadTransactionRecord(txn_id)).source_scope;
+    }
+
     pub fn getSourcePurpose(self: *TxnManager, txn_id: TxnId) !?[32]u8 {
         return (try self.loadTransactionRecord(txn_id)).source_purpose;
     }
@@ -3443,6 +3447,7 @@ pub fn completionCoordinatorRecord(raw: []const u8) !@import("history_decision_w
         .intents_resolved = record.intents_resolved,
         .digest = completion.bytesDigest(raw),
         .source_purpose = record.source_purpose,
+        .source_scope = record.source_scope,
     };
     try result.validate();
     return result;
@@ -6317,6 +6322,7 @@ test "transaction source purpose scoped reference survives restart and fences st
         defer a.free(raw);
         try std.testing.expectEqual(@as(usize, txn_record_v9_size), raw.len);
         try std.testing.expectEqualDeep(scope, (try decodeRecord(raw)).source_scope.?);
+        try std.testing.expectEqualDeep(scope, (try completionCoordinatorRecord(raw)).source_scope.?);
         const corrupt = try a.dupe(u8, raw);
         defer a.free(corrupt);
         corrupt[54] = 1;

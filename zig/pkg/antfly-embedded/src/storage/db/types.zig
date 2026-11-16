@@ -218,6 +218,7 @@ pub const TransactionMutation = union(enum) {
         completion_admission: ?[]const u8 = null,
         completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
         source_purpose: ?[32]u8 = null,
+        source_scope: ?@import("../source_scope.zig").Reference = null,
         source_checkpoint: bool = false,
         source_checkpoint_receipts: bool = false,
     },
@@ -226,11 +227,13 @@ pub const TransactionMutation = union(enum) {
         topology_epoch: u64,
         completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
         source_purpose: ?[32]u8 = null,
+        source_scope: ?@import("../source_scope.zig").Reference = null,
         source_checkpoint: ?@import("../source_checkpoint.zig").Command = null,
     },
     resolve: struct {
         completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
         source_purpose: ?[32]u8 = null,
+        source_scope: ?@import("../source_scope.zig").Reference = null,
         txn_id: TxnId,
         status: TxnStatus,
         commit_version: u64,
@@ -1776,6 +1779,7 @@ pub const TransactionIntentRequest = struct {
     completion_input_digest: ?[32]u8 = null,
     /// Whole-source ownership only; root-local checkpoint admission stays separate.
     completion_source_purpose: ?[32]u8 = null,
+    completion_source_scope: ?@import("../source_scope.zig").Reference = null,
     completion_source_checkpoint: ?@import("../source_checkpoint.zig").Command = null,
     /// Trusted source transaction metadata; public mutation JSON never sets it.
     source_admission: ?@import("../source_admission.zig").Command = null,
@@ -1804,6 +1808,13 @@ pub const TransactionIntentRequest = struct {
     integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
 
     pub fn sourcePurpose(self: @This()) !?[32]u8 {
+        if (self.completion_source_scope) |scope| {
+            try scope.validate();
+            if (self.completion_source_purpose == null or self.completion_owner == null or self.source_admission != null) return error.InvalidSourceAdmission;
+            if (self.completion_source_checkpoint) |checkpoint| {
+                if (checkpoint.receipt_window == 0 or !std.mem.eql(u8, &scope.binding, &checkpoint.binding) or scope.sequence != checkpoint.sequence) return error.SourceTransactionIdentityConflict;
+            }
+        }
         if (self.completion_source_checkpoint) |checkpoint| {
             try checkpoint.validate();
             const purpose = self.completion_source_purpose orelse return error.InvalidSourceAdmission;
@@ -1830,7 +1841,7 @@ pub const TransactionIntentRequest = struct {
         var request: BatchRequest = .{
             .timestamp_ns = begin_timestamp,
             .sync_level = .write,
-            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .completion_owner = owner, .source_purpose = self.completion_source_purpose, .source_checkpoint = self.completion_source_checkpoint } },
+            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .completion_owner = owner, .source_purpose = self.completion_source_purpose, .source_scope = self.completion_source_scope, .source_checkpoint = self.completion_source_checkpoint } },
         };
         // Compile-time exhaustiveness prevents newly added intent adjuncts
         // from being silently omitted from the frozen canonical input.
@@ -1838,6 +1849,7 @@ pub const TransactionIntentRequest = struct {
             if (comptime std.mem.eql(u8, name, "completion_owner") or
                 std.mem.eql(u8, name, "completion_input_digest") or
                 std.mem.eql(u8, name, "completion_source_purpose") or
+                std.mem.eql(u8, name, "completion_source_scope") or
                 std.mem.eql(u8, name, "completion_source_checkpoint") or
                 std.mem.eql(u8, name, "source_admission")) continue;
             if (comptime !@hasField(BatchRequest, name)) @compileError("unmapped completion PREPARE field: " ++ name);

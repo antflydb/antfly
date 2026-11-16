@@ -287,6 +287,8 @@ pub const NativeHistoryDecisionRecord = struct {
     digest: NativeHistoryDigest,
     /// Optional retained source admission fingerprint. Source-owned pending transactions cannot be expired by ordinary transaction recovery.
     source_purpose: ?NativeHistoryDigest = null,
+    /// Optional retained protocol-39 attempt identity. Required on every routed resolution of a scoped source transaction.
+    source_scope: ?NativeSourceScopeReference = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -299,6 +301,7 @@ pub const NativeHistoryDecisionRecord = struct {
         .{ "intents_resolved", "intents_resolved", false },
         .{ "digest", "digest", false },
         .{ "source_purpose", "source_purpose", true },
+        .{ "source_scope", "source_scope", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -329,6 +332,10 @@ pub const NativeHistoryDecisionRecord = struct {
         try jw.write(self.digest);
         if (self.source_purpose) |value| {
             try jw.objectField("source_purpose");
+            try jw.write(value);
+        }
+        if (self.source_scope) |value| {
+            try jw.objectField("source_scope");
             try jw.write(value);
         }
         try jw.endObject();
