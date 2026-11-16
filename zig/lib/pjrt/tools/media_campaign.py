@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import transformers
+from media_validation import validate_oracle
 from memory import MemorySampler
 
 
@@ -70,14 +71,11 @@ def main():
     ):
         raise ValueError("Campaign dimensions differ from frozen acceptance criteria")
     oracle = json.loads(a.oracle.read_text())
-    if {c["name"] for c in oracle["cases"]} != {
-        c["name"] for c in suite["cases"]
-    } or any(
-        c["max_abs"] > gates["static_wrapper_vs_unmodified_upstream_cpu"]["max_abs"]
-        for c in oracle["cases"]
-    ):
-        raise ValueError("Static wrapper did not pass the independent upstream oracle")
-    expected = {c["name"]: c["upstream_vector"] for c in oracle["cases"]}
+    expected = validate_oracle(
+        oracle,
+        [c["name"] for c in suite["cases"]],
+        gates["static_wrapper_vs_unmodified_upstream_cpu"]["max_abs"],
+    )
     paths = (
         [
             a.binary,

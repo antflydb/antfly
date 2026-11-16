@@ -33,6 +33,7 @@ pub const Arena = struct {
     mask_kind: u8 = 0,
     attention_workspace: usize = 0,
     global_attention_workspace: usize = 0,
+    global_attention_generation: u64 = 0,
     blas_workspace: usize = 0,
     weight_generation: usize = 0,
     buffers: [11]Buffer = @splat(.{}),
@@ -52,12 +53,13 @@ pub const Arena = struct {
     completion: driver.CUevent = null,
     pending: bool = false,
     fence_valid: bool = false,
-    pub fn attentionWorkspacesMatch(self: *const Arena, attention: usize, global_attention: usize, blas: usize) bool {
-        return self.attention_workspace == attention and self.global_attention_workspace == global_attention and self.blas_workspace == blas;
+    pub fn attentionWorkspacesMatch(self: *const Arena, attention: usize, global_attention: usize, global_generation: u64, blas: usize) bool {
+        return self.attention_workspace == attention and self.global_attention_workspace == global_attention and self.global_attention_generation == global_generation and self.blas_workspace == blas;
     }
-    pub fn setAttentionWorkspaces(self: *Arena, attention: usize, global_attention: usize, blas: usize) void {
+    pub fn setAttentionWorkspaces(self: *Arena, attention: usize, global_attention: usize, global_generation: u64, blas: usize) void {
         self.attention_workspace = attention;
         self.global_attention_workspace = global_attention;
+        self.global_attention_generation = global_generation;
         self.blas_workspace = blas;
     }
     pub fn noteUse(self: *Arena, ctx: *Context) void {
@@ -474,9 +476,10 @@ test "embeddinggemma2 graph retention keeps mixed stages and fences only replace
 
 test "encoder replay invalidates when attention or BLAS workspace moves" {
     var arena = Arena{};
-    arena.setAttentionWorkspaces(11, 22, 33);
-    try std.testing.expect(arena.attentionWorkspacesMatch(11, 22, 33));
-    try std.testing.expect(!arena.attentionWorkspacesMatch(12, 22, 33));
-    try std.testing.expect(!arena.attentionWorkspacesMatch(11, 23, 33));
-    try std.testing.expect(!arena.attentionWorkspacesMatch(11, 22, 34));
+    arena.setAttentionWorkspaces(11, 22, 7, 33);
+    try std.testing.expect(arena.attentionWorkspacesMatch(11, 22, 7, 33));
+    try std.testing.expect(!arena.attentionWorkspacesMatch(12, 22, 7, 33));
+    try std.testing.expect(!arena.attentionWorkspacesMatch(11, 23, 7, 33));
+    try std.testing.expect(!arena.attentionWorkspacesMatch(11, 22, 8, 33));
+    try std.testing.expect(!arena.attentionWorkspacesMatch(11, 22, 7, 34));
 }

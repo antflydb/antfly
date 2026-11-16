@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 from media_graph import load_meta, make_fn
 from media_inputs import prepare, processor
+from media_validation import validate_oracle
 from safetensors.torch import load_file
 
 p = argparse.ArgumentParser(description=__doc__)
@@ -51,6 +52,9 @@ with torch.inference_mode():
             "upstream_vector": expected.flatten().tolist(),
             "wrapper_vector": actual.flatten().tolist(),
         }
+        # Failed/nonfinite rows must not look like completed CPU validation to
+        # a later campaign. The consumer independently checks these vectors.
+        validate_oracle({"cases": [row]}, [c["name"]], 1e-6)
         results.append(row)
         a.out.write_text(
             json.dumps(
@@ -59,12 +63,7 @@ with torch.inference_mode():
                     "cases": results,
                 },
                 indent=2,
+                allow_nan=False,
             )
         )
         print(c["name"], diff, cos, flush=True)
-        if not torch.isfinite(actual).all() or not torch.isfinite(expected).all():
-            raise RuntimeError("Nonfinite CPU oracle")
-        if abs(expected.norm().item() - 1) > 0.001:
-            raise RuntimeError("Unnormalized CPU oracle")
-        if diff > 1e-6:
-            raise RuntimeError("Static media wrapper differs from official upstream")

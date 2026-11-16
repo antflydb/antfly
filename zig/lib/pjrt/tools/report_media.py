@@ -9,6 +9,7 @@ import statistics
 from pathlib import Path
 
 from media_campaign import metrics
+from media_validation import validate_oracle
 
 
 def main():
@@ -21,11 +22,11 @@ def main():
     report = json.loads((a.run / "summary.json").read_text())
     diagnostic = json.loads(a.fp32_acceptance.read_text())
     oracle = json.loads(a.fp32_oracle.read_text())
-    if any(
-        c["max_abs"] > diagnostic["wrapper_upstream_max_abs"] for c in oracle["cases"]
-    ):
-        raise ValueError("FP32 static wrapper failed its upstream oracle")
-    expected = {c["name"]: c["upstream_vector"] for c in oracle["cases"]}
+    expected = validate_oracle(
+        oracle,
+        [c["name"] for c in report["cases"]],
+        diagnostic["wrapper_upstream_max_abs"],
+    )
     for case in report["cases"]:
         case["fp32_diagnostic"] = {}
         case["round_medians_ms"] = {}

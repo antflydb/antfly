@@ -34,12 +34,16 @@ pub fn queryTile(sequence: usize) usize {
 pub const Scratch = struct {
     buffer: Buffer = .{},
     lease: ?memory.AdmissionLease = null,
+    generation: u64 = 0,
 
     pub fn clear(self: *Scratch, ctx: *Context) !void {
         if (self.buffer.ptr != 0) try ctx.synchronize();
         self.buffer.free(ctx);
         if (self.lease) |*lease| lease.release();
-        self.* = .{};
+        // Cached graphs can outlive this allocation, including failed growth.
+        // Preserve its generation so an allocator reusing the address cannot
+        // make a later, smaller allocation appear to be the old workspace.
+        self.* = .{ .generation = self.generation };
     }
 
     pub fn acquire(self: *Scratch, ctx: *Context, bytes: usize) !?Buffer {
@@ -55,13 +59,13 @@ pub const Scratch = struct {
             if (err == error.CudaMemoryLimitExceeded) return null;
             return err;
         };
-        self.* = .{ .buffer = buffer, .lease = lease };
+        self.* = .{ .buffer = buffer, .lease = lease, .generation = self.generation +% 1 };
         return .{ .ptr = buffer.ptr, .len = bytes, .borrowed = true };
     }
 
     pub fn releaseAfterContextDestroyed(self: *Scratch) void {
         if (self.lease) |*lease| lease.release();
-        self.* = .{};
+        self.* = .{ .generation = self.generation };
     }
 };
 
@@ -200,4 +204,58 @@ test "global MQA retained scratch shares admission and releases failed growth" {
     ctx.device_allocations.limit = 128;
     try std.testing.expect((try first.acquire(&ctx, 512)) == null);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+}
+
+test "global MQA failed growth and reused address invalidate captured workspace" {
+    const Mock = struct {
+        fn current(_: @import("driver.zig").CUcontext) callconv(.c) c_int {
+            return 0;
+        }
+        fn sync(_: @import("driver.zig").CUstream) callconv(.c) c_int {
+            return 0;
+        }
+        fn alloc(ptr: *u64, _: usize) callconv(.c) c_int {
+            ptr.* = 0x1000;
+            return 0;
+        }
+        fn free(_: u64) callconv(.c) c_int {
+            return 0;
+        }
+    };
+    var controller = memory.AdmissionController{};
+    var ctx: Context = undefined;
+    ctx.ctx = @ptrFromInt(1);
+    ctx.stream = @ptrFromInt(2);
+    ctx.stats = .{};
+    ctx.device_allocations = .{ .limit = 4096 };
+    ctx.video_cache_budget = .{ .admission = .{ .controller = &controller, .limits = .{ .backend_limit_bytes = 1024 }, .check_live_memory = false } };
+    ctx.driver.fns.cuCtxSetCurrent = Mock.current;
+    ctx.driver.fns.cuStreamSynchronize = Mock.sync;
+    ctx.driver.fns.cuMemAlloc = Mock.alloc;
+    ctx.driver.fns.cuMemFree = Mock.free;
+    var scratch = Scratch{};
+    defer scratch.clear(&ctx) catch unreachable;
+    const old = (try scratch.acquire(&ctx, 512)).?;
+    const old_generation = scratch.generation;
+    var graph = @import("embedding_gemma2_execution.zig").Arena{};
+    graph.setAttentionWorkspaces(0, old.ptr, old_generation, 0);
+    // Ordinary reuse must preserve the key for a live allocation.
+    _ = (try scratch.acquire(&ctx, 256)).?;
+    try std.testing.expect(graph.attentionWorkspacesMatch(0, scratch.buffer.ptr, scratch.generation, 0));
+    // Admission denial retires the old allocation. The driver then gives a
+    // smaller allocation exactly the same address, reproducing the ABA case.
+    try std.testing.expect((try scratch.acquire(&ctx, 2048)) == null);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    const smaller = (try scratch.acquire(&ctx, 256)).?;
+    try std.testing.expectEqual(old.ptr, smaller.ptr);
+    try std.testing.expect(smaller.len < old.len);
+    try std.testing.expect(scratch.generation != old_generation);
+    try std.testing.expect(!graph.attentionWorkspacesMatch(0, smaller.ptr, scratch.generation, 0));
+    // Explicit cache clearing must not reset the epoch either.
+    const previous_generation = scratch.generation;
+    try scratch.clear(&ctx);
+    try scratch.clear(&ctx);
+    _ = (try scratch.acquire(&ctx, 256)).?;
+    try std.testing.expect(scratch.generation != previous_generation);
+    try std.testing.expectEqual(@as(usize, 256), controller.snapshot().backend_scratch_bytes);
 }

@@ -218,5 +218,11 @@ expresses upstream `type_as` as `to(dtype=...)`. CPU upstream-forward comparison
 check exact output agreement before exporting. Any failed case makes the campaign
 exit nonzero **after** retaining its complete summary and per-case status.
 
+CPU oracle rows are validated before publication. Both the campaign and FP32
+report reject nonfinite error/cosine metadata, missing or duplicate cases,
+invalid vectors, and wrapper/upstream vector differences above tolerance.
+The error is recomputed from the saved vectors, so a success-looking summary
+cannot certify a failed wrapper check.
+
 See the [L4 media qualification report](../../../pkg/inference/scripts/embeddinggemma2/profiling/MEDIA.md)
 for measured results, precision limitations and the original acceptance criteria.

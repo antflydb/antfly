@@ -5192,7 +5192,7 @@ pub const CudaCompute = struct {
         if (arena) |entry| {
             // Other shapes can grow the cuDNN scratch or populate packed
             // weights. Never replay a graph with stale addresses/topology.
-            if (!entry.attentionWorkspacesMatch(self.embedding_gemma2_cudnn_attention_scratch.buffer.ptr, self.embedding_gemma2_global_scratch.buffer.ptr, self.cublaslt_workspace_scratch.buffer.ptr) or entry.weight_generation != self.embedding_gemma2_execution.weight_generation) {
+            if (!entry.attentionWorkspacesMatch(self.embedding_gemma2_cudnn_attention_scratch.buffer.ptr, self.embedding_gemma2_global_scratch.buffer.ptr, self.embedding_gemma2_global_scratch.generation, self.cublaslt_workspace_scratch.buffer.ptr) or entry.weight_generation != self.embedding_gemma2_execution.weight_generation) {
                 if (entry.graph != null) self.ctx.destroyGraphExec(entry.graph);
                 entry.graph = null;
                 entry.warm = false;
@@ -5237,7 +5237,7 @@ pub const CudaCompute = struct {
             } else {
                 try runEmbeddingGemma2Encoder(self, module, config, batch, encoder_sequence, all_attention_tokens_valid, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, control);
                 entry.warm = true;
-                entry.setAttentionWorkspaces(self.embedding_gemma2_cudnn_attention_scratch.buffer.ptr, self.embedding_gemma2_global_scratch.buffer.ptr, self.cublaslt_workspace_scratch.buffer.ptr);
+                entry.setAttentionWorkspaces(self.embedding_gemma2_cudnn_attention_scratch.buffer.ptr, self.embedding_gemma2_global_scratch.buffer.ptr, self.embedding_gemma2_global_scratch.generation, self.cublaslt_workspace_scratch.buffer.ptr);
                 entry.weight_generation = self.embedding_gemma2_execution.weight_generation;
             }
         } else try runEmbeddingGemma2Encoder(self, module, config, batch, encoder_sequence, all_attention_tokens_valid, mask, sequence_lengths, immutable, hidden_buf, a, bbuf, c, d, joined, ple, full, control);
@@ -25531,7 +25531,7 @@ fn runEmbeddingGemma2VisionTowerOp(ctx: *anyopaque, input_ct: CT, sequence: usiz
     // BF16 routes may capture; the reusable arena/geometry remains useful on
     // an eager fallback. Warm actual plans before entering driver capture.
     if (arena) |entry| {
-        if (!entry.attentionWorkspacesMatch(self.embedding_gemma2_cudnn_attention_scratch.buffer.ptr, self.embedding_gemma2_global_scratch.buffer.ptr, self.cublaslt_workspace_scratch.buffer.ptr) or entry.weight_generation != self.embedding_gemma2_execution.weight_generation) {
+        if (!entry.attentionWorkspacesMatch(self.embedding_gemma2_cudnn_attention_scratch.buffer.ptr, self.embedding_gemma2_global_scratch.buffer.ptr, self.embedding_gemma2_global_scratch.generation, self.cublaslt_workspace_scratch.buffer.ptr) or entry.weight_generation != self.embedding_gemma2_execution.weight_generation) {
             if (entry.graph != null) self.ctx.destroyGraphExec(entry.graph);
             entry.graph = null;
             entry.warm = false;
@@ -25568,7 +25568,7 @@ fn runEmbeddingGemma2VisionTowerOp(ctx: *anyopaque, input_ct: CT, sequence: usiz
         } else {
             try run.execute();
             entry.warm = true;
-            entry.setAttentionWorkspaces(self.embedding_gemma2_cudnn_attention_scratch.buffer.ptr, self.embedding_gemma2_global_scratch.buffer.ptr, self.cublaslt_workspace_scratch.buffer.ptr);
+            entry.setAttentionWorkspaces(self.embedding_gemma2_cudnn_attention_scratch.buffer.ptr, self.embedding_gemma2_global_scratch.buffer.ptr, self.embedding_gemma2_global_scratch.generation, self.cublaslt_workspace_scratch.buffer.ptr);
             entry.weight_generation = self.embedding_gemma2_execution.weight_generation;
         }
     } else try run.execute();

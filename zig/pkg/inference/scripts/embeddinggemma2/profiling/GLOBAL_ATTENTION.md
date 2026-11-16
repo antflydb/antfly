@@ -27,8 +27,11 @@ The default native policy uses zero cuBLAS workspace bytes. An
 explicit library-workspace setting remains separately owned. The new arena
 owns a shared admission lease while retained, is released on cache eviction or
 admission-policy replacement, and declines to the old route under pressure.
-CUDA graph keys track global-attention, cuDNN and cuBLAS workspace addresses;
-moving any borrowed workspace invalidates the graph before replay.
+CUDA graph keys track global-attention, cuDNN and cuBLAS workspace addresses,
+plus the global workspace's allocation generation. Failed growth can retire
+scratch before a smaller allocation reuses its address; that new generation
+invalidates the old graph even when the pointer is unchanged. Reusing the same
+live allocation preserves its generation and replay eligibility.
 
 The arithmetic policy has a separate embedding identity. Results produced with
 this BF16 attention schedule must not reuse a pinned identity from another
