@@ -10486,12 +10486,16 @@ test "issue1015 concurrent Lite handles sustain primary writes and full-text cat
                 const request = try std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"k:{d}:{d}\":{{\"search_text\":\"raft snapshot number {d}\"}}}},\"sync_level\":\"write\"}}", .{ self.ordinal, i, i });
                 var output: capi.Buffer = .{};
                 defer antfly_buffer_free(&output);
-                try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{ .ptr = request.ptr, .len = request.len }, &output));
+                const write_code = antfly_db_batch_json(handle, .{ .ptr = request.ptr, .len = request.len }, &output);
+                if (write_code != .ok) std.debug.print("issue1015 worker {d} write {d} failed: {s}\n", .{ self.ordinal, i, std.mem.span(antfly_last_error_detail()) });
+                try std.testing.expectEqual(capi.ErrorCode.ok, write_code);
                 if (i % 50 == 0) {
                     const query = "{\"full_text_search\":{\"match\":{\"field\":\"search_text\",\"text\":\"raft\"}},\"limit\":5}";
                     var hits: capi.Buffer = .{};
                     defer antfly_buffer_free(&hits);
-                    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(handle, .{ .ptr = query.ptr, .len = query.len }, &hits));
+                    const search_code = antfly_db_search_json(handle, .{ .ptr = query.ptr, .len = query.len }, &hits);
+                    if (search_code != .ok) std.debug.print("issue1015 worker {d} search {d} failed: {s}\n", .{ self.ordinal, i, std.mem.span(antfly_last_error_detail()) });
+                    try std.testing.expectEqual(capi.ErrorCode.ok, search_code);
                 }
             }
             // Primary availability alone is insufficient: every secondary must

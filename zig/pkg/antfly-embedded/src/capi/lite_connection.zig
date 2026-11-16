@@ -1137,26 +1137,23 @@ pub const WriterLane = struct {
 
     const poll_initial_ns: i96 = 50 * std.time.ns_per_us;
     const poll_max_ns: i96 = 2 * std.time.ns_per_ms;
-    /// Floor under any wait for *this same process's* own `checked_out`
-    /// span to end (another local caller mid-staging, about to `checkin`),
-    /// regardless of how small the caller's own `busy_timeout_ms` is.
-    /// `checked_out`/`parked` are pure in-process bookkeeping -- nothing
-    /// external ever contends for them -- so with `busy_timeout_ms == 0`
-    /// (the documented "fails immediately" contract, meant for a genuinely
-    /// foreign holder: see `Connection.admissionDeadline`) a caller that
-    /// landed here would otherwise give up before the current holder's
-    /// `checkin` (normally well under a millisecond away: `checkin` runs
-    /// right after staging, long before that write's own durability wait)
-    /// ever has a chance to run. Bounded and cancellable like every other
-    /// admission wait here, just never shorter than this for a condition
-    /// that is certain to resolve shortly on its own.
-    ///
-    /// Kept to a few `poll_max_ns` ticks, not hundreds of milliseconds: an
-    /// uncapped-rate caller retrying this same path in a tight loop (an
-    /// ordinary pattern for a read on a busy connection) turns every extra
-    /// millisecond of floor here into real, same-sized slowdown across
-    /// every such call site, not just the rare one that actually needed to
-    /// wait out a staging window measured in microseconds.
+    /// Floor under any *bounded* wait for *this same process's* own
+    /// `checked_out` span to end (another local caller mid-staging, about
+    /// to `checkin`), for a caller with an explicit nonzero
+    /// `busy_timeout_ms`: `@max(deadline, now + min_local_wait_ns)` never
+    /// shortens that caller's own budget, it only ever extends a smaller
+    /// one. See `checkout`'s own `unconditional_wait` for the `0` case --
+    /// this floor by itself is not a substitute for that: the staging
+    /// window it is sized for (a few `poll_max_ns` ticks, not hundreds of
+    /// milliseconds -- an uncapped-rate caller retrying this same path in a
+    /// tight loop turns every extra millisecond here into real, same-sized
+    /// slowdown across every such call site) is routinely exceeded under
+    /// genuine same-process write concurrency (issue1015: 32 concurrent
+    /// writers plus background full-text catch-up measured ordinary
+    /// `checkin`s 4-9ms away, an order of magnitude past this floor, and
+    /// occasionally far more), so relying on it alone to bound the `0`
+    /// case turns ordinary contention into a spurious `FileBusy` for a
+    /// condition that is never actually externally contended.
     const min_local_wait_ns: i96 = 4 * std.time.ns_per_ms;
 
     /// Whether `connection.refresh(root, intent)` might actually need to
@@ -1205,6 +1202,25 @@ pub const WriterLane = struct {
         // own lane, never a foreign holder, so it floors `deadline` rather
         // than using it directly.
         const local_wait_deadline = @max(deadline, std.Io.Clock.awake.now(io).nanoseconds + min_local_wait_ns);
+        // No busy timeout was actually configured for this call (the
+        // ordinary default): `connection.admissionDeadline()` still
+        // synthesizes one (`now + 0`), but `checked_out`/`parked` are pure
+        // in-process bookkeeping -- nothing external ever contends for
+        // them (same invariant `Connection.refresh`'s allocator-proof wait
+        // already relies on for its own `self.owner.allocator_proof_mutex.
+        // lockUncancelable` when `admission_deadline_ns == null and
+        // busy_timeout_ms == 0`) -- so there is no genuinely foreign
+        // holder to fail fast against here. Wait this same process's own
+        // imminent `checkin` out unconditionally instead of failing once
+        // `min_local_wait_ns`'s fixed floor elapses: that floor is sized
+        // for a staging window measured in microseconds and is routinely
+        // exceeded under real concurrent write load (issue1015), which
+        // turned ordinary same-process contention into a spurious
+        // `FileBusy` no caller's `busy_timeout_ms` could have prevented
+        // (`0` already means "no timeout", not "a 4ms one"). A caller that
+        // *did* set an explicit nonzero `busy_timeout_ms` is unaffected:
+        // `local_wait_deadline` still governs that case exactly as before.
+        const unconditional_wait = connection.admission_deadline_ns == null and connection.options.busy_timeout_ms == 0;
         var backoff_ns: i96 = poll_initial_ns;
         self.mutex.lockUncancelable(io);
         while (true) {
@@ -1302,15 +1318,21 @@ pub const WriterLane = struct {
             const epoch = self.release_epoch.load(.acquire);
             self.mutex.unlock(io);
             const remaining = local_wait_deadline - std.Io.Clock.awake.now(io).nanoseconds;
-            if (remaining <= 0) {
+            if (!unconditional_wait and remaining <= 0) {
                 self.mutex.lockUncancelable(io);
                 self.waiting -= 1;
                 self.mutex.unlock(io);
                 return error.FileBusy;
             }
             // Woken by `signalReleased`; the timeout only bounds a path
-            // that frees the lane without signalling.
-            io.futexWaitTimeout(u32, &self.release_epoch.raw, epoch, .{ .duration = .{ .raw = .fromNanoseconds(@intCast(@min(backoff_ns, remaining))), .clock = .awake } }) catch {};
+            // that frees the lane without signalling. With no busy timeout
+            // configured (`unconditional_wait`), `remaining` is meaningless
+            // (floored to `min_local_wait_ns`, already elapsed) -- just cap
+            // the poll at `poll_max_ns` and keep going; see
+            // `unconditional_wait`'s own doc comment for why that can never
+            // wait on anything but this same process's own imminent
+            // `checkin`.
+            io.futexWaitTimeout(u32, &self.release_epoch.raw, epoch, .{ .duration = .{ .raw = .fromNanoseconds(@intCast(if (unconditional_wait) @min(backoff_ns, poll_max_ns) else @min(backoff_ns, remaining))), .clock = .awake } }) catch {};
             backoff_ns = @min(backoff_ns * 2, poll_max_ns);
             self.mutex.lockUncancelable(io);
             self.waiting -= 1;
