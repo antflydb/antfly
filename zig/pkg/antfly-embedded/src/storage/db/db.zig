@@ -8948,11 +8948,13 @@ pub const DB = struct {
         const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), derived_batch, sequence);
         defer self.alloc.free(replay_payload);
 
-        try appendArtifactSourceRevisionWritesFromReplay(
+        try appendSourceRevisionWritesForEffects(
             self.alloc,
-            replay_payload,
             sequence,
             &store_writes,
+            delete_keys.items,
+            &.{},
+            &.{},
             &owned_store_keys,
             &owned_store_values,
         );
@@ -28705,6 +28707,7 @@ pub const DB = struct {
         for (command.mutations) |effect| {
             if (effect.value) |value| try writes.append(self.alloc, .{ .key = effect.key, .value = value }) else try deletes.append(self.alloc, effect.key);
         }
+        try appendSourceRevisionWritesForEffects(self.alloc, sequence, &writes, deletes.items, &.{}, &.{}, &owned_keys, &owned_values);
         try appendDenseArtifactCounterMutations(self.alloc, self.core.store, self.core.index_manager, &writes, deletes.items, &owned_keys, &owned_values);
         var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         try writes.append(self.alloc, orderedApplyReceiptWrite(entry, &marker_buf));
@@ -32637,7 +32640,7 @@ pub const DB = struct {
             for (revision_values.items) |value| self.alloc.free(value);
             revision_values.deinit(self.alloc);
         }
-        try appendArtifactSourceRevisionWritesFromReplay(self.alloc, replay, sequence, &writes, &revision_keys, &revision_values);
+        try appendSourceRevisionWritesForEffects(self.alloc, sequence, &writes, mutation.deletes.items, &.{}, &.{}, &revision_keys, &revision_values);
         var context = self.batchContext();
         var primary_replication = try PrimaryReplicationEffect.prepare(&context, writes.items, mutation.deletes.items, replay);
         defer primary_replication.deinit(self.alloc);
@@ -36403,6 +36406,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("publishVectorBlockBasesOnlineReported", .{ self, options });
         var catalog_lease = self.tryAcquireIndexCatalogReadLease() orelse return .{ .busy = true };
         defer catalog_lease.release();
+        if (self.core.index_manager.vector_block_storage == null) return .{};
         var session_lock = lockAtomicWithBackoffProfiled(
             &self.async_context.dense_admission.mutex,
             &self.async_context.stats.dense_finish_mutex,
@@ -36411,14 +36415,27 @@ pub const DB = struct {
         session_lock.unlock();
         if (!claimed) return .{ .busy = true };
         defer finishDenseProjectionFinalization(self.async_context);
-        const initial = try self.core.index_manager.publishVectorBlockBasesOnlineReported(options);
-        var published = initial.published;
-        var deferred = initial.deferred;
+        const allow_primary_snapshot = options.allow_primary_snapshot and
+            try denseCorpusCoverageAllowsPrimarySnapshot(self.async_context);
+        var published: usize = 0;
+        var deferred = false;
+        for (self.core.index_manager.dense_indexes.items) |entry| {
+            if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
+            if (entry.index.leann != null or self.core.index_manager.repairUnavailable(entry.config.name)) continue;
+            var index_options = options;
+            index_options.only_index = entry.config.name;
+            index_options.allow_primary_snapshot = allow_primary_snapshot;
+            const result = try self.core.index_manager.publishVectorBlockBasesOnlineReported(index_options);
+            published += result.published;
+            deferred = deferred or result.deferred;
+        }
         // Fail-closed reconstruction cannot depend on its own clean marker
         // to enter acceleration maintenance. Permit only candidates whose
         // durable terminal outcomes already cover the current source corpus.
         // Nothing here activates the repair or certifies a stale generation.
         for (self.core.index_manager.dense_indexes.items) |entry| {
+            if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
+            if (entry.index.leann != null) continue;
             if (!self.core.index_manager.repairUnavailable(entry.config.name)) continue;
             const checkpoint = self.core.index_manager.denseProjectionCheckpointMetadata(entry.config.name) orelse continue;
             if (checkpoint.status != .rebuilding) continue;
@@ -36426,6 +36443,8 @@ pub const DB = struct {
             if (entry.index.stats().active_count != expected) continue;
             var repair_options = options;
             repair_options.covered_rebuilding_index = entry.config.name;
+            repair_options.only_index = entry.config.name;
+            repair_options.allow_primary_snapshot = allow_primary_snapshot;
             const repair = try self.core.index_manager.publishVectorBlockBasesOnlineReported(repair_options);
             published += repair.published;
             deferred = deferred or repair.deferred;
@@ -39282,6 +39301,19 @@ pub const DB = struct {
         kind: types.IndexKind,
         applied_sequence: u64,
     ) !u64 {
+        // Query admission and public status use the selected source frontier.
+        // Replay/maintenance keep their kind-wide cursor: stable-tip physical
+        // publication certifies that complete journal boundary.
+        const names = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_name);
+        defer {
+            for (names) |name| alloc.free(name);
+            alloc.free(names);
+        }
+        if (names.len != 0) {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            if (try replay_source_mod.artifactTargetAtCut(alloc, &read, names, applied_sequence, null)) |target| return target;
+        }
         return try self.probeDerivedReplayTargetSequence(
             alloc,
             self.core.replaySource(),
@@ -50821,7 +50853,7 @@ fn encodeDirectChangeRecordPayload(
 
 const encodeThinReplayRecordPayload = local_mutation.encodeThinReplayRecordPayload;
 
-const appendArtifactSourceRevisionWritesFromReplay = local_mutation.appendArtifactSourceRevisionWritesFromReplay;
+const appendSourceRevisionWritesForEffects = local_mutation.appendSourceRevisionWritesForEffects;
 
 const appendUniqueOwnedKey = @import("owned_keys.zig").appendUniqueOwnedKey;
 
@@ -54478,6 +54510,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
+    try appendSourceRevisionWritesForEffects(ctx.alloc, sequence, &store_writes, delete_keys.items, &.{}, &.{}, &owned_store_keys, &owned_store_values);
     var primary_replication = try PrimaryReplicationEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
     defer primary_replication.deinit(ctx.alloc);
     try primary_replication.stage(ctx, &store_writes);
@@ -55233,7 +55266,7 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
         };
         var guard: Guard = .{ .required = required };
         _ = try ctx.store.putBatchWithPromotionsReplayAndBuiltWrite(ctx.io, &.{}, &.{}, &.{}, .{ .sequence = sequence, .payload = payload }, null, .{ .ptr = &guard, .validate = Guard.validate });
-    } else try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence, batch.generated_enrichment_refs);
+    } else try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence, batch);
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
@@ -55351,7 +55384,7 @@ fn appendReplicatedDerivedEffectContext(ctx: *const BatchExecutionContext, chang
         try appendAssetArtifactSourceIndexMutations(ctx.alloc, &writes, artifact_deletes.items, &deletes, &owned_keys, &owned_values, &owned_deletes);
         try appendRetiredDirectGraphTtlDueDeletes(ctx.alloc, ctx.store, ctx.index_manager, writes.items, deletes.items, &deletes, &owned_deletes);
     }
-    try appendArtifactSourceRevisionWritesFromReplay(ctx.alloc, payload, sequence, &writes, &owned_keys, &owned_values);
+    try appendSourceRevisionWritesForEffects(ctx.alloc, sequence, &writes, deletes.items, &.{}, &.{}, &owned_keys, &owned_values);
     const summary = try doc_identity.visibilitySummaryFromWrites(writes.items);
     var catalog: ?table_catalog_mod.Catalog = null;
     for (writes.items) |write| if (std.mem.eql(u8, write.key, table_catalog_mod.key)) {
@@ -55370,7 +55403,8 @@ fn appendReplicatedDerivedEffectContext(ctx: *const BatchExecutionContext, chang
     return sequence;
 }
 
-fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionContext, payload: []const u8, sequence: u64, requests: []const enrichment_types.GeneratedEnrichmentRef) !void {
+fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionContext, payload: []const u8, sequence: u64, batch: derived_types.DerivedBatch) !void {
+    const requests = batch.generated_enrichment_refs;
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer writes.deinit(ctx.alloc);
     var owned_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -55383,11 +55417,13 @@ fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionCont
         for (owned_values.items) |value| ctx.alloc.free(value);
         owned_values.deinit(ctx.alloc);
     }
-    try appendArtifactSourceRevisionWritesFromReplay(
+    try appendSourceRevisionWritesForEffects(
         ctx.alloc,
-        payload,
         sequence,
         &writes,
+        batch.deleted_keys,
+        &.{},
+        batch.changed_artifact_keys,
         &owned_keys,
         &owned_values,
     );
@@ -56974,7 +57010,21 @@ fn appendResolutionRecordWithProjection(
     defer batch_ctx.alloc.free(payload);
     var backlog_admission = try batch_ctx.executor.admitBacklogBytes(@intCast(payload.len));
     defer backlog_admission.cancel();
-    try batch_ctx.store.putBatchWithReplay(batch_ctx.io, store_writes, store_deletes.items, .{
+    var revision_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
+    defer revision_writes.deinit(batch_ctx.alloc);
+    try revision_writes.appendSlice(batch_ctx.alloc, store_writes);
+    var revision_keys: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (revision_keys.items) |key| batch_ctx.alloc.free(key);
+        revision_keys.deinit(batch_ctx.alloc);
+    }
+    var revision_values: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (revision_values.items) |value| batch_ctx.alloc.free(value);
+        revision_values.deinit(batch_ctx.alloc);
+    }
+    try appendSourceRevisionWritesForEffects(batch_ctx.alloc, sequence, &revision_writes, store_deletes.items, &.{}, &.{}, &revision_keys, &revision_values);
+    try batch_ctx.store.putBatchWithReplay(batch_ctx.io, revision_writes.items, store_deletes.items, .{
         .sequence = sequence,
         .payload = payload,
     });
@@ -57518,6 +57568,7 @@ fn appendGeneratedBatchFromEnrichment(
         for (owned_counter_values.items) |value| batch_ctx.alloc.free(value);
         owned_counter_values.deinit(batch_ctx.alloc);
     }
+    try appendSourceRevisionWritesForEffects(batch_ctx.alloc, sequence, &store_writes, store_delete_keys.items, store_promotions, batch.changed_artifact_keys, &owned_counter_keys, &owned_counter_values);
     try DB.appendDenseArtifactCounterMutationsWithPromotions(
         batch_ctx.alloc,
         batch_ctx.store,
@@ -62701,6 +62752,38 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
     return try denseTargetCountForIndexContextWithCoverage(ctx, index_name, .all_sources);
 }
 
+// The exact-vector store is shared: repairing A scans B's artifacts too.
+// One complete sibling must not repeatedly rebuild the corpus while another
+// producer is still publishing small batches. Native-only maintenance remains
+// eligible independently of this whole-corpus scan admission.
+fn denseCorpusCoverageAllowsPrimarySnapshot(ctx: *AsyncContext) !bool {
+    for (ctx.index_manager.dense_indexes.items) |entry| {
+        if (entry.index.leann != null) continue;
+        if (!try denseIndexSourceCoverageComplete(ctx, entry.config.name)) return false;
+    }
+    return true;
+}
+
+// Materialized vector cardinality is not source completion: one document
+// may emit many chunks, and a provider can pause between small output batches.
+// Use the current incarnation's terminal source outcomes to admit expensive
+// primary scans, independently of native WAL/query eligibility.
+fn denseIndexSourceCoverageComplete(ctx: *AsyncContext, index_name: []const u8) !bool {
+    const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return false;
+    const counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
+    const present: u2 = @as(u2, @intFromBool(counts.produced != null)) +
+        @as(u2, @intFromBool(counts.skipped != null)) +
+        @as(u2, @intFromBool(counts.terminal_failed != null));
+    // Authored/external and legacy projections may have no producer outcomes.
+    // Preserve their existing repair path; the first generated outcome creates
+    // the complete tuple and subsequent partial batches must wait.
+    if (present == 0) return true;
+    if (present != 3) return error.InvalidDerivedCoverageCounter;
+    const successful = std.math.add(u64, counts.produced.?, counts.skipped.?) catch return error.InvalidDerivedCoverageCounter;
+    const terminal = std.math.add(u64, successful, counts.terminal_failed.?) catch return error.InvalidDerivedCoverageCounter;
+    return if (counts.source_total) |total| terminal == total else false;
+}
+
 const DenseTargetCoverage = enum { all_sources, materialized };
 
 var test_dense_target_after_coverage_capture: ?*const fn (*AsyncContext) anyerror!void = null;
@@ -63807,6 +63890,7 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
     session_lock.unlock();
     if (!claimed) return true;
     defer finishDenseProjectionFinalization(ctx);
+    const allow_primary_snapshot = try denseCorpusCoverageAllowsPrimarySnapshot(ctx);
     var pending = false;
     for (manager.dense_indexes.items) |entry| {
         if (ctx.background_closing.load(.acquire)) return false;
@@ -63827,6 +63911,7 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
             .require_quiescence = checkpoint.status == .clean,
             .covered_rebuilding_index = entry.config.name,
             .only_index = entry.config.name,
+            .allow_primary_snapshot = allow_primary_snapshot,
         });
         if (!manager.vectorBlockReadyForDenseIndexAtSequence(entry.config.name, sequence, expected)) {
             pending = true;
@@ -100854,27 +100939,28 @@ fn testSequentialManagedDenseBackfills(workers: bool) !void {
         initialized += 1;
     }
     try db.batch(.{ .writes = &writes, .sync_level = .write });
-    const previous = index_manager_mod.test_vector_block_primary_snapshot_builds;
-    defer index_manager_mod.test_vector_block_primary_snapshot_builds = previous;
     for ([_][]const u8{ "A", "B" }) |name| {
         const config = try std.fmt.allocPrint(a, "{{\"field\":\"embedding\",\"dims\":3,\"execution\":{{\"embedding\":{{\"batch_items\":1}}}},\"generator\":{{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"{s}\"}}}}", .{name});
         defer a.free(config);
-        index_manager_mod.test_vector_block_primary_snapshot_builds = 0;
+        const primary_before = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire);
+        const native_before = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire);
         try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config });
         try db.runUntilIdle();
         // One genuine missing-generation repair is permitted at the idle
         // boundary; a small replay batch must never trigger another scan.
-        try std.testing.expect(index_manager_mod.test_vector_block_primary_snapshot_builds <= 1);
+        try std.testing.expect(index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - primary_before + index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before <= 1);
         try std.testing.expectEqual(@as(u64, count), db.core.index_manager.denseIndex(name).?.index.stats().active_count);
     }
     try std.testing.expectEqual(@as(usize, count * 2), probe.calls.load(.acquire));
     for (0..2) |restart| {
         if (restart != 0) {
-            index_manager_mod.test_vector_block_primary_snapshot_builds = 0;
+            const primary_before = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire);
+            const native_before = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire);
             db.close();
             db = try DB.open(a, directory.path(), options);
             try db.runUntilIdle();
-            try std.testing.expectEqual(@as(usize, 0), index_manager_mod.test_vector_block_primary_snapshot_builds);
+            try std.testing.expectEqual(primary_before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+            try std.testing.expectEqual(native_before, index_manager_mod.test_vector_block_native_merge_builds.load(.acquire));
             try std.testing.expectEqual(@as(usize, count * 2), probe.calls.load(.acquire));
         }
         for ([_][]const u8{ "A", "B" }) |name| {
@@ -155192,6 +155278,299 @@ test "db dense index inspection binds current chunk vectors and never invokes in
     try std.testing.expect((try db.getDocumentArtifactManifest(a, "doc", "dense")) == null);
 }
 
+test "privacy protected model migration batches across documents" {
+    try protectedModelBackfillProbe(64, 3, 1024);
+}
+
+test "privacy protected model migration 1024 document diagnostic" {
+    try protectedModelBackfillProbe(1024, 384, 1024);
+}
+
+test "privacy protected model migration spans vector bootstrap boundary" {
+    for ([_]usize{ 4095, 4096, 4097 }) |count| try protectedModelBackfillProbe(count, 3, 1024);
+}
+
+test "privacy protected model migration multi chunk output" {
+    try protectedModelBackfillProbe(16, 3, 8);
+}
+
+// Exercise the local producer path here; the companion HTTP fixture runs the
+// ordered standalone path, holds B while querying A, and crashes/reopens both.
+fn protectedModelBackfillProbe(document_count: usize, dimensions: u32, chunk_size: u32) !void {
+    var checked_allocator = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked_allocator.deinit();
+    const a = checked_allocator.allocator();
+    const workers = document_count >= 4095;
+    const privacy = @import("../../privacy/document.zig");
+    const catalog = @import("../../privacy/catalog.zig");
+    const Probe = struct {
+        batches: std.atomic.Value(usize) = .init(0),
+        items: std.atomic.Value(usize) = .init(0),
+        largest_batch: std.atomic.Value(usize) = .init(0),
+        privacy_calls: std.atomic.Value(usize) = .init(0),
+        fn check(_: *anyopaque) !void {}
+        fn detect(_: *anyopaque, out: Allocator, _: privacy.contract.Producer, _: []const u8) ![]u8 {
+            return out.dupe(u8, "{\"entities\":{\"email\":[{\"start\":0,\"end\":6,\"text\":\"a@b.co\",\"confidence\":0.9}]},\"long_document\":{\"window_count\":1}}");
+        }
+        fn produce(ptr: *anyopaque, out: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.privacy_calls.fetchAdd(1, .monotonic);
+            return privacy.produce(out, request.config_json, request.source_text, .{ .ptr = ptr, .produce = detect, .check = check });
+        }
+        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedUnbatchedInference;
+        }
+        fn batch(ptr: *anyopaque, out: Allocator, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.batches.fetchAdd(1, .monotonic);
+            _ = self.largest_batch.fetchMax(texts.len, .monotonic);
+            const vectors = try out.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (vectors[0..initialized]) |vector| out.free(@constCast(vector));
+                out.free(vectors);
+            }
+            for (texts, vectors) |text, *vector| {
+                try std.testing.expect(std.mem.indexOf(u8, text, "a@b.co") == null);
+                vector.* = try protectedBackfillVector(out, name, text, dims);
+                initialized += 1;
+            }
+            _ = self.items.fetchAdd(texts.len, .release);
+            return vectors;
+        }
+    };
+    var probe: Probe = .{};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const policy = privacy.contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"body"}, .category_groups = &.{}, .categories = &.{.{ .name = "email", .description = "migration batching" }} };
+    const version = try policy.identity(scratch);
+    const root = try privacy.protectedArtifactName(scratch, version);
+    const resolved = try privacy.resolve(scratch, policy, true);
+    const producer_json = try std.json.Stringify.valueAlloc(scratch, .{ .type = "extractor", .config = resolved.config }, .{});
+    var directory = try TestDirectory.init("protected-backfill-batching");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{
+        .start_index_workers = workers,
+        .start_optional_runtime_workers = workers,
+        .enrichment = .{
+            .asset_producer = .{ .ptr = &probe, .vtable = &.{ .produce = Probe.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } },
+            .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_batch_fn = Probe.batch },
+        },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+    try db.addEnrichment(.{ .name = root, .kind = .asset, .field = privacy.source_field, .content_type = "application/json", .producer_json = producer_json });
+    const writes = try scratch.alloc(types.BatchWrite, document_count);
+    for (writes, 0..) |*write, i| write.* = .{
+        .key = try std.fmt.allocPrint(scratch, "doc-{d:0>4}", .{i}),
+        .value = try std.fmt.allocPrint(scratch, "{{\"body\":\"a@b.co Orchard guidance {d}. {s}\"}}", .{ i, if (chunk_size < 1024) "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega" else "" }),
+    };
+    var migration_calls: usize = 0;
+    var migration_items: usize = 0;
+    var migration_snapshot_builds: usize = 0;
+    var migration_native_merges: usize = 0;
+    var verified_b_items: usize = 0;
+    for ([_][]const u8{ "A", "B" }, 0..) |name, i| {
+        const started = monotonicTimeNs();
+        const calls_before = probe.batches.load(.acquire);
+        const items_before = probe.items.load(.acquire);
+        const privacy_before = probe.privacy_calls.load(.acquire);
+        const native_before = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire);
+        const snapshots_before = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire);
+
+        const embedding = try catalog.managedName(scratch, version, name);
+        const chunks = try std.fmt.allocPrint(scratch, "{s}_chunks", .{embedding});
+        try db.addEnrichment(.{ .name = chunks, .kind = .chunk, .field = "body", .source_artifact_name = root, .chunk_size = chunk_size });
+        try db.addEnrichment(.{ .name = embedding, .kind = .embedding, .field = "text", .source_artifact_name = chunks, .expected_dims = dimensions, .execution = .{ .batch_items = 32 }, .producer_json = if (i == 0) "{\"provider\":\"antfly\",\"model\":\"model-A\"}" else "{\"provider\":\"antfly\",\"model\":\"model-B\"}" });
+        const config = try std.fmt.allocPrint(scratch, "{{\"field\":\"embedding\",\"dims\":{d},\"sources\":[{{\"artifact\":\"{s}\"}}]}}", .{ dimensions, embedding });
+        try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config, .coverage_generation = i + 1 });
+        if (i == 0) try db.batch(.{ .writes = writes, .sync_level = .write });
+        if (workers) {
+            waitForProtectedBackfillWithoutDrain(a, &db, name, writes[0].key, document_count, i != 0) catch |err| {
+                std.debug.print("PROTECTED-BACKFILL incomplete docs={d} index={s} batches={d} completed_items={d} primary_scans={d} native_merges={d}\n", .{ document_count, name, probe.batches.load(.acquire) - calls_before, probe.items.load(.acquire) - items_before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before, index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before });
+                return err;
+            };
+        } else try db.runUntilIdle();
+        std.debug.print("\nPROTECTED-BACKFILL docs={d} index={s} wall_ms={d} batches={d} completed_items={d} primary_scans={d} native_merges={d}\n", .{ document_count, name, (monotonicTimeNs() -| started) / std.time.ns_per_ms, probe.batches.load(.acquire) - calls_before, probe.items.load(.acquire) - items_before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before, index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before });
+        const verified = try verifyProtectedBackfillOutput(a, &db, name, embedding, writes, dimensions, chunk_size < 1024);
+        if (i == 1) {
+            migration_calls = probe.batches.load(.acquire) - calls_before;
+            migration_items = probe.items.load(.acquire) - items_before;
+            verified_b_items = verified;
+            migration_native_merges = index_manager_mod.test_vector_block_native_merge_builds.load(.acquire) - native_before;
+            migration_snapshot_builds = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire) - snapshots_before;
+            try std.testing.expectEqual(privacy_before, probe.privacy_calls.load(.acquire));
+        }
+    }
+    try std.testing.expectEqual(verified_b_items, migration_items);
+    if (chunk_size == 1024) try std.testing.expectEqual(document_count, migration_items);
+    try std.testing.expect(migration_snapshot_builds + migration_native_merges <= 4);
+    try std.testing.expect(migration_calls <= (migration_items + 31) / 32);
+    const completed_before_reopen = probe.items.load(.acquire);
+    const privacy_before_reopen = probe.privacy_calls.load(.acquire);
+    db.close();
+    db_open = false;
+    db = try DB.open(a, directory.path(), .{
+        .start_index_workers = workers,
+        .start_optional_runtime_workers = workers,
+        .enrichment = .{
+            .asset_producer = .{ .ptr = &probe, .vtable = &.{ .produce = Probe.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } },
+            .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_batch_fn = Probe.batch },
+        },
+    });
+    db_open = true;
+    if (!workers) try db.runUntilIdle();
+    for ([_][]const u8{ "A", "B" }) |name| {
+        if (workers) try waitForProtectedBackfillWithoutDrain(a, &db, name, writes[0].key, document_count, false);
+        const embedding = try catalog.managedName(scratch, version, name);
+        _ = try verifyProtectedBackfillOutput(a, &db, name, embedding, writes, dimensions, chunk_size < 1024);
+    }
+    try std.testing.expectEqual(completed_before_reopen, probe.items.load(.acquire));
+    try std.testing.expectEqual(privacy_before_reopen, probe.privacy_calls.load(.acquire));
+}
+
+// Status/inspection/search only: no explicit replay or maintenance driver may
+// make this owner complete. This exercises the real bootstrap/debounce policy.
+fn waitForProtectedBackfillWithoutDrain(a: Allocator, db: *DB, name: []const u8, document: []const u8, count: usize, keep_a_serving: bool) !void {
+    const deadline = monotonicTimeNs() + 120 * std.time.ns_per_s;
+    var next_a_check_ns: u64 = 0;
+    var availability_queries: usize = 0;
+    var availability_query_ns: u64 = 0;
+    while (true) {
+        var covered = false;
+        const stats = try db.stats(a);
+        defer types.freeDBStats(a, stats);
+        for (stats.indexes) |index| if (std.mem.eql(u8, index.name, name)) {
+            covered = index.doc_count == count and index.coverage_produced_count == count and index.coverage_terminal_failed_count == 0;
+        };
+        db.core.index_manager.catalog_mutex.lockShared();
+        const native_ready = db.core.index_manager.vectorBlockReadyForDenseIndex(name);
+        db.core.index_manager.catalog_mutex.unlockShared();
+        if (covered and native_ready) {
+            if (db.getDocumentArtifactManifest(a, document, name) catch |err| switch (err) {
+                error.StorageReadTemporarilyUnavailable => null,
+                else => return err,
+            }) |found| {
+                var manifest = found;
+                defer manifest.deinit(a);
+                const parsed = try std.json.parseFromSlice(struct { current: bool }, a, manifest.manifest_json, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                if (parsed.value.current) {
+                    var result = try db.search(a, .{ .index_name = name, .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });
+                    defer result.deinit();
+                    try std.testing.expect(result.hits.len != 0);
+                    if (keep_a_serving) std.debug.print("PROTECTED-BACKFILL availability index={s} queries={d} query_wall_ms={d}\n", .{ name, availability_queries, availability_query_ns / std.time.ns_per_ms });
+                    return;
+                }
+            }
+        }
+        // This verifies background progress under sampled queries, not a
+        // saturation workload. Full exact-vector searches with the checked
+        // Debug allocator must leave the producer/maintenance owners CPU time.
+        // The deterministic scoped-frontier regression checks the publication
+        // boundary directly, independently of this sampling interval.
+        if (keep_a_serving and monotonicTimeNs() >= next_a_check_ns) {
+            const query_started_ns = monotonicTimeNs();
+            var result = db.search(a, .{ .index_name = "A", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 }) catch |err| {
+                const applied = try db.core.loadAppliedSequence(a, "A");
+                const target = try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, applied);
+                std.debug.print("PROTECTED-BACKFILL A unavailable during {s}: {s} applied={d} target={d} tail={d} live={?d}\n", .{ name, @errorName(err), applied, target, db.core.store.lastReplaySequence(0), db.executor.appliedSequence("A") });
+                const names = try db.core.index_manager.artifactSourceNamesForIndexAlloc(a, "A");
+                defer {
+                    for (names) |source| a.free(source);
+                    a.free(names);
+                }
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                const scoped = try replay_source_mod.artifactTargetAtCut(a, &read, names, applied, null);
+                std.debug.print("PROTECTED-BACKFILL A scoped_target={?d}\n", .{scoped});
+                for (names) |source| {
+                    const key = try internal_keys.artifactSourceRevisionKeyAlloc(a, source);
+                    defer a.free(key);
+                    const raw = read.get(key) catch |failure| switch (failure) {
+                        error.NotFound => null,
+                        else => return failure,
+                    };
+                    std.debug.print("PROTECTED-BACKFILL A source={s} revision={?d}\n", .{ source, if (raw) |bytes| std.mem.readInt(u64, bytes[0..8], .big) else @as(?u64, null) });
+                }
+                const primary = read.get(&internal_keys.primary_source_revision_key) catch |failure| switch (failure) {
+                    error.NotFound => null,
+                    else => return failure,
+                };
+                std.debug.print("PROTECTED-BACKFILL primary_revision={?d}\n", .{if (primary) |bytes| std.mem.readInt(u64, bytes[0..8], .big) else @as(?u64, null)});
+                return err;
+            };
+            defer result.deinit();
+            try std.testing.expect(result.hits.len != 0);
+            availability_queries += 1;
+            const query_ns = monotonicTimeNs() -| query_started_ns;
+            availability_query_ns +|= query_ns;
+            // Bound observation to 10% of wall time even when exact fallback
+            // searches are slow under the checked Debug allocator.
+            next_a_check_ns = monotonicTimeNs() +| @max(std.time.ns_per_s, query_ns *| 9);
+        }
+        if (monotonicTimeNs() >= deadline) {
+            const diagnostic = try std.json.Stringify.valueAlloc(a, .{ .indexes = stats.indexes, .enrichment = stats.enrichment }, .{});
+            defer a.free(diagnostic);
+            std.debug.print("PROTECTED-BACKFILL timeout index={s} covered={} native_ready={} availability_queries={d} query_wall_ms={d} state={s}\n", .{ name, covered, native_ready, availability_queries, availability_query_ns / std.time.ns_per_ms, diagnostic });
+            return error.ProtectedBackfillTimedOut;
+        }
+        sleepNs(100 * std.time.ns_per_ms);
+    }
+}
+
+fn protectedBackfillVector(a: Allocator, model: []const u8, text: []const u8, dimensions: u32) ![]f32 {
+    var provider: embedder_mod.DeterministicDenseEmbedder = .{ .seed = std.hash.Wyhash.hash(0, model) };
+    return embedder_mod.DeterministicDenseEmbedder.embedDense(&provider, a, model, text, dimensions);
+}
+
+test "privacy protected model migration oracle rejects substituted model vectors" {
+    const a = std.testing.allocator;
+    const first = try protectedBackfillVector(a, "model-A", "same protected input", 384);
+    defer a.free(first);
+    const second = try protectedBackfillVector(a, "model-B", "same protected input", 384);
+    defer a.free(second);
+    try std.testing.expect(!std.mem.eql(f32, first, second));
+}
+
+fn verifyProtectedBackfillOutput(a: Allocator, db: *DB, name: []const u8, embedding: []const u8, writes: []const types.BatchWrite, dimensions: u32, multi_chunk: bool) !usize {
+    var vector_count: usize = 0;
+    for (writes) |write| {
+        var manifest = (try db.getDocumentArtifactManifest(a, write.key, name)) orelse return error.TestUnexpectedResult;
+        defer manifest.deinit(a);
+        const View = struct { current: bool, document_id: []const u8, vectors: []const struct { source_text: []const u8, values: []const f32 } };
+        const parsed = try std.json.parseFromSlice(View, a, manifest.manifest_json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.current);
+        try std.testing.expectEqualStrings(write.key, parsed.value.document_id);
+        if (multi_chunk) try std.testing.expect(parsed.value.vectors.len > 1) else try std.testing.expectEqual(@as(usize, 1), parsed.value.vectors.len);
+        var reconstructed: std.ArrayList(u8) = .empty;
+        defer reconstructed.deinit(a);
+        for (parsed.value.vectors) |vector| {
+            try std.testing.expect(std.mem.indexOfScalar(u8, vector.source_text, '@') == null);
+            const expected = try protectedBackfillVector(a, embedding, vector.source_text, dimensions);
+            defer a.free(expected);
+            try std.testing.expectEqualSlices(f32, expected, vector.values);
+            for (vector.source_text) |byte| {
+                if (!std.ascii.isWhitespace(byte)) try reconstructed.append(a, byte);
+            }
+            vector_count += 1;
+        }
+        const source = try std.json.parseFromSlice(struct { body: []const u8 }, a, write.value, .{});
+        defer source.deinit();
+        const protected = try std.mem.replaceOwned(u8, a, source.value.body, "a@b.co", "[EMAIL]");
+        defer a.free(protected);
+        var expected_text: std.ArrayList(u8) = .empty;
+        defer expected_text.deinit(a);
+        for (protected) |byte| {
+            if (!std.ascii.isWhitespace(byte)) try expected_text.append(a, byte);
+        }
+        try std.testing.expectEqualStrings(expected_text.items, reconstructed.items);
+    }
+    return vector_count;
+}
+
 test "privacy scoped readiness serves A while sibling B backfills" {
     const a = std.testing.allocator;
     const catalog = @import("../../privacy/catalog.zig");
@@ -155231,6 +155610,25 @@ test "privacy scoped readiness serves A while sibling B backfills" {
     }
     const vector = try embedder_mod.DeterministicDenseEmbedder.embedDense(&embedder.deterministic, scratch, embeddings[0], "Orchard guidance.", 3);
     const req: types.SearchRequest = .{ .index_name = "A", .dense = .{ .vector = vector, .k = 1 }, .include_stored = true };
+    const a_applied = try db.core.loadAppliedSequence(a, "A");
+    const sibling_tail = try appendDerivedBatchRecord(&db, .{ .documents = &.{.{
+        .key = "doc",
+        .action = .upsert,
+        .cleaned_value = "{\"body\":\"Orchard guidance.\"}",
+        .targets = &.{.{ .kind = .dense_vector, .index_name = "B" }},
+    }} });
+    try std.testing.expect(sibling_tail > a_applied);
+    try std.testing.expectEqual(sibling_tail, try db.core.replaySource().latestMatchingSequence(a, a_applied, .dense_vector));
+    try std.testing.expectEqual(a_applied, try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, a_applied));
+    // Cached projection work is a replay hint, not a mutation to A's source.
+    // The journal intentionally expands its artifact key for replay routing.
+    const a_chunks = try std.fmt.allocPrint(scratch, "{s}_chunks", .{embeddings[0]});
+    const a_chunk = try internal_keys.chunkArtifactKeyAlloc(scratch, "doc", a_chunks, 0);
+    const a_artifact = try expectedChunkEmbeddingArtifactKeyAlloc(scratch, "doc", a_chunks, 0, embeddings[0]);
+    const cached_tail = try appendDerivedBatchRecord(&db, .{ .dense_embeddings = &.{.{ .index_name = "A", .parent_doc_key = "doc", .doc_key = a_chunk, .artifact_key = a_artifact, .vector = &.{} }} });
+    try std.testing.expect(cached_tail > sibling_tail);
+    try std.testing.expectEqual(cached_tail, try db.core.replaySource().latestMatchingSequence(a, a_applied, .dense_vector));
+    try std.testing.expectEqual(a_applied, try db.managedIndexReplayTargetSequence(a, "A", .dense_vector, a_applied));
     const calls = embedder.calls;
     var result = try db.search(a, req);
     defer result.deinit();
@@ -155293,6 +155691,12 @@ test "privacy scoped readiness serves A while sibling B backfills" {
     defer ready_b.deinit();
     try std.testing.expectEqual(@as(usize, 1), ready_a.hits.len);
     try std.testing.expectEqual(@as(usize, 1), ready_b.hits.len);
+    try db.batch(.{ .deletes = &.{"doc"}, .sync_level = .write });
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, req));
+    try db.runUntilIdle();
+    var deleted = try db.search(a, req);
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), deleted.hits.len);
 }
 
 test "privacy scoped readiness status isolates shared catch-up telemetry" {

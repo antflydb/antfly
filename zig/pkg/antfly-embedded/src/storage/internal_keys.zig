@@ -165,6 +165,7 @@ pub const GlobalReplayKind = enum(u8) {
     promoted_keys_state = 0x44,
     graph_expiration = 0x54,
     outcome_receipt = 0x55,
+    primary_source_revision = 0x56,
 };
 
 pub fn globalReplayPrefix(comptime kind: GlobalReplayKind) [3]u8 {
@@ -196,6 +197,9 @@ pub const ordered_document_applied_entry_key = globalReplayPrefix(.ordered_docum
 /// that writer's last applied call. See `db/apply_receipts.zig`.
 pub const outcome_receipt_prefix = globalReplayPrefix(.outcome_receipt);
 pub const artifact_presence_key = globalReplayPrefix(.artifact_presence);
+/// Last replay sequence carrying primary upserts, deletes or replacements.
+/// Committed with that record; artifact-only sibling work never advances it.
+pub const primary_source_revision_key = globalReplayPrefix(.primary_source_revision);
 pub const asset_artifact_source_index_kind: u8 = @backingInt(GlobalReplayKind.asset_source_index);
 pub const document_child_range_outbox_kind: u8 = @backingInt(GlobalReplayKind.child_range_outbox);
 pub const artifact_repair_issue_kind: u8 = @backingInt(GlobalReplayKind.artifact_repair_issue);

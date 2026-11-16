@@ -24,6 +24,65 @@ const platform_time = @import("antfly_platform").time;
 
 pub const TargetHint = change_journal_mod.TargetHint;
 
+/// Exact projection frontier for artifact-backed consumers. Missing markers
+/// require the legacy kind-wide fallback, including stores predating the
+/// primary watermark. Primary mutations fence deletes/replacements even when
+/// no replacement artifact has been produced yet. Reads share one snapshot.
+pub fn artifactTargetAtCut(alloc: Allocator, read: anytype, names: []const []const u8, applied: u64, budget: ?*@import("../artifact_scan_budget.zig").Budget) !?u64 {
+    if (names.len == 0) return null;
+    if (budget) |b| try b.consume(internal_keys.primary_source_revision_key.len + @sizeOf(u64));
+    const primary = read.get(&internal_keys.primary_source_revision_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (primary.len != @sizeOf(u64)) return error.InvalidArtifactSourceRevision;
+    var target = @max(applied, std.mem.readInt(u64, primary[0..8], .big));
+    for (names) |name| {
+        const key = try internal_keys.artifactSourceRevisionKeyAlloc(alloc, name);
+        defer alloc.free(key);
+        if (budget) |b| try b.consume(key.len + @sizeOf(u64));
+        const raw = read.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (raw.len != @sizeOf(u64)) return error.InvalidArtifactSourceRevision;
+        target = @max(target, std.mem.readInt(u64, raw[0..8], .big));
+    }
+    return target;
+}
+
+test "privacy scoped readiness requires primary and artifact replay markers" {
+    const a = std.testing.allocator;
+    const source_key = try internal_keys.artifactSourceRevisionKeyAlloc(a, "A");
+    defer a.free(source_key);
+    const Read = struct {
+        key: []const u8,
+        primary: ?[]const u8 = null,
+        source: ?[]const u8 = null,
+        fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            if (std.mem.eql(u8, key, &internal_keys.primary_source_revision_key)) return self.primary orelse error.NotFound;
+            if (std.mem.eql(u8, key, self.key)) return self.source orelse error.NotFound;
+            return error.NotFound;
+        }
+    };
+    var read: Read = .{ .key = source_key };
+    try std.testing.expectEqual(@as(?u64, null), try artifactTargetAtCut(a, &read, &.{"A"}, 10, null));
+    var primary: [8]u8 = undefined;
+    var source: [8]u8 = undefined;
+    std.mem.writeInt(u64, &primary, 20, .big);
+    std.mem.writeInt(u64, &source, 40, .big);
+    read.primary = &primary;
+    try std.testing.expectEqual(@as(?u64, null), try artifactTargetAtCut(a, &read, &.{"A"}, 10, null));
+    read.source = &source;
+    try std.testing.expectEqual(@as(?u64, 40), try artifactTargetAtCut(a, &read, &.{"A"}, 10, null));
+    std.mem.writeInt(u64, &primary, 70, .big);
+    try std.testing.expectEqual(@as(?u64, 70), try artifactTargetAtCut(a, &read, &.{"A"}, 10, null));
+    try std.testing.expectEqual(@as(?u64, 80), try artifactTargetAtCut(a, &read, &.{"A"}, 80, null));
+    try std.testing.expectEqual(@as(?u64, null), try artifactTargetAtCut(a, &read, &.{ "A", "missing" }, 10, null));
+    read.source = source[0..7];
+    try std.testing.expectError(error.InvalidArtifactSourceRevision, artifactTargetAtCut(a, &read, &.{"A"}, 10, null));
+}
+
 pub const PendingDocumentGroup = struct {
     sequence: u64,
     doc_key: []const u8,

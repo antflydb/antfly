@@ -20,6 +20,21 @@ const keys = @import("internal_keys.zig");
 const publication = @import("db/artifact_publication.zig");
 const authority = @import("source_authority.zig");
 
+// Repeated outputs from one stream share a marker; avoid staging the same
+// write for every member of a producer batch.
+fn stageReplayFrontier(txn: anytype, key: []const u8, sequence: ?u64) !void {
+    const previous = txn.get(key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (sequence) |value| {
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, value, .big);
+        if (previous) |raw| if (std.mem.eql(u8, raw, &encoded)) return;
+        try txn.put(key, &encoded);
+    } else if (previous != null) try txn.delete(key);
+}
+
 pub const Capture = struct {
     /// Borrowed only for this physical writer attempt. Set by trusted ingress,
     /// never inferred from stored artifact flags or imported metadata.
@@ -211,6 +226,11 @@ pub const Capture = struct {
             self.replay_sequence.? != std.math.maxInt(u64) and self.replay_next.? == self.replay_sequence.? + 1) self.replay_sequence else null;
         if (replay_sequence == null) try @import("db/artifact_source_gap.zig").record(txn);
         const materialization = try (publication.Materialization{ .position = position, .replay_sequence = replay_sequence }).encode();
+        // Capture sees every physical source mutation, including ordered
+        // publications and TTL/transaction writes that bypass DB append
+        // helpers. Keep projection frontiers in this same writer transaction.
+        // An unsequenced mutation invalidates the shortcut conservatively.
+        if (self.documents.count() != 0) try stageReplayFrontier(txn, &keys.primary_source_revision_key, replay_sequence);
         var iter = self.documents.keyIterator();
         while (iter.next()) |document| {
             try txn.put(&publication.inputRevisionKey(expected.namespace, document.*), &encoded);
@@ -228,6 +248,9 @@ pub const Capture = struct {
         while (scope_artifacts.next()) |artifact| {
             const stream = (try keys.artifactNameAlloc(scope_alloc, artifact.*)) orelse continue;
             defer scope_alloc.free(stream);
+            const frontier_key = try keys.artifactSourceRevisionKeyAlloc(scope_alloc, stream);
+            defer scope_alloc.free(frontier_key);
+            try stageReplayFrontier(txn, frontier_key, replay_sequence);
             const document = try @import("db/artifact_publication_owner.zig").documentAlloc(scope_alloc, artifact.*);
             defer scope_alloc.free(document);
             const key = publication.producerScopeRevisionKey(expected.namespace, document, stream);
@@ -377,6 +400,11 @@ test "ordered artifact inventory input capture requires same transaction authori
         }
         try chunk_capture.stage(&txn, false);
         try std.testing.expectEqual(@as(?u64, 41), (try publication.materializationState(&txn, namespace, "doc")).?.replay_sequence);
+        const chunks_frontier = try keys.artifactSourceRevisionKeyAlloc(alloc, "chunks");
+        defer alloc.free(chunks_frontier);
+        try std.testing.expectEqual(@as(u64, 41), std.mem.readInt(u64, (try txn.get(chunks_frontier))[0..8], .big));
+        // Artifact publication cannot impersonate a primary write.
+        try std.testing.expectError(error.NotFound, txn.get(&keys.primary_source_revision_key));
         const reopened_work = (try obligations.lookupWork(alloc, &txn, active, "doc")).?;
         try std.testing.expectEqualDeep(original_work.position, reopened_work.position);
         try std.testing.expectEqual(original_work.revision + 1, reopened_work.revision);
@@ -446,5 +474,41 @@ test "ordered artifact inventory input capture requires same transaction authori
         try nested.touch(alloc, &txn, resolution, null);
         try std.testing.expect(nested.artifact_owners.contains("doc"));
         try std.testing.expect(!nested.artifact_owners.contains(unit_zero));
+
+        // A direct physical primary deletion, outside a DB append helper,
+        // still fences consumers at its exact replay sequence.
+        var deletion: Capture = .{};
+        defer deletion.deinit(alloc);
+        std.mem.writeInt(u64, &replay_next, 44, .little);
+        const deletion_replay = keys.replayEntryKey(keys.replay_all_kind, 43);
+        try deletion.touch(alloc, &txn, &keys.replay_meta_next_sequence_key, &replay_next);
+        try deletion.touch(alloc, &txn, &deletion_replay, "journal");
+        try deletion.touch(alloc, &txn, document, null);
+        try txn.delete(document);
+        if (kind == .raft) {
+            var marker: [16]u8 = undefined;
+            std.mem.writeInt(u64, marker[0..8], 2, .little);
+            std.mem.writeInt(u64, marker[8..16], 13, .little);
+            try deletion.touch(alloc, &txn, &keys.ordered_document_applied_entry_key, &marker);
+        }
+        try deletion.stage(&txn, false);
+        try std.testing.expectEqual(@as(u64, 43), std.mem.readInt(u64, (try txn.get(&keys.primary_source_revision_key))[0..8], .big));
+        // The earlier unsequenced write to the same stream revoked its
+        // marker; a later primary event cannot manufacture that proof.
+        try std.testing.expectError(error.NotFound, txn.get(chunks_frontier));
+
+        // An unsequenced replacement must revoke the scoped shortcut.
+        var replacement: Capture = .{};
+        defer replacement.deinit(alloc);
+        try replacement.touch(alloc, &txn, document, "replacement");
+        try txn.put(document, "replacement");
+        if (kind == .raft) {
+            var marker: [16]u8 = undefined;
+            std.mem.writeInt(u64, marker[0..8], 2, .little);
+            std.mem.writeInt(u64, marker[8..16], 14, .little);
+            try replacement.touch(alloc, &txn, &keys.ordered_document_applied_entry_key, &marker);
+        }
+        try replacement.stage(&txn, false);
+        try std.testing.expectError(error.NotFound, txn.get(&keys.primary_source_revision_key));
     }
 }
