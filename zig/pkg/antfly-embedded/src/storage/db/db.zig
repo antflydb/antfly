@@ -43278,7 +43278,7 @@ pub const DB = struct {
         lockApplyShared(self);
         var apply_shared_held = true;
         errdefer if (apply_shared_held) self.core.unlockApplyShared();
-        const privacy_status_published = if (opts.privacy_status) privacy.requirePublished(self, alloc, .{}) catch |err| switch (err) {
+        const privacy_status_published = if (opts.privacy_status) privacy.requireConsumersPublishedWithBudget(self, alloc, .{}, &.{}, null) catch |err| switch (err) {
             error.IndexRebuilding => false,
             else => return err,
         } else false;
@@ -45390,49 +45390,9 @@ pub const DB = struct {
         return out;
     }
 
-    fn searchRequestRequiresComposedSearch(req: types.SearchRequest) bool {
-        if (req.full_text_queries.len > 0 or req.dense_queries.len > 0 or req.sparse_queries.len > 0) return true;
+    const searchRequestRequiresComposedSearch = @import("query/control_contract.zig").searchRequestRequiresComposedSearch;
 
-        var base_result_sets: u32 = 0;
-        if (req.full_text != null) base_result_sets += 1;
-        if (req.dense != null) base_result_sets += 1;
-        if (req.sparse != null) base_result_sets += 1;
-        switch (req.query) {
-            .dense_knn => base_result_sets += 1,
-            .sparse_knn => base_result_sets += 1,
-            else => {},
-        }
-        return base_result_sets > 1;
-    }
-
-    fn directSingleVectorRequest(req: types.SearchRequest) ?types.SearchRequest {
-        if (req.merge_config != null or req.reranker != null or req.pruner != null) return null;
-        if (req.full_text_queries.len != 0) return null;
-        if (req.full_text) |text| switch (text) {
-            .match_all => {},
-            else => return null,
-        };
-        if (!db_query_search.isDefaultMatchAll(req.query)) return null;
-        if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.expand_strategy != null) return null;
-        if (req.dense != null or req.sparse != null) return null;
-        if (req.dense_queries.len == 1 and req.sparse_queries.len == 0) {
-            var next = req;
-            next.index_name = req.dense_queries[0].index_name;
-            next.full_text = null;
-            next.dense = req.dense_queries[0].query;
-            next.dense_queries = &.{};
-            return next;
-        }
-        if (req.sparse_queries.len == 1 and req.dense_queries.len == 0) {
-            var next = req;
-            next.index_name = req.sparse_queries[0].index_name;
-            next.full_text = null;
-            next.sparse = req.sparse_queries[0].query;
-            next.sparse_queries = &.{};
-            return next;
-        }
-        return null;
-    }
+    const directSingleVectorRequest = @import("query/control_contract.zig").directSingleVectorRequest;
 
     fn searchComposed(
         self: *DB,
@@ -46105,7 +46065,8 @@ pub const DB = struct {
         return entry.config.name;
     }
 
-    pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+    pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, input: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        const req = directSingleVectorRequest(input) orelse input;
         if (comptime storage_engine.enabled) return storage_engine.call("collectSearchRequestTextStats", .{ self, alloc, req });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
@@ -46162,10 +46123,11 @@ pub const DB = struct {
     fn collectPlanningStatsLocked(
         self: *DB,
         alloc: Allocator,
-        req: types.SearchRequest,
+        input: types.SearchRequest,
         max_work: u32,
         exec_ctx: types.ExecutionContext,
     ) !planning_stats_mod.PlanningStatsSummary {
+        const req = directSingleVectorRequest(input) orelse input;
         _ = exec_ctx;
         try planning_bindings_mod.validateSearchRequestBindings(self.core, self.alloc, req);
         return try planning_adapter_mod.collectSearchRequestStatsAlloc(
@@ -155166,6 +155128,9 @@ test "privacy scoped readiness serves A while sibling B backfills" {
         try db.addEnrichment(.{ .name = embedding, .kind = .embedding, .field = "text", .source_artifact_name = chunks, .expected_dims = 3, .producer_json = "{\"provider\":\"antfly\",\"model\":\"fixture\"}" });
         const config = try std.fmt.allocPrint(scratch, "{{\"field\":\"embedding\",\"dims\":3,\"sources\":[{{\"artifact\":\"{s}\"}}]}}", .{embedding});
         try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = config, .coverage_generation = i + 1 });
+        const text_name = if (i == 0) "text-A" else "text-B";
+        const text_config = try std.fmt.allocPrint(scratch, "{{\"sources\":[{{\"artifact\":\"{s}\",\"field\":\"text\"}}]}}", .{chunks});
+        try db.addIndex(.{ .name = text_name, .kind = .full_text, .config_json = text_config });
         if (i == 0) {
             try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"Orchard guidance.\"}" }}, .sync_level = .write });
             try db.runUntilIdle();
@@ -155193,6 +155158,23 @@ test "privacy scoped readiness serves A while sibling B backfills" {
     named.dense_queries = &.{.{ .name = "ready", .index_name = "A", .query = req.dense.? }};
     var named_result = try db.search(a, named);
     defer named_result.deinit();
+    // Execution removes this text sentinel; admission must remove it too.
+    var sentinel = named;
+    sentinel.index_name = "text-B";
+    sentinel.full_text = .{ .match_all = {} };
+    var sentinel_result = try db.search(a, sentinel);
+    defer sentinel_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), sentinel_result.hits.len);
+    const stats = try db.collectSearchRequestTextStats(a, sentinel);
+    try std.testing.expectEqual(@as(usize, 0), stats.len);
+    // Real text filters remain dependencies even on the optimized vector lane.
+    sentinel.primary_text_index_name = "text-B";
+    sentinel.filter_text = .{ .match_all = {} };
+    try std.testing.expectError(error.IndexRebuilding, db.search(a, sentinel));
+    // Default match-all is a text read, not an all-index status observation.
+    var text_result = try db.search(a, .{ .index_name = "text-A" });
+    defer text_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), text_result.hits.len);
     named.dense_queries = &.{ .{ .name = "ready", .index_name = "A", .query = req.dense.? }, .{ .name = "pending", .index_name = "B", .query = req.dense.? } };
     try std.testing.expectError(error.IndexRebuilding, db.search(a, named));
     var stale = req;

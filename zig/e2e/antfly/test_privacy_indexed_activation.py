@@ -540,7 +540,6 @@ def test_privacy_held_update_delete_crash_recovers_current_sources(
         api._server.pause(crash=True)
         api.resume_server()
     finally:
-        behavior["model_gate"].set()
         behavior["embed_gate"].set()
 
     def recovered():

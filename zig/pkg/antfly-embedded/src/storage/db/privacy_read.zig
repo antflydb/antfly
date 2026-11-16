@@ -205,12 +205,15 @@ pub fn projectArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, rea
 }
 
 // Resolve exactly the physical consumers used by retrieval and text filters.
-// Empty means a global observation (status/unspecialized scans), preserving its
-// stronger all-consumer contract. Names are pinned by the caller's apply cut.
-fn requestedConsumers(db: anytype, a: A, req: @import("types.zig").SearchRequest) !std.StringHashMapUnmanaged(void) {
+// A read with no resolvable consumer retains the stronger global fence.
+// Explicit status observations bypass this resolver and request all consumers.
+// Names are pinned by the caller's apply cut.
+fn requestedConsumers(db: anytype, a: A, input: @import("types.zig").SearchRequest) !std.StringHashMapUnmanaged(void) {
     var selected: std.StringHashMapUnmanaged(void) = .empty;
     const manager = db.core.index_manager;
     const control = @import("query/control_contract.zig");
+    const req = control.directSingleVectorRequest(input) orelse input;
+    const composed = control.searchRequestRequiresComposedSearch(req);
     if (req.dense_queries.len != 0) {
         for (req.dense_queries) |query| {
             const entry = manager.denseIndex(query.index_name) orelse return error.IndexNotFound;
@@ -229,11 +232,11 @@ fn requestedConsumers(db: anytype, a: A, req: @import("types.zig").SearchRequest
         const entry = manager.sparseIndex(req.index_name) orelse return error.IndexNotFound;
         try selected.put(a, entry.config.name, {});
     }
-    if (req.query == .dense_knn) {
+    if (!composed and req.full_text == null and req.dense == null and req.sparse == null and req.query == .dense_knn) {
         const entry = manager.denseIndex(req.index_name) orelse return error.IndexNotFound;
         try selected.put(a, entry.config.name, {});
     }
-    if (req.query == .sparse_knn) {
+    if (!composed and req.full_text == null and req.dense == null and req.sparse == null and req.query == .sparse_knn) {
         const entry = manager.sparseIndex(req.index_name) orelse return error.IndexNotFound;
         try selected.put(a, entry.config.name, {});
     }
@@ -242,7 +245,9 @@ fn requestedConsumers(db: anytype, a: A, req: @import("types.zig").SearchRequest
             const entry = manager.textIndexEntry(query.index_name) orelse return error.IndexNotFound;
             try selected.put(a, entry.config.name, {});
         }
-    } else if (control.requestBindsRootTextIndex(req)) {
+    } else if (req.full_text != null or
+        (control.isTextQuery(req.query) and (if (composed) !control.isDefaultMatchAll(req.query) else req.dense == null and req.sparse == null)))
+    {
         if (manager.textIndexEntry(req.index_name)) |entry| try selected.put(a, entry.config.name, {});
     }
     if (control.requestBindsFilterTextIndex(req) or req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0) {
@@ -326,7 +331,7 @@ pub fn requireConsumersPublishedWithBudget(db: anytype, a: A, req: @import("type
             if (selected.count() != 0 and !selected.contains(name)) continue;
             found_consumers += 1;
             if (budget) |b| try b.consume(entry.config.config_json.len);
-            if (!local) {
+            if (!local and selected.count() != 0) {
                 const names = try db.core.index_manager.artifactSourceNamesForIndexAlloc(scratch, name);
                 try sources.appendSlice(scratch, names);
             }
