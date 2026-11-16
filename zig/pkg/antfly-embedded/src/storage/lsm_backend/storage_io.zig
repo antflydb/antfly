@@ -274,28 +274,32 @@ pub const RangeReadFuture = struct {
     }
 };
 
-pub const ReadRuntime = if (builtin.os.tag == .freestanding)
-    struct {
-        pub fn getIo(_: *const ReadRuntime) ?std.Io {
-            return null;
-        }
-
-        pub fn init(_: anytype) ReadRuntime {
-            return .{};
-        }
+// Each variant is a named declaration: a struct literal inside the `if`
+// would be anonymous (`ReadRuntime__struct_<N>`), and its per-compilation
+// name would break native ABI layout ids of signatures that take it.
+const FreestandingReadRuntime = struct {
+    pub fn getIo(_: *const ReadRuntime) ?std.Io {
+        return null;
     }
-else
-    struct {
-        io: std.Io,
 
-        pub fn getIo(self: *const ReadRuntime) ?std.Io {
-            return self.io;
-        }
+    pub fn init(_: anytype) ReadRuntime {
+        return .{};
+    }
+};
 
-        pub fn init(io: std.Io) ReadRuntime {
-            return .{ .io = io };
-        }
-    };
+const HostedReadRuntime = struct {
+    io: std.Io,
+
+    pub fn getIo(self: *const ReadRuntime) ?std.Io {
+        return self.io;
+    }
+
+    pub fn init(io: std.Io) ReadRuntime {
+        return .{ .io = io };
+    }
+};
+
+pub const ReadRuntime = if (builtin.os.tag == .freestanding) FreestandingReadRuntime else HostedReadRuntime;
 
 const CompletedRangeReadFuture = struct {
     allocator: Allocator,
