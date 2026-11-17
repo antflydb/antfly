@@ -61,6 +61,34 @@ pub const Header = struct {
     schema_before: ?[]const u8 = null,
     schema_after: ?[]const u8 = null,
 };
+/// Resolve the original commit clock without changing historical frame bytes.
+/// A coordinated certificate must come from authoritative publication recovery,
+/// and frame_digest must be the verified digest of the addressed retained frame.
+pub fn commitTimeNs(header: Header, frame_digest: Digest, certificate: ?completion.Certificate) !i64 {
+    switch (header.transaction_scope) {
+        .unknown => return error.ChangefeedCapabilityUnsupported,
+        .root_local => {
+            if (header.committed_at_ns <= 0) return error.ChangefeedCapabilityUnsupported;
+            return header.committed_at_ns;
+        },
+        .coordinated => {
+            const proof = certificate orelse return error.SourceOutcomeUnresolved;
+            try proof.validate();
+            if (!std.meta.eql(header.transaction_id, proof.manifest.transaction_id)) return error.InvalidCommittedFrame;
+            for (proof.resolutions) |resolution| {
+                if (!std.meta.eql(resolution.namespace, header.namespace)) continue;
+                if (resolution.outcome != .effects or resolution.outcome.effects.sequence != header.sequence or
+                    !std.meta.eql(resolution.outcome.effects.frame_digest, frame_digest) or
+                    !std.meta.eql(resolution.source_position, header.source_position)) return error.InvalidCommittedFrame;
+                const time = std.math.cast(i64, proof.manifest.commit_version) orelse return error.ChangefeedCapabilityUnsupported;
+                if (header.committed_at_ns != 0 and header.committed_at_ns != time) return error.InvalidCommittedFrame;
+                return time;
+            }
+            return error.InvalidCommittedFrame;
+        },
+    }
+}
+
 fn length(value: ?[]const u8) !u32 {
     return if (value) |bytes| std.math.cast(u32, bytes.len) orelse error.HistoryTooLarge else absent;
 }
@@ -333,4 +361,37 @@ test "committed frame scopes distinguish native root effects from coordinated an
         reader = .{ .descriptor = descriptor, .source = .{ .context = &store, .read = Store.read } };
         try std.testing.expectError(error.InvalidCommittedFrame, reader.header(a));
     }
+}
+
+test "committed frame clock requires exact coordinated completion evidence" {
+    const member: completion.Participant = .{ .namespace = @splat(1), .owner_fence = @splat(2), .roles = completion.Roles.effects, .locator = "writer" };
+    const manifest: completion.Manifest = .{
+        .transaction_id = @splat(5),
+        .admission_digest = @splat(6),
+        .coordinator_namespace = member.namespace,
+        .coordinator_fence = member.owner_fence,
+        .commit_version = 1_700_000_000_000_000_000,
+        .participants = &.{member},
+    };
+    var position: Digest = @splat(0);
+    std.mem.writeInt(u64, position[0..8], 8, .little);
+    position[31] = 2;
+    const certificate: completion.Certificate = .{ .manifest = manifest, .resolutions = &.{.{
+        .namespace = member.namespace,
+        .owner_fence = member.owner_fence,
+        .manifest_digest = manifest.digest(),
+        .commit_version = manifest.commit_version,
+        .source_position = position,
+        .outcome = .{ .effects = .{ .sequence = 9, .frame_digest = @splat(10) } },
+    }} };
+    var header: Header = .{ .namespace = member.namespace, .sequence = 9, .transaction_id = manifest.transaction_id, .transaction_scope = .coordinated, .source_position = position };
+    try std.testing.expectEqual(@as(i64, @intCast(manifest.commit_version)), try commitTimeNs(header, @splat(10), certificate));
+    try std.testing.expectError(error.SourceOutcomeUnresolved, commitTimeNs(header, @splat(10), null));
+    try std.testing.expectError(error.InvalidCommittedFrame, commitTimeNs(header, @splat(11), certificate));
+    header.committed_at_ns = 12;
+    try std.testing.expectError(error.InvalidCommittedFrame, commitTimeNs(header, @splat(10), certificate));
+    header.transaction_scope = .root_local;
+    try std.testing.expectEqual(@as(i64, 12), try commitTimeNs(header, @splat(10), null));
+    header.committed_at_ns = 0;
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, commitTimeNs(header, @splat(10), null));
 }
