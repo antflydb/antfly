@@ -353,7 +353,7 @@ pub fn runRetainedUpload() !void {
                 .caught_up = second,
             };
         }
-        pub fn relation(_: *@This(), _: control.State, _: anytype, _: Request) !values.HistoricalRelation {
+        pub fn relation(_: *@This(), _: A, _: control.State, _: anytype, _: Request) !values.HistoricalRelation {
             return .{ .oid = 42, .namespace = "public", .name = "rows", .identity = .default, .key_ordinals = &.{0} };
         }
     };

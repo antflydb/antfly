@@ -156,7 +156,9 @@ pub fn Producer(comptime Policy: type) type {
             var page = (try self.source.readRelationalFrame(a, state, position, now, self.page_events, try self.policy.context(request))) orelse return null;
             defer page.deinit();
             const header = page.header orelse return error.InvalidPgSpool;
-            const relation = try self.policy.relation(state, header, request);
+            var relation_arena = std.heap.ArenaAllocator.init(a);
+            defer relation_arena.deinit();
+            const relation = try self.policy.relation(relation_arena.allocator(), state, header, request);
             if (now >= state.expires_at or now < state.created_at or header.committed_at_ns <= 0)
                 return error.ChangefeedResynchronizationRequired;
             // Preflight runs again before an issue receipt exists. Tie its

@@ -89,7 +89,7 @@ fn authenticate(api: *http.ApiHttpServer, credential: http.AuthenticatedRequest)
     };
 }
 
-fn owner(identity: http.AuthenticatedIdentity) !control.Digest {
+pub fn durableOwner(identity: http.AuthenticatedIdentity) !control.Digest {
     if (identity.is_internal_service or identity.live_user_manager == null or identity.credential_principal.len == 0)
         return error.Forbidden;
     const manager = identity.live_user_manager.?;
@@ -105,7 +105,7 @@ fn owner(identity: http.AuthenticatedIdentity) !control.Digest {
 }
 
 fn requireOwner(identity: http.AuthenticatedIdentity, definition: control.Definition) !void {
-    if (!same(definition.owner, try owner(identity))) return error.Forbidden;
+    if (!same(definition.owner, try durableOwner(identity))) return error.Forbidden;
 }
 
 fn authorization(identity: http.AuthenticatedIdentity, tables: []const control.Table, filter: ?[]const u8) control.Digest {
@@ -344,7 +344,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
     if (requested.len == 0 or requested.len > 1024) return error.InvalidChangefeed;
     var identity = try authenticate(api, credential);
     defer identity.deinit(api.alloc);
-    const caller = try owner(identity);
+    const caller = try durableOwner(identity);
     if (!try http.tablePermissionCurrentlyAllowed(identity, requested, .replicate)) return error.Forbidden;
     const meta = api.source.changefeeds orelse return error.ChangefeedCapabilityUnsupported;
     const source = api.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;

@@ -154,10 +154,14 @@ pub const ReplicationIdentity = struct {
     /// The caller supplies catalog-qualified names and verifies their immutable
     /// bindings. This path serves whole tuples and rejects effective filters.
     pub fn requireWholeTables(self: ReplicationIdentity, alloc: std.mem.Allocator, tables: []const []const u8) !void {
-        const control = @import("../metadata/changefeed_control.zig");
-        if (tables.len == 0 or tables.len > control.max_tables) return error.InvalidChangefeed;
         var identity = try self.read(self.context, alloc);
         defer identity.deinit(alloc);
+        try requireWholeTablesForIdentity(alloc, identity, tables);
+    }
+
+    fn requireWholeTablesForIdentity(alloc: std.mem.Allocator, identity: http.AuthenticatedIdentity, tables: []const []const u8) !void {
+        const control = @import("../metadata/changefeed_control.zig");
+        if (tables.len == 0 or tables.len > control.max_tables) return error.InvalidChangefeed;
         var checks: [control.max_tables]usermgr.UserManager.PermissionCheck = undefined;
         for (tables, checks[0..tables.len]) |table, *check| {
             if (table.len == 0) return error.InvalidChangefeed;
@@ -166,6 +170,172 @@ pub const ReplicationIdentity = struct {
         }
         if (!try http.resourcePermissionsCurrentlyAllowed(alloc, identity, checks[0..tables.len])) return error.Forbidden;
     }
+};
+
+/// Catalog-resolved publication members. The slot binds this whole immutable
+/// projection, including the retained relation identity and old-key contract.
+pub const ReplicationPublication = struct {
+    const feed = @import("../metadata/changefeed_control.zig");
+    const slot = feed.pg_slot;
+    const relation_values = @import("../pgwire/values.zig");
+
+    pub const Member = struct {
+        table: feed.Table,
+        /// Exact permission scope for the verified catalog incarnation.
+        permission_name: []const u8,
+        namespace: []const u8,
+        name: []const u8,
+        oid: u32,
+        identity: @import("../pgwire/pgoutput.zig").Identity,
+        key_columns: []const []const u8,
+    };
+
+    database: feed.Digest,
+    publications: []const []const u8,
+    members: []const Member,
+
+    pub fn binding(self: ReplicationPublication) !slot.Binding {
+        if (std.mem.allEqual(u8, &self.database, 0) or self.members.len == 0 or self.members.len > feed.max_tables)
+            return error.InvalidChangefeed;
+        for (self.members, 0..) |member, index| {
+            if (member.table.contract != .native_relational or member.table.fields.len != 0 or member.table.predicates.len != 0 or
+                member.table.table_id == 0 or member.table.policy_revision == 0 or std.mem.allEqual(u8, &member.table.binding, 0) or
+                member.permission_name.len == 0 or member.oid == 0 or !validIdentifier(member.namespace) or !validIdentifier(member.name) or
+                (index != 0 and self.members[index - 1].table.table_id >= member.table.table_id))
+                return error.ChangefeedCapabilityUnsupported;
+            if (member.identity != .default and member.identity != .full) return error.ChangefeedCapabilityUnsupported;
+            if (member.identity == .default and member.key_columns.len == 0) return error.ChangefeedCapabilityUnsupported;
+            for (member.key_columns, 0..) |name, column| {
+                if (!validIdentifier(name) or (column != 0 and std.mem.order(u8, member.key_columns[column - 1], name) != .lt))
+                    return error.InvalidChangefeed;
+            }
+            for (self.members[0..index]) |prior| if (prior.oid == member.oid) return error.InvalidChangefeed;
+        }
+        const value: slot.Binding = .{
+            .publications = self.publications,
+            .projection = feed.hash(.{ .domain = "antfly:pgoutput-publication-projection:v1", .database = self.database, .members = self.members }),
+        };
+        try value.validate();
+        return value;
+    }
+
+    fn validIdentifier(name: []const u8) bool {
+        return name.len != 0 and name.len <= 63 and std.unicode.utf8ValidateSlice(name) and std.mem.indexOfScalar(u8, name, 0) == null;
+    }
+
+    /// Re-read the connection credential each time a slot opens, builds, or
+    /// serves committed tuples. A changed projection requires a fresh slot.
+    pub fn authorize(self: ReplicationPublication, authority: ReplicationIdentity, a: std.mem.Allocator, state: feed.State, expected: slot.Binding) !void {
+        const current = try self.binding();
+        const owner_slot = state.slot orelse return error.ChangefeedCapabilityUnsupported;
+        const definition = state.definition orelse return error.ChangefeedConflict;
+        if (!std.meta.eql(current.identity(), expected.identity()) or !std.meta.eql(self.database, owner_slot.database) or
+            definition.projection != .rows or definition.tables.len != self.members.len)
+            return error.ChangefeedResynchronizationRequired;
+        if (owner_slot.binding) |recorded| {
+            if (!std.meta.eql(current.identity(), recorded.identity())) return error.ChangefeedResynchronizationRequired;
+        }
+        var names: [feed.max_tables][]const u8 = undefined;
+        for (self.members, definition.tables, 0..) |member, table, index| {
+            if (!std.meta.eql(feed.hash(member.table), feed.hash(table))) return error.ChangefeedResynchronizationRequired;
+            names[index] = member.permission_name;
+        }
+        var identity = try authority.read(authority.context, a);
+        defer identity.deinit(a);
+        const owner = try @import("changefeed_public.zig").durableOwner(identity);
+        if (!std.crypto.timing_safe.eql(feed.Digest, owner, definition.owner)) return error.Forbidden;
+        try ReplicationIdentity.requireWholeTablesForIdentity(a, identity, names[0..self.members.len]);
+    }
+
+    pub fn historicalRelation(self: ReplicationPublication, a: std.mem.Allocator, table_id: u64, schema: @import("antfly_local_sources").storage_schema.TableSchema) !relation_values.HistoricalRelation {
+        _ = try self.binding();
+        const member = for (self.members) |member| {
+            if (member.table.table_id == table_id) break member;
+        } else return error.ChangefeedResynchronizationRequired;
+        if (schema.storage_mode != .relational or schema.external_base_source != null) return error.ChangefeedCapabilityUnsupported;
+        const count = member.key_columns.len;
+        const ordinals = try a.alloc(u16, count);
+        errdefer a.free(ordinals);
+        var filled: usize = 0;
+        for (schema.relational_columns, 0..) |column, index| {
+            for (member.key_columns) |name| {
+                if (!std.mem.eql(u8, column.name, name)) continue;
+                if (filled == count) return error.ChangefeedResynchronizationRequired;
+                ordinals[filled] = std.math.cast(u16, index) orelse return error.ChangefeedCapabilityUnsupported;
+                filled += 1;
+                break;
+            }
+        }
+        if (filled != count) return error.ChangefeedResynchronizationRequired;
+        return .{ .oid = member.oid, .namespace = member.namespace, .name = member.name, .identity = member.identity, .key_ordinals = ordinals };
+    }
+};
+
+/// Request-scoped policy used by both the spool uploader and its CopyBoth
+/// reader. The resolver must return the complete current publication set.
+pub const LiveReplicationPublication = struct {
+    const feed = @import("../metadata/changefeed_control.zig");
+    const Binding = feed.pg_slot.Binding;
+
+    pub const Resolver = struct {
+        ptr: *anyopaque,
+        resolve: *const fn (*anyopaque, std.mem.Allocator, feed.Digest, []const []const u8, operation.RequestContext) anyerror!ReplicationPublication,
+    };
+
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    identity: ReplicationIdentity,
+    resolver: Resolver,
+    expected: Binding,
+
+    fn resolve(self: *LiveReplicationPublication, a: std.mem.Allocator, state: feed.State, request: operation.RequestContext) !ReplicationPublication {
+        try request.ensureActive();
+        const owner_slot = state.slot orelse return error.ChangefeedCapabilityUnsupported;
+        const current = try self.resolver.resolve(self.resolver.ptr, a, owner_slot.database, self.expected.publications, request);
+        try current.authorize(self.identity, a, state, self.expected);
+        try request.ensureActive();
+        return current;
+    }
+
+    pub fn authorize(self: *LiveReplicationPublication, state: feed.State, binding: Binding, request: operation.RequestContext) !void {
+        if (!std.meta.eql(self.expected.identity(), binding.identity())) return error.ChangefeedResynchronizationRequired;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        _ = try self.resolve(arena.allocator(), state, request);
+    }
+
+    pub fn nowSeconds(self: *LiveReplicationPublication, request: operation.RequestContext) !u64 {
+        try request.ensureActive();
+        const now = std.Io.Clock.now(.real, self.io).nanoseconds;
+        if (now <= 0) return error.ChangefeedResynchronizationRequired;
+        return std.math.cast(u64, @divFloor(now, std.time.ns_per_s)) orelse error.ChangefeedResynchronizationRequired;
+    }
+
+    pub const Upload = struct {
+        owner: *LiveReplicationPublication,
+
+        pub fn authorize(self: *Upload, state: feed.State, request: operation.RequestContext) !void {
+            try self.owner.authorize(state, self.owner.expected, request);
+        }
+
+        pub fn nowSeconds(self: *Upload, request: operation.RequestContext) !u64 {
+            return self.owner.nowSeconds(request);
+        }
+
+        pub fn context(_: *Upload, request: operation.RequestContext) !operation.RequestContext {
+            return request;
+        }
+
+        pub fn relation(self: *Upload, a: std.mem.Allocator, state: feed.State, header: @import("antfly_local_sources").storage_committed_history.frame.Header, request: operation.RequestContext) !ReplicationPublication.relation_values.HistoricalRelation {
+            const source = try self.owner.resolve(a, state, request);
+            const schema_mod = @import("antfly_local_sources").schema_mod;
+            const raw = header.schema_after orelse header.schema_before orelse return error.ChangefeedCapabilityUnsupported;
+            const parsed = try schema_mod.parseValidatedTableSchema(a, raw);
+            const schema = try schema_mod.deriveRuntimeTableSchema(a, parsed);
+            const id = std.mem.readInt(u64, header.namespace[0..8], .big);
+            return source.historicalRelation(a, id, schema);
+        }
+    };
 };
 
 /// Command completion for a replication owner that has resolved the database,
@@ -2483,4 +2653,73 @@ test "SQL pgwire credential identity rejects username reuse with an identical pa
     defer renewed_identity.deinit(a);
     try std.testing.expectEqual(replacement.instance_id, renewed_identity.user_instance_id.?);
     try std.testing.expect(try http.tablePermissionCurrentlyAllowed(renewed_identity, "docs", .read));
+}
+
+test "SQL pgwire native replication fences publication changes and live credential policy" {
+    const a = std.testing.allocator;
+    const feeds = ReplicationPublication.feed;
+    var store = usermgr.MemoryStore.init(a);
+    defer store.deinit();
+    var policies = @import("antfly_casbin").MemoryAdapter.init(a);
+    defer policies.deinit();
+    var manager = try usermgr.UserManager.init(a, store.iface(), try usermgr.initDefaultEnforcer(a, policies.iface()));
+    defer manager.deinit();
+    var permission = try usermgr.Permission.initOwned(a, .table, "docs", .replicate);
+    defer permission.deinit(a);
+    var user = try manager.createUser("replicator", "secret", &.{permission});
+    defer user.deinit(a);
+    const credential = try Credential.authenticate(a, &manager, "replicator", "secret");
+    defer Credential.release(credential, a);
+    var admitted = try credential.identity(a);
+    defer admitted.deinit(a);
+    const owner = try @import("changefeed_public.zig").durableOwner(admitted);
+    const member_table: feeds.Table = .{ .table_id = 77, .binding = @splat(5), .policy_revision = 1, .contract = .native_relational };
+    var members = [_]ReplicationPublication.Member{.{
+        .table = member_table,
+        .permission_name = "docs",
+        .namespace = "public",
+        .name = "docs",
+        .oid = 42,
+        .identity = .default,
+        .key_columns = &.{"id"},
+    }};
+    const Resolver = struct {
+        projection: ReplicationPublication,
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, db: feeds.Digest, publications: []const []const u8, _: operation.RequestContext) !ReplicationPublication {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.projection.database, db);
+            try std.testing.expectEqualStrings("docs_pub", publications[0]);
+            return self.projection;
+        }
+    };
+    var resolver: Resolver = .{ .projection = .{ .database = @splat(3), .publications = &.{"docs_pub"}, .members = &members } };
+    const frozen = try resolver.projection.binding();
+    const state: feeds.State = .{
+        .phase = .streaming,
+        .definition = .{ .owner = owner, .authorization = @splat(6), .tables = &.{member_table}, .projection = .rows },
+        .slot = .{ .database = @splat(3), .name = "docs_slot", .acknowledged_cursor = @splat(7), .mapped_cursor = @splat(7), .binding = frozen },
+    };
+    var policy: LiveReplicationPublication = .{ .allocator = a, .io = std.testing.io, .identity = .{ .context = credential, .read = Adapter.replicationIdentity }, .resolver = .{ .ptr = &resolver, .resolve = Resolver.resolve }, .expected = frozen };
+    try policy.authorize(state, frozen, .{});
+    var upload_policy: LiveReplicationPublication.Upload = .{ .owner = &policy };
+    const schema =
+        \\{"version":7,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"extra":{"type":"integer"},"id":{"type":"integer"}},"required":["extra","id"],"additionalProperties":false}}}}
+    ;
+    var namespace: feeds.Namespace = @splat(0);
+    std.mem.writeInt(u64, namespace[0..8], member_table.table_id, .big);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const relation = try upload_policy.relation(arena.allocator(), state, .{
+        .namespace = namespace,
+        .sequence = 10,
+        .transaction_id = @splat(8),
+        .schema_after = schema,
+    }, .{});
+    try std.testing.expectEqual(@as(u32, 42), relation.oid);
+    try std.testing.expectEqualSlices(u16, &.{1}, relation.key_ordinals);
+    members[0].oid = 43;
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, policy.authorize(state, frozen, .{}));
+    members[0].oid = 42;
+    try manager.setRowFilter("replicator", "docs", "{\"term\":{\"id\":1}}");
+    try std.testing.expectError(error.Forbidden, upload_policy.authorize(state, .{}));
 }
