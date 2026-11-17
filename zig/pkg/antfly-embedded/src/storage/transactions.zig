@@ -289,8 +289,17 @@ pub const TxnSummaryPage = struct {
     next_after: ?TxnId,
 };
 
+const SourceRetirement = struct {
+    command: @import("source_scope_retirement.zig").Command,
+    cut: source_scope.Cut,
+    already_fenced: bool,
+};
+
 pub const ResolutionExtraBatch = struct {
     source_scope_cut: ?source_scope.Cut = null,
+    /// Private ordered retirement receipt, staged after scope resolution in the
+    /// same writer, including terminal retries without row mutations.
+    source_retirement: ?SourceRetirement = null,
     source_scope: ?source_scope.Reference = null,
     completion_owner: ?completion.RoutedOwner = null,
     source_purpose: ?[32]u8 = null,
@@ -1167,24 +1176,26 @@ pub const TxnManager = struct {
             defer admission.deinit();
             if (!std.mem.eql(u8, &admission.value.digest, &proof.slot.admission_digest)) return error.SourceTransactionIdentityConflict;
             const member = try admission.value.admission.member(proof.root.namespace);
-            const outcome = try self.resolveIntentsWithExtraBatch(proof.slot.transaction_id, .aborted, command.observation.decision.?.record.finalized_at_ns, .{
+            _ = try self.resolveIntentsWithExtraBatch(proof.slot.transaction_id, .aborted, command.observation.decision.?.record.finalized_at_ns, .{
                 .completion_owner = command.intent.owner,
                 .source_purpose = proof.slot.source_purpose,
                 .source_scope = proof.slot.reference,
                 .source_scope_cut = applied,
+                .source_retirement = .{ .command = command, .cut = applied, .already_fenced = record.status != .pending and record.intents_resolved_known and record.intents_resolved },
                 .resolved_participant = member.locator,
                 .completion_writes = marker_writes,
             });
             var probe = try self.store.beginProbe();
             defer probe.abort();
-            const scoped = (try source_scope.Store.readRecord(arena.allocator(), &probe, proof.slot.reference.domain)) orelse return error.SourceOutcomeUnresolved;
-            const reply: retirement.Reply = .{ .version = 1, .request_digest = command.intent.digest(), .coordinator_record_digest = proof.coordinator_record_digest, .cut = applied, .closed_through_token = scoped.closed_through_token, .disposition = if (outcome.applied) .fenced else .already_fenced };
-            try reply.validate(command.intent);
-            return reply;
+            return switch (try @import("source_scope_retirement_ordered.zig").replay(arena.allocator(), &probe, command, applied)) {
+                .applied => |reply| reply,
+                .superseded => error.SourceOutcomeUnresolved,
+            };
         }
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
         const reply = try retirement.applyUnenlisted(arena.allocator(), &batch, command, applied);
+        try @import("source_scope_retirement_ordered.zig").stage(arena.allocator(), &batch, command, reply);
         for (marker_writes) |write| try batch.put(write.key, write.value);
         try batch.commit();
         return reply;
@@ -1205,6 +1216,10 @@ pub const TxnManager = struct {
         timestamp: u64,
         extra_batch: ResolutionExtraBatch,
     ) !ResolutionOutcome {
+        if (extra_batch.source_retirement) |ordered| {
+            const proof = try ordered.command.proof();
+            if (status != .aborted or !std.mem.eql(u8, &txn_id, &proof.slot.transaction_id) or !sameSourceScope(extra_batch.source_scope, proof.slot.reference) or !samePurpose(extra_batch.source_purpose, proof.slot.source_purpose) or extra_batch.completion_owner == null or !std.meta.eql(extra_batch.completion_owner.?, ordered.command.intent.owner) or extra_batch.source_scope_cut == null or !std.meta.eql(extra_batch.source_scope_cut.?, ordered.cut)) return error.SourceTransactionIdentityConflict;
+        }
         const rec_key = makeRecordKey(txn_id);
         const completion_request_key = completion.requestKey(txn_id);
         var completion_request: [124]u8 = undefined;
@@ -1299,8 +1314,8 @@ pub const TxnManager = struct {
             if (resolved_participant_value) |value| {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
             }
-            if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0) {
-                try self.applyBatch(completion_writes.items, extra_batch.completion_deletes, null);
+            if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0 or extra_batch.source_retirement != null) {
+                try self.applyBatchWithParticipant(completion_writes.items, extra_batch.completion_deletes, null, null, null, null, extra_batch.source_retirement);
             }
             return .{
                 .applied = false,
@@ -1358,7 +1373,7 @@ pub const TxnManager = struct {
             try completion_deletes.append(self.alloc, &schema_lease_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-            try self.applyBatchWithReservation(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 });
+            try self.applyBatchWithParticipant(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, extra_batch.source_scope_cut, extra_batch.source_retirement);
             return .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -1513,7 +1528,7 @@ pub const TxnManager = struct {
         }
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyBatchWithParticipant(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, extra_batch.source_scope_cut);
+        try self.applyBatchWithParticipant(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, extra_batch.source_scope_cut, extra_batch.source_retirement);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -3069,10 +3084,10 @@ pub const TxnManager = struct {
 
     const ReservationChange = struct { previous: u64, next: u64 };
     fn applyBatchWithReservation(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange) !void {
-        return self.applyBatchWithParticipant(writes, deletes, replay, reservation, null, null);
+        return self.applyBatchWithParticipant(writes, deletes, replay, reservation, null, null, null);
     }
 
-    fn applyBatchWithParticipant(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, scope_cut: ?source_scope.Cut) !void {
+    fn applyBatchWithParticipant(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, scope_cut: ?source_scope.Cut, source_retirement: ?SourceRetirement) !void {
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
         if (participant) |observer| try batch.setCommitParticipant(observer);
@@ -3147,6 +3162,11 @@ pub const TxnManager = struct {
         }
         for (writes) |kv| {
             try batch.put(kv.key, kv.value);
+        }
+        if (source_retirement) |ordered| {
+            const ordered_retirement = @import("source_scope_retirement_ordered.zig");
+            const reply = try ordered_retirement.resolvedReply(scope_arena.allocator(), &batch, ordered.command, ordered.cut, ordered.already_fenced);
+            try ordered_retirement.stage(scope_arena.allocator(), &batch, ordered.command, reply);
         }
         if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
         try batch.commit();

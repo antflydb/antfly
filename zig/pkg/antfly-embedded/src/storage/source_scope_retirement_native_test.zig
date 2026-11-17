@@ -19,6 +19,7 @@ const transactions = @import("transactions.zig");
 const completion = @import("transaction_completion.zig");
 const scope = @import("source_scope.zig");
 const retirement = @import("source_scope_retirement.zig");
+const ordered = @import("source_scope_retirement_ordered.zig");
 const DocStore = @import("docstore.zig").DocStore;
 const keys = @import("internal_keys.zig");
 
@@ -60,6 +61,23 @@ pub fn run(a: std.mem.Allocator, path: [:0]const u8) !void {
         try release.commit();
         var manager = try transactions.TxnManager.init(a, &store);
         defer manager.deinit();
+        // A receipt-validation failure after staging the token fence must roll
+        // back that fence and every completion write with it.
+        {
+            var failed = try store.beginWriteTxn();
+            defer failed.abort();
+            var invalid = try retirement.applyUnenlisted(arena.allocator(), &failed, command, .{ .term = 3, .index = 19 });
+            invalid.closed_through_token += 1;
+            try failed.put(marker.key, marker.value);
+            try std.testing.expectError(error.SourceAdmissionCorrupt, ordered.stage(arena.allocator(), &failed, command, invalid));
+        }
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u64, 0), (try scope.Store.readRecord(arena.allocator(), &read, spec.domain())).?.closed_through_token);
+            try std.testing.expectError(error.NotFound, read.get(marker.key));
+            try std.testing.expect(try ordered.replay(a, &read, command, .{ .term = 3, .index = 19 }) == .superseded);
+        }
         const reply = try manager.retireScopedSourceAttempt(command, .{ .term = 3, .index = 20 }, &.{marker});
         try reply.validate(command.intent);
         try std.testing.expectEqual(@TypeOf(reply.disposition).fenced, reply.disposition);
@@ -73,6 +91,18 @@ pub fn run(a: std.mem.Allocator, path: [:0]const u8) !void {
         defer store.close();
         var manager = try transactions.TxnManager.init(a, &store);
         defer manager.deinit();
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            const recovered = (try ordered.replay(a, &read, command, .{ .term = 3, .index = 20 })).applied;
+            try std.testing.expectEqual(@TypeOf(recovered.disposition).fenced, recovered.disposition);
+            try std.testing.expectEqual(@as(u64, 10), recovered.closed_through_token);
+            try std.testing.expectError(error.ConflictingOrderedApplyReceipt, ordered.replay(a, &read, command, .{ .term = 4, .index = 20 }));
+            var changed = command;
+            changed.intent.coordinator.minimum_applied_index += 1;
+            changed.observation.request_digest = changed.intent.coordinator.digest();
+            try std.testing.expectError(error.ConflictingOrderedApplyReceipt, ordered.replay(a, &read, changed, .{ .term = 3, .index = 20 }));
+        }
         const retry = try manager.retireScopedSourceAttempt(command, .{ .term = 3, .index = 21 }, &.{});
         try std.testing.expectEqual(@TypeOf(retry.disposition).already_fenced, retry.disposition);
         const extra: transactions.MutationExtraBatch = .{ .source_purpose = command.intent.source_purpose, .source_scope = reference, .completion_owner = owner, .completion_input_digest = members[1].input_digest };
@@ -99,10 +129,85 @@ pub fn run(a: std.mem.Allocator, path: [:0]const u8) !void {
         defer transactions.freeParticipantList(a, resolved);
         try std.testing.expectEqual(@as(usize, 1), resolved.len);
         try std.testing.expectEqualStrings("checkpoint", resolved[0]);
-        var probe = try store.beginReadTxn();
-        defer probe.abort();
-        const scoped = (try scope.Store.readRecord(a, &probe, reference.domain)).?;
-        try std.testing.expectEqual(@as(u64, 11), scoped.closed_through_token);
-        try std.testing.expect(scoped.slot == null);
+        {
+            var probe = try store.beginReadTxn();
+            defer probe.abort();
+            const scoped = (try scope.Store.readRecord(a, &probe, reference.domain)).?;
+            try std.testing.expectEqual(@as(u64, 11), scoped.closed_through_token);
+            try std.testing.expect(scoped.slot == null);
+            try std.testing.expectEqualDeep(drained, (try ordered.replay(a, &probe, command, drained.cut)).applied);
+        }
+        // Already-resolved retries with no marker writes still publish their
+        // receipt; they do not recertify or reapply any row effects.
+        const terminal_retry = try manager.retireScopedSourceAttempt(command, .{ .term = 3, .index = 23 }, &.{});
+        try std.testing.expectEqual(@TypeOf(terminal_retry.disposition).already_fenced, terminal_retry.disposition);
+        {
+            var last = try store.beginReadTxn();
+            defer last.abort();
+            try std.testing.expectEqualDeep(terminal_retry, (try ordered.replay(a, &last, command, terminal_retry.cut)).applied);
+            try std.testing.expect(try ordered.replay(a, &last, command, drained.cut) == .superseded);
+        }
+    }
+    {
+        var store = try DocStore.open(a, path.ptr, .{});
+        defer store.close();
+        var manager = try transactions.TxnManager.init(a, &store);
+        defer manager.deinit();
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            const recovered = (try ordered.replay(a, &read, command, .{ .term = 3, .index = 23 })).applied;
+            try std.testing.expectEqual(@TypeOf(recovered.disposition).already_fenced, recovered.disposition);
+        }
+        // Model a durable ABORT decision whose empty intent cleanup has not
+        // yet been acknowledged. Recovery must finish the scope and receipt
+        // together even though no primary row intents remain.
+        admission.transaction_id = @splat(23);
+        command.intent.coordinator.transaction_id = admission.transaction_id;
+        command.intent.reference.token = 12;
+        command.intent.admission_digest = admission.digest();
+        command.observation.request_digest = command.intent.coordinator.digest();
+        command.observation.decision.?.record.source_scope = command.intent.reference;
+        command.observation.decision.?.admission = .{ .admission = admission, .digest = admission.digest() };
+        try manager.initParticipantWithCompletionAdmission(admission, 10, 11, true, .{ .source_purpose = command.intent.source_purpose, .source_scope = command.intent.reference, .completion_owner = owner, .completion_input_digest = members[1].input_digest });
+        var record_key: [completion.record_prefix.len + 16]u8 = undefined;
+        @memcpy(record_key[0..completion.record_prefix.len], completion.record_prefix);
+        @memcpy(record_key[completion.record_prefix.len..], &admission.transaction_id);
+        const raw = try store.get(a, &record_key);
+        defer a.free(raw);
+        try std.testing.expectEqual(@as(usize, 175), raw.len);
+        raw[0] = @backingInt(transactions.TxnStatus.aborted);
+        std.mem.writeInt(u64, raw[25..33], 20, .little);
+        try std.testing.expectEqual(@as(u8, 0), raw[52]);
+        var decision_write = try store.beginWriteTxn();
+        errdefer decision_write.abort();
+        try decision_write.put(&record_key, raw);
+        try decision_write.commit();
+        const finished = try manager.retireScopedSourceAttempt(command, .{ .term = 3, .index = 24 }, &.{marker});
+        try std.testing.expectEqual(@as(u64, 12), finished.closed_through_token);
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqualDeep(finished, (try ordered.replay(a, &read, command, finished.cut)).applied);
+        }
+        // Corrupt and oversized receipts are errors, never success or expiry.
+        const receipt_bytes = try store.get(a, ordered.receipt_key);
+        defer a.free(receipt_bytes);
+        {
+            var corrupt = try store.beginWriteTxn();
+            defer corrupt.abort();
+            receipt_bytes[receipt_bytes.len - 2] ^= 1;
+            try corrupt.put(ordered.receipt_key, receipt_bytes);
+            try std.testing.expectError(error.SourceAdmissionCorrupt, ordered.replay(a, &corrupt, command, finished.cut));
+        }
+        {
+            var oversized = try store.beginWriteTxn();
+            defer oversized.abort();
+            const bytes = try a.alloc(u8, ordered.max_record_bytes + 1);
+            defer a.free(bytes);
+            @memset(bytes, ' ');
+            try oversized.put(ordered.receipt_key, bytes);
+            try std.testing.expectError(error.SourceAdmissionCorrupt, ordered.replay(a, &oversized, command, finished.cut));
+        }
     }
 }

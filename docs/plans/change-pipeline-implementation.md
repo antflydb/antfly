@@ -5176,3 +5176,51 @@ Actual native ordered controls/retirement RPC, genuine worker migration and the
 remaining full destination/changefeed/bootstrap/retention/pgoutput/client scope
 are still mandatory and incomplete. Neither these checks nor the PostgreSQL
 control baseline constitute full Antfly end-to-end qualification.
+
+### Atomic bounded native attempt-retirement success receipts
+
+`source_scope_retirement_ordered.zig` adds one bounded, checksummed successful
+retirement receipt per physical root (8 KiB maximum). The receipt binds the
+original qualified coordinator ABORT record digest, complete retirement intent,
+actual local ordered cut, cumulative token floor and original reply disposition.
+An exact recovery returns the stored reply without consulting newer live scope
+state. A replaced receipt returns superseded; mismatched term/intent/proof at the
+same index conflicts. Missing/superseded receipts never infer a transaction
+outcome. Corruption and oversize remain errors.
+
+TxnManager now stages this receipt in the same writer as unenlisted fencing, or
+as enlisted ABORT resolution, scope-slot completion, participant acknowledgement
+and caller-supplied ordered marker writes. Both terminal retry branches use that
+same writer, including empty intent cleanup and no-marker already-resolved
+retries. The private typed receipt input validates transaction identity, ABORT,
+source reference/purpose, owner and actual cut before resolution. No general row
+commit participant callback is used to certify control-only or abort effects.
+The successful reply is read from the durable receipt after commit instead of
+being reconstructed from a later live scope read.
+
+The real NativeKV retirement fixture covers failed receipt validation rolling
+back a staged token floor and marker, exact response recovery after reopen,
+wrong-term and altered-intent conflicts, enlisted intent cleanup, supersession,
+no-marker terminal retry, another reopen and an ABORT whose empty intent cleanup
+was not acknowledged. Further checks reject corrupt and oversized receipts.
+The combined docstore-history-test/source-control-test run exited 0 in
+`source-scope-retirement-receipt-qualified-test.log`; the native history suite
+reported 15 passed, zero skipped/failed/leaked. Final corruption checks and
+repository contract check results are recorded below after their terminal runs.
+
+This is a trusted low-level native transaction implementation, not exposure of
+retirement through DB/engine/opaque-owner/data-Raft/RPC. The fixture's namespace
+and source authority are established directly and do not prove production
+physical-owner qualification or metadata/coordinator-read provenance. Rejected
+ordered retirement results, genuine legacy worker migration, actual controls and
+retirement RPC, hidden checkpoint provisioning and cohort/root lifecycle remain
+required. Full destination integration, retained/public history, bootstrap and
+bounded retention, typed production pgoutput, actual Antfly Debezium qualification
+and the original issues' recovery/performance acceptance checks remain open.
+
+Final `docstore-history-test` exited 0, all 15 tests passed with no skips,
+failures or leaks (`source-scope-retirement-receipt-final-native-test.log`).
+`make source-catalog-check engine-errors-check openapi-check` exited 0
+(`source-scope-retirement-receipt-contract-check.log`), including nine schema
+fragment tests. No engine/owner/API ABI or data/metadata protocol maximum is
+changed by this internal native receipt implementation.
