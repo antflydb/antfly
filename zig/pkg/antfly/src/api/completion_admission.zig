@@ -154,8 +154,19 @@ pub const Coordinator = struct {
         var context = try original.platformDeadline();
         context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s);
         try context.ensureActive();
-        var plan = try plan_mod.Plan.restoreFrozen(a, bytes, digest);
+        const plan = try plan_mod.Plan.restoreFrozen(a, bytes, digest);
+        return self.qualifyRetained(a, plan, context);
+    }
+
+    /// Takes ownership on every path. The caller has already decoded and
+    /// verified the retained plan; this captures fresh transport authority
+    /// without copying or re-encoding its potentially large payload.
+    pub fn qualifyRetained(self: Coordinator, a: A, retained: plan_mod.Plan, original: Context) !Prepared {
+        var plan = retained;
         errdefer plan.deinit();
+        var context = try original.platformDeadline();
+        context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s);
+        try context.ensureActive();
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const scratch = arena.allocator();

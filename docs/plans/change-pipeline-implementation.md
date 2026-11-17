@@ -5742,3 +5742,52 @@ Source-catalog, engine-error and OpenAPI checks passed
 (`source-retained-admission-recovery-contract-check.log`), including nine schema
 fragment tests. All original outstanding full-scope acceptance criteria remain
 open; no issue is closed and no protocol or ABI changes are introduced.
+
+### Bind retained admission to one metadata reservation and native checkpoint
+
+`source_destination_admission.zig` now checks the actor's exact reservation and
+artifact ledger grant against its bounded retained manifest. It verifies source
+binding/generation/domain, reservation identity, original transaction, artifact
+specification, source input fingerprint and complete checkpoint command before
+using native evidence. Retired artifact grants fail closed. Admission requires
+the metadata sealed phase; a native seal alone does not authorize it.
+
+Checkpoint resolution validates a request-bound native observation. Absence is
+unproven, expiry is explicit, and only positive original checkpoint evidence
+returns fixed owned acceptance proof. That proof is separate from all-owner
+completion, source ACK, index visibility and retention release. The admission
+path loads the original sealed artifact, freshly qualifies its original owners,
+and invokes scoped retained recovery. An unknown mutation response permits only
+a checkpoint read in the same pass, never automatic write replay.
+
+`Coordinator.qualifyRetained` takes ownership of an already verified plan on all
+paths. Both byte-based restoration and destination admission use it, avoiding a
+second full frozen-plan encode/decode while capturing fresh transport authority.
+Focused `completion-frozen-plan-test -Dstrip=true -j1` passed all five selected
+tests (`source-destination-admission-test.log`), zero skips/failures/leaks. Tests
+cover metadata/payload identity substitution, native checkpoint correlation,
+unproven absence, seal gating before checkpoint access and positive acceptance
+without touching admission/artifact callbacks. Linked qualification follows.
+
+Production actor/adapter wiring, durable release authority and artifact manifest
+retention after metadata acceptance, real lifecycle registration/handover and the
+full original remaining acceptance criteria are still unfinished.
+
+Final `completion-frozen-plan-test history-control-apply-test -Dstrip=true -j1`
+exited 0 (`source-destination-admission-qualified-test.log`): all five focused
+tests, 27 selected linked tests and six selected local tests passed, zero
+skips/failures/leaks. The real forwarding-node/authenticated HTTP/native owner
+fixture now constructs a source-identity-bound local reservation/ledger grant,
+resolves its genuinely absent native checkpoint through production ports, and
+verifies that the complete qualified native observation remains unchanged. The
+fixture still grants metadata state locally and never invokes real source BEGIN;
+it does not prove full worker handover or successful source activation/admission.
+
+Source-catalog, engine-error and OpenAPI checks passed
+(`source-destination-admission-contract-check.log`), including nine schema
+fragment tests. No protocol, persisted format or runtime ABI changes occur in
+this step. The original full scope remains active. In particular, production
+metadata acceptance must retain sufficient original manifest authority for later
+completion/reclamation instead of losing it when the pending reservation clears.
+That durability contract, actor/worker wiring and all remaining original issue
+acceptance criteria are unfinished.
