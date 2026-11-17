@@ -338,6 +338,38 @@ pub const Storage = struct {
         try save(txn, .{ .domain = id, .owner_epoch = epoch });
     }
 
+    /// Activate a newly allocated graph incarnation. The catalog participant
+    /// must prove that the logical graph itself is empty under its creation
+    /// fence. The ordered store checks for leaked integrity rows separately.
+    pub fn activateNewIncarnation(txn: anytype, id: Digest, epoch: u64) !void {
+        var state = try load(txn, id);
+        if (state.owner_epoch != epoch) return error.GraphConstraintOwnerChanged;
+        if (state.phase == .active) return;
+        if (state.phase != .validating or state.revision != 0) return error.GraphConstraintNotReady;
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const suffix = std.fmt.bytesToHex(id, .lower);
+        try requireEmptyPrefix(&cursor, &(Adjacency.prefix.* ++ id));
+        try requireEmptyPrefix(&cursor, &(Membership.prefix.* ++ id));
+        try requireEmptyPrefix(&cursor, &(Contributions.prefix.* ++ id));
+        try requireEmptyPrefix(&cursor, &(receipt_prefix.* ++ suffix));
+        try requireEmptyPrefix(&cursor, &proofKey(id));
+        state.phase = .active;
+        try save(txn, state);
+    }
+
+    fn requireEmptyPrefix(cursor: anytype, prefix: []const u8) !void {
+        if (try cursor.seekAtOrAfter(prefix)) |entry| {
+            if (std.mem.startsWith(u8, entry.key, prefix)) return error.GraphConstraintNotReady;
+        }
+    }
+
+    pub fn retire(txn: anytype, id: Digest, epoch: u64) !void {
+        var state = try load(txn, id);
+        try state.retire(epoch);
+        try save(txn, state);
+    }
+
     fn save(txn: anytype, state: State) !void {
         try txn.put(&stateKey(state.domain), &try state.encode());
     }
@@ -1087,9 +1119,13 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     const remove = [_]Contributions.Replacement{
         .{ .owner = @splat(2), .source = "a", .targets = &.{} },
     };
-    try Storage.save(&txn, .{ .domain = id, .owner_epoch = 1, .phase = .active });
+    try Storage.create(&txn, id, 1);
     const edge = try std.mem.concat(alloc, u8, &.{ Adjacency.prefix, &id, "\x00\x00\x00\x01ab" });
     defer alloc.free(edge);
+    try txn.put(edge, "");
+    try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, id, 1));
+    try txn.delete(edge);
+    try Storage.activateNewIncarnation(&txn, id, 1);
     for ([_][]const Contributions.Replacement{ &initial, &transfer, &remove }, 0..) |replacements, revision| {
         var attempt = testAttempt(@intCast(revision + 1));
         attempt.candidate = Contributions.candidate(versions, replacements);
@@ -1109,9 +1145,12 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
             var rejected = testAttempt(9);
             rejected.candidate = Contributions.candidate(versions, reverse);
             const reverse_token = (try Storage.begin(&txn, id, 1, 2, rejected)).reserved;
+            try std.testing.expectError(error.GraphConstraintBusy, Storage.retire(&txn, id, 1));
             try std.testing.expectError(error.GraphCycle, Contributions.prepare(alloc, &txn, reverse_token, versions, reverse, &budget, &witness));
             try std.testing.expectError(error.GraphConstraintNotValidated, Contributions.accept(alloc, &txn, reverse_token, versions, reverse));
             _ = try Storage.reject(&txn, reverse_token, .semantic_rejection);
         }
     }
+    try Storage.retire(&txn, id, 1);
+    try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, id, 1));
 }
