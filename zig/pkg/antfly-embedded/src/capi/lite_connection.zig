@@ -1648,7 +1648,9 @@ pub const WriterLane = struct {
         self.parked = lease;
         self.parked_since_ns = now;
         self.parked_store = if (owner.current) |current| current.owned_lite_backend.?.native_docstore else null;
-        self.last_root = owner.current;
+        // A borrower may have released and reacquired the lease, or written
+        // through another instance: the next checkout must refresh.
+        self.last_root = null;
         self.checked_out = false;
         self.mutex.unlock(io);
         self.signalReleased(io);
@@ -3791,7 +3793,6 @@ pub const Owner = struct {
         self.gate.mutex.lockUncancelable(io);
         defer self.gate.mutex.unlock(io);
         if (maintenance_error) |err| {
-            std.debug.print("DBGMAINT err={s}\n", .{@errorName(err)});
             self.publication_stats.maintenance_errors +|= 1;
             self.publication_stats.last_maintenance_error = @errorName(err);
         } else self.publication_stats.last_maintenance_error = null;
