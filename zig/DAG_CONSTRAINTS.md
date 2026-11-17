@@ -22,9 +22,12 @@ Implemented sources:
 - `pkg/antfly-embedded/src/graph/dag_test.zig`: composition tests demonstrating
   why independently successful traversals cannot authorize opposing commits.
 
-The authority module is a value-level state machine. No current production owner
-persists or applies it. Its serialization tests demonstrate recovery of values,
-not recovery of an integrated distributed publication protocol. The validator's
+The authority module also provides transactional staging for the accepted
+adjacency, owner counts, validation proof and terminal receipts. The proof
+binds the staged adjacency and count updates to the reserved attempt and
+accepted revision across owner changes. The count reconciler takes effective
+changes after source precedence, so an edge remains present when another
+effective owner survives. Production writers do not yet call these adapters. The validator's
 `validateExisting` entry point requires complete enumeration; it does not provide
 resumable activation or a certificate of enumeration completeness.
 

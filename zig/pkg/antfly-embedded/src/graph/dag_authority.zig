@@ -284,7 +284,7 @@ pub const Storage = struct {
         return proof_prefix.* ++ std.fmt.bytesToHex(id, .lower);
     }
 
-    fn proof(token: Token, changes: []const validation.Change) Digest {
+    fn proof(token: Token, changes: []const validation.Change, membership: []const Membership.Update) Digest {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly/dag-adjacency-proof/v1");
         hash.update(&token.attempt.id);
@@ -293,15 +293,27 @@ pub const Storage = struct {
         var size: [8]u8 = undefined;
         std.mem.writeInt(u64, &size, token.revision, .little);
         hash.update(&size);
-        for (changes) |change| {
-            for ([_][]const u8{ change.source, change.target }) |key| {
-                std.mem.writeInt(u64, &size, key.len, .little);
-                hash.update(&size);
-                hash.update(key);
-            }
-            hash.update(&.{@intFromBool(change.present)});
+        std.mem.writeInt(u64, &size, changes.len, .little);
+        hash.update(&size);
+        for (changes) |change| hashChange(&hash, change);
+        std.mem.writeInt(u64, &size, membership.len, .little);
+        hash.update(&size);
+        for (membership) |update| {
+            hashChange(&hash, update.edge);
+            std.mem.writeInt(u64, &size, update.owners, .little);
+            hash.update(&size);
         }
         return hash.finalResult();
+    }
+
+    fn hashChange(hash: *std.crypto.hash.sha2.Sha256, change: validation.Change) void {
+        var size: [8]u8 = undefined;
+        for ([_][]const u8{ change.source, change.target }) |key| {
+            std.mem.writeInt(u64, &size, key.len, .little);
+            hash.update(&size);
+            hash.update(key);
+        }
+        hash.update(&.{@intFromBool(change.present)});
     }
 
     fn stateKey(id: Digest) [state_prefix.len + 64]u8 {
@@ -349,6 +361,7 @@ pub const Storage = struct {
         txn: anytype,
         token: Token,
         changes: []const validation.Change,
+        membership: []const Membership.Update,
         budget: *validation.Budget,
         witness: *validation.Witness,
     ) !void {
@@ -356,7 +369,7 @@ pub const Storage = struct {
         try state.require(token);
         const reader: Adjacency.Reader(@TypeOf(txn)) = .{ .txn = txn, .domain_id = token.domain };
         try validation.validate(alloc, reader, changes, budget, witness);
-        const digest = proof(token, changes);
+        const digest = proof(token, changes, membership);
         if (state.pending.?.validated) {
             try requireProof(txn, token.domain, digest);
             return;
@@ -418,6 +431,7 @@ pub const Storage = struct {
         txn: anytype,
         token: Token,
         changes: []const validation.Change,
+        membership: []const Membership.Update,
     ) !Receipt {
         if (try readReceipt(txn, token.domain, token.attempt)) |_| {
             return resolve(txn, token, .accepted);
@@ -425,9 +439,10 @@ pub const Storage = struct {
         const state = try load(txn, token.domain);
         try state.require(token);
         if (!state.pending.?.validated) return error.GraphConstraintNotValidated;
-        try requireProof(txn, token.domain, proof(token, changes));
+        try requireProof(txn, token.domain, proof(token, changes, membership));
         const receipt = try resolve(txn, token, .accepted);
         try Adjacency.stage(alloc, txn, token.domain, changes);
+        try Membership.stage(alloc, txn, token.domain, membership);
         return receipt;
     }
 
@@ -470,6 +485,7 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
         receipt: ?[89]u8 = null,
         proof_value: ?Digest = null,
         edges: usize = 0,
+        owners: u64 = 0,
 
         const Cursor = struct {
             const Entry = struct { key: []const u8 };
@@ -506,6 +522,8 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
                 self.proof_value = raw[0..32].*;
             } else if (std.mem.startsWith(u8, key, Adjacency.prefix)) {
                 self.edges += 1;
+            } else if (std.mem.startsWith(u8, key, Membership.prefix)) {
+                self.owners = std.mem.readInt(u64, raw[0..8], .little);
             } else {
                 self.receipt = raw[0..89].*;
             }
@@ -519,19 +537,22 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
     const token = (try Storage.begin(&txn, state.domain, 1, 0, testAttempt(1))).reserved;
     const alloc = std.testing.allocator;
     const changes: []const Storage.validation.Change = &.{.{ .source = "a", .target = "b", .present = true }};
+    const membership: []const Membership.Update = &.{.{ .edge = changes[0], .owners = 2 }};
     var budget: Storage.validation.Budget = .{ .clock = .{ .context = &txn, .now = Txn.now } };
     var witness: Storage.validation.Witness = .{};
-    try std.testing.expectError(error.GraphConstraintNotValidated, Storage.accept(alloc, &txn, token, changes));
-    try Storage.validate(alloc, &txn, token, changes, &budget, &witness);
-    try std.testing.expectError(error.GraphConstraintAttemptConflict, Storage.accept(alloc, &txn, token, &.{}));
-    try std.testing.expectError(error.GraphConstraintAttemptConflict, Storage.validate(alloc, &txn, token, &.{}, &budget, &witness));
+    try std.testing.expectError(error.GraphConstraintNotValidated, Storage.accept(alloc, &txn, token, changes, membership));
+    try Storage.validate(alloc, &txn, token, changes, membership, &budget, &witness);
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, Storage.accept(alloc, &txn, token, changes, &.{}));
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, Storage.accept(alloc, &txn, token, &.{}, &.{}));
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, Storage.validate(alloc, &txn, token, &.{}, &.{}, &budget, &witness));
     try Storage.takeover(&txn, state.domain, 1, 2);
-    try std.testing.expectError(error.GraphConstraintOwnerChanged, Storage.accept(alloc, &txn, token, changes));
+    try std.testing.expectError(error.GraphConstraintOwnerChanged, Storage.accept(alloc, &txn, token, changes, membership));
     const recovered = try Storage.load(&txn, state.domain);
     const current = (try recovered.recoveryToken(2)).?;
-    const receipt = try Storage.accept(alloc, &txn, current, changes);
-    try std.testing.expectEqualDeep(receipt, try Storage.accept(alloc, &txn, current, changes));
+    const receipt = try Storage.accept(alloc, &txn, current, changes, membership);
+    try std.testing.expectEqualDeep(receipt, try Storage.accept(alloc, &txn, current, changes, membership));
     try std.testing.expectEqual(@as(usize, 1), txn.edges);
+    try std.testing.expectEqual(@as(u64, 2), txn.owners);
     try std.testing.expectEqualDeep(receipt, (try Storage.begin(&txn, state.domain, 2, 0, testAttempt(1))).terminal);
     var conflicting = testAttempt(1);
     conflicting.candidate = @splat(2);
@@ -590,6 +611,103 @@ pub const Adjacency = struct {
                 return .{ .key = owned, .target = owned[source_prefix.len..] };
             }
         };
+    }
+};
+
+/// Reduces effective contributor changes to boolean adjacency. Source
+/// precedence must already have been applied within each logical contribution.
+/// Input is ordered by endpoint, with all changes for an endpoint contiguous.
+pub const Membership = struct {
+    const validation = @import("dag_validation.zig");
+    const prefix = "\x00\x00__metadata__:dag-members:";
+    const A = std.mem.Allocator;
+
+    pub const Update = struct {
+        edge: validation.Change,
+        owners: u64,
+    };
+
+    fn key(alloc: A, id: Digest, edge: validation.Change) ![]u8 {
+        const encoded = try Adjacency.sourcePrefix(alloc, id, edge.source);
+        defer alloc.free(encoded);
+        return std.mem.concat(alloc, u8, &.{ prefix, encoded[Adjacency.prefix.len..], edge.target });
+    }
+
+    fn read(txn: anytype, storage_key: []const u8) !u64 {
+        const raw = txn.get(storage_key) catch |err| {
+            if (err == error.NotFound) return 0;
+            return err;
+        };
+        if (raw.len != 8) return error.InvalidDagAuthority;
+        const count = std.mem.readInt(u64, raw[0..8], .little);
+        if (count == 0) return error.InvalidDagAuthority;
+        return count;
+    }
+
+    fn order(a: validation.Change, b: validation.Change) std.math.Order {
+        const source_order = std.mem.order(u8, a.source, b.source);
+        if (source_order != .eq) return source_order;
+        return std.mem.order(u8, a.target, b.target);
+    }
+
+    /// Caller owns both arrays and may reuse them across retries. The capacity
+    /// needed for each is at most the number of contributor changes.
+    pub fn reconcile(
+        alloc: A,
+        txn: anytype,
+        id: Digest,
+        input: []const validation.Change,
+        updates: []Update,
+        adjacency: []validation.Change,
+        budget: *validation.Budget,
+    ) !struct { updates: usize, adjacency: usize } {
+        if (updates.len < input.len or adjacency.len < input.len) return error.GraphConstraintCapacity;
+        var update_count: usize = 0;
+        var adjacency_count: usize = 0;
+        var index: usize = 0;
+        while (index < input.len) {
+            const edge = input[index];
+            var added: u64 = 0;
+            var removed: u64 = 0;
+            while (index < input.len and order(edge, input[index]) == .eq) : (index += 1) {
+                try budget.consume(.edges, 1);
+                try budget.consume(.bytes, edge.source.len);
+                try budget.consume(.bytes, edge.target.len);
+                if (input[index].present) added += 1 else removed += 1;
+            }
+            if (index < input.len and order(edge, input[index]) != .lt) return error.InvalidDagMutation;
+            try budget.consume(.requests, 1);
+            const storage_key = try key(alloc, id, edge);
+            defer alloc.free(storage_key);
+            const before = try read(txn, storage_key);
+            try budget.checkpoint();
+            if (removed > before) return error.InvalidDagMutation;
+            const after = std.math.add(u64, before - removed, added) catch return error.GraphConstraintCapacity;
+            if (before == after) continue;
+            const change: validation.Change = .{ .source = edge.source, .target = edge.target, .present = after != 0 };
+            updates[update_count] = .{ .edge = change, .owners = after };
+            update_count += 1;
+            if ((before != 0) != change.present) {
+                adjacency[adjacency_count] = change;
+                adjacency_count += 1;
+            }
+        }
+        return .{ .updates = update_count, .adjacency = adjacency_count };
+    }
+
+    /// Stage alongside the validated adjacency and the new owner manifests.
+    pub fn stage(alloc: A, txn: anytype, id: Digest, updates: []const Update) !void {
+        for (updates) |update| {
+            const storage_key = try key(alloc, id, update.edge);
+            defer alloc.free(storage_key);
+            if (update.owners == 0) {
+                try txn.delete(storage_key);
+            } else {
+                var raw: [8]u8 = undefined;
+                std.mem.writeInt(u64, &raw, update.owners, .little);
+                try txn.put(storage_key, &raw);
+            }
+        }
     }
 };
 
@@ -652,4 +770,46 @@ test "DAG adjacency cursor stays inside its source and resumes strictly after a 
     try std.testing.expectEqualStrings("second", second.target);
     try std.testing.expect(try reader.next(alloc, "a", second.key, &budget) == null);
     try std.testing.expectEqual(@as(usize, 3), budget.stats.requests);
+}
+
+test "DAG membership emits removal only after the final effective owner leaves" {
+    const Txn = struct {
+        count: ?[8]u8 = null,
+        fn get(self: *@This(), _: []const u8) ![]const u8 {
+            if (self.count) |*count| return count;
+            return error.NotFound;
+        }
+        fn put(self: *@This(), _: []const u8, value: []const u8) !void {
+            self.count = value[0..8].*;
+        }
+        fn delete(self: *@This(), _: []const u8) !void {
+            self.count = null;
+        }
+        fn now(_: *anyopaque) u64 {
+            return 0;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const id: Digest = @splat(1);
+    var txn: Txn = .{};
+    var budget: Membership.validation.Budget = .{ .clock = .{ .now = Txn.now, .context = &txn } };
+    const add: Membership.validation.Change = .{ .source = "a", .target = "b", .present = true };
+    var remove = add;
+    remove.present = false;
+    var updates: [2]Membership.Update = undefined;
+    var adjacency: [2]Membership.validation.Change = undefined;
+    const first = try Membership.reconcile(alloc, &txn, id, &.{ add, add }, &updates, &adjacency, &budget);
+    try std.testing.expectEqual(@as(usize, 1), first.adjacency);
+    try std.testing.expect(adjacency[0].present);
+    try Membership.stage(alloc, &txn, id, updates[0..first.updates]);
+    const transfer = try Membership.reconcile(alloc, &txn, id, &.{ remove, add }, &updates, &adjacency, &budget);
+    try std.testing.expectEqual(@as(usize, 0), transfer.updates);
+    const second = try Membership.reconcile(alloc, &txn, id, &.{remove}, &updates, &adjacency, &budget);
+    try std.testing.expectEqual(@as(usize, 0), second.adjacency);
+    try Membership.stage(alloc, &txn, id, updates[0..second.updates]);
+    const third = try Membership.reconcile(alloc, &txn, id, &.{remove}, &updates, &adjacency, &budget);
+    try std.testing.expectEqual(@as(usize, 1), third.adjacency);
+    try std.testing.expect(!adjacency[0].present);
+    try Membership.stage(alloc, &txn, id, updates[0..third.updates]);
+    try std.testing.expectError(error.InvalidDagMutation, Membership.reconcile(alloc, &txn, id, &.{remove}, &updates, &adjacency, &budget));
 }
