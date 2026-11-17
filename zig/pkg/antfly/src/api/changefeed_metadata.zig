@@ -288,6 +288,8 @@ pub const test_support = if (@import("builtin").is_test) struct {
             state: control.State,
             sealed: control.State,
             commit: bool = true,
+            refreshed: ?control.Write = null,
+            refreshes: usize = 0,
             reject: bool = false,
             acknowledge: bool = false,
             read_unavailable: bool = false,
@@ -298,6 +300,14 @@ pub const test_support = if (@import("builtin").is_test) struct {
                 if (self.read_unavailable) return error.ReadUnavailable;
                 return control.encode(allocator, self.state);
             }
+            fn refresh(raw: *anyopaque, _: A, request: @import("../pgwire/backend.zig").Request) anyerror!control.Write {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try request.check();
+                self.refreshes += 1;
+                self.reject = false;
+                return self.refreshed orelse error.TestUnexpectedResult;
+            }
+
             fn mutate(raw: *anyopaque, _: A, _: control.Write, _: Context) anyerror!void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 self.mutations += 1;
@@ -353,6 +363,28 @@ pub const test_support = if (@import("builtin").is_test) struct {
         var stale = drop;
         stale.expected_epoch += 1;
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.dropSlot(a, stale, context));
+        const active = try (control.Mutation{ .slot = .{ .acquire = .{ .actor = @splat(4), .expected = 0, .now = 101, .expires = 150 } } }).apply(scratch, sealed, .{ .incarnation = stamp.incarnation, .sequence = 5 });
+        fake.state = active;
+        var refreshed = drop;
+        refreshed.expected_revision = active.revision;
+        refreshed.mutation.slot.drop.now = 150;
+        fake.sealed = try refreshed.apply(scratch, active, 6);
+        fake.refreshed = refreshed;
+        fake.reject = true;
+        var cancellation = std.atomic.Value(bool).init(false);
+        const request: @import("../pgwire/backend.zig").Request = .{
+            .statement = "DROP_REPLICATION_SLOT slot WAIT",
+            .limit = 1,
+            .io = std.testing.io,
+            .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } },
+            .cancel_requested = &cancellation,
+        };
+        const refresh_port: commands.DropRefresh = .{ .ptr = &fake, .read = Fake.refresh };
+        const waited = try commands.dropWait(port, a, .{ .drop_slot = .{ .slot = configuration.name, .wait = true } }, drop, request, context, refresh_port);
+        try std.testing.expect(waited.mutation_outcome == .committed);
+        try std.testing.expectEqual(@as(usize, 1), fake.refreshes);
+        cancellation.store(true, .release);
+        try std.testing.expectError(error.QueryCanceled, commands.dropWait(port, a, .{ .drop_slot = .{ .slot = configuration.name, .wait = true } }, drop, request, context, refresh_port));
     }
 
     fn readAllocations(a: A, port: Port, id: control.Id, context: Context) !void {

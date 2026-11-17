@@ -187,6 +187,51 @@ pub const SlotCommands = struct {
         return .{ .command_tag = "DROP_REPLICATION_SLOT", .mutation_outcome = .committed };
     }
 
+    pub const DropRefresh = struct {
+        ptr: *anyopaque,
+        /// Reauthorize the same slot and capture its latest metadata revision
+        /// and the current trusted lease clock under the original request.
+        read: *const fn (*anyopaque, std.mem.Allocator, wire.Request) anyerror!control.Write,
+    };
+
+    pub fn dropWait(
+        metadata: Metadata,
+        alloc: std.mem.Allocator,
+        command: wire.replication_commands.Command,
+        original: control.Write,
+        request: wire.Request,
+        context: operation.RequestContext,
+        refresh: DropRefresh,
+    ) !wire.Result {
+        if (command != .drop_slot or original.mutation != .slot or original.mutation.slot != .drop) return error.InvalidChangefeed;
+        var write = original;
+        while (true) {
+            try request.check();
+            return drop(metadata, alloc, command, write, context) catch |err| {
+                if (!command.drop_slot.wait or err != error.ReplicationSlotActive) return err;
+                try request.io.sleep(.fromMilliseconds(25), .awake);
+                try request.check();
+                try context.ensureActive();
+                var scratch = std.heap.ArenaAllocator.init(alloc);
+                defer scratch.deinit();
+                const current = try refresh.read(refresh.ptr, scratch.allocator(), request);
+                try current.validate();
+                if (current.mutation != .slot or current.mutation.slot != .drop) return error.InvalidChangefeed;
+                const next = current.mutation.slot.drop;
+                const previous = write.mutation.slot.drop;
+                if (!std.meta.eql(current.id, original.id) or !std.meta.eql(current.authority, original.authority) or
+                    !std.meta.eql(current.owner, original.owner) or !std.meta.eql(current.authorization, original.authorization) or
+                    current.expected_epoch != original.expected_epoch or current.expected_revision < write.expected_revision or
+                    !std.meta.eql(next.database, previous.database) or !std.mem.eql(u8, next.name, previous.name) or
+                    next.now < previous.now) return error.ChangefeedConflict;
+                // Only these scalar values survive the refresh arena.
+                write.expected_revision = current.expected_revision;
+                write.mutation.slot.drop.now = next.now;
+                continue;
+            };
+        }
+    }
+
     pub fn create(
         metadata: Metadata,
         alloc: std.mem.Allocator,
