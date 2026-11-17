@@ -29568,7 +29568,7 @@ pub const DB = struct {
         var resolved_finalized: u64 = 0;
         for (txns) |txn| {
             if (txn.status == .pending or
-                (!(try self.core.transactionHasIntents(txn.txn_id)) and !(try self.core.transactionHasReplicationOutbox(txn.txn_id)))) continue;
+                (!txn.dag_prepared and !(try self.core.transactionHasIntents(txn.txn_id)) and !(try self.core.transactionHasReplicationOutbox(txn.txn_id)))) continue;
             const resolve_version = if (txn.status == .committed and txn.commit_version != 0)
                 txn.commit_version
             else

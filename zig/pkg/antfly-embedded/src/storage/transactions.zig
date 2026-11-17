@@ -5291,12 +5291,15 @@ test "DAG transaction prepare and resolution share the primary transaction" {
     defer store.close();
     var manager = try TxnManager.init(alloc, &store);
     defer manager.deinit();
-    const domain: dag.Digest = @splat(1);
+    const domain: dag.Digest = @splat(2);
+    const earlier_domain: dag.Digest = @splat(1);
     {
         var writer = try store.beginWriteTxn();
         errdefer writer.abort();
-        try dag.Storage.create(&writer, domain, 1);
-        try dag.Storage.activateNewIncarnation(&writer, domain, 1);
+        for ([_]dag.Digest{ earlier_domain, domain }) |domain_id| {
+            try dag.Storage.create(&writer, domain_id, 1);
+            try dag.Storage.activateNewIncarnation(&writer, domain_id, 1);
+        }
         try writer.commit();
     }
     const clock = struct {
@@ -5323,15 +5326,19 @@ test "DAG transaction prepare and resolution share the primary transaction" {
             .candidate = dag.Contributions.candidate(versions, replacements),
         };
         try manager.initTransaction(id, 100);
+        const current: DagDomainPrepare = .{
+            .domain = domain,
+            .epoch = 1,
+            .revision = revision,
+            .attempt = attempt,
+            .producer_versions = versions,
+            .replacements = replacements,
+        };
+        var earlier = current;
+        earlier.domain = earlier_domain;
+        earlier.revision = 0;
         const extra: MutationExtraBatch = .{ .dag_prepare = .{
-            .domains = &.{.{
-                .domain = domain,
-                .epoch = 1,
-                .revision = revision,
-                .attempt = attempt,
-                .producer_versions = versions,
-                .replacements = replacements,
-            }},
+            .domains = if (revision == 0) &.{current} else &.{ earlier, current },
             .budget = &budget,
             .witness = &witness,
         } };
@@ -5354,6 +5361,9 @@ test "DAG transaction prepare and resolution share the primary transaction" {
                 const state = try dag.Storage.load(&reader, domain);
                 try std.testing.expectEqual(@as(u64, 1), state.revision);
                 try std.testing.expect(state.pending == null);
+                const rolled_back = try dag.Storage.load(&reader, earlier_domain);
+                try std.testing.expect(rolled_back.pending == null);
+                try std.testing.expectEqual(@as(u64, 0), rolled_back.revision);
             }
             try manager.resolveIntents(id, .aborted, 200);
         }
