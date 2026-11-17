@@ -14130,7 +14130,7 @@ pub const DataServer = struct {
     const LegacyRead = @import("antfly_local_sources").storage_source_legacy_terminal_ordered;
     const ProducerControlHttp = @import("source_producer_control_http_wire.zig");
     const CheckpointRead = @import("antfly_local_sources").storage_source_checkpoint_read;
-    const NativeControlKind = enum { history, source_plan, source_scope, source_retirement, producer_closure };
+    const NativeControlKind = enum { history, source_plan, source_scope, source_retirement, producer_closure, legacy_terminal };
     fn NativeControlCommand(comptime kind: NativeControlKind) type {
         return switch (kind) {
             .history => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Command,
@@ -14138,6 +14138,7 @@ pub const DataServer = struct {
             .source_scope => ScopeRead.Command,
             .source_retirement => @import("antfly_local_sources").storage_source_scope_retirement.Command,
             .producer_closure => @import("antfly_local_sources").storage_transaction_completion.RoutedOwner,
+            .legacy_terminal => LegacyRead.policy.LegacyTerminalCommand,
         };
     }
     fn NativeControlOutcome(comptime kind: NativeControlKind) type {
@@ -14147,6 +14148,7 @@ pub const DataServer = struct {
             .source_scope => @import("antfly_local_sources").storage_source_scope_ordered.Outcome,
             .source_retirement => @import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery,
             .producer_closure => ProducerRead.Observation,
+            .legacy_terminal => LegacyRead.Observation,
         };
     }
     fn NativeControlReceipt(comptime kind: NativeControlKind) type {
@@ -14156,6 +14158,7 @@ pub const DataServer = struct {
             .source_scope => ScopeRead.scope.Cut,
             .source_retirement => ScopeRead.scope.Cut,
             .producer_closure => ScopeRead.scope.Cut,
+            .legacy_terminal => ScopeRead.scope.Cut,
         };
     }
     fn ControlSubmission(comptime kind: NativeControlKind) type {
@@ -14164,6 +14167,7 @@ pub const DataServer = struct {
     pub const HistorySubmission = ControlSubmission(.history);
     pub const SourcePlanSubmission = ControlSubmission(.source_plan);
     pub const SourceProducerClosureSubmission = ControlSubmission(.producer_closure);
+    pub const LegacyTerminalSubmission = ControlSubmission(.legacy_terminal);
     pub const SourceScopeSubmission = struct {
         command: ScopeRead.Command,
         entry: ScopeRead.scope.Cut,
@@ -14272,6 +14276,24 @@ pub const DataServer = struct {
         return self.recoverNativeControlLocal(a, fence, table, .producer_closure, original_owner, receipt, receipt.index);
     }
 
+    /// Admit only against a qualified persisted closure. The actual native
+    /// writer independently verifies the retained original terminal decision.
+    pub fn submitLegacyTerminalLocal(self: *DataServer, a: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, command: LegacyRead.policy.LegacyTerminalCommand) !LegacyTerminalSubmission {
+        try command.validate();
+        try @import("../api/source_owner_scope.zig").requireFence(command.owner, original_fence);
+        var scope = try @import("../api/history_publication_operations.zig").Scope.init(original_fence, .{});
+        const context = scope.context();
+        try context.ensureActive();
+        var fence = original_fence;
+        fence.admission_deadline_ns = context.deadline_ns;
+        fence.admission_deadline_io = context.deadline_io;
+        fence.admission_cancellation = context.cancellation;
+        const closure = try self.sourcePlanLocalRead(a, fence, table, .producer_closure, .{ .version = 1, .owner = command.owner, .minimum_applied_index = 1 }, context);
+        if (closure.closure == null) return error.SourcePendingWork;
+        try context.ensureActive();
+        return self.submitNativeControlLocal(a, fence, table, .legacy_terminal, command);
+    }
+
     fn submitNativeControlLocal(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table_name: []const u8, comptime kind: NativeControlKind, command: NativeControlCommand(kind)) !ControlSubmission(kind) {
         if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
         const raft = self.data_raft orelse return error.ChangefeedCapabilityUnsupported;
@@ -14297,6 +14319,7 @@ pub const DataServer = struct {
             .source_scope => @import("source_scope_entry.zig").required_protocol_version,
             .source_retirement => @import("source_retirement_entry.zig").required_protocol_version,
             .producer_closure => @import("source_producer_closure_entry.zig").required_protocol_version,
+            .legacy_terminal => @import("source_legacy_terminal_entry.zig").required_protocol_version,
         };
         // Create cache ownership atomically with the hosted-group check, so
         // retirement cannot clean the group just before a stale insertion.
@@ -14340,6 +14363,7 @@ pub const DataServer = struct {
         if (descriptor.identity.table_id != expected_identity.table_id or descriptor.identity.shard_id != expected_identity.shard_id or descriptor.identity.range_id != expected_identity.range_id) return error.HistoryResynchronizationRequired;
         if (comptime kind == .source_plan) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.source_owner, context);
         if (comptime kind == .producer_closure) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command, context);
+        if (comptime kind == .legacy_terminal) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.owner, context);
         if (comptime kind == .source_scope or kind == .source_retirement) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.intent.owner, context);
         const encoded = switch (kind) {
             .history => try @import("history_control_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .history_control = .{ .command = command } }, required),
@@ -14347,6 +14371,7 @@ pub const DataServer = struct {
             .source_scope => try @import("source_scope_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.intent.owner, .source_scope_control = command }, required),
             .source_retirement => try @import("source_retirement_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.intent.owner, .source_retirement = command }, required),
             .producer_closure => try @import("source_producer_closure_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command, .source_producer_closure = true }, required),
+            .legacy_terminal => try @import("source_legacy_terminal_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.owner, .source_legacy_terminal = command }, required),
         };
         defer alloc.free(encoded);
         const durable = try self.durableDataRaftBatchProtocolVersion(group);
@@ -14442,6 +14467,7 @@ pub const DataServer = struct {
                 .source_scope => owner.sourceScopeOutcomeRouted(alloc, fence, table_name, .{ .command = command, .entry = receipt, .minimum_applied_index = minimum_applied_index }),
                 .source_retirement => owner.sourceRetirementOutcomeRouted(alloc, fence, table_name, .{ .command = command, .entry = receipt, .minimum_applied_index = minimum_applied_index }),
                 .producer_closure => owner.sourceProducerClosureObservationRouted(alloc, fence, table_name, .{ .version = 1, .owner = command, .minimum_applied_index = @max(minimum_applied_index, receipt.index) }),
+                .legacy_terminal => owner.legacyTerminalOutcomeRouted(alloc, fence, table_name, .{ .version = 1, .owner = command.owner, .command = command, .entry = receipt, .minimum_applied_index = @max(minimum_applied_index, receipt.index) }),
                 .source_plan => blk: {
                     var lookup = command;
                     lookup.operation = .recover;
@@ -45634,6 +45660,8 @@ fn consumerTests() type {
             };
             try @import("source_producer_closure_proposal_native_test.zig").run(a, server, route.fence().?, producer_closure_owner orelse return error.TestExpectedProducerOwner, DataRequestLifecycleEvent, ClosureHarness);
             try std.testing.expectEqual(@import("source_producer_closure_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try @import("source_legacy_terminal_proposal_native_test.zig").run(a, server, route.fence().?, producer_closure_owner orelse return error.TestExpectedProducerOwner, DataRequestLifecycleEvent, ClosureHarness);
+            try std.testing.expectEqual(@import("source_legacy_terminal_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
         }
 
         test "data raft ordered history table producer capability refuses lossy fallback" {

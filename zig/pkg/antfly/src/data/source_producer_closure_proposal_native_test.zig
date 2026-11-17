@@ -22,6 +22,10 @@ const Owner = local.storage_transaction_completion.RoutedOwner;
 pub fn run(a: std.mem.Allocator, server: anytype, fence: metadata.CatalogRouteFence, owner: Owner, comptime Event: type, comptime Harness: type) !void {
     const before = try server.sourceProducerClosureObservationPort().read(a, fence, "docs", .{ .version = 1, .owner = owner, .minimum_applied_index = 1 }, .{});
     try std.testing.expect(before.closure == null);
+    const preclosure_last = Harness.last(server, owner.group_id);
+    try std.testing.expectError(error.SourcePendingWork, server.submitLegacyTerminalLocal(a, fence, "docs", .{ .version = 1, .owner = owner, .proof = .{ .root = try local.storage_source_scope.Basis.fromOwner(owner), .transaction_id = @splat(196), .record_digest = @splat(197) } }));
+    try std.testing.expectEqual(preclosure_last, Harness.last(server, owner.group_id));
+
     var changed = owner;
     changed.root_generation += 1;
     const original_last = Harness.last(server, owner.group_id);

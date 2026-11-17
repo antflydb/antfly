@@ -3237,6 +3237,18 @@ pub const TxnManager = struct {
         // writer. Metadata-only ACK/cleanup does not create new row authority.
         const producer_policy = @import("source_producer_policy.zig");
         const producer_closed = try producer_policy.Store.readStored(scope_arena.allocator(), &batch);
+        if (legacy_terminal) |proof| {
+            // Terminal retries can stage only markers/receipts, with no record
+            // replacement in writes. Their authority must still be checked in
+            // this exact native writer, including a concurrent GC/reuse race.
+            try proof.validate();
+            const closed = producer_closed orelse return error.SourcePendingWork;
+            if (!std.meta.eql(closed.root, proof.root)) return error.SourceTransactionIdentityConflict;
+            const raw = batch.get(&makeRecordKey(proof.transaction_id)) catch |err| return if (err == error.NotFound) error.TxnNotFound else err;
+            if (!std.mem.eql(u8, &completion.bytesDigest(raw), &proof.record_digest)) return error.SourceTransactionIdentityConflict;
+            const original = try decodeRecord(raw);
+            if (original.status == .pending or original.ordinary_producer or original.source_scope != null or original.finalized_at == 0 or (original.status == .committed and original.commit_version == 0)) return error.SourceOutcomeUnresolved;
+        }
         // Scope state and the retained record/effects share this physical commit.
         // Inspect original records before staging any replacement record bytes.
         for (writes) |write| {
@@ -6914,9 +6926,17 @@ test "transaction source purpose closed legacy terminal recovery preserves origi
     // not reapply the original row over a newer value.
     const resolved_bytes = try manager.getAlloc(a, &makeRecordKey(commit.transaction_id));
     defer a.free(resolved_bytes);
+    const metadata_marker = "\x00\x00__metadata__:legacy_terminal_atomic_test";
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.applyBatchWithParticipant(&.{.{ .key = metadata_marker, .value = "stale" }}, &.{}, null, null, null, null, null, commit));
+    try std.testing.expectError(error.NotFound, manager.getAlloc(a, metadata_marker));
+    try std.testing.expectError(error.TxnNotFound, manager.applyBatchWithParticipant(&.{.{ .key = metadata_marker, .value = "absent" }}, &.{}, null, null, null, null, null, absent));
+    try std.testing.expectError(error.NotFound, manager.getAlloc(a, metadata_marker));
     commit.record_digest = completion.bytesDigest(resolved_bytes);
     try manager.putValue(commit_key, "newer");
-    try std.testing.expect(!(try manager.resolveClosedLegacyTerminal(commit, .{})).applied);
+    try std.testing.expect(!(try manager.resolveClosedLegacyTerminal(commit, .{ .completion_writes = &.{.{ .key = metadata_marker, .value = "current" }} })).applied);
+    const marked = try manager.getAlloc(a, metadata_marker);
+    defer a.free(marked);
+    try std.testing.expectEqualStrings("current", marked);
     const newer = try manager.getAlloc(a, commit_key);
     defer a.free(newer);
     try std.testing.expectEqualStrings("newer", newer);

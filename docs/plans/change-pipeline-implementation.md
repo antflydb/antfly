@@ -7889,3 +7889,56 @@ rejected outcomes, reject future/conflicting cuts and survive reopen without
 advancing markers. Contract and whitespace checks passed. This qualifies the
 read foundation; managed proposal, authenticated recovery transport, global
 handover/drainage and every full issue acceptance remain required.
+
+### Managed original-terminal recovery proposer (in progress)
+
+NativeControlKind now includes legacy_terminal with the exact shared command,
+protocol-47 envelope, accepted term/index and qualified read observation. The
+public internal submit method validates the original fence and independently
+reads persisted producer closure before any activation/proposal. One bounded
+request scope covers closure lookup, preflight, proposal and confirmation.
+Absent closure returns SourcePendingWork without appending a barrier/command.
+The common proposer supplies current membership eligibility, decoder preflight,
+serialized durable activation, complete descriptor/catalog owner admission,
+leader-term/membership revalidation and accepted-receipt preservation. Lost
+confirmation returns the accepted position with no fabricated outcome; recovery
+uses the existing read-only native outcome path.
+
+The live Raft fixture uses the actual retained legacy ABORT at transaction 249
+from its original authenticated BEGIN/PREPARE/resolve phases. After the original
+profile-46 checks, the new helper verifies stale/cancelled submission rejection,
+profile-47 activation, lost confirmation of positive terminal recovery,
+read-only recovery without log growth, known replay confirmation, a durable
+missing-record rejection, receipt supersession and unchanged document/strict
+registry state. This positive case retires no new row effects: its original
+ABORT was already resolved. Unresolved committed/aborted materialization remains
+covered by the existing DB/native-owner fixtures.
+
+Tracing marker-only positive recovery found an atomicity gap: final transaction
+writers checked the record proof only when replacing record bytes. Every batch
+with legacy recovery authority now rechecks closure basis and exact original
+record inside that writer, including marker-only retries. Real-store regression
+coverage proves stale or missing records cannot write a marker and a current
+proof can acknowledge the terminal retry without overwriting newer row state.
+Qualification is running (`source-legacy-terminal-proposer-test.log`); contract
+checks passed (`source-legacy-terminal-proposer-contract-check.log`). Authenticated
+transport, original pending decisions, cohort handover/drainage and all complete
+issue requirements remain required.
+
+Managed proposer qualification passed six local, 46 linked native/live-Raft and
+18 store/history cases, zero skips/failures/leaks
+(`source-legacy-terminal-proposer-test.log`). The selected live helper confirms
+an actual original retained ABORT after lost confirmation, proves recovery
+appends nothing, preserves known replay, handles durable missing-record rejection
+and bounded receipt supersession, and leaves document/strict-registry state
+unchanged. Missing closure, stale owner and cancellation admit no new proposal.
+The preexisting protocol checks still run before the new profile-47 helper.
+
+Additional final-writer regression passed both physical-owner cases and the
+actual compiled-engine source-scope DB case, zero skips/failures/leaks
+(`source-legacy-terminal-proposer-storage-regression.log`). Unresolved original
+COMMIT/ABORT materialization, row-history images, opaque-owner reopen and exact
+replay remain correct with the stronger marker-only proof guard. Contract and
+whitespace checks passed. No authenticated transport, pending-decision authority,
+global worker handover, drainage, strict activation or full issue completion is
+claimed.
