@@ -17858,8 +17858,22 @@ const ContextDependencyFence = struct {
 /// published current) since its last accepted output.
 fn contextRebuildDueTxn(alloc: Allocator, read: anytype, request: enrichment_types.GeneratedEnrichmentRequest) !bool {
     if (request.context_sources_json.len == 0) return false;
-    var reader = context_dependency_store.TxnReader(@TypeOf(read.*)){ .txn = read };
-    var state = (try context_dependency_store.loadState(alloc, reader.reader(), null, request.doc_key, requestArtifactName(request))) orelse return false;
+    // Probe transactions have point reads only; dependency state is one key.
+    const Point = struct {
+        fn get(p: *anyopaque, a: Allocator, key: []const u8) anyerror!?[]u8 {
+            const txn: @TypeOf(read) = @ptrCast(@alignCast(p));
+            const value = txn.get(key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            return try a.dupe(u8, value);
+        }
+        fn scan(_: *anyopaque, _: []const u8, _: []const u8, _: context_dependency_store.Reader.Visitor) anyerror!void {
+            return error.Unsupported;
+        }
+    };
+    const reader: context_dependency_store.Reader = .{ .ptr = @ptrCast(read), .get_fn = Point.get, .scan_fn = Point.scan };
+    var state = (try context_dependency_store.loadState(alloc, reader, null, request.doc_key, requestArtifactName(request))) orelse return false;
     defer state.deinit(alloc);
     return state.freshness != .current;
 }
