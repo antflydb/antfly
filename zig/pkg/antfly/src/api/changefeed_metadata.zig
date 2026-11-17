@@ -127,6 +127,32 @@ pub const Port = struct {
         return control.recoverSlotStart(observed.value, write, now);
     }
 
+    /// Apply the authorized drop once. An uncertain response is resolved by
+    /// observing the same slot's durable closing or deleted state.
+    pub fn dropSlot(self: Port, a: A, write: control.Write, context: Context) !void {
+        try write.validate();
+        if (write.mutation != .slot or write.mutation.slot != .drop) return error.InvalidChangefeed;
+        const drop = write.mutation.slot.drop;
+        if (!std.mem.eql(u8, &write.id, &control.pg_slot.feedId(drop.database, drop.name))) return error.InvalidChangefeed;
+        self.mutate(a, write, context) catch |err| {
+            if (err != error.MetadataMutationOutcomeUnknown) return err;
+            const bytes = self.read(a, write.id, context) catch return err;
+            defer a.free(bytes);
+            var observed = control.parse(a, bytes) catch return err;
+            defer observed.deinit();
+            const state = observed.value;
+            if (state.phase != .closing and state.phase != .deleted) return err;
+            const definition = state.definition orelse return err;
+            const slot = state.slot orelse return err;
+            if (state.revision < write.expected_revision or state.epoch != write.expected_epoch or
+                !std.mem.eql(u8, &state.authority, &write.authority) or
+                !std.mem.eql(u8, &definition.owner, &write.owner) or
+                !std.mem.eql(u8, &definition.authorization, &write.authorization) or
+                !std.mem.eql(u8, &slot.database, &drop.database) or
+                !std.mem.eql(u8, slot.name, drop.name)) return err;
+        };
+    }
+
     pub fn authority(self: Port, a: A, context: Context) !?control.Stamp {
         try authorize(context);
         const result = try Boundary.call("authority", self.boundary_dispatch, self.authority_fn, .{ self.ptr, a, context });
@@ -279,6 +305,20 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try std.testing.expectEqual(configuration.consistent_lsn, start.consistent_lsn);
         try std.testing.expectEqual(sealed.latest_cursor, start.cursor);
         try std.testing.expectEqual(@as(usize, 2), fake.mutations);
+        var drop = write;
+        drop.expected_revision = sealed.revision;
+        drop.mutation = .{ .slot = .{ .drop = .{ .database = configuration.database, .name = configuration.name, .now = 102 } } };
+        fake.sealed = try drop.apply(scratch, sealed, 5);
+        fake.commit = false;
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.dropSlot(a, drop, context));
+        try std.testing.expectEqual(@as(usize, 3), fake.mutations);
+        fake.commit = true;
+        try port.dropSlot(a, drop, context);
+        try std.testing.expectEqual(@as(usize, 4), fake.mutations);
+        try std.testing.expectEqual(control.Phase.closing, fake.state.phase);
+        var stale = drop;
+        stale.expected_epoch += 1;
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.dropSlot(a, stale, context));
     }
 
     fn readAllocations(a: A, port: Port, id: control.Id, context: Context) !void {
