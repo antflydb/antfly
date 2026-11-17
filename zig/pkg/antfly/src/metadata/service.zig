@@ -23952,7 +23952,7 @@ test "selected owner readiness transition index cancels while observations are l
 test "source control requires its coordinated decoder floor before metadata proposal" {
     const contract = @import("source_control.zig");
     const a = std.testing.allocator;
-    try std.testing.expectEqual(contract.checkpoint_authority.protocol_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_source_control = "{}" }));
+    try std.testing.expectEqual(contract.closing_protocol_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_source_control = "{}" }));
     const scope: contract.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
     var write: contract.Write = .{ .table_id = 7, .source_id = scope.source_id, .expected_revision = 0, .expected_binding = scope.identity(), .expected_catalog_digest = @splat(5), .mutation = .{ .configure = scope } };
     const legacy = try contract.encodeWrite(a, write);
@@ -23970,6 +23970,10 @@ test "source control requires its coordinated decoder floor before metadata prop
     const fenced = try contract.encodeWrite(a, write);
     defer a.free(fenced);
     try std.testing.expectEqual(contract.checkpoint_authority.protocol_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_source_control = fenced }));
+    write.mutation = .{ .close = {} };
+    const closing = try contract.encodeWrite(a, write);
+    defer a.free(closing);
+    try std.testing.expectEqual(contract.closing_protocol_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_source_control = closing }));
 }
 
 test "changefeed control requires its coordinated decoder floor before metadata proposal" {

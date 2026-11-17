@@ -15388,7 +15388,7 @@ pub const RaftApplyStore = struct {
             if (!std.mem.eql(u8, &prior.identity(), &write.expected_binding)) return;
         } else if (write.mutation != .configure or !std.mem.eql(u8, &scope.identity(), &write.expected_binding)) return;
         switch (write.mutation) {
-            .configure, .reseed, .reserve, .replan, .bind_checkpoint => {
+            .configure, .reseed, .reserve, .replan, .bind_checkpoint, .enable_scope_fencing => {
                 const definition = source_control.definitionDigest(a, table.replication_sources_json, scope.source_ordinal) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => return,
@@ -15397,7 +15397,7 @@ pub const RaftApplyStore = struct {
             },
             // Already accepted work can drain after configuration replacement;
             // its current catalog CAS and original source binding still fence it.
-            .accept, .commit, .retire, .reject_and_retire, .seal_artifact, .retire_artifact, .reclaim_artifact, .fence_checkpoint => {},
+            .accept, .commit, .retire, .reject_and_retire, .seal_artifact, .retire_artifact, .reclaim_artifact, .fence_checkpoint, .close => {},
         }
         if (write.mutation == .bind_checkpoint) {
             const authority = write.mutation.bind_checkpoint;
@@ -46001,4 +46001,8 @@ test "metadata source control artifact debt survives reopening and keeps table r
             try restored.expectWork(0);
         }
     }
+}
+
+test "metadata source control scoped lifecycle pins idle bindings through reopen and snapshot" {
+    try @import("source_scope_mode_test.zig").run(std.testing.allocator);
 }

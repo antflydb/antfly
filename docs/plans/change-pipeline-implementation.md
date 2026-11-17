@@ -4800,3 +4800,52 @@ new scope-control binding profile must establish the stronger capability before
 production admission. The coordinator-before-BEGIN case additionally needs
 qualified scope-closure/admission retirement, rather than fabricating ABORT from
 absence. No issue is complete and the full goal remains active.
+
+### Durable source closing intent and lifetime scope-fencing debt
+
+Metadata protocol 104 adds `enable_scope_fencing` and `close` source mutations.
+Enabling requires a bound native checkpoint authority and drained pending,
+outstanding and artifact work. The enabled mode remains charged as source
+lifecycle work even while idle, preventing table deletion from bypassing native
+scope closure. It is idempotent and requires a scope-capable delivery adapter.
+
+Closing persists independently of retirement. It stops fresh reservations,
+replacement plans and new checkpoint-authority binding while preserving exact
+pending-grant confirmation, original positive outcome settlement and artifact
+cleanup. The closing state remains work until retirement; an enabled scoped
+actor must close before retirement, and its authority remains charged until the
+checkpoint-fence transition records completion. Reseeding clears the old mode
+only after its existing retirement gates succeed. False flags are omitted so
+legacy encoded state and the old native/lake contracts remain compatible.
+
+Delivery recovery still observes original outcomes and may confirm a previously
+sealed artifact, but known closing state never starts retained admission.
+Delivery and replanning reject fresh work before planning when closing is known.
+Metadata apply accepts closure as a drain operation after configuration changes,
+whereas enabling scoped mode still requires the live source definition. Both new
+operations use the coordinated decoder-104 barrier; malformed/unknown source
+commands conservatively require that maximum version rather than the older
+checkpoint-only floor. Existing valid legacy and artifact/checkpoint operations
+retain their previous floors.
+
+Qualification: final `source-control-test -j2` completed with exit zero
+(`source-closing-metadata-final-test.log`). Selected source model/delivery tests,
+service decoder classification and all 10 metadata storage/discovery regressions
+passed with zero reported skips/failures/leaks. The new source model tests cover
+closing/reopen, retained exact reservation retry, new-grant/replan rejection,
+positive original settlement, idle mode debt and ordered retirement. The delivery
+regression covers sealed pending authority with no fresh admission/planning.
+The separate real-store fixture verifies idle debt across reopen, closing flags
+and work counters across snapshot installation, blocked table deletion, and debt
+retention until the recorded checkpoint-fence step. Its native fence proof is a
+synthetic model input, not production coordinator provenance. Source-catalog,
+engine-error, OpenAPI, formatting and diff checks passed. Intermediate apply
+switch and test helper import/snapshot-interface errors were corrected before the
+final passing run.
+
+This supplies the metadata lifecycle prerequisite for actual scope controls.
+Independently qualified metadata state/cut capture, physical bind/close/drop and
+retirement endpoints, the stronger data-Raft activation profile, real native
+closure proofs and worker/ACK integration remain required. No native ABI shape
+was changed or data-scope capability advertised by this metadata-only step.
+The full issue contracts remain active and neither issue / draft PR is complete.

@@ -422,7 +422,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .target = target,
             .optimize = optimize,
         }),
-        .filters = &.{"delivery recovers"},
+        .filters = &.{ "delivery recovers", "delivery closing source" },
     });
     source_delivery_tests.root_module.addImport("antfly_local_sources", metadata_unit_baseline_mods[8].import_table.get("antfly_local_sources").?);
     const run_source_delivery_tests = b.addRunArtifact(source_delivery_tests);

@@ -24,6 +24,7 @@ pub const Digest = [32]u8;
 pub const artifact_control = @import("source_artifact_control.zig");
 pub const checkpoint_authority = @import("source_checkpoint_authority.zig");
 pub const protocol_version: u16 = 90;
+pub const closing_protocol_version: u16 = 104;
 pub const max_pending_bytes = 1024 * 1024;
 pub const max_state_bytes = 8 * 1024 * 1024;
 pub const max_outstanding = 256;
@@ -189,6 +190,8 @@ pub const State = struct {
     committed: Frontier = .{},
     outstanding: []const Accepted = &.{},
     retired: bool = false,
+    closing: bool = false,
+    scope_fencing: bool = false,
     retirement_receipt: []const u8 = "",
     retired_reservation_digest: Digest = @splat(0),
     artifact_control: ?@import("source_artifact_control.zig").State = null,
@@ -200,12 +203,13 @@ pub const State = struct {
     pub fn validate(self: State) !void {
         if (self.version != 1 or self.outstanding.len > max_outstanding or !text(self.retirement_receipt, 8192, true)) return error.InvalidSourceControl;
         if (self.scope) |scope| try scope.validate() else {
-            if (self.revision != 0 or self.pending != null or self.artifact_control != null or self.checkpoint_authority != null or self.accepted.sequence != 0 or self.committed.sequence != 0 or self.outstanding.len != 0 or self.retired) return error.InvalidSourceControl;
+            if (self.revision != 0 or self.pending != null or self.artifact_control != null or self.checkpoint_authority != null or self.accepted.sequence != 0 or self.committed.sequence != 0 or self.outstanding.len != 0 or self.retired or self.closing or self.scope_fencing) return error.InvalidSourceControl;
         }
         if (self.checkpoint_authority) |authority| {
             try authority.validate();
             if (self.scope == null or self.scope.?.destination != .native or self.artifact_control == null or !std.mem.eql(u8, &authority.binding, &self.scope.?.identity()) or (authority.retirement != null and !self.retired)) return error.InvalidSourceControl;
         }
+        if (self.scope_fencing and (self.checkpoint_authority == null or self.scope == null or self.scope.?.destination != .native)) return error.InvalidSourceControl;
         if (self.committed.sequence > self.accepted.sequence) return error.InvalidSourceControl;
         for ([_]Frontier{ self.accepted, self.committed }) |frontier| {
             if (!text(frontier.checkpoint, 1024, frontier.sequence == 0) or !text(frontier.reference, 8192, frontier.sequence == 0)) return error.InvalidSourceControl;
@@ -286,6 +290,9 @@ pub const Replan = struct {
 };
 
 pub const Mutation = union(enum) {
+    /// Stop new grants while preserving original recovery and cleanup debt.
+    close: void,
+    enable_scope_fencing: void,
     configure: Scope,
     bind_checkpoint: checkpoint_authority.Spec,
     fence_checkpoint: struct { authority_digest: Digest, proof: Digest },
@@ -312,6 +319,7 @@ pub const Mutation = union(enum) {
 
     pub fn validate(self: Mutation) !void {
         switch (self) {
+            .close, .enable_scope_fencing => {},
             .configure, .reseed => |scope| try scope.validate(),
             .bind_checkpoint => |authority| {
                 try authority.validate();
@@ -341,6 +349,18 @@ pub const Mutation = union(enum) {
         try state.validate();
         var next = try state.advance();
         switch (self) {
+            .enable_scope_fencing => {
+                if (state.scope_fencing) return state;
+                const scope = state.scope orelse return error.SourceBindingConflict;
+                if (state.closing or state.retired or scope.destination != .native or state.checkpoint_authority == null) return error.SourceBindingConflict;
+                if (state.pending != null or state.outstanding.len != 0 or (if (state.artifact_control) |ledger| ledger.current != null else false)) return error.SourcePendingWork;
+                next.scope_fencing = true;
+            },
+            .close => {
+                if (state.scope == null) return error.SourceBindingConflict;
+                if (state.closing or state.retired) return state;
+                next.closing = true;
+            },
             .configure => |scope| {
                 if (state.scope) |prior| if (!prior.sameBinding(scope) or state.retired) return error.SourceBindingConflict;
                 next.scope = scope;
@@ -352,6 +372,7 @@ pub const Mutation = union(enum) {
                     if (!bound.sameAuthority(authority) or bound.retirement != null) return error.SourceBindingConflict;
                     return state;
                 }
+                if (state.closing) return error.SourceBindingConflict;
                 if (state.pending != null or state.accepted.sequence != 0 or state.outstanding.len != 0) return error.SourcePendingWork;
                 if (state.artifact_control) |ledger| if (ledger.current != null) return error.SourcePendingWork;
                 next.checkpoint_authority = authority;
@@ -386,6 +407,7 @@ pub const Mutation = union(enum) {
                     if (!std.mem.eql(u8, &pending.identity(scope), &reservation.identity(scope))) return error.SourcePayloadConflict;
                     return state;
                 }
+                if (state.closing) return error.SourceBindingConflict;
                 if (nonzero(reservation.previous_reservation_digest) or reservation.replan_receipt.len != 0) return error.InvalidSourceControl;
                 if (state.outstanding.len == max_outstanding or
                     acceptance_credit > max_outstanding_encoded_bytes - outstandingBytes(state.outstanding)) return error.SourceAdmissionBackpressure;
@@ -405,6 +427,7 @@ pub const Mutation = union(enum) {
                     std.mem.eql(u8, &pending.transaction_id, &plan.transaction_id) and
                     std.mem.eql(u8, pending.delivery_manifest, plan.delivery_manifest) and
                     std.mem.eql(u8, pending.replan_receipt, plan.not_admitted_receipt) and std.meta.eql(pending.artifact, plan.artifact)) return state;
+                if (state.closing) return error.SourceBindingConflict;
                 if (!std.mem.eql(u8, &pending.identity(scope), &plan.reservation_digest)) return error.SourcePayloadConflict;
                 if (std.mem.eql(u8, &pending.transaction_id, &plan.transaction_id) or
                     std.mem.eql(u8, &pending.plan_digest, &plan.plan_digest) or
@@ -501,6 +524,7 @@ pub const Mutation = union(enum) {
                 next.outstanding = state.outstanding[index + 1 ..];
             },
             .reject_and_retire => |retirement| {
+                if (state.scope_fencing and !state.closing) return error.SourcePendingWork;
                 const scope = state.scope orelse return error.SourceBindingConflict;
                 if (state.outstanding.len != 0) return error.SourcePendingWork;
                 if (state.retired) {
@@ -521,6 +545,7 @@ pub const Mutation = union(enum) {
                 next.retirement_receipt = retirement.receipt;
             },
             .retire => |retirement| {
+                if (state.scope_fencing and !state.closing) return error.SourcePendingWork;
                 if (state.pending != null or state.outstanding.len != 0 or (if (state.artifact_control) |ledger| ledger.current != null else false)) return error.SourcePendingWork;
                 if (state.scope == null) return error.SourceBindingConflict;
                 if (state.retired) {
@@ -726,7 +751,7 @@ pub fn definitionDigest(a: A, sources_json: []const u8, ordinal: u32) !Digest {
     return hash.finalResult();
 }
 pub fn hasWork(state: State) bool {
-    return state.pending != null or state.outstanding.len != 0 or (if (state.artifact_control) |ledger| ledger.current != null else false) or (state.retired and if (state.checkpoint_authority) |authority| authority.retirement == null else false);
+    return (state.closing and !state.retired) or (state.scope_fencing and if (state.checkpoint_authority) |authority| authority.retirement == null else true) or state.pending != null or state.outstanding.len != 0 or (if (state.artifact_control) |ledger| ledger.current != null else false) or (state.retired and if (state.checkpoint_authority) |authority| authority.retirement == null else false);
 }
 pub fn validateEncodedWrite(bytes: []const u8) !void {
     var parsed = try parseWrite(std.heap.page_allocator, bytes);
@@ -1024,7 +1049,7 @@ test "source control replans only proven unadmitted delivery while retaining log
 fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
-        const include = if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority")) @field(value, name) != null else true;
+        const include = if (comptime std.mem.eql(u8, name, "closing") or std.mem.eql(u8, name, "scope_fencing")) @field(value, name) else if (comptime std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "artifact_control") or std.mem.eql(u8, name, "checkpoint_authority")) @field(value, name) != null else true;
         if (include) {
             try stream.objectField(name);
             try stream.write(@field(value, name));
@@ -1034,6 +1059,7 @@ fn writeArtifactFields(value: anytype, stream: anytype) @TypeOf(stream.*).Error!
 }
 pub fn requiredProtocol(mutation: Mutation) u16 {
     return switch (mutation) {
+        .close, .enable_scope_fencing => closing_protocol_version,
         .bind_checkpoint, .fence_checkpoint => checkpoint_authority.protocol_version,
         .reserve => |reservation| if (reservation.artifact != null) artifact_control.protocol_version else protocol_version,
         .replan => |plan| if (plan.artifact != null) artifact_control.protocol_version else protocol_version,
@@ -1042,7 +1068,7 @@ pub fn requiredProtocol(mutation: Mutation) u16 {
     };
 }
 pub fn requiredProtocolEncoded(bytes: []const u8) u16 {
-    var write = parseWrite(std.heap.page_allocator, bytes) catch return checkpoint_authority.protocol_version;
+    var write = parseWrite(std.heap.page_allocator, bytes) catch return closing_protocol_version;
     defer write.deinit();
     return requiredProtocol(write.value.mutation);
 }
@@ -1230,4 +1256,80 @@ test "source checkpoint authority is immutable and retirement debt blocks reseed
     state = try (Mutation{ .reseed = next_scope }).apply(ca, state);
     try std.testing.expect(state.checkpoint_authority == null);
     try std.testing.expect(state.artifact_control != null);
+}
+
+test "source control closing intent survives reopen blocks new grants and retains cleanup debt" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const scope: Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
+    var state = try (Mutation{ .configure = scope }).apply(ca, .{});
+    const legacy = try encode(a, state);
+    defer a.free(legacy);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "closing") == null);
+    const pending: Reservation = .{ .sequence = 1, .batch_id = "original", .checkpoint = "first", .accepted_at_ns = 10, .payload_digest = @splat(5), .plan_digest = @splat(6), .transaction_id = @splat(7), .destination = .native, .delivery_manifest = "original-plan" };
+    state = try (Mutation{ .reserve = pending }).apply(ca, state);
+    state = try (Mutation{ .close = {} }).apply(ca, state);
+    try std.testing.expect(state.closing and !state.retired);
+    try std.testing.expect(hasWork(state));
+    try std.testing.expectEqual(state.revision, (try (Mutation{ .close = {} }).apply(ca, state)).revision);
+    const bytes = try encode(a, state);
+    defer a.free(bytes);
+    var reopened = try parse(a, bytes);
+    defer reopened.deinit();
+    try std.testing.expect(reopened.value.closing);
+    try std.testing.expectEqual(pending.identity(scope), reopened.value.pending.?.identity(scope));
+    // Lost reservation acknowledgements can still confirm the exact old grant.
+    try std.testing.expectEqual(state.revision, (try (Mutation{ .reserve = pending }).apply(ca, reopened.value)).revision);
+    try std.testing.expectError(error.SourceBindingConflict, (Mutation{ .replan = .{ .reservation_digest = pending.identity(scope), .plan_digest = @splat(8), .transaction_id = @splat(9), .delivery_manifest = "replacement", .not_admitted_receipt = "proof" } }).apply(ca, state));
+    // Positive original outcomes still drain while admission remains closed.
+    state = try (Mutation{ .accept = .{ .reservation_digest = pending.identity(scope), .receipt = "accepted-original", .commit_reference = "committed-original" } }).apply(ca, state);
+    var next = pending;
+    next.sequence = 2;
+    next.batch_id = "new";
+    next.expected_checkpoint = "first";
+    try std.testing.expectError(error.SourceBindingConflict, (Mutation{ .reserve = next }).apply(ca, state));
+    try std.testing.expect(hasWork(state));
+    state = try (Mutation{ .retire = .{ .receipt = "all-roots-fenced" } }).apply(ca, state);
+    try std.testing.expect(!hasWork(state));
+    var replacement = scope;
+    replacement.generation += 1;
+    state = try (Mutation{ .reseed = replacement }).apply(ca, state);
+    try std.testing.expect(!state.closing and !state.retired);
+    const close_write = try encodeWrite(a, .{ .table_id = 7, .source_id = scope.source_id, .expected_revision = 1, .expected_binding = scope.identity(), .expected_catalog_digest = @splat(10), .mutation = .{ .close = {} } });
+    defer a.free(close_write);
+    try std.testing.expectEqual(closing_protocol_version, requiredProtocolEncoded(close_write));
+    try std.testing.expectEqual(closing_protocol_version, requiredProtocolEncoded("{}"));
+}
+
+test "source control scope fencing pins idle bindings until closing retirement and native proof" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const scope: Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
+    var state = try (Mutation{ .configure = scope }).apply(ca, .{});
+    try std.testing.expectError(error.SourceBindingConflict, (Mutation{ .enable_scope_fencing = {} }).apply(ca, state));
+    const authority: checkpoint_authority.Spec = .{ .binding = scope.identity(), .table_name = "checkpoint", .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .table_binding = @splat(5), .root_generation = 0, .group_id = 17, .topology_epoch = 1 } };
+    state = try (Mutation{ .bind_checkpoint = authority }).apply(ca, state);
+    try std.testing.expect(!hasWork(state));
+    const legacy = try encode(a, state);
+    defer a.free(legacy);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "scope_fencing") == null);
+    state = try (Mutation{ .enable_scope_fencing = {} }).apply(ca, state);
+    try std.testing.expect(hasWork(state));
+    try std.testing.expectEqual(state.revision, (try (Mutation{ .enable_scope_fencing = {} }).apply(ca, state)).revision);
+    try std.testing.expectError(error.SourcePendingWork, (Mutation{ .retire = .{ .receipt = "too-early" } }).apply(ca, state));
+    state = try (Mutation{ .close = {} }).apply(ca, state);
+    state = try (Mutation{ .retire = .{ .receipt = "cohort-closed" } }).apply(ca, state);
+    try std.testing.expect(hasWork(state));
+    const saved = try encode(a, state);
+    defer a.free(saved);
+    var reopened = try parse(a, saved);
+    defer reopened.deinit();
+    try std.testing.expect(reopened.value.scope_fencing and reopened.value.closing);
+    state = try (Mutation{ .fence_checkpoint = .{ .authority_digest = authority.digest(), .proof = @splat(6) } }).apply(ca, reopened.value);
+    try std.testing.expect(!hasWork(state));
+    try std.testing.expectEqual(closing_protocol_version, requiredProtocol(.{ .enable_scope_fencing = {} }));
 }

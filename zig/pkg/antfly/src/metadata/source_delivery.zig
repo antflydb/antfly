@@ -45,7 +45,12 @@ fn supportsCheckpoint(adapter: anytype) bool {
     if (comptime @hasDecl(AdapterType(@TypeOf(adapter)), "checkpoint_capable")) return AdapterType(@TypeOf(adapter)).checkpoint_capable;
     return false;
 }
+fn supportsScopeFencing(adapter: anytype) bool {
+    if (comptime @hasDecl(AdapterType(@TypeOf(adapter)), "scope_fencing_capable")) return AdapterType(@TypeOf(adapter)).scope_fencing_capable;
+    return false;
+}
 fn requireArtifactAdapter(adapter: anytype, state: control.State) !void {
+    if (state.scope_fencing and !supportsScopeFencing(adapter)) return error.UnsupportedOperation;
     if (state.checkpoint_authority != null and !supportsCheckpoint(adapter)) return error.UnsupportedOperation;
     if (state.artifact_control != null and !@hasDecl(AdapterType(@TypeOf(adapter)), "sealArtifact")) return error.UnsupportedOperation;
 }
@@ -176,6 +181,7 @@ fn recoverArtifact(svc: anytype, adapter: anytype, a: A, scope: control.Scope, c
 /// admission. Neither an absent destination receipt nor a native upload alone
 /// grants this capability. The adapter restores and verifies the frozen input.
 fn admitRetained(adapter: anytype, a: A, scope: control.Scope, state: control.State, request: anytype) !Acceptance {
+    if (state.closing) return error.SourcePendingWork;
     const pending = state.pending orelse return error.SourcePendingWork;
     const record = (state.artifact_control orelse return error.UnsupportedOperation).current orelse return error.SourcePendingWork;
     if (pending.artifact == null or record.phase != .sealed or record.stamp == null or !std.mem.eql(u8, &record.reservation, &pending.identity(scope))) return error.SourcePendingWork;
@@ -214,7 +220,7 @@ pub fn recover(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catal
     if (state.value.pending) |pending| {
         var resolved = try adapter.resolve(arena.allocator(), scope, pending, request);
         if (comptime @hasDecl(AdapterType(@TypeOf(adapter)), "admitRetained")) {
-            if (resolved == null and pending.artifact != null and state.value.artifact_control.?.current.?.phase == .sealed)
+            if (!state.value.closing and resolved == null and pending.artifact != null and state.value.artifact_control.?.current.?.phase == .sealed)
                 resolved = try admitRetained(adapter, arena.allocator(), scope, state.value, request);
         }
         if (resolved) |result| {
@@ -261,6 +267,7 @@ pub fn deliver(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catal
             return state;
         }
     }
+    if (state.value.closing) return error.SourcePendingWork;
     if (state.value.pending == null) {
         // Validate the predecessor before asking the destination to plan.
         const previous: ?[]const u8 = if (state.value.accepted.sequence == 0) null else state.value.accepted.checkpoint;
@@ -341,6 +348,7 @@ pub fn replan(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catalo
         try refreshAfterRelease(svc, a, scope, &state, request);
         if (state.value.pending == null and matches(input, try adapter.inspect(scratch, scope, state.value.accepted.reference))) return state;
     }
+    if (state.value.closing) return error.SourcePendingWork;
     const pending = state.value.pending orelse return error.SourcePendingWork;
     if (!matches(input, .{ .batch_id = pending.batch_id, .checkpoint = pending.checkpoint, .expected_checkpoint = pending.expected_checkpoint, .payload_digest = pending.payload_digest })) return error.SourcePayloadConflict;
     if (!std.mem.allEqual(u8, &pending.previous_reservation_digest, 0) and std.mem.eql(u8, &pending.previous_reservation_digest, &expected_reservation)) return state;
@@ -717,4 +725,80 @@ test "delivery recovers sealed source artifacts after a lost metadata reply with
             try std.testing.expectError(error.UnsupportedOperation, recover(&svc, &legacy, a, scope, @splat(9), Context{}));
         }
     }
+}
+
+test "delivery closing source preserves sealed pending authority without fresh admission or replanning" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const Context = struct {
+        pub fn ensureActive(_: @This()) !void {}
+    };
+    const scope: control.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
+    var attempt: [16]u8 = @splat(6);
+    std.mem.writeInt(u64, attempt[0..8], 1, .big);
+    const artifact: control.artifact_control.Spec = .{ .namespace = @splat(5), .binding = scope.identity(), .domain = control.artifact_control.domainFor(scope.identity()), .attempt = attempt, .bytes = 128, .checksum = @splat(7), .plan_digest = @splat(8) };
+    const pending: control.Reservation = .{ .sequence = 1, .batch_id = "original", .checkpoint = "one", .accepted_at_ns = 10, .payload_digest = @splat(9), .plan_digest = @splat(10), .transaction_id = @splat(11), .destination = .native, .delivery_manifest = "frozen-original", .artifact = artifact };
+    var state = try (control.Mutation{ .configure = scope }).apply(ca, .{});
+    state = try (control.Mutation{ .reserve = pending }).apply(ca, state);
+    state = try (control.Mutation{ .seal_artifact = .{ .reservation_digest = pending.identity(scope), .stamp = @splat(12) } }).apply(ca, state);
+    state = try (control.Mutation{ .close = {} }).apply(ca, state);
+    const Service = struct {
+        value: []const u8,
+        metadata_group_id: u64 = 1,
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: Context, _: u16) !void {
+            return error.TestUnexpectedMetadataMutation;
+        }
+        pub fn ensureLinearizableReadWithContext(_: *@This(), _: Context) !void {}
+        pub fn projectedStore(self: *@This()) ?*@This() {
+            return self;
+        }
+        pub fn getSourceControl(self: *@This(), allocator: A, _: u64, _: u64, _: control.Digest) ![]u8 {
+            return allocator.dupe(u8, self.value);
+        }
+        pub fn proposeTransitionCommandWithReceipt(_: *@This(), _: anytype) !u64 {
+            return error.TestUnexpectedMetadataMutation;
+        }
+        pub fn waitForTransitionAppliedWithContext(_: *@This(), _: u64, _: Context) !void {
+            return error.TestUnexpectedMetadataMutation;
+        }
+    };
+    const Adapter = struct {
+        resolves: usize = 0,
+        pub fn validateScope(_: *@This(), value: control.Scope) !void {
+            try value.validate();
+        }
+        pub fn resolve(self: *@This(), _: A, _: control.Scope, _: control.Reservation, _: Context) !?Acceptance {
+            self.resolves += 1;
+            return null;
+        }
+        pub fn release(_: *@This(), _: A, _: control.Scope, _: []const u8, _: Context) !void {
+            return error.TestUnexpectedRelease;
+        }
+        pub fn admitRetained(_: *@This(), _: A, _: control.Scope, _: control.Reservation, _: Context) !Acceptance {
+            return error.TestUnexpectedAdmission;
+        }
+        pub fn sealArtifact(_: *@This(), _: A, _: control.Scope, _: control.Reservation, _: []const u8, _: Context) !control.Digest {
+            return error.TestUnexpectedUpload;
+        }
+        pub fn plan(_: *@This(), _: A, _: control.Scope, _: Input, _: []const u8) !Plan {
+            return error.TestUnexpectedPlan;
+        }
+        pub fn inspect(_: *@This(), _: A, _: control.Scope, _: []const u8) !ReceiptIdentity {
+            return error.TestUnexpectedInspection;
+        }
+    };
+    const bytes = try control.encode(a, state);
+    defer a.free(bytes);
+    var service: Service = .{ .value = bytes };
+    var adapter: Adapter = .{};
+    var recovered = try recover(&service, &adapter, a, scope, @splat(13), Context{});
+    defer recovered.deinit();
+    try std.testing.expect(recovered.value.closing);
+    try std.testing.expectEqual(pending.identity(scope), recovered.value.pending.?.identity(scope));
+    try std.testing.expectEqual(@as(usize, 1), adapter.resolves);
+    try std.testing.expectError(error.SourcePendingWork, admitRetained(&adapter, a, scope, recovered.value, Context{}));
+    const input: Input = .{ .batch_id = pending.batch_id, .checkpoint = pending.checkpoint, .payload_digest = pending.payload_digest, .accepted_at_ns = pending.accepted_at_ns };
+    try std.testing.expectError(error.SourcePendingWork, deliver(&service, &adapter, a, scope, @splat(13), input, @as([]const u8, ""), Context{}));
 }
