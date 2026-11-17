@@ -47,8 +47,18 @@ test "privacy progress cannot replace physical owners or query catalog cuts" {
     try std.testing.expect(durable.object.get("_privacy").?.object.contains("coverage"));
     try std.testing.expect(durable.object.get("_privacy").?.object.contains("scans"));
     const stripped = try std.json.parseFromSliceLeaky(V, a, physical, .{});
+    const configuration = (try privacy.ownerExecution(a, physical)).?;
+    try std.testing.expectEqualDeep(resource.policy_version, configuration.policy_version);
+    try std.testing.expectEqualDeep(resource.policy.execution, configuration.execution);
+    try std.testing.expectError(error.MissingField, privacy.current(a, stripped));
     try std.testing.expect(!stripped.object.get("_privacy").?.object.contains("coverage"));
     try std.testing.expect(!stripped.object.get("_privacy").?.object.contains("scans"));
+    var invalid = try std.json.parseFromSliceLeaky(V, a, physical, .{});
+    try invalid.object.getPtr("_privacy").?.object.put(a, "generation", .{ .integer = 0 });
+    try std.testing.expectError(error.InvalidPrivacyCatalog, privacy.ownerExecution(a, try std.json.Stringify.valueAlloc(a, invalid, .{})));
+    var future = try std.json.parseFromSliceLeaky(V, a, physical, .{});
+    try future.object.getPtr("_privacy").?.object.put(a, "future_fence", .{ .integer = 1 });
+    try std.testing.expectError(error.UnknownField, privacy.ownerExecution(a, try std.json.Stringify.valueAlloc(a, future, .{})));
     // Every semantic or future field is still an owner invalidation fence.
     inline for (.{ "resource_version", "generation", "policy_version", "artifact_name", "policy", "unprotected_indexes_json", "future_fence" }) |field| {
         var changed = try std.json.parseFromSliceLeaky(V, a, progress, .{});
