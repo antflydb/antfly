@@ -37,7 +37,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 112 fences explicit ordinary completion transaction phases.
 // Version 113 fences private row batch producer envelopes.
 // Version 114 fences legacy completion transaction producer layouts.
-pub const abi_version: u32 = 114;
+// Version 115 fences explicit table transaction origin contracts.
+pub const abi_version: u32 = 115;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

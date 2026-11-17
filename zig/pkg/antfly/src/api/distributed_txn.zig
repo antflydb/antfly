@@ -1354,6 +1354,7 @@ pub fn executeMultiTableCommitWithOptions(
 /// Shared read-only partitioning for ordinary transactions and retained source
 /// planning. Payload slices are borrowed until completion preparation owns them.
 fn routeCommitParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest) !std.ArrayListUnmanaged(ParticipantTxn) {
+    const producer = try @import("antfly_local_sources").api_distributed_txn_contract.transactionProducer(tables);
     for (tables) |table| if (table.source_admission != null) return error.UnsupportedOperation;
     var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
     errdefer {
@@ -1451,6 +1452,7 @@ fn routeCommitParticipants(alloc: std.mem.Allocator, catalog: table_catalog.Cata
                     !std.mem.eql(u8, participant.row_policy_database, table.row_policy_database) or
                     participant.row_policy_admitted_at_seconds != table.row_policy_admitted_at_seconds))
                 return error.InvalidTxnRequest;
+            participant.source_producer = producer;
             participant.row_policy_principal_proof = table.row_policy_principal_proof;
             participant.row_policy_database = table.row_policy_database;
             participant.row_policy_admitted_at_seconds = table.row_policy_admitted_at_seconds;
@@ -1512,6 +1514,7 @@ pub fn prepareSourceCommit(
     grant: SourceGrant,
     context: @import("antfly_local_sources").api_operation.RequestContext,
 ) !@import("completion_admission.zig").Prepared {
+    for (tables) |table| if (table.source_producer != .unlabelled) return error.SourceTransactionIdentityConflict;
     try context.ensureActive();
     try grant.validate();
     var participants = try routeCommitParticipants(alloc, coordinator.recovery.catalog, tables);
@@ -1595,6 +1598,10 @@ fn executeMultiTableCommitOnce(
             } };
         }
     }
+
+    // The legacy BEGIN RPC has no origin field. Never drop an explicit origin
+    // into that fallback, even when every root lacks retained-history support.
+    for (participants.items) |participant| if (participant.source_producer != .unlabelled) return error.ChangefeedCapabilityUnsupported;
 
     // Allocate every coordination slot before contacting a participant. No
     // allocator failure may be introduced after the commit decision becomes
@@ -2108,6 +2115,7 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
 }
 
 const ParticipantTxn = struct {
+    source_producer: @FieldType(db_mod.types.BatchRequest, "source_producer") = .unlabelled,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
@@ -2139,6 +2147,8 @@ const ParticipantTxn = struct {
     /// immutable retained-history PREPARE compiler.
     fn intentRequest(self: *const ParticipantTxn) db_mod.types.TransactionIntentRequest {
         return .{
+            .completion_ordinary_producer = self.source_producer == .ordinary,
+            .completion_legacy_producer = self.source_producer == .legacy_cdc,
             .row_policy_principal_proof = self.row_policy_principal_proof,
             .row_policy_database = self.row_policy_database,
             .row_policy_admitted_at_seconds = self.row_policy_admitted_at_seconds,
@@ -5738,7 +5748,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 2), fully_begun.acknowledgement_count);
         }
 
-        test "distributed txn coordinator groups by range and commits all participants" {
+        test "data raft ordered history distributed txn coordinator groups by range and commits all participants" {
             const FakeCatalog = struct {
                 fn iface() table_catalog.CatalogSource {
                     return .{
@@ -5865,6 +5875,29 @@ fn consumerTests() type {
                     try self.acknowledgements.append(std.testing.allocator, group_id);
                 }
             };
+
+            const a = std.testing.allocator;
+            for ([_]@FieldType(db_mod.types.BatchRequest, "source_producer"){ .ordinary, .legacy_cdc }) |producer| {
+                const labelled = [_]TableCommitRequest{.{ .table_name = "docs", .source_producer = producer, .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }};
+                var routed = try routeCommitParticipants(a, FakeCatalog.iface(), &labelled);
+                defer {
+                    for (routed.items) |*participant| participant.deinit(a);
+                    routed.deinit(a);
+                }
+                try std.testing.expectEqual(@as(usize, 2), routed.items.len);
+                for (routed.items) |*participant| {
+                    try std.testing.expectEqual(producer, participant.source_producer);
+                    const intent = participant.intentRequest();
+                    try std.testing.expectEqual(producer == .ordinary, intent.completion_ordinary_producer);
+                    try std.testing.expectEqual(producer == .legacy_cdc, intent.completion_legacy_producer);
+                }
+                var untouched = Recorder{};
+                defer untouched.deinit(a);
+                try std.testing.expectError(error.ChangefeedCapabilityUnsupported, executeMultiTableCommitWithOptions(a, FakeCatalog.iface(), untouched.worker(), @splat(2), 10, 11, &labelled, .write, null, .{}));
+                try std.testing.expectEqual(@as(usize, 0), untouched.begins.items.len);
+            }
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, routeCommitParticipants(a, undefined, &.{ .{ .table_name = "docs", .source_producer = .ordinary }, .{ .table_name = "other" } }));
+            try std.testing.expectError(error.InvalidSourceAdmission, routeCommitParticipants(a, undefined, &.{.{ .table_name = "docs", .source_producer = .scoped_source }}));
 
             var recorder = Recorder{};
             defer recorder.deinit(std.testing.allocator);

@@ -44943,7 +44943,7 @@ fn consumerTests() type {
                     }
                     // Keep the large private batch temporaries off the parent
                     // HTTP/Raft fixture's already large stack frame.
-                    noinline fn run(fixture_alloc: std.mem.Allocator, fixture_owner: *antfly.public_api.ProvisionedKernelOwnerSource, fence: antfly.metadata_api.CatalogRouteFence, fixture_namespace: [24]u8, expected_binding: [32]u8, fixture_origin: *DataServer, fixture_endpoint: []const u8, fixture_credential: []const u8) !@import("../api/completion_plan.zig").Plan {
+                    noinline fn run(fixture_alloc: std.mem.Allocator, fixture_owner: *antfly.public_api.ProvisionedKernelOwnerSource, fence: antfly.metadata_api.CatalogRouteFence, fixture_namespace: [24]u8, expected_binding: [32]u8, fixture_origin: *DataServer, fixture_endpoint: []const u8, fixture_credential: []const u8, fixture_root: []const u8) !@import("../api/completion_plan.zig").Plan {
                         const fixture_completion = @import("../api/completion_plan.zig").completion;
                         var changed_binding = expected_binding;
                         changed_binding[0] ^= 1;
@@ -44982,10 +44982,33 @@ fn consumerTests() type {
                         const row: antfly.db.types.BatchRequest = .{ .source_producer = .ordinary, .timestamp_ns = 1002, .document_version_scheme = .revision_v1, .sync_level = .write, .writes = &.{.{ .key = "producer-envelope-row", .value = "{\"origin\":true}" }} };
                         try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_row_producer_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(fixture_alloc, row));
                         _ = (try writer.writer().write(fixture_alloc, .{ .catalog = fence }, 601, "docs", row, .{ .remaining_ms = 5000, .forwards_remaining = 2, .campaign_allowed = false }, .{})) orelse return error.TestUnexpectedResult;
+                        const Fast = struct {
+                            writer: *@import("../api/completion_participant.zig").HttpWriter,
+                            fn unqualified(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: antfly.db.types.BatchRequest) !void {
+                                return error.CatalogRouteFenceRequired;
+                            }
+                            fn routed(ptr: *anyopaque, allocator: std.mem.Allocator, fast_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: antfly.db.types.BatchRequest, cancellation: antfly.db.types.CancellationToken) !void {
+                                const self: *@This() = @ptrCast(@alignCast(ptr));
+                                _ = (try self.writer.writer().write(allocator, .{ .catalog = fast_fence }, fast_fence.route.group_id, table, request, .{ .remaining_ms = 5000, .forwards_remaining = 2, .campaign_allowed = false }, .{ .cancellation = cancellation })) orelse return error.TestUnexpectedResult;
+                            }
+                        };
+                        var fast: Fast = .{ .writer = &writer };
+                        const fast_root = try std.fmt.allocPrint(fixture_alloc, "{s}/producer-fast-client", .{fixture_root});
+                        defer fixture_alloc.free(fast_root);
+                        var fast_source = antfly.public_api.table_writes.ProvisionedTableWriteSource.initWithBackendRuntime(fast_root, fixture_origin.write_source.catalog, fixture_origin.backend_runtime);
+                        defer fast_source.deinit();
+                        _ = fast_source.withRaftBatcher(.{ .ptr = &fast, .vtable = &.{ .batch_group = Fast.unqualified, .batch_group_local = Fast.unqualified, .batch_group_routed_with_cancellation = Fast.routed } });
+                        for ([_]@FieldType(antfly.db.types.BatchRequest, "source_producer"){ .ordinary, .legacy_cdc }) |producer| {
+                            const fast_tables = [_]@import("../api/distributed_txn.zig").TableCommitRequest{.{ .source_producer = producer, .table_name = "docs", .writes = &.{.{ .key = if (producer == .ordinary) "producer-fast-ordinary" else "producer-fast-legacy", .value = "{}" }} }};
+                            const outcome = (try fast_source.source().commitBatch(fixture_alloc, &fast_tables, .write)) orelse return error.TestUnexpectedResult;
+                            try std.testing.expect(outcome == .committed);
+                            try std.testing.expectEqual(@as(usize, 1), outcome.committed.participant_count);
+                            try std.testing.expect(!outcome.committed.propagation_pending);
+                        }
                         return frozen;
                     }
                 };
-                var frozen = try CompletionAdmissionFixture.run(a, &owner, route.fence().?, namespace, feed_control.tableBinding(feed_table), origin, base, secret);
+                var frozen = try CompletionAdmissionFixture.run(a, &owner, route.fence().?, namespace, feed_control.tableBinding(feed_table), origin, base, secret, root);
                 defer frozen.deinit();
                 const plan = frozen.admission;
                 const current_owner = frozen.participants[0].owner;
@@ -45321,7 +45344,7 @@ fn consumerTests() type {
                         var hosted = antfly.public_api.table_writes.HostedProvisionedTableWriteSource.init(cache_root, source_catalog, hosted_router.router(), executor);
                         _ = hosted.withInternalServiceAuth(credential, "history-runtime").withHistoryPolicyProvisioning(null);
                         const source = hosted.source();
-                        const input = [_]@import("../api/distributed_txn.zig").TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "hosted-completion", .value = "{\"v\":9}" }} }};
+                        const input = [_]@import("../api/distributed_txn.zig").TableCommitRequest{.{ .source_producer = .ordinary, .table_name = "docs", .writes = &.{.{ .key = "hosted-completion", .value = "{\"v\":9}" }} }};
                         const hosted_outcome = (try source.commitTransactionWithId(alloc, @splat(115), 3000, &input, .write)).?;
                         try std.testing.expect(hosted_outcome == .committed);
                         try std.testing.expect(!hosted_outcome.committed.propagation_pending);
@@ -45375,7 +45398,7 @@ fn consumerTests() type {
                 noinline fn run(alloc: std.mem.Allocator, origin_server: *DataServer, value: []const u8, level: antfly.db.types.SyncLevel) !void {
                     const txn = @import("../api/distributed_txn.zig");
                     var participant_worker = txn.LocalTableWriteParticipantWorker.init(origin_server.write_source.source());
-                    const outcome = try txn.executeMultiTableCommitWithOptions(alloc, origin_server.write_source.catalog, participant_worker.worker(), @splat(114), 2000, 2001, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "normal-completion", .value = value }} }}, level, null, .{ .completion = .{ .owners = origin_server.historyOwnerPort(), .recovery = origin_server.completionRecovery() } });
+                    const outcome = try txn.executeMultiTableCommitWithOptions(alloc, origin_server.write_source.catalog, participant_worker.worker(), @splat(114), 2000, 2001, &.{.{ .source_producer = .legacy_cdc, .table_name = "docs", .writes = &.{.{ .key = "normal-completion", .value = value }} }}, level, null, .{ .completion = .{ .owners = origin_server.historyOwnerPort(), .recovery = origin_server.completionRecovery() } });
                     try std.testing.expect(outcome == .committed);
                     try std.testing.expect(!outcome.committed.propagation_pending);
                     try std.testing.expect(!outcome.committed.visibility_pending);
@@ -45407,6 +45430,10 @@ fn consumerTests() type {
             const policy_observed = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect_policy = .{ .namespace = namespace, .authority = ref.authority } });
             try std.testing.expectEqualDeep(policy_applied.outcome.?.applied.policy, policy_observed.outcome.?.applied.policy);
             try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_legacy_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+        }
+
+        test "data raft ordered history table producer capability refuses lossy fallback" {
+            try @import("../api/transaction_producer_routing_test.zig").run(std.testing.allocator);
         }
 
         test "data raft ordered history proposal authority fences term membership and missing owners" {

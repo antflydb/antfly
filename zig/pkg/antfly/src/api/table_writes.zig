@@ -7208,6 +7208,7 @@ pub const ProvisionedTableWriteSource = struct {
     };
 
     const WriteCoalesceEntry = struct {
+        source_producer: @FieldType(db_mod.types.BatchRequest, "source_producer") = .unlabelled,
         group: GroupBatch = .{ .group_id = 0 },
         sync_level: db_mod.types.SyncLevel = .write,
         timestamp_ns: u64 = 0,
@@ -20257,6 +20258,7 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn source(self: *ProvisionedTableWriteSource) TableWriteSource {
         return .{
             .ptr = self,
+            .supports_transaction_producers = true,
             .supports_sql_range_guards = if (self.raft_batcher) |batcher|
                 batcher.vtable.batch_group_routed_with_cancellation != null
             else
@@ -21313,7 +21315,8 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn coalesceCompatibleEntry(first: *const WriteCoalesceEntry, candidate: *const WriteCoalesceEntry) bool {
-        return first.sync_level == candidate.sync_level and
+        return first.source_producer == candidate.source_producer and
+            first.sync_level == candidate.sync_level and
             first.timestamp_ns == candidate.timestamp_ns and
             first.group.topology_epoch == candidate.group.topology_epoch and
             std.meta.eql(first.group.identity_namespace, candidate.group.identity_namespace);
@@ -21321,6 +21324,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn coalescedEntryBatchRequest(entry: *const WriteCoalesceEntry) db_mod.types.BatchRequest {
         return .{
+            .source_producer = entry.source_producer,
             .sync_level = entry.sync_level,
             .timestamp_ns = entry.timestamp_ns,
         };
@@ -21336,6 +21340,7 @@ pub const ProvisionedTableWriteSource = struct {
         var entry = WriteCoalesceEntry{
             .group = try cloneWriteCoalesceGroupBatch(alloc, group),
             .sync_level = req.sync_level,
+            .source_producer = req.source_producer,
             .timestamp_ns = req.timestamp_ns,
         };
         defer freeWriteCoalesceGroupBatch(alloc, &entry.group);
@@ -21800,6 +21805,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .writes = group.writes.items,
                     .deletes = group.deletes.items,
                     .transforms = group.transforms.items,
+                    .source_producer = req.source_producer,
                     .timestamp_ns = req.timestamp_ns,
                     .sync_level = req.sync_level,
                 }, cancellation) catch |err| {
@@ -22439,6 +22445,7 @@ pub const ProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        _ = try @import("antfly_local_sources").api_distributed_txn_contract.transactionProducer(tables);
         for (tables) |table| if (table.source_admission != null) return error.UnsupportedOperation;
         if (try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
         const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
@@ -22529,6 +22536,7 @@ pub const ProvisionedTableWriteSource = struct {
         // `batch` retains the established schema, cache, coalescing, HA, and
         // sync-level behavior used by all non-transactional shard writes.
         const applied = self.batchWithVisibilityCancellation(alloc, table_req.table_name, .{
+            .source_producer = table_req.source_producer,
             .writes = transactionWritesAsBatchWrites(table_req.writes),
             .deletes = table_req.deletes,
             .transforms = table_req.transforms,
@@ -22599,6 +22607,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         const batcher = self.raft_batcher orelse return null;
         const req: db_mod.types.BatchRequest = .{
+            .source_producer = table_req.source_producer,
             .writes = transactionWritesAsBatchWrites(table_req.writes),
             .deletes = table_req.deletes,
             .transforms = table_req.transforms,
@@ -25798,6 +25807,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
         return .{
             .ptr = self,
+            .supports_transaction_producers = true,
             .vtable = &.{
                 .drop_table = dropTable,
                 .activate_range_tracking = activateRangeTrackingHosted,
@@ -26376,6 +26386,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                             .graph_writes = req.graph_writes,
                             .graph_deletes = req.graph_deletes,
                             .predicates = req.predicates,
+                            .source_producer = req.source_producer,
                             .timestamp_ns = req.timestamp_ns,
                             .sync_level = req.sync_level,
                         }, dispatch_ctx.dispatcher());
@@ -26389,6 +26400,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                             .graph_writes = req.graph_writes,
                             .graph_deletes = req.graph_deletes,
                             .predicates = req.predicates,
+                            .source_producer = req.source_producer,
                             .timestamp_ns = req.timestamp_ns,
                             .sync_level = req.sync_level,
                         });
@@ -27963,6 +27975,7 @@ fn applyGroupBatchUnchecked(
         .graph_writes = req.graph_writes,
         .graph_deletes = req.graph_deletes,
         .predicates = req.predicates,
+        .source_producer = req.source_producer,
         .timestamp_ns = req.timestamp_ns,
         .sync_level = req.sync_level,
     };
@@ -27982,6 +27995,7 @@ fn groupBatchRequest(group: GroupBatch, req: db_mod.types.BatchRequest) db_mod.t
         .graph_writes = req.graph_writes,
         .graph_deletes = req.graph_deletes,
         .predicates = req.predicates,
+        .source_producer = req.source_producer,
         .timestamp_ns = req.timestamp_ns,
         .sync_level = req.sync_level,
         .reject_graph_transform_projections = req.reject_graph_transform_projections,
@@ -33296,6 +33310,23 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "data raft ordered history coalescer retains distinct producer partitions" {
+            const Source = ProvisionedTableWriteSource;
+            const ordinary: Source.WriteCoalesceEntry = .{ .source_producer = .ordinary };
+            var legacy = ordinary;
+            legacy.source_producer = .legacy_cdc;
+            var old = ordinary;
+            old.source_producer = .unlabelled;
+            try std.testing.expect(Source.coalesceCompatibleEntry(&ordinary, &ordinary));
+            try std.testing.expect(!Source.coalesceCompatibleEntry(&ordinary, &legacy));
+            try std.testing.expect(!Source.coalesceCompatibleEntry(&ordinary, &old));
+            try std.testing.expect(!Source.coalesceCompatibleEntry(&legacy, &old));
+            try std.testing.expectEqual(ordinary.source_producer, Source.coalescedEntryBatchRequest(&ordinary).source_producer);
+            try std.testing.expectEqual(legacy.source_producer, Source.coalescedEntryBatchRequest(&legacy).source_producer);
+            const group: GroupBatch = .{ .group_id = 1 };
+            try std.testing.expectEqual(legacy.source_producer, groupBatchRequest(group, Source.coalescedEntryBatchRequest(&legacy)).source_producer);
+        }
+
         test "compiled startup catch-up retains exact retries across owner contention" {
             if (comptime !control_only_storage_sources) return error.SkipZigTest;
             const alloc = std.testing.allocator;

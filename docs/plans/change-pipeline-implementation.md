@@ -6736,3 +6736,90 @@ routing, non-history compatibility, trusted public ingress assignment and
 qualified old-work drainage still need implementation before activation. The
 full original objective remains active; no issue acceptance criteria were
 checked off and no issue was closed.
+
+### Producer-aware table transaction routing (verification in progress)
+
+`TableCommitRequest.source_producer` now carries an explicit origin across the
+shared table-write contract. A transaction must use one identical ordinary,
+legacy CDC or unlabelled origin across every table, including read-only/empty
+inputs; mixed origins and a generic scoped-source label fail before catalog IO
+or participant BEGIN. Routing preserves the origin on each physical participant
+and compiles it into the already supported ordinary/legacy completion flags.
+Source-granted planning remains a separate intrinsic authority and rejects generic
+producer labels rather than replacing them with scoped authority.
+
+The shared table-write interface now requires an explicit producer-aware provider
+capability for labelled transactions. Missing callbacks and null/unsupported
+results cannot invite a lower unlabelled retry. Default older callers retain the
+existing null/fallback behavior. Reviewed provisioned and hosted providers opt
+in: provisioned single-group local/Raft batch optimizations carry the row origin;
+distributed/hosted retained completion preserves it in BEGIN/PREPARE and recovery.
+If retained completion is unavailable for a multi-participant labelled request,
+the old BEGIN interface cannot carry that origin and is refused before any
+participant mutation. Full labelled non-history multi-participant fallback still
+requires its own implementation; origin assignment is not enabled for production
+CDC/public ingress yet.
+
+Private canonical execution plans omit the new field when unlabelled, preserving
+older encoding/interpretation. Explicit labels remain in the retained plan;
+older stored plans decode to unlabelled and are not upgraded by replay. Native
+owner ABI 115 and API kernel 36 fence the table request/callback layouts and
+capability contract. Storage engine 64, data protocol 44, metadata 105 and failure
+89 are unchanged: this routing step uses the previously qualified native formats.
+
+Qualification adds real two-range partitioning for both origins, confirms their
+participant intents, and refuses unsupported legacy BEGIN with zero BEGIN calls.
+The shared callback test rejects unreviewed providers, null fallback and mixed
+origins while preserving default behavior and old canonical plan omission. The
+linked real runtime now exercises a tagged legacy completion transaction, an
+ordinary hosted stable-ID commit/retry, and both origins through the native
+single-group atomic optimization. Labels are still explicit trusted fixture
+input, not inferred public authority or completed legacy handover.
+
+Full generation passed (`source-table-producer-generate.log`); only the unrelated
+model-explorer pair was discarded. Source-catalog, engine-error and OpenAPI checks
+passed (`source-table-producer-contract-check.log`). Native/linked and existing
+transaction-suite results follow below. Guarded prebuild cleanup preserved
+recent/active output (`source-table-producer-prebuild-gc.log`). First-strict
+activation stays closed. Original destination integration, all retained/public
+history, bootstrap/retention, pgoutput and actual Antfly existing-client scope
+remain open, alongside ingress/CDC assignment, fallback, closure/drainage, special
+mutations and snapshot/cohort work.
+
+The first run passed the existing transaction suites (42 and 74 cases), the new
+shared capability test and two-range routing test. Its large linked fixture
+returned `StorageKernelOwnerUnavailable` when the new fast-path check used a
+server facade without a group-local owner binding. The fast check now builds a
+reviewed provisioned client facade with the fixture's composed runtime/catalog
+and forwards its routed batcher through the existing authenticated HTTP writer;
+unqualified batch callbacks are refused. It exercises the actual single-group
+optimization and actual native destination without inventing a storage owner.
+
+Review also found origin loss in per-group request reconstruction and local
+write coalescing. The queue now retains origin, groups only equal origins and
+reconstructs it for merged and isolated retries. Local/native and hosted/remote
+group adapters retain it too. A focused compatibility check covers ordinary,
+legacy and unlabelled queue partitions. The bound local table optimization also
+preserves row origin; its older multi-phase path explicitly rejects labelled
+transactions before mutation. These fixes extend the producer contract rather
+than disabling batching. Final verification follows below.
+
+Final verification passed (`source-table-producer-final-test.log`): all 42 local
+transaction cases and 74 transaction integration cases, plus six local linked
+cases and 36 linked control cases, zero failures, skips or leaks. This includes
+both-origin two-range partitioning, the producer-preserving coalescer check,
+unsupported fallback with zero BEGIN calls, explicit legacy retained completion,
+ordinary hosted stable-ID commit/retry, and both producer origins through the
+provisioned single-group optimization routed to the actual native HTTP/Raft
+owner. The tests use trusted fixture origins; production ingress/CDC assignment
+and physical legacy handover are not inferred from them.
+
+Final source-catalog, engine-error and OpenAPI checks passed
+(`source-table-producer-contract-final-check.log`). Guarded cleanup completed
+successfully (`source-table-producer-gc.log`), preserving recent/active output and
+leaving 7.0 GiB free. `git diff --check` passed. Current versions are owner ABI
+115, API kernel 36, storage engine 64, data 44, metadata 105 and failure 89. No
+original issue acceptance criterion is discharged by this routing milestone;
+full native/hosted fallback, producer assignment, qualified closure/drainage and
+all original destination/feed/bootstrap/pgoutput/client requirements remain open
+under the full active objective.

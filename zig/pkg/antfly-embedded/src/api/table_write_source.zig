@@ -87,6 +87,9 @@ pub const TableWriteSource = struct {
     /// Transaction-ID commits enforce owner-routed range guards atomically
     /// with primary writes, including read-only guard participants.
     supports_sql_range_guards: bool = false,
+    /// Understood on supported transaction shapes; unsupported shapes fail
+    /// explicitly rather than dropping an origin in a legacy fallback.
+    supports_transaction_producers: bool = false,
 
     pub const VTable = struct {
         activate_range_tracking: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("operation.zig").RequestContext) anyerror!void = null,
@@ -672,6 +675,7 @@ pub const TableWriteSource = struct {
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn admitSourceTransaction(self: TableWriteSource, alloc: std.mem.Allocator, table: distributed_txn.TableCommitRequest, cancellation: db_mod.types.CancellationToken) !distributed_txn.CommitOutcome {
+        if (table.source_producer != .unlabelled) return error.SourceTransactionIdentityConflict;
         const callback = self.vtable.admit_source_transaction orelse return error.UnsupportedOperation;
         return BoundaryAbi.call("admit_source_transaction", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, cancellation });
     }
@@ -972,14 +976,26 @@ pub const TableWriteSource = struct {
         fn_ptr(self.ptr, table_name);
     }
 
+    fn transactionProducer(self: TableWriteSource, tables: []const distributed_txn.TableCommitRequest) !@FieldType(db_mod.types.BatchRequest, "source_producer") {
+        const producer = try distributed_txn.transactionProducer(tables);
+        if (producer != .unlabelled and !self.supports_transaction_producers) return error.ChangefeedCapabilityUnsupported;
+        return producer;
+    }
+
+    fn producerOutcome(producer: @FieldType(db_mod.types.BatchRequest, "source_producer"), outcome: ?distributed_txn.CommitOutcome) !?distributed_txn.CommitOutcome {
+        if (producer != .unlabelled and outcome == null) return error.ChangefeedCapabilityUnsupported;
+        return outcome;
+    }
+
     pub fn commitTransaction(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        const fn_ptr = self.vtable.commit_transaction orelse return null;
-        return try BoundaryAbi.call("commit_transaction", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level });
+        const producer = try self.transactionProducer(tables);
+        const fn_ptr = self.vtable.commit_transaction orelse return producerOutcome(producer, null);
+        return producerOutcome(producer, try BoundaryAbi.call("commit_transaction", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level }));
     }
 
     pub fn commitTransactionWithCancellation(
@@ -989,9 +1005,10 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        const producer = try self.transactionProducer(tables);
         const fn_ptr = self.vtable.commit_transaction_with_cancellation orelse
             return try self.commitTransaction(alloc, tables, sync_level);
-        return try BoundaryAbi.call("commit_transaction_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level, cancellation });
+        return producerOutcome(producer, try BoundaryAbi.call("commit_transaction_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level, cancellation }));
     }
 
     pub fn commitBatch(
@@ -1000,8 +1017,9 @@ pub const TableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        const fn_ptr = self.vtable.commit_batch orelse self.vtable.commit_transaction orelse return null;
-        return try BoundaryAbi.call("commit_batch", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level });
+        const producer = try self.transactionProducer(tables);
+        const fn_ptr = self.vtable.commit_batch orelse self.vtable.commit_transaction orelse return producerOutcome(producer, null);
+        return producerOutcome(producer, try BoundaryAbi.call("commit_batch", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level }));
     }
 
     pub fn commitBatchWithCancellation(
@@ -1011,9 +1029,10 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        const producer = try self.transactionProducer(tables);
         const fn_ptr = self.vtable.commit_batch_with_cancellation orelse
             return try self.commitBatch(alloc, tables, sync_level);
-        return try BoundaryAbi.call("commit_batch_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level, cancellation });
+        return producerOutcome(producer, try BoundaryAbi.call("commit_batch_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level, cancellation }));
     }
 
     pub fn commitTransactionWithId(
@@ -1024,8 +1043,9 @@ pub const TableWriteSource = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
-        const fn_ptr = self.vtable.commit_transaction_with_id orelse return null;
-        return try BoundaryAbi.call("commit_transaction_with_id", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level });
+        const producer = try self.transactionProducer(tables);
+        const fn_ptr = self.vtable.commit_transaction_with_id orelse return producerOutcome(producer, null);
+        return producerOutcome(producer, try BoundaryAbi.call("commit_transaction_with_id", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level }));
     }
 
     pub fn commitTransactionWithIdAndCancellation(
@@ -1037,9 +1057,10 @@ pub const TableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        const producer = try self.transactionProducer(tables);
         const fn_ptr = self.vtable.commit_transaction_with_id_with_cancellation orelse
             return try self.commitTransactionWithId(alloc, txn_id, begin_timestamp, tables, sync_level);
-        return try BoundaryAbi.call("commit_transaction_with_id_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation });
+        return producerOutcome(producer, try BoundaryAbi.call("commit_transaction_with_id_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation }));
     }
 
     pub fn acknowledgeTransactionCommit(

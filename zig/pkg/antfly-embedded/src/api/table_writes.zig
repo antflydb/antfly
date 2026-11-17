@@ -733,12 +733,14 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        _ = try @import("distributed_txn_contract.zig").transactionProducer(tables);
         if (tables.len == 1 and tables[0].predicates.len == 0 and tables[0].relational_index_maintenance == null and tables[0].source_admission == null) {
             const table = tables[0];
             const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
             const db = try self.activeDb();
             const req: db_mod.types.BatchRequest = .{
+                .source_producer = table.source_producer,
                 .writes = transactionWritesAsBatchWrites(table.writes),
                 .deletes = table.deletes,
                 .transforms = table.transforms,
@@ -900,6 +902,7 @@ pub const BoundTableWriteSource = struct {
         retain_terminal: bool,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        if (try @import("distributed_txn_contract.zig").transactionProducer(tables) != .unlabelled) return error.ChangefeedCapabilityUnsupported;
         const admission = @import("../storage/source_admission.zig");
         if (tables.len != 1 or tables[0].source_admission == null)
             return commitBoundTransactionInner(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, retain_terminal, cancellation, false);

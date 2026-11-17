@@ -57,6 +57,14 @@ pub const TxnStatusRequest = struct {
 };
 
 pub const TableCommitRequest = struct {
+    /// Keep older canonical execution-plan bytes stable when no origin was
+    /// supplied. Explicit labels remain part of the retained plan identity.
+    pub fn nativeJsonSkipField(self: @This(), comptime name: []const u8) bool {
+        return @import("std").mem.eql(u8, name, "source_producer") and self.source_producer == .unlabelled;
+    }
+
+    /// Explicit trusted transaction origin. Older callers remain unlabelled.
+    source_producer: @FieldType(db_types.BatchRequest, "source_producer") = .unlabelled,
     source_admission: ?@import("../storage/source_admission.zig").Command = null,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
@@ -82,6 +90,15 @@ pub const TableCommitRequest = struct {
     relational_retirement: ?@import("../storage/db/relational_integrity_retirement_contract.zig").Command = null,
     relational_index_maintenance: ?@import("../storage/db/relational_index_maintenance_contract.zig").Command = null,
 };
+
+/// One transaction has one origin, including read-only and empty participants.
+/// Mixed/unknown authority cannot be filled in by routing or table identity.
+pub fn transactionProducer(tables: []const TableCommitRequest) !@FieldType(db_types.BatchRequest, "source_producer") {
+    const producer = if (tables.len == 0) .unlabelled else tables[0].source_producer;
+    if (producer == .scoped_source) return error.InvalidSourceAdmission;
+    for (tables) |table| if (table.source_producer != producer) return error.SourceTransactionIdentityConflict;
+    return producer;
+}
 
 pub const CommitConflict = struct {
     table_name: []const u8,
