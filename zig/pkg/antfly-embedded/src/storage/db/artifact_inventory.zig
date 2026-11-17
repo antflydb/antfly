@@ -98,6 +98,11 @@ pub const Catalogs = struct {
         for (producers) |cfg| if (cfg.group_source_json.len != 0 or cfg.prior_context_json.len != 0) {
             required = 16;
         };
+        // Context-source assets publish with an execution identity bound to
+        // their rendered context, admitted from protocol 17.
+        for (producers) |cfg| if (cfg.kind == .asset and cfg.context_sources_json.len != 0) {
+            required = @max(required, 17);
+        };
         if (self.indexes.len != 0) {
             const indexes = @import("catalog/index_manager.zig");
             const configs = try indexes.deserializeCatalog(alloc, self.indexes);
@@ -581,4 +586,16 @@ test "resolver curation semantic cache fences content generations and rollback w
     try std.testing.expectEqualDeep(first, try cache.get(std.testing.allocator, old));
     old.resolvers = "[{\"name\":\"different\",\"config_generation\":1}]";
     try std.testing.expectError(error.OutOfMemory, cache.get(bounded.allocator(), old));
+}
+
+test "context-source asset enrichments require the execution identity protocol" {
+    const alloc = std.testing.allocator;
+    const producer_catalog = @import("catalog/enrichment_catalog.zig");
+    const generator = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}";
+    const plain = try producer_catalog.serializeCatalog(alloc, &.{.{ .name = "brief", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = generator }});
+    defer alloc.free(plain);
+    try std.testing.expectEqual(@as(u16, 15), try (Catalogs{ .enrichments = plain }).requiredEffectProtocol(alloc));
+    const with_context = try producer_catalog.serializeCatalog(alloc, &.{.{ .name = "brief", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = generator, .context_sources_json = "{\"sources\":{}}" }});
+    defer alloc.free(with_context);
+    try std.testing.expectEqual(@as(u16, 17), try (Catalogs{ .enrichments = with_context }).requiredEffectProtocol(alloc));
 }
