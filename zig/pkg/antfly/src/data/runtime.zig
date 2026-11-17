@@ -24409,9 +24409,18 @@ pub const DataServer = struct {
         try request.ensureActive();
         const now = self.dataRaftRealtimeNs() / std.time.ns_per_s;
         const page = try remote.scanChangefeedMaintenance(self.alloc, .{ .now = now, .after = self.changefeed_maintenance_after }, request);
+        const SpoolRegistry = @import("../metadata/pg_spool_artifacts.zig").Registry;
+        const spool: ?SpoolRegistry = if (self.api_server_cfg.document_artifact_store) |store| blk: {
+            const candidate: SpoolRegistry = .{ .store = store, .io = io };
+            candidate.requireAvailable(self.api_server_cfg.deployment_mode != .standalone, request) catch |err| switch (err) {
+                error.PgSpoolStorageUnsupported => break :blk null,
+                else => return err,
+            };
+            break :blk candidate;
+        } else null;
         for (page.items()) |id| {
             try request.ensureActive();
-            @import("../api/changefeed_public.zig").maintainNativeFeed(metadata, self.historyRootsSource(), io, self.alloc, id, request) catch |err| switch (err) {
+            @import("../api/changefeed_public.zig").maintainNativeFeedWithSpool(metadata, self.historyRootsSource(), io, self.alloc, id, spool, request) catch |err| switch (err) {
                 error.ChangefeedConflict,
                 error.MetadataMutationOutcomeUnknown,
                 error.ChangefeedResynchronizationRequired,
