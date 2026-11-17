@@ -223,7 +223,7 @@ pub fn run(svc: anytype, registry: anytype, clock: u64) !void {
     var confirmed = try svc.load(a);
     defer confirmed.deinit();
     try std.testing.expectEqual(@as(u64, 105), confirmed.value.slot.?.confirmed_lsn);
-    try std.testing.expectEqual(@as(u64, 11), confirmed.value.roots[0].acknowledged.sequence);
+    try std.testing.expectEqual(@as(u64, 12), confirmed.value.roots[0].acknowledged.sequence);
     try std.testing.expectEqual(.garbage, confirmed.value.slot.?.spool.records[0].phase);
     try std.testing.expect(confirmed.value.slot.?.spool.charged_bytes != 0);
     try std.testing.expect(confirmed.value.slot.?.session == null);

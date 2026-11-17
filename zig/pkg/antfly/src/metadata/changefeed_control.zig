@@ -21,7 +21,7 @@ const A = std.mem.Allocator;
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
-pub const protocol_version: u16 = 108;
+pub const protocol_version: u16 = 109;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -389,6 +389,7 @@ pub const Mutation = union(enum) {
     rebind: struct { namespace: Namespace, previous: u64, next: u64, proof: Digest },
     refresh_grant: struct { namespace: Namespace, previous: u64 },
     seal: struct { cut: Digest, slot: ?pg_slot.Configuration = null },
+    skip_slot_projection: struct { session: pg_slot.Session, now: u64, delivery: Delivery },
     issue: Delivery,
     acknowledge: Digest,
     reclaimed: struct { namespace: Namespace, consumer_epoch: u64, previous: u64, next: u64 },
@@ -427,6 +428,11 @@ pub const Mutation = union(enum) {
             .seal => |value| {
                 if (!nz(value.cut)) return error.InvalidChangefeed;
                 if (value.slot) |configuration| try configuration.validate();
+            },
+            .skip_slot_projection => |skip| {
+                if (skip.now == 0 or skip.delivery.issued_at > skip.now or skip.delivery.advances.len == 0) return error.InvalidChangefeed;
+                for (skip.delivery.advances) |advance| if (advance.position.event != 0 or advance.snapshot != null) return error.InvalidChangefeed;
+                try (Mutation{ .issue = skip.delivery }).validate();
             },
             .issue => |value| {
                 if (!validProviderContext(value.provider_context)) return error.InvalidChangefeed;
@@ -702,6 +708,29 @@ pub const Mutation = union(enum) {
                     if (!equal(state.id, pg_slot.feedId(configuration.database, configuration.name))) return error.ChangefeedConflict;
                     next.slot = try pg_slot.State.initializeAt(configuration.database, configuration.name, next.acknowledged_cursor, configuration.byte_limit, configuration.consistent_lsn);
                 }
+            },
+            .skip_slot_projection => |skip| {
+                if (state.phase != .streaming or skip.now >= state.expires_at) return error.ChangefeedLeaseExpired;
+                const slot = state.slot orelse return error.ChangefeedConflict;
+                try slot.verifySession(skip.session, skip.now);
+                if (slot.binding == null or slot.entries.len != 0 or state.cursors.len != 0) return error.ChangefeedConflict;
+                for (slot.spool.records) |record| if (record.phase == .uploading) return error.ChangefeedConflict;
+                for (skip.delivery.advances) |advance| {
+                    const root = state.roots[try state.rootIndex(advance.namespace)];
+                    if (advance.position.order(root.acknowledged) != .gt) return error.ChangefeedConflict;
+                }
+                // The authorized producer attests the complete projection is
+                // empty. Stage and acknowledge it within this one mutation.
+                var staged_arena = std.heap.ArenaAllocator.init(a);
+                defer staged_arena.deinit();
+                const staged = try (Mutation{ .issue = skip.delivery }).apply(staged_arena.allocator(), state, stamp);
+                try acknowledge(a, staged, &next, skip.delivery.cursor);
+                next.latest_delivery = staged.latest_delivery;
+                next.latest_cursor = staged.latest_cursor;
+                next.latest_provider_context = skip.delivery.provider_context;
+                next.slot.?.acknowledged_cursor = skip.delivery.cursor;
+                next.slot.?.mapped_cursor = skip.delivery.cursor;
+                next.slot.?.observed_at = skip.now;
             },
             .issue => |delivery| {
                 if (state.phase != .streaming and state.phase != .bootstrap) return error.ChangefeedResynchronizationRequired;
@@ -1510,6 +1539,26 @@ test "changefeed logical slot confirms native ACK atomically and fences ordinary
     state = try step(a, state, .{ .slot = .{ .acquire = .{ .actor = @splat(3), .expected = 1, .now = 150, .expires = 200 } } });
     try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .slot = .{ .confirm = .{ .session = session, .now = 151, .flushed = lsn + 100 } } }));
 }
+test "changefeed logical slot skips a complete invisible projection without WAL positions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var state = try testSlotStateAt(a, 8192);
+    const session = state.slot.?.session.?;
+    state = try step(a, state, .{ .slot = .{ .bind = .{ .session = session, .now = 100, .binding = .{ .publications = &.{"rows_pub"}, .projection = @splat(8) } } } });
+    var delivery = testDelivery(state, &.{.{ .namespace = testNamespace(7), .position = .{ .sequence = 11 } }});
+    delivery.issued_at = 101;
+    delivery.cursor = delivery.identity(state.id, state.epoch);
+    const skip: Mutation = .{ .skip_slot_projection = .{ .session = session, .now = 101, .delivery = delivery } };
+    const skipped = try step(a, state, skip);
+    try std.testing.expectEqual(@as(u64, 8192), skipped.slot.?.confirmed_lsn);
+    try std.testing.expectEqual(@as(u64, 8192), skipped.slot.?.next_lsn);
+    try std.testing.expectEqual(delivery.cursor, skipped.slot.?.mapped_cursor);
+    try std.testing.expectEqual(@as(u64, 11), skipped.roots[0].acknowledged.sequence);
+    try std.testing.expectEqual(@as(usize, 0), skipped.cursors.len);
+    try std.testing.expectError(error.ChangefeedConflict, step(a, skipped, skip));
+}
+
 test "changefeed logical slot drop waits for the lease and preserves cleanup ownership" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

@@ -81,6 +81,7 @@ const Iterator = struct {
 const Producer = struct {
     initial: ?control.Digest = null,
     prepares: usize = 0,
+    invisible: bool = true,
     opens: usize = 0,
     denied: bool = false,
     corrupt: bool = false,
@@ -91,6 +92,20 @@ const Producer = struct {
     }
     pub fn nowSeconds(self: *@This(), _: Request) !u64 {
         return self.clock;
+    }
+    pub fn prepareInvisible(self: *@This(), a: A, state: control.State, _: Request) !?control.Delivery {
+        if (!self.invisible) return null;
+        const advances = try a.dupe(control.Advance, &.{.{ .namespace = namespace(), .position = .{ .sequence = 11 } }});
+        var delivery: control.Delivery = .{
+            .sequence = state.latest_delivery + 1,
+            .before = state.latest_cursor,
+            .cursor = @splat(0),
+            .authority = @splat(5),
+            .issued_at = self.clock,
+            .advances = advances,
+        };
+        delivery.cursor = delivery.identity(state.id, state.epoch);
+        return delivery;
     }
     pub fn prepare(self: *@This(), a: A, state: control.State, _: Request) !?upload.Candidate {
         self.prepares += 1;
@@ -104,7 +119,7 @@ const Producer = struct {
             try sha.add(message);
         }
         const advances = try a.alloc(control.Advance, 1);
-        advances[0] = .{ .namespace = namespace(), .position = .{ .sequence = 11 } };
+        advances[0] = .{ .namespace = namespace(), .position = .{ .sequence = 12 } };
         var candidate: upload.Candidate = .{ .delivery = .{ .sequence = state.latest_delivery + 1, .before = slot.mapped_cursor, .cursor = @splat(0), .authority = @splat(0), .issued_at = 110, .advances = advances }, .projection = @splat(8), .completion = @splat(4), .wire = sha.final(), .messages = 5, .visible_events = 3, .bytes = 104, .xid = 42, .commit_time = -1 };
         for (state.cursors) |receipt| if (std.mem.eql(u8, &receipt.before, &slot.mapped_cursor)) {
             candidate.delivery = receipt;
@@ -166,6 +181,15 @@ fn runImpl(with_stream: bool) !void {
     const session: control.pg_slot.Session = .{ .actor = @splat(2), .fence = 1 };
     try svc.mutate(a, .{ .slot = .{ .bind = .{ .session = session, .now = 101, .binding = .{ .publications = &.{"rows_pub"}, .projection = @splat(8) } } } });
     const config: upload.Config = .{ .require_shared = false }; // explicitly local fixture
+    try std.testing.expectEqual(.skipped_invisible, (try upload.drive(&svc, &registry, &producer, a, id, session, config, Request{})).status);
+    producer.invisible = false;
+    {
+        var skipped = try svc.load(a);
+        defer skipped.deinit();
+        try std.testing.expectEqual(@as(u64, 11), skipped.value.roots[0].acknowledged.sequence);
+        try std.testing.expectEqual(@as(u64, 1), skipped.value.slot.?.next_lsn);
+        try std.testing.expectEqual(@as(usize, 0), skipped.value.slot.?.spool.records.len);
+    }
     try std.testing.expectEqual(.staged, (try upload.drive(&svc, &registry, &producer, a, id, session, config, Request{})).status);
     try std.testing.expectError(error.PgSpoolStorageUnsupported, upload.drive(&svc, &registry, &producer, a, id, session, .{}, Request{}));
     svc.lose_ack = true;

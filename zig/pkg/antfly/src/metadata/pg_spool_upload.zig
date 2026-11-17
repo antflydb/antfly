@@ -70,7 +70,7 @@ pub const Candidate = struct {
     }
 };
 pub const Result = struct {
-    status: enum { idle, staged, reserved, abandoned, published },
+    status: enum { idle, staged, reserved, abandoned, published, skipped_invisible },
     reservation: u64 = 0,
     manifest: control.Digest = @splat(0),
 };
@@ -201,6 +201,17 @@ pub fn drive(svc: anytype, registry: anytype, producer: anytype, a: A, id: contr
     }
     var scratch_arena = std.heap.ArenaAllocator.init(a);
     defer scratch_arena.deinit();
+    // Only a producer that proves an empty complete authorized projection
+    // may use this path. An idle provider has supplied no progress evidence.
+    if (comptime @hasDecl(@typeInfo(@TypeOf(producer)).pointer.child, "prepareInvisible")) {
+        if (state.cursors.len == 0 and state.slot.?.entries.len == 0) {
+            if (try producer.prepareInvisible(scratch_arena.allocator(), state, request)) |delivery| {
+                const now = try active(producer, state, session, request);
+                try mutate(svc, a, state, .{ .skip_slot_projection = .{ .session = session, .now = now, .delivery = delivery } }, request);
+                return .{ .status = .skipped_invisible };
+            }
+        }
+    }
     const candidate: Candidate = (try producer.prepare(scratch_arena.allocator(), state, request)) orelse return .{ .status = .idle };
     // Validation uses a dummy storage identity only; no namespace is allocated
     // until the historical receipt has been observed in durable metadata.
