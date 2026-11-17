@@ -464,6 +464,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         identity: Identity,
         schema_json: []u8,
         indexes_json: []u8,
+        // A prepared apply must remain resumable after cache replacement.
+        apply_projection: ?@import("owner_catalog_projection.zig").Cache.Lease = null,
         restore_bootstrap_json: []u8,
         initial_child_bootstrap_json: []u8,
         initial_range: ?db_types.ByteRange = null,
@@ -2659,6 +2661,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.alloc.free(entry.table_name);
         self.alloc.free(entry.schema_json);
         self.alloc.free(entry.indexes_json);
+        if (entry.apply_projection) |*projection| projection.deinit();
         self.alloc.free(entry.restore_bootstrap_json);
         self.alloc.free(entry.initial_child_bootstrap_json);
         descriptor_contract.freeInitialRange(self.alloc, entry.initial_range);
@@ -4114,13 +4117,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         raw_descriptor: descriptor_contract.Descriptor,
         needs_index_catalog: bool,
     ) !Lease {
-        var physical = self.physical_catalogs.lookup(group_id, raw_descriptor.indexes_json) catch return error.RaftApplyWriterUnavailable;
+        var physical = self.physical_catalogs.lookup(group_id, raw_descriptor.indexes_json) catch null;
         defer if (physical) |*projection| projection.deinit();
-        var descriptor = raw_descriptor;
-        if (physical) |projection| descriptor.indexes_json = projection.bytes;
 
         if (!self.mutex.tryLock()) return error.RaftApplyWriterUnavailable;
-        const initial = if (physical != null) self.tryAcquireWarmApplyLocked(group_id, table_name, descriptor, needs_index_catalog) else null;
+        const initial = self.tryAcquireWarmApplyLocked(group_id, table_name, raw_descriptor, if (physical) |cut| cut.bytes else null, needs_index_catalog);
         const may_queue = !self.quiescing and !self.apply_control_stopping and
             !self.publicationPendingLocked(group_id, table_name) and self.apply_control_io != null and
             !self.applyRequestPendingLocked(group_id, table_name) and
@@ -4146,11 +4147,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         // The control executor may have admitted the raw cut while we
         // prepared the queue item. Recheck without building a projection.
         if (physical == null)
-            physical = self.physical_catalogs.lookup(group_id, raw_descriptor.indexes_json) catch return error.RaftApplyWriterUnavailable;
-        if (physical) |projection| {
-            descriptor.indexes_json = projection.bytes;
-            if (self.tryAcquireWarmApplyLocked(group_id, table_name, descriptor, needs_index_catalog)) |lease| return lease;
-        }
+            physical = self.physical_catalogs.lookup(group_id, raw_descriptor.indexes_json) catch null;
+        if (self.tryAcquireWarmApplyLocked(group_id, table_name, raw_descriptor, if (physical) |cut| cut.bytes else null, needs_index_catalog)) |lease| return lease;
         if (self.apply_control_io == null or self.applyRequestPendingLocked(group_id, table_name) or
             self.apply_control_pending.items.len + @as(usize, @intFromBool(self.apply_control_active != null)) >= apply_control_max_pending)
             return error.RaftApplyWriterUnavailable;
@@ -4164,7 +4162,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
         table_name: []const u8,
-        descriptor: descriptor_contract.Descriptor,
+        raw_descriptor: descriptor_contract.Descriptor,
+        projected: ?[]const u8,
         needs_index_catalog: bool,
     ) ?Lease {
         if (self.quiescing or self.apply_control_stopping or
@@ -4172,7 +4171,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (needs_index_catalog and !entry.graph_replay_indexes_prepared) continue;
-            if (!entry.retired and !entry.closing and exactApplyDescriptor(entry, descriptor) and
+            if (entry.retired or entry.closing) continue;
+            var descriptor = raw_descriptor;
+            descriptor.indexes_json = projected orelse blk: {
+                const pinned = entry.apply_projection orelse continue;
+                if (!pinned.matchesRaw(raw_descriptor.indexes_json)) continue;
+                break :blk pinned.bytes;
+            };
+            if (exactApplyDescriptor(entry, descriptor) and
                 tryReserveEntryLeaseLocked(entry, .shared))
             {
                 entry.resident = true;
@@ -4309,6 +4315,11 @@ pub const ProvisionedKernelOwnerSource = struct {
                 entry.resident = true;
                 entry.transient_retirement_pending = false;
             }
+            if (controls.historical_raft_apply) {
+                const pin = physical.pin();
+                if (entry.apply_projection) |*previous| previous.deinit();
+                entry.apply_projection = pin;
+            }
             self.physical_catalogs.retainAdmitted(self.alloc, &physical);
             _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
             return .{ .source = self, .entry = entry, .exclusive = exclusive };
@@ -4406,6 +4417,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .identity = descriptor.identity,
             .schema_json = owned_schema_json,
             .indexes_json = owned_indexes_json,
+            .apply_projection = if (controls.historical_raft_apply) physical.pin() else null,
             .restore_bootstrap_json = owned_restore_bootstrap_json,
             .initial_child_bootstrap_json = owned_initial_child_bootstrap_json,
             .initial_range = owned_initial_range,
@@ -7090,6 +7102,16 @@ test "committed owner apply never opens or closes storage under the raft apply l
     var admitted = (try source.physical_catalogs.lookup(1, first.indexes_json)) orelse return error.TestWarmOwnerDidNotAdmit;
     defer admitted.deinit();
     try std.testing.expectEqualStrings("{}", admitted.bytes);
+    source.physical_catalogs.forget(1);
+    try std.testing.expect((try source.physical_catalogs.lookup(1, first.indexes_json)) == null);
+    // Holding the shared cache lock also forces the owner-pinned path.
+    {
+        try std.testing.expect(source.physical_catalogs.mutex.tryLock());
+        defer source.physical_catalogs.mutex.unlock();
+        var pinned = try source.acquireApplyOnly(1, "docs", first);
+        pinned.deinit();
+    }
+
     // A different group's cold open can hold the owner registry while a
     // recovery callback awaits Raft progress. The already-admitted apply
     // lease must be releasable even in that exact lock order.

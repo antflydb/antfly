@@ -51,6 +51,17 @@ pub const Cache = struct {
     pub const Lease = struct {
         entry: ?*Entry = null,
         bytes: []const u8,
+        pub fn pin(self: Lease) ?Lease {
+            const entry = self.entry orelse return null;
+            entry.retain();
+            return self;
+        }
+
+        pub fn matchesRaw(self: Lease, raw: []const u8) bool {
+            const entry = self.entry orelse return false;
+            return std.mem.eql(u8, entry.raw, raw) or std.mem.eql(u8, self.bytes, raw);
+        }
+
         pub fn deinit(self: *Lease) void {
             if (self.entry) |entry| entry.release();
             self.* = undefined;
