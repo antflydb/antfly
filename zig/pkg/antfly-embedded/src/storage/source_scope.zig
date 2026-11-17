@@ -109,6 +109,16 @@ pub const Record = struct {
     slot: ?Slot = null,
     close_metadata_index: u64 = 0,
     closed_at: ?Cut = null,
+    pub fn validate(self: @This()) !void {
+        self.spec.validate() catch return error.SourceAdmissionCorrupt;
+        if (self.bound_metadata_index == 0 or self.last_committed_token > self.closed_through_token or (self.last_committed_sequence == 0 and self.last_committed_token != 0)) return error.SourceAdmissionCorrupt;
+        if ((self.phase == .closed) != (self.closed_at != null) or (self.phase == .active) != (self.close_metadata_index == 0) or (self.phase != .active and self.close_metadata_index <= self.bound_metadata_index)) return error.SourceAdmissionCorrupt;
+        if (self.closed_at) |cut| if (cut.term == 0 or cut.index == 0 or self.slot != null) return error.SourceAdmissionCorrupt;
+        if (self.slot) |slot| {
+            self.matches(slot.reference) catch return error.SourceAdmissionCorrupt;
+            if (self.phase == .closed or slot.reference.token <= self.closed_through_token or slot.reference.sequence <= self.last_committed_sequence or !nonzero(slot.transaction_id) or !nonzero(slot.source_purpose) or !nonzero(slot.admission_digest)) return error.SourceAdmissionCorrupt;
+        }
+    }
     fn matches(self: Record, ref: Reference) !void {
         try ref.validate();
         if (!same(ref.domain, self.spec.domain()) or !same(ref.binding, self.spec.binding) or ref.generation != self.spec.generation) return error.SourceCheckpointConflict;
@@ -182,6 +192,10 @@ pub const Header = struct {
     metadata_floor: u64 = 0,
     domains: u16 = 0,
     strict: bool = false,
+    pub fn validate(self: @This()) !void {
+        self.root.validate() catch return error.SourceAdmissionCorrupt;
+        if (self.version != 1 or self.domains > max_domains or (!self.strict and (self.domains != 0 or self.metadata_floor != 0))) return error.SourceAdmissionCorrupt;
+    }
     pub fn requireLegacyAllowed(self: Header) !void {
         if (self.strict) return error.SourceCheckpointConflict;
     }
@@ -191,7 +205,7 @@ pub const Header = struct {
         try self.root.validate();
         try spec.validate();
         try cut.require(self.root);
-        if (cut.index < self.metadata_floor) return error.SourceCheckpointConflict;
+        if (spec.checkpoint_owner.metadata_group_id != self.root.metadata_group_id or !same(spec.checkpoint_owner.metadata_incarnation, self.root.metadata_incarnation) or cut.index < self.metadata_floor) return error.SourceCheckpointConflict;
         if (old) |record| {
             if (!self.strict or self.domains == 0) return error.SourceAdmissionCorrupt;
             if (!same(record.spec.domain(), spec.domain())) return error.SourceAdmissionCorrupt;
@@ -245,19 +259,7 @@ pub const Store = struct {
         var parsed = std.json.parseFromSlice(T, a, bytes[36..], .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.SourceAdmissionCorrupt;
         defer parsed.deinit();
         const value = parsed.value;
-        if (T == Header) {
-            value.root.validate() catch return error.SourceAdmissionCorrupt;
-            if (value.version != 1 or value.domains > max_domains or (!value.strict and (value.domains != 0 or value.metadata_floor != 0))) return error.SourceAdmissionCorrupt;
-        } else if (T == Record) {
-            value.spec.validate() catch return error.SourceAdmissionCorrupt;
-            if (value.bound_metadata_index == 0 or value.last_committed_token > value.closed_through_token or (value.last_committed_sequence == 0 and value.last_committed_token != 0)) return error.SourceAdmissionCorrupt;
-            if ((value.phase == .closed) != (value.closed_at != null) or (value.phase == .active) != (value.close_metadata_index == 0) or (value.phase != .active and value.close_metadata_index <= value.bound_metadata_index)) return error.SourceAdmissionCorrupt;
-            if (value.closed_at) |cut| if (cut.term == 0 or cut.index == 0 or value.slot != null) return error.SourceAdmissionCorrupt;
-            if (value.slot) |slot| {
-                value.matches(slot.reference) catch return error.SourceAdmissionCorrupt;
-                if (value.phase == .closed or slot.reference.token <= value.closed_through_token or slot.reference.sequence <= value.last_committed_sequence or !nonzero(slot.transaction_id) or !nonzero(slot.source_purpose) or !nonzero(slot.admission_digest)) return error.SourceAdmissionCorrupt;
-            }
-        } else @compileError("unsupported source scope record type");
+        if (T == Header or T == Record) try value.validate() else @compileError("unsupported source scope record type");
         return value;
     }
     /// Reject fresh legacy source admission once this root enables scoped work.
@@ -356,7 +358,10 @@ pub const Store = struct {
         var record = try requireRecord(a, txn, root, domain);
         if (!same(record.spec, expected_spec)) return error.SourceCheckpointConflict;
         try record.close(root, cut, applied);
+        var header = try readHeader(a, txn, root);
+        header.metadata_floor = @max(header.metadata_floor, cut.index);
         try writeRecord(a, txn, record);
+        try writeHeader(a, txn, header);
         return record;
     }
     pub fn finish(a: std.mem.Allocator, txn: anytype, root: Basis, slot: Slot, committed: bool, applied: Cut) !void {

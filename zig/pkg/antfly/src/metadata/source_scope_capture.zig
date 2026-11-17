@@ -103,3 +103,22 @@ pub fn readOnService(svc: anytype, a: A, query: Query, request: anytype) !Snapsh
     try request.ensureActive();
     return snapshot;
 }
+
+/// The intent carries only a minimum metadata cut. Re-read independently on the
+/// metadata service, require the exact persisted binding and lifecycle phase,
+/// then construct the private command using the actual observed cut. This does
+/// not qualify the destination root or establish first-bind legacy drainage.
+pub fn authorizeOnService(svc: anytype, a: A, intent: @import("antfly_local_sources").storage_source_scope_control.Intent, request: anytype) !@import("antfly_local_sources").storage_source_scope_control.Command {
+    try intent.validate();
+    var snapshot = try readOnService(svc, a, .{ .metadata_group_id = intent.owner.metadata_group_id, .metadata_incarnation = intent.owner.metadata_incarnation, .actor_table_id = intent.spec.actor_table_id, .source_id = intent.spec.source_id, .minimum_applied_index = intent.minimum_metadata_index }, request);
+    defer snapshot.deinit(a);
+    try snapshot.requireBinding(intent.spec);
+    switch (intent.action) {
+        .bind => try snapshot.requireBind(),
+        .close => try snapshot.requireClose(),
+        .drop => try snapshot.requireDrop(),
+    }
+    const command: @import("antfly_local_sources").storage_source_scope_control.Command = .{ .version = 1, .intent = intent, .metadata_cut = snapshot.cut };
+    try command.validate();
+    return command;
+}

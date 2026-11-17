@@ -159,6 +159,22 @@ pub fn run(a: A) !void {
     foreign.metadata_group_id += 1;
     try std.testing.expectError(error.SourceBindingConflict, capture.readOnService(&service, a, foreign, context));
     try std.testing.expectEqual(@as(usize, 1), service.reads);
+    const native_control = @import("antfly_local_sources").storage_source_scope_control;
+    var intent: native_control.Intent = .{ .version = 1, .owner = authority.owner, .spec = restored.spec, .minimum_metadata_index = 1, .action = .bind };
+    // The request cannot bind a retired actor even with an old minimum index.
+    try std.testing.expectError(error.SourceBindingConflict, capture.authorizeOnService(&service, a, intent, context));
+    intent.action = .close;
+    const close_command = try capture.authorizeOnService(&service, a, intent, context);
+    try std.testing.expectEqualDeep(restored.cut, close_command.metadata_cut);
+    try std.testing.expectEqualDeep(intent, close_command.intent);
+    intent.action = .{ .drop = .{ .term = 1, .index = 20 } };
+    const drop_command = try capture.authorizeOnService(&service, a, intent, context);
+    try std.testing.expectEqualDeep(restored.cut, drop_command.metadata_cut);
+    intent.spec.generation += 1;
+    try std.testing.expectError(error.SourceBindingConflict, capture.authorizeOnService(&service, a, intent, context));
+    intent.spec = restored.spec;
+    intent.minimum_metadata_index = restored.cut.index + 1;
+    try std.testing.expectError(error.ReadUnavailable, capture.authorizeOnService(&service, a, intent, context));
     service.cancel_at_projection = true;
     try std.testing.expectError(error.Canceled, capture.readOnService(&service, a, query, context));
     const read_count = service.reads;

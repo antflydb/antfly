@@ -1257,6 +1257,8 @@ pub const NativeSourceScopeAbortReply = struct {
     disposition: []const u8,
 };
 
+pub const NativeSourceScopeAction = std.json.Value;
+
 /// Immutable physical owner basis; schema/topology leases are qualified separately. All metadata indices in a registry share this metadata group/incarnation.
 pub const NativeSourceScopeBasis = struct {
     metadata_group_id: u64,
@@ -1266,11 +1268,146 @@ pub const NativeSourceScopeBasis = struct {
     group_id: u64,
 };
 
+/// Trusted ordered command constructed from an independently qualified metadata read. Not an HTTP authorization body. Scope mutation and the actual apply marker commit atomically. First strict admission also requires independently verified legacy worker handover and transaction drainage.
+pub const NativeSourceScopeControlCommand = struct {
+    version: i64,
+    intent: NativeSourceScopeControlIntent,
+    metadata_cut: NativeSourceScopeMetadataCut,
+};
+
+/// Private scope lifecycle intent. The control owner independently reads metadata at or beyond the minimum index, verifies the exact binding and active/closing/retired actor phase, and qualifies the physical destination owner. No caller-supplied lifecycle state or drain flag grants authority.
+pub const NativeSourceScopeControlIntent = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    spec: NativeSourceScopeSpec,
+    minimum_metadata_index: u64,
+    action: NativeSourceScopeAction,
+};
+
+/// Bounded physical-root registry. The monotonic metadata floor and strict admission survive deletion of the last domain; no unbounded generation tombstones are retained.
+pub const NativeSourceScopeHeader = struct {
+    version: i64,
+    root: NativeSourceScopeBasis,
+    metadata_floor: u64,
+    domains: i64,
+    strict: bool,
+};
+
 /// Qualified metadata actor/configuration cut, not a caller-supplied lease. The trusted control owner must independently capture active/closing/retired actor state at this same cut. Native monotonic floors reject stale bind after cleanup.
 pub const NativeSourceScopeMetadataCut = struct {
     group_id: u64,
     incarnation: []const i64,
     index: u64,
+};
+
+/// One qualified physical-root snapshot. A local closure receipt does not prove all-owner fencing, global commit, publication, or safe metadata retirement.
+pub const NativeSourceScopeObservation = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    domain: NativeHistoryDigest,
+    cut: NativeHistoryPublicationCut,
+    header: NativeSourceScopeHeader,
+    record: ?NativeSourceScopeRecord,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "owner", "owner", false },
+        .{ "domain", "domain", false },
+        .{ "cut", "cut", false },
+        .{ "header", "header", false },
+        .{ "record", "record", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        try jw.objectField("domain");
+        try jw.write(self.domain);
+        try jw.objectField("cut");
+        try jw.write(self.cut);
+        try jw.objectField("header");
+        try jw.write(self.header);
+        try jw.objectField("record");
+        try jw.write(self.record);
+        try jw.endObject();
+    }
+};
+
+/// ReadIndex-qualified physical-root scope observation. Absence is not an outcome or replay grant.
+pub const NativeSourceScopeQuery = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    domain: NativeHistoryDigest,
+    minimum_applied_index: u64,
+};
+
+/// One current generation and at most one attempt slot per source domain. Closing prevents new admission and prepares while original decisions drain. Closed records retain their first actual ordered close cut.
+pub const NativeSourceScopeRecord = struct {
+    spec: NativeSourceScopeSpec,
+    bound_metadata_index: u64,
+    phase: []const u8,
+    closed_through_token: u64,
+    last_committed_sequence: u64,
+    last_committed_token: u64,
+    slot: ?NativeSourceScopeSlot,
+    close_metadata_index: u64,
+    closed_at: ?NativeHistoryPublicationCut,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "spec", "spec", false },
+        .{ "bound_metadata_index", "bound_metadata_index", false },
+        .{ "phase", "phase", false },
+        .{ "closed_through_token", "closed_through_token", false },
+        .{ "last_committed_sequence", "last_committed_sequence", false },
+        .{ "last_committed_token", "last_committed_token", false },
+        .{ "slot", "slot", false },
+        .{ "close_metadata_index", "close_metadata_index", false },
+        .{ "closed_at", "closed_at", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("spec");
+        try jw.write(self.spec);
+        try jw.objectField("bound_metadata_index");
+        try jw.write(self.bound_metadata_index);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("closed_through_token");
+        try jw.write(self.closed_through_token);
+        try jw.objectField("last_committed_sequence");
+        try jw.write(self.last_committed_sequence);
+        try jw.objectField("last_committed_token");
+        try jw.write(self.last_committed_token);
+        try jw.objectField("slot");
+        try jw.write(self.slot);
+        try jw.objectField("close_metadata_index");
+        try jw.write(self.close_metadata_index);
+        try jw.objectField("closed_at");
+        try jw.write(self.closed_at);
+        try jw.endObject();
+    }
 };
 
 /// Frozen protocol-39 BEGIN/PREPARE reference. Token is the positive source upload/attempt token; sequence is the logical source sequence. Native local retirement floors prevent delayed BEGIN after transaction metadata GC. A reference alone grants no authority.
@@ -1280,6 +1417,13 @@ pub const NativeSourceScopeReference = struct {
     generation: u64,
     token: u64,
     sequence: u64,
+};
+
+pub const NativeSourceScopeSlot = struct {
+    reference: NativeSourceScopeReference,
+    transaction_id: NativeHistoryConsumerId,
+    source_purpose: NativeHistoryDigest,
+    admission_digest: NativeHistoryDigest,
 };
 
 /// Private protocol-39 source scope registration. Domain derives from actor_table_id/source_id and stays stable across generations. Binding authenticates one immutable source configuration. A source may target roots different from its actor table or checkpoint authority.

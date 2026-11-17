@@ -4897,3 +4897,49 @@ Private transport/routing, physical ordered scope control and native observation
 legacy-source migration qualification, stronger data activation, source worker
 integration and coordinator-before-BEGIN closure retirement remain outstanding.
 The full issue goals and draft PR remain active and unfinished.
+
+### Qualified lifecycle command construction and bounded scope control reducer
+
+- Added private scope control Intent/Command/Query/Observation contracts, including
+  exact original routed owner, immutable actor binding, minimum metadata cut,
+  bind/close/drop action, actual local apply cut, bounded header and current slot.
+  Internal OpenAPI schemas and generated types describe these shapes without
+  advertising an unimplemented endpoint or a new data decoder floor.
+- `source_scope_capture.authorizeOnService` independently runs the qualified
+  metadata service read, requires the exact stored binding and correct lifecycle
+  phase, and puts the actual captured metadata cut in the private command.
+  An old minimum index cannot authorize binding an already retired actor. The
+  command body is still not self-authenticating metadata evidence.
+- The native reducer requires an independently supplied legacy-drain gate before
+  first enabling strict admission, including absent-scope closure. No request
+  boolean or metadata `pending == null` substitutes for a real worker handover.
+  There is deliberately no production gate that asserts drainage unconditionally.
+- Closing an existing scope now persists the root metadata floor in the same
+  enclosing transaction as the record, matching absent-scope closure. Delayed
+  captures cannot allocate another domain below that floor. Cross-metadata-group
+  and cross-incarnation checkpoint owners are rejected during binding.
+- Drop requires the exact stored Spec and first actual close cut, releases one
+  domain charge, and retains strict admission plus the root metadata floor.
+  Observation absence grants no outcome/replay/global fencing authority.
+- Header and Record invariants are shared by durable decoding and wire observation
+  validation; malformed phase/cut/slot combinations cannot pass the wire validator.
+
+Validation: direct scope control tests passed all 18 tests; these tests are also
+now included in `zig build source-control-test`. The final combined target exited
+0, including real committed metadata projection, snapshot installation, fresh-cut
+command authorization, wrong binding/future-cut refusal, cancellation and service
+ReadIndex ordering tests (metadata storage 11, service 3 and discovery suites 12,
+all zero failed/skipped/leaked). `make generate` completed with the pinned network
+accessible toolchain after the sandboxed attempt could not resolve npm DNS.
+`source-catalog-check`, `engine-errors-check`, and `openapi-check` exited 0; the
+schema fragment tests passed all nine cases. No native ABI or data-Raft protocol
+maximum was changed by this reducer/authorization milestone.
+
+Still outstanding: genuine first-bind legacy-worker handover/drain certification,
+actual native owner/ordered apply/RPC wiring and durable bounded control receipts,
+qualified native observation and coordinator-retirement transport, historical root
+cohort registration and lifecycle coverage, destination provisioning and migration,
+all-owner fencing/ACK/publication/credit cleanup, and the remaining full-scope
+public feeds/bootstrap/retention/pgoutput/existing-client requirements above. The
+unit reducer gate is a fixture, not production migration qualification. Issues
+#1698/#1639 remain open and PR #1700 remains draft.
