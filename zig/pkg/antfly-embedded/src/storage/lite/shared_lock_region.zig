@@ -1843,6 +1843,14 @@ pub const Region = struct {
     /// never true for a live holder (the normal, overwhelmingly common
     /// case: a waiter should keep waiting on the futex, not spin probing
     /// `fcntl` on every iteration).
+    /// True when a live process other than `own_pid` holds the writer
+    /// lease, so it may have an append in flight right now.
+    pub fn foreignLiveWriter(self: *const Region, own_pid: u32) bool {
+        const word = self.header().writer_holder.load(.acquire);
+        if (word == 0 or holderPid(word) == own_pid) return false;
+        return !self.isReferenceDead(holderLivenessSlot(word), holderClaimGeneration(word));
+    }
+
     pub fn writerHolderDead(self: *const Region) bool {
         const word = self.header().writer_holder.load(.acquire);
         if (word == 0) return false;

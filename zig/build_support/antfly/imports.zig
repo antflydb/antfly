@@ -428,6 +428,8 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_template_content", implementation.template_content);
         mod.addImport("antfly_runtime_fs", self.runtime_fs);
+        // Extraction clients carry the caller's request deadline/cancellation.
+        mod.addImport("antfly_inference_execution_context", self.inference_execution_context);
         mod.link_libc = link_libc;
         inline for (.{ "image", "font", "pdf", "json", "scraping", "scraping_openapi", "reader_config", "chunking", "hash", "httpx", "structlog" }) |field| implementation.addImport(mod, field);
         if (self.pdf_implementation) |raw_pdf| mod.addImport("antfly_pdf", raw_pdf);

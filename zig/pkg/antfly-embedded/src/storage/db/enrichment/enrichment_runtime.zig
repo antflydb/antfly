@@ -17666,8 +17666,11 @@ fn processAsset(
         // Same reasoning as the generic producer's receipt below: key the
         // reuse receipt on the declared source (`source_text`), not the
         // whole primary document (`raw`), so an edit to an unrelated field
-        // doesn't invalidate it.
-        if (try shouldSkipAssetArtifact(runtime, key, source_text) and try reusableLocalAsset(runtime, request.doc_key, artifact_name, source_text, source_text)) {
+        // doesn't invalidate it -- unless a graph index extracts relations
+        // from this artifact, in which case the receipt must track the
+        // exact primary revision (see `artifactFeedsGraph`'s doc comment).
+        const reuse_parent = if (runtime.index_manager.artifactFeedsGraph(artifact_name)) raw else source_text;
+        if (try shouldSkipAssetArtifact(runtime, key, source_text) and try reusableLocalAsset(runtime, request.doc_key, artifact_name, reuse_parent, source_text)) {
             try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
             try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
             // The artifact exists and is current: produced coverage, so an
@@ -17679,7 +17682,7 @@ fn processAsset(
         const receipt_key = try local.key(runtime.alloc, key);
         defer runtime.alloc.free(receipt_key);
         const producer_recipe = local.requestRecipe(request);
-        const receipt = local.encode(producer_recipe, source_text, source_text);
+        const receipt = local.encode(producer_recipe, reuse_parent, source_text);
         try storePutBatchGuardedWithRetry(runtime, &.{ .{ .key = key, .value = source_text }, .{ .key = receipt_key, .value = &receipt } }, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .upstream_name = request.upstream_artifact_name, .upstream_digest = upstream_digest, .producer_name = artifact_name, .producer_recipe = producer_recipe });
         try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
         try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
@@ -17746,8 +17749,12 @@ fn processAsset(
             // unrelated field silently defeats the skip this check exists
             // to provide (`storePutBatchGuarded`'s separate fencing digest,
             // a few lines below in the write path, still keys on `raw` to
-            // guard against a genuinely concurrent primary change).
-            if (try reusableLocalAsset(runtime, request.doc_key, artifact_name, source_text, value) and try reusablePrivateAsset(runtime, artifact_name, key, source_text, raw, producer_cfg.config_json, value)) {
+            // guard against a genuinely concurrent primary change) --
+            // unless a graph index extracts relations from this artifact,
+            // in which case the receipt must track the exact primary
+            // revision (see `artifactFeedsGraph`'s doc comment).
+            const reuse_parent = if (runtime.index_manager.artifactFeedsGraph(artifact_name)) raw else source_text;
+            if (try reusableLocalAsset(runtime, request.doc_key, artifact_name, reuse_parent, value) and try reusablePrivateAsset(runtime, artifact_name, key, source_text, raw, producer_cfg.config_json, value)) {
                 try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
                 try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
                 // Private outputs also require their destination-owned witness.
@@ -19466,8 +19473,12 @@ fn applyAssetProducerBatchOutput(
     // non-private-consumer case. Keying this receipt on `item.raw_doc`
     // instead invalidated it on every unrelated field edit, silently
     // defeating the skip (the duplicate work `shouldSkipAssetProducer`
-    // already proved is unnecessary) on every such edit.
-    const receipt = local.encode(producer_recipe, item.source_text, validated);
+    // already proved is unnecessary) on every such edit -- unless a graph
+    // index extracts relations from this artifact, in which case the
+    // receipt must track the exact primary revision instead (see
+    // `IndexManager.artifactFeedsGraph`'s doc comment).
+    const receipt_parent = if (runtime.index_manager.artifactFeedsGraph(requestArtifactName(item.request))) item.raw_doc else item.source_text;
+    const receipt = local.encode(producer_recipe, receipt_parent, validated);
     try writes.append(runtime.alloc, .{ .key = receipt_key, .value = &receipt });
     try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe });
 

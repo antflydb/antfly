@@ -1547,6 +1547,21 @@ pub const IndexManager = struct {
     /// Durable generated-artifact cleanup uses the same single-flight shape,
     /// but runs in bounded pages so it cannot monopolize structural locks.
     artifact_cleanup_state: std.atomic.Value(u8) = .init(0),
+    /// Bounds `db.zig`'s `onGeneratedArtifactCleanupGiveUp` resubmission: a
+    /// transient failure burst longer than one `cleanup_job_owner.drain`
+    /// run's 8-attempt budget (e.g. a rate-limited dependency) must still
+    /// clear, but a genuinely permanent failure must not resubmit forever.
+    /// Reset to 0 by `advanceArtifactCleanup`'s own non-error returns.
+    artifact_cleanup_giveup_rounds: std.atomic.Value(u32) = .init(0),
+    /// Set by every `db.zig` `scheduleGeneratedArtifactCleanupContext` call
+    /// (mirrors `attachHllMaintenance`'s `hll_maintenance_lane`/
+    /// `hll_maintenance_owner_id` pair below). `cleanup_job_owner.Port`'s
+    /// `on_give_up` callback only receives its own `ptr`
+    /// (`*execution_resources.AsyncContext`), not the lane/owner_id used to
+    /// schedule it, so `onGeneratedArtifactCleanupGiveUp` reads these back
+    /// from `ctx.index_manager` to resubmit a bounded number of times.
+    artifact_cleanup_lane: ?background_runtime_mod.DurableJobLane = null,
+    artifact_cleanup_owner_id: u64 = 0,
     // Bulk text backfill performs its own policy compaction at durable batch
     // boundaries. Keep the asynchronous scheduler from competing with it (or
     // compacting an older schema generation) for CPU, mmap residency, and the
@@ -20565,6 +20580,24 @@ pub const IndexManager = struct {
             if (std.mem.eql(u8, source.artifact_name, artifact_name)) return source;
         }
         return null;
+    }
+
+    /// True when some graph index extracts relations from this asset (or
+    /// chunk) artifact. Graph edge construction keys its producer
+    /// provenance to the exact primary-document revision it observed
+    /// (`artifact_producer_context.Token`/ordered publication's authority
+    /// path), so a local, revision-blind reuse receipt cannot stand in for
+    /// it: `reusableLocalAsset`'s skip-the-producer check must key on the
+    /// whole primary document here, not just the producer's declared
+    /// source field, even though the narrower key is otherwise correct and
+    /// avoids redundant producer calls on an unrelated-field edit.
+    pub fn artifactFeedsGraph(self: *const IndexManager, artifact_name: []const u8) bool {
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.artifact_sources) |source| {
+                if (std.mem.eql(u8, source.artifact_name, artifact_name)) return true;
+            }
+        }
+        return false;
     }
 
     pub fn graphIndexConsumesAssetArtifact(self: *const IndexManager, index_name: []const u8, artifact_name: []const u8) bool {
