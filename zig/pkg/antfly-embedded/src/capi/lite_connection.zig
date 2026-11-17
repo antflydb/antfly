@@ -1613,13 +1613,13 @@ pub const WriterLane = struct {
                 .parked => |held| {
                     var lease = held;
                     self.lendLease(&lease);
-                    if (owner.currentStore()) |store| store.ensureDurableForReuse();
+                    owner.drainForReuse();
                     return .{ .lease = lease, .source = .handoff };
                 },
                 .overdue => |held| {
                     var lease = held;
                     // Drain only; see `releaseBorrowed`.
-                    if (owner.currentStore()) |store| store.ensureDurableForReuse();
+                    owner.drainForReuse();
                     lease.close();
                     break;
                 },
@@ -1645,7 +1645,7 @@ pub const WriterLane = struct {
             // only after a failed attempt with budget left.
             if (native.lockWriterPathWithIo(alloc, io, c.path)) |got| {
                 var lease = got;
-                if (owner.currentStore()) |store| store.ensureDurableForReuse();
+                owner.drainForReuse();
                 self.lendLease(&lease);
                 return .{ .lease = lease, .source = .uncontended };
             } else |err| {
@@ -1660,7 +1660,7 @@ pub const WriterLane = struct {
             self.cancelCheckout();
             return err;
         };
-        if (owner.currentStore()) |store| store.ensureDurableForReuse();
+        owner.drainForReuse();
         self.lendLease(&held);
         return .{ .lease = held, .source = if (held.contended) .queued else .uncontended };
     }
@@ -2909,6 +2909,16 @@ pub const Owner = struct {
         return held;
     }
 
+    /// Finish the current store's staged commits before its lease serves
+    /// another instance. Skipped for an admission on the current root itself
+    /// (`skip_reuse_drain`, hosted turns): the lease stays with the same
+    /// instance, and that admission can be nested inside the very commit
+    /// drive the drain would wait for.
+    fn drainForReuse(self: *Owner) void {
+        if (self.skip_reuse_drain) return;
+        if (self.currentStore()) |store| store.ensureDurableForReuse();
+    }
+
     fn currentStore(self: *Owner) ?*NativeStore {
         const current = self.current orelse return null;
         return current.owned_lite_backend.?.native_docstore;
@@ -2971,7 +2981,7 @@ pub const Owner = struct {
             .parked => |held| blk: {
                 var parked = held;
                 self.writer_lane.lendLease(&parked);
-                if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
+                self.drainForReuse();
                 stats.recordAcquired(.handoff, 0);
                 break :blk parked;
             },
@@ -2980,7 +2990,7 @@ pub const Owner = struct {
                 // of holding it for nonblocking reclamation.
                 var overdue = held;
                 // Drain only; see `WriterLane.releaseBorrowed`.
-                if (self.currentStore()) |store| store.ensureDurableForReuse();
+                self.drainForReuse();
                 overdue.close();
                 self.writer_lane.cancelCheckout();
                 return error.FileBusy;
@@ -2990,7 +3000,7 @@ pub const Owner = struct {
                     self.writer_lane.cancelCheckout();
                     return err;
                 };
-                if (self.current) |current| if (current.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
+                self.drainForReuse();
                 self.writer_lane.lendLease(&fresh);
                 stats.recordAcquired(.uncontended, 0);
                 break :blk fresh;
