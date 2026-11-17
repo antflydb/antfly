@@ -138,7 +138,9 @@ const std = @import("std");
 /// Version 107 atomically seals the feed cut and initializes its logical slot.
 /// Version 108 fences logical slot drop against an active stream lease.
 /// Version 109 advances empty slot projections without allocating LSNs.
-pub const current_version: u16 = 109;
+/// Version 110 coordinates durable PostgreSQL publication changes.
+pub const current_version: u16 = 110;
+pub const pg_publication_version: u16 = @import("pg_publication.zig").protocol_version;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;

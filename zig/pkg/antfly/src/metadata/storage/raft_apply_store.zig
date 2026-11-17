@@ -58,6 +58,7 @@ const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig"
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 const source_control = @import("../source_control.zig");
 const changefeed_control = @import("../changefeed_control.zig");
+const pg_publication = @import("../pg_publication.zig");
 pub const apply_contract = @import("raft_apply_contract.zig");
 const platform_time = @import("antfly_platform").time;
 const restore_staging = @import("../restore_staging.zig");
@@ -6007,6 +6008,7 @@ pub const TransitionCommand = union(enum) {
     },
     apply_source_control: []const u8,
     apply_changefeed_control: []const u8,
+    apply_pg_publication: []const u8,
     upsert_replication_source_status: metadata.ReplicationSourceStatusRecord,
     claim_replication_source_cutover: struct {
         expected_replication_sources_json: []const u8,
@@ -6082,7 +6084,7 @@ pub const TransitionCommand = union(enum) {
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .mutate_lake_index_lifecycle => |*command| command.mutation.deinitOwned(alloc),
-            .apply_changefeed_control, .apply_source_control, .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
+            .apply_changefeed_control, .apply_pg_publication, .apply_source_control, .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
             .apply_transaction_sessions, .apply_resolver_authority, .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_completion_reference, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
@@ -6242,6 +6244,7 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
         },
         .apply_source_control => |bytes| try source_control.validateEncodedWrite(bytes),
         .apply_changefeed_control => |bytes| try changefeed_control.validateEncodedWrite(bytes),
+        .apply_pg_publication => |bytes| try pg_publication.validateEncodedWrite(bytes),
         .mutate_lake_index_lifecycle => |mutation| {
             // Row zero owns composed-query artifacts without a logical table.
             if (mutation.table_id == 0) switch (mutation.mutation) {
@@ -15305,6 +15308,48 @@ pub const RaftApplyStore = struct {
         return try decodeTableRecord(alloc, encoded);
     }
 
+    pub fn getPgPublication(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, database: changefeed_control.Digest, name: []const u8) !?std.json.Parsed(pg_publication.Record) {
+        var buffer: [256]u8 = undefined;
+        const raw = self.store.get(a, try pg_publication.key(&buffer, group_id, database, name)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer a.free(raw);
+        var parsed = try pg_publication.parseRecord(a, raw);
+        errdefer parsed.deinit();
+        if (!std.meta.eql(parsed.value.database, database) or !std.mem.eql(u8, parsed.value.name, name))
+            return error.ChangefeedCorrupt;
+        return parsed;
+    }
+
+    fn applyPgPublicationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        var write = try pg_publication.parseWrite(self.alloc, bytes);
+        defer write.deinit();
+        const next = write.value.next;
+        var buffer: [256]u8 = undefined;
+        const key = try pg_publication.key(&buffer, group_id, next.database, next.name);
+        var before = if (try stagingGet(txn, key)) |raw| try pg_publication.parseRecord(self.alloc, raw) else null;
+        defer if (before) |*parsed| parsed.deinit();
+        if (before) |parsed| {
+            if (!std.meta.eql(parsed.value.database, next.database) or !std.mem.eql(u8, parsed.value.name, next.name))
+                return error.ChangefeedCorrupt;
+        }
+        if (!write.value.applies(if (before) |parsed| parsed.value else null)) return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        if (next.members) |members| for (members) |member| {
+            var table_buffer: [256]u8 = undefined;
+            const raw = (try stagingGet(txn, try tableKeyForGroup(&table_buffer, group_id, member.table.table_id))) orelse return;
+            const table = try decodeTableRecord(a, raw);
+            if (table.storage.engine != .local or !std.meta.eql(member.table.binding, changefeed_control.tableBinding(table))) return;
+        };
+        const encoded = try std.json.Stringify.valueAlloc(a, next, .{});
+        if (encoded.len > pg_publication.max_wire_bytes) return error.InvalidChangefeed;
+        try txn.put(key, encoded);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+    }
+
     pub fn getChangefeedControl(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, id: changefeed_control.Id) ![]u8 {
         var buffer: [256]u8 = undefined;
         return self.store.get(a, try changefeed_control.keyForGroup(&buffer, group_id, id)) catch |err| switch (err) {
@@ -18913,7 +18958,7 @@ pub const RaftApplyStore = struct {
             .advance_resolver_namespace, .apply_resolver_authority => metadataSnapshotProjectionBit(.resolver_namespaces) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.catalog_revision),
             .mutate_lake_index_lifecycle => metadataSnapshotProjectionBit(.lake_index_lifecycle),
             .apply_source_control => metadataSnapshotProjectionBit(.source_control),
-            .apply_changefeed_control => metadataSnapshotProjectionBit(.changefeeds),
+            .apply_changefeed_control, .apply_pg_publication => metadataSnapshotProjectionBit(.changefeeds),
             .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.sql_completion_reference) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.catalog_revision),
             .apply_table_topology => metadataSnapshotProjectionBit(.sql_completion_reference) | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
@@ -21501,6 +21546,7 @@ pub const RaftApplyStore = struct {
             .apply_resolver_authority => |bytes| try self.applyResolverAuthorityTxn(txn, group_id, bytes),
             .apply_source_control => |bytes| try self.applySourceControlTxn(txn, group_id, bytes),
             .apply_changefeed_control => |bytes| try self.applyChangefeedControlTxn(txn, group_id, bytes),
+            .apply_pg_publication => |bytes| try self.applyPgPublicationTxn(txn, group_id, bytes),
             .mutate_lake_index_lifecycle => |mutation| {
                 try self.applyLakeIndexLifecycleTxn(txn, group_id, mutation.table_id, mutation.expected_revision, mutation.mutation);
             },
@@ -28347,6 +28393,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 const TransitionTag = enum(u8) {
     apply_source_control = 83,
     apply_changefeed_control = 84,
+    apply_pg_publication = 85,
     apply_sql_completion_reference = 81,
     advance_resolver_namespace = 80,
     apply_transaction_sessions = 82,
@@ -28645,6 +28692,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .apply_changefeed_control => |bytes| {
             try changefeed_control.validateEncodedWrite(bytes);
             try out.append(alloc, @backingInt(TransitionTag.apply_changefeed_control));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .apply_pg_publication => |bytes| {
+            try pg_publication.validateEncodedWrite(bytes);
+            try out.append(alloc, @backingInt(TransitionTag.apply_pg_publication));
             try appendRequiredString(alloc, &out, bytes);
         },
         .mutate_lake_index_lifecycle => |mutation| {
@@ -29153,6 +29205,15 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
             if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
             try changefeed_control.validateEncodedWrite(bytes);
             break :blk .{ .apply_changefeed_control = try alloc.dupe(u8, bytes) };
+        },
+        .apply_pg_publication => blk: {
+            const len = try readInt(encoded, &pos, u32);
+            if (len == 0 or len > pg_publication.max_wire_bytes or len > encoded.len - pos) return error.InvalidMetadataTransitionEncoding;
+            const bytes = encoded[pos..][0..len];
+            pos += len;
+            if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
+            try pg_publication.validateEncodedWrite(bytes);
+            break :blk .{ .apply_pg_publication = try alloc.dupe(u8, bytes) };
         },
         .mutate_lake_index_lifecycle => blk: {
             const table_id = try readInt(encoded, &pos, u64);
@@ -45618,6 +45679,61 @@ test "metadata source control snapshot installs pending source authority and ret
     var txn = try target.store.beginWriteTxn();
     defer txn.abort();
     try std.testing.expectError(error.TableTransitionActive, target.removeTableTxn(&txn, group_id, table.table_id, 0));
+}
+
+test "metadata changefeed control PostgreSQL publication CAS preserves database and table incarnations" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/pg-publication", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = "{}" };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const member: pg_publication.Member = .{
+        .table = .{ .table_id = 7, .binding = changefeed_control.tableBinding(table), .policy_revision = 1, .contract = .native_relational },
+        .permission_name = "rows",
+        .namespace = "public",
+        .name = "rows",
+        .oid = 42,
+        .identity = .default,
+        .key_columns = &.{"id"},
+    };
+    const database: changefeed_control.Digest = @splat(1);
+    var write: pg_publication.Write = .{
+        .expected_revision = 0,
+        .next = .{ .database = database, .name = "rows_pub", .owner = @splat(2), .revision = 1, .members = &.{member} },
+    };
+    const encoded = try std.json.Stringify.valueAlloc(scratch, write, .{});
+    const frame = try encodeTransitionCommand(scratch, .{ .apply_pg_publication = encoded });
+    var decoded = (try decodeTransitionCommand(a, frame)).?;
+    defer decoded.deinit(a);
+    try store.applyStandaloneCommand(group, decoded);
+    try store.applyStandaloneCommand(group, decoded);
+    {
+        var observed = (try store.getPgPublication(a, group, database, write.next.name)).?;
+        defer observed.deinit();
+        try std.testing.expectEqualDeep(write.next, observed.value);
+        try std.testing.expect((try store.getPgPublication(a, group, @splat(3), write.next.name)) == null);
+    }
+    write.expected_revision = 1;
+    write.next.revision = 2;
+    var wrong = member;
+    wrong.table.binding = @splat(4);
+    write.next.members = &.{wrong};
+    try store.applyStandaloneCommand(group, .{ .apply_pg_publication = try std.json.Stringify.valueAlloc(scratch, write, .{}) });
+    write.next.members = null;
+    try store.applyStandaloneCommand(group, .{ .apply_pg_publication = try std.json.Stringify.valueAlloc(scratch, write, .{}) });
+    store.deinit();
+    store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    try store.applyStandaloneCommand(group, decoded);
+    var dropped = (try store.getPgPublication(a, group, database, write.next.name)).?;
+    defer dropped.deinit();
+    try std.testing.expectEqualDeep(write.next, dropped.value);
 }
 
 test "metadata changefeed control maintenance scan advances over a full ineligible page" {

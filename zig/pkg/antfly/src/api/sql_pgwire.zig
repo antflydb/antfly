@@ -179,16 +179,8 @@ pub const ReplicationPublication = struct {
     const slot = feed.pg_slot;
     const relation_values = @import("../pgwire/values.zig");
 
-    pub const Member = struct {
-        table: feed.Table,
-        /// Exact permission scope for the verified catalog incarnation.
-        permission_name: []const u8,
-        namespace: []const u8,
-        name: []const u8,
-        oid: u32,
-        identity: @import("../pgwire/pgoutput.zig").Identity,
-        key_columns: []const []const u8,
-    };
+    const publication = @import("../metadata/pg_publication.zig");
+    pub const Member = publication.Member;
 
     database: feed.Digest,
     publications: []const []const u8,
@@ -197,30 +189,13 @@ pub const ReplicationPublication = struct {
     pub fn binding(self: ReplicationPublication) !slot.Binding {
         if (std.mem.allEqual(u8, &self.database, 0) or self.members.len == 0 or self.members.len > feed.max_tables)
             return error.InvalidChangefeed;
-        for (self.members, 0..) |member, index| {
-            if (member.table.contract != .native_relational or member.table.fields.len != 0 or member.table.predicates.len != 0 or
-                member.table.table_id == 0 or member.table.policy_revision == 0 or std.mem.allEqual(u8, &member.table.binding, 0) or
-                member.permission_name.len == 0 or member.oid == 0 or !validIdentifier(member.namespace) or !validIdentifier(member.name) or
-                (index != 0 and self.members[index - 1].table.table_id >= member.table.table_id))
-                return error.ChangefeedCapabilityUnsupported;
-            if (member.identity != .default and member.identity != .full) return error.ChangefeedCapabilityUnsupported;
-            if (member.identity == .default and member.key_columns.len == 0) return error.ChangefeedCapabilityUnsupported;
-            for (member.key_columns, 0..) |name, column| {
-                if (!validIdentifier(name) or (column != 0 and std.mem.order(u8, member.key_columns[column - 1], name) != .lt))
-                    return error.InvalidChangefeed;
-            }
-            for (self.members[0..index]) |prior| if (prior.oid == member.oid) return error.InvalidChangefeed;
-        }
+        try publication.validateMembers(self.members);
         const value: slot.Binding = .{
             .publications = self.publications,
             .projection = feed.hash(.{ .domain = "antfly:pgoutput-publication-projection:v1", .database = self.database, .members = self.members }),
         };
         try value.validate();
         return value;
-    }
-
-    fn validIdentifier(name: []const u8) bool {
-        return name.len != 0 and name.len <= 63 and std.unicode.utf8ValidateSlice(name) and std.mem.indexOfScalar(u8, name, 0) == null;
     }
 
     /// Re-read the connection credential each time a slot opens, builds, or
