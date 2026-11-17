@@ -79,7 +79,7 @@ pub fn bindingAlloc(a: A, names: []const []const u8, projection: Digest) !Bindin
     return value;
 }
 pub const Mutation = union(enum) {
-    configure: struct { database: Digest, name: []const u8, byte_limit: u64 = max_pending_bytes },
+    configure: struct { database: Digest, name: []const u8, byte_limit: u64 = max_pending_bytes, consistent_lsn: u64 = 1 },
     acquire: struct { actor: Id, expected: u64, now: u64, expires: u64 },
     release: struct { session: Session, now: u64 },
     issue: struct { session: Session, now: u64, transaction: Prepared },
@@ -192,7 +192,7 @@ pub const State = struct {
     spool_retired: bool = false,
     binding: ?Binding = null,
     pub fn validate(self: State) !void {
-        if (!nz(self.database) or !validName(self.name) or self.consistent_lsn != 1 or self.confirmed_lsn < self.consistent_lsn or self.next_lsn < self.confirmed_lsn or !nz(self.acknowledged_cursor) or !nz(self.mapped_cursor) or self.byte_limit < 47 or self.byte_limit > max_pending_bytes or self.entries.len > max_entries or self.pending_bytes > self.byte_limit) return error.InvalidChangefeed;
+        if (!nz(self.database) or !validName(self.name) or self.consistent_lsn == 0 or self.confirmed_lsn < self.consistent_lsn or self.next_lsn < self.confirmed_lsn or !nz(self.acknowledged_cursor) or !nz(self.mapped_cursor) or self.byte_limit < 47 or self.byte_limit > max_pending_bytes or self.entries.len > max_entries or self.pending_bytes > self.byte_limit) return error.InvalidChangefeed;
         if ((self.fence == 0) != (self.observed_at == 0)) return error.InvalidChangefeed;
         if (self.session) |session| {
             if (!nz(session.actor) or session.fence == 0 or session.fence != self.fence or self.session_expires_at <= self.observed_at) return error.InvalidChangefeed;
@@ -239,7 +239,20 @@ pub const State = struct {
         };
     }
     pub fn initialize(database: Digest, name: []const u8, cursor: Digest, byte_limit: u64) !State {
-        const value: State = .{ .database = database, .name = name, .acknowledged_cursor = cursor, .mapped_cursor = cursor, .byte_limit = byte_limit };
+        return initializeAt(database, name, cursor, byte_limit, 1);
+    }
+
+    pub fn initializeAt(database: Digest, name: []const u8, cursor: Digest, byte_limit: u64, consistent_lsn: u64) !State {
+        const value: State = .{
+            .database = database,
+            .name = name,
+            .consistent_lsn = consistent_lsn,
+            .next_lsn = consistent_lsn,
+            .confirmed_lsn = consistent_lsn,
+            .acknowledged_cursor = cursor,
+            .mapped_cursor = cursor,
+            .byte_limit = byte_limit,
+        };
         try value.validate();
         return value;
     }

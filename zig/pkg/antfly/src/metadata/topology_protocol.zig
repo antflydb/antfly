@@ -134,7 +134,8 @@ const std = @import("std");
 /// Version 102 reserves and seals quota for recoverable source-plan artifacts.
 /// Version 103 binds source checkpoint authority before reservation and retirement.
 /// Version 105 retains frozen source recovery manifests through reclamation.
-pub const current_version: u16 = 105;
+/// Version 106 persists the allocated initial position for logical slots.
+pub const current_version: u16 = 106;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;

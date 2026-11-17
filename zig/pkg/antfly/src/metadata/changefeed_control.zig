@@ -21,7 +21,7 @@ const A = std.mem.Allocator;
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
-pub const protocol_version: u16 = 101;
+pub const protocol_version: u16 = 106;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -547,12 +547,12 @@ pub const Mutation = union(enum) {
                     .configure => |configuration| {
                         if (!equal(state.id, pg_slot.feedId(configuration.database, configuration.name))) return error.ChangefeedConflict;
                         if (state.slot) |existing| {
-                            if (!equal(existing.database, configuration.database) or !std.mem.eql(u8, existing.name, configuration.name) or existing.byte_limit != configuration.byte_limit) return error.ChangefeedConflict;
+                            if (!equal(existing.database, configuration.database) or !std.mem.eql(u8, existing.name, configuration.name) or existing.byte_limit != configuration.byte_limit or existing.consistent_lsn != configuration.consistent_lsn) return error.ChangefeedConflict;
                             return state;
                         }
                         if (state.cursors.len != 0) return error.ChangefeedConflict;
                         for (state.roots) |root| if (root.acknowledged.event != 0) return error.ChangefeedConflict;
-                        next.slot = try pg_slot.State.initialize(configuration.database, configuration.name, state.acknowledged_cursor, configuration.byte_limit);
+                        next.slot = try pg_slot.State.initializeAt(configuration.database, configuration.name, state.acknowledged_cursor, configuration.byte_limit, configuration.consistent_lsn);
                     },
                     .acquire => |claim| {
                         if (claim.now >= state.expires_at or claim.expires > state.expires_at) return error.ChangefeedLeaseExpired;
@@ -1388,6 +1388,10 @@ test "changefeed control rejects deeply nested unknown state before digest trave
 }
 
 fn testSlotState(a: A) !State {
+    return testSlotStateAt(a, 1);
+}
+
+fn testSlotStateAt(a: A, lsn: u64) !State {
     var definition = testDefinition(.now);
     definition.projection = .rows;
     const id = pg_slot.feedId(@splat(1), "slot");
@@ -1395,37 +1399,39 @@ fn testSlotState(a: A) !State {
     state = try step(a, state, .{ .plan_roots = &.{.{ .namespace = testNamespace(7), .ownership_epoch = 1 }} });
     state = try step(a, state, .{ .enroll = .{ .namespace = testNamespace(7), .ownership_epoch = 1, .grant_sequence = state.roots[0].grant_sequence, .consumer_epoch = 6, .start = 10 } });
     state = try step(a, state, .{ .seal = .{ .cut = @splat(7) } });
-    state = try step(a, state, .{ .slot = .{ .configure = .{ .database = @splat(1), .name = "slot" } } });
+    state = try step(a, state, .{ .slot = .{ .configure = .{ .database = @splat(1), .name = "slot", .consistent_lsn = lsn } } });
     return step(a, state, .{ .slot = .{ .acquire = .{ .actor = @splat(2), .expected = 0, .now = 100, .expires = 150 } } });
 }
 test "changefeed logical slot confirms native ACK atomically and fences ordinary acknowledgements" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var state = try testSlotState(a);
+    const lsn = 4096;
+    var state = try testSlotStateAt(a, lsn);
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .slot = .{ .configure = .{ .database = @splat(1), .name = "slot", .consistent_lsn = lsn + 1 } } }));
     const initial = state.latest_cursor;
     const session = state.slot.?.session.?;
     const delivery = testDelivery(state, &.{.{ .namespace = testNamespace(7), .position = .{ .sequence = 11 } }});
     state = try step(a, state, .{ .issue = delivery });
-    state = try step(a, state, .{ .slot = .{ .configure = .{ .database = @splat(1), .name = "slot" } } });
+    state = try step(a, state, .{ .slot = .{ .configure = .{ .database = @splat(1), .name = "slot", .consistent_lsn = lsn } } });
     const transaction: pg_slot.Prepared = .{ .before = initial, .after = delivery.cursor, .content = @splat(3), .completion = @splat(4), .bytes = 100, .commit_offset = 74, .xid = 42, .commit_time = -1 };
     state = try step(a, state, .{ .slot = .{ .issue = .{ .session = session, .now = 101, .transaction = transaction } } });
     try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .acknowledge = delivery.cursor }));
     const encoded = try encode(a, state);
     var parsed = try parse(std.testing.allocator, encoded);
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u64, 101), parsed.value.slot.?.next_lsn);
-    const partial = try step(a, parsed.value, .{ .slot = .{ .confirm = .{ .session = session, .now = 102, .flushed = 100 } } });
+    try std.testing.expectEqual(@as(u64, lsn + 100), parsed.value.slot.?.next_lsn);
+    const partial = try step(a, parsed.value, .{ .slot = .{ .confirm = .{ .session = session, .now = 102, .flushed = lsn + 99 } } });
     try std.testing.expectEqual(@as(u64, 0), partial.acknowledged_delivery);
-    state = try step(a, partial, .{ .slot = .{ .confirm = .{ .session = session, .now = 103, .flushed = 101 } } });
+    state = try step(a, partial, .{ .slot = .{ .confirm = .{ .session = session, .now = 103, .flushed = lsn + 100 } } });
     try std.testing.expectEqual(@as(u64, 1), state.acknowledged_delivery);
     try std.testing.expectEqual(@as(u64, 11), state.roots[0].acknowledged.sequence);
     try std.testing.expectEqual(@as(u64, 10), state.roots[0].reclaimed_through);
-    try std.testing.expectEqual(@as(u64, 101), state.slot.?.confirmed_lsn);
+    try std.testing.expectEqual(@as(u64, lsn + 100), state.slot.?.confirmed_lsn);
     try std.testing.expectEqual(@as(usize, 0), state.cursors.len);
     try std.testing.expectEqual(@as(usize, 0), state.slot.?.entries.len);
     state = try step(a, state, .{ .slot = .{ .acquire = .{ .actor = @splat(3), .expected = 1, .now = 150, .expires = 200 } } });
-    try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .slot = .{ .confirm = .{ .session = session, .now = 151, .flushed = 101 } } }));
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .slot = .{ .confirm = .{ .session = session, .now = 151, .flushed = lsn + 100 } } }));
 }
 test "changefeed logical slot rejects partial frame endpoints and document table compatibility" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
