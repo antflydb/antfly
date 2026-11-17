@@ -286,7 +286,8 @@ can still be opened in Lite to access its data.
 When selecting tables from a cluster backup, use the `selector` in
 `backup --list --output json` under `table_selectors`. Pass it unchanged to
 `restore --tables` for the same backup. Selectors work for tables with
-ambiguous display names, commas, or surrounding whitespace.
+ambiguous display names, commas, or surrounding whitespace. If a literal table
+name has the same format as a selector, use the listed selector for that table.
 
 For an offline source inventory and compatibility report, use:
 

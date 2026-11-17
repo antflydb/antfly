@@ -10934,10 +10934,9 @@ fn backupInfoFromManifest(alloc: std.mem.Allocator, manifest: *const ClusterBack
         for (table_selectors[0..initialized_selectors]) |entry| alloc.free(entry.selector);
         alloc.free(table_selectors);
     }
-    const salt = clusterSelectorSalt(manifest);
     const fingerprint = clusterSelectorFingerprint(manifest);
     for (tables, table_selectors, 0..) |name, *entry, i| {
-        entry.* = .{ .name = name, .selector = try std.fmt.allocPrint(alloc, "{s}{d}/{s}/{d}", .{ cluster_selector_prefix, salt, &fingerprint, i }) };
+        entry.* = .{ .name = name, .selector = try std.fmt.allocPrint(alloc, "{s}{s}/{d}", .{ cluster_selector_prefix, &fingerprint, i }) };
         initialized_selectors += 1;
     }
     const backup_id = try alloc.dupe(u8, manifest.backup_id);
@@ -11344,7 +11343,7 @@ pub fn listClusterBackupsFromOpenedLocation(
     return .{ .backups = try infos.toOwnedSlice(alloc), .next_cursor = next_cursor };
 }
 
-const cluster_selector_prefix = "@antfly/restore/";
+const cluster_selector_prefix = "@antfly/restore/v1/";
 
 const ClusterSelectorFingerprint = [2 * std.crypto.hash.sha2.Sha256.digest_length]u8;
 
@@ -11361,32 +11360,15 @@ fn clusterSelectorFingerprint(manifest: *const ClusterBackupManifest) ClusterSel
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-fn clusterSelectorParts(name: []const u8) ?struct { salt: usize, suffix: []const u8 } {
+fn clusterSelectorParts(name: []const u8) ?struct { fingerprint: []const u8, ordinal: []const u8 } {
     if (!std.mem.startsWith(u8, name, cluster_selector_prefix)) return null;
     const suffix = name[cluster_selector_prefix.len..];
-    const slash = std.mem.indexOfScalar(u8, suffix, '/') orelse return null;
-    const salt = std.fmt.parseInt(usize, suffix[0..slash], 10) catch return null;
-    return .{ .salt = salt, .suffix = suffix[slash + 1 ..] };
-}
-
-fn clusterSelectorSalt(manifest: *const ClusterBackupManifest) usize {
-    // Scoped display names start with a catalog identifier. Raw names and
-    // default display names can occupy any selector prefix.
-    const salt_count = 2 * max_cluster_backup_attempt_tables + 1;
-    var available: std.StaticBitSet(salt_count) = .full;
-    for (manifest.tables) |table| {
-        if (clusterSelectorParts(table.name)) |parts| {
-            if (parts.salt < salt_count) available.unset(parts.salt);
-        }
-        if (table.catalog_target) |target| {
-            if (target.isDefault()) {
-                if (clusterSelectorParts(target.table)) |parts| {
-                    if (parts.salt < salt_count) available.unset(parts.salt);
-                }
-            }
-        }
-    }
-    return available.findFirstSet().?;
+    const slash = @sizeOf(ClusterSelectorFingerprint);
+    if (suffix.len <= slash + 1 or suffix[slash] != '/' or !isLowerSha256Hex(suffix[0..slash])) return null;
+    const ordinal = suffix[slash + 1 ..];
+    if (ordinal.len > 1 and ordinal[0] == '0') return null;
+    for (ordinal) |digit| if (!std.ascii.isDigit(digit)) return null;
+    return .{ .fingerprint = suffix[0..slash], .ordinal = ordinal };
 }
 
 pub fn findClusterTableByStorageName(
@@ -11401,20 +11383,17 @@ pub fn findClusterTableByStorageName(
 
 pub const ClusterTableSelection = struct {
     manifest: *const ClusterBackupManifest,
-    salt: ?usize = null,
     fingerprint: ?ClusterSelectorFingerprint = null,
 
     pub fn find(self: *ClusterTableSelection, table_name: []const u8) ?*const ClusterTableBackupEntry {
         if (clusterSelectorParts(table_name)) |parts| {
-            if (self.salt == null) self.salt = clusterSelectorSalt(self.manifest);
-            if (parts.salt == self.salt.?) {
-                const slash = std.mem.indexOfScalar(u8, parts.suffix, '/') orelse return null;
-                if (slash != @sizeOf(ClusterSelectorFingerprint)) return null;
-                if (self.fingerprint == null) self.fingerprint = clusterSelectorFingerprint(self.manifest);
-                if (!std.mem.eql(u8, parts.suffix[0..slash], &self.fingerprint.?)) return null;
-                const ordinal = std.fmt.parseInt(usize, parts.suffix[slash + 1 ..], 10) catch return null;
-                return if (ordinal < self.manifest.tables.len) &self.manifest.tables[ordinal] else null;
-            }
+            const ordinal = std.fmt.parseInt(usize, parts.ordinal, 10) catch return null;
+            if (ordinal >= self.manifest.tables.len) return null;
+            if (self.fingerprint == null) self.fingerprint = clusterSelectorFingerprint(self.manifest);
+            // Well-formed tokens never fall through to an unrelated literal
+            // name, even when that name happens to contain the old token.
+            if (!std.mem.eql(u8, parts.fingerprint, &self.fingerprint.?)) return null;
+            return &self.manifest.tables[ordinal];
         }
         return findClusterTableByPublicName(self.manifest, table_name);
     }
@@ -11475,10 +11454,14 @@ test "cluster backup selectors resolve raw and display collisions without CLI de
     try std.testing.expect(selection.find("@antfly/restore/2/other-backup/0") == null);
     var reordered = entries;
     std.mem.swap(ClusterTableBackupEntry, &reordered[0], &reordered[1]);
+    reordered[3].name = info.table_selectors[0].selector;
     var other_manifest = manifest;
     other_manifest.tables = &reordered;
     var other_selection: ClusterTableSelection = .{ .manifest = &other_manifest };
     try std.testing.expect(other_selection.find(info.table_selectors[0].selector) == null);
+    const other_info = try backupInfoFromManifest(alloc, &other_manifest, other_manifest.location);
+    defer freeBackupInfo(alloc, other_info);
+    try std.testing.expect(other_selection.find(other_info.table_selectors[3].selector) == &reordered[3]);
     try std.testing.expectEqualStrings(" , padded ", info.table_selectors[2].name);
     for (info.table_selectors, entries[0..]) |item, *entry| {
         try std.testing.expect(std.mem.indexOfAny(u8, item.selector, " ,\t\r\n") == null);
