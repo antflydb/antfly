@@ -17447,10 +17447,6 @@ fn processAsset(
     const accepted = if (context) |*value| accepted: {
         var read = try runtime.store.beginProbe();
         defer read.abort();
-        // Acceptance is keyed by the primary source revision, which a
-        // context-source change leaves untouched. A dependent its context
-        // invalidated must be produced again, not settled as accepted.
-        if (try contextRebuildDueTxn(runtime.alloc, &read, request)) break :accepted false;
         break :accepted try value.accepted(runtime.alloc, &read);
     } else false;
     if (accepted) {
@@ -17854,30 +17850,6 @@ const ContextDependencyFence = struct {
 
 /// Register-before-read capture. Returns null when the request already
 /// recorded an explicit failure (budget overflow, missing required input).
-/// Whether `request`'s context dependencies were invalidated (or never
-/// published current) since its last accepted output.
-fn contextRebuildDueTxn(alloc: Allocator, read: anytype, request: enrichment_types.GeneratedEnrichmentRequest) !bool {
-    if (request.context_sources_json.len == 0) return false;
-    // Probe transactions have point reads only; dependency state is one key.
-    const Point = struct {
-        fn get(p: *anyopaque, a: Allocator, key: []const u8) anyerror!?[]u8 {
-            const txn: @TypeOf(read) = @ptrCast(@alignCast(p));
-            const value = txn.get(key) catch |err| switch (err) {
-                error.NotFound => return null,
-                else => return err,
-            };
-            return try a.dupe(u8, value);
-        }
-        fn scan(_: *anyopaque, _: []const u8, _: []const u8, _: context_dependency_store.Reader.Visitor) anyerror!void {
-            return error.Unsupported;
-        }
-    };
-    const reader: context_dependency_store.Reader = .{ .ptr = @ptrCast(read), .get_fn = Point.get, .scan_fn = Point.scan };
-    var state = (try context_dependency_store.loadState(alloc, reader, null, request.doc_key, requestArtifactName(request))) orelse return false;
-    defer state.deinit(alloc);
-    return state.freshness != .current;
-}
-
 fn captureContextSources(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -32090,31 +32062,20 @@ fn finishAcceptedAssetGraph(runtime: *EnrichmentRuntime, request: enrichment_typ
 }
 
 fn enqueueAssetProducerOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, token: *@import("../artifact_producer_context.zig").Token, key: []const u8, payload: ?[]const u8) !void {
-    // A context-invalidated dependent publishes again at an unchanged source
-    // revision, so an earlier accepted receipt must not settle it.
-    const reproduce = blk: {
-        var read = try runtime.store.beginProbe();
-        defer read.abort();
-        break :blk try contextRebuildDueTxn(runtime.alloc, &read, request);
-    };
-    try enqueueProducerEffectsWith(runtime, token, &.{.{ .family = .document_artifact, .key = key, .value = payload, .source_index = 0 }}, reproduce);
+    try enqueueProducerEffects(runtime, token, &.{.{ .family = .document_artifact, .key = key, .value = payload, .source_index = 0 }});
     // Acceptance can race enqueue, including a deferred provider callback.
     // Consume the accepted bytes, never this callback's uncommitted response.
     try finishAcceptedAssetGraph(runtime, request);
 }
 
 fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation) !void {
-    return enqueueProducerEffectsWith(runtime, token, effects, false);
-}
-
-fn enqueueProducerEffectsWith(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation, reproduce: bool) !void {
     {
         const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
         var read = try runtime.store.beginProbe();
         defer read.abort();
         try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
         try token.validateInputs(runtime.alloc, &read);
-        if (!reproduce and try token.accepted(runtime.alloc, &read)) return;
+        if (try token.accepted(runtime.alloc, &read)) return;
         try token.validate(runtime.alloc, &read);
     }
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
