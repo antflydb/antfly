@@ -5004,3 +5004,37 @@ that integration), qualified metadata lifecycle transport and real first-bind
 worker handover, original-coordinator retirement transport, all root lifecycle
 coverage and the rest of the full issue scope. The above is native read
 qualification, not complete destination or changefeed qualification.
+
+### Pinned existing-client runner and independently verified PostgreSQL baseline
+
+Added `zig/e2e/antfly/clients/debezium`: Debezium 3.3.0.Final's unchanged PostgreSQL
+connector and pgoutput decoder, a small engine lifecycle/JSONL runner, digest-pinned
+Maven/JRE images, and a generic SQL-driven qualification driver. There is no Antfly
+connector, SQL/catalog shim or decoder adapter. The driver verifies the connector's
+reported runtime version and connector identity, keeps the stock connector's offset
+file across restarts, and supports an external endpoint as well as its disposable
+PostgreSQL baseline. Baseline PostgreSQL 17.6 is also pinned by image digest. Only
+uniquely named test containers/SQL objects are created and removed; the driver uses
+an existing Docker network and exposes no baseline host ports. Credential-bearing
+retained artifacts are opt-in, permission-restricted and gitignored.
+
+Validation: the digest-pinned image builds successfully. The final baseline run
+`debezium-baseline-version-verified-test.log` exited 0 and observed 19 events through
+an initial snapshot, exact numeric(38,8) byte representation, boolean/before-image
+checks, a two-row transaction with stable source txId/order and END count, primary
+key delete/tombstone/new-key records, a graceful reconnect after offline writes,
+and a client SIGKILL/reconnect with additional offline writes. Neither reconnect
+repeated the initial snapshot. The runtime event metadata reports PostgreSQL
+connector version 3.3.0.Final. Initial fixture assumptions were corrected from
+cross-row Debezium transaction-string equality to actual stable source.txId and
+transaction order/count evidence; PostgreSQL row LSNs differ within a transaction.
+A Docker address-pool exhaustion was avoided without pruning other resources by
+using the existing bridge and the disposable server's actual container address.
+Python syntax checks pass. No test artifacts or credential files are committed.
+
+This proves the harness runs a real pinned existing client. It does NOT qualify
+Antfly. The same client still must pass against Antfly's actual public factory,
+bootstrap/exported snapshot, slots and bounded retention, typed pgoutput, schema
+history, publication, privacy, reconnect, root lifecycle, server/node/HA failures
+and inbound-to-Native/Lake-to-outbound pipelines. Those remain mandatory scope;
+the PostgreSQL baseline is an independent control, not a replacement for them.
