@@ -38,6 +38,21 @@ pub const Capture = struct {
     staging: bool = false,
     staged: bool = false,
     poisoned: bool = false,
+    /// Set by `writeReplayEntries` immediately before its one `txn.put` of
+    /// `replay_meta_next_sequence_key` per commit, to the pre-write value it
+    /// already read for its own monotonicity check. Outer `null` means "no
+    /// hint, read it yourself" (every caller other than that one `put` call
+    /// leaves this unset); `Some(inner)` means the hint was taken, with
+    /// inner `null` for "key not found" and `Some(bytes)` for the 8-byte
+    /// value found. `touch`'s identical check below for that same key
+    /// reuses an outer-`Some` hint instead of issuing a second `txn.get`
+    /// for the same key's same pre-write value -- safe because nothing
+    /// writes `replay_meta_next_sequence_key` between the two reads (one
+    /// transaction, no interleaving writers under the single-writer
+    /// model). `touch` clears this unconditionally on every call (not just
+    /// the branch that consumes it), so a hint can never survive to be
+    /// (mis)read by a later, unrelated `touch` call.
+    replay_meta_previous_hint: ??[8]u8 = null,
 
     pub fn attach(self: *Capture, participant: @import("commit_participant.zig").Participant) !void {
         if (self.participant != null or self.allocator != null or self.checked or self.staged or self.poisoned) return error.InvalidBatch;
@@ -65,6 +80,11 @@ pub const Capture = struct {
     }
 
     pub fn touch(self: *Capture, alloc: std.mem.Allocator, txn: anytype, key: []const u8, value: ?[]const u8) !void {
+        // Consumed (and cleared) exactly once per call, regardless of which
+        // branch below returns early, so a hint meant for this call can
+        // never leak into a later, unrelated one. See the field doc.
+        const replay_meta_previous_hint = self.replay_meta_previous_hint;
+        self.replay_meta_previous_hint = null;
         errdefer self.poisoned = true;
         if (self.participant) |participant| if (participant.charge) |charge| try charge(participant.ptr, key, value);
         if (self.staging) return;
@@ -87,9 +107,23 @@ pub const Capture = struct {
                     self.replay_sequence = sequence;
                 } else if (value.?.len == 8) {
                     const next = std.mem.readInt(u64, value.?[0..8], .little);
-                    const previous = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+                    var previous_ambiguous = false;
+                    var previous_value: ?u64 = null;
+                    if (replay_meta_previous_hint) |hint| {
+                        // The hint is only ever set from the exact 8-byte
+                        // value `writeReplayEntries` already validated
+                        // before this `put`, so it is never the
+                        // wrong-length case a direct `txn.get` must still
+                        // check for below.
+                        if (hint) |bytes| previous_value = std.mem.readInt(u64, &bytes, .little);
+                    } else {
+                        const previous = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+                        if (previous) |raw| {
+                            if (raw.len != 8) previous_ambiguous = true else previous_value = std.mem.readInt(u64, raw[0..8], .little);
+                        }
+                    }
                     if (next <= 1 or (self.replay_next != null and self.replay_next.? != next) or
-                        (if (previous) |raw| raw.len != 8 or next <= std.mem.readInt(u64, raw[0..8], .little) else false)) self.replay_ambiguous = true;
+                        previous_ambiguous or (if (previous_value) |value_u64| next <= value_u64 else false)) self.replay_ambiguous = true;
                     self.replay_next = next;
                 } else self.replay_ambiguous = true;
             } else {
@@ -480,4 +514,92 @@ test "ordered artifact inventory input capture requires same transaction authori
         try std.testing.expect(nested.artifact_owners.contains("doc"));
         try std.testing.expect(!nested.artifact_owners.contains(unit_zero));
     }
+}
+
+// Regression for `writeReplayEntries` handing `touch` its already-read
+// pre-write value of `replay_meta_next_sequence_key` (`replay_meta_previous_hint`)
+// instead of letting `touch` read that same key a second time. A hint that
+// disagreed with the real stored bytes, or that leaked into some later,
+// unhinted call, would silently change which commits get an ambiguous
+// replay sequence -- exactly the kind of cache bug the design review asked
+// for a test on.
+test "artifact input capture's replay-meta previous hint matches a direct txn.get, and is cleared after one touch" {
+    const Fake = struct {
+        values: std.StringHashMap([]u8),
+        pub fn delete(self: *@This(), key: []const u8) !void {
+            if (self.values.fetchRemove(key)) |entry| {
+                std.testing.allocator.free(entry.key);
+                std.testing.allocator.free(entry.value);
+            }
+        }
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            return self.values.get(key) orelse error.NotFound;
+        }
+        pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            const owned = try std.testing.allocator.dupe(u8, value);
+            errdefer std.testing.allocator.free(owned);
+            if (self.values.getPtr(key)) |old| {
+                std.testing.allocator.free(old.*);
+                old.* = owned;
+            } else {
+                const owned_key = try std.testing.allocator.dupe(u8, key);
+                errdefer std.testing.allocator.free(owned_key);
+                try self.values.put(owned_key, owned);
+            }
+        }
+        pub fn deinit(self: *@This()) void {
+            var iter = self.values.iterator();
+            while (iter.next()) |entry| {
+                std.testing.allocator.free(entry.key_ptr.*);
+                std.testing.allocator.free(entry.value_ptr.*);
+            }
+            self.values.deinit();
+        }
+    };
+    const alloc = std.testing.allocator;
+    const namespace: [24]u8 = @splat(3);
+    const activation: publication.Command = .{ .mode = .activate, .namespace = namespace, .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    var txn: Fake = .{ .values = std.StringHashMap([]u8).init(alloc) };
+    defer txn.deinit();
+    try authority.bind(&txn, .native, namespace);
+    try publication.stageAuthority(&txn, activation);
+
+    var stored: [8]u8 = undefined;
+    std.mem.writeInt(u64, &stored, 5, .little);
+    try txn.put(&keys.replay_meta_next_sequence_key, &stored);
+
+    var next_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &next_bytes, 6, .little);
+
+    // Baseline: no hint, so `touch` reads the key itself -- today's
+    // behavior, unchanged.
+    var without_hint: Capture = .{};
+    defer without_hint.deinit(alloc);
+    try without_hint.touch(alloc, &txn, &keys.replay_meta_next_sequence_key, &next_bytes);
+    try std.testing.expect(!without_hint.replay_ambiguous);
+    try std.testing.expectEqual(@as(?u64, 6), without_hint.replay_next);
+
+    // Hinted with the exact pre-write bytes `writeReplayEntries` would have
+    // stashed (the real stored value): identical outcome, no `txn.get`
+    // needed, and the hint is gone afterward so it can never be reused by
+    // a later, unrelated `touch` call on the same `Capture`.
+    var with_hint: Capture = .{};
+    defer with_hint.deinit(alloc);
+    with_hint.replay_meta_previous_hint = @as(?[8]u8, stored);
+    try with_hint.touch(alloc, &txn, &keys.replay_meta_next_sequence_key, &next_bytes);
+    try std.testing.expect(!with_hint.replay_ambiguous);
+    try std.testing.expectEqual(@as(?u64, 6), with_hint.replay_next);
+    try std.testing.expect(with_hint.replay_meta_previous_hint == null);
+
+    // A hint reporting a *different* previous value than what is actually
+    // stored changes the ambiguity verdict exactly the way a direct
+    // `txn.get` returning that same (different) value would -- proving the
+    // hint's bytes are what drive the check, not a fixed true/false.
+    var disagreeing: Capture = .{};
+    defer disagreeing.deinit(alloc);
+    var higher_previous: [8]u8 = undefined;
+    std.mem.writeInt(u64, &higher_previous, 99, .little);
+    disagreeing.replay_meta_previous_hint = @as(?[8]u8, higher_previous);
+    try disagreeing.touch(alloc, &txn, &keys.replay_meta_next_sequence_key, &next_bytes);
+    try std.testing.expect(disagreeing.replay_ambiguous);
 }

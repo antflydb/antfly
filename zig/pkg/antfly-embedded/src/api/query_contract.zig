@@ -2784,6 +2784,20 @@ fn freeClonedJsonValues(alloc: std.mem.Allocator, values: []const std.json.Value
 }
 
 fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
+    // perf/lwa-search-overhead: this is checked on every public query
+    // (`queryExecutionDeadlineNsFromBody`'s only caller), but `timeout_ms`
+    // is an optional, rarely-set extension. A full `std.json.Value` parse
+    // of the whole body just to look for one key is wasted work on the
+    // overwhelmingly common case where the key is absent; mirror this
+    // file's own established idiom (`fastDensePublicQueryMayApply`, the
+    // `_native_cut`/`_response_live_read` checks in
+    // `parseQueryRequestWithDeadline`) of a cheap substring pre-check
+    // before paying for a parse. A JSON member name can be spelled with
+    // `\uXXXX` escapes (see "api query contract applies timeout_ms with
+    // an escaped member name"), so this must fall through to the real
+    // parse -- never conclude "absent" -- whenever the body has any
+    // backslash at all, exactly as those other checks do.
+    if (std.mem.indexOf(u8, body, "\"timeout_ms\"") == null and std.mem.indexOfScalar(u8, body, '\\') == null) return null;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -2966,7 +2980,43 @@ fn validateRawGraphWhereAlloc(
     }
 }
 
+const query_body_contract_fields_empty: QueryBodyContractFields = .{
+    .has_internal_shard_fields = false,
+    .has_embedding_limits = false,
+    .has_public_doc_filter_bindings = false,
+    .has_public_hierarchy_controls = false,
+    .has_query_timeout = false,
+    .has_graph_metric = false,
+};
+
 fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBodyContractFields {
+    // perf/lwa-search-overhead: this runs on every query admission (see
+    // `parseQueryRequestWithDeadlineCore`) and today always pays for a
+    // full `std.json.Value` parse plus a graph-query validation pass,
+    // even for the overwhelmingly common plain query that uses none of
+    // these extensions. If the body contains none of the literal key
+    // texts this function ever looks at or rejects on ("lake_read",
+    // "lake_visibility", "value_search_execution", "graph_queries",
+    // "with", "hierarchy", "timeout_ms", "graph_metric", and everything
+    // `isInternalShardFieldName` matches, which already covers
+    // "_embedding_limits"), none of them can be present as an object
+    // member, so every flag is exactly `false` and there is nothing for
+    // `validateRawGraphQueriesValueAlloc` to validate. Same "substring
+    // absent => skip the parse" idiom as `parseQueryTimeoutMs` and
+    // `queryBodyHasForbiddenPublicDocIdentityControlFields` above; a
+    // false positive on the check just falls through to the real parse.
+    // A `\uXXXX`-escaped member name (any backslash at all) also always
+    // falls through, never concluding "absent" from a substring miss.
+    only_fast_path: {
+        if (std.mem.indexOfScalar(u8, body, '\\') != null) break :only_fast_path;
+        inline for (.{ "lake_read", "lake_visibility", "value_search_execution", "graph_queries", "\"with\"", "\"hierarchy\"", "\"timeout_ms\"", "\"graph_metric\"" }) |needle| {
+            if (std.mem.indexOf(u8, body, needle) != null) break :only_fast_path;
+        }
+        inline for (internal_shard_field_names) |field| {
+            if (std.mem.indexOf(u8, body, field) != null) break :only_fast_path;
+        }
+        return query_body_contract_fields_empty;
+    }
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -12800,6 +12850,18 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
 }
 
 fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
+    // perf/lwa-search-overhead: same cheap substring pre-check idiom as
+    // `parseQueryTimeoutMs` above -- both fields are rare internal-only
+    // controls, absent from every ordinary public query, so the common
+    // case should not pay for a full `std.json.Value` parse just to learn
+    // neither key is present. A body lacking both literal key texts
+    // cannot contain either as an object member -- except through a
+    // `\uXXXX`-escaped member name, so any backslash at all also keeps
+    // this on the real-parse path, never concluding "absent" from a
+    // substring miss.
+    if (std.mem.indexOfScalar(u8, body, '\\') == null and
+        std.mem.indexOf(u8, body, "\"identity_read_generation\"") == null and
+        std.mem.indexOf(u8, body, "\"allow_doc_identity_reassignment\"") == null) return false;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -12807,7 +12869,32 @@ fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body:
         parsed.value.object.get("allow_doc_identity_reassignment") != null;
 }
 
+/// Cheap substring pre-check for `objectHasForbiddenPublicQueryField`'s
+/// three named fields plus every name `isInternalShardFieldName` matches:
+/// true only if none of their literal key texts could possibly be an
+/// object member of `body` (none of the substrings occur at all). A false
+/// positive (a name appearing only inside unrelated string content) just
+/// falls through to the real parse below, same as every other guard of
+/// this shape in this file -- never a false negative.
+fn bodyCouldHaveForbiddenPublicQueryField(body: []const u8) bool {
+    // A `\uXXXX`-escaped member name defeats every substring check below,
+    // so any backslash at all must answer "could have", never "absent".
+    if (std.mem.indexOfScalar(u8, body, '\\') != null) return true;
+    inline for (.{ "\"source_projection\"", "\"identity_read_generation\"", "\"allow_doc_identity_reassignment\"" }) |needle| {
+        if (std.mem.indexOf(u8, body, needle) != null) return true;
+    }
+    inline for (internal_shard_field_names) |field| {
+        if (std.mem.indexOfPos(u8, body, 0, field) != null) return true;
+    }
+    return false;
+}
+
 fn queryBodyHasForbiddenPublicDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
+    // perf/lwa-search-overhead: every field this checks is a rare,
+    // internal-only or advanced control absent from an ordinary public
+    // query; skip the full `std.json.Value` parse when none of their
+    // literal key texts appear anywhere in the body at all.
+    if (!bodyCouldHaveForbiddenPublicQueryField(body)) return false;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -12859,31 +12946,32 @@ fn queryBodyForGeneratedContractAlloc(
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
 }
 
+const internal_shard_field_names = [_][]const u8{
+    "_projection_source_fields",
+    "_distributed_text_stats",
+    "native_doc_id_constraints",
+    "_filter_query_json",
+    "_exclusion_query_json",
+    "_identity_read_generation",
+    "_native_cut",
+    "_index_alias_fences",
+    "_response_live_read",
+    "_document_authority",
+    "_privacy_policy_version",
+    "_index_name",
+    "_primary_text_index_name",
+    "_embedding_limits",
+    "_hierarchy_parent_admitted",
+    "_defer_hierarchy_child_hydration",
+    "_require_algebraic_filter_resolution",
+    db_mod.doc_filter_wire.field_name,
+    "_filter_doc_ids",
+    "_filter_doc_ids_positive",
+    "_exclude_doc_ids",
+};
+
 fn isInternalShardFieldName(name: []const u8) bool {
-    const internal_fields = [_][]const u8{
-        "_projection_source_fields",
-        "_distributed_text_stats",
-        "native_doc_id_constraints",
-        "_filter_query_json",
-        "_exclusion_query_json",
-        "_identity_read_generation",
-        "_native_cut",
-        "_index_alias_fences",
-        "_response_live_read",
-        "_document_authority",
-        "_privacy_policy_version",
-        "_index_name",
-        "_primary_text_index_name",
-        "_embedding_limits",
-        "_hierarchy_parent_admitted",
-        "_defer_hierarchy_child_hydration",
-        "_require_algebraic_filter_resolution",
-        db_mod.doc_filter_wire.field_name,
-        "_filter_doc_ids",
-        "_filter_doc_ids_positive",
-        "_exclude_doc_ids",
-    };
-    inline for (internal_fields) |field| {
+    inline for (internal_shard_field_names) |field| {
         if (std.mem.eql(u8, name, field)) return true;
     }
     return false;
@@ -12906,6 +12994,14 @@ fn objectHasForbiddenPublicQueryField(object: std.json.ObjectMap) bool {
 
 const ProjectionSourceMask = struct { fields: []const []const u8, include_all: bool };
 fn parseProjectionSourceFields(a: std.mem.Allocator, body: []const u8) !?std.json.Parsed(ProjectionSourceMask) {
+    // perf/lwa-search-overhead: `_projection_source_fields` is an internal
+    // worker-wire extension, never present in an ordinary public query.
+    // Same cheap substring pre-check idiom as `parseQueryTimeoutMs` --
+    // skip the full parse when the literal key text cannot be an object
+    // member because it is nowhere in the body. Any backslash at all
+    // (a possible `\uXXXX`-escaped member name) still falls through to
+    // the real parse, never concluding "absent" from a substring miss.
+    if (std.mem.indexOf(u8, body, "\"_projection_source_fields\"") == null and std.mem.indexOfScalar(u8, body, '\\') == null) return null;
     var raw = try std.json.parseFromSlice(std.json.Value, a, body, .{});
     defer raw.deinit();
     const value = raw.value.object.get("_projection_source_fields") orelse return null;
