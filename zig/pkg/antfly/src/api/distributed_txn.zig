@@ -215,6 +215,8 @@ pub const PreDecisionContext = @import("antfly_local_sources").api_local_transac
 pub const pre_decision_server_response_reserve_ms = contract.pre_decision_server_response_reserve_ms;
 
 pub const ParticipantWorker = struct {
+    /// Reviewed BEGIN/PREPARE transport retains explicit producer identity.
+    supports_transaction_producers: bool = false,
     ptr: *anyopaque,
     vtable: *const VTable,
 
@@ -287,10 +289,12 @@ pub const ParticipantWorker = struct {
     };
 
     pub fn beginGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
+        if (req.source_producer != .unlabelled and !self.supports_transaction_producers) return error.ChangefeedCapabilityUnsupported;
         try self.vtable.begin_group(self.ptr, alloc, group_id, table_name, req);
     }
 
     pub fn prepareGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
+        if ((req.req.completion_ordinary_producer or req.req.completion_legacy_producer) and !self.supports_transaction_producers) return error.ChangefeedCapabilityUnsupported;
         try self.vtable.prepare_group(self.ptr, alloc, group_id, table_name, req);
     }
 
@@ -453,6 +457,7 @@ pub const HostedParticipantWorker = struct {
 
     pub fn worker(self: *HostedParticipantWorker) ParticipantWorker {
         return .{
+            .supports_transaction_producers = true,
             .ptr = self,
             .vtable = &.{
                 .begin_group = beginGroup,
@@ -1059,6 +1064,7 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     pub fn worker(self: *LocalTableWriteParticipantWorker) ParticipantWorker {
         return .{
+            .supports_transaction_producers = self.writes.supports_transaction_producer_phases,
             .ptr = self,
             .vtable = &.{
                 .begin_group = beginGroup,
@@ -1602,9 +1608,11 @@ fn executeMultiTableCommitOnce(
         }
     }
 
-    // The legacy BEGIN RPC has no origin field. Never drop an explicit origin
-    // into that fallback, even when every root lacks retained-history support.
-    for (participants.items) |participant| if (participant.source_producer != .unlabelled) return error.ChangefeedCapabilityUnsupported;
+    // Only a reviewed producer-aware worker can use non-history phases.
+    // Unknown adapters retain the pre-BEGIN rejection rather than losing origin.
+    if (!worker.supports_transaction_producers) {
+        for (participants.items) |participant| if (participant.source_producer != .unlabelled) return error.ChangefeedCapabilityUnsupported;
+    }
 
     // Allocate every coordination slot before contacting a participant. No
     // allocator failure may be introduced after the commit decision becomes
@@ -1643,6 +1651,13 @@ fn executeMultiTableCommitOnce(
             if (@import("source_transaction_errors.zig").classify(err)) |reason| {
                 abort_on_error = false;
                 return reason;
+            }
+            if (participant.source_producer != .unlabelled and err != error.DecisionConflict) {
+                // An older peer can reject the envelope while still exposing
+                // an unlabelled committed record. Plain status is not origin
+                // evidence. Retry BEGIN until the original class is checked.
+                abort_on_error = false;
+                return error.CommitDecisionUnknown;
             }
             if (options.retain_terminal or err == error.DecisionConflict) {
                 // A stable transaction ID may be retried after the coordinator
@@ -2550,6 +2565,24 @@ fn requireProducerMarker(obj: std.json.ObjectMap, producer: TransactionProducer)
     }
     const marker = obj.get("source_producer") orelse return error.InvalidTxnRequest;
     if (marker != .string or !std.mem.eql(u8, marker.string, @tagName(producer))) return error.InvalidTxnRequest;
+}
+
+/// A generic 409 is not evidence that a labelled BEGIN checked the original
+/// record. Only the new request form can receive this request-bound response.
+pub fn encodeProducerBeginConflict(a: std.mem.Allocator, request: TxnBeginRequest) ![]u8 {
+    if (request.source_producer != .ordinary and request.source_producer != .legacy_cdc) return error.InvalidTxnRequest;
+    const id = encodeTxnIdHex(request.txn_id);
+    return std.json.Stringify.valueAlloc(a, [_][]const u8{ "producer-begin-conflict-v1", @tagName(request.source_producer), &id }, .{});
+}
+pub fn producerBeginConflictMatches(a: std.mem.Allocator, bytes: []const u8, request: TxnBeginRequest) !bool {
+    if (bytes.len > 4096 or request.source_producer == .unlabelled or request.source_producer == .scoped_source) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{}) catch |err| return if (err == error.OutOfMemory) err else false;
+    defer parsed.deinit();
+    if (parsed.value != .array or parsed.value.array.items.len != 3) return false;
+    const values = parsed.value.array.items;
+    for (values) |value| if (value != .string) return false;
+    const id = encodeTxnIdHex(request.txn_id);
+    return std.mem.eql(u8, values[0].string, "producer-begin-conflict-v1") and std.mem.eql(u8, values[1].string, @tagName(request.source_producer)) and std.mem.eql(u8, values[2].string, &id);
 }
 
 pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]u8 {
@@ -5846,6 +5879,7 @@ fn consumerTests() type {
 
             const Recorder = struct {
                 reject_origin: bool = false,
+                ambiguous_labelled_begin: bool = false,
                 status_calls: usize = 0,
                 begins: std.ArrayListUnmanaged(u64) = .empty,
                 prepares: std.ArrayListUnmanaged(u64) = .empty,
@@ -5871,6 +5905,7 @@ fn consumerTests() type {
 
                 fn worker(self: *@This()) ParticipantWorker {
                     return .{
+                        .supports_transaction_producers = self.ambiguous_labelled_begin,
                         .ptr = self,
                         .vtable = &.{
                             .begin_group = begin,
@@ -5885,6 +5920,7 @@ fn consumerTests() type {
                 fn begin(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnBeginRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.reject_origin) return error.SourceTransactionIdentityConflict;
+                    if (self.ambiguous_labelled_begin) return error.UnexpectedHttpStatus;
                     try std.testing.expectEqual(@as(usize, 2), req.participants.len);
                     try self.begins.append(std.testing.allocator, group_id);
                 }
@@ -5933,7 +5969,7 @@ fn consumerTests() type {
                 fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.status_calls += 1;
-                    return if (self.reject_origin) .committed else .pending;
+                    return if (self.reject_origin or self.ambiguous_labelled_begin) .committed else .pending;
                 }
 
                 fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnAcknowledgeRequest) !void {
@@ -5966,6 +6002,14 @@ fn consumerTests() type {
                     const intent = participant.intentRequest();
                     try std.testing.expectEqual(producer == .ordinary, intent.completion_ordinary_producer);
                     try std.testing.expectEqual(producer == .legacy_cdc, intent.completion_legacy_producer);
+                }
+                {
+                    var ambiguous: Recorder = .{ .ambiguous_labelled_begin = true };
+                    defer ambiguous.deinit(a);
+                    try std.testing.expectError(error.CommitDecisionUnknown, executeMultiTableCommitWithOptions(a, FakeCatalog.iface(), ambiguous.worker(), @splat(28), 10, 11, &labelled, .write, null, .{ .retain_terminal = true }));
+                    try std.testing.expectEqual(@as(usize, 0), ambiguous.status_calls);
+                    try std.testing.expectEqual(@as(usize, 0), ambiguous.prepares.items.len);
+                    try std.testing.expectEqual(@as(usize, 0), ambiguous.resolves.items.len);
                 }
                 var untouched = Recorder{};
                 defer untouched.deinit(a);
@@ -7336,4 +7380,8 @@ test "distributed txn producer RPC envelopes preserve origin through nested row 
     var invalid = older;
     invalid.source_producer = .scoped_source;
     try std.testing.expectError(error.InvalidTxnRequest, encodeTxnBeginRequest(a, invalid));
+}
+
+test "distributed txn native producers span physical participants" {
+    try @import("transaction_producer_native_test.zig").run(std.testing.allocator);
 }

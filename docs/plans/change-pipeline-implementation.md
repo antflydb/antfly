@@ -6977,3 +6977,79 @@ resolution after deterministic identity rejection. Contract checks and
 `git diff --check` passed. Versions remain owner 117, API 37, engine 65, data 45,
 metadata 105 and failure 89. No new public API or format was introduced, and
 original acceptance/production ingress activation remains open.
+
+### Producer-aware non-history coordinator fallback (in progress)
+
+Participant workers now explicitly opt into producer-preserving BEGIN/PREPARE.
+Unknown adapters retain zero-BEGIN rejection. Production local workers derive
+support from their reviewed phase provider; hosted workers use the versioned
+RPC/context implementation. This permits the real non-history coordinator path
+for reviewed workers without inventing retained-history admission. Worker
+capability is process-local inside the API implementation, not a new exported
+owner/context layout; existing versions are unchanged.
+
+Added two actual native physical roots with immutable catalog fixture placement,
+production local participant workers and the production distributed coordinator.
+The qualification exercises ordinary/legacy origins, native coordinator/follower
+roles, two-root reopen, stable-ID retry and origin-switch rejection. It neither
+manufactures Raft cuts nor claims native roots prove remote/Raft qualification.
+Current transaction/linked checks are running
+(`source-producer-native-fallback-test.log`); source-catalog, engine-error and
+OpenAPI checks passed (`source-producer-native-fallback-contract-check.log`).
+
+Review identified a further required compatibility constraint before this change
+can be committed: a labelled BEGIN rejected by an older peer or lost in transport
+must not adopt an older unlabelled committed record through plain status. Its
+retry needs an origin-checked BEGIN result before committed-status recovery.
+The fallback remains uncommitted pending that correction and qualification.
+Production ingress assignment, first-strict activation and all original issue
+scope remain open.
+
+The initial native fallback run passed all 42 local and 77 API integration
+cases, including the two-root native reopen test. The linked control build
+correctly rejected its explicit `OpenOptions`/DB-open dependency: the physical
+test had also matched a control-only suite filter. It is now selected only by
+the native API transaction suite; no physical type was exposed across that
+boundary. The corrected native/linked run passed all 42/77 and six/37 cases
+(`source-producer-native-fallback-final-test.log`).
+
+Before finalizing fallback, labelled BEGIN ambiguity was tightened: only an
+origin-checked terminal BEGIN conflict can precede plain committed-status
+recovery. Other labelled failures return decision ambiguity without status
+adoption or ABORT. Both-origin coordinator tests provide an older committed
+status behind an ambiguous BEGIN and require zero probes or resolutions.
+Remote terminal conflicts now additionally use a bounded
+`producer-begin-conflict-v1` reply bound to producer and original transaction ID.
+The client refuses generic 409, wrong-origin and wrong-ID substitutes. New
+request envelopes reject older readers; an older peer cannot manufacture the
+new checked reply by returning its old generic conflict. Native HTTP tests also
+retry the original BEGIN after COMMIT and require that checked conflict.
+Final proof/native/linked checks are running
+(`source-producer-native-fallback-proof-test.log`); latest contract checks passed
+(`source-producer-native-fallback-proof-contract-check.log`). This remains
+uncommitted until those checks finish. Production origin assignment, actual
+multi-owner Raft/failover qualification and all original acceptance remain open.
+
+Final native fallback verification passed. The first proof run caught four
+request-allocator reply buffers not freed after response construction, plus a
+wrong-ID proof reported as an unexpected response rather than decision ambiguity.
+The reply buffers are now freed and unknown/unproven labelled conflicts remain
+ambiguous. Final affected suites passed
+(`source-producer-native-fallback-proof-final-test.log`): 42 local and 78 API
+integration cases, zero failures, skips or leaks. This includes two physical
+native roots/reopen/stable retries, checked native HTTP terminal replies,
+immutable origin rejection, wrong-ID/wrong-origin/generic 409 rejection, and
+no-status/no-ABORT ambiguity handling. The preceding proof run passed six local
+and 37 linked history/control cases; its two failures were confined to the
+subsequently corrected API reply checks. Final source-catalog, engine-error,
+OpenAPI and `git diff --check` passed
+(`source-producer-native-fallback-proof-final-contract-check.log`).
+
+Reviewed producer-aware workers can now execute non-history coordinator phases;
+unreviewed workers still reject before BEGIN. No public/native owner ABI,
+metadata or data format changed: versions remain owner 117, API 37, engine 65,
+data 45, metadata 105 and failure 89. The checked conflict reply belongs to the
+new private producer-BEGIN request contract. Native qualification does not
+qualify multi-owner Raft failover, source-root cohorts or production CDC/public
+origin assignment. Bound whole-commit origin support is also still needed before
+standalone CDC ingress can opt in. All original issue acceptance remains open.

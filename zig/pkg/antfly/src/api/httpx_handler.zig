@@ -4827,8 +4827,14 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         var input = distributed_txn.parseTxnBeginRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnBeginRequest(ctx.allocator, &input);
-        self.internalGroupOperations().txnBegin(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+        self.internalGroupOperations().txnBegin(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err| {
+            if (err == error.DecisionConflict and input.source_producer != .unlabelled) {
+                const proof = try distributed_txn.encodeProducerBeginConflict(ctx.allocator, input);
+                defer ctx.allocator.free(proof);
+                return textResponse(ctx, 409, proof);
+            }
             return internalTxnErrorResponse(ctx, err, .begin);
+        };
         return ctx.json(struct {}{});
     }
 

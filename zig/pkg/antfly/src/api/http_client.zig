@@ -4067,7 +4067,16 @@ pub const ApiHttpClient = struct {
         if (remoteRelationalRowError(resp.status, resp.body)) |reason| return reason;
         switch (resp.status) {
             200 => return .applied,
-            409 => return remoteGroupConflictError(resp.body),
+            409 => {
+                var original = txn_api.parseTxnBeginRequest(self.alloc, body) catch |err| return if (err == error.OutOfMemory) err else error.CommitDecisionUnknown;
+                defer txn_api.freeTxnBeginRequest(self.alloc, &original);
+                if (original.source_producer != .unlabelled) {
+                    if (try txn_api.producerBeginConflictMatches(self.alloc, resp.body, original)) return error.DecisionConflict;
+                    const conflict = remoteGroupConflictError(resp.body);
+                    return if (conflict == error.DecisionConflict or conflict == error.UnexpectedHttpStatus) error.CommitDecisionUnknown else conflict;
+                }
+                return remoteGroupConflictError(resp.body);
+            },
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -8408,6 +8417,7 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
             defer a.free(resolve);
             _ = try client.fetchGroupTxnResolve(base, 2, "docs", resolve);
             try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try db.getTransactionStatus(id));
+            try std.testing.expectError(error.DecisionConflict, client.fetchGroupTxnBegin(base, 2, "docs", begin));
             for ([_]@FieldType(db_mod.types.BatchRequest, "source_producer"){ .unlabelled, if (producer == .ordinary) .legacy_cdc else .ordinary }) |changed| {
                 const reclassified = try txn_api.encodeTxnBeginRequest(a, .{ .source_producer = changed, .txn_id = id, .begin_timestamp = 100, .retain_terminal = true, .participants = if (coordinator) &.{own} else &.{ other, own } });
                 defer a.free(reclassified);
@@ -8419,4 +8429,37 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
     const row = (try db.get(a, "row")) orelse return error.TestExpectedProducerRow;
     defer a.free(row);
     try std.testing.expectEqualStrings("{}", row);
+}
+
+test "distributed txn producer BEGIN conflict requires correlated provenance" {
+    const Fake = struct {
+        reply: []const u8,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = 409, .body = try a.dupe(u8, self.reply) };
+        }
+    };
+    const a = std.testing.allocator;
+    const input: txn_api.TxnBeginRequest = .{ .source_producer = .ordinary, .txn_id = @splat(1), .begin_timestamp = 100, .participants = &.{"participant"} };
+    const body = try txn_api.encodeTxnBeginRequest(a, input);
+    defer a.free(body);
+    var fake: Fake = .{ .reply = "decision conflict" };
+    var client = ApiHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    try std.testing.expectError(error.CommitDecisionUnknown, client.fetchGroupTxnBegin("http://peer", 1, "docs", body));
+    const proof = try txn_api.encodeProducerBeginConflict(a, input);
+    defer a.free(proof);
+    fake.reply = proof;
+    try std.testing.expectError(error.DecisionConflict, client.fetchGroupTxnBegin("http://peer", 1, "docs", body));
+    var changed = input;
+    changed.txn_id = @splat(2);
+    const wrong_id = try txn_api.encodeProducerBeginConflict(a, changed);
+    defer a.free(wrong_id);
+    fake.reply = wrong_id;
+    try std.testing.expectError(error.CommitDecisionUnknown, client.fetchGroupTxnBegin("http://peer", 1, "docs", body));
+    changed = input;
+    changed.source_producer = .legacy_cdc;
+    const wrong_origin = try txn_api.encodeProducerBeginConflict(a, changed);
+    defer a.free(wrong_origin);
+    fake.reply = wrong_origin;
+    try std.testing.expectError(error.CommitDecisionUnknown, client.fetchGroupTxnBegin("http://peer", 1, "docs", body));
 }
