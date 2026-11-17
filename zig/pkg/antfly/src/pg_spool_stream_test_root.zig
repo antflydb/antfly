@@ -18,3 +18,7 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 test "pg spool stream serves retained history over CopyBoth and confirms only complete feedback" {
     try @import("pg_spool_upload_test.zig").runStream();
 }
+
+test "pg spool stream encodes a retained relational transaction with a historical key change" {
+    try @import("metadata/pg_retained_transaction.zig").testRetainedTransaction();
+}
