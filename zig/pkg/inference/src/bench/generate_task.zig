@@ -56,6 +56,7 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .compiled_attachment_target = .whole_model,
         .pjrt_client = client,
         .pjrt_media_bucket_rows = options.pjrt.media_bucket_rows,
+        .pjrt_decoder_cache = options.pjrt.decoder_cache,
     };
     defer pipeline.deinit();
     const image_bytes = if (options.generate_image) |path| try std.Io.Dir.cwd().readFileAlloc(init.io, path, a, .limited(64 * 1024 * 1024)) else null;
@@ -104,13 +105,14 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .pjrt_execution_profile = factory.getPjrtExecutionProfile(model.session),
         .pjrt_device = if (is_pjrt) @tagName(options.pjrt.device) else null,
         .pjrt_media_bucket_rows = options.pjrt.media_bucket_rows,
+        .pjrt_decoder_cache = options.pjrt.decoder_cache,
         .pjrt_gemm = if (is_pjrt) @tagName(options.pjrt.gemm) else null,
         .pjrt_precision = if (is_pjrt) @tagName(options.pjrt.precision) else null,
         .whole_model_required = is_pjrt,
         .modalities = .{ .image = image_bytes != null, .audio = audio_bytes != null, .video = video_bytes != null },
-        .decode_execution_scope = if (is_pjrt) "offline_full_prefix_recomputation" else "native_paged_kv",
+        .decode_execution_scope = if (is_pjrt) (if (options.pjrt.decoder_cache) "request_resident_state" else "offline_full_prefix_recomputation") else "native_paged_kv",
         .cached_serving_performance_qualified = false,
-        .kv_cached = !is_pjrt,
+        .kv_cached = !is_pjrt or options.pjrt.decoder_cache,
         .model_load_in_timing = false,
         .model_chat_template = model.chat_tmpl != null,
         .runtime_capabilities = if (cache.compiled_model_runtime) |*runtime| runtime.capabilities() else null,

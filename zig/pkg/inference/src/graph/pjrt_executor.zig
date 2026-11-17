@@ -111,6 +111,11 @@ pub const PjrtExecutor = struct {
     input_dtypes: []ml.graph.DType = &.{},
     output_dtypes: []ml.graph.DType = &.{},
     retained_parameters: []?pjrt_lib.pjrt.Buffer = &.{},
+    resident_output_start: ?usize = null,
+    resident_capacity: usize = 0,
+    resident_query_rows: usize = 0,
+    resident_dynamic_rows: bool = false,
+    resident_prefill_only: bool = false,
     parameters_shared: bool = false,
     /// Inline PartitionExecutor for stable pointer access.
     pe: PartitionExecutor = undefined,
@@ -141,7 +146,14 @@ pub const PjrtExecutor = struct {
         retained_cache: ?*const PjrtRetainedBufferCache,
         semantic_input_bindings: []const PjrtSemanticInputBinding,
     ) ![]pjrt_lib.pjrt.Buffer {
-        return self.executeToBuffersWithAllocators(values, exec_ctx, allocator, allocator, retained_cache, semantic_input_bindings);
+        return self.executeToBuffersWithAllocators(values, exec_ctx, allocator, allocator, retained_cache, semantic_input_bindings, null);
+    }
+
+    /// Borrow request-owned inputs without donating them. Publication belongs
+    /// to the request transaction after synchronization and logits readback.
+    pub fn executeWithResidentState(self: *PjrtExecutor, values: []?CT, backend: *const ComputeBackend, state: []const pjrt_lib.pjrt.Buffer, allocator: Allocator) ![]pjrt_lib.pjrt.Buffer {
+        if (self.resident_output_start == null) return error.NotResidentDecoder;
+        return self.executeToBuffersWithAllocators(values, .{ .backend = backend }, allocator, allocator, null, &.{}, state);
     }
 
     fn uploadTensor(self: *PjrtExecutor, backend: *const ComputeBackend, value: CT, index: usize, allocator: Allocator) !pjrt_lib.pjrt.Buffer {
@@ -239,7 +251,9 @@ pub const PjrtExecutor = struct {
         transfer_allocator: Allocator,
         retained_cache: ?*const PjrtRetainedBufferCache,
         semantic_input_bindings: []const PjrtSemanticInputBinding,
+        resident_inputs: ?[]const pjrt_lib.pjrt.Buffer,
     ) ![]pjrt_lib.pjrt.Buffer {
+        if (self.resident_output_start != null and resident_inputs == null) return error.MissingResidentState;
         const staging_allocator = @import("antfly_platform").allocator.reclaimingScratch(transfer_allocator);
         const num_inputs = self.input_bindings.len;
         const debug = pjrtExecDebugEnabled();
@@ -260,7 +274,17 @@ pub const PjrtExecutor = struct {
         };
 
         var semantic_inputs = try SemanticInputCursor.init(semantic_input_bindings, num_inputs);
+        var resident_index: usize = 0;
         for (self.input_bindings, 0..) |binding, i| {
+            if (resident_inputs) |buffers| if (binding == .semantic_past_graph_node) {
+                if (resident_index >= buffers.len) return error.MissingResidentState;
+                const buffer = buffers[resident_index];
+                if (!try buffer.matchesFloat32Shape(self.input_shapes_[i])) return error.InvalidResidentState;
+                input_bufs[i] = buffer;
+                resident_index += 1;
+                input_bufs_initialized += 1;
+                continue;
+            };
             if (semantic_inputs.at(i)) |semantic_binding| {
                 const cache = retained_cache orelse {
                     if (debug) {
@@ -400,6 +424,7 @@ pub const PjrtExecutor = struct {
         // ── 2. Execute ──────────────────────────────────────────
 
         if (debug) std.log.info("PJRT execute calling LoadedExecutable.Execute", .{});
+        if (resident_inputs) |buffers| if (resident_index != buffers.len) return error.InvalidResidentState;
         const outputs = try self.executable.execute(input_bufs[0..num_inputs], allocator);
         if (debug) std.log.info("PJRT execute completed outputs={d}", .{outputs.len});
         return outputs;
@@ -514,6 +539,11 @@ pub fn createExecutorWithOptions(
         client,
     );
     executable_owned = false;
+    executor.resident_output_start = result.resident_output_start;
+    executor.resident_capacity = options.resident_capacity;
+    executor.resident_query_rows = result.resident_query_rows;
+    executor.resident_dynamic_rows = result.resident_dynamic_rows;
+    executor.resident_prefill_only = options.resident_visibility != null;
     errdefer executor.partitionExecutor().deinitExecutor();
     if (options.mutable_parameters) |flags| try executor.retainParameters(graph, cb, flags, shared_parameters);
     return executor;
@@ -1318,6 +1348,7 @@ const PjrtModelRuntime = struct {
             allocator,
             &self.retained_buffers,
             phase.semantic_input_bindings,
+            null,
         );
         defer bookkeeping.free(outputs);
         const debug = pjrtExecDebugEnabled();

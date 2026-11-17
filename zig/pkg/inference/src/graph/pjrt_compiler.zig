@@ -64,6 +64,9 @@ pub const CompileResult = struct {
     input_shapes: [][]i64,
     /// Actual HLO output shapes, ordered to match output_node_ids.
     output_shapes: [][]i64,
+    resident_output_start: ?usize = null,
+    resident_query_rows: usize = 0,
+    resident_dynamic_rows: bool = false,
     allocator: Allocator,
 
     pub fn deinit(self: *CompileResult) void {
@@ -84,6 +87,10 @@ pub const InputBinding = union(enum) {
 
 pub const CompileOptions = struct {
     precision: @import("../execution/precision.zig").Policy = .f32,
+    /// Request-private fixed-capacity state. Position is a runtime scalar;
+    /// no sequence-length-specialized decode executables or host KV readbacks.
+    resident_capacity: usize = 0,
+    resident_visibility: ?[]const u8 = null,
     /// Emit graph parameter nodes as HLO parameters instead of embedding their
     /// current f32 values as HLO constants. This is host-assisted and mainly
     /// useful for validation or plugins that cannot compile huge constant HLO.
@@ -254,6 +261,29 @@ pub fn compilePartitionWithOptions(
         }
     }
 
+    if (options.resident_capacity != 0 and (options.semantic_kv_bindings or options.resident_capacity > 16_777_216)) return error.UnsupportedResidentDecode;
+    var resident = ResidentLowering{ .capacity = options.resident_capacity };
+    defer resident.outputs.deinit(allocator);
+    defer resident.nodes.deinit(allocator);
+    defer resident.kv.deinit(allocator);
+    if (resident.capacity != 0) resident.position = try resident.input(allocator, &b, &input_bindings_list, &next_param, null_node, hlo.Shape.scalar(.f32));
+    // Prebind this control independently of graph scheduling. It also selects
+    // the public logits row; changing prompt length cannot specialize its value.
+    if (resident.capacity != 0) for (part.node_ids) |node_id| {
+        const node = graph.node(node_id);
+        if (node.op != .parameter or !std.mem.eql(u8, graph.parameterName(node), "logits_row")) continue;
+        if (node.output_shape.dtype != .i64 or node.output_shape.rank() != 1 or node.output_shape.dims[0] != 1) return error.UnsupportedResidentDecode;
+        const input = node_map[node_id] orelse input: {
+            const id = try b.parameter(next_param, graphShapeToHlo(node), "logits_row");
+            next_param += 1;
+            try input_bindings_list.append(allocator, .{ .graph_node = node_id });
+            try input_node_ids_list.append(allocator, node_id);
+            node_map[node_id] = id;
+            break :input id;
+        };
+        resident.valid_rows = try b.add(try b.convertType(try b.reshape(input, hlo.Shape.scalar(.s64)), .s32), try b.constantS32(hlo.Shape.scalar(.s32), &.{1}));
+    };
+
     // ── 2. Walk partition nodes, emit HLO ops ───────────────────
 
     // Secondary results belong to their producer. Topological scheduling may
@@ -279,9 +309,42 @@ pub fn compilePartitionWithOptions(
                 return err;
             };
             if (ins.len != 3) return error.UnsupportedShape;
-            node_map[nid] = try program.emit(allocator, &b, try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1]), try getHloId(node_map, ins[2]), n.op.fused_gated_delta, reducer_comp.id, recurrent_programs.items.len - 1);
+            const attrs = n.op.fused_gated_delta;
+            if (resident.capacity != 0) try resident.queryRows(attrs.rows);
+            const initial = if (resident.capacity != 0) try resident.input(allocator, &b, &input_bindings_list, &next_param, node_id, hlo.Shape.init(.f32, &.{ attrs.value_heads, attrs.key_dim, attrs.value_dim })) else null;
+            const emitted = try program.emitWithState(allocator, &b, try getHloId(node_map, ins[0]), try getHloId(node_map, ins[1]), try getHloId(node_map, ins[2]), attrs, reducer_comp.id, recurrent_programs.items.len - 1, initial, resident.valid_rows);
+            node_map[nid] = emitted.output;
+            if (resident.capacity != 0) try resident.output(allocator, node_id, emitted.state);
             needs_reducer = true;
             continue;
+        }
+
+        if (resident.capacity != 0 and n.op == .conv_general) {
+            const attrs = n.op.conv_general;
+            // Only the canonical causal depthwise temporal layout owns history.
+            // Image/encoder convolutions must never become decoder state.
+            if (attrs.num_spatial == 1 and attrs.padding[0][0] > 0 and attrs.padding[0][1] == 0 and attrs.groups > 0) {
+                const x = try getHloId(node_map, ins[0]);
+                const w = try getHloId(node_map, ins[1]);
+                const xs = b.getInst(x).shape;
+                const ws = b.getInst(w).shape;
+                const history = attrs.padding[0][0];
+                if (xs.dimensions.len == 3) try resident.queryRows(@intCast(xs.dimensions[2]));
+                if (xs.dimensions.len != 3 or ws.dimensions.len != 3 or xs.dimensions[0] != 1 or xs.dimensions[1] != attrs.groups or ws.dimensions[1] != 1 or ws.dimensions[2] != history + 1 or attrs.strides[0] != 1 or attrs.dilations[0] != 1) return error.UnsupportedResidentDecode;
+                const shape = hlo.Shape.init(.f32, &.{ 1, xs.dimensions[1], history });
+                const past = try resident.input(allocator, &b, &input_bindings_list, &next_param, node_id, shape);
+                const combined_shape = hlo.Shape.init(.f32, &.{ 1, xs.dimensions[1], history + xs.dimensions[2] });
+                const combined = try b.concatenate(&.{ past, x }, 2, combined_shape);
+                var conv = try convolutionAttrs(attrs);
+                conv.padding_low[0] = 0;
+                node_map[nid] = try b.convolution(combined, w, graphShapeToHlo(n), conv);
+                const tail = if (resident.valid_rows) |limit| tail: {
+                    const zero = try b.constantS32(hlo.Shape.scalar(.s32), &.{0});
+                    break :tail try b.dynamicSlice(combined, &.{ zero, zero, limit }, shape.dimensions);
+                } else try b.slice(combined, &.{ 0, 0, xs.dimensions[2] }, combined_shape.dimensions, &.{ 1, 1, 1 }, shape);
+                try resident.output(allocator, node_id, tail);
+                continue;
+            }
         }
         if (try emitPrimitiveNode(allocator, &b, n, node_map, nid, &reducer_comp, &max_reducer_comp, &needs_reducer, &needs_max_reducer)) continue;
 
@@ -290,6 +353,7 @@ pub fn compilePartitionWithOptions(
                 node_map[nid] = try b.broadcast(try b.constantScalarF32(0), &.{}, graphShapeToHlo(n));
             },
             .parameter => {
+                if (node_map[nid] != null) continue;
                 const mutable = if (options.mutable_parameters) |flags| blk: {
                     if (flags.len != graph.nodeCount()) return error.InvalidMutableParameterTable;
                     break :blk flags[node_id];
@@ -478,6 +542,10 @@ pub fn compilePartitionWithOptions(
             },
 
             .fused_rope => |attrs| {
+                if (resident.capacity != 0) {
+                    node_map[nid] = try emitResidentRope(allocator, &b, n, try getHloId(node_map, ins[0]), attrs, resident.position.?, resident.capacity, options.precision == .bf16);
+                    continue;
+                }
                 node_map[nid] = try emitStaticRope(
                     allocator,
                     &b,
@@ -492,6 +560,35 @@ pub fn compilePartitionWithOptions(
                 const k = try getHloId(node_map, ins[1]);
                 const v = try getHloId(node_map, ins[2]);
                 const bias = if (n.num_inputs > 3 and ins[3] != null_node) try getHloId(node_map, ins[3]) else null;
+                if (resident.capacity != 0) {
+                    if (attrs.batch != 1 or attrs.seq_len > resident.capacity or bias != null) return error.UnsupportedResidentDecode;
+                    try resident.queryRows(attrs.seq_len);
+                    const width = @as(i64, if (attrs.num_kv_heads == 0) attrs.num_heads else attrs.num_kv_heads) * attrs.head_dim;
+                    const shape = hlo.Shape.init(.f32, &.{ @intCast(resident.capacity), width });
+                    var present_k = resident.kv.get(ins[1]);
+                    var present_v = resident.kv.get(ins[2]);
+                    if ((present_k == null) != (present_v == null)) return error.UnsupportedResidentDecode;
+                    if (present_k == null) {
+                        if (attrs.skip_kv_write) return error.UnsupportedResidentDecode;
+                        const old_k = try resident.input(allocator, &b, &input_bindings_list, &next_param, ins[1], shape);
+                        const old_v = try resident.input(allocator, &b, &input_bindings_list, &next_param, ins[2], shape);
+                        const zero = try b.constantS32(hlo.Shape.scalar(.s32), &.{0});
+                        const position = try b.convertType(resident.position.?, .s32);
+                        present_k = try b.dynamicUpdateSlice(old_k, k, &.{ position, zero });
+                        present_v = try b.dynamicUpdateSlice(old_v, v, &.{ position, zero });
+                        try resident.output(allocator, ins[1], present_k.?);
+                        try resident.output(allocator, ins[2], present_v.?);
+                        try resident.kv.put(allocator, ins[1], present_k.?);
+                        try resident.kv.put(allocator, ins[2], present_v.?);
+                    }
+                    var attention_attrs = attrs;
+                    attention_attrs.skip_kv_write = false;
+                    const emitted = try emitStaticGqaAttention(allocator, &b, n, q, present_k.?, present_v.?, null, attention_attrs, &reducer_comp, &max_reducer_comp, null, null, resident.position, options.resident_visibility);
+                    node_map[nid] = emitted.output;
+                    needs_reducer = true;
+                    needs_max_reducer = true;
+                    continue;
+                }
                 const past_k = if (options.semantic_kv_bindings) semantic_past_inputs.get(ins[1]) else null;
                 const past_v = if (options.semantic_kv_bindings) semantic_past_inputs.get(ins[2]) else null;
                 const emitted = try emitStaticGqaAttention(
@@ -507,6 +604,8 @@ pub fn compilePartitionWithOptions(
                     &max_reducer_comp,
                     past_k,
                     past_v,
+                    null,
+                    null,
                 );
                 node_map[nid] = emitted.output;
                 if (emitted.present_k) |present_k| node_map[@intCast(ins[1])] = present_k;
@@ -535,30 +634,21 @@ pub fn compilePartitionWithOptions(
 
     // ── 3. Determine partition outputs ──────────────────────────
 
-    const output_node_ids = try computeOutputsWithOptions(allocator, graph, &part_set, part.node_ids, options);
+    const ordinary_outputs = try computeOutputsWithOptions(allocator, graph, &part_set, part.node_ids, options);
+    defer allocator.free(ordinary_outputs);
+    const output_node_ids = try allocator.alloc(NodeId, ordinary_outputs.len + resident.outputs.items.len);
     errdefer allocator.free(output_node_ids);
-
-    // Make the output(s) the root of the computation.
-    if (output_node_ids.len == 0) {
-        return error.NoOutputs;
-    } else if (output_node_ids.len == 1) {
-        // Single output: ensure it is the last (root) instruction.
-        const out_hlo_id = node_map[@intCast(output_node_ids[0])] orelse return error.MissingOutput;
-        const last_id = b.instructions.items[b.instructions.items.len - 1].id;
-        if (out_hlo_id != last_id) {
-            // Add a reshape-to-same-shape as a no-op to make it the root.
-            const out_shape = graphShapeToHlo(graph.node(output_node_ids[0]));
-            _ = try b.reshape(out_hlo_id, out_shape);
-        }
-    } else {
-        // Multiple outputs: pack into an HLO tuple as the root.
-        var hlo_output_ids = try allocator.alloc(hlo.Id, output_node_ids.len);
-        defer allocator.free(hlo_output_ids);
-        for (output_node_ids, 0..) |nid, i| {
-            hlo_output_ids[i] = node_map[@intCast(nid)] orelse return error.MissingOutput;
-        }
-        _ = try b.tuple(hlo_output_ids);
-    }
+    @memcpy(output_node_ids[0..ordinary_outputs.len], ordinary_outputs);
+    @memcpy(output_node_ids[ordinary_outputs.len..], resident.nodes.items);
+    if (output_node_ids.len == 0) return error.NoOutputs;
+    const hlo_output_ids = try allocator.alloc(hlo.Id, output_node_ids.len);
+    defer allocator.free(hlo_output_ids);
+    for (ordinary_outputs, 0..) |nid, i| hlo_output_ids[i] = node_map[@intCast(nid)] orelse return error.MissingOutput;
+    @memcpy(hlo_output_ids[ordinary_outputs.len..], resident.outputs.items);
+    if (hlo_output_ids.len == 1) {
+        const root = hlo_output_ids[0];
+        _ = try b.reshape(root, b.getInst(root).shape);
+    } else _ = try b.tuple(hlo_output_ids);
 
     // ── 4. Build & serialize HloModuleProto ─────────────────────
 
@@ -576,9 +666,18 @@ pub fn compilePartitionWithOptions(
     errdefer allocator.free(input_bindings);
     const input_node_ids = try input_node_ids_list.toOwnedSlice(allocator);
     errdefer allocator.free(input_node_ids);
-    const input_shapes = try buildInputShapesForBindings(allocator, graph, input_bindings);
+    const input_shapes = if (resident.capacity != 0) try cloneParameterShapes(allocator, &b, input_bindings.len) else try buildInputShapesForBindings(allocator, graph, input_bindings);
     errdefer freeShapeSlices(allocator, input_shapes);
-    const output_shapes = try cloneHloShapesForOutputNodeIds(allocator, &b, node_map, output_node_ids);
+    const output_shapes = try allocator.alloc([]i64, hlo_output_ids.len);
+    var shapes_initialized: usize = 0;
+    errdefer {
+        for (output_shapes[0..shapes_initialized]) |shape| allocator.free(shape);
+        allocator.free(output_shapes);
+    }
+    for (hlo_output_ids, output_shapes) |id, *shape| {
+        shape.* = try allocator.dupe(i64, b.getInst(id).shape.dimensions);
+        shapes_initialized += 1;
+    }
     errdefer freeShapeSlices(allocator, output_shapes);
 
     return .{
@@ -589,7 +688,114 @@ pub fn compilePartitionWithOptions(
         .input_shapes = input_shapes,
         .output_shapes = output_shapes,
         .allocator = allocator,
+        .resident_output_start = if (resident.capacity != 0) ordinary_outputs.len else null,
+        .resident_query_rows = resident.rows,
+        .resident_dynamic_rows = resident.valid_rows != null,
     };
+}
+
+const ResidentLowering = struct {
+    capacity: usize,
+    position: ?hlo.Id = null,
+    valid_rows: ?hlo.Id = null,
+    rows: usize = 0,
+    outputs: std.ArrayListUnmanaged(hlo.Id) = .empty,
+    nodes: std.ArrayListUnmanaged(NodeId) = .empty,
+    kv: std.AutoHashMapUnmanaged(NodeId, hlo.Id) = .empty,
+
+    fn queryRows(self: *@This(), rows: usize) !void {
+        if (rows == 0 or (self.rows != 0 and self.rows != rows)) return error.UnsupportedResidentDecode;
+        self.rows = rows;
+    }
+    fn input(_: *@This(), a: Allocator, b: *hlo.Builder, bindings: *std.ArrayListUnmanaged(InputBinding), next: *u32, node: NodeId, shape: hlo.Shape) !hlo.Id {
+        const id = try b.parameter(next.*, shape, "resident_state");
+        next.* += 1;
+        try bindings.append(a, .{ .semantic_past_graph_node = node });
+        return id;
+    }
+    fn output(self: *@This(), a: Allocator, node: NodeId, id: hlo.Id) !void {
+        try self.outputs.append(a, id);
+        try self.nodes.append(a, node);
+    }
+};
+
+fn cloneParameterShapes(a: Allocator, b: *const hlo.Builder, count: usize) ![][]i64 {
+    const shapes = try a.alloc([]i64, count);
+    @memset(shapes, &.{});
+    errdefer {
+        for (shapes) |shape| a.free(shape);
+        a.free(shapes);
+    }
+    for (b.instructions.items) |inst| if (inst.parameter_number) |index| {
+        if (index >= count) return error.InvalidParameterIndex;
+        shapes[index] = try a.dupe(i64, inst.shape.dimensions);
+    };
+    return shapes;
+}
+
+fn residentRange(a: Allocator, b: *hlo.Builder, count: i64) !hlo.Id {
+    const values = try a.alloc(i32, @intCast(count));
+    defer a.free(values);
+    for (values, 0..) |*value, i| value.* = @intCast(i);
+    return b.constantS32(hlo.Shape.init(.s32, &.{count}), values);
+}
+
+fn emitResidentMask(a: Allocator, b: *hlo.Builder, heads: i64, rows: i64, keys: i64, window: u32, position: hlo.Id, visibility: ?[]const u8) !hlo.Id {
+    const grid = hlo.Shape.init(.s32, &.{ rows, keys });
+    const query = try b.broadcast(try b.add(try residentRange(a, b, rows), try b.convertType(position, .s32)), &.{0}, grid);
+    const key = try b.broadcast(try residentRange(a, b, keys), &.{1}, grid);
+    var allowed = try b.compare(query, key, "GE");
+    if (visibility) |mask| {
+        if (rows > keys or mask.len != try std.math.mul(usize, @intCast(rows), @intCast(rows))) return error.InvalidAttentionMask;
+        var blocks = try b.constantPred(hlo.Shape.init(.pred, &.{ rows, rows }), mask);
+        if (keys != rows) {
+            const tail_shape = hlo.Shape.init(.pred, &.{ rows, keys - rows });
+            const tail = try b.broadcast(try b.constantPred(hlo.Shape.scalar(.pred), &.{0}), &.{}, tail_shape);
+            blocks = try b.concatenate(&.{ blocks, tail }, 1, hlo.Shape.init(.pred, &.{ rows, keys }));
+        }
+        allowed = try b.logicalOr(allowed, blocks);
+    }
+    if (window != 0) {
+        const span = try b.broadcast(try b.constantS32(hlo.Shape.scalar(.s32), &.{@intCast(window - 1)}), &.{}, grid);
+        allowed = try b.logicalAnd(allowed, try b.compare(key, try b.subtract(query, span), "GE"));
+    }
+    const floats = hlo.Shape.init(.f32, &.{ rows, keys });
+    const mask = try b.select(allowed, try b.broadcast(try b.constantScalarF32(0), &.{}, floats), try b.broadcast(try b.constantScalarF32(-1e9), &.{}, floats));
+    return b.broadcast(mask, &.{ 1, 2 }, hlo.Shape.init(.f32, &.{ heads, rows, keys }));
+}
+
+fn roundBf16(b: *hlo.Builder, id: hlo.Id, enabled: bool) !hlo.Id {
+    return if (enabled) b.convertType(try b.convertType(id, .bf16), .f32) else id;
+}
+
+fn emitResidentRope(a: Allocator, b: *hlo.Builder, node: *const Node, x: hlo.Id, attrs: ml.graph.node.RopeAttrs, position: hlo.Id, capacity: usize, bf16: bool) !hlo.Id {
+    const shape = node.output_shape;
+    if (shape.rank() != 2 or shape.dims[0] != attrs.seq_len or attrs.seq_len > capacity) return error.UnsupportedResidentDecode;
+    const rows: usize = @intCast(shape.dims[0]);
+    const width: usize = @intCast(shape.dims[1]);
+    const dim: usize = attrs.head_dim;
+    const rotary: usize = if (attrs.rope_dim == 0) dim else attrs.rope_dim;
+    if (dim == 0 or width % dim != 0 or rotary == 0 or rotary > dim or rotary % 2 != 0) return error.UnsupportedResidentDecode;
+    const frequencies = try a.alloc(f32, width);
+    defer a.free(frequencies);
+    const active = try a.alloc(u8, width);
+    defer a.free(active);
+    for (frequencies, active, 0..) |*frequency, *flag, col| {
+        const lane = col % dim;
+        const pair = if (attrs.consecutive_pairs) lane / 2 else lane % (dim / 2);
+        flag.* = @intFromBool(pair < rotary / 2 and (if (attrs.consecutive_pairs) lane < rotary else true));
+        frequency.* = if (flag.* == 0) 0 else attrs.freq_scale / std.math.pow(f32, attrs.theta, @as(f32, @floatFromInt(pair * 2)) / @as(f32, @floatFromInt(rotary)));
+    }
+    const hs = hlo.Shape.init(.f32, &.{ @intCast(rows), @intCast(width) });
+    const positions = try b.add(try b.convertType(try residentRange(a, b, @intCast(rows)), .f32), position);
+    const angles = try b.multiply(try b.broadcast(positions, &.{0}, hs), try b.broadcast(try b.constantF32(hlo.Shape.init(.f32, &.{@intCast(width)}), frequencies), &.{1}, hs));
+    const cosines = try roundBf16(b, try b.cosine(angles), bf16);
+    const sines = try roundBf16(b, try b.sine(angles), bf16);
+    const rotated = try emitRopePermutation(b, x, rows, width, dim, rotary, attrs.consecutive_pairs);
+    const result = try roundBf16(b, try b.add(try roundBf16(b, try b.multiply(x, cosines), bf16), try roundBf16(b, try b.multiply(rotated, sines), bf16)), bf16);
+    if (!bf16 or rotary == dim) return result;
+    const predicate = try b.broadcast(try b.constantPred(hlo.Shape.init(.pred, &.{@intCast(width)}), active), &.{1}, hlo.Shape.init(.pred, hs.dimensions));
+    return b.select(predicate, result, x);
 }
 
 // ── HLO composite helpers ──────────────────────────────────────────
@@ -1286,6 +1492,8 @@ fn emitStaticGqaAttention(
     max_reducer: *const hlo.Computation,
     past_k: ?hlo.Id,
     past_v: ?hlo.Id,
+    runtime_position: ?hlo.Id,
+    visibility: ?[]const u8,
 ) !StaticGqaAttentionResult {
     if (attrs.batch != 1 or attrs.seq_len == 0 or attrs.num_heads == 0 or attrs.head_dim == 0) return error.UnsupportedShape;
     const has_past = past_k != null or past_v != null;
@@ -1326,7 +1534,9 @@ fn emitStaticGqaAttention(
     });
     const scale = try b.constantScalarF32(1.0 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim))));
     scores = try b.multiply(scores, scale);
-    if (past_k == null or (attrs.sliding_window orelse 0) != 0) {
+    if (runtime_position) |position| {
+        scores = try b.add(scores, try emitResidentMask(allocator, b, num_heads, q_len, kv_len, attrs.sliding_window orelse 0, position, visibility));
+    } else if (past_k == null or (attrs.sliding_window orelse 0) != 0) {
         scores = try b.add(scores, try emitCausalMask(allocator, b, num_heads, q_len, kv_len, attrs.sliding_window orelse 0));
     }
     if (bias) |bias_id| scores = try b.add(scores, bias_id);

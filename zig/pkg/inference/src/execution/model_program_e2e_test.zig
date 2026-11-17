@@ -786,3 +786,77 @@ test "model program qualified extraction binds actual PJRT profile and bounded g
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, policy.supportsFeatures(opts.identity.?, .pjrt_cpu_f32, policy.Features.initOne(.long_document)));
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, policy.supportsFeatures(opts.identity.?, .pjrt_cuda_bf16_vendor, policy.Features.initOne(.entities)));
 }
+
+test "model program resident decoder matches full-prefix logits without per-token compilation" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const path = @import("antfly_platform").env.getenv("ANTFLY_PJRT_DECODER_MODEL") orelse return error.SkipZigTest;
+    var f32_reference: [3]?[]f32 = @splat(null);
+    defer for (f32_reference) |reference| if (reference) |values| a.free(values);
+    for ([_]factory.PjrtSessionOptions.Precision{ .f32, .bf16 }) |precision| {
+        const session = try factory.createPjrtSessionWithOptions(a, path, .{ .task_override = .generic, .memory_policy = .cpu, .precision = precision });
+        defer session.close();
+        const cfg = factory.getGptConfig(session) orelse return error.WrongModelArchitecture;
+        const values = try a.alloc(f32, cfg.hidden_size);
+        defer a.free(values);
+        for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) / 100;
+        var embedding = try Tensor.initFloat32(a, "input_embeddings", &.{ 1, 1, cfg.hidden_size }, values);
+        defer embedding.deinit();
+        const prefix = @import("media_prefix.zig").Prefix{ .embeddings = embedding.borrowedView("input_embeddings") };
+        const history = [_]i64{ 1, 2, 3, 4, 5 };
+        for (0..2) |round| {
+            var cached = try @import("resident_decoder.zig").Decoder.init(a, session, 8 + round, null);
+            defer cached.deinit();
+            const first_rows = 3 + round;
+            for (first_rows..6) |rows| {
+                const exact = try prefix.run(session, history[0..rows], a, .{ .native_call_policy = .in_process });
+                defer a.free(exact);
+                const before = factory.getPjrtSpecializationCount(session).?;
+                const incremental = if (rows == first_rows) try prefix.runCached(&cached, history[0..rows], a, .{ .native_call_policy = .in_process }) else try cached.text(history[0..rows], a, .{ .native_call_policy = .in_process });
+                defer a.free(incremental);
+                if (rows == 5 or round == 1) try std.testing.expectEqual(before, factory.getPjrtSpecializationCount(session).?);
+                try std.testing.expectEqual(exact.len, incremental.len);
+                if (precision == .f32 and f32_reference[rows - 3] == null) f32_reference[rows - 3] = try a.dupe(f32, exact);
+                const reference = f32_reference[rows - 3].?;
+                var source_error: f64 = 0;
+                var cached_error: f64 = 0;
+                var energy: f64 = 0;
+                var maximum: f32 = 0;
+                for (reference, exact, incremental) |fp32, want, got| {
+                    if (precision == .f32) try std.testing.expectApproxEqAbs(want, got, @as(f32, 0.003));
+                    energy += @as(f64, fp32) * fp32;
+                    source_error += @as(f64, want - fp32) * (want - fp32);
+                    cached_error += @as(f64, got - fp32) * (got - fp32);
+                    maximum = @max(maximum, @abs(want - got));
+                }
+                const source_relative = @sqrt(source_error / @max(energy, 1e-30));
+                const cached_relative = @sqrt(cached_error / @max(energy, 1e-30));
+                std.debug.print("resident model precision={s} rows={d} max_difference={d} source_f32_relative={d} cached_f32_relative={d}\n", .{ @tagName(precision), rows, maximum, source_relative, cached_relative });
+                try std.testing.expect(cached_relative <= @max(@as(f64, 0.003), source_relative * 1.5));
+                const exact_best = std.mem.indexOfMax(f32, exact);
+                const cached_best = std.mem.indexOfMax(f32, incremental);
+                try std.testing.expectEqual(exact_best, cached_best);
+            }
+        }
+        if (precision == .f32) {
+            for (3..5) |rows| {
+                const full_values = try a.alloc(f32, rows * cfg.hidden_size);
+                defer a.free(full_values);
+                for (full_values, 0..) |*value, i| value.* = values[i % values.len];
+                var full_embedding = try Tensor.initFloat32(a, "input_embeddings", &.{ 1, @intCast(rows), cfg.hidden_size }, full_values);
+                defer full_embedding.deinit();
+                const prepared = @import("media_prefix.zig").Prefix{ .embeddings = full_embedding.borrowedView("input_embeddings") };
+                const expected = try prepared.run(session, history[0..rows], a, .{ .native_call_policy = .in_process });
+                defer a.free(expected);
+                var cached = try @import("resident_decoder.zig").Decoder.init(a, session, 8, null);
+                defer cached.deinit();
+                const before = factory.getPjrtSpecializationCount(session).?;
+                const actual = try prepared.runCached(&cached, history[0..rows], a, .{ .native_call_policy = .in_process });
+                defer a.free(actual);
+                if (rows == 4) try std.testing.expectEqual(before, factory.getPjrtSpecializationCount(session).?);
+                try std.testing.expectEqual(rows, cached.position);
+                for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, @as(f32, 0.003));
+            }
+        }
+    }
+}

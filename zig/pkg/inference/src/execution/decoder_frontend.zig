@@ -11,6 +11,20 @@ const Tensor = @import("../backends/tensor.zig").Tensor;
 const gpt = @import("../architectures/gpt.zig");
 const Config = @import("../models/gpt.zig").Config;
 
+/// The query width and resident key extent are distinct in cached decode.
+/// Declares public logits independently of a generic session's hidden output.
+pub fn geometry(config: Config, rows: usize, keys: usize) !@import("../backends/session.zig").RunGeometry {
+    if (rows == 0 or keys < rows or keys > config.max_position_embeddings) return error.InvalidInputShape;
+    var width: usize = config.hidden_size;
+    for (0..config.num_hidden_layers) |layer| width = @max(width, try std.math.mul(usize, config.num_attention_heads, config.effectiveHeadDimForLayer(layer)));
+    var workspace = try @import("stage_workspace.zig").attentionFfn(1, rows, keys, width, config.num_attention_heads, config.intermediate_size);
+    if (config.qwen35_has_linear_attention) {
+        const matrix = try std.math.mul(usize, config.qwen35_linear_num_value_heads, try std.math.mul(usize, config.qwen35_linear_key_head_dim, config.qwen35_linear_value_head_dim));
+        workspace = try std.math.add(usize, workspace, try std.math.mul(usize, matrix, 2 * @sizeOf(f32)));
+    }
+    return .{ .sequence = rows, .output_bytes = try std.math.add(usize, try std.math.mul(usize, config.vocab_size, @sizeOf(f32)), 2 * @sizeOf(i64)), .workspace_bytes = workspace };
+}
+
 pub fn resolve(config: *Config) capture.Forward {
     return .{ .context = config, .fingerprint = 6, .output_names = &.{"logits"}, .validate = validate, .run = run };
 }
@@ -126,4 +140,16 @@ fn run(raw: *anyopaque, cb: *const ops.ComputeBackend, a: std.mem.Allocator, dec
     const outputs = try a.alloc(capture.Output, 1);
     outputs[0] = .{ .name = "logits", .value = logits, .float32_transform = .{ .scale = transform.scale, .softcap = transform.softcap } };
     return outputs;
+}
+
+test "resident decoder geometry protects the vocabulary row and resident key extent" {
+    const cfg = Config{ .hidden_size = 64, .num_attention_heads = 2, .num_hidden_layers = 1, .intermediate_size = 128, .vocab_size = 65536, .max_position_embeddings = 1024 };
+    const short = try geometry(cfg, 1, 1);
+    const cached = try geometry(cfg, 1, 512);
+    try std.testing.expectEqual(@as(usize, 65536 * @sizeOf(f32) + 2 * @sizeOf(i64)), cached.output_bytes);
+    try std.testing.expectEqual(short.output_bytes, cached.output_bytes);
+    try std.testing.expect(cached.workspace_bytes > short.workspace_bytes);
+    try std.testing.expectEqual(@as(usize, 512 * 64 * 6 * @sizeOf(f32)), cached.workspace_bytes);
+    try std.testing.expectError(error.InvalidInputShape, geometry(cfg, 2, 1));
+    try std.testing.expectError(error.InvalidInputShape, geometry(cfg, 1, 1025));
 }

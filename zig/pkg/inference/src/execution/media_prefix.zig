@@ -27,10 +27,24 @@ pub const Prefix = struct {
         self.* = undefined;
     }
 
+    pub fn runCached(self: *const Prefix, decoder: *@import("resident_decoder.zig").Decoder, history: []const i64, a: std.mem.Allocator, control: ?Control) ![]f32 {
+        if (decoder.failed) return error.DecoderRequestFailed;
+        if (decoder.position != 0) return error.InvalidResidentDecodePosition;
+        errdefer decoder.failed = true;
+        const logits = try self.runImpl(decoder, decoder.source, history, a, control);
+        decoder.axis_positions = self.axis_positions != null;
+        decoder.position_delta = self.position_delta;
+        return logits;
+    }
+
     pub fn run(self: *const Prefix, session: Session, history: []const i64, a: std.mem.Allocator, control: ?Control) ![]f32 {
+        return self.runImpl(null, session, history, a, control);
+    }
+
+    fn runImpl(self: *const Prefix, decoder: ?*@import("resident_decoder.zig").Decoder, session: Session, history: []const i64, a: std.mem.Allocator, control: ?Control) ![]f32 {
         if (self.bucket_rows > 256) return error.InvalidInputShape;
         if (history.len == 0) return error.InvalidPreparedPrompt;
-        const rows = if (self.bucket_rows == 0) history.len else bucket: {
+        const rows = if (decoder) |cached| try @import("resident_decoder.zig").capacityFor(history.len, cached.config.max_position_embeddings) else if (self.bucket_rows == 0) history.len else bucket: {
             const cfg = @import("../architectures/session_factory.zig").getGptConfig(session) orelse return error.InvalidPreparedPrompt;
             const rounded = try std.math.mul(usize, try std.math.divCeil(usize, history.len, self.bucket_rows), self.bucket_rows);
             break :bucket @min(rounded, cfg.max_position_embeddings);
@@ -40,7 +54,11 @@ pub const Prefix = struct {
         // real host charge until all argument copies have been released.
         var elements = try std.math.mul(usize, rows, 2 + @as(usize, if (self.ple_ids != null) 1 else 0));
         if (self.axis_positions != null) elements = try std.math.add(usize, elements, try std.math.mul(usize, rows, 6));
+        const prefix_rows: usize = @intCast(self.embeddings.shape[1]);
+        if (history.len < prefix_rows) return error.InvalidPreparedPrompt;
+        const pad_embeddings = decoder != null and prefix_rows == history.len and rows != prefix_rows;
         var staging_bytes = try std.math.mul(usize, elements, @sizeOf(i64));
+        if (pad_embeddings) staging_bytes = try std.math.add(usize, staging_bytes, try std.math.mul(usize, try std.math.mul(usize, rows, @intCast(self.embeddings.shape[2])), @sizeOf(f32)));
         if (self.visibility != null) staging_bytes = try std.math.add(usize, staging_bytes, try std.math.mul(usize, rows, rows));
         var staging = try session.withAdmissionControl(control).admitRetainedMedia(staging_bytes, 0);
         defer staging.deinit();
@@ -51,8 +69,6 @@ pub const Prefix = struct {
             @memset(values[history.len..], 0);
         }
         const padded_ids = padded orelse history;
-        const prefix_rows: usize = @intCast(self.embeddings.shape[1]);
-        if (history.len < prefix_rows) return error.InvalidPreparedPrompt;
         var inputs: std.ArrayList(Tensor) = .empty;
         defer {
             for (inputs.items) |*input| input.deinit();
@@ -60,8 +76,18 @@ pub const Prefix = struct {
         }
         try inputs.ensureTotalCapacity(a, 6);
         inputs.appendAssumeCapacity(try Tensor.initInt64(a, "input_ids", &.{ 1, @intCast(rows) }, padded_ids));
-        if (self.bucket_rows != 0) inputs.appendAssumeCapacity(try Tensor.initInt64(a, "logits_row", &.{1}, &.{@intCast(history.len - 1)}));
-        inputs.appendAssumeCapacity(self.embeddings.borrowedView("input_embeddings"));
+        if (self.bucket_rows != 0 or decoder != null) inputs.appendAssumeCapacity(try Tensor.initInt64(a, "logits_row", &.{1}, &.{@intCast(history.len - 1)}));
+        if (pad_embeddings) {
+            const width: usize = @intCast(self.embeddings.shape[2]);
+            const values = try a.alloc(f32, try std.math.mul(usize, rows, width));
+            @memcpy(values[0 .. prefix_rows * width], self.embeddings.asFloat32());
+            @memset(values[prefix_rows * width ..], 0);
+            const imported = Tensor.initFloat32Owned(a, "input_embeddings", &.{ 1, @intCast(rows), @intCast(width) }, values) catch |err| {
+                a.free(values);
+                return err;
+            };
+            inputs.appendAssumeCapacity(imported);
+        } else inputs.appendAssumeCapacity(self.embeddings.borrowedView("input_embeddings"));
         if (self.ple_ids) |prefix| {
             if (prefix.len != prefix_rows) return error.InvalidPreparedPrompt;
             const ids = try Tensor.initInt64(a, "ple_input_ids", &.{ 1, @intCast(rows) }, padded_ids);
@@ -90,7 +116,7 @@ pub const Prefix = struct {
             for (0..prefix_rows) |row| @memcpy(mask.data[row * rows ..][0..prefix_rows], prefix[row * prefix_rows ..][0..prefix_rows]);
             inputs.appendAssumeCapacity(mask);
         }
-        const outputs = try session.runWithControl(inputs.items, a, control);
+        const outputs = if (decoder) |cached| try cached.run(inputs.items, a, control) else try session.runWithControl(inputs.items, a, control);
         defer a.free(outputs);
         defer for (outputs) |*output| output.deinit();
         if (outputs.len != 1 or !std.mem.eql(u8, outputs[0].name, "logits") or outputs[0].dtype != .f32) return error.InvalidModelProgramOutput;

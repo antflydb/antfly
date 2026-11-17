@@ -997,3 +997,131 @@ test "pjrt_executor: element-wise add end-to-end" {
     try std.testing.expectApproxEqAbs(@as(f32, 33), output_f32[2], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 44), output_f32[3], 1e-4);
 }
+
+const ResidentFixture = struct {
+    fn graph(a: std.mem.Allocator, rows: usize, recurrent: bool, bf16: bool, cached: bool) !Graph {
+        var g = Graph.init(a);
+        errdefer g.deinit();
+        var b = Builder.init(&g);
+        const r: i64 = @intCast(rows);
+        if (cached and rows == 8) _ = try b.parameter("logits_row", Shape.init(.i64, &.{1}));
+        if (recurrent) {
+            const mixed = try b.parameter("mixed", Shape.init(.f32, &.{ r, 6 }));
+            const weight = try b.tensorConst(&.{ 0.2, 0.1, -0.2, 0.3, -0.1, 0.4, 0.5, -0.2, 0.1, 0.2, 0.3, -0.4 }, Shape.init(.f32, &.{ 2, 6 }));
+            const convolved = try @import("temporal_program.zig").depthwiseCausal(&g, mixed, weight, rows, 6, 2);
+            const beta = try b.parameter("beta", Shape.init(.f32, &.{ r, 1 }));
+            const decay = try b.parameter("decay", Shape.init(.f32, &.{ r, 1 }));
+            const result = try g.addNode(.{ .op = .{ .fused_gated_delta = .{ .rows = @intCast(rows), .key_heads = 1, .value_heads = 1, .key_dim = 2, .value_dim = 2 } }, .output_shape = Shape.init(.f32, &.{ r, 2 }), .inputs = .{ convolved, beta, decay, ml.graph.null_node }, .num_inputs = 3 });
+            try g.markOutput(result);
+        } else {
+            const query = try b.parameter("q", Shape.init(.f32, &.{ r, 4 }));
+            const key = try b.parameter("k", Shape.init(.f32, &.{ r, 2 }));
+            const value = try b.parameter("v", Shape.init(.f32, &.{ r, 2 }));
+            var rotated: [2]NodeId = undefined;
+            for ([_]NodeId{ query, key }, &rotated) |source, *destination| {
+                const attrs = ml.graph.node.RopeAttrs{ .seq_len = @intCast(rows), .head_dim = 2, .rope_dim = 2, .theta = 10000, .freq_scale = 1, .consecutive_pairs = true };
+                destination.* = if (bf16 and !cached) try @import("rotary_program.zig").emitBf16(&g, source, attrs) else try g.addNode(.{ .op = .{ .fused_rope = attrs }, .output_shape = g.node(source).output_shape, .inputs = .{ source, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node }, .num_inputs = 1 });
+            }
+            const result = try g.addNode(.{ .op = .{ .fused_gqa_causal_attention = .{ .batch = 1, .seq_len = @intCast(rows), .num_heads = 2, .num_kv_heads = 1, .head_dim = 2, .sliding_window = 3 } }, .output_shape = Shape.init(.f32, &.{ r, 4 }), .inputs = .{ rotated[0], rotated[1], value, ml.graph.null_node }, .num_inputs = 3 });
+            var donor_node = g.node(result).*;
+            donor_node.op.fused_gqa_causal_attention.skip_kv_write = cached;
+            const consumer = try g.addNode(donor_node);
+            try g.markOutput(try b.add(result, consumer));
+        }
+        return g;
+    }
+    fn compile(a: std.mem.Allocator, g: *Graph, cb: *const ComputeBackend, client: *pjrt_lib.pjrt.Client, cached: bool, bf16: bool) !*pjrt_executor.PjrtExecutor {
+        const nodes = try a.alloc(NodeId, g.nodeCount());
+        defer a.free(nodes);
+        for (nodes, 0..) |*node, i| node.* = @intCast(i);
+        const part = Partition{ .backend = .pjrt, .node_ids = nodes, .external_inputs = &.{} };
+        return pjrt_executor.createExecutorWithOptions(a, g, &part, cb, cb, client, .{ .parameter_inputs = true, .resident_capacity = if (cached) 8 else 0, .precision = if (bf16) .bf16 else .f32 }, null);
+    }
+    fn inputs(a: std.mem.Allocator, g: *Graph, cb: *const ComputeBackend, offset: usize) ![]?CT {
+        const values = try a.alloc(?CT, g.nodeCount());
+        @memset(values, null);
+        errdefer release(a, cb, values);
+        for (g.parameters.items) |node| {
+            const shape = g.node(node).output_shape;
+            if (shape.dtype == .i64) {
+                const index: i64 = 2;
+                values[node] = (try cb.fromConstantBytes(std.mem.asBytes(&index), .i64, &.{1})).?;
+                continue;
+            }
+            const count: usize = @intCast(shape.numElements().?);
+            const data = try a.alloc(f32, count);
+            defer a.free(data);
+            const width: usize = @intCast(shape.dims[1]);
+            const name = g.parameterName(g.node(node));
+            for (data, 0..) |*x, i| x.* = if (std.mem.eql(u8, name, "beta")) 0.4 else if (std.mem.eql(u8, name, "decay")) 0.9 else @as(f32, @floatFromInt(@as(i32, @intCast(((i + offset * width) * 7) % 23)) - 11)) / 13;
+            values[node] = try cb.fromFloat32Shape(data, &.{ @intCast(shape.dims[0]), @intCast(shape.dims[1]) });
+        }
+        return values;
+    }
+    fn release(a: std.mem.Allocator, cb: *const ComputeBackend, values: []?CT) void {
+        for (values) |value| if (value) |tensor| cb.free(tensor);
+        a.free(values);
+    }
+};
+
+test "PJRT resident decoder caches attention and recurrent history transactionally" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var client = try initClient();
+    defer client.deinit();
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_]bool{ false, true }) |recurrent| for ([_]bool{ false, true }) |bf16| {
+        if (recurrent and bf16) continue;
+        std.debug.print("resident fixture recurrent={} bf16={}\n", .{ recurrent, bf16 });
+        var prefill = try ResidentFixture.graph(a, 8, recurrent, bf16, true);
+        defer prefill.deinit();
+        var decode = try ResidentFixture.graph(a, 1, recurrent, bf16, true);
+        defer decode.deinit();
+        var full = try ResidentFixture.graph(a, 6, recurrent, bf16, false);
+        defer full.deinit();
+        const prefill_exec = try ResidentFixture.compile(a, &prefill, &cb, &client, true, bf16);
+        defer prefill_exec.partitionExecutor().deinitExecutor();
+        const decode_exec = try ResidentFixture.compile(a, &decode, &cb, &client, true, bf16);
+        defer decode_exec.partitionExecutor().deinitExecutor();
+        const full_exec = try ResidentFixture.compile(a, &full, &cb, &client, false, bf16);
+        defer full_exec.partitionExecutor().deinitExecutor();
+        const full_inputs = try ResidentFixture.inputs(a, &full, &cb, 0);
+        defer ResidentFixture.release(a, &cb, full_inputs);
+        var full_outputs = try full_exec.executeToBuffers(full_inputs, .{ .backend = &cb }, a);
+        defer {
+            for (full_outputs) |*buffer| buffer.deinit();
+            a.free(full_outputs);
+        }
+        const expected = try full_outputs[0].toFloat32WithShape(a, full_exec.output_shapes[0]);
+        defer a.free(expected);
+        var state = @import("pjrt_decoder_state.zig").State{ .allocator = a, .capacity = 8 };
+        defer state.deinit();
+        const width: usize = if (recurrent) 2 else 4;
+        for (0..2) |_| {
+            const prefill_inputs = try ResidentFixture.inputs(a, &prefill, &cb, 0);
+            defer ResidentFixture.release(a, &cb, prefill_inputs);
+            const first = try state.run(prefill_exec, &cb, prefill_inputs, 8, 3, a, null);
+            defer a.free(first);
+            for (first[0 .. 3 * width], expected[0 .. 3 * width]) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 2e-5);
+            for (3..6) |position| {
+                std.debug.print("resident step position={d}\n", .{position});
+                const decode_inputs = try ResidentFixture.inputs(a, &decode, &cb, position);
+                defer ResidentFixture.release(a, &cb, decode_inputs);
+                const next = try state.run(decode_exec, &cb, decode_inputs, 1, 1, a, null);
+                defer a.free(next);
+                for (next, expected[position * width ..][0..width]) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 2e-5);
+            }
+            try std.testing.expectEqual(@as(usize, 6), state.position);
+            const empty = try a.alloc(?CT, decode.nodeCount());
+            defer a.free(empty);
+            @memset(empty, null);
+            try std.testing.expectError(error.MissingValue, state.run(decode_exec, &cb, empty, 1, 1, a, null));
+            try std.testing.expectEqual(@as(usize, 6), state.position);
+            try std.testing.expectError(error.InvalidResidentDecodePosition, state.run(decode_exec, &cb, empty, 3, 3, a, null));
+            state.reset();
+        }
+    };
+}

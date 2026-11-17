@@ -394,6 +394,7 @@ const run_usage_options =
     \\  --pjrt-gemm <profile>                 provider_default, vendor, vendor_deterministic
     \\  --pjrt-extraction-batch-size <1..8>  Compiled request batch limit
     \\  --pjrt-media-bucket-rows <0..256>    Media-prefix shape reuse
+    \\  --pjrt-decoder-cache <true|false>    Qualify resident decoder state
     \\  --models-dir <path>                 AI model directory
     \\  --ml-dir <path>                     Predictor model directory
     \\  --config <path>                     JSON run configuration
@@ -627,6 +628,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
         .pjrt_gemm = pjrt_options.gemm,
         .pjrt_extraction_batch_size = pjrt_options.extraction_batch_size,
         .pjrt_media_bucket_rows = pjrt_options.media_bucket_rows,
+        .pjrt_decoder_cache = pjrt_options.decoder_cache,
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .generation_budget_overrides = .{

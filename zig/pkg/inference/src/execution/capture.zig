@@ -32,6 +32,7 @@ pub const Forward = struct {
     /// Checkpoint/configuration and arithmetic-contract identity. The cache
     /// belongs to its loaded model, never a process-global checkpoint name.
     fingerprint: u64,
+    resident_capacity: usize = 0,
     precision: @import("precision.zig").Policy = .f32,
     /// Public output ABI names retained by the model, independent of cache entries.
     output_names: []const []const u8 = &.{},
@@ -65,6 +66,7 @@ pub fn inputShape(input: tensor.Tensor) !ml.graph.Shape {
 pub fn specializationKey(forward: Forward, inputs: []const Input) ![32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(std.mem.asBytes(&forward.fingerprint));
+    hash.update(std.mem.asBytes(&forward.resident_capacity));
     hash.update(&.{@backingInt(forward.precision)});
     for (inputs) |input| {
         const shape = try inputShape(input.tensor);
@@ -86,6 +88,7 @@ pub fn trace(allocator: std.mem.Allocator, forward: Forward, inputs: []const Inp
     defer tracer.deinit();
     tracer.require_resident_outputs = true;
     tracer.precision = forward.precision;
+    tracer.resident_decoder = forward.resident_capacity != 0;
     var bindings: std.ArrayList(program.Binding) = .empty;
     defer bindings.deinit(allocator);
     for (inputs) |input| {

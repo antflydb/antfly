@@ -23,11 +23,12 @@ pub const Provider = struct {
     compiled_context: ?compiled.AttachContext = null,
 };
 
+const PjrtExecutor = if (@import("build_options").enable_pjrt) @import("../graph/pjrt_executor.zig").PjrtExecutor else opaque {};
 const ParameterStore = if (@import("build_options").enable_pjrt) @import("../graph/pjrt_parameters.zig").Store else opaque {};
 
 const Frame = struct {
     backend: ops.ComputeBackend,
-    executable: executable.Executable,
+    executable: ?executable.Executable = null,
     busy: bool = false,
 };
 
@@ -40,6 +41,7 @@ const Entry = struct {
     mutex: std.atomic.Mutex = .unlocked,
     frames: std.ArrayListUnmanaged(*Frame) = .empty,
     creating: usize = 0,
+    resident: ?*PjrtExecutor = null,
     const max_frames = 8;
 
     fn keyOf(self: *Entry) Key {
@@ -55,13 +57,14 @@ const Entry = struct {
     fn release(self: *Entry) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         std.debug.assert(self.creating == 0);
+        if (comptime @import("build_options").enable_pjrt) if (self.resident) |resident| resident.partitionExecutor().deinitExecutor();
         // Borrowed compiled partitions retire before the owning first frame.
         var index = self.frames.items.len;
         while (index != 0) {
             index -= 1;
             const frame = self.frames.items[index];
             std.debug.assert(!frame.busy);
-            frame.executable.deinit();
+            if (frame.executable) |*value| value.deinit();
             frame.backend.deinit();
             self.allocator.destroy(frame);
         }
@@ -109,7 +112,24 @@ const Entry = struct {
         try entry.frames.ensureUnusedCapacity(allocator, 1);
         var options = executable.PrepareOptions{ .compiled = provider.compiled_context };
         if (options.compiled) |*context| context.cb = &frame.backend;
-        frame.executable = try executable.prepareWithOptions(allocator, &entry.program, &frame.backend, if (provider.compiled_context != null) .compiled_required else .compiled_preferred, options);
+        frame.executable = null;
+        if (forward.resident_capacity != 0) {
+            if (comptime @import("build_options").enable_pjrt) {
+                const context = options.compiled orelse return error.MissingPjrtClient;
+                const client: *@import("pjrt").pjrt.Client = @ptrCast(@alignCast(context.pjrt_client orelse return error.MissingPjrtClient));
+                const count = entry.program.graph.nodeCount();
+                const nodes = try allocator.alloc(@import("ml").graph.NodeId, count);
+                defer allocator.free(nodes);
+                for (nodes, 0..) |*node, i| node.* = @intCast(i);
+                const part = @import("../graph/partition.zig").Partition{ .backend = .pjrt, .node_ids = nodes, .external_inputs = &.{} };
+                const visibility: ?[]const u8 = for (inputs) |input| {
+                    if (std.mem.eql(u8, input.tensor.name, "attention_or_mask")) break input.tensor.data;
+                } else null;
+                entry.resident = try @import("../graph/pjrt_executor.zig").createExecutorWithOptions(allocator, &entry.program.graph, &part, &frame.backend, &frame.backend, client, .{ .resident_capacity = forward.resident_capacity, .resident_visibility = visibility, .precision = forward.precision, .mutable_parameters = entry.program.mutable_parameters }, if (context.pjrt_parameter_store) |store| @ptrCast(@alignCast(store)) else null);
+            } else return error.PjrtNotEnabled;
+        } else {
+            frame.executable = try executable.prepareWithOptions(allocator, &entry.program, &frame.backend, if (provider.compiled_context != null) .compiled_required else .compiled_preferred, options);
+        }
         frame.busy = false;
         entry.frames.appendAssumeCapacity(frame);
         return entry;
@@ -132,7 +152,7 @@ const Entry = struct {
             return err;
         };
         self.creating += 1;
-        const source = &self.frames.items[0].executable.runtime;
+        const source = if (self.frames.items[0].executable) |*value| &value.runtime else null;
         self.mutex.unlock();
         errdefer {
             platform.sync.lockYielding(&self.mutex);
@@ -145,7 +165,7 @@ const Entry = struct {
         errdefer frame.backend.deinit();
         var options = executable.PrepareOptions{ .compiled = self.provider.compiled_context, .compiled_source = if (self.provider.compiled_context != null) source else null };
         if (options.compiled) |*context| context.cb = &frame.backend;
-        frame.executable = try executable.prepareWithOptions(self.allocator, &self.program, &frame.backend, if (self.provider.compiled_context != null) .compiled_required else .compiled_preferred, options);
+        frame.executable = if (self.resident != null) null else try executable.prepareWithOptions(self.allocator, &self.program, &frame.backend, if (self.provider.compiled_context != null) .compiled_required else .compiled_preferred, options);
         frame.busy = true;
         platform.sync.lockYielding(&self.mutex);
         self.creating -= 1;
@@ -257,6 +277,48 @@ pub const Cache = struct {
         if (victim) |old| old.release();
         return built;
     }
+    pub fn runResident(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, state: *@import("../graph/pjrt_decoder_state.zig").State, allocator: std.mem.Allocator, control: ?Control) ![]Tensor {
+        if (comptime !@import("build_options").enable_pjrt) return error.PjrtNotEnabled;
+        if (forward.resident_capacity == 0) return error.NotResidentDecoder;
+        if (control) |active| try active.check();
+        for (inputs) |input| _ = try capture.inputShape(input.tensor);
+        if (forward.validate) |validate| try validate(forward.context, inputs);
+        const entry = try self.acquire(model_allocator, provider, forward, inputs);
+        defer entry.release();
+        const frame = try entry.acquireFrame();
+        defer entry.returnFrame(frame);
+        frame.backend.execution_control = control;
+        defer frame.backend.execution_control = null;
+        const values = try allocator.alloc(?ops.CT, entry.program.graph.nodeCount());
+        defer allocator.free(values);
+        @memset(values, null);
+        defer for (values) |value| if (value) |tensor| frame.backend.free(tensor);
+        for (inputs) |input| {
+            for (entry.program.bindings) |binding| {
+                if (binding.kind != .input or !std.mem.eql(u8, binding.name, input.tensor.name) or binding.node_id == @import("ml").graph.null_node) continue;
+                values[binding.node_id] = try provider.import(provider.context, &frame.backend, &input.tensor, allocator);
+            }
+        }
+        var rows: usize = 0;
+        for (inputs) |input| if (std.mem.eql(u8, input.tensor.name, "input_ids")) {
+            rows = @intCast(input.tensor.shape[1]);
+            break;
+        };
+        var valid_rows = rows;
+        for (inputs) |input| if (std.mem.eql(u8, input.tensor.name, "logits_row")) {
+            valid_rows = @intCast(input.tensor.asInt64()[0] + 1);
+            break;
+        };
+        // Allocate the entire public result before committing request state.
+        const outputs = try allocator.alloc(Tensor, 1);
+        errdefer allocator.free(outputs);
+        const shape = try allocator.dupe(i64, entry.resident.?.output_shapes[0]);
+        errdefer allocator.free(shape);
+        const data = try state.run(entry.resident.?, &frame.backend, values, rows, valid_rows, allocator, control);
+        outputs[0] = .{ .data = std.mem.sliceAsBytes(data), .dtype = .f32, .shape = shape, .name = "logits", .allocator = allocator, .owns_data = true, .owns_shape = true, .data_alignment = .of(f32) };
+        return outputs;
+    }
+
     pub fn run(self: *Cache, model_allocator: std.mem.Allocator, provider: Provider, forward: capture.Forward, inputs: []const capture.Input, allocator: std.mem.Allocator, control: ?Control) ![]Tensor {
         if (control) |active| try active.check();
         for (inputs) |input| _ = try capture.inputShape(input.tensor);
@@ -265,6 +327,7 @@ pub const Cache = struct {
         defer entry.release();
         const frame = try entry.acquireFrame();
         defer entry.returnFrame(frame);
+        const frame_executable = if (frame.executable) |*value| value else return error.ResidentDecoderRequiresState;
         frame.backend.execution_control = control;
         defer frame.backend.execution_control = null;
         var runtime_inputs: std.ArrayList(interpreter.RuntimeInput) = .empty;
@@ -286,8 +349,8 @@ pub const Cache = struct {
                 return err;
             };
         }
-        var result = try frame.executable.run(allocator, .{ .runtime_inputs = runtime_inputs.items, .execution_control = control, .output_placement = .producer, .strict_integer_constants = true });
-        defer result.deinit(&frame.executable.runtime);
+        var result = try frame_executable.run(allocator, .{ .runtime_inputs = runtime_inputs.items, .execution_control = control, .output_placement = .producer, .strict_integer_constants = true });
+        defer result.deinit(&frame_executable.runtime);
         if (control) |active| try active.check();
         const outputs = try allocator.alloc(Tensor, result.outputs.len);
         var count: usize = 0;
@@ -301,7 +364,7 @@ pub const Cache = struct {
             const shape = entry.program.graph.node(node).output_shape;
             if (shape.dtype != .f32) return error.UnsupportedProgramOutputType;
 
-            const owner = result.backendFor(&frame.executable.runtime, i);
+            const owner = result.backendFor(&frame_executable.runtime, i);
             const data = try owner.toFloat32(value, allocator);
             outputs[i] = Tensor.initFloat32Owned(allocator, output_names[i], shape.dims[0..shape.rank()], data) catch |err| {
                 allocator.free(data);
@@ -410,8 +473,8 @@ const TestProvider = struct {
         defer entry.returnFrame(second);
         try std.testing.expect(first.backend.ptr != second.backend.ptr);
         if (client != null) {
-            const original = first.executable.runtime.plan.?;
-            const receiving = second.executable.runtime.plan.?;
+            const original = first.executable.?.runtime.plan.?;
+            const receiving = second.executable.?.runtime.plan.?;
             var compiled_count: usize = 0;
             for (original.base.partitions, receiving.base.partitions) |left, right| {
                 if (left.executor) |executor| {

@@ -33,6 +33,10 @@ pub const Program = struct {
     }
 
     pub fn emit(self: *Program, allocator: std.mem.Allocator, b: *hlo.Builder, mixed: Id, beta: Id, decay: Id, p: Attrs, reducer: Id, ordinal: usize) !Id {
+        return (try self.emitWithState(allocator, b, mixed, beta, decay, p, reducer, ordinal, null, null)).output;
+    }
+
+    pub fn emitWithState(self: *Program, allocator: std.mem.Allocator, b: *hlo.Builder, mixed: Id, beta: Id, decay: Id, p: Attrs, reducer: Id, ordinal: usize, initial_matrix: ?Id, valid_rows: ?Id) !struct { output: Id, state: Id } {
         if (p.rows == 0 or p.key_heads == 0 or p.value_heads == 0 or p.value_heads % p.key_heads != 0 or p.key_dim == 0 or p.value_dim == 0) return error.UnsupportedShape;
         const s: i64 = p.rows;
         const h: i64 = p.value_heads;
@@ -47,7 +51,8 @@ pub const Program = struct {
         const decays = try b.convertType(decay, .f32);
         if (!std.mem.eql(i64, b.getInst(source).shape.dimensions, &.{ s, c }) or !std.mem.eql(i64, b.getInst(betas).shape.dimensions, &.{ s, h }) or !std.mem.eql(i64, b.getInst(decays).shape.dimensions, &.{ s, h })) return error.UnsupportedShape;
         const zero = try b.constantScalarF32(0);
-        const initial = try b.tuple(&.{ try b.constantS32(Shape.scalar(.s32), &.{0}), try b.broadcast(zero, &.{}, matrix_shape), try b.broadcast(zero, &.{}, output_shape), source, betas, decays });
+        const initial_values = [_]Id{ try b.constantS32(Shape.scalar(.s32), &.{0}), initial_matrix orelse try b.broadcast(zero, &.{}, matrix_shape), try b.broadcast(zero, &.{}, output_shape), source, betas, decays, valid_rows orelse zero };
+        const initial = try b.tuple(initial_values[0..if (valid_rows != null) @as(usize, 7) else 6]);
         const state_shapes = b.getInst(initial).tuple_child_shapes.?;
         // XLA indexes some import metadata by the largest wire ID. Keep this
         // range adjacent to the compiler's reducers, and number recurrences
@@ -64,7 +69,8 @@ pub const Program = struct {
         self.body.base_id = base + 101;
         const cond = &self.condition;
         const cond_state = try cond.tupleParameter(0, state_shapes);
-        _ = try cond.lessThan(try cond.tupleElement(cond_state, 0), try cond.constantS32(Shape.scalar(.s32), &.{@intCast(s)}));
+        const limit = if (valid_rows != null) try cond.tupleElement(cond_state, 6) else try cond.constantS32(Shape.scalar(.s32), &.{@intCast(s)});
+        _ = try cond.lessThan(try cond.tupleElement(cond_state, 0), limit);
         const body = &self.body;
         const state = try body.tupleParameter(0, state_shapes);
         const cursor = try body.tupleElement(state, 0);
@@ -94,9 +100,10 @@ pub const Program = struct {
         const updated = try body.add(decayed, try body.multiply(key_matrix, try body.broadcast(delta, &.{ 0, 2 }, matrix_shape)));
         const result = try body.reduce(try body.multiply(updated, try body.broadcast(queries, &.{ 0, 1 }, matrix_shape)), try body.constantScalarF32(0), &.{1}, Shape.init(.f32, &.{ h, v }), reducer);
         const published = try body.dynamicUpdateSlice(outputs, try body.reshape(result, Shape.init(.f32, &.{ 1, h, v })), &.{ cursor, izero, izero });
-        _ = try body.tuple(&.{ try body.add(cursor, try body.constantS32(Shape.scalar(.s32), &.{1})), updated, published, xs, bs, ds });
+        const next_values = [_]Id{ try body.add(cursor, try body.constantS32(Shape.scalar(.s32), &.{1})), updated, published, xs, bs, ds, if (valid_rows != null) try body.tupleElement(state, 6) else izero };
+        _ = try body.tuple(next_values[0..if (valid_rows != null) @as(usize, 7) else 6]);
         const loop = try b.whileLoop(initial, self.condition_id, self.body_id);
-        return b.reshape(try b.tupleElement(loop, 2), Shape.init(.f32, &.{ s, h * v }));
+        return .{ .output = try b.reshape(try b.tupleElement(loop, 2), Shape.init(.f32, &.{ s, h * v })), .state = try b.tupleElement(loop, 1) };
     }
 };
 

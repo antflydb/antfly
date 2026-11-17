@@ -2611,6 +2611,8 @@ pub const NativeGenerationPipeline = struct {
     io: ?std.Io = null,
     cb: ComputeBackend,
     session: ?backends.Session = null,
+    pjrt_decoder_cache: bool = false,
+    compiled_decoder: ?*@import("../execution/resident_decoder.zig").Decoder = null,
     compiled_media_prefix: ?*@import("../execution/media_prefix.zig").Prefix = null,
     /// Optional observation-only model capability; never changes provider,
     /// compiled graph, residency, numerical policy or Session attribution.
@@ -3006,6 +3008,13 @@ pub const NativeGenerationPipeline = struct {
         on_token_ctx: ?*anyopaque,
     ) !GenerationResult {
         var compiled_prefix: ?@import("../execution/media_prefix.zig").Prefix = null;
+        var compiled_decoder: ?@import("../execution/resident_decoder.zig").Decoder = null;
+        const previous_compiled_decoder = self.compiled_decoder;
+        self.compiled_decoder = null;
+        defer {
+            self.compiled_decoder = previous_compiled_decoder;
+            if (compiled_decoder) |*decoder| decoder.deinit();
+        }
         const previous_compiled_prefix = self.compiled_media_prefix;
         self.compiled_media_prefix = null;
         defer {
@@ -3676,7 +3685,14 @@ pub const NativeGenerationPipeline = struct {
             }
             if (compiled_prefix) |*prefix| self.compiled_media_prefix = prefix;
         }
-        const prefill_output = if (self.compiled_media_prefix) |prefix|
+        if (self.usesPjrtSession() and self.pjrt_decoder_cache) {
+            const capacity = @min(try std.math.add(usize, seq_len, max_tokens), self.gpt_config.max_position_embeddings);
+            compiled_decoder = try @import("../execution/resident_decoder.zig").Decoder.init(self.allocator, self.session.?, capacity, self.execution_control);
+            self.compiled_decoder = &compiled_decoder.?;
+        }
+        const prefill_output = if (self.compiled_decoder) |decoder|
+            PrefillOutput{ .last_logits = if (self.compiled_media_prefix) |prefix| try prefix.runCached(decoder, token_ids[0..seq_len], allocator, self.execution_control) else try decoder.text(token_ids[0..seq_len], allocator, self.execution_control) }
+        else if (self.compiled_media_prefix) |prefix|
             PrefillOutput{ .last_logits = try prefix.run(self.session.?, token_ids[0..seq_len], allocator, self.execution_control) }
         else if (self.checkpoint_resume) |request|
             try self.resumeNativeCheckpoint(request, token_ids[0..seq_len], max_tokens, decode_state, config)
@@ -5626,6 +5642,10 @@ pub const NativeGenerationPipeline = struct {
                         }
                     }
 
+                    if (self.compiled_decoder) |decoder| {
+                        owns_last_logits = true;
+                        break :logits_blk try decoder.text(token_ids[0..seq_len.*], self.allocator, self.execution_control);
+                    }
                     if (self.compiled_media_prefix) |prefix| {
                         owns_last_logits = true;
                         break :logits_blk try prefix.run(self.session.?, token_ids[0..seq_len.*], self.allocator, self.execution_control);

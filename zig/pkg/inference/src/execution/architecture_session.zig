@@ -3996,6 +3996,7 @@ const arch_vtable = Session.VTable{
     .runLayaDecisions = archRunLayaDecisions,
     .run = &archRun,
     .runWithControl = &archRunWithControl,
+    .runCachedDecoder = &archRunCachedDecoder,
     .eager_host_services = &eager_host_services,
     .runResident = &archRunResident,
     .runResidentTextEmbedding = &archRunResidentTextEmbedding,
@@ -7623,6 +7624,31 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
     return archRunImpl(ptr, inputs, allocator, null);
 }
 
+fn archRunCachedDecoder(ptr: *anyopaque, state: *@import("resident_decoder.zig").Decoder, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) ![]Tensor {
+    if (comptime !build_options.enable_pjrt) return error.PjrtNotEnabled;
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.backend_type != .pjrt or self.arch_config != .gpt or state.failed) return error.UnsupportedResidentDecode;
+    var forward = @import("decoder_frontend.zig").resolve(&self.arch_config.gpt);
+    forward.precision = self.backend_data.pjrt.precision;
+    forward.resident_capacity = state.capacity;
+    const declared = try allocator.alloc(@import("capture.zig").Input, inputs.len);
+    defer allocator.free(declared);
+    for (inputs, declared) |input, *value| {
+        const visibility = std.mem.eql(u8, input.name, "attention_or_mask");
+        if (visibility and state.position != 0) return error.UnsupportedResidentDecode;
+        value.* = .{ .tensor = input, .specialize = visibility };
+    }
+    if (state.resident == null) {
+        const resident = try state.allocator.create(@import("../graph/pjrt_decoder_state.zig").State);
+        resident.* = .{ .allocator = state.allocator, .capacity = state.capacity, .admitted_bytes = state.bank_bytes };
+        state.resident = resident;
+    }
+    const client = if (self.backend_data.pjrt.client) |*value| @as(*anyopaque, @ptrCast(value)) else return error.MissingPjrtClient;
+    const outputs = try self.captured_programs.runResident(self.allocator, .{ .context = self, .create = createProgramFrame, .import = importProgramInput, .compiled_context = .{ .cb = undefined, .requested_backend = .pjrt, .pjrt_client = client, .pjrt_precision = forward.precision, .pjrt_parameter_store = getPjrtParameterStore(archSessionHandle(self)) } }, forward, declared, state.resident.?, allocator, control);
+    state.position = state.resident.?.position;
+    return outputs;
+}
+
 fn archRunWithControl(
     ptr: *anyopaque,
     inputs: []const Tensor,
@@ -9472,7 +9498,7 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
             const merge: usize = cfg.vision_spatial_merge_size;
             if (merge == 0 or count % (merge * merge) != 0 or count / (merge * merge) > 576) return error.VisionAdmissionExceeded;
             const output = std.math.mul(usize, count / (merge * merge), @as(usize, cfg.hidden_size) * @sizeOf(f32)) catch return error.ResourceLimitExceeded;
-            return .{ .sequence = count, .output_bytes = std.math.add(usize, output, 2 * @sizeOf(i64)) catch return error.ResourceLimitExceeded, .workspace_bytes = try whisperStageWorkspace(1, count, count, cfg.vision_hidden_size, cfg.vision_num_attention_heads, cfg.vision_intermediate_size) };
+            return .{ .sequence = count, .output_bytes = std.math.add(usize, output, 2 * @sizeOf(i64)) catch return error.ResourceLimitExceeded, .workspace_bytes = try attentionFfnWorkspace(1, count, count, cfg.vision_hidden_size, cfg.vision_num_attention_heads, cfg.vision_intermediate_size) };
         }
         if (inputs.named("pixel_values")) |pixels| {
             if (pixels.dtype != .f32 or pixels.shape.len != 4 or pixels.shape[0] <= 0 or pixels.shape[1] != 3 or pixels.shape[2] <= 0 or pixels.shape[3] <= 0 or pixels.shape[0] != batch) return error.InvalidInputShape;
@@ -9489,12 +9515,7 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
             if (ids.shape.len != 2 or ids.shape[0] != 1 or ids.shape[1] <= 0 or batch != 1) return error.InvalidInputShape;
             const cfg = self.arch_config.gpt;
             const rows: usize = @intCast(ids.shape[1]);
-            var workspace = try whisperStageWorkspace(1, rows, rows, cfg.hidden_size, cfg.num_attention_heads, cfg.intermediate_size);
-            if (cfg.qwen35_has_linear_attention) {
-                const matrix = try std.math.mul(usize, try std.math.mul(usize, cfg.qwen35_linear_num_value_heads, cfg.qwen35_linear_key_head_dim), cfg.qwen35_linear_value_head_dim);
-                workspace = try std.math.add(usize, workspace, try std.math.mul(usize, matrix, 2 * @sizeOf(f32)));
-            }
-            return .{ .sequence = rows, .output_bytes = try std.math.add(usize, try std.math.mul(usize, cfg.vocab_size, @sizeOf(f32)), 2 * @sizeOf(i64)), .workspace_bytes = workspace };
+            return try @import("decoder_frontend.zig").geometry(cfg, rows, rows);
         }
     }
     const first = inputs.get(0);
@@ -9546,7 +9567,7 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
                 workspace_bytes = if (self.backend_type == .cuda)
                     try layaCudaWorkspace(batch, input_seq, count, cfg.hidden_size, cfg.intermediate_size)
                 else
-                    try std.math.mul(usize, 2, try whisperStageWorkspace(batch, input_seq, input_seq, cfg.hidden_size, @max(cfg.num_attention_heads, cfg.hidden_size / 64), cfg.hidden_size * 4));
+                    try std.math.mul(usize, 2, try attentionFfnWorkspace(batch, input_seq, input_seq, cfg.hidden_size, @max(cfg.num_attention_heads, cfg.hidden_size / 64), cfg.hidden_size * 4));
                 if (comptime build_options.enable_metal) if (self.backend_type == .metal and @import("../ops/laya_metal.zig").enabledFor(cfg.laya.?)) {
                     workspace_bytes = try @import("../ops/laya_metal.zig").workspaceBound(cfg, batch, input_seq, count);
                 };
@@ -9563,7 +9584,7 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
             workspace_bytes = if (self.backend_type == .cuda)
                 try layaCudaWorkspace(batch, input_seq, count, cfg.hidden_size, cfg.intermediate_size)
             else
-                try whisperStageWorkspace(batch, input_seq, input_seq, cfg.hidden_size, cfg.num_attention_heads, cfg.intermediate_size * 2);
+                try attentionFfnWorkspace(batch, input_seq, input_seq, cfg.hidden_size, cfg.num_attention_heads, cfg.intermediate_size * 2);
             break :blk count;
         },
         .embedding_gemma2 => |cfg| blk: {
@@ -9603,13 +9624,13 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
                 if (first.shape.len != 3 or first.shape[2] <= 0) return error.InvalidInputShape;
                 sequence = @intCast(first.shape[2]);
                 output_seq = (std.math.add(usize, sequence, 1) catch return error.ResourceLimitExceeded) / 2;
-                workspace_bytes = try whisperStageWorkspace(batch, output_seq, output_seq, cfg.d_model, cfg.encoder_attention_heads, cfg.encoder_ffn_dim);
+                workspace_bytes = try attentionFfnWorkspace(batch, output_seq, output_seq, cfg.d_model, cfg.encoder_attention_heads, cfg.encoder_ffn_dim);
                 break :blk cfg.d_model;
             }
             const hidden = inputs.named("encoder_hidden_states") orelse return error.InvalidInputShape;
             if (hidden.shape.len != 3 or hidden.shape[1] <= 0) return error.InvalidInputShape;
             sequence = @max(input_seq, @as(usize, @intCast(hidden.shape[1])));
-            workspace_bytes = try whisperStageWorkspace(batch, input_seq, sequence, cfg.d_model, cfg.decoder_attention_heads, cfg.decoder_ffn_dim);
+            workspace_bytes = try attentionFfnWorkspace(batch, input_seq, sequence, cfg.d_model, cfg.decoder_attention_heads, cfg.decoder_ffn_dim);
             break :blk cfg.vocab_size;
         },
         else => return null,
@@ -9696,16 +9717,7 @@ fn modernBertGlinerWorkspace(batch: usize, sequence: usize, hidden: usize, inter
 /// Attention scores live in block shared memory; no B*heads*S*S device tensor.
 const layaCudaWorkspace = cuda_weights.layaCudaWorkspace;
 
-fn whisperStageWorkspace(batch: usize, queries: usize, keys: usize, hidden: usize, heads: usize, ffn: usize) !usize {
-    // Attention score/probability storage, FFN intermediates, and K/V/frontend
-    // storage are sequential peaks, not one copy per transformer layer.
-    const mul = std.math.mul;
-    const add = std.math.add;
-    const scores = try mul(usize, try mul(usize, try mul(usize, queries, keys), heads), 3);
-    const activations = try mul(usize, queries, try add(usize, try mul(usize, hidden, 6), try mul(usize, ffn, 3)));
-    const context = try mul(usize, try mul(usize, keys, hidden), 6);
-    return mul(usize, try mul(usize, batch, @max(scores, @max(activations, context))), @sizeOf(f32)) catch error.ResourceLimitExceeded;
-}
+const attentionFfnWorkspace = @import("stage_workspace.zig").attentionFfn;
 
 test "native stage geometry resolves Whisper encoder and decoder output residency" {
     var arch: ArchSession = undefined;

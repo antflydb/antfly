@@ -1315,6 +1315,7 @@ pub const NodeConfig = struct {
     pjrt_precision: session_factory.PjrtSessionOptions.Precision = .f32,
     pjrt_extraction_batch_size: usize = 1,
     pjrt_media_bucket_rows: usize = 0,
+    pjrt_decoder_cache: bool = false,
     pjrt_gemm: @import("../execution/precision.zig").Gemm = .provider_default,
     audio_readers: []const transcribing_api.NamedConfig = &.{},
     chunking_limits: @import("../pipelines/media_chunk_limits.zig").Limits = .{},
@@ -18719,6 +18720,7 @@ pub const Node = struct {
             .generation_admission = &model.generation_admission,
             .media_prepaid = .{ .process_bytes = media.host_scratch_bytes },
             .pjrt_media_bucket_rows = self.config.pjrt_media_bucket_rows,
+            .pjrt_decoder_cache = self.config.pjrt_decoder_cache,
         };
         defer pipeline.deinit();
         if (stream) return self.streamGenerate(ctx, body.model, &pipeline, null, messages, config, parser, include_usage, null, completion);
@@ -38442,26 +38444,29 @@ test "whole-model PJRT generation serves real HTTP responses and refunds request
     const domain = node.model_manager.resource_domain.?;
     var previous: ?[]u8 = null;
     defer if (previous) |bytes| a.free(bytes);
-    for (0..2) |_| {
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        const request_allocator = arena.allocator();
-        var request = try httpx.Request.init(request_allocator, .POST, "/ai/v1/generate");
-        defer request.deinit();
-        var ctx = httpx.Context.init(request_allocator, std.testing.io, &request);
-        const body = api.GenerateRequest{ .model = "fixture", .messages = &.{} };
-        var completion: ?Node.DeferredGenerationCompletion = null;
-        const response = try node.generatePjrt(&ctx, body, path, model, &.{.{ .role = "user", .content = "Say hello." }}, .{ .max_tokens = 2, .temperature = 0, .enable_thinking = false }, null, false, false, .{ .io = std.testing.io, .native_call_policy = .in_process }, null, &completion);
-        try std.testing.expectEqual(@as(u16, 200), response.status.code);
-        try std.testing.expect(completion == null);
-        const parsed = try std.json.parseFromSlice(std.json.Value, request_allocator, response.body.?, .{});
-        const choices = parsed.value.object.get("choices").?.array.items;
-        const content = choices[0].object.get("message").?.object.get("content").?.string;
-        try std.testing.expect(content.len != 0);
-        if (previous) |expected| try std.testing.expectEqualStrings(expected, content) else previous = try a.dupe(u8, content);
-        const amounts = domain.admission.snapshot();
-        try std.testing.expectEqual(@as(usize, 0), amounts.host_scratch_bytes);
-        try std.testing.expectEqual(@as(usize, 0), amounts.backend_scratch_bytes);
+    for ([_]bool{ false, true }) |cached| {
+        node.config.pjrt_decoder_cache = cached;
+        for (0..2) |_| {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const request_allocator = arena.allocator();
+            var request = try httpx.Request.init(request_allocator, .POST, "/ai/v1/generate");
+            defer request.deinit();
+            var ctx = httpx.Context.init(request_allocator, std.testing.io, &request);
+            const body = api.GenerateRequest{ .model = "fixture", .messages = &.{} };
+            var completion: ?Node.DeferredGenerationCompletion = null;
+            const response = try node.generatePjrt(&ctx, body, path, model, &.{.{ .role = "user", .content = "Say hello." }}, .{ .max_tokens = 2, .temperature = 0, .enable_thinking = false }, null, false, false, .{ .io = std.testing.io, .native_call_policy = .in_process }, null, &completion);
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            try std.testing.expect(completion == null);
+            const parsed = try std.json.parseFromSlice(std.json.Value, request_allocator, response.body.?, .{});
+            const choices = parsed.value.object.get("choices").?.array.items;
+            const content = choices[0].object.get("message").?.object.get("content").?.string;
+            try std.testing.expect(content.len != 0);
+            if (previous) |expected| try std.testing.expectEqualStrings(expected, content) else previous = try a.dupe(u8, content);
+            const amounts = domain.admission.snapshot();
+            try std.testing.expectEqual(@as(usize, 0), amounts.host_scratch_bytes);
+            try std.testing.expectEqual(@as(usize, 0), amounts.backend_scratch_bytes);
+        }
     }
     try std.testing.expect(!usesPjrtGenerationSession(try parseGenerateBackendSelection(.xla, "compiled", "partitioned")));
 }

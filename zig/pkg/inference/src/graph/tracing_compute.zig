@@ -97,6 +97,7 @@ pub const TracingCompute = struct {
     /// Shared program capture cannot observe provisional host values.
     require_resident_outputs: bool = false,
     precision: @import("../execution/precision.zig").Policy = .f32,
+    resident_decoder: bool = false,
 
     const RuntimeInput = struct {
         bytes: []const u8,
@@ -1173,7 +1174,7 @@ pub const TracingCompute = struct {
         // Paged attention records the same as GQA causal with the query
         // sequence length from the attention context.
         const tc = fromCtx(ctx);
-        if (attention.attn_or_mask != null) return tc.makeHandle(try @import("masked_grouped_attention.zig").emit(&tc.graph, nodeIdFromCT(Q), nodeIdFromCT(K), nodeIdFromCT(V), if (attn_bias) |bias| nodeIdFromCT(bias) else null, attention, batch, num_heads, num_kv_heads, head_dim));
+        if (attention.attn_or_mask != null and !tc.resident_decoder) return tc.makeHandle(try @import("masked_grouped_attention.zig").emit(&tc.graph, nodeIdFromCT(Q), nodeIdFromCT(K), nodeIdFromCT(V), if (attn_bias) |bias| nodeIdFromCT(bias) else null, attention, batch, num_heads, num_kv_heads, head_dim));
         const q_id = nodeIdFromCT(Q);
         const out_shape = tc.graph.node(q_id).output_shape;
         var inputs: [4]NodeId = .{ q_id, nodeIdFromCT(K), nodeIdFromCT(V), null_node };
@@ -1433,6 +1434,9 @@ pub const TracingCompute = struct {
 
     fn mropeOp(ctx: *anyopaque, input: CT, rows: usize, dim: usize, theta: f32, scale: f32, positions: []const u32, sections: [3]u32) anyerror!?CT {
         const tc = fromCtx(ctx);
+        if (tc.resident_decoder) for (tc.graph.parameters.items) |node| {
+            if (std.mem.eql(u8, tc.graph.parameterName(tc.graph.node(node)), "position_ids")) return tc.makeHandleExact(try @import("rotary_program.zig").emitMropeRuntime(&tc.graph, nodeIdFromCT(input), rows, dim, theta, scale, positions, sections, node));
+        };
         return tc.makeHandleExact(try @import("rotary_program.zig").emitMrope(&tc.graph, nodeIdFromCT(input), rows, dim, theta, scale, positions, sections));
     }
 
@@ -1445,7 +1449,7 @@ pub const TracingCompute = struct {
         const tc = fromCtx(ctx);
         const in_id = nodeIdFromCT(input);
         const out_shape = tc.graph.node(in_id).output_shape;
-        if (tc.precision == .bf16) return tc.makeHandleExact(try @import("rotary_program.zig").emitBf16(&tc.graph, in_id, .{ .seq_len = @intCast(seq_len), .head_dim = @intCast(head_dim), .rope_dim = @intCast(rope_dim), .theta = theta, .freq_scale = freq_scale, .position_offset = @intCast(position_offset), .consecutive_pairs = consecutive_pairs }));
+        if (tc.precision == .bf16 and !tc.resident_decoder) return tc.makeHandleExact(try @import("rotary_program.zig").emitBf16(&tc.graph, in_id, .{ .seq_len = @intCast(seq_len), .head_dim = @intCast(head_dim), .rope_dim = @intCast(rope_dim), .theta = theta, .freq_scale = freq_scale, .position_offset = @intCast(position_offset), .consecutive_pairs = consecutive_pairs }));
         const id = try tc.graph.addNode(.{
             .op = .{ .fused_rope = .{
                 .seq_len = @intCast(seq_len),

@@ -2037,6 +2037,8 @@ pub const Session = struct {
     generation_workspace: ?*memory.ReservedGenerationWorkspace = null,
     output_geometry: ?SequenceOutputGeometry = null,
     cached_decoder_geometry: ?CachedDecoderGeometry = null,
+    /// Trusted synchronous request view; never written into the loaded model.
+    invocation_geometry: ?RunGeometry = null,
     /// Explicit stage contract: these small control tensors are equal across
     /// a physical batch and passed once, never concatenated as independent rows.
     broadcast_inputs: []const []const u8 = &.{},
@@ -2176,6 +2178,7 @@ pub const Session = struct {
         /// and after it; the owner can then route those backends through the
         /// supervised process boundary without a silent uncontrolled fallback.
         runWithControl: *const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror![]Tensor = &unsupportedControlledRun,
+        runCachedDecoder: ?*const fn (*anyopaque, *@import("../execution/resident_decoder.zig").Decoder, []const Tensor, std.mem.Allocator, ?InferenceExecutionControl) anyerror![]Tensor = null,
         eager_host_services: ?*const EagerHostRunServices = null,
         runResidentWithControl: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
         runResidentInputsWithControl: ?*const fn (ptr: *anyopaque, inputs: []const ResidentInput, allocator: std.mem.Allocator, control: InferenceExecutionControl) anyerror!?ResidentOutputs = null,
@@ -2374,6 +2377,20 @@ pub const Session = struct {
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
         return attachOutputAdmission(outputs, allocator, &resource_lease, self.resourcePin());
+    }
+
+    /// Resident request state uses the same source admission, execution turn,
+    /// process guard and host-output accounting as ordinary session execution.
+    pub fn runCachedDecoder(self: Session, state: *@import("../execution/resident_decoder.zig").Decoder, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) ![]Tensor {
+        if (self.ptr != state.source.ptr or self.vtable != state.source.vtable or self.vtable.runCachedDecoder == null) return error.ForeignCompiledProvider;
+        var source = self;
+        source.invocation_geometry = try state.geometry(inputs);
+        var permit: RunPermit = undefined;
+        try source.admitInputsInto(inputs, allocator, control, &permit);
+        defer permit.deinit();
+        const outputs = try permit.runCachedDecoder(state, inputs, allocator, control);
+        errdefer deinitTensorSlice(outputs, allocator);
+        return attachOutputAdmission(outputs, allocator, &permit.lease, self.resourcePin());
     }
 
     /// Optional typed-decision route. Only an unsupported/disabled capability
@@ -2910,7 +2927,7 @@ pub const Session = struct {
 
     fn resolveRunGeometry(self: *const Session, inputs: ShapeInputs, request: *RunRequest) !void {
         try self.validateEagerHostServices();
-        const resolved_geometry = if (self.vtable.runGeometry) |geometry| try geometry(self.ptr, inputs, request.batch) else null;
+        const resolved_geometry = if (self.invocation_geometry) |geometry| @as(?RunGeometry, geometry) else if (self.vtable.runGeometry) |geometry| try geometry(self.ptr, inputs, request.batch) else null;
         const concrete = resolved_geometry orelse if (self.cached_decoder_geometry) |geometry| try geometry.resolve(inputs, self.outputInfo(), request.batch) else if (self.output_geometry) |geometry| try geometry.resolve(inputs, request.batch) else null;
         if (concrete) |resolved| {
             request.sequence = resolved.sequence;
@@ -5515,6 +5532,26 @@ pub const RunPermit = struct {
             inputs,
             allocator,
         });
+    }
+
+    fn runCachedDecoder(self: *RunPermit, state: *@import("../execution/resident_decoder.zig").Decoder, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) ![]Tensor {
+        try self.resolveGeometry(inputs);
+        if (self.execution_yielded) {
+            var execution = try self.acquireExecutionInputs(.{ .host = inputs }, allocator, control);
+            defer execution.deinit();
+            const outputs = try execution.runCachedDecoder(state, inputs, allocator, control);
+            errdefer deinitTensorSlice(outputs, allocator);
+            return Session.attachOutputAdmission(outputs, allocator, &execution.lease, self.session.resourcePin());
+        }
+        const callback = self.session.vtable.runCachedDecoder orelse return error.UnsupportedResidentDecode;
+        const active = control orelse InferenceExecutionControl{ .request_owned = false, .native_call_policy = .in_process };
+        try active.check();
+        var protection = try active.enterUninterruptible(self.session.interruption());
+        defer protection.deinit();
+        const outputs = try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, callback, .{ self.session.ptr, state, inputs, allocator, control });
+        errdefer deinitTensorSlice(outputs, allocator);
+        try active.check();
+        return outputs;
     }
 
     pub fn runWithControl(

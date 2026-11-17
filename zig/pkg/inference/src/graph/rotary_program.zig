@@ -16,16 +16,20 @@ pub const Kind = enum { cos, sin };
 /// Axis-major positions, half-head pairing. The caller owns axis reordering;
 /// each token's phase is shared by every head without activation readback.
 pub fn emitVision(g: *Graph, input: Id, rows: usize, dim: usize, theta: f32, positions: []const u32) !Id {
-    return emitAxis(g, input, rows, dim, theta, 1, positions, .{ 0, 0, 0 }, true);
+    return emitAxis(g, input, rows, dim, theta, 1, positions, .{ 0, 0, 0 }, true, null);
 }
 
 /// Interleaved temporal/height/width positions. Sections count rotary pairs;
 /// partial-head slicing remains owned by ComputeBackend.partialMrope.
 pub fn emitMrope(g: *Graph, input: Id, rows: usize, dim: usize, theta: f32, scale: f32, positions: []const u32, sections: [3]u32) !Id {
-    return emitAxis(g, input, rows, dim, theta, scale, positions, sections, false);
+    return emitAxis(g, input, rows, dim, theta, scale, positions, sections, false, null);
 }
 
-fn emitAxis(g: *Graph, input: Id, rows: usize, dim: usize, theta: f32, scale: f32, positions: []const u32, sections: [3]u32, comptime vision: bool) !Id {
+pub fn emitMropeRuntime(g: *Graph, input: Id, rows: usize, dim: usize, theta: f32, scale: f32, positions: []const u32, sections: [3]u32, runtime_positions: Id) !Id {
+    return emitAxis(g, input, rows, dim, theta, scale, positions, sections, false, runtime_positions);
+}
+
+fn emitAxis(g: *Graph, input: Id, rows: usize, dim: usize, theta: f32, scale: f32, positions: []const u32, sections: [3]u32, comptime vision: bool, runtime_positions: ?Id) !Id {
     const source = g.node(input).output_shape;
     if (rows == 0 or dim == 0 or dim % (if (vision) @as(usize, 4) else 2) != 0 or !std.math.isFinite(theta) or theta <= 0 or !std.math.isFinite(scale) or positions.len != try std.math.mul(usize, rows, if (vision) @as(usize, 2) else 3)) return error.InvalidRoPEInput;
     const elements: usize = @intCast(source.numElements() orelse return error.InvalidRoPEInput);
@@ -50,8 +54,28 @@ fn emitAxis(g: *Graph, input: Id, rows: usize, dim: usize, theta: f32, scale: f3
     };
     var b = Builder.init(g);
     const coefficient_shape = Shape.init(.f32, &.{ @intCast(rows), 1, @intCast(half) });
-    const c = try b.tensorConst(cosines, coefficient_shape);
-    const sine = try b.tensorConst(sines, coefficient_shape);
+    var c: Id = undefined;
+    var sine: Id = undefined;
+    if (runtime_positions) |runtime| {
+        if (!std.mem.eql(i64, g.node(runtime).output_shape.dims[0..g.node(runtime).output_shape.rank()], &.{ 3, @as(i64, @intCast(rows)) })) return error.InvalidRoPEInput;
+        const axes = try g.allocator.alloc(i32, half);
+        defer g.allocator.free(axes);
+        const frequencies = try g.allocator.alloc(f32, half);
+        defer g.allocator.free(frequencies);
+        for (axes, frequencies, 0..) |*axis, *frequency, pair| {
+            axis.* = if (pair % 3 == 1 and pair < @as(usize, sections[1]) * 3) 1 else if (pair % 3 == 2 and pair < @as(usize, sections[2]) * 3) 2 else 0;
+            frequency.* = 1 / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * pair)) / @as(f32, @floatFromInt(dim)));
+        }
+        const indices = try b.tensorConstBytes(std.mem.sliceAsBytes(axes), Shape.init(.i32, &.{@intCast(half)}));
+        const gathered = try b.gather(runtime, indices, Shape.init(.i64, &.{ @intCast(half), @intCast(rows) }));
+        const p = try b.convertDtype(try b.transpose(gathered, &.{ 1, 0 }), .f32);
+        const angles = try b.mul(try b.mul(p, try b.scalarConst(.f32, scale)), try b.tensorConst(frequencies, Shape.init(.f32, &.{ 1, @intCast(half) })));
+        c = try b.reshape(try b.cosOp(angles), coefficient_shape);
+        sine = try b.reshape(try b.sinOp(angles), coefficient_shape);
+    } else {
+        c = try b.tensorConst(cosines, coefficient_shape);
+        sine = try b.tensorConst(sines, coefficient_shape);
+    }
     const x = try b.reshape(input, Shape.init(.f32, &.{ @intCast(rows), @intCast(heads), @intCast(dim) }));
     const left = try slice(g, x, 0, @intCast(half), 1);
     const right = try slice(g, x, @intCast(half), @intCast(dim), 1);
