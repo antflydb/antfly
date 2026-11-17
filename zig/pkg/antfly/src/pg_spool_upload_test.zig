@@ -31,26 +31,27 @@ const Request = fixture.Request;
 const Registry = struct {
     fs: *FsStore,
     scopes: usize = 0,
-    pub fn newUploadScope(self: *@This(), state: control.State, id: u64, _: Request) !control.pg_slot.spool_control.Scope {
-        self.scopes += 1;
-        const scope = try artifacts.UploadScope.forPublication(control.pg_slot.spool_control.Scope.domainFor(state.id, state.epoch), id, std.testing.io);
-        return .{ .namespace = @splat(9), .domain = scope.domain, .attempt = scope.attempt };
-    }
-    pub fn newBuildToken(_: *@This(), _: anytype, _: Request) !control.Id {
-        var token: control.Id = undefined;
-        std.testing.io.random(&token);
-        return token;
-    }
-    pub fn artifactStore(self: *@This(), _: anytype, _: anytype) !artifacts.ArtifactStore {
+    fn backend(self: *@This()) adapter.Registry {
         var store = self.fs.artifactStore();
         store.namespace_identity = @splat(9);
-        return store;
+        return .{ .store = store, .io = std.testing.io };
     }
-    pub fn qualify(_: *@This(), _: control.State, shared: bool, _: anytype) !void {
-        if (shared) return error.PgSpoolStorageUnsupported;
+    pub fn newUploadScope(self: *@This(), state: control.State, id: u64, request: Request) !control.pg_slot.spool_control.Scope {
+        const scope = try self.backend().newUploadScope(state, id, request);
+        self.scopes += 1;
+        return scope;
     }
-    pub fn protect(_: *@This(), _: control.State, _: anytype, seal: spool.Seal, writer: *adapter.Adapter, _: Request) !void {
-        _ = try writer.recordClosure(seal);
+    pub fn newBuildToken(self: *@This(), record: control.pg_slot.spool_control.Record, request: Request) !control.Id {
+        return self.backend().newBuildToken(record, request);
+    }
+    pub fn artifactStore(self: *@This(), scope: control.pg_slot.spool_control.Scope, request: anytype) !artifacts.ArtifactStore {
+        return self.backend().artifactStore(scope, request);
+    }
+    pub fn qualify(self: *@This(), state: control.State, shared: bool, request: anytype) !void {
+        try self.backend().qualify(state, shared, request);
+    }
+    pub fn protect(self: *@This(), state: control.State, record: control.pg_slot.spool_control.Record, seal: spool.Seal, writer: *adapter.Adapter, request: Request) !void {
+        try self.backend().protect(state, record, seal, writer, request);
     }
     pub fn authorizeCleanup(_: *@This(), state: control.State, _: Request) !void {
         if (state.definition == null) return error.TestDenied;

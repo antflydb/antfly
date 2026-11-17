@@ -70,3 +70,73 @@ pub const Adapter = struct {
         return witness;
     }
 };
+
+/// Borrow a configured artifact namespace for the lifetime of a slot owner.
+/// Durable reservations carry the exact namespace and fenced upload scope.
+pub const Registry = struct {
+    const feeds = @import("changefeed_control.zig");
+
+    store: artifacts.ArtifactStore,
+    io: std.Io,
+
+    fn namespace(self: Registry) !spool.Digest {
+        const id = self.store.namespace_identity orelse return error.PgSpoolStorageUnsupported;
+        const vt = self.store.vtable;
+        if (std.mem.allEqual(u8, &id, 0) or self.store.upload_scope != null or
+            vt.put_scoped == null or vt.visit_scoped_uploads == null or vt.retire_scoped_uploads == null or vt.scoped_uploads_reclaimed == null or
+            vt.retention_witness == null or vt.remember_closure == null or vt.seal_closures == null)
+            return error.PgSpoolStorageUnsupported;
+        return id;
+    }
+
+    pub fn qualify(self: Registry, state: feeds.State, shared: bool, request: anytype) !void {
+        try request.ensureActive();
+        const id = try self.namespace();
+        if (shared and !self.store.shared_across_owners) return error.PgSpoolStorageUnsupported;
+        const slot = state.slot orelse return error.ChangefeedCapabilityUnsupported;
+        for (slot.spool.records) |record| {
+            if (!std.meta.eql(record.scope.namespace, id)) return error.PgSpoolStorageUnsupported;
+        }
+    }
+
+    pub fn newUploadScope(self: Registry, state: feeds.State, id: u64, request: anytype) !control.Scope {
+        try request.ensureActive();
+        const storage = try self.namespace();
+        const slot = state.slot orelse return error.ChangefeedCapabilityUnsupported;
+        if (id == 0 or id != slot.spool.next_id or state.epoch == 0) return error.ChangefeedConflict;
+        const scope = try artifacts.UploadScope.forPublication(control.Scope.domainFor(state.id, state.epoch), id, self.io);
+        return .{ .namespace = storage, .domain = scope.domain, .attempt = scope.attempt };
+    }
+
+    pub fn newBuildToken(self: Registry, record: control.Record, request: anytype) !feeds.Id {
+        try request.ensureActive();
+        try record.validate();
+        if (record.phase != .uploading or record.build != null) return error.ChangefeedConflict;
+        var token: feeds.Id = undefined;
+        while (true) {
+            self.io.random(&token);
+            if (!std.mem.allEqual(u8, &token, 0)) return token;
+            try request.ensureActive();
+        }
+    }
+
+    pub fn artifactStore(self: Registry, scope: control.Scope, request: anytype) !artifacts.ArtifactStore {
+        try request.ensureActive();
+        try scope.validate();
+        if (!std.meta.eql(scope.namespace, try self.namespace())) return error.PgSpoolStorageUnsupported;
+        return self.store;
+    }
+
+    pub fn protect(self: Registry, state: feeds.State, record: control.Record, sealed: spool.Seal, writer: *Adapter, request: anytype) !void {
+        try request.ensureActive();
+        _ = try self.artifactStore(record.scope, request);
+        try record.validate();
+        if (record.phase != .uploading or record.build == null or
+            !std.meta.eql(record.spec.feed, state.id) or record.spec.epoch != state.epoch or
+            !std.meta.eql(record.scope.storageIdentity(), writer.storageIdentity()) or
+            !record.spec.matchesPlan(sealed.plan))
+            return error.ChangefeedConflict;
+        _ = try writer.recordClosure(sealed);
+        try request.ensureActive();
+    }
+};
