@@ -32,6 +32,77 @@ pytest_plugins = ("test_auth", "test_privacy_indexed_activation")
 BATCH_ITEMS = 32
 
 
+def assert_recovered_inputs_not_requested(records, accepted_inputs):
+    repeated = [
+        row
+        for row in records
+        if row["model"] == "fixture-v2" and accepted_inputs.intersection(row["inputs"])
+    ]
+    assert not repeated, ("durable inputs must not be requested again", repeated)
+
+
+@pytest.mark.parametrize("status", [None, 200, 502])
+def test_recovered_inputs_reject_every_inference_attempt(status):
+    with pytest.raises(AssertionError, match="durable inputs"):
+        assert_recovered_inputs_not_requested(
+            [{"model": "fixture-v2", "inputs": ["accepted"], "status": status}],
+            {"accepted"},
+        )
+
+
+def test_recovered_inputs_allow_only_unaccepted_work():
+    assert_recovered_inputs_not_requested(
+        [{"model": "fixture-v2", "inputs": ["pending"], "status": None}],
+        {"accepted"},
+    )
+
+
+def durably_produced_count(status):
+    coverage = status.get("coverage", {})
+    if (
+        not status.get("runtime_fresh")
+        or not coverage.get("summary_ready")
+        or coverage.get("config_mismatch_group_count") != 0
+    ):
+        return None
+    # Target observation/readiness may still be pending during atomic cutover.
+    # Source outcome counts are committed with the accepted artifact batch.
+    return coverage.get("produced")
+
+
+def durable_prefix_status():
+    return {
+        "runtime_fresh": True,
+        "published_doc_count": 0,
+        "coverage": {
+            "summary_ready": True,
+            "observation_complete": False,
+            "config_mismatch_group_count": 0,
+            "produced": 64,
+        },
+    }
+
+
+def test_durable_source_count_is_independent_of_projection_readiness():
+    assert durably_produced_count(durable_prefix_status()) == 64
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("runtime_fresh", False),
+        ("summary_ready", False),
+        ("config_mismatch_group_count", 1),
+        ("produced", None),
+    ],
+)
+def test_durable_source_count_rejects_missing_or_mismatched_evidence(field, value):
+    status = durable_prefix_status()
+    target = status if field == "runtime_fresh" else status["coverage"]
+    target[field] = value
+    assert durably_produced_count(status) is None
+
+
 @pytest.fixture
 def migration_api(monkeypatch, request):
     # Keep the physical wave and planning quantum explicit for the crash gate.
@@ -243,6 +314,7 @@ def test_protected_model_backfill_batches(
         behavior["hold_after_document_calls"] = 2 if crash_during_backfill else 0
         pre_crash_work = []
         persisted_before_crash = set()
+        recovery_request_start = None
         add_index("b", "fixture-v2")
         report["index_create_seconds"] = time.monotonic() - began
         assert behavior["model_held"].wait(timeout=20), (
@@ -250,7 +322,7 @@ def test_protected_model_backfill_batches(
         )
         if crash_during_backfill:
 
-            def partially_published():
+            def partially_accepted():
                 nonlocal persisted_before_crash
                 status = api.get(f"/tables/{table}/indexes/b")["status"]
                 report["last_partial_status"] = status
@@ -261,19 +333,31 @@ def test_protected_model_backfill_batches(
                     for text in row["inputs"]
                     if "Orchard schedule." in text
                 }
-                # The privacy barrier deliberately hides partial B output from
-                # searches/inspection. Its published physical count is separate
-                # from whole-index coverage. With one vector per unique input,
-                # equality accounts for every completed provider result.
-                count = status["published_doc_count"]
-                if not 0 < count == len(completed) < document_count:
+                # Produced source outcomes commit in the artifact transaction
+                # (DB.applyArtifactPublication -> stageCoverage). Atomic index
+                # publication may still expose zero native vectors while the
+                # next model response is held. Unique fixture inputs and one
+                # vector per source make this equality an acceptance proof for
+                # every completed provider result, independent of readiness.
+                count = durably_produced_count(status)
+                coverage = status["coverage"]
+                if (
+                    count is None
+                    or coverage["source_total"] != document_count
+                    or not coverage.get("config_fingerprint")
+                    or not 0 < count == len(completed) < document_count
+                ):
                     return False
+                report["accepted_prefix_config_fingerprint"] = coverage[
+                    "config_fingerprint"
+                ]
+                report["crash_cut_evidence"] = "durable_source_outcomes"
                 persisted_before_crash = completed
                 report["durably_produced_before_crash"] = count
                 report["verified_inputs_before_crash"] = sorted(completed)
                 return True
 
-            assert wait_until(partially_published, timeout_s=30, interval_s=0.1), report
+            assert wait_until(partially_accepted, timeout_s=30, interval_s=0.1), report
             pre_crash_work = [
                 r for r in calls["snapshot"]()[before_requests:] if document_request(r)
             ]
@@ -295,23 +379,34 @@ def test_protected_model_backfill_batches(
             behavior["hold_after_document_calls"] = 0
             behavior["model_gate"].clear()
             behavior["model_held"].clear()
+            recovery_request_start = len(calls["snapshot"]())
             api._server.restart()
             cpu_before = cpu_seconds()
             report["server_cpu_scope"] = "post-restart"
             # A killed worker's durable producer lease remains fenced until
-            # its 30-second TTL expires. Recovery of already published vectors
+            # its 30-second TTL expires. Recovery of already accepted work
             # must not wait for a replacement producer to reach inference.
             # All new B responses remain gated throughout this proof; the
             # completion check below separately requires resumed production.
 
-            def recovered_publication():
+            def recovered_acceptance():
                 status = api.get(f"/tables/{table}/indexes/b")["status"]
                 report["recovered_partial_status"] = status
-                # The provider withholds every new document response. A
-                # recovered prefix therefore comes from durable stored work.
-                return status["published_doc_count"] >= len(persisted_before_crash)
+                # The provider withholds every new document response. Require
+                # the same generation's durable acceptance summary now; final
+                # vector inspection plus the no-repeat oracle below prove the
+                # accepted vectors survive, even before atomic publication.
+                count = durably_produced_count(status)
+                coverage = status["coverage"]
+                return (
+                    count is not None
+                    and count >= len(persisted_before_crash)
+                    and coverage["source_total"] == document_count
+                    and coverage["config_fingerprint"]
+                    == report["accepted_prefix_config_fingerprint"]
+                )
 
-            assert wait_until(recovered_publication, timeout_s=30, interval_s=0.1), (
+            assert wait_until(recovered_acceptance, timeout_s=30, interval_s=0.1), (
                 report
             )
             assert not any(
@@ -320,6 +415,9 @@ def test_protected_model_backfill_batches(
                 if row["model"] == "fixture-v2"
                 and row["started"] > pre_crash_work[-1]["started"]
             ), "recovery must precede newly completed inference"
+            assert_recovered_inputs_not_requested(
+                calls["snapshot"]()[recovery_request_start:], persisted_before_crash
+            )
             report["crashed_during_backfill"] = True
         held_since = time.monotonic()
         assert not complete("b")
@@ -357,6 +455,11 @@ def test_protected_model_backfill_batches(
             document_records
         )
         assert work and all(r["completed"] is not None for r in work), work
+        if recovery_request_start is not None:
+            assert_recovered_inputs_not_requested(
+                calls["snapshot"]()[recovery_request_start:], persisted_before_crash
+            )
+            report["recovered_prefix_embedding_attempts"] = 0
         successful = [r for r in work if r["status"] == 200]
         abandoned = [r for r in work if r["status"] != 200]
         # Foreground reads may cancel a background invocation while the fake

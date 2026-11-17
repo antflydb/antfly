@@ -423,12 +423,40 @@ pub fn current(a: A, indexes: std.json.Value) !?std.json.Parsed(Resource) {
     defer a.free(encoded);
     const parsed = try std.json.parseFromSlice(Resource, a, encoded, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
-    if (parsed.value.resource_version == 0 or parsed.value.generation == 0 or
-        !std.mem.eql(u8, &parsed.value.policy_version, &(try parsed.value.policy.identity(a)))) return error.InvalidPrivacyCatalog;
-    const expected_artifact = if (parsed.value.policy.mode == .redact_for_search_and_ai) try projection.protectedArtifactName(a, parsed.value.policy_version) else try a.dupe(u8, projection.artifact_name);
-    defer a.free(expected_artifact);
-    if (!std.mem.eql(u8, expected_artifact, parsed.value.artifact_name)) return error.InvalidPrivacyCatalog;
+    try validateResourceIdentity(a, parsed.value);
     return parsed;
+}
+
+fn validateResourceIdentity(a: A, value: anytype) !void {
+    if (value.resource_version == 0 or value.generation == 0 or
+        !std.mem.eql(u8, &value.policy_version, &(try value.policy.identity(a)))) return error.InvalidPrivacyCatalog;
+    const expected_artifact = if (value.policy.mode == .redact_for_search_and_ai) try projection.protectedArtifactName(a, value.policy_version) else try a.dupe(u8, projection.artifact_name);
+    defer a.free(expected_artifact);
+    if (!std.mem.eql(u8, expected_artifact, value.artifact_name)) return error.InvalidPrivacyCatalog;
+}
+
+/// A storage owner consumes policy/execution configuration, not a scan job.
+/// Accept full or progress-free catalogs without weakening Resource's required
+/// job fields. Unknown semantic fields and invalid policy bindings still fail
+/// closed; returned execution tuning owns no borrowed JSON storage.
+pub fn ownerExecution(a: A, raw: []const u8) !?projection.ExecutionOverride {
+    var root = try std.json.parseFromSlice(std.json.Value, a, if (raw.len == 0) "{}" else raw, .{});
+    defer root.deinit();
+    if (root.value != .object) return error.InvalidPrivacyCatalog;
+    if (!root.value.object.contains(key)) return null;
+    removeProgress(&root.value);
+    const Control = struct {
+        policy: contract.Policy,
+        artifact_name: []const u8 = projection.artifact_name,
+        policy_version: [64]u8,
+        resource_version: u64,
+        generation: u64,
+        unprotected_indexes_json: []const u8 = "",
+    };
+    var parsed = try std.json.parseFromValue(Control, a, root.value.object.get(key).?, .{});
+    defer parsed.deinit();
+    try validateResourceIdentity(a, parsed.value);
+    return .{ .policy_version = parsed.value.policy_version, .execution = parsed.value.policy.execution };
 }
 
 /// Compact read binding extracted once per immutable semantic catalog cut.
