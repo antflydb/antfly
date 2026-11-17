@@ -149,6 +149,23 @@ test "SQL pgwire owner rejects unauthenticated and runtime-less startup" {
 pub const ReplicationIdentity = struct {
     context: *anyopaque,
     read: *const fn (*anyopaque, std.mem.Allocator) anyerror!http.AuthenticatedIdentity,
+
+    /// Authorize an already resolved publication's exact logical table scopes.
+    /// The caller supplies catalog-qualified names and verifies their immutable
+    /// bindings. This path serves whole tuples and rejects effective filters.
+    pub fn requireWholeTables(self: ReplicationIdentity, alloc: std.mem.Allocator, tables: []const []const u8) !void {
+        const control = @import("../metadata/changefeed_control.zig");
+        if (tables.len == 0 or tables.len > control.max_tables) return error.InvalidChangefeed;
+        var identity = try self.read(self.context, alloc);
+        defer identity.deinit(alloc);
+        var checks: [control.max_tables]usermgr.UserManager.PermissionCheck = undefined;
+        for (tables, checks[0..tables.len]) |table, *check| {
+            if (table.len == 0) return error.InvalidChangefeed;
+            if (http.hasEffectiveRowFilter(identity, table)) return error.Forbidden;
+            check.* = .{ .resource_type = .table, .resource = table, .permission_type = .replicate };
+        }
+        if (!try http.resourcePermissionsCurrentlyAllowed(alloc, identity, checks[0..tables.len])) return error.Forbidden;
+    }
 };
 
 pub const ReplicationFactory = struct {
@@ -1996,6 +2013,32 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     var replacement_identity = try replacement.identity(alloc);
     defer replacement_identity.deinit(alloc);
     try std.testing.expect(!(try http.tablePermissionCurrentlyAllowed(replacement_identity, "docs", .read)));
+}
+
+test "SQL pgwire native replication requires live whole-table export authority" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        identity: http.AuthenticatedIdentity,
+        reads: usize = 0,
+        fn read(raw: *anyopaque, alloc: std.mem.Allocator) anyerror!http.AuthenticatedIdentity {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            return (try http.cloneCatalogIdentity(alloc, self.identity)).?;
+        }
+    };
+    var grant = try usermgr.Permission.initOwned(a, .table, "docs", .read);
+    defer grant.deinit(a);
+    var fixture: Fixture = .{ .identity = .{ .username = @constCast("exporter"), .permissions = (&grant)[0..1] } };
+    const authority: ReplicationIdentity = .{ .context = &fixture, .read = Fixture.read };
+    try std.testing.expectError(error.Forbidden, authority.requireWholeTables(a, &.{"docs"}));
+    grant.type = .replicate;
+    try authority.requireWholeTables(a, &.{"docs"});
+    try std.testing.expectError(error.Forbidden, authority.requireWholeTables(a, &.{ "docs", "other" }));
+    var filter = try usermgr.RowFilterEntry.initOwned(a, "docs", "{}");
+    defer filter.deinit(a);
+    fixture.identity.row_filter = (&filter)[0..1];
+    try std.testing.expectError(error.Forbidden, authority.requireWholeTables(a, &.{"docs"}));
+    try std.testing.expectEqual(@as(usize, 4), fixture.reads);
 }
 
 test "SQL pgwire native adapter admits sessions for principal scoped native validation" {
