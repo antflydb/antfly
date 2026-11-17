@@ -17444,7 +17444,11 @@ fn processAsset(
     defer if (context_owned) if (context) |*value| value.deinit();
     var prior_input: ?@import("group_prior_input.zig").Input = null;
     defer if (prior_input) |*value| value.deinit();
+    // A context-source dependent's acceptance is bound to the context it was
+    // built from, known only after resolution below.
+    const context_bound = request.context_sources_json.len != 0 and observed != null;
     const accepted = if (context) |*value| accepted: {
+        if (context_bound) break :accepted false;
         var read = try runtime.store.beginProbe();
         defer read.abort();
         break :accepted try value.accepted(runtime.alloc, &read);
@@ -17743,6 +17747,27 @@ fn processAsset(
             }
         }
     }
+    if (context_bound) if (context) |*token| {
+        // Ordered acceptance is per source revision, which a context change
+        // leaves untouched: bind the publication to the rendered context so
+        // a different context is a distinct, publishable input.
+        if (context_publish) |publish| {
+            token.execution_identity = contextExecutionIdentity(&publish.resolution.rendered.fingerprint);
+            token.execution_bound = true;
+        }
+        const settled = settled: {
+            var read = try runtime.store.beginProbe();
+            defer read.abort();
+            break :settled try token.accepted(runtime.alloc, &read);
+        };
+        if (settled) {
+            try finishAcceptedAssetGraph(runtime, request);
+            try settleAcceptedMediaOutput(runtime, request, window);
+            try retireMediaPassForAssetRequest(runtime, request);
+            try retireIndexDocumentCheckpoint(runtime, request, token);
+            return;
+        }
+    };
 
     if (prior_input) |value| {
         const marker = try std.fmt.allocPrint(runtime.alloc, "[prior_context {x}]\n{s}", .{ &value.fingerprint, value.text });
@@ -17850,6 +17875,17 @@ const ContextDependencyFence = struct {
 
 /// Register-before-read capture. Returns null when the request already
 /// recorded an explicit failure (budget overflow, missing required input).
+/// Ordered publication identity of a context-source dependent built from
+/// context with this rendered fingerprint.
+fn contextExecutionIdentity(fingerprint: *const enrichment_context_sources.Digest) [32]u8 {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("antfly-context-sources-execution-v1\x00");
+    hash.update(fingerprint);
+    var out: [32]u8 = undefined;
+    hash.final(&out);
+    return out;
+}
+
 fn captureContextSources(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,

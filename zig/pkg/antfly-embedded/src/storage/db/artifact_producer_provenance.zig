@@ -127,6 +127,19 @@ pub const Proof = struct {
         return .{ .namespace = self.namespace, .authority_epoch = self.authority_epoch, .catalog_digest = self.catalog_digest, .producer_kind = self.producer_kind, .producer_name = self.producer_name, .producer_generation = self.producer_generation, .producer_artifact_name = self.producer_artifact_name, .producer_scope_key = self.producer_scope_key, .execution_identity = self.execution_identity, .sources = self.sources, .artifact_sources = self.artifact_sources, .mutation_preconditions = self.mutation_preconditions, .mutations = &.{}, .publication_digest = self.publication_digest };
     }
 
+    /// Proofs that may name an execution identity: index vectors (the
+    /// deployed model revision) and enrichment assets built from context
+    /// sources (the rendered context), each one effect for one source.
+    fn executionBound(self: Proof) bool {
+        if (self.effects.len != 1) return false;
+        return switch (self.producer_kind) {
+            .index => (self.producer_scope_key.len != 0 or self.sources.len == 1) and
+                self.effects[0].family == (if (self.producer_scope_key.len == 0) @as(@FieldType(Effect, "family"), .base_vector) else @as(@FieldType(Effect, "family"), .derived_vector)),
+            .enrichment => self.producer_scope_key.len == 0 and self.sources.len == 1 and self.effects[0].family == .document_artifact,
+            else => false,
+        };
+    }
+
     pub fn validate(self: Proof) !void {
         if ((self.version != 3 and self.version != 4) or (self.version == 4) != (self.execution_identity != null) or self.authority_epoch == 0 or (self.producer_generation == 0 and self.producer_kind != .resolver) or
             self.producer_name.len == 0 or self.producer_artifact_name.len == 0 or
@@ -134,9 +147,7 @@ pub const Proof = struct {
             self.artifact_sources.len > publication.max_source_documents or
             self.mutation_preconditions.len > publication.max_source_documents - self.artifact_sources.len or self.effects.len == 0 or
             self.effects.len > publication.max_mutations or !std.mem.eql(u8, &self.input_digest, &self.inputCommand().inputDigest())) return error.ArtifactCatalogCorrupt;
-        if (self.execution_identity != null and (self.producer_kind != .index or
-            (self.producer_scope_key.len == 0 and self.sources.len != 1) or self.effects.len != 1 or
-            self.effects[0].family != (if (self.producer_scope_key.len == 0) @as(@FieldType(Effect, "family"), .base_vector) else @as(@FieldType(Effect, "family"), .derived_vector)))) return error.ArtifactCatalogCorrupt;
+        if (self.execution_identity != null and !self.executionBound()) return error.ArtifactCatalogCorrupt;
         for (self.effects) |effect| if (effect.source_index >= self.sources.len or
             (effect.value_digest == null and effect.value_bytes != 0)) return error.ArtifactCatalogCorrupt;
         if (self.origin) |origin| {
@@ -1981,4 +1992,35 @@ test "ordered artifact inventory adopted proof binds certified origin and select
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{proof});
+}
+
+test "ordered artifact proofs bind enrichment assets to their rendered context" {
+    const alloc = std.testing.allocator;
+    const source = publication.Source{ .document_key = "person:1", .content_digest = @splat(1), .timestamp = 3, .input_position = .{ .raft = .{ .term = 1, .index = 4 } } };
+    const output = publication.Mutation{ .family = .document_artifact, .key = "brief-output", .value = null, .source_index = 0 };
+    var command: publication.Command = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .enrichment, .producer_name = "brief", .producer_generation = 1, .producer_artifact_name = "brief", .sources = (&source)[0..1], .mutations = (&output)[0..1], .publication_digest = @splat(0) };
+    command.execution_identity = @splat(5);
+    command.publication_digest = command.digest();
+    const first_input = command.inputDigest();
+    var prepared = try fromCommand(alloc, command);
+    defer prepared.deinit();
+    const raw = try encodeAlloc(alloc, prepared.proof);
+    defer alloc.free(raw);
+    var decoded = try decodeAlloc(alloc, raw);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u8, 4), decoded.proof.version);
+    try decoded.proof.validate();
+    // A different rendered context is a distinct input at the same source.
+    command.execution_identity = @splat(6);
+    try std.testing.expect(!std.mem.eql(u8, &first_input, &command.inputDigest()));
+
+    // Only a single document artifact effect may carry an enrichment identity.
+    var vector = decoded.proof;
+    const wrong = Effect{ .family = .base_vector, .key = "brief-output", .source_index = 0, .value_digest = null, .value_bytes = 0 };
+    vector.effects = (&wrong)[0..1];
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, vector.validate());
+    var scoped = decoded.proof;
+    scoped.producer_scope_key = "unit";
+    scoped.input_digest = scoped.inputCommand().inputDigest();
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, scoped.validate());
 }
