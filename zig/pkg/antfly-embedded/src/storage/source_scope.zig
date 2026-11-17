@@ -232,8 +232,8 @@ pub const Header = struct {
     }
 };
 
-/// All buffers use the enclosing attempt arena. Any write failure requires
-/// aborting the enclosing NativeKV transaction, including earlier writes.
+/// Temporary encodings are released after the native writer copies them. Any
+/// write failure requires aborting the transaction, including earlier writes.
 pub const Store = struct {
     pub const max_record_bytes = 8192;
     const header_key = prefix ++ "header";
@@ -297,10 +297,12 @@ pub const Store = struct {
     }
     pub fn writeHeader(a: std.mem.Allocator, txn: anytype, header: Header) !void {
         const bytes = try encode(a, header);
+        defer a.free(bytes);
         try txn.put(header_key, bytes);
     }
     pub fn writeRecord(a: std.mem.Allocator, txn: anytype, record: Record) !void {
         const bytes = try encode(a, record);
+        defer a.free(bytes);
         try txn.put(&recordKey(record.spec.domain()), bytes);
     }
     pub fn bind(a: std.mem.Allocator, txn: anytype, root: Basis, spec: Spec, cut: MetadataCut) !Record {
@@ -378,8 +380,15 @@ pub const Store = struct {
         var header = try readHeader(a, txn, root);
         try cut.require(root);
         const record = (try readRecord(a, txn, domain)) orelse {
-            if (header.strict and header.metadata_floor >= cut.index) return;
-            return error.SourceCheckpointConflict;
+            if (!header.strict) return error.SourceCheckpointConflict;
+            // A fresh qualified retired-actor read may follow an earlier drop.
+            // Preserve strict admission and all other domains while extending
+            // the common metadata fence; no per-source tombstone is required.
+            if (header.metadata_floor < cut.index) {
+                header.metadata_floor = cut.index;
+                try writeHeader(a, txn, header);
+            }
+            return;
         };
         try header.drop(record, cut, retired_through_generation, closed_at);
         try txn.delete(&recordKey(domain));

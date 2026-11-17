@@ -5224,3 +5224,95 @@ failures or leaks (`source-scope-retirement-receipt-final-native-test.log`).
 (`source-scope-retirement-receipt-contract-check.log`), including nine schema
 fragment tests. No engine/owner/API ABI or data/metadata protocol maximum is
 changed by this internal native receipt implementation.
+
+### Physical ordered source-scope DB controls and recovery
+
+The DB now exposes trusted `applyOrderedSourceScopeControl` and
+`orderedSourceScopeOutcome`, with compiled-engine descriptor 57. Ordered apply
+holds the physical apply fence, snapshot mutation admission and replication
+write gate; verifies namespace/root generation and durable Raft authority; and
+stages the scope transition, bounded outcome and actual entry marker in one
+native writer. Deterministic rejection aborts the reducer's partial writes before
+committing its narrow rejection and marker separately. Replay binds the exact
+entry and command. Recovery verifies the actual durable applied cut and refuses
+future cuts, mismatched terms and physical roots.
+
+First strict activation deliberately remains blocked by SourcePendingWork.
+The current production worker can emit ordinary unlabelled commitBatch writes;
+an empty source registry or absent retained source transaction is therefore not
+a legacy-drain proof. The DB gate cannot open until genuine persisted worker
+handover is integrated. Already strict roots use their durable registry without
+re-running migration authorization. This is an unfinished migration contract,
+not evidence that a production actor can now activate scoped delivery.
+
+A real NativeKV DB regression reopens the root across first-activation rejection,
+sets up a strict scope explicitly as a fixture, then exercises repeated binding,
+close, exact replay, rejection of a wrong physical close cut, drop, stale bind
+rejection, superseded recovery, future read cuts, wrong term and changed root.
+The first run completed its behavioral checks but failed leak detection: seven
+encoded scope header/record buffers were not released. Scope writers now free
+those temporary encodings after the writer copies them, including failed puts.
+The dedicated native target and existing source-control suite are being rerun;
+terminal evidence follows below. Repository source-catalog, engine-error and
+OpenAPI checks passed.
+
+Serving-owner/metadata qualification, all-member data decoder activation and
+opaque/Raft/RPC exposure are independent integration requirements. No stronger
+data protocol is advertised by these DB methods. Retirement DB exposure and
+durable rejection outcomes, genuine migration, hidden checkpoint and cohort
+lifecycle, and the complete original destination/public-history/bootstrap/
+retention/pgoutput/real-Antfly-client and recovery/performance scope remain open.
+
+The final dedicated DB control regression passed, zero skipped/failed/leaked,
+and source-control-test exited 0
+(`source-scope-native-ordered-control-green-test.log`). The regression is also
+selected by the default data-storage test profile. Contract checks exited 0
+(`source-scope-native-ordered-control-contract-check.log`). A real linked native
+owner/routed history integration run is in progress to qualify descriptor 57;
+its terminal result is recorded below. No owner/API ABI or data/metadata protocol
+maximum has been changed.
+
+Issues #1698 and #1639 were re-read from GitHub during this milestone. Both remain
+open, with all original acceptance criteria intact, including complete native
+and writable-Iceberg destination integration, public retained feeds, coherent
+bootstrap/retention and actual pinned-client Antfly pgoutput qualification.
+The current native scope controls do not establish those broader requirements.
+
+A second recovery regression reproduced absent-drop refresh failure: after drop
+at metadata cut 12, the same retired actor freshly captured at cut 13 returned
+SourceCheckpointConflict. An absent strict-root drop now advances the common
+metadata floor when necessary, preserving strict mode, other domains and bounded
+storage without a per-source tombstone. The first standalone run failed exactly
+at that refreshed drop; the fixed run passed all 22 tests
+(`source-scope-refreshed-drop-{red,green}-test.log`). The real DB fixture now
+includes repeated drop with a newer metadata cut and checks that floor after
+reopen. This does not authorize first strict activation on a legacy root.
+
+The first broad linked integration compile failed with LLVM's No space left on
+device while emitting its object. Dedicated DB/control tests and the shared
+15-test history suite had passed. Normal repository GC completed but reclaimed
+no significant space; recent/active caches were protected. The same linked test
+selection is being retried with -Dstrip=true and -j1 to omit debug information
+and bound concurrent build output, without changing protocol/runtime assertions
+or test selection. A lower 5 GiB disposable-cache threshold is also being run
+through the repository collector with its active-process/recent-write guards
+unchanged. Final results follow after terminal observation.
+
+The final `source-scope-native-control-test source-control-test
+ docstore-history-test -j1` invocation exited 0
+(`source-scope-native-control-final-regression-test.log`), including the native
+refreshed-drop/reopen checks and all 15 history tests, with no failures or leaks.
+Final `make source-catalog-check engine-errors-check openapi-check` exited 0
+(`source-scope-native-control-final-contract-check.log`), including nine schema
+fragment tests. Linked-owner qualification remains pending below; these narrower
+passes do not substitute for it or the original issues' end-to-end requirements.
+
+The linked `history-control-apply-test -Dstrip=true -j1` retry exited 0
+(`source-scope-native-control-owner-stripped-integration-test.log`): all 19
+selected history/source-scope tests passed, zero skipped/failed/leaked. This
+qualifies the existing real native-owner, routed and authenticated fixtures with
+engine descriptor 57; it does not expose the new control methods through opaque
+owner or data-Raft/RPC yet. Debug-symbol stripping changes emitted debug data,
+not this run's assertions or selected test surface. The guarded lower-threshold
+collector recovered usable disk space (44 GiB observed before its final shared
+cache phases), protecting active builds and recent outputs.

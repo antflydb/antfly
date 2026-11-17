@@ -36,6 +36,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const target = options.target;
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
+    const source_scope_storage_tests = b.addTest(.{ .root_module = data_storage_test_mod, .filters = compileFiltersWithAnchors(b, &.{"data storage module tests are reachable"}, &.{"db ordered source scope"}), .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("source-scope-native-control-test", "Verify physical source scope controls and atomic ordered recovery").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, source_scope_storage_tests, &.{"db ordered source scope"}).step);
     const source_plan_apply_tests = @import("linked_tests.zig").add(b, .{ .name = "source-plan-apply-tests", .root_module = data_runtime_test_mod, .filters = &.{"data raft source plan"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("source-plan-apply-test", "Verify activated frozen source plan native dispatch and lost-result recovery").dependOn(&source_plan_apply_tests.run(b).step);
     const history_apply_tests = @import("linked_tests.zig").add(b, .{ .name = "ordered-history-apply-tests", .root_module = data_runtime_test_mod, .filters = &.{ "data raft ordered history", "source scope" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
@@ -308,6 +310,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, private_initial_owner_predicate_tests).step);
 
     const lib_data_storage_default_filters = [_][]const u8{
+        "db ordered source scope",
         "privacy data raft apply batches WAL-durable commands without one SST per entry",
         "privacy data raft apply compaction families are contiguous and separate hot metadata from history",
         "membership reducer",

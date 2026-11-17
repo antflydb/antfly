@@ -254,3 +254,25 @@ test "scope control codec binds original owners cuts and durable record invarian
     observation.cut.index = 19;
     try std.testing.expectError(error.SourceAdmissionCorrupt, observation.validate(query));
 }
+
+test "scope repeated drop advances a fresh retired metadata cut without a domain tombstone" {
+    const a = std.testing.allocator;
+    var txn: TestTxn = .{};
+    defer txn.deinit();
+    var gate: Gate = .{ .drained = true };
+    var command = fixture();
+    _ = try apply(a, &txn, &gate, command, .{ .term = 1, .index = 20 });
+    command.intent.action = .close;
+    command.metadata_cut.index = 11;
+    const closed = try apply(a, &txn, &gate, command, .{ .term = 1, .index = 21 });
+    command.intent.action = .{ .drop = closed.record.?.closed_at.? };
+    command.metadata_cut.index = 12;
+    _ = try apply(a, &txn, &gate, command, .{ .term = 1, .index = 22 });
+    command.metadata_cut.index = 13;
+    const refreshed = try apply(a, &txn, &gate, command, .{ .term = 1, .index = 23 });
+    try std.testing.expect(refreshed.record == null);
+    try std.testing.expect(refreshed.header.strict);
+    try std.testing.expectEqual(@as(u16, 0), refreshed.header.domains);
+    try std.testing.expectEqual(@as(u64, 13), refreshed.header.metadata_floor);
+    try std.testing.expectEqual(@as(u32, 1), txn.map.count());
+}

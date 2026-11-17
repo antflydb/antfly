@@ -26084,6 +26084,84 @@ pub const DB = struct {
         return .{ .root = query.root, .cut = position, .quota = try source_plan_control.storage.readQuota(txn, query.root), .status = if (query.spec) |spec| try source_plan_control.storage.inspect(self.alloc, txn, query.root, spec) else null };
     }
 
+    /// Trusted data-Raft control only. The serving owner obtains fresh metadata
+    /// authorization and the all-member decoder barrier before proposing. This
+    /// layer owns physical identity, exact replay and atomic rejection markers.
+    pub fn applyOrderedSourceScopeControl(self: *DB, command: @import("../source_scope_control.zig").Command, entry: OrderedApplyReceipt, bypass_write_gate: bool) !@import("../source_scope_ordered.zig").Outcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedSourceScopeControl", .{ self, command, entry, bypass_write_gate });
+        const control = @import("../source_scope_control.zig");
+        const ordered = @import("../source_scope_ordered.zig");
+        try command.validate();
+        try self.requireSourcePlanAvailable();
+        const owner = command.intent.owner;
+        const root: source_plan_control.storage.Root = .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() };
+        var replication_mutation = if (bypass_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!bypass_write_gate) try self.enforceReplicationWriteGate();
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.requireSourcePlanAvailable();
+        try self.requireSourcePlanPhysicalRoot(root);
+        const cut: control.scope.Cut = .{ .term = entry.term, .index = entry.index };
+        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+            .already_applied => {
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                _ = try self.requireSourcePlanRoot(&read, root);
+                return ordered.replay(self.alloc, &read, command, cut);
+            },
+            .apply => {},
+        }
+        // Strict roots no longer need migration authorization. A scalar metadata
+        // cut, empty scope registry or absent source txn cannot establish that
+        // old unlabelled production CDC writes have drained. Genuine persisted
+        // worker handover must replace this gate before first activation opens.
+        const Handover = struct {
+            pub fn requireLegacyDrained(_: @This(), _: anytype, _: control.scope.Basis) !void {
+                return error.SourcePendingWork;
+            }
+        };
+        var rejection: ?ordered.Rejection = null;
+        while (true) {
+            var txn = try self.core.store.beginWriteTxn();
+            var txn_open = true;
+            defer if (txn_open) txn.abort();
+            if (try doc_identity.loadNamespaceTxn(&txn)) |persisted| {
+                if (!persisted.eql(self.core.identity_namespace)) return error.HistoryResynchronizationRequired;
+            } else try doc_identity.writeNamespaceTxn(&txn, self.core.identity_namespace);
+            try @import("../source_authority.zig").bind(&txn, .raft, root.namespace);
+            _ = try self.requireSourcePlanRoot(&txn, root);
+            const outcome: ordered.Outcome = if (rejection) |reason| .{ .rejected = reason } else .{
+                .applied = control.apply(self.alloc, &txn, Handover{}, command, cut) catch |err| {
+                    rejection = ordered.Rejection.fromError(err) orelse return err;
+                    continue;
+                },
+            };
+            try ordered.stage(self.alloc, &txn, command, cut, outcome);
+            var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+            try txn.put(marker.key, marker.value);
+            try txn.commit();
+            txn_open = false;
+            return outcome;
+        }
+    }
+
+    pub fn orderedSourceScopeOutcome(self: *DB, recovery: @import("../source_scope_ordered.zig").Recovery) !@import("../source_scope_ordered.zig").Outcome {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedSourceScopeOutcome", .{ self, recovery });
+        try recovery.validate();
+        try self.requireSourcePlanAvailable();
+        const owner = recovery.command.intent.owner;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() });
+        const cut = try orderedHistoryReadCut(&txn, recovery.minimum_applied_index);
+        if (cut.index == recovery.entry.index and cut.term != recovery.entry.term) return error.ConflictingOrderedApplyReceipt;
+        return @import("../source_scope_ordered.zig").replay(self.alloc, &txn, recovery.command, recovery.entry);
+    }
+
     /// The serving owner establishes and revalidates ReadIndex and the complete
     /// catalog owner. Native identity, real apply cut and registry share a read.
     pub fn sourceScopeObservation(self: *DB, query: @import("../source_scope_control.zig").Query) !@import("../source_scope_control.zig").Observation {
@@ -154406,4 +154484,10 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
         count += 1;
     }
     try std.testing.expect(count > 3);
+}
+
+test "db ordered source scope controls fence legacy activation and recover native outcomes" {
+    var directory = try TestDirectory.init("source-scope-control");
+    defer directory.cleanup();
+    try @import("source_scope_control_native_test.zig").run(std.testing.allocator, directory.path());
 }
