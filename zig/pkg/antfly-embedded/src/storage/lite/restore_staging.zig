@@ -708,14 +708,17 @@ fn portableFileMetadataAlloc(allocator: Allocator, io: std.Io, file: std.Io.File
                     self.has_runtime_schema = true;
                 } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema_json")) {
                     self.has_public_schema = true;
+                    const replacement = try self.allocator.dupe(u8, entry.value);
                     self.allocator.free(self.schema_json.*);
-                    self.schema_json.* = try self.allocator.dupe(u8, entry.value);
+                    self.schema_json.* = replacement;
                 } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:indexes")) {
+                    const replacement = try self.allocator.dupe(u8, entry.value);
                     if (self.raw_indexes_json.*) |value| self.allocator.free(value);
-                    self.raw_indexes_json.* = try self.allocator.dupe(u8, entry.value);
+                    self.raw_indexes_json.* = replacement;
                 } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:enrichments")) {
+                    const replacement = try self.allocator.dupe(u8, entry.value);
                     if (self.raw_enrichments_json.*) |value| self.allocator.free(value);
-                    self.raw_enrichments_json.* = try self.allocator.dupe(u8, entry.value);
+                    self.raw_enrichments_json.* = replacement;
                 }
             }
         }

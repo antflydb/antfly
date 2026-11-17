@@ -257,6 +257,19 @@ backups retain their bytes; Lite exports retain the metadata from the same
 snapshot as their documents. A native AFB2 bundle keeps its native representation.
 Delta bundles need their base and are not supported by this input path.
 
+When upgrading from a release that interpreted filesystem backup URIs relative
+to the connection root, update backup and restore commands to name the existing
+directory by its absolute path. For example, with a connection rooted at
+`/srv/antfly/backups`, change `file:///nightly` to
+`file:///srv/antfly/backups/nightly`. Keep the same connection and backup ID.
+The existing backup files can stay where they are.
+
+Native Lite sparse indexes that extract vectors directly from document fields
+cannot be represented by the server's public index catalog. Restore those
+backups to Lite to retain direct-field indexing. For a server transfer, prepare
+an explicit external sparse index and supply its vectors as embedding artifacts
+before exporting.
+
 For an offline source inventory and compatibility report, use:
 
 ```bash

@@ -33,10 +33,10 @@ pytestmark = pytest.mark.e2e_resource("antfly_process")
 
 
 @pytest.mark.parametrize(
-    "schema_version,legacy_sparse", [(0, False), (3, False), (0, True)]
+    "schema_version,direct_sparse", [(0, False), (3, False), (0, True)]
 )
 def test_lite_server_backup_roundtrip_under_connection_root(
-    tmp_path, schema_version, legacy_sparse
+    tmp_path, schema_version, direct_sparse
 ):
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     root = (tmp_path / "backups").resolve()
@@ -63,7 +63,7 @@ def test_lite_server_backup_roundtrip_under_connection_root(
     }
     env.pop("ANTFLY_TOKEN", None)
 
-    def cli(*args):
+    def cli(*args, check=True):
         result = subprocess.run(
             [binary, *([] if args[0] == "lite" else ["--no-agent"]), *map(str, args)],
             env=env,
@@ -71,7 +71,7 @@ def test_lite_server_backup_roundtrip_under_connection_root(
             text=True,
             timeout=120,
         )
-        assert result.returncode == 0, (
+        assert not check or result.returncode == 0, (
             result.stdout
             + result.stderr
             + "\nSERVER:\n"
@@ -213,7 +213,7 @@ def test_lite_server_backup_roundtrip_under_connection_root(
                     "config_json": json.dumps(
                         {
                             "field": "embedding",
-                            **({} if legacy_sparse else {"external": True}),
+                            **({} if direct_sparse else {"external": True}),
                         }
                     ),
                 }
@@ -238,6 +238,32 @@ def test_lite_server_backup_roundtrip_under_connection_root(
         assert initial["responses"][0]["hits"]["hits"][0]["_id"] == "a", initial
         portable = tmp_path / "seed.afb"
         cli("lite", "backup", seed, "--out", portable)
+        if direct_sparse:
+            result = cli(
+                "restore",
+                "--input",
+                portable,
+                "--table",
+                "direct_sparse",
+                "--connection",
+                "bk",
+                "--location",
+                root.as_uri(),
+                "--url",
+                server.url,
+                "--wait",
+                check=False,
+            )
+            assert result.returncode != 0
+            assert "UnsupportedEmbeddedLiteIndex" in result.stderr
+            assert (
+                requests.get(
+                    server.api_url + "/tables/direct_sparse", timeout=10
+                ).status_code
+                == 404
+            )
+            failed = False
+            return
         for name, source in [("from_file", seed), ("from_archive", portable)]:
             location = root / name
             cli(
@@ -270,6 +296,19 @@ def test_lite_server_backup_roundtrip_under_connection_root(
         )
         expect_docs("promoted")
         for format in ("portable", "native"):
+            if format == "native":
+                alias = requests.put(
+                    server.api_url + "/tables/from_file/index-aliases/live",
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                    json={
+                        "index": "sparse_vectors",
+                        "idempotency_key": "restore-alias",
+                        "require": "queryable",
+                    },
+                    timeout=10,
+                )
+                assert alias.ok, alias.text
+                source_etag = alias.headers["ETag"]
             output = tmp_path / f"server-{format}.afb"
             cli(
                 "backup",
@@ -305,6 +344,14 @@ def test_lite_server_backup_roundtrip_under_connection_root(
                 "--wait",
             )
             expect_docs(f"returned_{format}")
+            if format == "native":
+                restored_alias = requests.get(
+                    server.api_url + "/tables/returned_native/index-aliases/live",
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                    timeout=10,
+                )
+                assert restored_alias.ok, restored_alias.text
+                assert restored_alias.headers["ETag"] != source_etag
             if format == "portable":
                 restored = tmp_path / "returned.aflite"
                 cli("lite", "restore", output, "--out", restored)

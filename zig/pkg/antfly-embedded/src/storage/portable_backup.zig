@@ -7941,7 +7941,7 @@ test "public catalog translation preserves runtime config and incarnation" {
     defer a.free(again);
     try std.testing.expectEqualStrings(translated, again);
     const vectors = try publicTableIndexesJsonAlloc(a,
-        \\{"dense":{"kind":"dense_vector","config_json":"{\"dims\":2,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"dense\",\"field\":\"embedding\"}"},"sparse":{"kind":"sparse_vector","config_json":"{\"field\":\"embedding\"}"},"links":{"kind":"graph","config_json":"{}"}}
+        \\{"dense":{"kind":"dense_vector","config_json":"{\"dims\":2,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"dense\",\"field\":\"embedding\"}"},"sparse":{"kind":"sparse_vector","config_json":"{\"field\":\"embedding\",\"external\":true}"},"links":{"kind":"graph","config_json":"{}"}}
     , .table_restore);
     defer a.free(vectors);
     var public = try std.json.parseFromSlice(std.json.Value, a, vectors, .{});
@@ -7966,6 +7966,9 @@ test "public catalog translation preserves runtime config and incarnation" {
     , .table_restore));
     try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,
         \\{"sparse":{"kind":"sparse_vector","config_json":"{\"field\":\"body\"}"}}
+    , .table_restore));
+    try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,
+        \\{"sparse":{"kind":"sparse_vector","config_json":"{\"field\":\"embedding\"}"}}
     , .table_restore));
     try std.testing.expectEqualStrings("graph", public.value.object.get("links").?.object.get("type").?.string);
     try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,

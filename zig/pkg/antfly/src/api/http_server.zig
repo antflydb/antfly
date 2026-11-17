@@ -13639,15 +13639,16 @@ pub const ApiHttpServer = struct {
             previous_definition = (try self.loadOwnedTableRecord(self.alloc, table_name)) orelse return error.TableNotFound;
             // Keep authenticated source bytes for storage validation. Only the
             // destination definition loses source-owned operational checkpoints.
-            replacement_indexes = try @import("antfly_local_sources").privacy_catalog.prepareRestore(self.alloc, manifest.indexes_json);
+            if (!created_metadata) replacement_indexes = try @import("antfly_local_sources").privacy_catalog.prepareRestore(self.alloc, manifest.indexes_json);
+            const destination_indexes = replacement_indexes orelse previous_definition.?.indexes_json;
             var destination_manifest = manifest;
-            destination_manifest.indexes_json = replacement_indexes.?;
+            destination_manifest.indexes_json = destination_indexes;
             if (!try tableDefinitionMatchesManifest(self.alloc, previous_definition.?, &destination_manifest)) {
                 var replacement = previous_definition.?;
                 replacement.description = manifest.description;
                 replacement.schema_json = manifest.schema_json;
                 replacement.read_schema_json = "";
-                replacement.indexes_json = replacement_indexes.?;
+                replacement.indexes_json = destination_indexes;
                 replacement.replication_sources_json = manifest.replication_sources_json;
                 replacement.restore_backup_id = "";
                 replacement.restore_location = "";
@@ -15187,6 +15188,7 @@ pub const ApiHttpServer = struct {
             error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
             error.ReembedSetupRetry => return error.ReembedSetupRetry,
             error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
+            error.ForeignQueryFailed => return error.ForeignQueryFailed,
             error.LibpqUnavailable => return error.LibpqUnavailable,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation => return error.GraphMinWeightDomainViolation,
@@ -15547,6 +15549,7 @@ pub const ApiHttpServer = struct {
                 error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
                 error.ReembedSetupRetry => return error.ReembedSetupRetry,
                 error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
+                error.ForeignQueryFailed => return error.ForeignQueryFailed,
                 error.LibpqUnavailable => return error.LibpqUnavailable,
                 error.GraphWorkBudgetExceeded,
                 error.GraphMinWeightDomainViolation,
@@ -15627,6 +15630,7 @@ pub const ApiHttpServer = struct {
             error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
             error.ReembedSetupRetry => return error.ReembedSetupRetry,
             error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
+            error.ForeignQueryFailed => return error.ForeignQueryFailed,
             error.LibpqUnavailable => return error.LibpqUnavailable,
             error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation,
@@ -15754,6 +15758,7 @@ pub const ApiHttpServer = struct {
             error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
             error.ReembedSetupRetry => return error.ReembedSetupRetry,
             error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
+            error.ForeignQueryFailed => return error.ForeignQueryFailed,
             error.LibpqUnavailable => return error.LibpqUnavailable,
             error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation,
@@ -23926,8 +23931,9 @@ pub const ApiHttpServer = struct {
         err: anyerror,
     ) !contextual_operations.OwnedResponse {
         return switch (err) {
-            error.ForeignConnectionFailed => try contextualForeignSourceFailureResponse(self.alloc, table_name, false),
-            error.LibpqUnavailable => try contextualForeignSourceFailureResponse(self.alloc, table_name, true),
+            error.ForeignConnectionFailed => try contextualForeignSourceFailureResponse(self.alloc, table_name, .connection),
+            error.ForeignQueryFailed => try contextualForeignSourceFailureResponse(self.alloc, table_name, .execution),
+            error.LibpqUnavailable => try contextualForeignSourceFailureResponse(self.alloc, table_name, .driver),
             error.ObjectTableJoinUnsupported => try contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported"),
             error.Forbidden => try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden"),
             error.PreparedGenerationChanged, error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
@@ -28574,8 +28580,8 @@ fn contextualQueryTemporarilyUnavailableResponse(
     return try contextualResponseFromPublicTable(alloc, response);
 }
 
-fn contextualForeignSourceFailureResponse(alloc: std.mem.Allocator, source: []const u8, driver_unavailable: bool) !contextual_operations.OwnedResponse {
-    var response = try public_table_http.foreignSourceFailureOwnedResponse(alloc, source, driver_unavailable);
+fn contextualForeignSourceFailureResponse(alloc: std.mem.Allocator, source: []const u8, failure: public_table_http.ForeignSourceFailure) !contextual_operations.OwnedResponse {
+    var response = try public_table_http.foreignSourceFailureOwnedResponse(alloc, source, failure);
     defer response.deinit(alloc);
     return try contextualResponseFromPublicTable(alloc, response);
 }
