@@ -7101,6 +7101,10 @@ pub const NativeFile = struct {
     last_synced_header: ?Header = null,
     change_capture: ?*ChangeCapture = null,
     read_only: bool = false,
+    /// Set on a maintenance snapshot's file: its store forwards every write
+    /// to the writer (lite-writer-authority.md W1), so this file never
+    /// begins a transaction.
+    forwarding_only: bool = false,
     no_sync: bool = false,
     /// When set, durability barriers (`syncIfRequired`) call
     /// `antfly_platform.filesystem.syncData` directly on the raw handle
@@ -19235,6 +19239,9 @@ pub const NativeFile = struct {
     /// transaction. Intermediate roots are private; existing pinned readers
     /// continue reading immutable pages from their own checkpoint.
     pub fn beginTransaction(self: *NativeFile) !void {
+        // lite-writer-authority.md W1: a maintenance snapshot's writes all
+        // forward to the writer's store; this file never begins one.
+        std.debug.assert(!self.forwarding_only);
         if (self.read_only) return error.ReadOnly;
         if (self.transaction_header != null) return error.TransactionAlreadyActive;
         // A previous commit's durability is unknown. Try to resolve it from
