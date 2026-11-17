@@ -20263,6 +20263,7 @@ pub const ProvisionedTableWriteSource = struct {
                 batcher.vtable.batch_group_routed_with_cancellation != null
             else
                 self.standalone_sql_range_guards and (self.groupLocalWriteSource() != null or self.write_cache != null),
+            .supports_transaction_producer_phases = true,
             .vtable = &.{
                 .activate_range_tracking = activateRangeTracking,
                 .create_table = createTable,
@@ -23465,7 +23466,7 @@ pub const ProvisionedTableWriteSource = struct {
             try self.applyRestoreStagingBatch(alloc, table_name, group_id, .{
                 .restore_staging_scope = scope,
                 .restore_staging_plan_id = context.restore_staging_plan_id,
-                .transaction = .{ .begin = .{ .txn_id = txn_id, .begin_timestamp = begin_timestamp, .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null), .topology_epoch = topology_epoch, .retain_terminal = retain_terminal, .participants = participants } },
+                .transaction = .{ .begin = .{ .ordinary_producer = context.source_producer == .ordinary, .legacy_producer = context.source_producer == .legacy_cdc, .txn_id = txn_id, .begin_timestamp = begin_timestamp, .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null), .topology_epoch = topology_epoch, .retain_terminal = retain_terminal, .participants = participants } },
             }, context);
             return {};
         }
@@ -23474,6 +23475,8 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
                 .transaction = .{ .begin = .{
+                    .ordinary_producer = context.source_producer == .ordinary,
+                    .legacy_producer = context.source_producer == .legacy_cdc,
                     .txn_id = txn_id,
                     .begin_timestamp = begin_timestamp,
                     .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
@@ -23487,7 +23490,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const owner = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            return try owner.txnBeginGroupLocal(
+            return try owner.txnBeginGroupLocalWithPreDecisionContext(
                 alloc,
                 group_id,
                 table_name,
@@ -23496,10 +23499,11 @@ pub const ProvisionedTableWriteSource = struct {
                 topology_epoch,
                 retain_terminal,
                 participants,
+                context,
             );
         }
         if (self.groupLocalWriteSource()) |owner|
-            return try owner.txnBeginGroupLocal(
+            return try owner.txnBeginGroupLocalWithPreDecisionContext(
                 alloc,
                 group_id,
                 table_name,
@@ -23508,6 +23512,7 @@ pub const ProvisionedTableWriteSource = struct {
                 topology_epoch,
                 retain_terminal,
                 participants,
+                context,
             );
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -23516,6 +23521,8 @@ pub const ProvisionedTableWriteSource = struct {
             defer cached.deinit(alloc);
             try ensurePreDecisionContextActive(context);
             try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, .{ .transaction = .{ .begin = .{
+                .ordinary_producer = context.source_producer == .ordinary,
+                .legacy_producer = context.source_producer == .legacy_cdc,
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
@@ -23532,6 +23539,8 @@ pub const ProvisionedTableWriteSource = struct {
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try ensurePreDecisionContextActive(context);
             try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, .{ .transaction = .{ .begin = .{
+                .ordinary_producer = context.source_producer == .ordinary,
+                .legacy_producer = context.source_producer == .legacy_cdc,
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
@@ -23593,7 +23602,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .graph_writes = req.graph_writes,
                 .graph_deletes = req.graph_deletes,
                 .predicates = req.predicates,
-                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .ordinary_producer = req.completion_ordinary_producer, .legacy_producer = req.completion_legacy_producer } },
                 .integrity = req.integrity,
                 .integrity_commands = req.integrity_commands,
                 .range_guards = req.range_guards,
@@ -23623,7 +23632,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .graph_writes = req.graph_writes,
                 .graph_deletes = req.graph_deletes,
                 .predicates = req.predicates,
-                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .ordinary_producer = req.completion_ordinary_producer, .legacy_producer = req.completion_legacy_producer } },
                 .integrity = req.integrity,
                 .integrity_commands = req.integrity_commands,
                 .range_guards = req.range_guards,
@@ -25808,6 +25817,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         return .{
             .ptr = self,
             .supports_transaction_producers = true,
+            .supports_transaction_producer_phases = true,
             .vtable = &.{
                 .drop_table = dropTable,
                 .activate_range_tracking = activateRangeTrackingHosted,
@@ -26986,6 +26996,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             .restore_staging_scope = context.restore_staging_scope,
             .restore_staging_plan_id = context.restore_staging_plan_id,
             .transaction = .{ .begin = .{
+                .ordinary_producer = context.source_producer == .ordinary,
+                .legacy_producer = context.source_producer == .legacy_cdc,
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null),
@@ -27030,7 +27042,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             .graph_writes = req.graph_writes,
             .graph_deletes = req.graph_deletes,
             .predicates = req.predicates,
-            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .ordinary_producer = req.completion_ordinary_producer, .legacy_producer = req.completion_legacy_producer } },
             .integrity = req.integrity,
             .integrity_commands = req.integrity_commands,
             .range_guards = req.range_guards,

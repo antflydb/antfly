@@ -40,6 +40,7 @@ const table_participant_v3_prefix = @import("antfly_local_sources").api_local_tr
 pub const group_participant_marker = @import("antfly_local_sources").api_local_transaction_contract.group_participant_marker;
 
 pub const TxnBeginRequest = struct {
+    source_producer: @FieldType(db_mod.types.BatchRequest, "source_producer") = .unlabelled,
     txn_id: db_mod.types.TxnId,
     begin_timestamp: u64,
     topology_epoch: u64 = 0,
@@ -491,6 +492,7 @@ pub const HostedParticipantWorker = struct {
                     if (err == error.Timeout) return error.PreDecisionNotProposed;
                     return err;
                 };
+                context.source_producer = req.source_producer;
                 context.restore_staging_scope = req.restore_staging_scope;
                 context.restore_staging_plan_id = req.restore_staging_plan_id;
                 const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
@@ -641,6 +643,7 @@ pub const HostedParticipantWorker = struct {
                 if (err == error.Timeout) return false;
                 return err;
             };
+            context.source_producer = req.source_producer;
             context.restore_staging_scope = req.restore_staging_scope;
             context.restore_staging_plan_id = req.restore_staging_plan_id;
             const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
@@ -1073,7 +1076,7 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn beginGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        _ = (try self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, .{ .restore_staging_scope = req.restore_staging_scope, .restore_staging_plan_id = req.restore_staging_plan_id })) orelse return error.UnknownGroup;
+        _ = (try self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, .{ .source_producer = req.source_producer, .restore_staging_scope = req.restore_staging_scope, .restore_staging_plan_id = req.restore_staging_plan_id })) orelse return error.UnknownGroup;
     }
 
     fn prepareGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
@@ -1626,6 +1629,7 @@ fn executeMultiTableCommitOnce(
     if (participants.items.len > 0) coordinator_begin: {
         const participant = participants.items[0];
         worker.beginGroup(alloc, participant.group_id, participant.table_name, .{
+            .source_producer = participant.source_producer,
             .txn_id = txn_id,
             .begin_timestamp = begin_timestamp,
             .topology_epoch = participant.topology_epoch,
@@ -2205,6 +2209,7 @@ const BeginFanoutTask = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         worker.beginGroup(arena.allocator(), participant.group_id, participant.table_name, .{
+            .source_producer = participant.source_producer,
             .txn_id = txn_id,
             .begin_timestamp = begin_timestamp,
             .topology_epoch = participant.topology_epoch,
@@ -2505,11 +2510,48 @@ pub fn parseTxnIdHex(text: []const u8) !db_mod.types.TxnId {
     return out;
 }
 
+const TransactionProducer = @FieldType(db_mod.types.BatchRequest, "source_producer");
+fn requireGenericProducer(producer: TransactionProducer) !void {
+    if (producer == .scoped_source) return error.InvalidTxnRequest;
+}
+fn appendProducerEnvelope(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), tag: []const u8, producer: TransactionProducer) !void {
+    try requireGenericProducer(producer);
+    if (producer == .unlabelled) return;
+    const prefix = try std.fmt.allocPrint(alloc, "[\"{s}\",\"{s}\",", .{ tag, @tagName(producer) });
+    defer alloc.free(prefix);
+    try out.appendSlice(alloc, prefix);
+}
+fn appendProducerMarker(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), producer: TransactionProducer) !void {
+    if (producer == .unlabelled) return;
+    const marker = try std.fmt.allocPrint(alloc, ",\"source_producer\":\"{s}\"", .{@tagName(producer)});
+    defer alloc.free(marker);
+    try out.appendSlice(alloc, marker);
+}
+const ProducerEnvelope = struct { root: std.json.Value, producer: TransactionProducer = .unlabelled };
+fn unwrapProducerEnvelope(value: std.json.Value, tag: []const u8) !ProducerEnvelope {
+    if (value != .array) return .{ .root = value };
+    const entries = value.array.items;
+    if (entries.len == 0 or entries[0] != .string or !std.mem.eql(u8, entries[0].string, tag)) return .{ .root = value };
+    if (entries.len != 3 or entries[1] != .string) return error.InvalidTxnRequest;
+    const producer = std.meta.stringToEnum(TransactionProducer, entries[1].string) orelse return error.InvalidTxnRequest;
+    if (producer != .ordinary and producer != .legacy_cdc) return error.InvalidTxnRequest;
+    return .{ .root = entries[2], .producer = producer };
+}
+fn requireProducerMarker(obj: std.json.ObjectMap, producer: TransactionProducer) !void {
+    if (producer == .unlabelled) {
+        if (obj.contains("source_producer")) return error.InvalidTxnRequest;
+        return;
+    }
+    const marker = obj.get("source_producer") orelse return error.InvalidTxnRequest;
+    if (marker != .string or !std.mem.eql(u8, marker.string, @tagName(producer))) return error.InvalidTxnRequest;
+}
+
 pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]u8 {
     try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
     const txn_hex = encodeTxnIdHex(req.txn_id);
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
+    try appendProducerEnvelope(alloc, &out, "producer-begin-v1", req.source_producer);
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
     try out.appendSlice(alloc, "\",\"begin_timestamp\":");
@@ -2537,15 +2579,21 @@ pub fn encodeTxnBeginRequest(alloc: std.mem.Allocator, req: TxnBeginRequest) ![]
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
+    try appendProducerMarker(alloc, &out, req.source_producer);
     try out.appendSlice(alloc, "}");
+    if (req.source_producer != .unlabelled) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
 pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest) ![]u8 {
+    if (req.req.completion_owner != null or req.req.completion_input_digest != null or req.req.completion_source_purpose != null or req.req.completion_source_scope != null or req.req.completion_source_checkpoint != null or req.req.source_admission != null) return error.InvalidTxnRequest;
+    if (req.req.completion_ordinary_producer and req.req.completion_legacy_producer) return error.InvalidTxnRequest;
+    const producer: TransactionProducer = if (req.req.completion_ordinary_producer) .ordinary else if (req.req.completion_legacy_producer) .legacy_cdc else .unlabelled;
     try validateRestorePlan(req.req.restore_staging_scope, req.req.restore_staging_plan_id);
     const txn_hex = encodeTxnIdHex(req.txn_id);
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
+    try appendProducerEnvelope(alloc, &out, "producer-prepare-v1", producer);
     const guarded = req.req.range_guards.len != 0;
     const row_semantics = @import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
     if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
@@ -2679,8 +2727,10 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
+    try appendProducerMarker(alloc, &out, producer);
     try out.append(alloc, '}');
     if (guarded or row_semantics) try out.append(alloc, ']');
+    if (producer != .unlabelled) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -2798,12 +2848,14 @@ pub fn encodeTxnStatusResponse(alloc: std.mem.Allocator, response: TxnStatusResp
 }
 
 pub fn parseTxnBeginRequest(alloc: std.mem.Allocator, body: []const u8) !TxnBeginRequest {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .duplicate_field_behavior = .@"error" });
     defer parsed.deinit();
-    const obj = switch (parsed.value) {
+    const envelope = try unwrapProducerEnvelope(parsed.value, "producer-begin-v1");
+    const obj = switch (envelope.root) {
         .object => |obj| obj,
         else => return error.InvalidTxnRequest,
     };
+    try requireProducerMarker(obj, envelope.producer);
     const txn_id = try parseTxnIdHex(requireString(obj, "txn_id"));
     const begin_timestamp = try requireU64(obj, "begin_timestamp");
     const participants_value = obj.get("participants") orelse return error.InvalidTxnRequest;
@@ -2826,6 +2878,7 @@ pub fn parseTxnBeginRequest(alloc: std.mem.Allocator, body: []const u8) !TxnBegi
     }
     const restore_scope = if (obj.get("restore_staging_scope")) |value| try integrity_wire.parseGenerationSet(value) else null;
     return .{
+        .source_producer = envelope.producer,
         .txn_id = txn_id,
         .begin_timestamp = begin_timestamp,
         .restore_staging_scope = restore_scope,
@@ -2846,21 +2899,23 @@ pub fn freeTxnBeginRequest(alloc: std.mem.Allocator, req: *TxnBeginRequest) void
 }
 
 pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPrepareRequest {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false, .duplicate_field_behavior = .@"error" });
     defer parsed.deinit();
-    const wrapped = parsed.value == .array;
+    const envelope = try unwrapProducerEnvelope(parsed.value, "producer-prepare-v1");
+    const wrapped = envelope.root == .array;
     var row_semantics = false;
     const root = if (wrapped) blk: {
-        const entries = parsed.value.array.items;
+        const entries = envelope.root.array.items;
         if (entries.len != 2 or entries[0] != .string) return error.InvalidTxnRequest;
         row_semantics = std.mem.eql(u8, entries[0].string, "row-semantics-prepare-v1");
         if (!row_semantics and !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
         break :blk entries[1];
-    } else parsed.value;
+    } else envelope.root;
     const obj = switch (root) {
         .object => |obj| obj,
         else => return error.InvalidTxnRequest,
     };
+    try requireProducerMarker(obj, envelope.producer);
     var extensions = try std.json.parseFromValue(PrepareExtensions, alloc, root, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     errdefer extensions.deinit();
     const ext = extensions.value;
@@ -2917,6 +2972,8 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
         .txn_id = txn_id,
         .topology_epoch = try optionalU64(obj, "topology_epoch"),
         .req = .{
+            .completion_ordinary_producer = envelope.producer == .ordinary,
+            .completion_legacy_producer = envelope.producer == .legacy_cdc,
             .row_policy_principal_proof = ext.row_policy_principal_proof,
             .row_policy_database = ext.row_policy_database,
             .row_policy_admitted_at_seconds = ext.row_policy_admitted_at_seconds,
@@ -7193,4 +7250,71 @@ test "distributed txn prepare retains signed graph mutations and normalized rows
     var decoded = try parseTxnPrepareRequest(alloc, encoded);
     defer freeTxnPrepareRequest(alloc, &decoded);
     try std.testing.expectEqualDeep(request.req, decoded.req);
+}
+
+test "distributed txn producer RPC envelopes preserve origin through nested row semantics and refuse downgrade" {
+    const a = std.testing.allocator;
+    for ([_]TransactionProducer{ .ordinary, .legacy_cdc }) |producer| {
+        const begin: TxnBeginRequest = .{ .source_producer = producer, .txn_id = @splat(19), .begin_timestamp = 100, .topology_epoch = 3, .participants = &.{"participant"}, .restore_staging_scope = @splat(21), .restore_staging_plan_id = @splat(22) };
+        const begin_bytes = try encodeTxnBeginRequest(a, begin);
+        defer a.free(begin_bytes);
+        var begin_decoded = try parseTxnBeginRequest(a, begin_bytes);
+        defer freeTxnBeginRequest(a, &begin_decoded);
+        try std.testing.expectEqualDeep(begin, begin_decoded);
+        const prepare: TxnPrepareRequest = .{ .txn_id = begin.txn_id, .topology_epoch = begin.topology_epoch, .req = .{ .completion_ordinary_producer = producer == .ordinary, .completion_legacy_producer = producer == .legacy_cdc, .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }} } };
+        const prepare_bytes = try encodeTxnPrepareRequest(a, prepare);
+        defer a.free(prepare_bytes);
+        var prepare_decoded = try parseTxnPrepareRequest(a, prepare_bytes);
+        defer freeTxnPrepareRequest(a, &prepare_decoded);
+        try std.testing.expectEqual(producer == .ordinary, prepare_decoded.req.completion_ordinary_producer);
+        try std.testing.expectEqual(producer == .legacy_cdc, prepare_decoded.req.completion_legacy_producer);
+        try std.testing.expectEqualDeep(prepare.req.writes[0].json_null_fields, prepare_decoded.req.writes[0].json_null_fields);
+        var empty = prepare;
+        empty.req.writes = &.{};
+        const empty_bytes = try encodeTxnPrepareRequest(a, empty);
+        defer a.free(empty_bytes);
+        var empty_decoded = try parseTxnPrepareRequest(a, empty_bytes);
+        defer freeTxnPrepareRequest(a, &empty_decoded);
+        try std.testing.expectEqual(producer == .ordinary, empty_decoded.req.completion_ordinary_producer);
+        try std.testing.expectEqual(producer == .legacy_cdc, empty_decoded.req.completion_legacy_producer);
+        for ([_][]const u8{ begin_bytes, prepare_bytes }, [_]bool{ true, false }) |bytes, is_begin| {
+            var json = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always });
+            defer json.deinit();
+            const inner_bytes = try std.json.Stringify.valueAlloc(a, json.value.array.items[2], .{});
+            defer a.free(inner_bytes);
+            if (is_begin)
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnBeginRequest(a, inner_bytes))
+            else
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(a, inner_bytes));
+            json.value.array.items[1] = .{ .string = if (producer == .ordinary) "legacy_cdc" else "ordinary" };
+            const substituted = try std.json.Stringify.valueAlloc(a, json.value, .{});
+            defer a.free(substituted);
+            if (is_begin)
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnBeginRequest(a, substituted))
+            else
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(a, substituted));
+            json.value.array.items[1] = .{ .string = @tagName(producer) };
+            const body = if (is_begin) &json.value.array.items[2] else &json.value.array.items[2].array.items[1];
+            _ = body.object.swapRemove("source_producer");
+            const stripped = try std.json.Stringify.valueAlloc(a, json.value, .{});
+            defer a.free(stripped);
+            if (is_begin)
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnBeginRequest(a, stripped))
+            else
+                try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(a, stripped));
+        }
+        var invalid = prepare;
+        invalid.req.completion_input_digest = @splat(1);
+        try std.testing.expectError(error.InvalidTxnRequest, encodeTxnPrepareRequest(a, invalid));
+    }
+    const older: TxnBeginRequest = .{ .txn_id = @splat(1), .begin_timestamp = 10, .participants = &.{"participant"} };
+    const bytes = try encodeTxnBeginRequest(a, older);
+    defer a.free(bytes);
+    try std.testing.expect(bytes[0] == '{');
+    var decoded = try parseTxnBeginRequest(a, bytes);
+    defer freeTxnBeginRequest(a, &decoded);
+    try std.testing.expectEqual(TransactionProducer.unlabelled, decoded.source_producer);
+    var invalid = older;
+    invalid.source_producer = .scoped_source;
+    try std.testing.expectError(error.InvalidTxnRequest, encodeTxnBeginRequest(a, invalid));
 }

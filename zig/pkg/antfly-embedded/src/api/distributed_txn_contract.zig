@@ -40,6 +40,7 @@ pub const status_server_response_reserve_ms: u32 = 50;
 /// Process-local execution context established by the receiving node. This is
 /// never serialized directly across the wire.
 pub const PreDecisionContext = struct {
+    source_producer: @FieldType(db_types.BatchRequest, "source_producer") = .unlabelled,
     route_fence: ?@import("../metadata/catalog_route_contract.zig").CatalogRouteFence = null,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,

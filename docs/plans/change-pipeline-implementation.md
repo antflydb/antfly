@@ -6873,3 +6873,76 @@ The next required work carries origin through BEGIN RPC, participant context and
 all provider request reconstruction, qualifies multi-participant non-history
 routing, and only then enables production ingress assignment. First-strict
 activation remains closed and no original issue acceptance box is checked.
+
+### Producer-aware transaction RPC/context (qualification in progress)
+
+Participant BEGIN requests and process-local pre-decision context now retain the
+explicit producer. Both coordinator and follower fan-out retain it, including
+hosted local candidates and authenticated internal receivers. Reviewed bound,
+provisioned, hosted and native-owner phase providers preserve it on BEGIN and
+PREPARE reconstruction. Provisioned owner forwarding uses the full context
+instead of its older reduced BEGIN signature.
+
+The shared interface exposes a separate producer-phase capability: a reviewed
+phase provider need not claim to implement the entire table-commit interface.
+Labelled BEGIN/PREPARE refuses unreviewed callbacks; labelled BEGIN also refuses
+an absent context callback rather than invoking the older signature. Bound
+multi-table commit remains unqualified and retains its existing guard.
+
+Private RPC uses `producer-begin-v1` / `producer-prepare-v1` outer arrays, with an
+explicit ordinary/legacy label and a matching required marker in the object.
+PREPARE composes its existing guarded/row-semantics envelope inside that array.
+Older object readers reject the outer form. Upgraded readers reject stripped,
+missing, substituted or nested markers; absent older bodies stay unlabelled.
+Generic PREPARE explicitly refuses retained completion/source capabilities it
+cannot encode, rather than silently omitting them. Duplicate JSON keys fail
+closed. API kernel 37 and owner ABI 117 fence context/capability layouts; engine
+65, data 45, metadata 105 and failure 89 are unchanged.
+
+Added origin-envelope/restore/row-semantics adversarial round trips and shared
+phase capability checks. Full generation and source-catalog, engine-error and
+OpenAPI checks passed. Transaction and linked regression qualification is
+running (`source-producer-rpc-test.log`). The coordinator's labelled non-history
+fallback guard remains in place until actual end-to-end qualification; production
+CDC/public producer assignment is still disabled. No first-strict activation,
+legacy drainage, public-history completion or original acceptance is inferred.
+
+Repository-wide guarded cleanup completed
+(`source-nonhistory-producer-repo-gc.log`), removing 86.2 GiB of idle build output
+while preserving active and recent work; 88.2 GiB was free afterward.
+
+The first RPC transaction run passed 42 local cases and 74 existing integration
+cases, but the new round trip rejected PREPARE. Its encoder had placed the
+required marker in each row instead of the transaction object. The marker now
+lives on the transaction object, including empty/read-only PREPARE, and the
+corrected run passed all 42 and 75 cases
+(`source-producer-rpc-final-test.log`). The initial linked suite also passed six
+local and 37 linked cases (`source-producer-rpc-test.log`).
+
+Review found that bound native BEGIN's old path marked every record coordinator.
+The labelled path now validates unique canonical participant membership, checks
+an explicit bound group if present, derives coordinator role from the original
+first participant, and retains local-only membership for followers. Older
+unlabelled behavior remains compatible. Added an authenticated real-loopback
+HTTP/native DB qualification for both origins and both coordinator/follower
+roles across BEGIN/PREPARE/COMMIT. Final native HTTP and regression verification
+is running (`source-producer-rpc-http-test.log`); latest source-catalog,
+engine-error and OpenAPI checks passed
+(`source-producer-rpc-http-contract-check.log`). Multi-participant non-history
+coordinator fallback still requires its own end-to-end qualification before its
+guard can be removed. Production CDC/public origin assignment and all original
+issue requirements remain pending under the full active objective.
+
+Final verification passed (`source-producer-rpc-http-test.log`): 42 local
+transaction cases, 76 transaction integration cases, six local history cases and
+37 linked history/control cases, zero failures, skips or leaks. The real native
+HTTP test passed both ordinary/legacy origins and coordinator/follower roles
+across authenticated BEGIN/PREPARE/COMMIT with physical row visibility. Latest
+contract checks and `git diff --check` passed. Current versions are owner ABI
+117, API kernel 37, storage engine 65, data 45, metadata 105 and failure 89.
+Full generation passed (`source-producer-rpc-generate.log`); later source-only
+marker/role/test adjustments passed the focused contract and runtime checks.
+Original issue acceptance remains open. The next required qualification uses
+multiple physical participants and the actual coordinator path, followed by
+producer ingress assignment and the remaining original destination/history/feed/
+bootstrap/retention/pgoutput/client implementation.

@@ -90,6 +90,8 @@ pub const TableWriteSource = struct {
     /// Understood on supported transaction shapes; unsupported shapes fail
     /// explicitly rather than dropping an origin in a legacy fallback.
     supports_transaction_producers: bool = false,
+    /// Reviewed BEGIN/PREPARE callbacks preserve explicit native origin.
+    supports_transaction_producer_phases: bool = false,
 
     pub const VTable = struct {
         activate_range_tracking: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("operation.zig").RequestContext) anyerror!void = null,
@@ -1124,6 +1126,7 @@ pub const TableWriteSource = struct {
         topology_epoch: u64,
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
+        if ((req.completion_ordinary_producer or req.completion_legacy_producer) and !self.supports_transaction_producer_phases) return error.ChangefeedCapabilityUnsupported;
         const fn_ptr = self.vtable.txn_prepare_group_local orelse return null;
         return try BoundaryAbi.call("txn_prepare_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, topology_epoch, req });
     }
@@ -1140,6 +1143,8 @@ pub const TableWriteSource = struct {
         participants: []const []const u8,
         context: distributed_txn.PreDecisionContext,
     ) !?void {
+        if (context.source_producer == .scoped_source) return error.InvalidSourceAdmission;
+        if (context.source_producer != .unlabelled and (!self.supports_transaction_producer_phases or self.vtable.txn_begin_group_local_with_pre_decision_context == null)) return error.ChangefeedCapabilityUnsupported;
         const fn_ptr = self.vtable.txn_begin_group_local_with_pre_decision_context orelse
             return try self.txnBeginGroupLocal(alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants);
         return try BoundaryAbi.call("txn_begin_group_local_with_pre_decision_context", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants, context });
@@ -1155,6 +1160,7 @@ pub const TableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
         context: distributed_txn.PreDecisionContext,
     ) !?void {
+        if ((req.completion_ordinary_producer or req.completion_legacy_producer) and !self.supports_transaction_producer_phases) return error.ChangefeedCapabilityUnsupported;
         if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
         if (context.route_fence != null and self.vtable.txn_prepare_group_local_with_pre_decision_context == null) return error.CatalogRouteFenceUnsupported;
         const fn_ptr = self.vtable.txn_prepare_group_local_with_pre_decision_context orelse

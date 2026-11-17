@@ -953,6 +953,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn writeSource(self: *ProvisionedKernelOwnerSource) table_write_source.TableWriteSource {
         return .{
             .ptr = self,
+            .supports_transaction_producer_phases = true,
             .vtable = &.{
                 .batch = unsupportedTopLevelBatch,
                 .batch_group_local = batchGroupLocal,
@@ -6530,6 +6531,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             .restore_staging_scope = context.restore_staging_scope,
             .restore_staging_plan_id = context.restore_staging_plan_id,
             .transaction = .{ .begin = .{
+                .ordinary_producer = context.source_producer == .ordinary,
+                .legacy_producer = context.source_producer == .legacy_cdc,
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
                 .created_at_ns = platform_time.realtimeNs(),
@@ -6580,6 +6583,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             .restore_staging_scope = req.restore_staging_scope,
             .restore_staging_plan_id = req.restore_staging_plan_id,
             .transaction = .{ .prepare = .{
+                .ordinary_producer = req.completion_ordinary_producer,
+                .legacy_producer = req.completion_legacy_producer,
                 .txn_id = txn_id,
                 .topology_epoch = topology_epoch,
             } },

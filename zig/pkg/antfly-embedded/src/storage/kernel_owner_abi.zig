@@ -39,7 +39,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 114 fences legacy completion transaction producer layouts.
 // Version 115 fences explicit table transaction origin contracts.
 // Version 116 fences native/ordered non-history producer admission.
-pub const abi_version: u32 = 116;
+// Version 117 fences native producer pre-decision context layouts.
+pub const abi_version: u32 = 117;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

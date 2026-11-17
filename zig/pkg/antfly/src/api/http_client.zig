@@ -8354,3 +8354,57 @@ test "source scope control HTTP client preserves captured authority and never re
 test "source scope retirement client preserves owned exact recovery and refuses replay" {
     try @import("source_retirement_transport_test.zig").run(ApiHttpClient);
 }
+
+test "distributed txn producer HTTP preserves native origin and coordinator roles" {
+    const http_server = @import("http_server.zig");
+    const http_test_runtime = @import("http_test_runtime.zig");
+    const std_http_executor = @import("../raft/transport/std_http_executor.zig");
+    const bound_writes = @import("antfly_local_sources").api_local_table_writes;
+    const contract = @import("antfly_local_sources").api_local_transaction_contract;
+    const StatusSource = struct {
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("producer-native-http");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 7, .shard_id = 2, .range_id = 2 }, .online_source_authority = .native, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    var bound = bound_writes.BoundTableWriteSource.init("docs", &db);
+    bound.owner_group_id = 2;
+    var status_context: u8 = 0;
+    var server = http_server.ApiHttpServer.init(a, .{ .internal_service_secret = "producer-native-http-secret" }, .{ .ptr = &status_context, .vtable = &.{ .status = StatusSource.status } }, null, bound.source());
+    defer server.deinit();
+    var listener = try http_test_runtime.Runtime.startOwned(a, &server);
+    defer listener.deinit();
+    const base = try listener.baseUri(a);
+    defer a.free(base);
+    var executor = std_http_executor.StdHttpExecutor.init(a, .{});
+    defer executor.deinit();
+    var client = ApiHttpClient.init(a, executor.executor());
+    _ = client.withInternalServiceAuth("producer-native-http-secret", null);
+    const own = try contract.participantIdForGroupScoped(a, "docs", 2, null, null);
+    defer a.free(own);
+    const other = try contract.participantIdForGroupScoped(a, "docs", 1, null, null);
+    defer a.free(other);
+    for ([_]@FieldType(db_mod.types.BatchRequest, "source_producer"){ .ordinary, .legacy_cdc }, 0..) |producer, n| {
+        for ([_]bool{ true, false }, 0..) |coordinator, role| {
+            const id: [16]u8 = @splat(@intCast(30 + n * 2 + role));
+            const begin = try txn_api.encodeTxnBeginRequest(a, .{ .source_producer = producer, .txn_id = id, .begin_timestamp = 100, .retain_terminal = true, .participants = if (coordinator) &.{own} else &.{ other, own } });
+            defer a.free(begin);
+            _ = try client.fetchGroupTxnBegin(base, 2, "docs", begin);
+            try std.testing.expectEqual(coordinator, try db.transactionRetainsCoordinatorAcknowledgement(id));
+            const prepare = try txn_api.encodeTxnPrepareRequest(a, .{ .txn_id = id, .req = .{ .completion_ordinary_producer = producer == .ordinary, .completion_legacy_producer = producer == .legacy_cdc, .writes = &.{.{ .key = "row", .value = "{}" }} } });
+            defer a.free(prepare);
+            _ = try client.fetchGroupTxnPrepare(base, 2, "docs", prepare);
+            const resolve = try txn_api.encodeTxnResolveRequest(a, .{ .txn_id = id, .status = .committed, .commit_version = 200 + n * 2 + role, .sync_level = .write });
+            defer a.free(resolve);
+            _ = try client.fetchGroupTxnResolve(base, 2, "docs", resolve);
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try db.getTransactionStatus(id));
+        }
+    }
+    const row = (try db.get(a, "row")) orelse return error.TestExpectedProducerRow;
+    defer a.free(row);
+    try std.testing.expectEqualStrings("{}", row);
+}

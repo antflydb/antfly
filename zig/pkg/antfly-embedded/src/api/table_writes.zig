@@ -102,6 +102,7 @@ pub const BoundTableWriteSource = struct {
     pub fn source(self: *BoundTableWriteSource) TableWriteSource {
         return .{
             .ptr = self,
+            .supports_transaction_producer_phases = true,
             .vtable = &.{
                 .retire_source_attempt = retireSourceAttempt,
                 .native_history_consumer_control = nativeHistoryConsumerControl,
@@ -1280,8 +1281,8 @@ pub const BoundTableWriteSource = struct {
 
     pub fn txnBeginGroupLocalWithPreDecisionContext(
         ptr: *anyopaque,
-        _: std.mem.Allocator,
-        _: u64,
+        alloc: std.mem.Allocator,
+        group_id: u64,
         table_name: []const u8,
         txn_id: db_mod.types.TxnId,
         begin_timestamp: u64,
@@ -1293,6 +1294,26 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try ensurePreDecisionContextActive(context);
+        if (context.source_producer != .unlabelled) {
+            if (self.owner_group_id) |bound_group| if (bound_group != group_id) return null;
+            const local_participant = try distributed_txn.participantIdForGroupScoped(alloc, table_name, group_id, context.restore_staging_scope, context.restore_staging_plan_id);
+            defer alloc.free(local_participant);
+            if (participants.len == 0) return error.InvalidParticipant;
+            var seen = std.StringHashMapUnmanaged(void).empty;
+            defer seen.deinit(alloc);
+            var local_present = false;
+            for (participants) |participant| {
+                if (distributed_txn.parseParticipantRef(participant) == null) return error.InvalidParticipant;
+                const slot = try seen.getOrPut(alloc, participant);
+                if (slot.found_existing) return error.InvalidParticipant;
+                if (std.mem.eql(u8, participant, local_participant)) local_present = true;
+            }
+            if (!local_present) return error.InvalidParticipant;
+            const coordinator = std.mem.eql(u8, participants[0], local_participant);
+            const local_only = [_][]const u8{local_participant};
+            _ = try (try self.activeDb()).beginProducerTransactionScoped(txn_id, begin_timestamp, nextTxnTimestamp(self.db.backend_runtime.io()), if (coordinator) participants else &local_only, coordinator, retain_terminal, context.restore_staging_scope, context.source_producer);
+            return {};
+        }
         _ = try (try self.activeDb()).beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
             txn_id,
             begin_timestamp,

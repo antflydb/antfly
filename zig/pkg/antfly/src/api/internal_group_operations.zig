@@ -698,6 +698,7 @@ pub const Operations = struct {
         const supports_pre_decision_context =
             writes.vtable.txn_begin_group_local_with_pre_decision_context != null;
         _ = (writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants, .{
+            .source_producer = input.source_producer,
             .restore_staging_scope = input.restore_staging_scope,
             .restore_staging_plan_id = input.restore_staging_plan_id,
             .deadline_ns = request.deadline_ns,
