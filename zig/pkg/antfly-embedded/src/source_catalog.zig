@@ -293,6 +293,7 @@ pub const storage_db_artifact_extraction_generation = @import("storage/db/artifa
 pub const storage_db_artifact_generation_scope = @import("storage/db/artifact_generation_scope.zig");
 pub const storage_db_artifact_graph_planning = @import("storage/db/artifact_graph_planning.zig");
 pub const storage_db_artifact_graph_publication = @import("storage/db/artifact_graph_publication.zig");
+pub const storage_db_dag_graph_effects = @import("storage/db/dag_graph_effects.zig");
 pub const storage_db_artifact_ids = @import("storage/db/artifact_ids.zig");
 pub const storage_db_artifact_inventory = @import("storage/db/artifact_inventory.zig");
 pub const storage_db_artifact_native_stream = @import("storage/db/artifact_native_stream.zig");

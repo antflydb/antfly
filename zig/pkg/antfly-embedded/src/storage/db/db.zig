@@ -28752,6 +28752,7 @@ pub const DB = struct {
                 if (guard.chunk_fence) |fence| try fence.requireCurrent(txn);
                 if (guard.chunk_vector_fence) |fence| try fence.requireCurrent(txn);
                 for (guard.asset_upstream_fences) |fence| try fence.requireCurrent(txn);
+                try publication.requireUnrejectedGraphCandidate(txn, guard.command);
                 try publication.stageCoverage(alloc, txn, guard.command, guard.coverage);
                 try publication.stageReceipts(txn, guard.command, guard.sequence);
                 try @import("artifact_producer_provenance.zig").stageIndexed(txn, guard.command, guard.proof, guard.position, guard.document_references);
@@ -28763,6 +28764,7 @@ pub const DB = struct {
         };
         var guard: Guard = .{ .db = self, .replication_payload = replication_payload, .command = command, .sequence = sequence, .coverage = prepared_value.coverage, .chunk_fence = prepared_value.chunk_fence, .chunk_vector_fence = prepared_value.chunk_vector_fence, .asset_upstream_fences = prepared_value.asset_upstream_fences, .position = .{ .raft = .{ .term = entry.term, .index = entry.index } }, .proof = prepared_proof orelse return error.ArtifactCatalogCorrupt, .document_references = if (prepared_document_refs) |*value| value else return error.ArtifactCatalogCorrupt, .upload = opts.artifact_upload_finalize };
         _ = self.core.store.putBatchWithPromotionsReplayAndBuiltWrite(batch_ctx.io, writes.items, deletes.items, &.{}, .{ .sequence = sequence, .payload = replay }, null, .{ .ptr = &guard, .validate = Guard.validate }) catch |err| switch (err) {
+            error.GraphCycle => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .graph_cycle, &apply_held),
             error.EnrichmentSourceChanged => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .stale_source, &apply_held),
             error.ArtifactCoverageBaselinePending, error.ArtifactPublicationPending => return self.rejectArtifactPublicationAssumeApply(command, opts, replication_payload, .baseline_pending, &apply_held),
             else => return err,

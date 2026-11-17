@@ -118,6 +118,13 @@ fresh admission that could strand a committed participant.
 
 ## Generated candidates and inspection still required
 
+Graph publication reserves a bounded slot for the latest cycle rejection per
+producer/source. Replaying that exact candidate is rejected inside the same
+guarded write that would publish it. Transient responses and newer successful
+publications preserve the cycle record. The authority still needs to drive this
+outcome from an actual cross-shard validation decision and retain inspectable
+candidate history under the configured policy.
+
 Generated output must first enter private candidate storage, outside the current
 accepted artifact namespace. A candidate binds source revisions, producer recipe,
 index incarnations, complete contribution replacement, and stable attempt ID.

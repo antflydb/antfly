@@ -513,7 +513,7 @@ pub const Command = struct {
 };
 
 pub const Receipt = struct { publication_digest: Digest, sequence: u64 };
-pub const Rejection = enum(u8) { stale_source = 1, stale_catalog = 2, sealed_source = 3, invalid_output = 4, baseline_pending = 5 };
+pub const Rejection = enum(u8) { stale_source = 1, stale_catalog = 2, sealed_source = 3, invalid_output = 4, baseline_pending = 5, graph_cycle = 6 };
 pub const Rejected = struct { publication_digest: Digest, applied_index: u64, reason: Rejection };
 const receipt_prefix = "\x00\x00__artifact_publication__:receipt:";
 const receipt_bytes = 4 + 32 + 32 + 8 + 8 + Position.encoded_len + 32 + 32;
@@ -820,7 +820,9 @@ pub fn receiptKey(command: Command, source: Source) [receipt_prefix.len + 32]u8 
     return result;
 }
 
-fn rejectionKey(command: Command) [receipt_prefix.len + 33]u8 {
+const RejectionSlot = enum(u8) { retry = 0xff, cycle = 0xfe };
+
+fn rejectionKey(command: Command, slot: RejectionSlot) [receipt_prefix.len + 33]u8 {
     const source: Source = if (command.sources.len != 0) command.sources[0] else .{
         .document_key = "",
         .content_digest = @splat(0),
@@ -829,7 +831,7 @@ fn rejectionKey(command: Command) [receipt_prefix.len + 33]u8 {
     };
     var key: [receipt_prefix.len + 33]u8 = undefined;
     @memcpy(key[0 .. key.len - 1], &receiptKey(command, source));
-    key[key.len - 1] = 0xff;
+    key[key.len - 1] = @backingInt(slot);
     return key;
 }
 
@@ -843,11 +845,41 @@ pub fn stageRejection(txn: anytype, command: Command, index: u64, reason: Reject
     @memcpy(raw[5..37], &command.publication_digest);
     std.mem.writeInt(u64, raw[37..45], index, .little);
     std.crypto.hash.Blake3.hash(raw[0..45], raw[45..77], .{});
-    try txn.put(&rejectionKey(command), &raw);
+    const slot: RejectionSlot = if (reason == .graph_cycle) .cycle else .retry;
+    if (reason == .graph_cycle) {
+        if (try readRejection(txn, command, .cycle)) |existing| {
+            // Preserve the first terminal response to the same publication.
+            if (std.mem.eql(u8, &existing.publication_digest, &command.publication_digest) or existing.applied_index >= index) return;
+        }
+    }
+    try txn.put(&rejectionKey(command, slot), &raw);
+}
+
+/// Read the last terminal DAG rejection for this producer/source slot.
+pub fn latestGraphCycle(txn: anytype, command: Command) !?Rejected {
+    return readRejection(txn, command, .cycle);
+}
+
+pub fn requireUnrejectedGraphCandidate(txn: anytype, command: Command) !void {
+    if (command.producer_kind != .graph) return;
+    const cycle = (try latestGraphCycle(txn, command)) orelse return;
+    if (std.mem.eql(u8, &command.publication_digest, &cycle.publication_digest)) return error.GraphCycle;
 }
 
 pub fn rejected(txn: anytype, command: Command) !?Rejected {
-    const raw = txn.get(&rejectionKey(command)) catch |err| switch (err) {
+    if (try latestGraphCycle(txn, command)) |cycle| {
+        if (std.mem.eql(u8, &command.publication_digest, &cycle.publication_digest)) return cycle;
+    }
+    return matchingRetryRejection(txn, command);
+}
+
+fn matchingRetryRejection(txn: anytype, command: Command) !?Rejected {
+    const response = (try readRejection(txn, command, .retry)) orelse return null;
+    return if (std.mem.eql(u8, &command.publication_digest, &response.publication_digest)) response else null;
+}
+
+fn readRejection(txn: anytype, command: Command, slot: RejectionSlot) !?Rejected {
+    const raw = txn.get(&rejectionKey(command, slot)) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
@@ -858,7 +890,7 @@ pub fn rejected(txn: anytype, command: Command) !?Rejected {
     const reason = std.enums.fromInt(Rejection, raw[4]) orelse return error.ArtifactCatalogCorrupt;
     const index = std.mem.readInt(u64, raw[37..45], .little);
     if (index == 0) return error.ArtifactCatalogCorrupt;
-    if (!std.mem.eql(u8, &command.publication_digest, raw[5..37])) return null;
+    if ((reason == .graph_cycle) != (slot == .cycle)) return error.ArtifactCatalogCorrupt;
     return .{ .publication_digest = raw[5..37].*, .applied_index = index, .reason = reason };
 }
 
@@ -928,7 +960,7 @@ pub fn stageSelectedReceipts(txn: anytype, command: Command, input_digest: Diges
     }
     // A successful retry supersedes its temporary rejection, atomically with
     // acceptance. Do not erase another command's response in the shared slot.
-    if (try rejected(txn, command) != null) try txn.delete(&rejectionKey(command));
+    if (try matchingRetryRejection(txn, command) != null) try txn.delete(&rejectionKey(command, .retry));
 }
 
 pub fn validateRequest(alloc: std.mem.Allocator, request: anytype) !void {
@@ -1633,6 +1665,22 @@ test "ordered artifact inventory publication coverage is point bounded idempoten
     try stageRejection(&txn, changed, 9, .stale_source);
     try stageReceipts(&txn, command, 10);
     try std.testing.expect((try rejected(&txn, changed)) != null);
+    try stageRejection(&txn, changed, 11, .graph_cycle);
+    try stageRejection(&txn, changed, 12, .baseline_pending);
+    try stageRejection(&txn, changed, 13, .graph_cycle);
+    try stageReceipts(&txn, command, 14);
+    const cycle = (try rejected(&txn, changed)).?;
+    try std.testing.expectEqual(.graph_cycle, cycle.reason);
+    try std.testing.expectEqual(@as(u64, 11), cycle.applied_index);
+    try std.testing.expectEqualDeep(cycle, (try latestGraphCycle(&txn, command)).?);
+    try std.testing.expect((try rejected(&txn, command)) == null);
+    var graph = changed;
+    graph.producer_kind = .graph;
+    graph.publication_digest = graph.digest();
+    try stageRejection(&txn, graph, 15, .graph_cycle);
+    try std.testing.expectError(error.GraphCycle, requireUnrejectedGraphCandidate(&txn, graph));
+    graph.publication_digest = @splat(92);
+    try requireUnrejectedGraphCandidate(&txn, graph);
 }
 
 test "ordered artifact inventory producer dispatch preserves foreign named failures" {
