@@ -40,7 +40,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 115 fences explicit table transaction origin contracts.
 // Version 116 fences native/ordered non-history producer admission.
 // Version 117 fences native producer pre-decision context layouts.
-pub const abi_version: u32 = 117;
+// Version 118 adds apply-only physical producer closure.
+pub const abi_version: u32 = 118;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1997,6 +1998,7 @@ pub extern fn antfly_storage_owner_native_source_plan_control(owner: ?*anyopaque
 pub extern fn antfly_storage_owner_ordered_source_plan_control(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_ordered_source_scope_control(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_ordered_source_scope_outcome(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_source_producer_closure(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_ordered_source_retirement(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_source_retirement_outcome(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_source_scope_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;

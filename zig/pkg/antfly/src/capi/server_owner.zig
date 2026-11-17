@@ -4622,6 +4622,29 @@ pub fn storageOwnerOrderedSourceScopeOutcome(owner: ?*anyopaque, request: *const
 }
 // Private apply-only boundary: the trusted Raft proposal path must obtain the
 // coordinator observation independently before this command reaches storage.
+// Apply-only: the term/index come from the actual committed Raft entry.
+// This closes producer intake; it does not authorize first-strict activation.
+pub fn storageOwnerOrderedSourceProducerClosure(owner: ?*anyopaque, request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const policy = @import("antfly_local_sources").storage_source_producer_policy;
+    const RoutedOwner = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion.RoutedOwner;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.raft_term == 0 or request.raft_index == 0 or request.request_json.len == 0 or request.request_json.len > 8192 or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(RoutedOwner, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return storageOwnerStatusFromError(err);
+    defer parsed.deinit();
+    parsed.value.validate() catch |err| return storageOwnerStatusFromError(err);
+    if (parsed.value.group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.HistoryResynchronizationRequired);
+    const result = handle.db.applyOrderedSourceProducerClosure(parsed.value, .{ .term = request.raft_term, .index = request.raft_index }, true) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    const bytes = std.json.Stringify.valueAlloc(std.heap.c_allocator, result, .{}) catch |err| return storageOwnerStatusFromError(err);
+    if (bytes.len > policy.max_bytes) {
+        std.heap.c_allocator.free(bytes);
+        return storageOwnerStatusFromError(error.SourceAdmissionCorrupt);
+    }
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
 pub fn storageOwnerOrderedSourceRetirement(owner: ?*anyopaque, request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     const retirement = @import("antfly_local_sources").storage_source_scope_retirement;
     const ordered = @import("antfly_local_sources").storage_source_scope_retirement_ordered;

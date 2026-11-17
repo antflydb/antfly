@@ -7323,3 +7323,59 @@ promote old pending records. Raw policy BEGIN remains fenced without creating a
 record during transition. Contract and whitespace checks passed. No issue
 acceptance box, first-strict activation, retained-history/feed availability or
 actual Antfly pgoutput/client qualification is discharged by this milestone.
+
+### Ordered physical producer closure (in progress)
+
+The native producer-closure primitive now has a dedicated data-Raft envelope at
+protocol 46 and an apply-only owner ABI 118 entry point. The envelope requires
+its positive closure tag, the full original routed owner, and the complete
+physical storage descriptor. Generic document-batch decode rejects it, including
+a stripped control tag that still carries the reserved source owner. Projection
+and native apply both require durable activation and native ownership. Native
+apply uses the actual committed term/index, retains the original first closure
+cut, and returns a bounded root-validated receipt through the native owner.
+Closure does not carry source scope, row payload, a claimed drain flag, or a
+transaction decision.
+
+New wire coverage checks activation, original owner/generation, missing material
+fields, false/missing tags and mixed controls. The existing linked native
+source-control fixture now drives closure through projection/native Raft apply,
+loses its native reply after commit, retries without document progress, and
+recovers the original first cut. A following real scope-binding entry must still
+be rejected as SourcePendingWork: producer closure is not proof of drainage.
+Generation passed (`source-producer-closure-generate.log`); unrelated explorer
+artifacts were restored. Wire and linked native qualification are running
+(`source-producer-closure-raft-test.log`). Authenticated closure proposal/read
+transport, handover/drain proof and first-strict activation remain outstanding;
+no issue acceptance is closed by adding this apply path.
+
+The first build passed 13 local and 30 history/control cases but native parsing
+found test-helper variable shadowing, now corrected. Inspecting actual selected
+test names showed those passing history filters did not select the new closure
+wire test, and the history apply filter does not select the source-plan staging
+fixture containing the new native closure path. These counts are regression
+evidence only, not closure qualification. The next selection must include the
+new wire test and `source-plan-apply-test`; no coverage is inferred from merely
+importing a module or compiling runtime dispatch.
+
+Native history regression passed six local/37 linked cases
+(`source-producer-closure-native-test.log`). The correctly selected source-plan
+apply target passed both actual linked cases, including the newly called closure
+fixture (`source-producer-closure-selected-test.log`): activation refusals leave
+projection/native progress unchanged, closure's committed native reply can be
+lost and replayed, the original closure cut survives, no document apply is
+counted, and a following real scope bind still returns SourcePendingWork.
+The new wire test is now included explicitly in the standard history/control
+filter. Its first actual compilation caught a missing JSON-map allocator
+argument; corrected to use the parsed arena. Wire qualification is rerunning
+(`source-producer-closure-wire-test.log`).
+
+Final closure wire qualification passed 13 local and 31 control cases, including
+the named new closure entry case, zero failures/skips/leaks
+(`source-producer-closure-wire-test.log`). This supplements the six/37 native
+history regressions and two correctly selected native source-plan cases.
+Generation, catalog/error/OpenAPI and whitespace checks passed. The qualified
+milestone is ordered physical closure dispatch and replay only. No authenticated
+proposal/qualified closure observation, retained-root cohort/drainage certificate,
+original pending-decision migration, or first-strict activation is claimed.
+All full #1698/#1639 requirements remain active and their issues stay open.

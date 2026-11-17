@@ -653,6 +653,26 @@ pub const Owner = struct {
         return ordered.decodeOutcome(a, response.bytes(), recovery.command, recovery.entry);
     }
 
+    pub fn orderedSourceProducerClosure(self: *Owner, a: std.mem.Allocator, table: []const u8, owner: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion.RoutedOwner, term: u64, index: u64) !@import("antfly_local_sources").storage_source_producer_policy.Closure {
+        const policy = @import("antfly_local_sources").storage_source_producer_policy;
+        const scope = @import("antfly_local_sources").storage_source_scope;
+        try owner.validate();
+        if (term == 0 or index == 0) return error.InvalidSourceAdmission;
+        const bytes = try std.json.Stringify.valueAlloc(a, owner, .{});
+        defer a.free(bytes);
+        if (bytes.len > 8192) return error.InvalidSourceAdmission;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_ordered_source_producer_closure(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes), .raft_term = term, .raft_index = index }, &response.buffer));
+        defer response.deinit();
+        if (response.bytes().len == 0 or response.bytes().len > policy.max_bytes) return error.SourceOutcomeUnresolved;
+        var parsed = std.json.parseFromSlice(policy.Closure, a, response.bytes(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.SourceOutcomeUnresolved;
+        defer parsed.deinit();
+        const result = parsed.value;
+        try result.validate();
+        if (!std.meta.eql(result.root, try scope.Basis.fromOwner(owner)) or result.first_closed_at.index > index or result.first_closed_at.term > term or (result.first_closed_at.index == index and result.first_closed_at.term != term)) return error.SourceOutcomeUnresolved;
+        return result;
+    }
+
     pub fn orderedSourceRetirement(self: *Owner, a: std.mem.Allocator, table: []const u8, command: @import("antfly_local_sources").storage_source_scope_retirement.Command, term: u64, index: u64) !@import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery {
         const retirement = @import("antfly_local_sources").storage_source_scope_retirement;
         const ordered = @import("antfly_local_sources").storage_source_scope_retirement_ordered;

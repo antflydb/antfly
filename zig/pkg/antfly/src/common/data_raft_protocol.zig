@@ -40,7 +40,7 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 45;
+pub const batch_protocol_version: u16 = 46;
 /// Frozen completion BEGIN and owner/input-fenced PREPARE require durable
 /// activation across every applying member before proposal or native apply.
 pub const batch_completion_admission_protocol_version: u16 = 31;
@@ -66,6 +66,8 @@ pub const batch_source_attempt_protocol_version: u16 = 39;
 pub const batch_source_scope_control_protocol_version: u16 = 40;
 /// Version 41 applies original-coordinator-authorized source attempt retirement.
 pub const batch_source_retirement_protocol_version: u16 = 41;
+/// Version 46 orders cumulative physical producer intake closure separately from rows.
+pub const batch_source_producer_closure_protocol_version: u16 = 46;
 /// Version 42 retains explicit ordinary transaction producer identity.
 pub const batch_ordinary_producer_protocol_version: u16 = 42;
 /// Version 44 retains explicit legacy completion producer identity.
