@@ -997,7 +997,7 @@ pub const Session = struct {
                             deadline = self.replicationNow() +| @as(i64, limits.replication_timeout_ms) * std.time.ns_per_ms;
                             self.replicationDeadline(deadline);
                             if (feedback.request_reply) {
-                                try self.replicationKeepalive(scratch.allocator(), observed_end, false, deadline);
+                                try self.replicationKeepalive(scratch.allocator(), sent, false, deadline);
                                 last_keepalive = self.replicationNow();
                             }
                         },
@@ -1026,7 +1026,9 @@ pub const Session = struct {
                         if (next > @backingInt(feedback_ceiling)) feedback_ceiling = sent;
                     }
                     if (self.replicationNow() - last_keepalive >= @as(i64, limits.replication_keepalive_ms) * std.time.ns_per_ms) {
-                        try self.replicationKeepalive(scratch.allocator(), observed_end, true, deadline);
+                        // Logical clients can acknowledge the keepalive LSN.
+                        // Pending spool bytes are not yet eligible for feedback.
+                        try self.replicationKeepalive(scratch.allocator(), sent, true, deadline);
                         last_keepalive = self.replicationNow();
                     }
                     const elapsed_ms: u32 = @intCast(@min(@as(i64, limits.replication_keepalive_ms), @divTrunc(@max(0, self.replicationNow() - last_keepalive), std.time.ns_per_ms)));

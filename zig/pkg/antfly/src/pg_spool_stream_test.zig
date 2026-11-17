@@ -35,6 +35,20 @@ fn response(reader: *std.Io.Reader) !struct { tag: u8, bytes: []const u8 } {
     if (size < 4 or size > 65536) return error.TestUnexpectedResult;
     return .{ .tag = tag, .bytes = try reader.take(size - 4) };
 }
+fn recvLogical(a: A, program: []const u8, dsn: []const u8, start: []const u8) ![]u8 {
+    const child = try std.process.run(a, std.testing.io, .{
+        .argv = &.{ program, "--dbname", dsn, "--slot", "upload_slot", "--start", start, "--endpos=0/69", "--file=-", "--no-loop", "--option=proto_version=1", "--option=publication_names=rows_pub" },
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
+    });
+    defer a.free(child.stderr);
+    errdefer a.free(child.stdout);
+    if (child.term != .exited or child.term.exited != 0) {
+        std.debug.print("pg_recvlogical failed: {s}\n", .{child.stderr});
+        return error.TestUnexpectedResult;
+    }
+    return child.stdout;
+}
+
 pub fn run(svc: anytype, registry: anytype, clock: u64) !void {
     const Host = struct {
         service: *const Port,
@@ -137,19 +151,19 @@ pub fn run(svc: anytype, registry: anytype, clock: u64) !void {
         defer listener.deinit();
         const dsn = try std.fmt.allocPrint(a, "host=127.0.0.1 port={d} dbname=db user=alice password=pw sslmode=disable gssencmode=disable", .{listener.address().getPort()});
         defer a.free(dsn);
-        const child = try std.process.run(a, std.testing.io, .{
-            .argv = &.{ program, "--dbname", dsn, "--slot", "upload_slot", "--start", "--startpos=0/1", "--endpos=0/69", "--file=-", "--no-loop", "--option=proto_version=1", "--option=publication_names=rows_pub" },
-            .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
-        });
-        defer a.free(child.stdout);
-        defer a.free(child.stderr);
-        if (child.term != .exited or child.term.exited != 0) {
-            std.debug.print("pg_recvlogical failed: {s}\n", .{child.stderr});
-            return error.TestUnexpectedResult;
-        }
-        try std.testing.expectEqual(@as(usize, 109), child.stdout.len);
-        try std.testing.expectEqual(@as(u8, 'B'), child.stdout[0]);
-        try std.testing.expectEqual(@as(u8, 'C'), child.stdout[82]);
+        const payload = try recvLogical(a, program, dsn, "--startpos=0/1");
+        defer a.free(payload);
+        try std.testing.expectEqual(@as(usize, 109), payload.len);
+        try std.testing.expectEqual(@as(u8, 'B'), payload[0]);
+        try std.testing.expectEqual(@as(u8, 'C'), payload[82]);
+
+        const replay = try recvLogical(a, program, dsn, "--startpos=0/69");
+        defer a.free(replay);
+        try std.testing.expectEqual(@as(usize, 0), replay.len);
+        listener.deinit();
+        var acknowledged = try svc.load(a);
+        defer acknowledged.deinit();
+        try std.testing.expectEqual(@as(u64, 105), acknowledged.value.slot.?.confirmed_lsn);
         return;
     }
     // Real CopyBoth reads the actual slot/spool implementation. The wire client
