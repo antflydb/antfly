@@ -20,6 +20,22 @@
 const std = @import("std");
 const backend = @import("backend.zig");
 const retained = @import("../metadata/pg_spool_stream.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const Context = operation.RequestContext;
+
+pub fn metadataContext(request: backend.Request) !Context {
+    try request.check();
+    if (request.deadline.clock != .awake) return error.UnsupportedReplicationMode;
+    const deadline = std.math.cast(u64, request.deadline.raw.nanoseconds);
+    const context: Context = .{
+        .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" },
+        .deadline_ns = deadline,
+        .deadline_io = if (deadline != null) @import("antfly_runtime_abi").io_abi.Borrow.init(&request.io) else null,
+        .cancellation = operation.CancellationToken.fromAtomic(request.cancel_requested),
+    };
+    return context.platformDeadline();
+}
+
 pub fn Bridge(comptime Host: type) type {
     return struct {
         const Self = @This();

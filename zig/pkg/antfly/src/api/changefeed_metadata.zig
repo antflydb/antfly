@@ -147,6 +147,11 @@ pub const Port = struct {
         // Cancellation after a successful callback cannot certify non-commit.
         context.ensureActive() catch return error.MetadataMutationOutcomeUnknown;
     }
+    // The retained spool owners accept the same state contract as a local
+    // metadata service. The port preserves its principal and outcome checks.
+    pub const readChangefeedState = read;
+    pub const mutateChangefeedState = mutate;
+
     /// Complete an authorized slot seal, or recover its exact start after an
     /// ambiguous write. The caller supplies the qualified cut and allocation.
     pub fn sealSlot(self: Port, a: A, write: control.Write, now: u64, context: Context) !control.SlotStart {

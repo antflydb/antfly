@@ -21,12 +21,9 @@ const bridge = @import("pgwire/retained_stream.zig");
 const server = @import("pgwire/server.zig");
 const Request = @import("pg_spool_cleanup_test.zig").Request;
 const A = std.mem.Allocator;
-const WireRequest = struct {
-    value: backend.Request,
-    pub fn ensureActive(self: @This()) !void {
-        try self.value.check();
-    }
-};
+const Port = @import("api/changefeed_metadata.zig").Port;
+const Context = @import("antfly_local_sources").api_operation.RequestContext;
+const close_context: Context = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" } };
 fn frame(writer: *std.Io.Writer, tag: u8, bytes: []const u8) !void {
     try writer.writeByte(tag);
     try writer.writeInt(u32, @intCast(bytes.len + 4), .big);
@@ -40,7 +37,7 @@ fn response(reader: *std.Io.Reader) !struct { tag: u8, bytes: []const u8 } {
 }
 pub fn run(svc: anytype, registry: anytype, clock: u64) !void {
     const Host = struct {
-        service: @TypeOf(svc),
+        service: *const Port,
         registry: @TypeOf(registry),
         id: control.Id,
         actor: control.Id = @splat(3),
@@ -52,9 +49,8 @@ pub fn run(svc: anytype, registry: anytype, clock: u64) !void {
         pub fn binding(_: *@This(), a: A, start: backend.replication_commands.Start, _: backend.Request) !control.pg_slot.Binding {
             return control.pg_slot.bindingAlloc(a, start.publications, @splat(8));
         }
-        pub fn request(_: *@This(), value: backend.Request) !WireRequest {
-            try value.check();
-            return .{ .value = value };
+        pub fn request(_: *@This(), value: backend.Request) !Context {
+            return bridge.metadataContext(value);
         }
         pub fn authorize(self: *@This(), state: control.State, selected: control.pg_slot.Binding, req: anytype) !void {
             try req.ensureActive();
@@ -64,12 +60,12 @@ pub fn run(svc: anytype, registry: anytype, clock: u64) !void {
             return self.clock;
         }
         pub fn failedOpen(self: *@This()) void {
-            retained.releaseActor(self.service, self, std.testing.allocator, self.id, self.actor, Request{}) catch {
+            retained.releaseActor(self.service, self, std.testing.allocator, self.id, self.actor, close_context) catch {
                 self.close_errors += 1;
             };
         }
         pub fn closed(self: *@This(), owner: *retained.Owner) void {
-            owner.release(self.service, self, std.testing.allocator, Request{}) catch {
+            owner.release(self.service, self, std.testing.allocator, close_context) catch {
                 self.close_errors += 1;
             };
             self.closes += 1;
@@ -109,7 +105,8 @@ pub fn run(svc: anytype, registry: anytype, clock: u64) !void {
         const vtable: backend.Backend.VTable = .{ .authenticate = authenticate, .describe = describe, .execute = execute, .disconnect = disconnect, .open_replication_session = replication };
     };
     const a = std.testing.allocator;
-    var host: Host = .{ .service = svc, .registry = registry, .id = svc.id, .clock = clock };
+    const metadata = Port.fromService(svc);
+    var host: Host = .{ .service = &metadata, .registry = registry, .id = svc.id, .clock = clock };
     try svc.mutate(a, .{ .slot = .{ .release = .{ .session = .{ .actor = @splat(2), .fence = 1 }, .now = clock } } });
     const selected: control.pg_slot.Binding = .{ .publications = &.{"rows_pub"}, .projection = @splat(8) };
     const changed: control.pg_slot.Binding = .{ .publications = &.{"other_pub"}, .projection = @splat(8) };
