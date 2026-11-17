@@ -6150,3 +6150,68 @@ retained coordinator locator mismatch case passed in a final focused run
 (`source-retirement-authority-gc.log`). Successful scoped ABORT submission through
 production Raft and authenticated retirement transport remain required, as do all
 other outstanding original acceptance criteria. The goal remains active.
+
+
+### Authenticated retirement submit/recovery transport
+
+The spec now defines `/internal/v1/groups/{group}/tables/{table}/source-retirement/
+control-v1`. Submit carries only original retirement intent, original coordinator
+locator and a fresh nonzero RPC identity. The leader independently obtains the
+coordinator ABORT before protocol-41 proposal. Recovery accepts the exact original
+command/entry and minimum applied index and is read-only. An observation supplied
+inside a recovery query grants no proposal authorization. Local fencing proves no
+global commit, publication, source ACK, retention release or all-owner retirement.
+
+Transport request/reply bounds include the original bounded coordinator admission
+(16,798,720 and 16,802,816 bytes respectively). Requests and replies explicitly own
+all decoded participant/locator data. Reply validation correlates the complete
+request including nonce, original intent and retained coordinator locator, full
+command fingerprint and actual entry. A known command may survive an ambiguous
+submit without a known index, but no outcome is then permitted. Recovery preserves
+its exact command/entry; superseded remains unconfirmed. No parsed arena is freed
+while its participant strings remain referenced by an emitted response.
+
+API kernel 32 adds the owned callback port. The HTTP handler requires an explicit
+valid internal-service credential even under legacy unauthenticated settings,
+checks body limits and route identity, and marks unconfirmed submits unknown.
+The routed port uses leader discovery and authenticated bounded forwarding. The
+client has exactly one HTTP attempt, requires one matching route acknowledgement
+and JSON content type, validates the whole correlated reply and clears confirmation
+on unknown markers or late cancellation. Lost, malformed, oversized, mismatched
+or unsuccessful replies produce owned unconfirmed responses; recovery preserves
+its original command and entry rather than manufacturing a result or resending.
+
+The transport fixture covers owned decoding after input/response buffers are
+released, missing credentials before I/O, one-attempt loss handling, wrong nonce,
+missing/duplicate acknowledgement, unknown outcome markers, known command without
+entry, exact recovery and changed receipt refusal. Submit JSON with an extra
+observation is refused. HTTP auth coverage includes missing/invalid credentials
+in legacy mode. The actual native forwarding fixture queries an absent exact
+retirement receipt, requires superseded, and checks unchanged registry/apply cut.
+It uses modeled evidence only for read-only recovery, not source activation.
+
+Full generation completed (`source-retirement-http-generate.log`), retaining the
+intended internal OpenAPI artifacts and discarding unrelated model explorer
+outputs. Contract checks passed (`source-retirement-http-contract-check.log`).
+Initial linked compiles caught a missing shared dispatch enumeration case, an
+untyped fixture cut and use of an owned rather than borrowed fake-response header
+type; these were corrected before final qualification. Final results follow below.
+
+Storage engine 58, owner ABI 111, data profile 41, metadata 105 and failure 89 are
+unchanged. Successful production scoped retirement/activation, all-owner retirement
+and source ACK/release, genuine legacy-worker handover, the destination adapter,
+public feeds/bootstrap/retention, production pgoutput and actual Antfly existing-
+client qualification remain open. The full original goal and both issues remain
+open; transport qualification alone cannot satisfy them.
+
+The first executing linked run passed the new client/auth cases but exposed that
+the manually constructed native fixture server omitted the retirement callback;
+its conservative 501/unknown result correctly failed the expected exact-read test.
+Production server configuration already wired the callback. Adding it to the
+fixture produced final `history-control-apply-test -Dstrip=true -j1` exit 0
+(`source-retirement-http-native-test.log`): all 30 linked tests and six local
+integration tests passed, zero reported skips/failures/leaks. Exact retirement
+recovery traverses the real authenticated forwarding path, returns superseded and
+leaves the native registry/apply cut unchanged. The focused authority case also
+passed in the earlier combined run. Guarded cache cleanup completed
+(`source-retirement-http-gc.log`). The full original goal remains active.

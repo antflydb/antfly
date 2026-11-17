@@ -1905,6 +1905,10 @@ pub const AntflyApiHandler = struct {
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
         if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit"))
+            try server.postWithBodyLimit(table_prefix ++ routes.source_retirement_control_suffix, @import("source_retirement_operations.zig").wire.max_request_bytes, httpx.Handler.bind(self, internalSourceRetirementControl))
+        else
+            try server.post(table_prefix ++ routes.source_retirement_control_suffix, httpx.Handler.bind(self, internalSourceRetirementControl));
+        if (comptime @hasDecl(@TypeOf(server.*), "postWithBodyLimit"))
             try server.postWithBodyLimit(table_prefix ++ routes.source_scope_control_suffix, @import("source_scope_control_operations.zig").wire.max_request_bytes, httpx.Handler.bind(self, internalSourceScopeControl))
         else
             try server.post(table_prefix ++ routes.source_scope_control_suffix, httpx.Handler.bind(self, internalSourceScopeControl));
@@ -4232,6 +4236,28 @@ pub const AntflyApiHandler = struct {
         const result = operations.execute(self.api_server.cfg.native_source_scope_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, mutation);
         if (mutation and !result.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
         const encoded = operations.wire.encodeReply(ctx.allocator, input, result) catch |err| return sourcePlanError(ctx, err, mutation);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/json");
+        return ctx.response.body(encoded).build();
+    }
+    fn internalSourceRetirementControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid source retirement path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_retirement_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing source retirement request");
+        if (body.len > operations.wire.max_request_bytes) return textResponse(ctx, 413, "source retirement request exceeds byte limit");
+        var decoded = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
+        defer decoded.deinit();
+        const input = decoded.value;
+        const mutation = input.operation == .submit;
+        var result = operations.execute(self.api_server.cfg.native_source_retirement_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, mutation);
+        defer result.deinit();
+        if (mutation and !result.value.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const encoded = operations.wire.encodeReply(ctx.allocator, input, result.value) catch |err| return sourcePlanError(ctx, err, mutation);
         defer ctx.allocator.free(encoded);
         try ctx.setHeader("Content-Type", "application/json");
         return ctx.response.body(encoded).build();
@@ -23400,4 +23426,24 @@ test "distributed SQL API control routes authenticate cancellation and share ter
     var response = try server.router.find(.POST, transport.result_path, &params).?.handler.invoke(&ctx);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 409), response.status.code);
+}
+
+test "httpx source scope retirement control refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-retirement/control-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalSourceRetirementControl(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
 }

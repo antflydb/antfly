@@ -1301,6 +1301,120 @@ pub const NativeSourcePlanStatus = struct {
     reclamation: NativeHistoryDigest,
 };
 
+pub const NativeSourceRetirementOutcome = std.json.Value;
+
+/// Read-only exact retirement recovery. Minimum must cover the entry. Entire original command including coordinator read cut is immutable.
+pub const NativeSourceRetirementRecovery = struct {
+    command: NativeSourceScopeAbortCommand,
+    entry: NativeHistoryPublicationCut,
+    minimum_applied_index: u64,
+};
+
+/// At most 16802816 bytes. Full-request SHA-256 correlation. Command may survive an ambiguous submission without known entry; outcome then must be null. Known entry requires exact command. Recovery preserves original command and entry. Unknown/superseded authorize no retry, source ACK, retention release or global outcome.
+pub const NativeSourceRetirementReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    command: OpenApiOptionalNullable(NativeSourceScopeAbortCommand) = .absent,
+    receipt: OpenApiOptionalNullable(NativeHistoryPublicationCut) = .absent,
+    outcome: OpenApiOptionalNullable(NativeSourceRetirementOutcome) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        switch (self.command) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("command");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("command");
+                try jw.write(value);
+            },
+        }
+        switch (self.receipt) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("receipt");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("receipt");
+                try jw.write(value);
+            },
+        }
+        switch (self.outcome) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("outcome");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("outcome");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// At most 16798720 bytes. Nonzero fresh request_id. Submit requires intent and coordinator_locator with null recovery; no caller observation is accepted. Recover requires recovery with null intent/locator and is strictly read-only.
+pub const NativeSourceRetirementRequest = struct {
+    version: i64,
+    request_id: NativeHistoryConsumerId,
+    operation: []const u8,
+    intent: OpenApiOptionalNullable(NativeSourceScopeAbortIntent) = .absent,
+    coordinator_locator: OpenApiOptionalNullable([]const u8) = .absent,
+    recovery: OpenApiOptionalNullable(NativeSourceRetirementRecovery) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_id");
+        try jw.write(self.request_id);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        switch (self.intent) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("intent");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("intent");
+                try jw.write(value);
+            },
+        }
+        switch (self.coordinator_locator) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("coordinator_locator");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("coordinator_locator");
+                try jw.write(value);
+            },
+        }
+        switch (self.recovery) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("recovery");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("recovery");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 /// Trusted ordered reducer command constructed only after an independent qualified coordinator read. Requires the retained original scoped ABORT and original participant membership. Never accept this command body as self-authenticating public or private HTTP evidence.
 pub const NativeSourceScopeAbortCommand = struct {
     version: i64,

@@ -1715,6 +1715,7 @@ pub const ApiHttpServerConfig = struct {
     native_source_plan_control: ?@import("source_plan_operations.zig").ControlPort = null,
     native_source_plan_observe: ?@import("source_plan_operations.zig").ObservePort = null,
     native_source_scope_control: ?@import("source_scope_control_operations.zig").Port = null,
+    native_source_retirement_control: ?@import("source_retirement_operations.zig").Port = null,
     native_source_scope_observe: ?@import("source_scope_operations.zig").Port = null,
     native_source_checkpoint_observe: ?@import("source_checkpoint_operations.zig").Port = null,
     native_source_plan_chunk: ?@import("source_plan_operations.zig").ChunkPort = null,

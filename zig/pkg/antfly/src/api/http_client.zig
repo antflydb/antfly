@@ -3115,6 +3115,54 @@ pub const ApiHttpClient = struct {
     const SourcePlanWire = @import("../data/source_plan_http_wire.zig");
     const CheckpointRead = @import("antfly_local_sources").storage_source_checkpoint_read;
     const ScopeRead = @import("antfly_local_sources").storage_source_scope_control;
+    const RetirementWire = @import("../data/source_retirement_http_wire.zig");
+    pub fn fetchGroupSourceRetirementControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, input: RetirementWire.Request, fence: route_metadata_api.CatalogRouteFence, original: @import("antfly_local_sources").api_operation.RequestContext) !RetirementWire.OwnedReply {
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
+        try context.ensureActive();
+        if (self.internal_service == null) return error.Unauthorized;
+        try input.validate();
+        try @import("source_owner_scope.zig").requireFence(input.owner(), fence);
+        if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
+        const table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, table, routes.Routes.source_retirement_control_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try RetirementWire.encodeRequest(self.alloc, input);
+        defer self.alloc.free(body);
+        const route_json = try std.json.Stringify.valueAlloc(self.alloc, fence, .{});
+        defer self.alloc.free(route_json);
+        if (route_json.len > 16384) return error.InvalidCatalogRouteFence;
+        const timeout = @min(try context.remainingTimeoutMs() orelse route_metadata_api.catalog_route_default_deadline_ms, 5000);
+        var timeout_buffer: [10]u8 = undefined;
+        const timeout_text = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{timeout});
+        var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
+        try context.ensureActive();
+        // Exactly one HTTP attempt. No post-dispatch failure permits replay.
+        var response = self.executeRequest(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .headers = &.{
+            .{ .name = route_metadata_api.catalog_route_fence_header, .value = route_json },
+            .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = timeout_text },
+        }, .timeout_ms = timeout, .cancellation = &cancellation, .max_response_bytes = RetirementWire.max_reply_bytes }) catch return RetirementWire.unknown(self.alloc, input);
+        defer response.deinit(self.alloc);
+        if (response.status != 200 or response.body.len > RetirementWire.max_reply_bytes) return RetirementWire.unknown(self.alloc, input);
+        var acknowledgements: usize = 0;
+        for (response.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, route_metadata_api.catalog_route_fence_ack_header)) {
+            acknowledgements += 1;
+        };
+        const ack = response.header(route_metadata_api.catalog_route_fence_ack_header);
+        const content_type = response.header("Content-Type") orelse response.content_type;
+        if (acknowledgements != 1 or ack == null or !std.mem.eql(u8, ack.?, route_metadata_api.catalog_route_fence_ack_value) or content_type == null or !std.ascii.eqlIgnoreCase(content_type.?, "application/json")) return RetirementWire.unknown(self.alloc, input);
+        var result = RetirementWire.decodeReply(self.alloc, input, response.body) catch return RetirementWire.unknown(self.alloc, input);
+        if (response.header(internal_batch_forwarding.outcome_header) != null) result.value.outcome = null;
+        context.ensureActive() catch {
+            result.value.outcome = null;
+            return result;
+        };
+        return result;
+    }
+
     const ScopeControlWire = @import("../data/source_scope_http_wire.zig");
     const SourcePlanOperation = enum { control, observe, chunk, checkpoint, scope, scope_control };
     fn sourcePlanInput(comptime kind: SourcePlanOperation) type {
@@ -8301,4 +8349,8 @@ test "source scope HTTP client rejects unqualified forged expired and ambiguous 
 
 test "source scope control HTTP client preserves captured authority and never retries ambiguous dispatch" {
     try @import("source_scope_control_client_test.zig").run(ApiHttpClient);
+}
+
+test "source scope retirement client preserves owned exact recovery and refuses replay" {
+    try @import("source_retirement_transport_test.zig").run(ApiHttpClient);
 }

@@ -250,3 +250,22 @@ pub fn verifyRetirementSubmission(a: std.mem.Allocator, server: anytype, observa
     intent.owner.group_id += 1;
     try std.testing.expectError(error.HistoryResynchronizationRequired, server.submitSourceRetirementIntentLocal(a, fence, "docs", intent, locator));
 }
+
+/// Exact recovery through the authenticated routed RPC never submits the
+/// modeled command. An absent native retirement receipt remains superseded.
+pub fn verifyRetirementRpc(a: std.mem.Allocator, port: @import("source_retirement_operations.zig").Port, observations: @import("source_scope_operations.zig").Port, fence: metadata.CatalogRouteFence, source_owner: @FieldType(completion.Intent, "owner")) !void {
+    const rpc = @import("../data/source_retirement_http_wire.zig");
+    var fixture: @import("../data/source_retirement_test_fixture.zig").Fixture = .{};
+    try fixture.init(source_owner);
+    const query: wire.Query = .{ .version = 1, .owner = source_owner, .domain = fixture.command.intent.reference.domain, .minimum_applied_index = 1 };
+    const before = try observations.read(a, fence, "docs", query, .{});
+    const request: rpc.Request = .{ .version = 1, .request_id = @splat(93), .operation = .recover, .recovery = .{ .command = fixture.command, .entry = before.cut, .minimum_applied_index = before.cut.index } };
+    var reply = try port.execute(a, fence, "docs", request, .{});
+    defer reply.deinit();
+    try reply.value.validate(a, request);
+    if (reply.value.outcome == null) return error.TestRetirementRpcOutcomeUnknown;
+    try std.testing.expect(reply.value.outcome.? == .superseded);
+    try std.testing.expect(!reply.value.confirmed());
+    const after = try observations.read(a, fence, "docs", query, .{});
+    try std.testing.expectEqualDeep(before, after);
+}
