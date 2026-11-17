@@ -727,13 +727,22 @@ fn parseBatchRequestWithOptions(
         else => return error.InvalidBatchRequest,
     };
     defer parsed.deinit();
-    const versioned = parsed.value == .array;
-    const document_versions_envelope = versioned and parsed.value.array.items.len == 2 and parsed.value.array.items[0] == .string and std.mem.eql(u8, parsed.value.array.items[0].string, "document-revisions-batch-v1");
+    const Producer = @import("../storage/source_producer_policy.zig").Producer;
+    var source_producer: Producer = .unlabelled;
+    var batch_value = parsed.value;
+    if (batch_value == .array and batch_value.array.items.len == 3) {
+        const envelope = batch_value.array.items;
+        if (!allow_internal or envelope[0] != .string or !std.mem.eql(u8, envelope[0].string, "source-producer-batch-v1") or envelope[1] != .string) return error.InvalidBatchRequest;
+        source_producer = if (std.mem.eql(u8, envelope[1].string, "ordinary")) .ordinary else if (std.mem.eql(u8, envelope[1].string, "legacy_cdc")) .legacy_cdc else return error.InvalidBatchRequest;
+        batch_value = envelope[2];
+    }
+    const versioned = batch_value == .array;
+    const document_versions_envelope = versioned and batch_value.array.items.len == 2 and batch_value.array.items[0] == .string and std.mem.eql(u8, batch_value.array.items[0].string, "document-revisions-batch-v1");
     const root_value = if (versioned) blk: {
-        const entries = parsed.value.array.items;
+        const entries = batch_value.array.items;
         if (!allow_internal or entries.len != 2 or entries[0] != .string or (!document_versions_envelope and !std.mem.eql(u8, entries[0].string, "row-semantics-batch-v1"))) return error.InvalidBatchRequest;
         break :blk entries[1];
-    } else parsed.value;
+    } else batch_value;
     if (root_value != .object) return error.InvalidBatchRequest;
     const root = root_value.object;
     // Versioned revision metadata does not add effects to a sole-control
@@ -1521,6 +1530,7 @@ fn parseBatchRequestWithOptions(
         for (transaction_participants[0..transaction_participants_initialized]) |participant| alloc.free(participant);
         if (transaction_participants.len > 0) alloc.free(transaction_participants);
     }
+    if (source_producer != .unlabelled and root.contains("_transaction")) return error.InvalidBatchRequest;
     const transaction: ?db_mod.types.TransactionMutation = transaction: {
         const value = root.get("_transaction") orelse break :transaction null;
         if (!allow_internal or value != .object) return error.InvalidBatchRequest;
@@ -1860,6 +1870,7 @@ fn parseBatchRequestWithOptions(
             .graph_deletes = graph_deletes,
             .graph_endpoint_cleanup_guards = if (graph_endpoint_cleanup_guards) |guards| guards.value else &.{},
             .predicates = predicates,
+            .source_producer = source_producer,
             .timestamp_ns = timestamp_ns,
             .document_version_scheme = document_version_scheme,
             .sync_level = sync_level,
@@ -1943,7 +1954,7 @@ pub fn requiresDocumentVersionsEnvelope(req: db_mod.types.BatchRequest) bool {
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
-    return encodeBatchRequestOwned(alloc, req, false) catch |err| switch (err) {
+    return encodeProducerBatchRequest(alloc, req, false) catch |err| switch (err) {
         // This memory writer can fail only when allocation fails.
         error.WriteFailed => error.OutOfMemory,
         else => err,
@@ -1954,10 +1965,20 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
 /// fence. Remote replicated batches still require the prepare protocol and
 /// continue to use encodeBatchRequest, which rejects unscoped predicates.
 pub fn encodeOwnerBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
-    return encodeBatchRequestOwned(alloc, req, true) catch |err| switch (err) {
+    return encodeProducerBatchRequest(alloc, req, true) catch |err| switch (err) {
         error.WriteFailed => error.OutOfMemory,
         else => err,
     };
+}
+
+fn encodeProducerBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest, local_owner: bool) ![]u8 {
+    // Scoped source authority is intrinsic to validated transaction resolution;
+    // a generic row envelope cannot manufacture that authority.
+    if (req.source_producer == .scoped_source or (req.source_producer != .unlabelled and req.transaction != null)) return error.InvalidBatchRequest;
+    const encoded = try encodeBatchRequestOwned(alloc, req, local_owner);
+    if (req.source_producer == .unlabelled) return encoded;
+    defer alloc.free(encoded);
+    return std.fmt.allocPrint(alloc, "[\"source-producer-batch-v1\",\"{s}\",{s}]", .{ @tagName(req.source_producer), encoded });
 }
 
 fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest, local_owner: bool) ![]u8 {
@@ -4388,4 +4409,43 @@ test "completion begin wire ordinary producer phases preserve absence and reject
     var mixed = prepare;
     mixed.transaction.?.prepare.source_purpose = @splat(5);
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, mixed));
+}
+
+test "completion begin wire row producer envelope retains explicit labels without upgrading absent origin" {
+    const a = std.testing.allocator;
+    const Producer = @import("../storage/source_producer_policy.zig").Producer;
+    for ([_]Producer{ .ordinary, .legacy_cdc }) |producer| {
+        const request: db_mod.types.BatchRequest = .{ .source_producer = producer, .document_version_scheme = .revision_v1, .timestamp_ns = 100, .writes = &.{.{ .key = "row", .value = "{\"v\":9007199254740993}" }} };
+        const encoded = try encodeBatchRequest(a, request);
+        defer a.free(encoded);
+        var decoded = try parseInternalBatchRequest(a, encoded);
+        defer decoded.deinit(a);
+        try std.testing.expectEqual(producer, decoded.req.source_producer);
+        try std.testing.expectEqualStrings(request.writes[0].value, decoded.req.writes[0].value);
+        try std.testing.expectEqual(db_mod.types.DocumentVersionScheme.revision_v1, decoded.req.document_version_scheme);
+        try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, encoded));
+        const forwarded = try encodeBatchRequest(a, decoded.req);
+        defer a.free(forwarded);
+        try std.testing.expectEqualStrings(encoded, forwarded);
+        var old = request;
+        old.source_producer = .unlabelled;
+        const old_bytes = try encodeBatchRequest(a, old);
+        defer a.free(old_bytes);
+        var old_decoded = try parseInternalBatchRequest(a, old_bytes);
+        defer old_decoded.deinit(a);
+        try std.testing.expectEqual(Producer.unlabelled, old_decoded.req.source_producer);
+        var forged = request;
+        forged.source_producer = .scoped_source;
+        try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, forged));
+    }
+    for ([_][]const u8{
+        "[\"source-producer-batch-v1\",\"unlabelled\",{}]",
+        "[\"source-producer-batch-v1\",\"scoped_source\",{}]",
+        "[\"source-producer-batch-v1\",null,{}]",
+        "[\"source-producer-batch-v1\",\"ordinary\",{} ,{}]",
+        "[\"source-producer-batch-v1\",\"ordinary\",[\"source-producer-batch-v1\",\"legacy_cdc\",{}]]",
+    }) |invalid| try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, invalid));
+    var public = try parseBatchRequest(a, "{\"source_producer\":\"ordinary\",\"inserts\":{\"row\":{}}}");
+    defer public.deinit(a);
+    try std.testing.expectEqual(Producer.unlabelled, public.req.source_producer);
 }

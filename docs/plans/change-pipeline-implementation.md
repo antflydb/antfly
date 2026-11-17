@@ -6596,3 +6596,67 @@ and leaving 14.0 GiB free. `git diff --check` passed. Current versions are engin
 62, owner ABI 112, API kernel 33, data protocol 42, metadata 105 and failure 89.
 The first-strict gate and all remaining full-scope acceptance requirements remain
 open; neither issue is closed and the implementation PR remains a draft.
+
+### Private row producer envelopes (verification in progress)
+
+`BatchRequest.source_producer` now carries an explicit trusted row origin,
+defaulting to unlabelled. Ordinary and legacy CDC rows use the private three-item
+`["source-producer-batch-v1", origin, original_batch]` envelope. The original row
+semantics/document revision envelope remains nested and unchanged. Old decoders
+reject the new outer tag rather than silently dropping a field; current decoders
+accept exactly ordinary or legacy CDC, reject nested producer envelopes and
+malformed/unknown labels, and preserve absence on older batches. Public mutation
+promotion does not acquire classification from JSON. The public parser still
+refuses private array envelopes. Generic row envelopes cannot carry private
+transaction commands or grant scoped-source authority.
+
+The primary DB apply path combines the request's retained origin and explicit
+native admission under the apply fence. Missing labels do not upgrade another
+origin; conflicting explicit labels fail before effects/marker commit. Scoped
+classification is derived only from an intrinsic scoped transaction resolution,
+not a generic row label or an ordinary ordered mutation caller. The existing
+ordered replay check still precedes producer policy evaluation.
+
+Data protocol 43 requires irreversible all-applying-member activation before
+these row envelopes are proposed or applied. Engine 63, native owner ABI 113 and
+API kernel 34 fence the changed private batch layouts/semantics independently.
+Metadata 105 and failure 89 are unchanged. The linked service-authenticated
+HTTP/Raft fixture submits an explicitly classified ordinary row through the
+private batch writer and requires profile 43; later barriers/assertions preserve
+that nondecreasing floor. The native DB fixture now uses the row request's own
+classification, rejects a conflicting native admission and forged generic scoped
+label, and refuses an explicitly labelled legacy row after closure.
+
+Full generation passed (`source-row-producer-generate.log`); only the two unrelated
+model-explorer outputs were discarded. Source-catalog, engine-error and OpenAPI
+checks passed (`source-row-producer-contract-check.log`). Native/wire/linked test
+results follow below and are not inferred from an earlier ABI or protocol run.
+
+This is row transport and native admission, not production origin assignment.
+Legacy CDC currently enters `commitBatch`/table-transaction compilation without an
+origin field, so a purpose-free request cannot safely be inferred ordinary.
+Trusted ingress and all legacy producer labels still need end-to-end plumbing,
+including transaction routing and fallback. Closure RPC/Raft activation,
+qualified old-transaction resolution/drainage, every special mutation and
+snapshot/cohort transfer remain required; first-strict activation stays closed.
+The full original destination/history/public feed/bootstrap/retention/pgoutput/
+actual Antfly CDC-client acceptance scope remains open and active.
+
+The combined native/wire run passed all 16 history cases, 32 private-wire cases,
+six local boundary cases and the actual DB/compiled-engine closure case with zero
+failures, skips or leaks (`source-row-producer-test.log`). Its linked fixture
+initially failed compilation because the new direct writer call omitted the
+required forwarding context fields. Supplying explicit bounded remaining time,
+forward count and campaign policy fixed the fixture. The final linked run passed
+all six local and 33 linked cases, zero failures, skips or leaks
+(`source-row-producer-linked-test.log`), including the authenticated HTTP row
+producer envelope and actual profile-43 Raft dispatch. The row label is explicit
+trusted fixture input; the remote root is not a production handover qualification.
+
+Final source-catalog, engine-error and OpenAPI checks passed
+(`source-row-producer-contract-final-check.log`). Guarded cleanup completed
+successfully (`source-row-producer-gc.log`), preserving active/recent output;
+11.7 GiB remained free. `git diff --check` passed. No issue was closed or acceptance
+criterion marked complete by this transport milestone. The full goal remains
+active with trusted ingress/legacy CDC assignment, transaction-origin propagation,
+closure activation/drainage and all other original feature requirements open.

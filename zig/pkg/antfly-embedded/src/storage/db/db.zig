@@ -7839,6 +7839,7 @@ pub const DB = struct {
 
     pub fn applyOrderedCommittedMutationWithProducer(self: *DB, request: types.BatchRequest, producer: @import("../source_producer_policy.zig").Producer, identity: OrderedApplyReceipt, bypass_write_gate: bool) anyerror!void {
         if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedCommittedMutationWithProducer", .{ self, request, producer, identity, bypass_write_gate });
+        if (producer == .scoped_source) return error.InvalidSourceAdmission;
         if (request.graph_endpoint_cleanup and !request.graph_endpoint_cleanup_planned) return error.InvalidBatchRequest;
         try self.batchInternal(request, null, .{
             .validate_range_ownership = false,

@@ -27,7 +27,7 @@ pub fn run(a: std.mem.Allocator, path: []const u8, options: db_mod.OpenOptions, 
     const legacy_id: [16]u8 = @splat(231);
     const blocked_id: [16]u8 = @splat(232);
     const legacy_prepare: @import("types.zig").TransactionIntentRequest = .{ .writes = &.{.{ .key = "producer-legacy-txn", .value = "{}" }} };
-    const ordinary: @import("types.zig").BatchRequest = .{ .writes = &.{.{ .key = "producer-ordinary", .value = "{}" }}, .sync_level = .write };
+    const ordinary: @import("types.zig").BatchRequest = .{ .source_producer = .ordinary, .writes = &.{.{ .key = "producer-ordinary", .value = "{}" }}, .sync_level = .write };
     {
         var db = try db_mod.DB.open(a, path, options);
         defer db.close();
@@ -48,8 +48,12 @@ pub fn run(a: std.mem.Allocator, path: []const u8, options: db_mod.OpenOptions, 
         try std.testing.expectError(error.SourcePendingWork, db.applyOrderedCommittedMutation(late, .{ .term = 1, .index = 13 }, false));
         try std.testing.expect(try db.get(a, "producer-late") == null);
         try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.sourceScopeObservation(.{ .version = 1, .owner = owner, .domain = domain, .minimum_applied_index = 13 }));
-        try db.applyOrderedCommittedMutationWithProducer(ordinary, .ordinary, .{ .term = 1, .index = 13 }, false);
-        try std.testing.expectError(error.SourcePendingWork, db.applyOrderedCommittedMutationWithProducer(late, .legacy_cdc, .{ .term = 1, .index = 14 }, false));
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, db.applyOrderedCommittedMutationWithProducer(ordinary, .legacy_cdc, .{ .term = 1, .index = 13 }, false));
+        try std.testing.expectError(error.InvalidSourceAdmission, db.applyOrderedCommittedMutationWithProducer(ordinary, .scoped_source, .{ .term = 1, .index = 13 }, false));
+        try db.applyOrderedCommittedMutation(ordinary, .{ .term = 1, .index = 13 }, false);
+        var labelled_legacy = late;
+        labelled_legacy.source_producer = .legacy_cdc;
+        try std.testing.expectError(error.SourcePendingWork, db.applyOrderedCommittedMutation(labelled_legacy, .{ .term = 1, .index = 14 }, false));
         try std.testing.expectEqualDeep(closed, try db.applyOrderedSourceProducerClosure(owner, .{ .term = 1, .index = 14 }, false));
     }
     {

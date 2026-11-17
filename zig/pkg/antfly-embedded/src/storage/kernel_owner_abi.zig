@@ -35,7 +35,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 110 adds ordered source-scope controls and exact outcome recovery.
 // Version 111 adds ordered source retirement and exact outcome recovery.
 // Version 112 fences explicit ordinary completion transaction phases.
-pub const abi_version: u32 = 112;
+// Version 113 fences private row batch producer envelopes.
+pub const abi_version: u32 = 113;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

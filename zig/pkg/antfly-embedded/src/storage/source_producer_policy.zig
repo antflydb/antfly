@@ -25,6 +25,13 @@ pub const max_bytes = 4096;
 /// Only authenticated ordinary ingress may attach ordinary. Scoped ingress
 /// separately validates its retained source scope and original admission.
 pub const Producer = enum { unlabelled, ordinary, legacy_cdc, scoped_source };
+/// Merge explicit native admission with the retained private row envelope.
+/// Neither a missing label nor a conflicting label upgrades another origin.
+pub fn rowProducer(request: Producer, admission: Producer) !Producer {
+    if (request == .scoped_source) return error.InvalidSourceAdmission;
+    if (request != .unlabelled and admission != .unlabelled and request != admission) return error.SourceTransactionIdentityConflict;
+    return if (request != .unlabelled) request else admission;
+}
 pub const Closure = struct {
     version: u8 = 1,
     root: scope.Basis,

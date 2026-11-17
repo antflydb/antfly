@@ -1017,7 +1017,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer producer_read.abort();
                 // Scoped resolution already carries original native scope and
                 // admission identity; it is not ordinary/legacy row inference.
-                const producer = if (opts.transaction_resolution != null and opts.transaction_resolution.?.source_scope != null) @import("../source_producer_policy.zig").Producer.scoped_source else opts.source_producer;
+                const policy = @import("../source_producer_policy.zig");
+                const row_producer = try policy.rowProducer(req.source_producer, opts.source_producer);
+                const producer = if (opts.transaction_resolution != null and opts.transaction_resolution.?.source_scope != null) scoped: {
+                    if (row_producer != .unlabelled and row_producer != .scoped_source) return error.SourceTransactionIdentityConflict;
+                    break :scoped policy.Producer.scoped_source;
+                } else ordinary: {
+                    if (row_producer == .scoped_source) return error.InvalidSourceAdmission;
+                    break :ordinary row_producer;
+                };
                 try @import("../source_producer_policy.zig").Store.requirePhysical(preparation_alloc, &producer_read, @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace), S.ownerField(self, "core").*.root_generation, producer);
             }
 

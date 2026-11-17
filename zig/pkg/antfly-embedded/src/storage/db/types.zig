@@ -274,6 +274,9 @@ pub const TransactionMutation = union(enum) {
 pub const DocumentVersionScheme = enum { legacy, revision_v1, admit_current };
 
 pub const BatchRequest = struct {
+    /// Trusted origin carried by a separate private versioned envelope.
+    /// Public mutation promotion and older transport preserve unlabelled.
+    source_producer: @import("../source_producer_policy.zig").Producer = .unlabelled,
     /// Private ordered curator decision; never accepted from public batch JSON.
     resolver_review: ?@import("resolver_review.zig").Command = null,
     /// Trusted ingress attaches a signed write principal and the admission

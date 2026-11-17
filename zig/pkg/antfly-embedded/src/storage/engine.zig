@@ -610,7 +610,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 60 requires producer closure on transaction-record mutation.
 /// Version 61 retains immutable ordinary transaction producer provenance.
 /// Version 62 adds explicitly classified ordinary completion BEGIN.
-pub const descriptor_version: u32 = 62;
+/// Version 63 preserves row producer provenance through primary materialization.
+pub const descriptor_version: u32 = 63;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

@@ -40,7 +40,7 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 42;
+pub const batch_protocol_version: u16 = 43;
 /// Frozen completion BEGIN and owner/input-fenced PREPARE require durable
 /// activation across every applying member before proposal or native apply.
 pub const batch_completion_admission_protocol_version: u16 = 31;
@@ -95,7 +95,12 @@ fn completionEnvelopeVersion(a: @import("std").mem.Allocator, bytes: []const u8,
     defer parsed.deinit();
     return if (certificate) parsed.value.certificate.manifest.version else parsed.value.admission.version;
 }
+/// Version 43 preserves ordinary/legacy origin on the private row envelope.
+pub const batch_row_producer_protocol_version: u16 = 43;
 pub fn completionProtocolVersion(a: @import("std").mem.Allocator, request: anytype) !?u16 {
+    if (comptime @hasField(@TypeOf(request), "source_producer")) {
+        if (request.source_producer != .unlabelled) return batch_row_producer_protocol_version;
+    }
     const mutation = request.transaction orelse return null;
     return switch (mutation) {
         .publish_completion => |value| if (try completionEnvelopeVersion(a, value.certificate, true) >= 3) batch_completion_recovery_protocol_version else batch_completion_publication_protocol_version,
@@ -254,4 +259,13 @@ test "data raft ordered history ordinary producer requires its own activation fl
     try std.testing.expectEqual(@as(?u16, 42), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .begin = .{ .ordinary_producer = true } } }));
     try std.testing.expectEqual(@as(?u16, 42), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .prepare = .{ .ordinary_producer = true } } }));
     try std.testing.expectEqual(@as(?u16, 31), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .prepare = .{ .completion_owner = 1 } } }));
+}
+
+test "data raft ordered history row producer envelope requires separate activation" {
+    const Request = @import("antfly_local_sources").storage_db_selected_root.db.types.BatchRequest;
+    const a = @import("std").testing.allocator;
+    const expect = @import("std").testing.expectEqual;
+    try expect(@as(?u16, 43), try completionProtocolVersion(a, Request{ .source_producer = .ordinary }));
+    try expect(@as(?u16, 43), try completionProtocolVersion(a, Request{ .source_producer = .legacy_cdc }));
+    try expect(@as(?u16, null), try completionProtocolVersion(a, Request{}));
 }
