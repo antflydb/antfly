@@ -41,6 +41,55 @@ pub const Closure = struct {
         if (self.version != 1 or self.first_closed_at.term == 0 or self.first_closed_at.index == 0) return error.SourceAdmissionCorrupt;
     }
 };
+/// Serving owners establish ReadIndex and verify the full catalog owner
+/// before and after this native snapshot. A lower bound is never an ACK.
+pub const Query = struct {
+    version: u8,
+    owner: @import("transaction_completion.zig").RoutedOwner,
+    minimum_applied_index: u64,
+    pub fn validate(self: Query) !void {
+        try self.owner.validate();
+        if (self.version != 1 or self.minimum_applied_index == 0) return error.InvalidSourceAdmission;
+    }
+};
+pub const max_query_bytes = 4096;
+pub const max_observation_bytes = 8192;
+pub const Observation = struct {
+    version: u8,
+    owner: @import("transaction_completion.zig").RoutedOwner,
+    cut: scope.Cut,
+    /// Absence is not a transaction outcome or a legacy-drain proof.
+    closure: ?Closure,
+    pub fn validate(self: Observation, query: Query) !void {
+        try query.validate();
+        if (self.version != 1 or !std.meta.eql(self.owner, query.owner) or self.cut.term == 0 or self.cut.index < query.minimum_applied_index) return error.SourceAdmissionCorrupt;
+        if (self.closure) |closed| {
+            try closed.validate();
+            if (!std.meta.eql(closed.root, try scope.Basis.fromOwner(query.owner)) or closed.first_closed_at.index > self.cut.index or closed.first_closed_at.term > self.cut.term or (closed.first_closed_at.index == self.cut.index and closed.first_closed_at.term != self.cut.term)) return error.SourceAdmissionCorrupt;
+        }
+    }
+};
+pub fn observe(a: A, txn: anytype, query: Query, applied: scope.Cut) !Observation {
+    try query.validate();
+    const result: Observation = .{ .version = 1, .owner = query.owner, .cut = applied, .closure = try Store.read(a, txn, try scope.Basis.fromOwner(query.owner)) };
+    try result.validate(query);
+    return result;
+}
+pub fn encodeObservation(a: A, query: Query, observed: Observation) ![]u8 {
+    try observed.validate(query);
+    const bytes = try std.json.Stringify.valueAlloc(a, observed, .{});
+    errdefer a.free(bytes);
+    if (bytes.len > max_observation_bytes) return error.SourceAdmissionCorrupt;
+    return bytes;
+}
+pub fn decodeObservation(a: A, bytes: []const u8, query: Query) !Observation {
+    try query.validate();
+    if (bytes.len == 0 or bytes.len > max_observation_bytes) return error.SourceAdmissionCorrupt;
+    var parsed = std.json.parseFromSlice(Observation, a, bytes, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.SourceAdmissionCorrupt;
+    defer parsed.deinit();
+    try parsed.value.validate(query);
+    return parsed.value;
+}
 const Envelope = struct { closure: Closure, checksum: scope.Digest };
 fn digest(a: A, closure: Closure) !scope.Digest {
     const bytes = try std.json.Stringify.valueAlloc(a, closure, .{});

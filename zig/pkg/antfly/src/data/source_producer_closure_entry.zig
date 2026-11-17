@@ -123,3 +123,39 @@ test "source producer closure entry requires activation and never becomes row wo
     defer a.free(mixed);
     try std.testing.expectError(error.UnknownField, batch.decodeForApply(a, mixed));
 }
+
+test "history control entry producer closure observations bind original root and native cut" {
+    const a = std.testing.allocator;
+    const policy = local.storage_source_producer_policy;
+    const scope = local.storage_source_scope;
+    var namespace: [24]u8 = undefined;
+    std.mem.writeInt(u64, namespace[0..8], 7, .big);
+    std.mem.writeInt(u64, namespace[8..16], 11, .big);
+    std.mem.writeInt(u64, namespace[16..24], 13, .big);
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = namespace, .table_binding = @splat(3), .root_generation = 4, .group_id = 601, .topology_epoch = 5 };
+    const query: policy.Query = .{ .version = 1, .owner = owner, .minimum_applied_index = 9 };
+    const absent: policy.Observation = .{ .version = 1, .owner = owner, .cut = .{ .term = 2, .index = 10 }, .closure = null };
+    const bytes = try policy.encodeObservation(a, query, absent);
+    defer a.free(bytes);
+    try std.testing.expect((try policy.decodeObservation(a, bytes, query)).closure == null);
+    var present = absent;
+    present.closure = .{ .root = try scope.Basis.fromOwner(owner), .first_closed_at = .{ .term = 1, .index = 9 } };
+    const closed_bytes = try policy.encodeObservation(a, query, present);
+    defer a.free(closed_bytes);
+    try std.testing.expectEqualDeep(present, try policy.decodeObservation(a, closed_bytes, query));
+    var changed = query;
+    changed.owner.root_generation += 1;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, policy.decodeObservation(a, closed_bytes, changed));
+    changed = query;
+    changed.minimum_applied_index = 11;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, policy.decodeObservation(a, closed_bytes, changed));
+    var forged = present;
+    forged.closure.?.first_closed_at.index = 11;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, policy.encodeObservation(a, query, forged));
+    forged = present;
+    forged.closure.?.root.root_generation += 1;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, policy.encodeObservation(a, query, forged));
+    const duplicate = try std.fmt.allocPrint(a, "{s},\"closure\":null}}", .{closed_bytes[0 .. closed_bytes.len - 1]});
+    defer a.free(duplicate);
+    try std.testing.expectError(error.SourceAdmissionCorrupt, policy.decodeObservation(a, duplicate, query));
+}

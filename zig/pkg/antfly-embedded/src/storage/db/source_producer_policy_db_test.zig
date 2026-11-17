@@ -32,10 +32,19 @@ pub fn run(a: std.mem.Allocator, path: []const u8, options: db_mod.OpenOptions, 
         var db = try db_mod.DB.open(a, path, options);
         defer db.close();
         try db.applyOrderedCommittedMutation(before, .{ .term = 1, .index = 11 }, false);
+        const absent = try db.sourceProducerClosureObservation(.{ .version = 1, .owner = owner, .minimum_applied_index = 11 });
+        try std.testing.expect(absent.closure == null);
+        try std.testing.expectEqual(@as(u64, 11), absent.cut.index);
+
         _ = try db.beginTransactionScoped(legacy_id, 10, 11, &.{"legacy-participant"}, true, false, null);
         try db.writeTransaction(legacy_id, legacy_prepare);
         const closed = try db.applyOrderedSourceProducerClosure(owner, .{ .term = 1, .index = 12 }, false);
         try std.testing.expectEqual(@as(u64, 12), closed.first_closed_at.index);
+        const observed_closure = try db.sourceProducerClosureObservation(.{ .version = 1, .owner = owner, .minimum_applied_index = 12 });
+        try std.testing.expectEqualDeep(closed, observed_closure.closure.?);
+        try std.testing.expectEqual(@as(u64, 12), observed_closure.cut.index);
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.sourceProducerClosureObservation(.{ .version = 1, .owner = owner, .minimum_applied_index = 13 }));
+
         try std.testing.expectEqualDeep(closed, try db.applyOrderedSourceProducerClosure(owner, .{ .term = 1, .index = 12 }, false));
         try std.testing.expectError(error.SourceOutcomeUnresolved, db.applyOrderedSourceProducerClosure(owner, .{ .term = 1, .index = 11 }, false));
         try std.testing.expectError(error.SourcePendingWork, db.beginReplicatedTransactionAtOrderedReceipt(blocked_id, 10, 11, &.{"legacy-participant"}, true, false, .{ .term = 1, .index = 13 }));
@@ -68,6 +77,11 @@ pub fn run(a: std.mem.Allocator, path: []const u8, options: db_mod.OpenOptions, 
         try std.testing.expect(try db.get(a, "producer-late") == null);
         const observed = try db.sourceScopeObservation(.{ .version = 1, .owner = owner, .domain = domain, .minimum_applied_index = 14 });
         try std.testing.expectEqual(@as(u64, 14), observed.cut.index);
+        const reopened_closure = try db.sourceProducerClosureObservation(.{ .version = 1, .owner = owner, .minimum_applied_index = 14 });
+        try std.testing.expectEqual(@as(u64, 12), reopened_closure.closure.?.first_closed_at.index);
+        try std.testing.expectEqual(@as(u64, 14), reopened_closure.cut.index);
+        try std.testing.expectEqualDeep(reopened_closure, try db.sourceProducerClosureObservation(.{ .version = 1, .owner = owner, .minimum_applied_index = 14 }));
+
         {
             var txn = try db.core.store.beginWriteTxn();
             errdefer txn.abort();
@@ -75,6 +89,7 @@ pub fn run(a: std.mem.Allocator, path: []const u8, options: db_mod.OpenOptions, 
             try txn.commit();
         }
         try std.testing.expectError(error.SourceAdmissionCorrupt, db.applyOrderedCommittedMutationWithProducer(late, .ordinary, .{ .term = 1, .index = 15 }, false));
+        try std.testing.expectError(error.SourceAdmissionCorrupt, db.sourceProducerClosureObservation(.{ .version = 1, .owner = owner, .minimum_applied_index = 14 }));
         try std.testing.expect(try db.get(a, "producer-late") == null);
     }
     try @import("source_ordinary_transaction_db_test.zig").run(a, path, options, owner);

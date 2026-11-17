@@ -1905,11 +1905,12 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     const source_plan_http = @import("../data/source_plan_http_wire.zig");
-    const SourcePlanReadKind = enum { observation, chunk, outcome, checkpoint, scope, scope_outcome, retirement_outcome };
+    const SourcePlanReadKind = enum { observation, chunk, outcome, checkpoint, scope, scope_outcome, retirement_outcome, producer_closure };
     fn SourcePlanReadInput(comptime kind: SourcePlanReadKind) type {
         return switch (kind) {
             .observation => source_plan_http.ObserveRequest,
             .scope => @import("antfly_local_sources").storage_source_scope_control.Query,
+            .producer_closure => @import("antfly_local_sources").storage_source_producer_policy.Query,
             .scope_outcome => @import("antfly_local_sources").storage_source_scope_ordered.Recovery,
             .retirement_outcome => @import("antfly_local_sources").storage_source_scope_retirement_ordered.Query,
             .checkpoint => @import("antfly_local_sources").storage_source_checkpoint_read.Request,
@@ -1921,6 +1922,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return switch (kind) {
             .observation => source_plan_http.control.Observation,
             .scope => @import("antfly_local_sources").storage_source_scope_control.Observation,
+            .producer_closure => @import("antfly_local_sources").storage_source_producer_policy.Observation,
             .scope_outcome => @import("antfly_local_sources").storage_source_scope_ordered.Outcome,
             .retirement_outcome => @import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery,
             .checkpoint => @import("antfly_local_sources").storage_source_checkpoint_read.Reply,
@@ -1933,6 +1935,9 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
     pub fn sourceScopeOutcomeRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_scope_ordered.Recovery) !@import("antfly_local_sources").storage_source_scope_ordered.Outcome {
         return self.sourcePlanReadRouted(a, fence, table, .scope_outcome, request);
+    }
+    pub fn sourceProducerClosureObservationRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_producer_policy.Query) !@import("antfly_local_sources").storage_source_producer_policy.Observation {
+        return self.sourcePlanReadRouted(a, fence, table, .producer_closure, request);
     }
     pub fn sourceScopeObservationRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_scope_control.Query) !@import("antfly_local_sources").storage_source_scope_control.Observation {
         return self.sourcePlanReadRouted(a, fence, table, .scope, request);
@@ -1955,7 +1960,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             try request.validate(a);
             if (request.operation != .recover) return error.InvalidSourcePlanWire;
         } else try request.validate();
-        const expected = if (kind == .scope) request.owner else if (kind == .scope_outcome or kind == .retirement_outcome) request.command.intent.owner else request.source_owner;
+        const expected = if (kind == .scope or kind == .producer_closure) request.owner else if (kind == .scope_outcome or kind == .retirement_outcome) request.command.intent.owner else request.source_owner;
         const group = fence.route.group_id;
         if (expected.group_id != group) return error.TopologyChanged;
         const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
@@ -1973,7 +1978,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (proof.incarnation == 0 or proof.term == 0 or proof.applied_index == 0) return error.ReadUnavailable;
         const minimum = switch (kind) {
             .observation => request.query.minimum_applied_index,
-            .checkpoint, .scope, .scope_outcome, .retirement_outcome => request.minimum_applied_index,
+            .checkpoint, .scope, .scope_outcome, .retirement_outcome, .producer_closure => request.minimum_applied_index,
             .chunk => request.request.query.minimum_applied_index,
             .outcome => request.receipt.?.index,
         };
@@ -1987,6 +1992,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const result = switch (kind) {
             .observation => try lease.owner().sourcePlanObservation(a, table, request.query),
             .scope => try lease.owner().sourceScopeObservation(a, table, request),
+            .producer_closure => try lease.owner().sourceProducerClosureObservation(a, table, request),
             .scope_outcome => try lease.owner().sourceScopeOutcome(a, table, request),
             .retirement_outcome => try lease.owner().sourceRetirementOutcome(a, table, request),
             .checkpoint => try lease.owner().sourceCheckpointObservation(a, table, request),

@@ -26326,6 +26326,19 @@ pub const DB = struct {
 
     /// The serving owner establishes and revalidates ReadIndex and the complete
     /// catalog owner. Native identity, real apply cut and registry share a read.
+    /// The serving owner independently qualifies ReadIndex/catalog ownership.
+    /// Native root, apply cut and closure state share this read-only snapshot.
+    pub fn sourceProducerClosureObservation(self: *DB, query: @import("../source_producer_policy.zig").Query) !@import("../source_producer_policy.zig").Observation {
+        if (comptime storage_engine.enabled) return storage_engine.call("sourceProducerClosureObservation", .{ self, query });
+        try query.validate();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = query.owner.namespace, .generation = query.owner.root_generation, .fence = query.owner.digest() });
+        const cut = try orderedHistoryReadCut(&txn, query.minimum_applied_index);
+        return @import("../source_producer_policy.zig").observe(self.alloc, &txn, query, .{ .term = cut.term, .index = cut.index });
+    }
+
     pub fn sourceScopeObservation(self: *DB, query: @import("../source_scope_control.zig").Query) !@import("../source_scope_control.zig").Observation {
         if (comptime storage_engine.enabled) return storage_engine.call("sourceScopeObservation", .{ self, query });
         try query.validate();

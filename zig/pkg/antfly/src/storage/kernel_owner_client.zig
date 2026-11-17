@@ -694,6 +694,17 @@ pub const Owner = struct {
         return ordered.decodeOutcome(a, response.bytes(), query.command, query.entry);
     }
 
+    pub fn sourceProducerClosureObservation(self: *Owner, a: std.mem.Allocator, table: []const u8, query: @import("antfly_local_sources").storage_source_producer_policy.Query) !@import("antfly_local_sources").storage_source_producer_policy.Observation {
+        const wire = @import("antfly_local_sources").storage_source_producer_policy;
+        try query.validate();
+        const json = try std.json.Stringify.valueAlloc(a, query, .{});
+        defer a.free(json);
+        if (json.len > wire.max_query_bytes) return error.InvalidSourceAdmission;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_source_producer_closure_observation(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(json) }, &response.buffer));
+        defer response.deinit();
+        return wire.decodeObservation(a, response.bytes(), query);
+    }
     pub fn sourceScopeObservation(self: *Owner, a: std.mem.Allocator, table: []const u8, input: @import("antfly_local_sources").storage_source_scope_control.Query) !@import("antfly_local_sources").storage_source_scope_control.Observation {
         const wire = @import("antfly_local_sources").storage_source_scope_control;
         try input.validate();

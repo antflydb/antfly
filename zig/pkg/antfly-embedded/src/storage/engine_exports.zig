@@ -1199,6 +1199,9 @@ fn orderedSourceRetirementOutcome(self: *DB, query: @import("source_scope_retire
 fn orderedSourceScopeOutcome(self: *DB, recovery: @import("source_scope_ordered.zig").Recovery) engine.Outcome(@import("source_scope_ordered.zig").Outcome) {
     return .{ .value = self.orderedSourceScopeOutcome(recovery) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn sourceProducerClosureObservation(self: *DB, query: @import("source_producer_policy.zig").Query) engine.Outcome(@import("source_producer_policy.zig").Observation) {
+    return .{ .value = self.sourceProducerClosureObservation(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn sourceScopeObservation(self: *DB, query: @import("source_scope_control.zig").Query) engine.Outcome(@import("source_scope_control.zig").Observation) {
     return .{ .value = self.sourceScopeObservation(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

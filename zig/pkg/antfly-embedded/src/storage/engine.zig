@@ -565,6 +565,7 @@ pub const VTable = struct {
     orderedSourceScopeOutcome: *const fn (*DB, @import("source_scope_ordered.zig").Recovery) Outcome(@import("source_scope_ordered.zig").Outcome),
     applyOrderedSourceRetirement: *const fn (*DB, @import("source_scope_retirement.zig").Command, types.OrderedApplyReceipt, bool) Outcome(@import("source_scope_retirement_ordered.zig").Recovery),
     orderedSourceRetirementOutcome: *const fn (*DB, @import("source_scope_retirement_ordered.zig").Query) Outcome(@import("source_scope_retirement_ordered.zig").Recovery),
+    sourceProducerClosureObservation: *const fn (*DB, @import("source_producer_policy.zig").Query) Outcome(@import("source_producer_policy.zig").Observation),
     sourceScopeObservation: *const fn (*DB, @import("source_scope_control.zig").Query) Outcome(@import("source_scope_control.zig").Observation),
     sourceCheckpointObservation: *const fn (*DB, @import("source_checkpoint_read.zig").Request) Outcome(@import("source_checkpoint_read.zig").Reply),
     sourcePlanObservation: *const fn (*DB, @import("source_plan_control.zig").Query) Outcome(@import("source_plan_control.zig").Observation),
@@ -617,7 +618,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 63 preserves row producer provenance through primary materialization.
 /// Version 64 retains immutable legacy completion transaction origin.
 /// Version 65 adds native and applying-entry non-history producer BEGIN.
-pub const descriptor_version: u32 = 65;
+/// Version 66 adds snapshot-bound producer closure observations.
+pub const descriptor_version: u32 = 66;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

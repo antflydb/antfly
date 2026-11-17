@@ -4674,6 +4674,21 @@ pub fn storageOwnerSourceRetirementOutcome(owner: ?*anyopaque, request: *const k
     out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
     return .ok;
 }
+pub fn storageOwnerSourceProducerClosureObservation(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const wire = @import("antfly_local_sources").storage_source_producer_policy;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len == 0 or request.request_json.len > wire.max_query_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(wire.Query, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return storageOwnerStatusFromError(if (err == error.OutOfMemory) err else error.InvalidSourceAdmission);
+    defer parsed.deinit();
+    if (parsed.value.owner.group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.HistoryResynchronizationRequired);
+    const result = handle.db.sourceProducerClosureObservation(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    const bytes = wire.encodeObservation(std.heap.c_allocator, parsed.value, result) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
 pub fn storageOwnerSourceScopeObservation(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     const wire = @import("antfly_local_sources").storage_source_scope_control;
     out.* = .{};

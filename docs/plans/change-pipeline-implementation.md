@@ -7379,3 +7379,41 @@ milestone is ordered physical closure dispatch and replay only. No authenticated
 proposal/qualified closure observation, retained-root cohort/drainage certificate,
 original pending-decision migration, or first-strict activation is claimed.
 All full #1698/#1639 requirements remain active and their issues stay open.
+
+### Qualified physical producer-closure observation (in progress)
+
+Re-fetched authoritative issues #1698/#1639; both remain open with their full
+inbound/destination, retained-history, public feed/bootstrap/retention, actual
+pgoutput and pinned existing-client acceptance intact. No scope was narrowed.
+The previous turn's ordered-closure commit 047829a99b is concrete progress.
+
+Producer closure now has a separate bounded read contract: a complete routed
+owner plus a nonzero minimum native apply index yields the actual snapshot cut
+and an optional immutable closure. The root, closure and cut are read together;
+absence is not an outcome, acknowledgement, drain proof or replay authority.
+Validation rejects owner/generation mismatches, stale/future cuts, impossible
+first-closure positions, duplicate fields and oversized replies. The compiled
+engine (66) and native owner ABI (119) expose read-only observation. The serving
+owner reuses the established catalog/descriptor checks, frozen ReadIndex proof,
+namespace verification and post-read revalidation/cancellation path.
+
+Native DB coverage checks absence before closure, exact first cut, rejected
+future minimum, reopened state, repeated reads and corruption. Real Raft owner
+coverage checks absence through the new typed native ABI, fresh read fences,
+wrong generation, future minimum and cancellation. Wire checks cover bounded
+positive/absent observations and forged cuts/owners. Generation passed
+(`source-producer-closure-observation-generate.log`); unrelated explorer artifacts
+were restored. Qualification is running
+(`source-producer-closure-observation-test.log`). Authenticated node proposal/read
+transport, root cohort/drainage, original pending decision migration and first
+strict activation remain outstanding.
+
+Qualified closure observation passed 13 local/32 wire-control cases, one actual
+native storage case, and six local/37 linked native/real-Raft cases, zero failures,
+skips or leaks (`source-producer-closure-observation-test.log`). The named new
+wire observation case is selected; the native storage helper is called by the
+ordered scope-control fixture, and the real Raft submission fixture calls the
+new routed observation checks through its native owner. Generation and contract/
+whitespace checks passed. This proves the read foundation and owner fencing,
+not authenticated node RPC completion, producer drainage, source activation or
+public feed/bootstrap/pgoutput/client acceptance.

@@ -32,10 +32,51 @@ pub fn verify(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRoute
     changed.owner.root_generation += 1;
     try std.testing.expectError(error.TopologyChanged, owner.sourceScopeObservationRouted(a, fence, "docs", changed));
     try verifyReadFence(a, owner, fence, query, observed.cut.index);
+    try verifyProducerClosure(a, owner, fence, source_owner, observed.cut.index);
     try verifyOutcome(a, owner, fence, source_owner, observed.cut);
     try verifyControlGuards();
     try verifyRetirementGuards();
     try verifyRetirementOutcome(a, owner, fence, source_owner, observed.cut);
+}
+fn verifyProducerClosure(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRouteFence, source_owner: @FieldType(completion.Intent, "owner"), index: u64) !void {
+    const policy = @import("antfly_local_sources").storage_source_producer_policy;
+    const query: policy.Query = .{ .version = 1, .owner = source_owner, .minimum_applied_index = index };
+    const observed = try readProducerClosureQualified(a, owner, fence, query);
+    try observed.validate(query);
+    try std.testing.expect(observed.closure == null);
+    const again = try readProducerClosureQualified(a, owner, fence, query);
+    try std.testing.expect(again.closure == null);
+    try std.testing.expect(again.cut.index >= observed.cut.index);
+    var changed = query;
+    changed.owner.root_generation += 1;
+    try std.testing.expectError(error.TopologyChanged, owner.sourceProducerClosureObservationRouted(a, fence, "docs", changed));
+    var future = query;
+    future.minimum_applied_index = observed.cut.index + 1000000;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, readProducerClosureQualified(a, owner, fence, future));
+    var cancelled: std.atomic.Value(bool) = .init(true);
+    var cancelled_fence = fence;
+    cancelled_fence.admission_cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled);
+    try std.testing.expectError(error.Canceled, owner.sourceProducerClosureObservationRouted(a, cancelled_fence, "docs", query));
+    const abi = @import("kernel_owner_abi");
+    var request: abi.JsonOperationRequest = .{ .version = abi.abi_version - 1 };
+    var response: abi.OwnedBytes = .{ .len = 99 };
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_source_producer_closure_observation(null, &request, &response));
+    try std.testing.expectEqual(@as(usize, 0), response.len);
+    request.version = abi.abi_version;
+    request.request_json.len = policy.max_query_bytes + 1;
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_source_producer_closure_observation(null, &request, &response));
+}
+fn readProducerClosureQualified(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRouteFence, query: @import("antfly_local_sources").storage_source_producer_policy.Query) !@import("antfly_local_sources").storage_source_producer_policy.Observation {
+    for (0..1000) |_| {
+        return owner.sourceProducerClosureObservationRouted(a, fence, "docs", query) catch |err| switch (err) {
+            error.ReadUnavailable => {
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    }
+    return error.TestReadFenceUnavailable;
 }
 fn verifyReadFence(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRouteFence, query: wire.Query, index: u64) !void {
     var future = query;
