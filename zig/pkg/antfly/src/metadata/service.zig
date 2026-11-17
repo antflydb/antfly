@@ -4610,6 +4610,70 @@ fn runResolverNamespaceRound(service: anytype) !void {
     try service.proposeTransitionCommand(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } });
 }
 
+const ChangefeedExpiry = struct {
+    const feed = @import("changefeed_control.zig");
+
+    lane: std.Io.Mutex = .init,
+    next_scan_ns: u64 = 0,
+    after: ?feed.Id = null,
+
+    fn run(self: *ChangefeedExpiry, svc: anytype) void {
+        if (!self.lane.tryLock()) return;
+        defer self.lane.unlock(std.Options.debug_io);
+        const monotonic = platform_time.monotonicNs();
+        if (monotonic < self.next_scan_ns) return;
+        self.next_scan_ns = monotonic +| std.time.ns_per_s;
+        if (!svc.runtime_mutex.tryLock()) return;
+        const host = if (@TypeOf(svc.*) == MetadataHttpService) svc.raft.host.http_host.host else svc.raft.host.host;
+        const local_leader = host.isLocalLeader(svc.metadata_group_id);
+        svc.unlockRuntime();
+        if (!local_leader) {
+            self.after = null;
+            return;
+        }
+        const store = svc.projectedStore() orelse return;
+        const now = platform_time.realtimeNs() / std.time.ns_per_s;
+        if (now == 0) return;
+        const page_result = store.scanChangefeedMaintenance(svc.alloc, svc.metadata_group_id, now, self.after) catch |err| {
+            std.log.warn("changefeed expiry scan failed: {s}", .{@errorName(err)});
+            return;
+        };
+        const request: api_operation.RequestContext = .{
+            .deadline_ns = monotonic +| std.time.ns_per_s / 4,
+            .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" },
+        };
+        for (page_result.items()) |id| {
+            expire(svc, store, id, now, request) catch |err| switch (err) {
+                error.ChangefeedConflict => continue,
+                error.NotLeader, error.DeadlineExceeded, error.MetadataMutationOutcomeUnknown => return,
+                else => std.log.warn("changefeed expiry failed: {s}", .{@errorName(err)}),
+            };
+        }
+        self.after = page_result.next;
+    }
+
+    fn expire(svc: anytype, store: anytype, id: feed.Id, now: u64, request: api_operation.RequestContext) !void {
+        try request.ensureActive();
+        const bytes = try store.getChangefeedControl(svc.alloc, svc.metadata_group_id, id);
+        defer svc.alloc.free(bytes);
+        var parsed = try feed.parse(svc.alloc, bytes);
+        defer parsed.deinit();
+        const state = parsed.value;
+        if (!state.expiryDue(now)) return;
+        if (!std.mem.eql(u8, &id, &state.id)) return error.ChangefeedCorrupt;
+        const definition = state.definition.?;
+        try feed.mutateOnService(svc, svc.alloc, .{
+            .id = id,
+            .authority = state.authority,
+            .owner = definition.owner,
+            .authorization = definition.authorization,
+            .expected_revision = state.revision,
+            .expected_epoch = state.epoch,
+            .mutation = .{ .expire = now },
+        }, request);
+    }
+};
+
 fn runRelationReconciliationRound(service: anytype) !void {
     const store = service.projectedStore() orelse {
         if (service.relation_reconciliation_worker.lane.tryLock()) {
@@ -6061,6 +6125,7 @@ pub const MetadataService = struct {
     cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
     relation_reconciliation_worker: relation_worker.Worker = .{},
+    changefeed_expiry: ChangefeedExpiry = .{},
     relation_publication_preparation: RelationPublicationPreparation = .{},
     // Coordinate proposal progress across in-process callers just as the HTTP
     // service does: one waiter drives Raft while the others sleep on a
@@ -7572,6 +7637,7 @@ pub const MetadataService = struct {
         if (!try self.ensureMetadataIncarnation()) return;
         try runRelationReconciliationRound(self);
         try runResolverNamespaceRound(self);
+        self.changefeed_expiry.run(self);
         if (!self.observe_local_replica_root) return;
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForRound();
         if ((self.store_status_ticks >= 40 or backfill_markers.len > 0) and shouldRefreshLocalStoreStatus(self, backfill_markers)) {
@@ -7610,6 +7676,7 @@ pub const MetadataService = struct {
         if (!try self.ensureMetadataIncarnation()) return;
         try runRelationReconciliationRound(self);
         try runResolverNamespaceRound(self);
+        self.changefeed_expiry.run(self);
         if (!self.observe_local_replica_root) return;
 
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForLifecycleRound();
@@ -8870,6 +8937,7 @@ pub const MetadataHttpService = struct {
     cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
     relation_reconciliation_worker: relation_worker.Worker = .{},
+    changefeed_expiry: ChangefeedExpiry = .{},
     relation_publication_preparation: RelationPublicationPreparation = .{},
     runtime_mutex: std.Io.Mutex = .init,
     catalog_mutation_mutex: std.Io.RwLock = .init,
@@ -11344,6 +11412,7 @@ pub const MetadataHttpService = struct {
         if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
         try runRelationReconciliationRound(self);
         try runResolverNamespaceRound(self);
+        self.changefeed_expiry.run(self);
         if (skip_local_replica_root or !self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
@@ -11449,6 +11518,7 @@ pub const MetadataHttpService = struct {
         self.refreshProbeReady();
         try runRelationReconciliationRound(self);
         try runResolverNamespaceRound(self);
+        self.changefeed_expiry.run(self);
         if (!self.observe_local_replica_root) return;
 
         var local_transition_inputs = try captureLocalTransitionInputs(self);
@@ -23998,4 +24068,52 @@ test "source control requires its coordinated decoder floor before metadata prop
 
 test "changefeed control requires its coordinated decoder floor before metadata proposal" {
     try std.testing.expectEqual(metadata_topology_protocol.changefeed_control_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_changefeed_control = "{}" }));
+}
+
+test "changefeed control expiry applies a fenced reset only when the lease is due" {
+    const a = std.testing.allocator;
+    const feed = ChangefeedExpiry.feed;
+    const Client = struct {
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64 = 1,
+        state: feed.State,
+        applied: usize = 0,
+
+        pub fn getChangefeedControl(self: *@This(), allocator: std.mem.Allocator, group: u64, id: feed.Id) ![]u8 {
+            try std.testing.expectEqual(self.metadata_group_id, group);
+            try std.testing.expectEqual(self.state.id, id);
+            return feed.encode(allocator, self.state);
+        }
+        pub fn mutateChangefeedState(self: *@This(), allocator: std.mem.Allocator, write: feed.Write, request: api_operation.RequestContext) !void {
+            try request.ensureActive();
+            try std.testing.expectEqual(feed.Mutation{ .expire = 200 }, write.mutation);
+            self.state = try write.apply(allocator, self.state, self.state.authority_sequence + 1);
+            self.applied += 1;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const definition: feed.Definition = .{
+        .owner = @splat(1),
+        .authorization = @splat(2),
+        .tables = &.{.{ .table_id = 7, .binding = @splat(5), .policy_revision = 1, .contract = .native_document }},
+    };
+    const id: feed.Id = @splat(4);
+    const command: feed.Write = .{
+        .id = id,
+        .authority = @splat(9),
+        .owner = definition.owner,
+        .authorization = definition.authorization,
+        .expected_revision = 0,
+        .expected_epoch = 0,
+        .mutation = .{ .create = .{ .id = id, .definition = definition, .now = 100, .expires_at = 200 } },
+    };
+    var client: Client = .{ .alloc = arena.allocator(), .state = try command.apply(arena.allocator(), .{}, 1) };
+    try ChangefeedExpiry.expire(&client, &client, id, 199, .{});
+    try std.testing.expectEqual(@as(usize, 0), client.applied);
+    try ChangefeedExpiry.expire(&client, &client, id, 200, .{});
+    try std.testing.expectEqual(feed.Phase.reset_required, client.state.phase);
+    try std.testing.expectEqual(feed.Reset.lease_expired, client.state.reset_reason);
+    try ChangefeedExpiry.expire(&client, &client, id, 201, .{});
+    try std.testing.expectEqual(@as(usize, 1), client.applied);
 }

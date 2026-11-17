@@ -537,7 +537,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const changefeed_storage_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{ "metadata changefeed control", "metadata raft apply store snapshot key registry covers every durable projection class" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const run_changefeed_storage_tests = b.addRunArtifact(changefeed_storage_tests);
-    const changefeed_service_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"changefeed control requires its coordinated decoder floor"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const changefeed_service_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{ "changefeed control requires its coordinated decoder floor", "changefeed control expiry applies", "relation reconciliation worker activates and publishes verified roots", "metadata http service catalog cache is independent" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const run_changefeed_service_tests = b.addRunArtifact(changefeed_service_tests);
     const changefeed_control_step = b.step("changefeed-control-test", "Verify durable feed ACK windows, bootstrap lifecycle and metadata recovery");
     changefeed_control_step.dependOn(&run_changefeed_control_tests.step);

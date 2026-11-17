@@ -229,15 +229,21 @@ pub const State = struct {
         }
         return error.ChangefeedConflict;
     }
+    pub fn expiryDue(self: State, now: u64) bool {
+        return switch (self.phase) {
+            .enrolling, .bootstrap, .streaming => now >= self.expires_at or
+                (self.phase != .streaming and self.bootstrap_expires_at != 0 and now >= self.bootstrap_expires_at),
+            else => false,
+        };
+    }
+
     pub fn needsMaintenance(self: State, now: u64) bool {
         return switch (self.phase) {
-            .empty, .deleted => false,
             .closing => true,
             .reset_required => for (self.roots) |root| {
                 if (!root.released or (root.snapshot != null and !root.snapshot_released)) break true;
             } else if (self.slot) |slot| slot.spool.records.len != 0 else false,
-            .enrolling, .bootstrap, .streaming => now >= self.expires_at or
-                (self.phase != .streaming and self.bootstrap_expires_at != 0 and now >= self.bootstrap_expires_at),
+            else => self.expiryDue(now),
         };
     }
 
