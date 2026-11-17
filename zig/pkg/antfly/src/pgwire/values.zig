@@ -301,6 +301,91 @@ pub fn encodeHistoricalRow(
     return encodeReplicationTuple(alloc, columns, cells, format, byte_limit);
 }
 
+/// A relation mapping frozen by the publication at the retained schema cut.
+/// Key ordinals are in relation order and refer to historical columns.
+pub const HistoricalRelation = struct {
+    oid: u32,
+    namespace: []const u8,
+    name: []const u8,
+    identity: @import("pgoutput.zig").Identity,
+    key_ordinals: []const u16 = &.{},
+
+    fn validate(self: HistoricalRelation, width: usize) !void {
+        if (self.oid == 0 or width == 0 or width > std.math.maxInt(u16)) return error.InvalidResult;
+        if (self.identity == .nothing or self.identity == .index) return error.ChangefeedCapabilityUnsupported;
+        if (self.identity == .default and self.key_ordinals.len == 0) return error.ChangefeedCapabilityUnsupported;
+        for (self.key_ordinals, 0..) |ordinal, index| {
+            if (ordinal >= width or (index > 0 and ordinal <= self.key_ordinals[index - 1])) return error.InvalidResult;
+        }
+    }
+
+    pub fn encodeRelation(self: HistoricalRelation, alloc: std.mem.Allocator, schema: HistorySchema.TableSchema, limit: usize) ![]u8 {
+        const output = @import("pgoutput.zig");
+        try self.validate(schema.relational_columns.len);
+        const columns = try alloc.alloc(output.Column, schema.relational_columns.len);
+        defer alloc.free(columns);
+        var key_index: usize = 0;
+        for (schema.relational_columns, columns, 0..) |historical, *column, ordinal| {
+            const descriptor = try historicalColumn(historical);
+            const key = self.identity == .full or (key_index < self.key_ordinals.len and self.key_ordinals[key_index] == ordinal);
+            if (key and self.identity != .full) key_index += 1;
+            column.* = .{
+                .key = key,
+                .name = descriptor.name,
+                .type_oid = try columnOid(descriptor),
+                .type_modifier = try columnModifier(descriptor),
+            };
+        }
+        return output.encode(alloc, .{ .relation = .{ .oid = self.oid, .namespace = self.namespace, .name = self.name, .identity = self.identity, .columns = columns } }, limit);
+    }
+
+    /// Both images must be qualified against this same historical layout.
+    /// A schema transition requires separate qualification by the publisher.
+    pub fn encodeChange(
+        self: HistoricalRelation,
+        alloc: std.mem.Allocator,
+        schema: HistorySchema.TableSchema,
+        layout: *const HistoryRow.PhysicalLayout,
+        before: ?[]const u8,
+        after: ?[]const u8,
+        format: u16,
+        limit: usize,
+    ) ![]u8 {
+        const output = @import("pgoutput.zig");
+        try self.validate(schema.relational_columns.len);
+        if (before == null and after == null) return error.InvalidResult;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const new = if (after) |image| try encodeHistoricalRow(scratch, schema, layout, image, format, limit) else null;
+        const prior = if (before) |image| try encodeHistoricalRow(scratch, schema, layout, image, format, limit) else null;
+        if (self.identity == .default) for (self.key_ordinals) |ordinal| {
+            if (new) |cells| if (cells[ordinal] == .null) return error.InvalidResult;
+            if (prior) |cells| if (cells[ordinal] == .null) return error.InvalidResult;
+        };
+        const old: ?output.Old = if (prior) |cells| old: {
+            if (self.identity == .full) break :old .{ .full = cells };
+            const keys = try scratch.alloc(output.Cell, cells.len);
+            @memset(keys, .null);
+            var changed = new == null;
+            for (self.key_ordinals) |ordinal| {
+                keys[ordinal] = cells[ordinal];
+                if (new) |current| {
+                    const old_bytes = if (format == 0) cells[ordinal].text else cells[ordinal].binary;
+                    const new_bytes = if (format == 0) current[ordinal].text else current[ordinal].binary;
+                    changed = changed or !std.mem.eql(u8, old_bytes, new_bytes);
+                }
+            }
+            break :old if (changed) .{ .key = keys } else null;
+        } else null;
+        if (new) |cells| {
+            if (prior == null) return output.encode(alloc, .{ .insert = .{ .relation = self.oid, .values = cells } }, limit);
+            return output.encode(alloc, .{ .update = .{ .relation = self.oid, .old = old, .values = cells } }, limit);
+        }
+        return output.encode(alloc, .{ .delete = .{ .relation = self.oid, .old = old.? } }, limit);
+    }
+};
+
 test "pgwire retained ordinal row preserves historical column types and null identity" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -325,6 +410,26 @@ test "pgwire retained ordinal row preserves historical column types and null ide
     try std.testing.expectEqualSlices(u8, "\x01null", tuple[1].binary);
     try std.testing.expect(tuple[2] == .null);
     try std.testing.expectEqual(@as(u32, 23), try columnOid(try historicalColumn(schema.relational_columns[0])));
+    const relation: HistoricalRelation = .{ .oid = 42, .namespace = "public", .name = "docs", .identity = .default, .key_ordinals = &.{0} };
+    const metadata = try relation.encodeRelation(a, schema, 128);
+    try std.testing.expectEqual(@as(u8, 'R'), metadata[0]);
+    const inserted = try relation.encodeChange(a, schema, &layout, null, image, 0, 128);
+    try std.testing.expectEqualStrings("IN", &.{ inserted[0], inserted[5] });
+    const updated = try relation.encodeChange(a, schema, &layout, image, image, 0, 128);
+    try std.testing.expectEqualStrings("UN", &.{ updated[0], updated[5] });
+    const replacement = try HistoryRow.serializeOrdinal(a, schema.version, schema.relational_columns, &.{
+        .{ .ordinal = 0, .path = "id", .value_type = .i64_val, .value = .{ .i64_val = 18 } },
+    }, @splat(0));
+    const moved = try relation.encodeChange(a, schema, &layout, image, replacement, 0, 128);
+    try std.testing.expectEqualStrings("UK", &.{ moved[0], moved[5] });
+    try std.testing.expectEqualStrings("17", moved[13..15]);
+    var full = relation;
+    full.identity = .full;
+    const full_delete = try full.encodeChange(a, schema, &layout, image, null, 0, 128);
+    try std.testing.expectEqualStrings("DO", &.{ full_delete[0], full_delete[5] });
+    const deleted = try relation.encodeChange(a, schema, &layout, image, null, 0, 128);
+    try std.testing.expectEqualStrings("DK", &.{ deleted[0], deleted[5] });
+    try std.testing.expectEqualSlices(u8, &.{ 't', 0, 0, 0, 2, '1', '7', 'n', 'n' }, deleted[8..]);
 }
 
 test "pgwire replication tuples preserve exact numeric and distinguish JSON null from SQL NULL" {
