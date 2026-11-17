@@ -7942,3 +7942,47 @@ replay remain correct with the stronger marker-only proof guard. Contract and
 whitespace checks passed. No authenticated transport, pending-decision authority,
 global worker handover, drainage, strict activation or full issue completion is
 claimed.
+
+### Authenticated original-terminal submit and recovery transport (in progress)
+
+The internal OpenAPI contract now declares the bounded legacy-terminal-v1 route
+with separate submit and recover operations, mandatory service credentials and
+complete catalog/physical-owner fencing. Submit carries no accepted receipt;
+recovery carries the original term/index and a minimum read cut at least that
+index. The canonical request digest binds the operation, nonce, command, owner,
+receipt and minimum cut. A recovery reply cannot substitute a newer receipt.
+Unknown results preserve a previously known receipt without manufacturing an
+outcome. Supersession remains an explicit qualified observation, not success.
+
+The API callback ABI is 40. The shared request/reply decoder rejects missing
+material fields, unknown fields, duplicate fields and incomplete nested owner
+identities. The client dispatches once, requires exactly one catalog fence ACK,
+checks content type and byte limits, and preserves only qualified observations.
+Late cancellation and outcome-unknown headers remove confirmation while retaining
+an already qualified accepted position. Invalid responses and transport loss
+preserve the original recovery receipt. Authenticated server dispatch and routed
+forwarding use the same bounded operation context and exact captured fence.
+
+The live managed-Raft fixture now submits and recovers the original retained
+ABORT over a signed loopback HTTP connection, including lost confirmation,
+read-only recovery without append, replay, durable missing-record rejection and
+explicit bounded receipt supersession. Each listener fixture runs on a 32 MiB
+worker stack to accommodate the actual native API runtime constructors. Client
+adversarial coverage includes moved recovery receipts, missing/duplicate route
+ACKs, nonce mismatch, unknown outcome, cancellation and malformed transport.
+Generation and contract checks passed; native qualification is running in
+`source-legacy-terminal-http-test.log`. This transport does not authorize pending
+transaction decisions, global drainage, strict activation or source ACKs. Full
+issue acceptance remains open.
+
+Authenticated transport qualification passed 6 local apply, 50 linked native
+HTTP/live-Raft, 16 store/history, 38 envelope/wire and 5 authentication cases,
+zero failures/skips/leaks (`source-legacy-terminal-http-test.log`, exit 0).
+The linked run selected the actual managed closure/recovery fixture and the
+adversarial legacy-terminal client case; import-only compilation is not counted
+as execution. Generation, source catalog, engine error, OpenAPI and whitespace
+checks passed (`source-legacy-terminal-http-contracts.log`). Pending legacy
+decision authority, complete cohort handover/drainage, destination integration,
+public feeds, coherent bootstrap/retention, production pgoutput and actual
+Antfly existing-client qualification remain outstanding. Issues stay open and
+PR 1700 stays draft.

@@ -42,7 +42,8 @@ pub const StatusDetail = error_abi.Detail;
 // Version 37 fences producer pre-decision context layouts.
 // Version 38 includes the qualified producer-closure observation port.
 // Version 39 includes the producer-close submission callback.
-pub const abi_version: u32 = 39;
+// Version 40 includes authenticated original-terminal recovery callbacks.
+pub const abi_version: u32 = 40;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

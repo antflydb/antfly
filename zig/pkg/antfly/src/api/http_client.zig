@@ -3165,13 +3165,15 @@ pub const ApiHttpClient = struct {
     }
 
     const ScopeControlWire = @import("../data/source_scope_http_wire.zig");
+    const LegacyTerminalWire = @import("../data/source_legacy_terminal_http_wire.zig");
     const ProducerControlWire = @import("../data/source_producer_control_http_wire.zig");
-    const SourcePlanOperation = enum { control, observe, chunk, checkpoint, scope, scope_control, producer_closure, producer_control };
+    const SourcePlanOperation = enum { control, observe, chunk, checkpoint, scope, scope_control, producer_closure, producer_control, legacy_terminal };
     fn sourcePlanInput(comptime kind: SourcePlanOperation) type {
         return switch (kind) {
             .control => SourcePlanWire.ControlRequest,
             .scope_control => ScopeControlWire.Request,
             .producer_control => ProducerControlWire.Request,
+            .legacy_terminal => LegacyTerminalWire.Request,
             .observe => SourcePlanWire.ObserveRequest,
             .scope => ScopeRead.Query,
             .producer_closure => ProducerRead.Query,
@@ -3184,6 +3186,7 @@ pub const ApiHttpClient = struct {
             .control => SourcePlanWire.ControlReply,
             .scope_control => ScopeControlWire.Reply,
             .producer_control => ProducerControlWire.Reply,
+            .legacy_terminal => LegacyTerminalWire.Reply,
             .observe => SourcePlanWire.control.Observation,
             .scope => ScopeRead.Observation,
             .producer_closure => ProducerRead.Observation,
@@ -3196,6 +3199,9 @@ pub const ApiHttpClient = struct {
     }
     pub fn fetchGroupSourceScopeControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: ScopeControlWire.Request, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !ScopeControlWire.Reply {
         return self.fetchGroupSourcePlan(base_uri, group_id, table, .scope_control, input, fence, context);
+    }
+    pub fn fetchGroupLegacyTerminal(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: LegacyTerminalWire.Request, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !LegacyTerminalWire.Reply {
+        return self.fetchGroupSourcePlan(base_uri, group_id, table, .legacy_terminal, input, fence, context);
     }
     pub fn fetchGroupSourceProducerClose(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table: []const u8, input: ProducerControlWire.Request, fence: route_metadata_api.CatalogRouteFence, context: @import("antfly_local_sources").api_operation.RequestContext) !ProducerControlWire.Reply {
         return self.fetchGroupSourcePlan(base_uri, group_id, table, .producer_control, input, fence, context);
@@ -3217,7 +3223,7 @@ pub const ApiHttpClient = struct {
         return self.fetchGroupSourcePlan(base_uri, group_id, table, .chunk, input, fence, context);
     }
     fn fetchGroupSourcePlan(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, comptime kind: SourcePlanOperation, input: sourcePlanInput(kind), fence: route_metadata_api.CatalogRouteFence, original: @import("antfly_local_sources").api_operation.RequestContext) !sourcePlanResult(kind) {
-        const is_control = kind == .control or kind == .scope_control or kind == .producer_control;
+        const is_control = kind == .control or kind == .scope_control or kind == .producer_control or kind == .legacy_terminal;
         // This scope intersects both original cancellation/deadline authorities.
         var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
         const context = scope.context();
@@ -3226,7 +3232,7 @@ pub const ApiHttpClient = struct {
         try fence.validate();
         if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
         if (comptime kind == .control) try input.validate(self.alloc) else try input.validate();
-        const owner = if (kind == .scope or kind == .producer_closure or kind == .producer_control) input.owner else if (kind == .scope_control) input.owner() else input.source_owner;
+        const owner = if (kind == .scope or kind == .producer_closure or kind == .producer_control or kind == .legacy_terminal) input.owner else if (kind == .scope_control) input.owner() else input.source_owner;
         const identity = fence.route.identity_namespace;
         const incarnation = fence.metadata_incarnation orelse return error.InvalidCatalogRouteFence;
         if (owner.group_id != group_id or owner.metadata_group_id != fence.metadata_group_id or owner.topology_epoch != fence.topology_epoch or
@@ -3235,13 +3241,14 @@ pub const ApiHttpClient = struct {
             std.mem.readInt(u64, owner.namespace[8..16], .big) != identity.shard_id or
             std.mem.readInt(u64, owner.namespace[16..24], .big) != identity.range_id) return error.InvalidCatalogRouteFence;
         const digest = if (is_control) try input.digest(self.alloc) else {};
-        const unknown = if (kind == .control) SourcePlanWire.ControlReply{ .request_digest = digest, .receipt = input.receipt } else if (kind == .scope_control) try ScopeControlWire.unknown(self.alloc, input) else if (kind == .producer_control) try ProducerControlWire.unknown(self.alloc, input) else {};
+        const unknown = if (kind == .control) SourcePlanWire.ControlReply{ .request_digest = digest, .receipt = input.receipt } else if (kind == .scope_control) try ScopeControlWire.unknown(self.alloc, input) else if (kind == .producer_control) try ProducerControlWire.unknown(self.alloc, input) else if (kind == .legacy_terminal) try LegacyTerminalWire.unknown(self.alloc, input) else {};
         const table = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(table);
         const suffix = switch (kind) {
             .control => routes.Routes.source_plan_control_suffix,
             .scope_control => routes.Routes.source_scope_control_suffix,
             .producer_control => routes.Routes.source_producer_close_suffix,
+            .legacy_terminal => routes.Routes.legacy_terminal_suffix,
             .observe => routes.Routes.source_plan_observe_suffix,
             .scope => routes.Routes.source_scope_observe_suffix,
             .producer_closure => routes.Routes.source_producer_closure_observe_suffix,
@@ -3254,6 +3261,7 @@ pub const ApiHttpClient = struct {
         defer self.alloc.free(uri);
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
+        if (kind == .legacy_terminal and body.len > LegacyTerminalWire.max_request_bytes) return error.InvalidSourceAdmission;
         if (kind == .producer_control and body.len > ProducerControlWire.max_request_bytes) return error.InvalidSourceAdmission;
         if (kind == .scope_control and body.len > ScopeControlWire.max_request_bytes) return error.InvalidSourceAdmission;
         if (kind == .producer_closure and body.len > ProducerRead.max_query_bytes) return error.InvalidSourceAdmission;
@@ -3267,7 +3275,7 @@ pub const ApiHttpClient = struct {
         var timeout_buffer: [10]u8 = undefined;
         const timeout_text = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{timeout});
         var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
-        const max_reply = if (kind == .producer_control) ProducerControlWire.max_reply_bytes else if (kind == .scope_control) ScopeControlWire.max_reply_bytes else if (kind == .chunk) SourcePlanWire.max_bytes else if (kind == .producer_closure) ProducerRead.max_observation_bytes else if (kind == .scope) ScopeRead.max_bytes else if (kind == .checkpoint) CheckpointRead.max_reply_bytes else SourcePlanWire.max_control_reply_bytes;
+        const max_reply = if (kind == .legacy_terminal) LegacyTerminalWire.max_reply_bytes else if (kind == .producer_control) ProducerControlWire.max_reply_bytes else if (kind == .scope_control) ScopeControlWire.max_reply_bytes else if (kind == .chunk) SourcePlanWire.max_bytes else if (kind == .producer_closure) ProducerRead.max_observation_bytes else if (kind == .scope) ScopeRead.max_bytes else if (kind == .checkpoint) CheckpointRead.max_reply_bytes else SourcePlanWire.max_control_reply_bytes;
         try context.ensureActive();
         // A mutation has one transport attempt. Any post-dispatch ambiguity
         // preserves only original recovery authority; callers must not replay.
@@ -3312,14 +3320,14 @@ pub const ApiHttpClient = struct {
             if (route_acknowledgements != 1) return error.InvalidRemoteResponse;
         }
         if (comptime is_control) {
-            if (comptime kind == .scope_control or kind == .producer_control) {
+            if (comptime kind == .scope_control or kind == .producer_control or kind == .legacy_terminal) {
                 var acknowledgements: usize = 0;
                 for (response.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, route_metadata_api.catalog_route_fence_ack_header)) {
                     acknowledgements += 1;
                 };
                 if (acknowledgements != 1) return unknown;
             }
-            var result = (if (comptime kind == .scope_control) ScopeControlWire.decodeReply(self.alloc, input, response.body) else if (comptime kind == .producer_control) ProducerControlWire.decodeReply(self.alloc, input, response.body) else SourcePlanWire.decodeControlReply(self.alloc, input, response.body)) catch return unknown;
+            var result = (if (comptime kind == .scope_control) ScopeControlWire.decodeReply(self.alloc, input, response.body) else if (comptime kind == .producer_control) ProducerControlWire.decodeReply(self.alloc, input, response.body) else if (comptime kind == .legacy_terminal) LegacyTerminalWire.decodeReply(self.alloc, input, response.body) else SourcePlanWire.decodeControlReply(self.alloc, input, response.body)) catch return unknown;
             if (response.header(internal_batch_forwarding.outcome_header) != null) result.outcome = null;
             context.ensureActive() catch {
                 result.outcome = null;
@@ -3334,7 +3342,7 @@ pub const ApiHttpClient = struct {
                 .producer_closure => try ProducerRead.decodeObservation(self.alloc, response.body, input),
                 .checkpoint => try CheckpointRead.decodeReply(self.alloc, input, response.body),
                 .chunk => try SourcePlanWire.native.decodeChunkReply(self.alloc, input.request, response.body),
-                .control, .scope_control, .producer_control => unreachable,
+                .control, .scope_control, .producer_control, .legacy_terminal => unreachable,
             };
             errdefer if (kind == .chunk) self.alloc.free(result.bytes);
             try context.ensureActive();
@@ -8509,6 +8517,86 @@ test "source producer control HTTP client keeps one attempt and only qualified r
         try std.testing.expectEqual(before + 1, fake.calls);
         try std.testing.expect(reply.outcome == null);
         try std.testing.expectEqual(mode == .marker or mode == .cancel, reply.receipt != null);
+    }
+}
+
+test "source legacy terminal HTTP client keeps one attempt and only qualified receipts" {
+    const a = std.testing.allocator;
+    const wire = @import("../data/source_legacy_terminal_http_wire.zig");
+    const Fake = struct {
+        const Mode = enum { good, moved_receipt, lost, missing_ack, duplicate_ack, forged, marker, wrong_type, oversized, denied, cancel };
+        mode: Mode = .good,
+        calls: usize = 0,
+        request: wire.Request,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, input: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, input.uri, "/source-producers/legacy-terminal-v1"));
+            try std.testing.expectEqual(@as(?usize, wire.max_reply_bytes), input.max_response_bytes);
+            if (self.mode == .lost) return error.ConnectionResetByPeer;
+            var reply = try wire.test_support.knownReply(alloc, self.request);
+            if (self.mode == .forged) reply.request_digest[0] ^= 1;
+            if (self.mode == .moved_receipt) {
+                reply.receipt.?.index += 1;
+                reply.outcome.?.entry = reply.receipt.?;
+                reply.outcome.?.cut = reply.receipt.?;
+            }
+            const body = if (self.mode == .oversized) try alloc.alloc(u8, wire.max_reply_bytes + 1) else try std.json.Stringify.valueAlloc(alloc, reply, .{});
+            defer alloc.free(body);
+            if (self.mode == .oversized) @memset(body, ' ');
+            const Header = @typeInfo(@typeInfo(@TypeOf(http_route_helpers.textResponseWithHeaders)).@"fn".param_types[3].?).pointer.child;
+            var headers: [4]Header = undefined;
+            var count: usize = 0;
+            if (self.mode != .missing_ack) {
+                headers[count] = .{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = route_metadata_api.catalog_route_fence_ack_value };
+                count += 1;
+            }
+            if (self.mode == .duplicate_ack) {
+                headers[count] = .{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = route_metadata_api.catalog_route_fence_ack_value };
+                count += 1;
+            }
+            headers[count] = .{ .name = "Content-Type", .value = if (self.mode == .wrong_type) "text/plain" else "application/json" };
+            count += 1;
+            if (self.mode == .marker) {
+                headers[count] = .{ .name = internal_batch_forwarding.outcome_header, .value = "" };
+                count += 1;
+            }
+            if (self.mode == .cancel) self.cancelled.store(true, .release);
+            return http_route_helpers.textResponseWithHeaders(alloc, if (self.mode == .denied) 503 else 200, body, headers[0..count]);
+        }
+    };
+    const input = wire.test_support.fixture();
+    const fence: route_metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = input.owner.metadata_incarnation, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    var fake: Fake = .{ .request = input };
+    var client = ApiHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    try std.testing.expectError(error.Unauthorized, client.fetchGroupLegacyTerminal("http://node", 17, "docs", input, fence, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    _ = client.withInternalServiceAuth("producer-control-client-secret-long-enough", "producer-control-test");
+    try std.testing.expect((try client.fetchGroupLegacyTerminal("http://node", 17, "docs", input, fence, .{})).confirmed());
+    for ([_]Fake.Mode{ .lost, .missing_ack, .duplicate_ack, .forged, .marker, .wrong_type, .oversized, .denied, .cancel }) |mode| {
+        fake.mode = mode;
+        fake.cancelled.store(false, .release);
+        const before = fake.calls;
+        const reply = try client.fetchGroupLegacyTerminal("http://node", 17, "docs", input, fence, .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&fake.cancelled) });
+        try std.testing.expectEqual(before + 1, fake.calls);
+        try std.testing.expect(reply.outcome == null);
+        try std.testing.expectEqual(mode == .marker or mode == .cancel, reply.receipt != null);
+    }
+    var recovery = input;
+    recovery.operation = .recover;
+    recovery.request_id[0] ^= 1;
+    recovery.receipt = (try wire.test_support.knownReply(a, input)).receipt;
+    recovery.minimum_applied_index = recovery.receipt.?.index;
+    fake.request = recovery;
+    for ([_]Fake.Mode{ .good, .lost, .moved_receipt, .missing_ack, .marker, .cancel }) |mode| {
+        fake.mode = mode;
+        fake.cancelled.store(false, .release);
+        const before = fake.calls;
+        const reply = try client.fetchGroupLegacyTerminal("http://node", 17, "docs", recovery, fence, .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&fake.cancelled) });
+        try std.testing.expectEqual(before + 1, fake.calls);
+        try std.testing.expectEqualDeep(recovery.receipt, reply.receipt);
+        try std.testing.expectEqual(mode == .good, reply.confirmed());
     }
 }
 

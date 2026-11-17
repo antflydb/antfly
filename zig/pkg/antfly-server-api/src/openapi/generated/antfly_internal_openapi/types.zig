@@ -827,6 +827,125 @@ pub const NativeHistoryRetirement = struct {
     grant: u64,
 };
 
+/// Trusted native recovery derives the original decision/version from the matching durable terminal record. It never decides pending work.
+pub const NativeLegacyTerminalCommand = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    proof: NativeLegacyTerminalProof,
+};
+
+/// Original commit version or ABORT finalization timestamp; not a new commit clock or PostgreSQL LSN.
+pub const NativeLegacyTerminalDecision = struct {
+    kind: []const u8,
+    timestamp: u64,
+};
+
+/// Fresh ownership/ReadIndex qualified observation. Native closure, receipt and actual cut come from one snapshot.
+pub const NativeLegacyTerminalObservation = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    command_digest: NativeHistoryDigest,
+    entry: NativeHistoryPublicationCut,
+    cut: NativeHistoryPublicationCut,
+    outcome: NativeLegacyTerminalOutcome,
+};
+
+/// One bounded checksummed exact-command receipt per root, atomically retained with effects or deterministic rejection and actual marker. Supersession confirms neither success nor failure.
+pub const NativeLegacyTerminalOutcome = std.json.Value;
+
+/// Exact original terminal record binding; no chosen outcome or drain claim.
+pub const NativeLegacyTerminalProof = struct {
+    root: NativeSourceScopeBasis,
+    transaction_id: NativeHistoryConsumerId,
+    record_digest: NativeHistoryDigest,
+};
+
+/// Full-request correlation. Recovery always preserves its original accepted entry. Valid accepted positions survive unknown confirmation; absent or superseded outcomes authorize no mutation replay or source ACK.
+pub const NativeLegacyTerminalReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    receipt: ?NativeHistoryPublicationCut,
+    outcome: ?NativeLegacyTerminalObservation,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "request_digest", "request_digest", false },
+        .{ "receipt", "receipt", false },
+        .{ "outcome", "outcome", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        try jw.objectField("receipt");
+        try jw.write(self.receipt);
+        try jw.objectField("outcome");
+        try jw.write(self.outcome);
+        try jw.endObject();
+    }
+};
+
+/// Submit: null receipt and zero minimum. Recover: exact accepted receipt and minimum at least its index. Nonzero request_id is correlation only, never retry permission. Owner must equal command.owner.
+pub const NativeLegacyTerminalRequest = struct {
+    version: i64,
+    operation: []const u8,
+    request_id: NativeHistoryConsumerId,
+    owner: NativeHistoryPublicationOwner,
+    command: NativeLegacyTerminalCommand,
+    receipt: ?NativeHistoryPublicationCut,
+    minimum_applied_index: u64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "operation", "operation", false },
+        .{ "request_id", "request_id", false },
+        .{ "owner", "owner", false },
+        .{ "command", "command", false },
+        .{ "receipt", "receipt", false },
+        .{ "minimum_applied_index", "minimum_applied_index", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        try jw.objectField("request_id");
+        try jw.write(self.request_id);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        try jw.objectField("command");
+        try jw.write(self.command);
+        try jw.objectField("receipt");
+        try jw.write(self.receipt);
+        try jw.objectField("minimum_applied_index");
+        try jw.write(self.minimum_applied_index);
+        try jw.endObject();
+    }
+};
+
 /// Durable source-journal checkpoint authority, metadata protocol 103. Bind before the first source reservation; later batches reuse this full owner independently of row routing. Retirement proof must be supplied by qualified native fencing before reseeding; this record alone does not create or migrate a storage authority.
 pub const NativeSourceCheckpointAuthority = struct {
     binding: NativeHistoryDigest,

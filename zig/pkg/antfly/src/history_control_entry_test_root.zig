@@ -25,6 +25,8 @@ test {
     _ = @import("api/source_scope_control_operations.zig");
     _ = @import("api/source_producer_closure_operations.zig");
     _ = @import("api/source_producer_control_operations.zig");
+    _ = @import("api/source_legacy_terminal_operations.zig");
+    _ = @import("data/source_legacy_terminal_http_wire.zig");
     _ = @import("data/source_producer_control_http_wire.zig");
     _ = @import("data/history_control_wire.zig");
     _ = @import("data/raft_batch.zig").consumer_tests;
