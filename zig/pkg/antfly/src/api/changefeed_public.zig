@@ -161,6 +161,8 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         return .{ .page = try delivery.pull(&client, &provider, a, selection.id, selection.after, bounds, internal) };
     var confirmed = try delivery.acknowledge(&client, &provider, a, selection.id, selection.after, internal);
     defer confirmed.deinit();
+    var driver_policy: RootPolicy = .{ .access = policy, .source = source, .allocator = a };
+    try flushAcknowledged(&client, &driver_policy, a, confirmed.value, captured.roots[0], internal);
     return .{ .acknowledged = confirmed.value.acknowledged_cursor };
 }
 
@@ -182,7 +184,7 @@ const enrollment = @import("../metadata/root_control_driver.zig");
 const source_api = @import("history_roots.zig");
 const metadata_api = @import("../metadata/api.zig");
 
-const EnrollmentPolicy = struct {
+const RootPolicy = struct {
     access: Policy,
     source: source_api.Source,
     allocator: A,
@@ -205,6 +207,72 @@ const EnrollmentPolicy = struct {
         return request;
     }
 };
+
+/// Propagate whole-frame client ACKs through receipt-qualified owner controls.
+/// Partial-frame cursors can be durable without moving the native floor.
+fn flushAcknowledged(client: *config.Client, policy: *RootPolicy, a: A, confirmed: control.State, root: source_api.Root, request: Context) !void {
+    const target = confirmed.roots[try confirmed.rootIndex(root.namespace)].acknowledged.sequence;
+    for (0..4) |_| {
+        var parsed = try load(client, a, confirmed.id, request);
+        defer parsed.deinit();
+        const state = parsed.value;
+        try policy.access.authorize(state, request);
+        if (state.epoch != confirmed.epoch or !same(state.authority, confirmed.authority) or state.phase != .streaming)
+            return error.ChangefeedResynchronizationRequired;
+        const item = state.roots[try state.rootIndex(root.namespace)];
+        if (item.reclaimed_through >= target) return;
+        if (item.pending_control != null) {
+            try driveRoot(client, policy, a, state, root.namespace, request);
+            continue;
+        }
+        const command: @import("history_control_operations.zig").wire.Request = .{
+            .version = 1,
+            .operation = .submit,
+            .command = .{ .acknowledge = .{
+                .reference = .{
+                    .namespace = root.namespace,
+                    .authority = state.authority,
+                    .consumer = state.consumerId(),
+                    .epoch = item.consumer_epoch,
+                    .grant = item.grant_sequence,
+                    .definition = state.definition.?.identity(),
+                },
+                .previous = item.reclaimed_through,
+                .next = target,
+            } },
+        };
+        try prepareRoot(client, policy, a, state.id, root, command, request);
+    }
+    return error.MetadataMutationOutcomeUnknown;
+}
+
+fn prepareRoot(client: *config.Client, policy: *RootPolicy, a: A, id: control.Id, root: source_api.Root, command: @import("history_control_operations.zig").wire.Request, request: Context) !void {
+    const body = try std.json.Stringify.valueAlloc(a, command, .{});
+    defer a.free(body);
+    const fence = try std.json.Stringify.valueAlloc(a, root.fence, .{});
+    defer a.free(fence);
+    try enrollment.prepare(client, policy, a, id, root.namespace, .{ .command = body, .fence = fence, .table = root.table_name }, request);
+}
+
+fn driveRoot(client: *config.Client, policy: *RootPolicy, a: A, state: control.State, namespace: control.Namespace, request: Context) !void {
+    const item = state.roots[try state.rootIndex(namespace)];
+    const result = if (item.pending_control.?.stage == .dispatching)
+        try enrollment.reconcile(client, policy, policy.source.grants, a, state.id, namespace, request)
+    else
+        try enrollment.drive(client, policy, policy.source.controls, a, state.id, namespace, request);
+    switch (result.status) {
+        .settled => {
+            const effect = result.settlement.?.effect;
+            if (effect == .rejected) {
+                const Rejection = local.api_local_table_writes.table_write_source.history_ordered.Rejection;
+                const rejection = std.enums.fromInt(Rejection, effect.rejected) orelse return error.ChangefeedCorrupt;
+                return rejection.asError();
+            }
+        },
+        .reconciled => {},
+        else => return result.deferred_error orelse error.MetadataMutationOutcomeUnknown,
+    }
+}
 
 fn load(client: *config.Client, a: A, id: control.Id, request: Context) !control.Parsed {
     const bytes = try client.readChangefeedState(a, id, request);
@@ -274,7 +342,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
     const authority = try @import("history_policy_provisioning.zig").authority(root.fence);
     const id: control.Id = control.hash(.{ .domain = "antfly:public-changefeed-create:v1", .owner = caller, .key = key })[0..16].*;
     var client: config.Client = .{ .port = meta };
-    var policy: EnrollmentPolicy = .{
+    var policy: RootPolicy = .{
         .access = .{ .api = api, .credential = credential, .table = root.table_name, .filter = filter },
         .source = source,
         .allocator = a,
@@ -344,21 +412,10 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
                     .policy_revision = tables[0].policy_revision,
                 } },
             };
-            const body = try std.json.Stringify.valueAlloc(a, request, .{});
-            defer a.free(body);
-            const fence = try std.json.Stringify.valueAlloc(a, root.fence, .{});
-            defer a.free(fence);
-            try enrollment.prepare(&client, &policy, a, id, root.namespace, .{ .command = body, .fence = fence, .table = root.table_name }, internal);
+            try prepareRoot(&client, &policy, a, id, root, request, internal);
             continue;
         }
-        const result = if (item.pending_control.?.stage == .dispatching)
-            try enrollment.reconcile(&client, &policy, source.grants, a, id, root.namespace, internal)
-        else
-            try enrollment.drive(&client, &policy, source.controls, a, id, root.namespace, internal);
-        switch (result.status) {
-            .settled, .reconciled => continue,
-            else => return result.deferred_error orelse error.MetadataMutationOutcomeUnknown,
-        }
+        try driveRoot(&client, &policy, a, state, root.namespace, internal);
     }
     return error.MetadataMutationOutcomeUnknown;
 }

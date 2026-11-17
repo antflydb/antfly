@@ -45265,7 +45265,7 @@ fn consumerTests() type {
                         if (!std.mem.eql(u8, table.name, name)) return null;
                         return try antfly.metadata.table_manager.cloneTable(allocator, table.*);
                     }
-                    noinline fn run(allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: Table, backend: *backend_runtime_mod.BackendRuntime) !void {
+                    noinline fn run(allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: Table, node: *DataServer, fence: antfly.metadata_api.CatalogRouteFence) !void {
                         var auth_storage = antfly.lsm_backend.Backend.init(allocator, .{ .flush_threshold = 1 });
                         defer auth_storage.close();
                         var store = try auth_storage.runtimeNamespaceStore(allocator);
@@ -45281,7 +45281,7 @@ fn consumerTests() type {
                         const http_api = try allocator.create(Http.ApiHttpServer);
                         defer allocator.destroy(http_api);
                         var record_value = table;
-                        http_api.* = try Http.ApiHttpServer.initWithConfig(allocator, .{ .auth_enabled = true, .user_manager = &manager, .native_history_roots = source, .backend_runtime = backend }, .{
+                        http_api.* = try Http.ApiHttpServer.initWithConfig(allocator, .{ .auth_enabled = true, .user_manager = &manager, .native_history_roots = source, .backend_runtime = node.backend_runtime }, .{
                             .ptr = &record_value,
                             .vtable = &.{ .status = status, .table_record = record },
                             .changefeeds = @import("../api/changefeed_metadata.zig").Port.fromService(svc),
@@ -45292,18 +45292,32 @@ fn consumerTests() type {
                         const created = try api.create(http_api, allocator, credential, "live-feed", definition, .{});
                         const repeated = try api.create(http_api, allocator, credential, "live-feed", definition, .{});
                         try std.testing.expectEqualDeep(created, repeated);
+                        try node.proposeRaftBatchGroupWithLeaderWait(allocator, fence.route.group_id, table.name, .{
+                            .writes = &.{.{ .key = "retained-feed-event", .value = "{\"v\":1}" }},
+                        }, .{ .discovery = .cached, .allow_remote_forward = false, .write_route_fence = fence }, 5 * std.time.ns_per_s);
                         var pulled = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = created.cursor }, .{}, .{});
                         defer pulled.deinit();
                         try std.testing.expect(pulled == .page);
+                        try std.testing.expect(std.mem.indexOf(u8, pulled.page.body, "retained-feed-event") != null);
                         var ack = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = pulled.page.cursor }, null, .{});
                         defer ack.deinit();
                         try std.testing.expectEqual(pulled.page.cursor, ack.acknowledged);
+                        const bytes = try svc.store.getChangefeedControl(allocator, svc.metadata_group_id, created.id);
+                        defer allocator.free(bytes);
+                        var current = try feed_control.parse(allocator, bytes);
+                        defer current.deinit();
+                        const item = current.value.roots[0];
+                        try std.testing.expectEqual(item.start + 1, item.acknowledged.sequence);
+                        try std.testing.expectEqual(item.acknowledged.sequence, item.reclaimed_through);
+                        var repeated_ack = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = pulled.page.cursor }, null, .{});
+                        defer repeated_ack.deinit();
+                        try std.testing.expectEqual(ack.acknowledged, repeated_ack.acknowledged);
                     }
                 };
                 {
                     const Worker = struct {
-                        fn run(result: *anyerror!void, allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: antfly.metadata.table_manager.TableRecord, backend: *backend_runtime_mod.BackendRuntime) void {
-                            result.* = PublicFeedHarness.run(allocator, svc, source, table, backend);
+                        fn run(result: *anyerror!void, allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: antfly.metadata.table_manager.TableRecord, node: *DataServer, fence: antfly.metadata_api.CatalogRouteFence) void {
+                            result.* = PublicFeedHarness.run(allocator, svc, source, table, node, fence);
                         }
                     };
                     // This fixture supplies one immutable peer generation and
@@ -45312,7 +45326,7 @@ fn consumerTests() type {
                     metadata_source.control_read_generation_at_ms = std.math.maxInt(u64);
                     defer metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                     var outcome: anyerror!void = undefined;
-                    const thread = try std.Thread.spawn(.{ .stack_size = 32 * 1024 * 1024 }, Worker.run, .{ &outcome, a, &feed_svc, origin.historyRootsSource(), feed_table, runtime.ptr() });
+                    const thread = try std.Thread.spawn(.{ .stack_size = 32 * 1024 * 1024 }, Worker.run, .{ &outcome, a, &feed_svc, origin.historyRootsSource(), feed_table, server, route.fence().? });
                     thread.join();
                     try outcome;
                 }
