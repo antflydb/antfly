@@ -404,6 +404,10 @@ pub fn close(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReque
 /// Consume one bounded maintenance step. Only already-invalidated native
 /// feeds qualify, and a reset retains its resynchronization reason.
 pub fn maintainNativeFeed(metadata: config.Port, source: source_api.Source, io: std.Io, a: A, id: control.Id, request: Context) !void {
+    return maintainNativeFeedWithSpool(metadata, source, io, a, id, null, request);
+}
+
+pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Source, io: std.Io, a: A, id: control.Id, spool_registry: ?@import("../metadata/pg_spool_artifacts.zig").Registry, request: Context) !void {
     var client: config.Client = .{ .port = metadata };
     var parsed = try load(&client, a, id, request);
     defer parsed.deinit();
@@ -411,7 +415,14 @@ pub fn maintainNativeFeed(metadata: config.Port, source: source_api.Source, io: 
     if ((state.phase != .closing and state.phase != .reset_required) or state.definition.?.start != .now)
         return;
     var policy: RootPolicy = .{ .access = null, .io = io, .source = source, .allocator = a, .closing = true };
-    _ = try retireOne(&client, &policy, a, state, request);
+    if (try retireOne(&client, &policy, a, state, request)) return;
+    if (spool_registry) |storage| if (state.slot) |slot| {
+        if (slot.spool.records.len != 0) {
+            const cleanup = @import("../metadata/pg_spool_cleanup.zig");
+            const registry: cleanup.TerminalRegistry(@TypeOf(storage)) = .{ .storage = storage };
+            _ = try cleanup.cleanup(&metadata, registry, a, id, .{}, request);
+        }
+    };
 }
 
 fn retireOne(client: *config.Client, policy: *RootPolicy, a: A, state: control.State, request: Context) !bool {

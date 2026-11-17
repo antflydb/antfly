@@ -78,7 +78,7 @@ const Registry = struct {
     pub fn authorizeCleanup(self: *@This(), state: control.State, _: Request) !void {
         if (self.denied or state.definition == null or !std.mem.eql(u8, &state.definition.?.owner, &@as(control.Digest, @splat(1)))) return error.TestDenied;
     }
-    pub fn artifactStore(self: *@This(), _: control.pg_slot.spool_control.Scope, _: Request) !artifacts.ArtifactStore {
+    pub fn artifactStore(self: *@This(), _: control.pg_slot.spool_control.Scope, _: anytype) !artifacts.ArtifactStore {
         self.calls += 1;
         return .{ .allocator = std.testing.allocator, .ptr = self, .namespace_identity = self.namespace, .vtable = &vtable };
     }
@@ -296,4 +296,19 @@ pub fn run() !void {
     const message = (try reader.message(a, &reader_store, 21, 1024)).?;
     defer a.free(message);
     try std.testing.expectEqual(@as(u8, 'I'), message[0]);
+    const Context = @import("antfly_local_sources").api_operation.RequestContext;
+    const terminal: cleanup.TerminalRegistry(*Registry) = .{ .storage = &registry };
+    const maintenance: Context = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" } };
+    try std.testing.expectError(error.ChangefeedConflict, cleanup.cleanup(&svc, terminal, a, id, limits, maintenance));
+    try svc.mutate(a, .close);
+    try std.testing.expectError(error.Forbidden, cleanup.cleanup(&svc, terminal, a, id, limits, Context{}));
+    for (0..16) |_| {
+        const result = try cleanup.cleanup(&svc, terminal, a, id, limits, maintenance);
+        if (result.status == .idle) break;
+    }
+    var terminal_state = try svc.load(a);
+    defer terminal_state.deinit();
+    try std.testing.expectEqual(control.Phase.closing, terminal_state.value.phase);
+    try std.testing.expectEqual(@as(usize, 0), terminal_state.value.slot.?.spool.records.len);
+    try std.testing.expectEqual(@as(u64, 0), terminal_state.value.slot.?.spool.charged_bytes);
 }

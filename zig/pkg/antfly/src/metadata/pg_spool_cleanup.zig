@@ -102,6 +102,27 @@ fn Context(comptime Request: type) type {
         }
     };
 }
+/// A terminal slot has already fenced its writer. Maintenance can collect
+/// its exact durable scope without the client's credential or a live lease.
+pub fn TerminalRegistry(comptime Storage: type) type {
+    return struct {
+        storage: Storage,
+
+        pub fn artifactStore(self: @This(), scope: ledger.Scope, request: anytype) !artifacts.ArtifactStore {
+            return self.storage.artifactStore(scope, request);
+        }
+
+        pub fn authorizeCleanup(_: @This(), state: control.State, request: anytype) !void {
+            try request.ensureActive();
+            const principal = request.principal orelse return error.Forbidden;
+            if (principal.kind != .internal or !std.mem.eql(u8, principal.subject, "changefeed-maintenance")) return error.Forbidden;
+            if (state.phase != .closing and state.phase != .reset_required) return error.ChangefeedConflict;
+            const slot = state.slot orelse return error.ChangefeedCapabilityUnsupported;
+            if (slot.spool.records.len != 0 and !slot.spool_retired) return error.ChangefeedConflict;
+        }
+    };
+}
+
 /// At most one bounded sweep page and one metadata checkpoint. Call again to
 /// continue. Unknown metadata responses escape without publishing further work;
 /// the next call re-reads the exact durable progress before touching storage.
