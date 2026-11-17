@@ -34,7 +34,9 @@ pub fn verify(a: A, svc: anytype, client: *client_mod.MetadataHttpClient, uri: [
     try svc.upsertTable(.{ .table_id = 77, .name = "docs", .replication_sources_json = sources });
     const identity = try svc.catalogIdentity();
     const scope: control.Scope = .{ .table_id = 77, .source_id = @splat(71), .source_ordinal = 0, .generation = 1, .definition = try control.definitionDigest(a, sources, 0), .provider = @splat(72), .destination = .native, .destination_binding = @splat(73) };
+    try std.testing.expect(try svc.legacyReplicationSourceIntakeAllowed(scope.table_id, 0, scope.definition));
     try mutate(a, svc, scope, sources, .{ .configure = scope }, context);
+    try std.testing.expect(!try svc.legacyReplicationSourceIntakeAllowed(scope.table_id, 0, scope.definition));
     var namespace: [24]u8 = undefined;
     std.mem.writeInt(u64, namespace[0..8], 77, .big);
     std.mem.writeInt(u64, namespace[8..16], 17, .big);
@@ -90,4 +92,5 @@ pub fn verify(a: A, svc: anytype, client: *client_mod.MetadataHttpClient, uri: [
     var state = try control.parse(a, raw);
     defer state.deinit();
     try std.testing.expect(control.hasWork(state.value));
+    try std.testing.expect(!try svc.legacyReplicationSourceIntakeAllowed(scope.table_id, 0, scope.definition));
 }

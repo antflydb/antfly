@@ -15363,6 +15363,13 @@ pub const RaftApplyStore = struct {
             else => err,
         };
     }
+    /// The caller first establishes metadata ReadIndex. This only decides
+    /// whether an old round may start; it never proves in-flight writers drained.
+    pub fn legacyReplicationSourceIntakeAllowed(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64, ordinal: u32, definition: source_control.Digest) !bool {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        return @import("../source_legacy_intake.zig").allowed(a, &txn, group_id, table_id, ordinal, definition);
+    }
     /// The service establishes ReadIndex before calling. Every captured field,
     /// including the actual applied index and activated decoder, shares one read.
     pub fn captureSourceScope(self: *RaftApplyStore, a: std.mem.Allocator, query: @import("../source_scope_capture.zig").Query) !@import("../source_scope_capture.zig").Snapshot {

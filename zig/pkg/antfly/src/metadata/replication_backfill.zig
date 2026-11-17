@@ -1244,6 +1244,7 @@ fn backfillBulkIngestTableOpened(opened_tables: []const []const u8, table_name: 
 pub const BackfillRoundSummary = struct {
     tables_considered: usize = 0,
     sources_considered: usize = 0,
+    sources_skipped_destination_actor: usize = 0,
     sources_started: usize = 0,
     sources_resumed: usize = 0,
     sources_skipped_complete: usize = 0,
@@ -1268,6 +1269,7 @@ const ReplicationApplySummary = struct {
 pub const StreamingRoundSummary = struct {
     tables_considered: usize = 0,
     sources_considered: usize = 0,
+    sources_skipped_destination_actor: usize = 0,
     sources_started: usize = 0,
     sources_resumed: usize = 0,
     sources_skipped_pending_snapshot: usize = 0,
@@ -1375,6 +1377,26 @@ fn nextCursorAfterYield(
     return .{ .valid = true, .table_id = next_table.table_id, .source_ordinal = 0 };
 }
 
+const LegacyIntake = enum { allowed, destination_actor, unproven };
+fn legacyIntake(service: anytype, a: Allocator, table: metadata_table_manager.TableRecord, ordinal: u32) !LegacyIntake {
+    const Service = switch (@typeInfo(@TypeOf(service))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(service),
+    };
+    // Legacy-only test sinks retain the old interface; production owners
+    // expose the qualified actor-state gate.
+    if (comptime !@hasDecl(Service, "legacyReplicationSourceIntakeAllowed")) return .allowed;
+    const definition = @import("source_control.zig").definitionDigest(a, table.replication_sources_json, ordinal) catch |err| return switch (err) {
+        error.InvalidSourceControl => .unproven,
+        else => err,
+    };
+    const permitted = service.legacyReplicationSourceIntakeAllowed(table.table_id, ordinal, definition) catch |err| return switch (err) {
+        error.SourceAdmissionBackpressure, error.SourceControlCorrupt, error.InvalidSourceControl => .unproven,
+        else => err,
+    };
+    return if (permitted) .allowed else .destination_actor;
+}
+
 pub const SnapshotBackfillCoordinator = struct {
     alloc: Allocator,
     runner: SnapshotBackfillRunner,
@@ -1451,6 +1473,18 @@ pub const SnapshotBackfillCoordinator = struct {
                 }
                 try self.runner.checkpointWork();
                 summary.sources_considered += 1;
+                switch (try legacyIntake(service, self.alloc, table, @intCast(ordinal))) {
+                    .allowed => {},
+                    .destination_actor => {
+                        summary.sources_skipped_destination_actor += 1;
+                        continue;
+                    },
+                    .unproven => {
+                        summary.sources_failed += 1;
+                        continue;
+                    },
+                }
+
                 const existing = findReplicationSourceStatus(statuses, table.table_id, @intCast(ordinal));
                 const exact_config_replaced = if (existing) |record| blk: {
                     if (record.cutover_authority_id == 0) break :blk false;
@@ -2009,6 +2043,18 @@ pub const StreamingReplicationCoordinator = struct {
                 }
                 try self.runner.checkpointWork();
                 summary.sources_considered += 1;
+                switch (try legacyIntake(service, self.alloc, table, @intCast(ordinal))) {
+                    .allowed => {},
+                    .destination_actor => {
+                        summary.sources_skipped_destination_actor += 1;
+                        continue;
+                    },
+                    .unproven => {
+                        summary.sources_failed += 1;
+                        continue;
+                    },
+                }
+
                 const existing = findReplicationSourceStatus(statuses, table.table_id, @intCast(ordinal)) orelse {
                     std.log.info(
                         "metadata cdc stream skip pending snapshot table={s} source={d} reason=no_status",
@@ -5153,6 +5199,17 @@ test "metadata replication backfill coordinator resumes and then skips completed
         alloc: Allocator,
         table: metadata_table_manager.TableRecord,
         statuses: std.ArrayListUnmanaged(metadata_table_manager.ReplicationSourceStatusRecord) = .empty,
+        legacy_allowed: bool = true,
+        legacy_checks: usize = 0,
+        intake_error: ?anyerror = null,
+        pub fn legacyReplicationSourceIntakeAllowed(self: *@This(), table_id: u64, ordinal: u32, definition: @import("source_control.zig").Digest) !bool {
+            try std.testing.expectEqual(self.table.table_id, table_id);
+            try std.testing.expectEqual(@as(u32, 0), ordinal);
+            try std.testing.expectEqualDeep(try @import("source_control.zig").definitionDigest(self.alloc, self.table.replication_sources_json, ordinal), definition);
+            self.legacy_checks += 1;
+            if (self.intake_error) |err| return err;
+            return self.legacy_allowed;
+        }
 
         pub fn deinit(self: *@This()) void {
             for (self.statuses.items) |record| metadata_table_manager.freeReplicationSourceStatus(self.alloc, record);
@@ -5288,6 +5345,32 @@ test "metadata replication backfill coordinator resumes and then skips completed
         },
     };
 
+    service.legacy_allowed = false;
+    const blocked = try coordinator.runRound(&service);
+    try std.testing.expectEqual(@as(usize, 1), blocked.sources_skipped_destination_actor);
+    try std.testing.expectEqual(@as(usize, 0), blocked.sources_completed);
+    try std.testing.expectEqualStrings("snapshot_keyset:[\"doc:1\"]", service.statuses.items[0].checkpoint);
+    var stream = StreamingReplicationCoordinator{ .alloc = alloc, .runner = .{ .alloc = alloc, .registry = &registry, .write_source = write_source.source() } };
+    const stream_blocked = blk: {
+        const prior_phase = service.statuses.items[0].phase;
+        const streaming_phase = try alloc.dupe(u8, "streaming");
+        service.statuses.items[0].phase = streaming_phase;
+        defer {
+            service.statuses.items[0].phase = prior_phase;
+            alloc.free(streaming_phase);
+        }
+        break :blk try stream.runRound(&service);
+    };
+    try std.testing.expectEqual(@as(usize, 1), stream_blocked.sources_skipped_destination_actor);
+    try std.testing.expectEqual(@as(usize, 0), stream_blocked.sources_started);
+    try std.testing.expectEqual(@as(usize, 2), service.legacy_checks);
+    service.intake_error = error.SourceAdmissionBackpressure;
+    const deferred = try coordinator.runRound(&service);
+    try std.testing.expectEqual(@as(usize, 1), deferred.sources_failed);
+    try std.testing.expectEqual(@as(usize, 0), deferred.sources_completed);
+    try std.testing.expectEqualStrings("snapshot_keyset:[\"doc:1\"]", service.statuses.items[0].checkpoint);
+    service.intake_error = null;
+    service.legacy_allowed = true;
     const first = try coordinator.runRound(&service);
     try std.testing.expectEqual(@as(usize, 1), first.tables_considered);
     try std.testing.expectEqual(@as(usize, 1), first.sources_considered);

@@ -63,7 +63,12 @@ pub fn run(a: A) !void {
     try store.applyStandaloneCommand(group, .{ .upsert_table = table });
     const source: control.Scope = .{ .table_id = table.table_id, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = try control.definitionDigest(a, table.replication_sources_json, 0), .provider = @splat(2), .destination = .native, .destination_binding = @splat(3) };
     const actor: Actor = .{ .a = a, .store = &store, .scope = source, .catalog = control.digest(table.replication_sources_json) };
+    try std.testing.expect(try store.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
     try actor.apply(.{ .configure = source });
+    try std.testing.expect(!try store.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
+    try std.testing.expect(!try store.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 1, source.definition));
+    try std.testing.expect(try store.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 1, @splat(99)));
+
     const authority: control.checkpoint_authority.Spec = .{ .binding = source.identity(), .table_name = "checkpoint", .owner = .{ .metadata_group_id = group, .metadata_incarnation = incarnation, .namespace = @splat(1), .table_binding = @splat(4), .root_generation = 0, .group_id = 17, .topology_epoch = 1 } };
     try actor.apply(.{ .bind_checkpoint = authority });
     try actor.apply(.{ .enable_scope_fencing = {} });
@@ -78,6 +83,7 @@ pub fn run(a: A) !void {
     defer restored.deinit();
     try std.testing.expect(restored.value.scope_fencing and !restored.value.closing);
     try actor.expectWork(1);
+    try std.testing.expect(!try store.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
     try actor.apply(.{ .close = {} });
     try actor.expectWork(1);
     const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
@@ -97,4 +103,41 @@ pub fn run(a: A) !void {
     try installed.expectWork(1);
     try installed.apply(.{ .fence_checkpoint = .{ .authority_digest = authority.digest(), .proof = @splat(5) } });
     try installed.expectWork(0);
+    try std.testing.expect(!try target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 0, source.definition));
+    // A bounded census must never turn an incomplete/corrupt scan into intake
+    // permission. Exercise the real cursor and persisted actor prefix.
+    const eligibility = @import("../source_legacy_intake.zig");
+    {
+        var txn = try target.store.beginWriteTxn();
+        errdefer txn.abort();
+        const empty = try control.encode(a, .{});
+        defer a.free(empty);
+        for (0..eligibility.max_records + 1) |index| {
+            var id: control.Digest = @splat(0);
+            std.mem.writeInt(u64, id[24..32], @intCast(index + 2), .big);
+            var key_buffer: [256]u8 = undefined;
+            try txn.put(try control.keyForGroup(&key_buffer, group, source.table_id, id), empty);
+        }
+        try txn.commit();
+    }
+    try std.testing.expectError(error.SourceAdmissionBackpressure, target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 9, @splat(99)));
+    {
+        var txn = try target.store.beginWriteTxn();
+        errdefer txn.abort();
+        var key_buffer: [256]u8 = undefined;
+        try txn.put(try control.keyForGroup(&key_buffer, group, source.table_id, @splat(0)), "!");
+        try txn.commit();
+    }
+    try std.testing.expectError(error.SourceControlCorrupt, target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 9, @splat(99)));
+    {
+        const oversized = try a.alloc(u8, eligibility.max_bytes + 1);
+        defer a.free(oversized);
+        @memset(oversized, ' ');
+        var txn = try target.store.beginWriteTxn();
+        errdefer txn.abort();
+        var key_buffer: [256]u8 = undefined;
+        try txn.put(try control.keyForGroup(&key_buffer, group, source.table_id, @splat(0)), oversized);
+        try txn.commit();
+    }
+    try std.testing.expectError(error.SourceAdmissionBackpressure, target.legacyReplicationSourceIntakeAllowed(a, group, source.table_id, 9, @splat(99)));
 }

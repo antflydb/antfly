@@ -7349,6 +7349,14 @@ pub const MetadataService = struct {
         return error.MetadataMutationApplyTimeout;
     }
 
+    /// Prevent the unscoped coordinator from starting destination-owned work.
+    /// The native activation gate still requires independent persisted drainage.
+    pub fn legacyReplicationSourceIntakeAllowed(self: *MetadataService, table_id: u64, ordinal: u32, definition: @import("source_control.zig").Digest) !bool {
+        try self.ensureLinearizableReadWithContext(api_operation.RequestContext{});
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return store.legacyReplicationSourceIntakeAllowed(self.alloc, self.metadata_group_id, table_id, ordinal, definition);
+    }
+
     pub fn replicationSourceAuthorityCurrent(
         self: *MetadataService,
         expected_replication_sources_json: []const u8,
@@ -10508,6 +10516,14 @@ pub const MetadataHttpService = struct {
             platform_clock.Clock.real().sleepMs(1);
         }
         return error.MetadataMutationApplyTimeout;
+    }
+
+    /// Prevent the unscoped coordinator from starting destination-owned work.
+    /// The native activation gate still requires independent persisted drainage.
+    pub fn legacyReplicationSourceIntakeAllowed(self: *MetadataHttpService, table_id: u64, ordinal: u32, definition: @import("source_control.zig").Digest) !bool {
+        try self.ensureLinearizableReadWithContext(api_operation.RequestContext{});
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return store.legacyReplicationSourceIntakeAllowed(self.alloc, self.metadata_group_id, table_id, ordinal, definition);
     }
 
     pub fn replicationSourceAuthorityCurrent(

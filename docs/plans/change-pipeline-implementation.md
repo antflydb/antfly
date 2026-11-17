@@ -6215,3 +6215,65 @@ recovery traverses the real authenticated forwarding path, returns superseded an
 leaves the native registry/apply cut unchanged. The focused authority case also
 passed in the earlier combined run. Guarded cache cleanup completed
 (`source-retirement-http-gc.log`). The full original goal remains active.
+
+
+### Stop new legacy CDC rounds for destination-owned sources
+
+Both production metadata services now establish qualified metadata ReadIndex
+before checking whether a legacy snapshot/stream source may start. Standalone's
+single catalog owner performs the same native lifecycle-store check under its
+catalog lock. A configured destination actor reserves its source ordinal and its
+canonical definition: matching work cannot resume through the old unscoped
+`commitBatch` path, including when an unchanged definition moves ordinal or an
+actor is retired. Unrelated ordinals/definitions remain eligible. This decision
+reads persisted actor state, not the transient lifecycle-work counter; zero work
+never grants downgrade authority.
+
+The read uses one native snapshot and a strict table/group actor prefix. It
+validates state/key ownership, bounds traversal to 256 records and 4 MiB total
+value bytes, and fails closed on incomplete or corrupt census. A definitive match
+pauses the old source before provider preparation, destination commit or provider
+ACK. A bounded/unreadable source census is unproven; the coordinator defers that
+source and continues the round rather than granting permission or aborting later
+sources. Existing legacy-only test sinks keep their old interface; all production
+cluster/standalone owners expose the gate.
+
+Actual native metadata fixtures check initial eligibility, blocking immediately
+after configuration, definition matching across ordinal moves, unrelated source
+eligibility, persistence through reopen and snapshot, blocking after retirement
+with work count zero, record and byte scan caps, and corrupt state refusal. The
+real metadata Raft/ReadIndex host checks the service method before configuration,
+after configuration and after retirement. The CDC fixture checks that both an
+otherwise eligible snapshot and streaming source are paused without checkpoint
+movement and that an unproven census defers without destination completion. Its
+initial streaming check was below readiness while still in snapshot phase; the
+fixture was corrected to be streaming-eligible before testing the gate.
+
+`source-control-test antfly-metadata-sql-sessions-test -Dstrip=true -j1` passed
+(`source-legacy-intake-native-test.log`), including the two selected real metadata
+host/session cases and all selected source-control/storage cases. The CDC suite
+passed all 30 selected cases after the readiness correction
+(`source-legacy-intake-coordinator-test.log`); final localized-error and standalone
+qualification results follow below. Source-catalog, engine-error and OpenAPI
+checks passed (`source-legacy-intake-contract-check.log`). No schema/protocol/ABI
+change is introduced.
+
+This is intake ownership, not persisted worker handover. A worker already past
+its intake check may still be active. Active-round cancellation/drainage, delayed
+unlabelled internal writes, durable producer fencing and old transaction recovery
+still require independent qualification. The native first-strict activation gate
+remains closed and is not weakened by this change. Production destination adapter,
+cohort lifecycle/retirement/release and all remaining original public feeds,
+bootstrap/retention, pgoutput and actual Antfly CDC client requirements remain
+open. The full goal and both original issues remain open.
+
+Final localized-error `source-transaction-test -Dstrip=true -j1` exited 0
+(`source-legacy-intake-final-coordinator-test.log`): all 30 CDC cases and four
+selected effect/transaction cases passed, plus 12 discovery anchors. Standalone's
+production wrapper now exposes the same native gate under its catalog lock;
+`antfly-standalone-cdc-test -Dstrip=true -j1` passed all eight selected cases
+(`source-legacy-intake-standalone-test.log`), including native actor configuration
+blocking the old source path. Zero reported skips/failures/leaks. Guarded cache
+cleanup completed (`source-legacy-intake-gc.log`). These results qualify new-round
+intake only; durable old-writer fencing and in-flight handover remain required.
+The full original goal remains active.

@@ -4132,6 +4132,15 @@ const LocalStandaloneMetadata = struct {
             return error.ReplicationCutoverAuthorityLost;
         }
 
+        pub fn legacyReplicationSourceIntakeAllowed(self: CdcService, table_id: u64, ordinal: u32, definition: [32]u8) !bool {
+            const m = self.metadata;
+            lockAtomic(&m.mutex);
+            defer m.mutex.unlock();
+            try refreshLocked(m);
+            const lifecycle = try self.store();
+            return lifecycle.legacyReplicationSourceIntakeAllowed(m.alloc, group, table_id, ordinal, definition);
+        }
+
         pub fn replicationSourceAuthorityCurrent(
             self: CdcService,
             expected_replication_sources_json: []const u8,
@@ -9783,6 +9792,16 @@ test "standalone cdc accepts Postgres replication sources" {
     try LocalStandaloneMetadata.createTable(&metadata, alloc, "tickets", .{ .replication_sources_json = owned_sources });
     const created = metadata.findTableByNameLocked("tickets") orelse return error.TestExpectedTable;
     try std.testing.expect(std.mem.indexOf(u8, created.replication_sources_json, "public.tickets") != null);
+    const source_control = @import("../metadata/source_control.zig");
+    const definition = try source_control.definitionDigest(alloc, created.replication_sources_json, 0);
+    const cdc_service = LocalStandaloneMetadata.CdcService{ .metadata = &metadata };
+    try std.testing.expect(try cdc_service.legacyReplicationSourceIntakeAllowed(created.table_id, 0, definition));
+    const scope: source_control.Scope = .{ .table_id = created.table_id, .source_id = @splat(71), .source_ordinal = 0, .generation = 1, .definition = definition, .provider = @splat(72), .destination = .native, .destination_binding = @splat(73) };
+    const configured = try source_control.encodeWrite(alloc, .{ .table_id = scope.table_id, .source_id = scope.source_id, .expected_revision = 0, .expected_binding = scope.identity(), .expected_catalog_digest = source_control.digest(created.replication_sources_json), .mutation = .{ .configure = scope } });
+    defer alloc.free(configured);
+    try cdc_service.apply(.{ .apply_source_control = configured });
+    try std.testing.expect(!try cdc_service.legacyReplicationSourceIntakeAllowed(scope.table_id, 0, definition));
+
     // Tables without sources, and an explicit empty list, are unaffected.
     try LocalStandaloneMetadata.createTable(&metadata, alloc, "plain", .{});
     const empty_sources = try alloc.dupe(u8, "[]");
