@@ -571,15 +571,27 @@ pub fn ensureRedoOverlay(
 }
 
 /// Runs `apply` against this inode's already-populated shared overlay
-/// under the same `entry.mutex` `ensureRedoOverlay`'s own `populate`
-/// callback runs under. §9.3b's cross-process catch-up refresh needs
-/// this: `redo_overlay.SharedRedoOverlay.decodeLogicalMutationsPayload`/
+/// under `entry.mutex` *and* the overlay's own `mutex`. §9.3b's
+/// cross-process catch-up refresh needs this:
+/// `redo_overlay.SharedRedoOverlay.decodeLogicalMutationsPayload`/
 /// `decodeRedoGroupPayload` are deliberately unlocked (safe only while
 /// nothing else can reach the overlay concurrently -- see their own doc
-/// comments), so any caller that touches them *after* the overlay
-/// already exists (every caller but the genuine first opener, which
-/// `ensureRedoOverlay` itself already serializes) must take this lock
-/// itself, exactly as `ensureRedoOverlay` does for first population.
+/// comments), which is true at the genuine first population `populate`
+/// runs under (`ensureRedoOverlay` creates the `SharedRedoOverlay` fresh
+/// and holds the only pointer to it, under `entry.mutex`, before any
+/// other thread can have one). It is *not* true here: by the time a
+/// catch-up refresh runs, other `NativeFile`s in this process already
+/// hold their own pointer to this same, long-lived overlay and call
+/// `appendVersion`/`resolve`/etc. against it guarded by the overlay's
+/// own `mutex`, a different lock than `entry.mutex`. Taking only
+/// `entry.mutex` here (as a prior version of this function did) leaves
+/// the unlocked decode calls racing every one of those `self.mutex`-
+/// guarded callers on the same `maps`/`entry_pool` -- observed live as
+/// both lost full-text-index writes (a racing `appendVersion` insert
+/// overwritten or dropped) and `entry_pool` free-list corruption
+/// (concurrent `create`/`destroy` tearing the free list, segfaulting a
+/// later `create`). Taking the overlay's own `mutex` too gives the
+/// decode calls the same exclusion every other accessor already gets.
 /// Returns `error.InvalidTransactionState` if the overlay was never
 /// populated at all (nothing to refresh).
 pub fn withRedoOverlayLock(
@@ -591,6 +603,8 @@ pub fn withRedoOverlayLock(
     entry.mutex.lockUncancelable(io);
     defer entry.mutex.unlock(io);
     const overlay = if (entry.redo_overlay) |*o| o else return error.InvalidTransactionState;
+    overlay.mutex.lockUncancelable(io);
+    defer overlay.mutex.unlock(io);
     try apply(ctx, overlay);
 }
 
@@ -1314,4 +1328,186 @@ test "ensureFd's lazy reopen targets the original file despite a relative open p
 
     try std.process.setCurrentPath(io, original_cwd);
     restored = true;
+}
+
+test "withRedoOverlayLock's cross-process catch-up replay does not race a live appendVersion caller" {
+    // Regression for perf/lwa-integration: `withRedoOverlayLock` used to
+    // take only `entry.mutex` before running `decodeLogicalMutationsPayload`
+    // against an *already-live* overlay. That decode call is deliberately
+    // unlocked -- safe only while nothing else can reach the overlay
+    // concurrently, true at `ensureRedoOverlay`'s genuine first population
+    // but not here, since every other accessor (`appendVersion`/`reclaim`
+    // included) serializes through the overlay's own `mutex`, a different
+    // lock than `entry.mutex`. Without the overlay's `mutex` held too, a
+    // concurrent `appendVersion`/`reclaim` pair raced the unlocked decode's
+    // direct `entry_pool`/`maps` mutation -- observed live as a segfault
+    // inside `MemoryPool.create` -> `SinglyLinkedList.popFirst` (reusing
+    // a node `reclaim` had just freed back to the pool's shared free list)
+    // and as full-text search silently missing a handful of just-indexed
+    // documents (a racing `appendVersion` insert lost or overwritten).
+    //
+    // To actually exercise `popFirst`'s non-empty-free-list path (the one
+    // that crashed), both sides reuse a small, fixed key set so repeated
+    // appends chain onto (supersede) the previous version and `reclaim`
+    // has something real to free back into the pool on every call --
+    // `entry_pool` is shared across every root, so this churns the same
+    // free list the unlocked decode calls allocate from. Every version's
+    // value also carries a unique, checkable marker: if the race aliases
+    // or clobbers a node, some key's final resolved value stops matching
+    // what that key's own thread last wrote, which the final loop below
+    // catches even on a run that happens not to crash outright.
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const path = try std.fmt.allocPrint(a, "{s}/inode-overlay-race.data", .{buf[0..dir_len]});
+    defer a.free(path);
+    {
+        const f = try Io.Dir.cwd().createFile(io, path, .{});
+        f.close(io);
+    }
+
+    const entry = try open(io, path);
+    defer unref(entry, io);
+
+    const NoopCtx = struct {};
+    var noop_ctx: NoopCtx = .{};
+    const overlay = try ensureRedoOverlay(entry, io, &noop_ctx, struct {
+        fn populate(_: *NoopCtx, _: *redo_overlay.SharedRedoOverlay, _: std.mem.Allocator) anyerror!void {}
+    }.populate);
+
+    const key_count = 6;
+    const total: u64 = 6000;
+
+    // A pin held for the whole test, well above every sequence either
+    // thread ever writes: `reclaim`'s floor (`min(durable_checkpoint_sequence,
+    // min_pin)`) still advances freely (the pin's value is never the
+    // binding constraint), so superseded (non-head) versions are freed
+    // back to `entry_pool` throughout -- real churn on the same free list
+    // the unlocked decode calls allocate from. What a live pin *does*
+    // change is `reclaim`'s "min_pin == null" whole-key-drop path (see its
+    // own doc comment): with a pin always held, a key's current head is
+    // never wholesale-dropped from `maps` just for being old, exactly the
+    // same durability guarantee a real live reader gives -- without this,
+    // a key whose last write happens to fall behind the floor before
+    // either thread writes it again would legitimately disappear from the
+    // overlay (not a bug; the same thing a real reader's pin exists to
+    // prevent), which would otherwise show up indistinguishably from the
+    // race this test actually targets.
+    try overlay.pin(a, io, total * 10);
+    defer overlay.unpin(io, total * 10);
+    const Appender = struct {
+        overlay: *redo_overlay.SharedRedoOverlay,
+        allocator: std.mem.Allocator,
+        final_value: [key_count]u64 = @splat(0),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.work() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn work(self: *@This()) !void {
+            var seq: u64 = 1;
+            while (seq <= total) : (seq += 1) {
+                const slot = seq % key_count;
+                var key_buf: [16]u8 = undefined;
+                const key = try std.fmt.bufPrint(&key_buf, "a/{d:0>4}", .{slot});
+                var value_buf: [24]u8 = undefined;
+                const value = try std.fmt.bufPrint(&value_buf, "a-{d}-{d}", .{ slot, seq });
+                try self.overlay.appendVersion(self.allocator, std.testing.io, 0, key, seq, try redo_overlay.owned_allocator.dupe(u8, value), false, 0, 0);
+                self.final_value[slot] = seq;
+                if (seq % 3 == 0) self.overlay.reclaim(self.allocator, std.testing.io, seq);
+            }
+        }
+    };
+    var appender: Appender = .{ .overlay = overlay, .allocator = a };
+
+    const Catcher = struct {
+        entry: *Entry,
+        allocator: std.mem.Allocator,
+        final_value: [key_count]u64 = @splat(0),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.work() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn work(self: *@This()) !void {
+            var seq: u64 = 1;
+            while (seq <= total) : (seq += 1) {
+                const slot = seq % key_count;
+                var key_buf: [16]u8 = undefined;
+                const key = try std.fmt.bufPrint(&key_buf, "b/{d:0>4}", .{slot});
+                var value_buf: [24]u8 = undefined;
+                const value = try std.fmt.bufPrint(&value_buf, "b-{d}-{d}", .{ slot, seq });
+
+                // Exactly `RedoCommitState.appendLogicalMutation`'s own
+                // encoding: [root:u8][key_len:u16 LE][key][flags:u8]
+                // [value_len:u32 LE][value].
+                var payload: std.ArrayList(u8) = .empty;
+                defer payload.deinit(self.allocator);
+                try payload.append(self.allocator, 1); // root
+                var key_len_buf: [2]u8 = undefined;
+                std.mem.writeInt(u16, &key_len_buf, @intCast(key.len), .little);
+                try payload.appendSlice(self.allocator, &key_len_buf);
+                try payload.appendSlice(self.allocator, key);
+                try payload.append(self.allocator, 0); // flags: live, inline value
+                var value_len_buf: [4]u8 = undefined;
+                std.mem.writeInt(u32, &value_len_buf, @intCast(value.len), .little);
+                try payload.appendSlice(self.allocator, &value_len_buf);
+                try payload.appendSlice(self.allocator, value);
+
+                const ApplyCtx = struct { payload: []const u8, sequence: u64 };
+                var actx: ApplyCtx = .{ .payload = payload.items, .sequence = seq };
+                try withRedoOverlayLock(self.entry, std.testing.io, &actx, struct {
+                    fn apply(ctx: *ApplyCtx, ovl: *redo_overlay.SharedRedoOverlay) anyerror!void {
+                        try ovl.decodeLogicalMutationsPayload(std.heap.page_allocator, ctx.payload, ctx.sequence);
+                    }
+                }.apply);
+                self.final_value[slot] = seq;
+            }
+        }
+    };
+    var catcher: Catcher = .{ .entry = entry, .allocator = a };
+
+    const t1 = try std.Thread.spawn(.{}, Appender.run, .{&appender});
+    const t2 = try std.Thread.spawn(.{}, Catcher.run, .{&catcher});
+    t1.join();
+    t2.join();
+
+    try std.testing.expectEqual(@as(?anyerror, null), appender.failure);
+    try std.testing.expectEqual(@as(?anyerror, null), catcher.failure);
+
+    // Content check: each key's final resolved value must be exactly
+    // what that key's own thread last wrote for it -- any aliasing or
+    // lost write in the shared `entry_pool`/`maps` shows up here as a
+    // mismatch, even on a run that did not outright crash.
+    var slot: u64 = 0;
+    while (slot < key_count) : (slot += 1) {
+        var a_key_buf: [16]u8 = undefined;
+        const a_key = try std.fmt.bufPrint(&a_key_buf, "a/{d:0>4}", .{slot});
+        const a_seq = appender.final_value[slot];
+        if (a_seq != 0) {
+            var expected_buf: [24]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&expected_buf, "a-{d}-{d}", .{ slot, a_seq });
+            const got = (try overlay.resolveAlloc(a, io, 0, a_key, a_seq)) orelse return error.MissingKeyAfterRace;
+            defer a.free(got.value);
+            try std.testing.expectEqualStrings(expected, got.value);
+        }
+
+        var b_key_buf: [16]u8 = undefined;
+        const b_key = try std.fmt.bufPrint(&b_key_buf, "b/{d:0>4}", .{slot});
+        const b_seq = catcher.final_value[slot];
+        if (b_seq != 0) {
+            var expected_buf: [24]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&expected_buf, "b-{d}-{d}", .{ slot, b_seq });
+            const got = (try overlay.resolveAlloc(a, io, 1, b_key, b_seq)) orelse return error.MissingKeyAfterRace;
+            defer a.free(got.value);
+            try std.testing.expectEqualStrings(expected, got.value);
+        }
+    }
 }
