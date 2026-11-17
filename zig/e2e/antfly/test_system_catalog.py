@@ -442,7 +442,7 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
             timeout=120,
         )
         assert command.returncode == 0, command.stderr + api.debug_logs()
-        assert json.loads(command.stdout)["committed_table_count"] == 3
+        assert json.loads(command.stdout)["result"]["committed_table_count"] == 3
         for index, path in enumerate(paths):
             assert api.get(path + "/documents/doc") == {"scope": index}
     for path in paths:
