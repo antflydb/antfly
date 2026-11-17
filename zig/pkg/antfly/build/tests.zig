@@ -531,7 +531,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const transaction_completion_tests = b.addTest(.{ .root_module = transaction_completion_mod });
     const run_transaction_completion_tests = b.addRunArtifact(transaction_completion_tests);
     b.step("transaction-completion-test", "Verify frozen distributed completion evidence and committed frame contracts").dependOn(&run_transaction_completion_tests.step);
-    const feed_metadata_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{ "metadata changefeed state transport", "metadata linearizable head uses the fenced source operation" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const feed_metadata_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{ "metadata changefeed state transport", "metadata pg publication transport", "metadata linearizable head uses the fenced source operation" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const run_feed_metadata_transport_tests = b.addRunArtifact(feed_metadata_transport_tests);
     b.step("changefeed-metadata-transport-test", "Verify private metadata feed state transport and uncertain mutation boundaries").dependOn(&run_feed_metadata_transport_tests.step);
 

@@ -552,13 +552,31 @@ pub const MetadataHttpClient = struct {
 
     pub fn accessChangefeedState(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../api/changefeed_metadata.zig").Request, request: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("../api/changefeed_metadata.zig").Reply) {
         const feeds = @import("../api/changefeed_metadata.zig");
-        try request.ensureActive();
         try input.validate();
+        const wire_limit: usize = if (input.action == .scan_maintenance) feeds.max_scan_wire_bytes else feeds.max_wire_bytes;
+        const mutates = input.action == .mutate;
+        var parsed = try self.accessFencedCatalog(feeds.Reply, base_uri, feeds.path, wire_limit, mutates, null, input, request);
+        errdefer parsed.deinit();
+        parsed.value.validate(self.alloc, input) catch |err| return if (mutates) error.MetadataMutationOutcomeUnknown else err;
+        return parsed;
+    }
+
+    pub fn accessPgPublication(self: *MetadataHttpClient, base_uri: []const u8, input: @import("pg_publication.zig").Request, request: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("pg_publication.zig").Reply) {
+        const publication = @import("pg_publication.zig");
+        try input.validate();
+        const mutates = input.write != null;
+        var parsed = try self.accessFencedCatalog(publication.Reply, base_uri, publication.path, publication.max_transport_bytes, mutates, error.PgPublicationConflict, input, request);
+        errdefer parsed.deinit();
+        parsed.value.validate(input) catch |err| return if (mutates) error.MetadataMutationOutcomeUnknown else err;
+        return parsed;
+    }
+
+    fn accessFencedCatalog(self: *MetadataHttpClient, comptime Reply: type, base_uri: []const u8, path: []const u8, wire_limit: usize, mutates: bool, conflict: ?anyerror, input: anytype, request: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(Reply) {
+        try request.ensureActive();
         const bytes = try std.json.Stringify.valueAlloc(self.alloc, input, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(bytes);
-        const wire_limit: usize = if (input.action == .scan_maintenance) feeds.max_scan_wire_bytes else feeds.max_wire_bytes;
         if (bytes.len > wire_limit) return error.InvalidChangefeed;
-        const uri = try join(self.alloc, base_uri, feeds.path);
+        const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
         const timeout = @min(@as(u32, 5000), (try request.remainingTimeoutMs()) orelse 5000);
         var encoded_budget: [20]u8 = undefined;
@@ -570,7 +588,7 @@ pub const MetadataHttpClient = struct {
         // clock. The request's absolute deadline may use a borrowed test clock.
         const transport_budget: RequestBudget = .{ .deadline_ns = platform_time.monotonicNs() +| @as(u64, timeout) * std.time.ns_per_ms, .cancellation = &signal };
         var response = self.executeWithRetryPolicy(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .headers = &headers, .timeout_ms = timeout, .max_response_bytes = wire_limit, .cancellation = &signal, .delivery_tracker = &delivery }, transport_budget, .at_most_once) catch |err| {
-            if (input.action == .mutate and (err == error.ReallocationOutcomeUnknown or err == error.MetadataMutationOutcomeUnknown or delivery.load() != .not_sent)) return error.MetadataMutationOutcomeUnknown;
+            if (mutates and (err == error.ReallocationOutcomeUnknown or err == error.MetadataMutationOutcomeUnknown or delivery.load() != .not_sent)) return error.MetadataMutationOutcomeUnknown;
             return err;
         };
         defer response.deinit(self.alloc);
@@ -584,16 +602,16 @@ pub const MetadataHttpClient = struct {
         }
         const committed = outcome_count == 1 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed);
         const not_proposed = outcome_count == 1 and std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed);
-        if (input.action == .mutate and !committed) {
+        if (mutates and !committed) {
             if (not_proposed and response.status == 400) return error.InvalidChangefeed;
             if (not_proposed and response.status == 403) return error.Forbidden;
+            if (not_proposed and response.status == 409 and conflict != null) return conflict.?;
             return error.MetadataMutationOutcomeUnknown;
         }
         if (response.status != 200) return error.StorageReadTemporarilyUnavailable;
-        var parsed = std.json.parseFromSlice(feeds.Reply, self.alloc, response.body, .{ .allocate = .alloc_always }) catch |err| return if (input.action == .mutate) error.MetadataMutationOutcomeUnknown else err;
+        var parsed = std.json.parseFromSlice(Reply, self.alloc, response.body, .{ .allocate = .alloc_always }) catch |err| return if (mutates) error.MetadataMutationOutcomeUnknown else err;
         errdefer parsed.deinit();
-        parsed.value.validate(self.alloc, input) catch |err| return if (input.action == .mutate) error.MetadataMutationOutcomeUnknown else err;
-        request.ensureActive() catch |err| return if (input.action == .mutate) error.MetadataMutationOutcomeUnknown else err;
+        request.ensureActive() catch |err| return if (mutates) error.MetadataMutationOutcomeUnknown else err;
         return parsed;
     }
 
@@ -5119,4 +5137,45 @@ test "metadata source scope HTTP client requires qualified correlated bounded re
         try std.testing.expectError(if (mode == .lost) error.ReadUnavailable else error.SourceControlCorrupt, client.captureSourceScope("http://metadata.invalid", input, .{}));
         try std.testing.expectEqual(before + @as(usize, if (mode == .lost) 2 else 1), fake.calls);
     }
+}
+
+test "metadata pg publication transport validates confirmed writes without retrying a lost reply" {
+    const a = std.testing.allocator;
+    const publication = @import("pg_publication.zig");
+    const Executor = struct {
+        calls: usize = 0,
+        lost: bool = false,
+        body: []const u8,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, publication.path));
+            if (self.lost) return error.Timeout;
+            const headers = try alloc.alloc(http_common.Header, 1);
+            headers[0] = .{
+                .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header),
+                .value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_committed),
+            };
+            return .{ .status = 200, .headers = headers, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+    const next: publication.Record = .{ .database = @splat(2), .name = "docs_pub", .owner = @splat(3), .revision = 2, .members = null };
+    const input: publication.Request = .{ .group = 1, .incarnation = @splat(1), .database = next.database, .name = next.name, .write = .{ .expected_revision = 1, .next = next } };
+    var reply_body: publication.Reply = .{ .group = input.group, .incarnation = input.incarnation, .database = input.database, .name = input.name, .record = next };
+    const body = try std.json.Stringify.valueAlloc(a, reply_body, .{});
+    defer a.free(body);
+    var executor: Executor = .{ .body = body };
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    var result = try client.accessPgPublication("http://metadata.invalid", input, .{});
+    defer result.deinit();
+    try std.testing.expectEqualDeep(next, result.value.record.?);
+    executor.lost = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessPgPublication("http://metadata.invalid", input, .{}));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    executor.lost = false;
+    reply_body.record.?.revision = 3;
+    const stale = try std.json.Stringify.valueAlloc(a, reply_body, .{});
+    defer a.free(stale);
+    executor.body = stale;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.accessPgPublication("http://metadata.invalid", input, .{}));
 }

@@ -284,6 +284,7 @@ pub const MetadataServer = struct {
                 metadata_http_server.AdminSource.fromMetadataHttpService(svc),
             );
             admin_http_server.changefeed_scan = @import("../api/changefeed_metadata.zig").ScanPort.fromService(svc);
+            admin_http_server.pg_publications = @import("pg_publication.zig").Port.fromService(svc);
             owned_admin_http_server = admin_http_server;
 
             const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(svc);

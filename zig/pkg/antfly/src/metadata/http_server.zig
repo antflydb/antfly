@@ -1999,6 +1999,7 @@ pub const MetadataHttpServer = struct {
     transfers: snapshot_transfer.Transfers = .{},
     source: AdminSource,
     changefeed_scan: ?@import("../api/changefeed_metadata.zig").ScanPort = null,
+    pg_publications: ?@import("pg_publication.zig").Port = null,
     internal_service_auth_capability: ?[]const u8 = null,
     setting_authority_secret: ?[]const u8 = null,
     setting_authority_issuer: ?[]const u8 = null,
@@ -2045,6 +2046,8 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_owner_readiness, httpx.Handler.bind(self, metadataOwnerReadiness));
         try server.post(routes.Routes.internal_privacy_policy_binding, httpx.Handler.bind(self, metadataPrivacyPolicyBinding));
         try server.postWithBodyLimit(@import("../api/source_scope_metadata.zig").path, @import("../api/source_scope_metadata.zig").wire.max_request_bytes, httpx.Handler.bind(self, metadataSourceScopeCapture));
+        const pg_publication = @import("pg_publication.zig");
+        try server.postWithBodyLimit(pg_publication.path, pg_publication.max_transport_bytes, httpx.Handler.bind(self, metadataPgPublication));
         try server.postWithBodyLimit(@import("../api/changefeed_metadata.zig").path, @import("../api/changefeed_metadata.zig").max_wire_bytes, httpx.Handler.bind(self, metadataChangefeedState));
         try server.post(routes.Routes.internal_routing_change, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_routing_authority, httpx.Handler.bind(self, metadataRoutingChange));
@@ -2659,6 +2662,49 @@ pub const MetadataHttpServer = struct {
         try ctx.setHeader("content-type", "application/json");
         _ = ctx.response.body(encoded);
         return ctx.response.build();
+    }
+
+    fn metadataPgPublication(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const publication = @import("pg_publication.zig");
+        const outcome = routes.Routes.raft_mutation_outcome_header;
+        try ctx.setHeader(outcome, routes.Routes.raft_mutation_outcome_not_proposed);
+        if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null)
+            return ctx.status(403).text("authenticated service required");
+        if (ctx.header(routes.routing_remaining_ms_header) == null) return ctx.status(400).text("shared budget required");
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        const bytes = (try ctx.body()) orelse return ctx.status(400).text("missing publication operation");
+        if (bytes.len > publication.max_transport_bytes) return ctx.status(400).text("publication operation too large");
+        var parsed = std.json.parseFromSlice(publication.Request, ctx.allocator, bytes, .{}) catch
+            return ctx.status(400).text("invalid publication operation");
+        defer parsed.deinit();
+        const input = parsed.value;
+        input.validate() catch return ctx.status(400).text("invalid publication operation");
+        const identity_fn = self.source.vtable.catalog_identity orelse return ctx.status(503).text("metadata identity unavailable");
+        const identity = identity_fn(self.source.ptr) catch |err| return metadataReadError(ctx, err);
+        if (identity.metadata_group_id != input.group or !std.meta.eql(identity.metadata_incarnation, input.incarnation))
+            return ctx.status(409).text("metadata identity mismatch");
+        const port = self.pg_publications orelse return ctx.status(503).text("publication service unavailable");
+        var request = requestContext(ctx);
+        request.principal = .{ .kind = .internal, .subject = "pg-publication-maintenance" };
+        var observed: ?std.json.Parsed(publication.Record) = null;
+        defer if (observed) |*record| record.deinit();
+        var reply: publication.Reply = .{ .group = input.group, .incarnation = input.incarnation, .database = input.database, .name = input.name, .record = null };
+        if (input.write) |write| {
+            try ctx.setHeader(outcome, routes.Routes.raft_mutation_outcome_unknown);
+            port.mutate(port.ptr, ctx.allocator, write, request) catch |err| switch (err) {
+                error.PgPublicationConflict => {
+                    try ctx.setHeader(outcome, routes.Routes.raft_mutation_outcome_not_proposed);
+                    return ctx.status(409).text("publication revision conflict");
+                },
+                else => return ctx.status(503).text("publication mutation outcome unknown"),
+            };
+            reply.record = write.next;
+            try ctx.setHeader(outcome, routes.Routes.raft_mutation_outcome_committed);
+        } else {
+            observed = port.read(port.ptr, ctx.allocator, input.database, input.name, request) catch |err| return metadataReadError(ctx, err);
+            if (observed) |record| reply.record = record.value;
+        }
+        return ctx.json(reply);
     }
 
     fn metadataChangefeedState(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -7283,6 +7329,103 @@ test "metadata changefeed state transport rejects unsigned migration requests" {
     var response = try server.executeTypedHandlerWithBodyForTest(.POST, @import("../api/changefeed_metadata.zig").path, &.{}, "{\"version\":1,\"action\":\"authority\"}", MetadataHttpServer.metadataChangefeedState);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 403), response.status.code);
+}
+
+test "metadata pg publication transport recovers an exact write after acknowledgement loss" {
+    const publication = @import("pg_publication.zig");
+    const feed = @import("changefeed_control.zig");
+    const a = std.testing.allocator;
+    const Fake = struct {
+        alloc: std.mem.Allocator,
+        metadata_group_id: u64 = 77,
+        stored: ?[]u8 = null,
+        proposals: u64 = 0,
+        lose_ack: bool = true,
+
+        fn identity(_: *anyopaque) !metadata_api.CatalogIdentity {
+            return .{ .metadata_group_id = 77, .metadata_incarnation = @splat(1) };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+        pub fn projectedStore(self: *@This()) ?*@This() {
+            return self;
+        }
+        pub fn ensureLinearizableReadWithContext(_: *@This(), request: operation.RequestContext) !void {
+            try request.ensureActive();
+        }
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), request: operation.RequestContext, version: u16) !void {
+            try request.ensureActive();
+            try std.testing.expectEqual(publication.protocol_version, version);
+        }
+        pub fn getPgPublication(self: *@This(), allocator: std.mem.Allocator, group: u64, database: feed.Digest, name: []const u8) !?std.json.Parsed(publication.Record) {
+            try std.testing.expectEqual(self.metadata_group_id, group);
+            try std.testing.expectEqual(@as(feed.Digest, @splat(2)), database);
+            try std.testing.expectEqualStrings("rows_pub", name);
+            return if (self.stored) |bytes| try publication.parseRecord(allocator, bytes) else null;
+        }
+        pub fn proposeTransitionCommandWithReceiptObserved(self: *@This(), command: anytype, submitted: ?*bool) !u64 {
+            var write = try publication.parseWrite(self.alloc, command.apply_pg_publication);
+            defer write.deinit();
+            const bytes = try std.json.Stringify.valueAlloc(self.alloc, write.value.next, .{});
+            if (self.stored) |old| self.alloc.free(old);
+            self.stored = bytes;
+            self.proposals += 1;
+            submitted.?.* = true;
+            return self.proposals;
+        }
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: operation.RequestContext) !void {
+            if (self.lose_ack) return error.TestLostAcknowledgement;
+        }
+    };
+    var fake: Fake = .{ .alloc = a };
+    defer if (fake.stored) |bytes| a.free(bytes);
+    var server = MetadataHttpServer.init(a, .{}, .{
+        .ptr = &fake,
+        .vtable = &.{ .catalog_identity = Fake.identity, .status = Fake.status, .admin_snapshot = undefined, .free_admin_snapshot = undefined },
+    });
+    server.pg_publications = publication.Port.fromService(&fake);
+    const input: publication.Request = .{
+        .group = 77,
+        .incarnation = @splat(1),
+        .database = @splat(2),
+        .name = "rows_pub",
+        .write = .{ .expected_revision = 0, .next = .{
+            .database = @splat(2),
+            .name = "rows_pub",
+            .owner = @splat(3),
+            .revision = 1,
+            .members = &.{.{
+                .table = .{ .table_id = 7, .binding = @splat(4), .policy_revision = 1, .contract = .native_relational },
+                .permission_name = "rows",
+                .namespace = "public",
+                .name = "rows",
+                .oid = 42,
+                .identity = .default,
+                .key_columns = &.{"id"},
+            }},
+        } },
+    };
+    const body = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(body);
+    for ([_]u16{ 403, 503, 200 }) |status| {
+        var request = try httpx.Request.init(a, .POST, publication.path);
+        defer request.deinit();
+        try request.setBody(body);
+        if (status != 403) try request.setHeader(@import("../api/internal_service_auth.zig").header_name, "verified-by-host-fixture");
+        try request.setHeader(routes.routing_remaining_ms_header, "1000");
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try server.metadataPgPublication(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(status, response.status.code);
+        try std.testing.expectEqual(@as(u64, if (status == 403) 0 else 1), fake.proposals);
+        if (status == 200) {
+            var parsed = try std.json.parseFromSlice(publication.Reply, a, response.body.?, .{});
+            defer parsed.deinit();
+            try parsed.value.validate(input);
+        }
+    }
 }
 
 test "metadata changefeed state transport correlates sparse bounded maintenance scans" {
