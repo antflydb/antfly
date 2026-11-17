@@ -54854,6 +54854,7 @@ test "api http server cluster overwrite restores from read-only repository witho
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_table = createTable,
                     .replace_table_definition = replaceTableDefinition,
+                    .wait_table_projection = waitTableProjection,
                     .drop_table = dropTable,
                 },
             };
@@ -54886,6 +54887,13 @@ test "api http server cluster overwrite restores from read-only repository witho
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
             };
+        }
+
+        fn waitTableProjection(ptr: *anyopaque, table_name: []const u8, _: ?[]const u8, indexes_json: ?[]const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.state.definition_replaced);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(std.mem.indexOf(u8, indexes_json.?, "_index_alias_epoch") != null);
         }
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
