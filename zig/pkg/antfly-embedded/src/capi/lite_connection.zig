@@ -1253,9 +1253,9 @@ pub const WriterLane = struct {
                 self.checked_out = true;
                 const likely_root = self.last_root;
                 self.mutex.unlock(io);
-                if (likely_root != null and likely_root == connection.owner.current and
-                    !mightNeedRefreshAdmission(connection, likely_root.?, intent))
-                {
+                const take_fast_path = likely_root != null and likely_root == connection.owner.current and
+                    !mightNeedRefreshAdmission(connection, likely_root.?, intent);
+                if (take_fast_path) {
                     const root = likely_root.?;
                     connection.current = root;
                     connection.attach(root);
@@ -4525,6 +4525,7 @@ pub const Connection = struct {
         std.debug.assert(!self.attached);
         if (root.owned_lite_backend) |*backend| if (backend.native_docstore) |store| {
             store.background_write_admission = .{ .ptr = &self.owner.writer_lane, .try_enter = backgroundWriteRefused, .leave = backgroundWriteLeave };
+            store.pending_admission_hint = .{ .ptr = &self.owner.writer_lane, .active = pendingAdmissionActive };
         };
         std.debug.assert(root.sql_sessions.count() == 0 and root.sql_cursors.count() == 0);
         root.lite_connection_context = self;
@@ -4552,6 +4553,22 @@ pub const Connection = struct {
     }
 
     fn backgroundWriteLeave(_: *anyopaque) void {}
+
+    /// `Store.PendingAdmissionHint`: whether exactly one writer is
+    /// currently between this lane's `checkout` and the matching
+    /// `checkin` -- admitted to validate and stage its write, but not
+    /// yet enqueued (see `checked_out`'s own doc comment). Reads
+    /// `checked_out` under the lane's own mutex: cheap and never
+    /// contended by this call, since neither `checkout` nor `checkin`
+    /// ever touches a `Store`'s `commit_mutex` (the lock this hint is
+    /// read under), so there is no lock-ordering cycle between them.
+    fn pendingAdmissionActive(ptr: *anyopaque) bool {
+        const lane: *WriterLane = @ptrCast(@alignCast(ptr));
+        const io = h.handleLockIo();
+        lane.mutex.lockUncancelable(io);
+        defer lane.mutex.unlock(io);
+        return lane.checked_out;
+    }
 
     pub fn detach(self: *Connection) void {
         if (!self.attached) return;
