@@ -62803,8 +62803,19 @@ fn denseTargetCountForIndexContextWithCoverage(
     index_name: []const u8,
     coverage: DenseTargetCoverage,
 ) !?u64 {
-    const entry = ctx.index_manager.denseIndex(index_name) orelse return null;
-    return denseTargetCountForDenseEntryContext(ctx, entry, coverage);
+    if (ctx.index_manager.denseIndex(index_name)) |entry| {
+        return denseTargetCountForDenseEntryContext(ctx, entry, coverage);
+    }
+    // Quarantine retains the authoritative config while the replacement is
+    // built off-catalog. Its activation must still validate durable coverage.
+    const cfg = ctx.index_manager.get(index_name) orelse return null;
+    if (cfg.kind != .dense_vector) return null;
+    if (try ctx.index_manager.denseConfigUsesArtifactTarget(cfg.*)) {
+        return try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
+    }
+    const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return null;
+    const counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
+    return denseTargetCountFromCoverage(ctx, index_name, coverage, counts);
 }
 
 // Catalog walkers already own a pinned entry; preserve that identity all the
@@ -111779,6 +111790,9 @@ test "db quarantined dense bootstrap tracks concurrent insert update and delete"
         @as(?u64, 1),
         try DB.loadDenseArtifactTargetCounter(alloc, reopened.core.store, cfg.name),
     );
+
+    try std.testing.expect(reopened.core.index_manager.denseIndex(cfg.name) == null);
+    try std.testing.expectEqual(@as(?u64, 1), try denseTargetCountForIndexContext(reopened.async_context, cfg.name));
 
     const repaired = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
     try std.testing.expect(repaired.repaired);

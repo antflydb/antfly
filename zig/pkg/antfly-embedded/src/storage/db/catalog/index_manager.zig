@@ -18248,6 +18248,18 @@ pub const IndexManager = struct {
         return containsOwnedString(refs.source_artifact_names, candidate);
     }
 
+    /// Quarantined indexes have a config but no resident entry. Use the same
+    /// cardinality authority as activation without opening native storage.
+    pub fn denseConfigUsesArtifactTarget(self: *const IndexManager, cfg: types.IndexConfig) !bool {
+        if (cfg.kind != .dense_vector) return false;
+        const dense = try parseDenseConfig(self.alloc, cfg.config_json);
+        defer dense.deinit(self.alloc);
+        if (dense.external or dense.embedding_names.len > 1) return true;
+        var refs = try self.artifactRefsFromConfig(cfg);
+        defer refs.deinit(self.alloc);
+        return refs.chunk_name != null;
+    }
+
     fn artifactRefsFromConfig(self: *const IndexManager, cfg: types.IndexConfig) !ArtifactRefs {
         switch (cfg.kind) {
             .full_text => {

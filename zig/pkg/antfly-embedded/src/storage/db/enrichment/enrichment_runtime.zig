@@ -31005,7 +31005,9 @@ const OrderedDenseTextBatch = struct {
                         // A call-local cancellation must not discard a later
                         // successful sibling. The generation/global guard is
                         // checked separately before any result is submitted.
-                        if (failure == null or denseBatchFailurePriority(classified) > denseBatchFailurePriority(failure.?)) {
+                        // Ordinary retries retain the first parked owner's identity.
+                        // Only pipeline controls supersede that durable retry.
+                        if (failure == null or (isEnrichmentControlError(classified) and !isEnrichmentControlError(failure.?))) {
                             failure = classified;
                             failed_scope = self.scope.*;
                         }
@@ -42880,6 +42882,11 @@ test "ordered materialized chunk embeddings preserve successes around call cance
     try testOrderedChunkVectorCarry(true, .cancel_global);
 }
 
+test "ordered materialized chunk embeddings preserve mixed ordinary retry identity" {
+    try testOrderedChunkVectorCarry(true, .mixed_retry_first);
+    try testOrderedChunkVectorCarry(true, .mixed_retry_second);
+}
+
 test "ordered materialized chunk embeddings preserve controls over parked provider retries" {
     try testOrderedChunkVectorCarry(true, .source_first);
     try testOrderedChunkVectorCarry(true, .source_second);
@@ -42935,7 +42942,7 @@ test "ordered materialized chunk embeddings retain owners across planning failur
     try testOrderedChunkVectorCarry(true, .planning_retry);
 }
 
-const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, cancel_first, cancel_second, cancel_global, source_first, source_second, abort_first, abort_second, memo_serial, memo_parallel, memo_unused, parallel_capacity, parallel_capacity_cancel, planning_terminal, planning_retry, collection_multi, collection_contention, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current };
+const ChunkVectorBatchTest = enum { carry, items, bytes, revision, legacy, legacy_bytes, terminal, metadata_retry, metadata_tail_retry, relational_retry, legacy_budget, legacy_boundary_terminal, legacy_metadata_retry, legacy_metadata_terminal, parallel, parallel_bytes, legacy_preparation_retry, legacy_preparation_retry_cached, mixed_publication_pending, parallel_oversize, parallel_terminal, parallel_retry, collection_pressure, collection_too_large, parallel_cancel, cancel_first, cancel_second, cancel_global, source_first, source_second, abort_first, abort_second, mixed_retry_first, mixed_retry_second, memo_serial, memo_parallel, memo_unused, parallel_capacity, parallel_capacity_cancel, planning_terminal, planning_retry, collection_multi, collection_contention, legacy_cleanup_terminal, legacy_cleanup_terminal_empty, legacy_cleanup_terminal_current };
 
 fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
@@ -43477,7 +43484,7 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
             request.* = vector_request;
             request.doc_key = key.*;
         }
-        harness.parallel = batching == .source_first or batching == .source_second or batching == .abort_first or batching == .abort_second or batching == .cancel_global or batching == .cancel_first or batching == .cancel_second or batching == .parallel or batching == .parallel_bytes or batching == .parallel_terminal or batching == .parallel_retry or batching == .parallel_cancel or batching == .memo_parallel or batching == .memo_unused or batching == .parallel_capacity or batching == .parallel_capacity_cancel;
+        harness.parallel = batching == .mixed_retry_first or batching == .mixed_retry_second or batching == .source_first or batching == .source_second or batching == .abort_first or batching == .abort_second or batching == .cancel_global or batching == .cancel_first or batching == .cancel_second or batching == .parallel or batching == .parallel_bytes or batching == .parallel_terminal or batching == .parallel_retry or batching == .parallel_cancel or batching == .memo_parallel or batching == .memo_unused or batching == .parallel_capacity or batching == .parallel_capacity_cancel;
         runtime.config.dense_embedder = .{ .dense_batch_concurrency = if (harness.parallel or batching == .parallel_oversize or batching == .memo_serial) 2 else 1, .ptr = &harness, .dense_embed_fn = Harness.embedDense, .dense_embed_batch_with_context_fn = Harness.embedDenseBatch, .cache_revision_fn = Harness.revision, .capabilities_fn = Harness.caps, .dense_embed_batch_planned_fn = Harness.planned };
         if (batching == .memo_serial or batching == .memo_parallel or batching == .memo_unused) {
             if (batching != .memo_unused) runtime.config.dense_embedder.?.computation_key_fn = Harness.computationKey;
@@ -43604,6 +43611,29 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
                 for (harness.batches.items) |size| try std.testing.expect(size <= 32);
             }
             try std.testing.expect(test_ordered_collection_pressure_drains.load(.acquire) > denied_before);
+            return;
+        }
+        if (batching == .mixed_retry_first or batching == .mixed_retry_second) {
+            var scheduler = try ScopedReplay.load(runtime);
+            defer scheduler.deinit(runtime.alloc);
+            runtime.retry_scheduler = &scheduler;
+            defer runtime.retry_scheduler = null;
+            runtime.config.inline_retry_max_attempts = 1;
+            runtime.config.worker_retry_max_attempts = 2;
+            for (&requests) |*request| request.sequence = index;
+            harness.cancel_text = "hello 00000";
+            harness.fail_text = "hello 00032";
+            harness.retry_text = true;
+            harness.control_error = if (batching == .mixed_retry_first) error.UnexpectedProviderFailure else error.EmbedRateLimited;
+            harness.retry_error = if (batching == .mixed_retry_first) error.EmbedRateLimited else error.UnexpectedProviderFailure;
+            var scope: FailureScope = .{};
+            const before = harness.queued.items.len;
+            const result = processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope);
+            try std.testing.expectError(harness.control_error, result);
+            try LaneOutcome.of(&scope, result).result;
+            try std.testing.expectEqual(scope.first_scheduled_fingerprint, scope.retry_fingerprint);
+            try std.testing.expectEqual(@as(usize, count), scheduler.state.tickets.items.len);
+            try std.testing.expectEqual(before, harness.queued.items.len);
             return;
         }
         if (batching == .source_first or batching == .source_second or batching == .abort_first or batching == .abort_second) {
