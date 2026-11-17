@@ -14662,6 +14662,12 @@ pub const RaftApplyStore = struct {
         try context.ensureActive();
         if (request.targets.len > 256 or request.storage_names.len > 256 - request.targets.len or request.relations.len > 256 - request.targets.len - request.storage_names.len) return error.CatalogCommandTooLarge;
         if (request.expected_relation_epoch != null and request.relations.len == 0) return error.InvalidCatalogMutation;
+        if (request.publication_database) |database| {
+            try system_catalog.validateName(database);
+            if (!request.include_query_definitions or request.storage_names.len != 0 or request.relations.len != 0 or request.name_allocation)
+                return error.InvalidCatalogMutation;
+            for (request.targets) |target| if (!std.mem.eql(u8, target.database, database)) return error.InvalidCatalogMutation;
+        }
         for (request.relations) |target| try target.validate();
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
@@ -14694,6 +14700,28 @@ pub const RaftApplyStore = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const view: system_catalog_storage.View = .{ .alloc = arena.allocator(), .txn = &txn, .group_id = group_id, .meta = meta };
+        const publication_cut: ?system_catalog.PublicationCatalogCut = if (request.publication_database) |database| blk: {
+            const resource = (try view.lookup(.database, 0, database)) orelse return error.DatabaseNotFound;
+            var buffer: [160]u8 = undefined;
+            const raw_identity = txn.get(try metadataIncarnationKeyForGroup(&buffer, group_id)) catch |err| switch (err) {
+                error.NotFound => return error.MetadataIncarnationUnavailable,
+                else => return err,
+            };
+            const identity = try decodeMetadataIncarnationRecord(raw_identity);
+            const bindings = try alloc.alloc(?[32]u8, tables.len);
+            errdefer alloc.free(bindings);
+            for (tables, bindings) |resolved, *binding| {
+                try context.ensureActive();
+                binding.* = null;
+                if (resolved) |table| {
+                    const record = try decodeTableRecord(arena.allocator(), try txn.get(try tableKeyForGroup(&buffer, group_id, table.table_id)));
+                    if (record.table_id != table.table_id or !std.mem.eql(u8, record.name, table.name)) return error.InvalidCatalogRecord;
+                    binding.* = changefeed_control.tableBinding(record);
+                }
+            }
+            break :blk .{ .metadata_group_id = group_id, .metadata_incarnation = identity.incarnation, .database_id = resource.id, .bindings = bindings };
+        } else null;
+        errdefer if (publication_cut) |cut| alloc.free(cut.bindings);
         const relations = try alloc.alloc(?system_catalog.ResolvedRelation, request.relations.len);
         @memset(relations, null);
         errdefer {
@@ -14730,7 +14758,7 @@ pub const RaftApplyStore = struct {
             }
             slot.* = .{ .owner = owner, .table = table, .logical_table = try alloc.dupe(u8, logical_name) };
         }
-        return .{ .revision = meta.revision, .tables = tables, .logical_names = try system_catalog.logicalNamesAlloc(alloc, view, request.storage_names), .relation_epoch = if (live) |value| value.root.epoch else null, .relations = relations };
+        return .{ .revision = meta.revision, .tables = tables, .publication_cut = publication_cut, .logical_names = try system_catalog.logicalNamesAlloc(alloc, view, request.storage_names), .relation_epoch = if (live) |value| value.root.epoch else null, .relations = relations };
     }
 
     /// Name selection can precede registry adoption. Read the complete source
@@ -39988,6 +40016,32 @@ test "system catalog publishes names and table topology atomically and fences st
         try std.testing.expectEqual(@as(u64, 42), resolved.tables[0].?.table_id);
         try std.testing.expect(resolved.tables[1] == null);
         try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(alloc, 21, .{ .targets = &targets, .expected_revision = 1 }));
+    }
+    {
+        const incarnation = "01010101010101010101010101010101".*;
+        const targets = [_]system_catalog.Target{ .{ .database = "analytics", .table = "events" }, .{ .database = "analytics", .table = "missing" } };
+        const request: system_catalog.ResolveMany = .{ .targets = &targets, .publication_database = "analytics", .include_query_definitions = true, .expected_revision = 2 };
+        try std.testing.expectError(error.MetadataIncarnationUnavailable, store.resolveSystemCatalogIdentities(alloc, 21, request));
+        try store.applyStandaloneCommand(21, .{ .initialize_metadata_incarnation = incarnation });
+        const resolved = try store.resolveSystemCatalogIdentities(alloc, 21, request);
+        defer resolved.deinit(alloc);
+        const cut = try resolved.requirePublicationCut(request);
+        try std.testing.expectEqual(@as(u64, 21), cut.metadata_group_id);
+        try std.testing.expectEqual(incarnation, cut.metadata_incarnation);
+        try std.testing.expect(cut.database_id != system_catalog.default_database_id and cut.database_id != 0);
+        try std.testing.expectEqual(changefeed_control.tableBinding(table), cut.bindings[0].?);
+        try std.testing.expect(cut.bindings[1] == null);
+        const bytes = try std.json.Stringify.valueAlloc(alloc, resolved, .{});
+        defer alloc.free(bytes);
+        const response = try std.json.parseFromSlice(system_catalog.ResolvedMany, alloc, bytes, .{});
+        defer response.deinit();
+        try std.testing.expectEqual(cut.database_id, (try response.value.requirePublicationCut(request)).database_id);
+        var old_peer = resolved;
+        old_peer.publication_cut = null;
+        try std.testing.expectError(error.TableTopologyUpgradeRequired, old_peer.requirePublicationCut(request));
+        var foreign_database = request;
+        foreign_database.publication_database = "default";
+        try std.testing.expectError(error.InvalidCatalogMutation, store.resolveSystemCatalogIdentities(alloc, 21, foreign_database));
     }
     // The hot-path response must neither serialize nor allocate the table's
     // potentially large definition. Its allocator budget is independent of it.
