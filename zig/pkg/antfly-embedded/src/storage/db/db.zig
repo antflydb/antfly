@@ -153573,11 +153573,18 @@ test "full_text visibility wait timeout with a live text-merge worker does not h
     try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"body\":\"counter\",\"count\":0}" }}, .sync_level = .write });
     try std.testing.expect(db.text_merge_runtime.?.isStarted());
 
-    // Claim the whole segment budget before the live worker has a chance to
-    // reserve any of it itself (unlike variant 2's manual-mode runtime,
-    // which never races this acquire).
+    // Claim the rest of the segment budget. Unlike variant 2's manual-mode
+    // runtime (which never races this acquire), the live worker notified by
+    // `addWorker`/the batch above already wins the race to index "counter"
+    // into ft_v1's own first segment before this loop's first attempt can
+    // even run -- `acquireProducerPermitWithApplyOwnership`'s admission
+    // check always observes `active_segments >= 1` by then, deterministically,
+    // not just occasionally. Asking for all 12 therefore always overshoots
+    // by exactly that one already-durable segment and times out every one
+    // of the 200 attempts; ask for 11 so admission succeeds whether this
+    // runs before or after the worker's own segment lands.
     var held = held_loop: for (0..200) |_| {
-        break :held_loop db.text_merge_runtime.?.acquireProducerPermit("ft_v1", 12, 0) catch |err| switch (err) {
+        break :held_loop db.text_merge_runtime.?.acquireProducerPermit("ft_v1", 11, 0) catch |err| switch (err) {
             error.TextMergeBackpressureTimeout => {
                 std.Thread.yield() catch {};
                 continue;
@@ -153594,10 +153601,19 @@ test "full_text visibility wait timeout with a live text-merge worker does not h
     // mode) the backpressure timeout can surface either wrapped (primary
     // already committed) or bare (admission blocked before the primary
     // write landed) depending on exactly when the worker's own activity
-    // interleaves with this call; either way the point of this test is
-    // that `close()` afterward must not hang.
+    // interleaves with this call. Holding 11 of ft_v1's 12-segment budget
+    // leaves no room for the worker's own catch-up of this write either, so
+    // the race can also resolve as the worker's bounded recoverable-retry
+    // backoff (`scheduleRecoverableCatchUpRetry`/`catch_up_exhausted`)
+    // giving up first and marking itself permanently failed before this
+    // call's own visibility wait observes the softer, transient error -- a
+    // third legitimate shape of the same underlying backpressure this held
+    // permit models. Only that path logs (the worker's own `std.log.err`
+    // on exhaustion); the other two never do, so the expectation is
+    // declared only once the outcome is known, not unconditionally.
     db.batch(request) catch |err| switch (err) {
         error.CommitVisibilityNotSatisfied, error.TextMergeBackpressureTimeout => {},
+        error.AsyncWorkerFailed => @import("antfly_test_error_logs").expectErrorLogs(1),
         else => return err,
     };
 
