@@ -556,7 +556,8 @@ pub const MetadataHttpClient = struct {
         try input.validate();
         const bytes = try std.json.Stringify.valueAlloc(self.alloc, input, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(bytes);
-        if (bytes.len > feeds.max_wire_bytes) return error.InvalidChangefeed;
+        const wire_limit: usize = if (input.action == .scan_maintenance) feeds.max_scan_wire_bytes else feeds.max_wire_bytes;
+        if (bytes.len > wire_limit) return error.InvalidChangefeed;
         const uri = try join(self.alloc, base_uri, feeds.path);
         defer self.alloc.free(uri);
         const timeout = @min(@as(u32, 5000), (try request.remainingTimeoutMs()) orelse 5000);
@@ -568,7 +569,7 @@ pub const MetadataHttpClient = struct {
         // Translate the remaining budget once into the executor's platform
         // clock. The request's absolute deadline may use a borrowed test clock.
         const transport_budget: RequestBudget = .{ .deadline_ns = platform_time.monotonicNs() +| @as(u64, timeout) * std.time.ns_per_ms, .cancellation = &signal };
-        var response = self.executeWithRetryPolicy(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .headers = &headers, .timeout_ms = timeout, .max_response_bytes = feeds.max_wire_bytes, .cancellation = &signal, .delivery_tracker = &delivery }, transport_budget, .at_most_once) catch |err| {
+        var response = self.executeWithRetryPolicy(.{ .method = .POST, .uri = uri, .body = bytes, .content_type = "application/json", .headers = &headers, .timeout_ms = timeout, .max_response_bytes = wire_limit, .cancellation = &signal, .delivery_tracker = &delivery }, transport_budget, .at_most_once) catch |err| {
             if (input.action == .mutate and (err == error.ReallocationOutcomeUnknown or err == error.MetadataMutationOutcomeUnknown or delivery.load() != .not_sent)) return error.MetadataMutationOutcomeUnknown;
             return err;
         };

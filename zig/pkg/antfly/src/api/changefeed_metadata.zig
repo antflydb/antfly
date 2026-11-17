@@ -24,7 +24,30 @@ const Context = local.api_operation.RequestContext;
 const A = std.mem.Allocator;
 pub const path = "/internal/v1/catalog/changefeed-state-v1";
 pub const max_wire_bytes = control.max_state_bytes * 6 + 4096;
-pub const Action = enum { read, authority, mutate };
+pub const max_scan_wire_bytes = 16 * 1024;
+pub const Action = enum { read, authority, mutate, scan_maintenance };
+pub const ScanRequest = struct { now: u64, after: ?control.Id = null };
+pub const ScanReply = struct {
+    request: ScanRequest,
+    ids: []const control.Id,
+    next: ?control.Id,
+
+    fn validate(self: ScanReply, expected: ScanRequest) !void {
+        if (!std.meta.eql(self.request, expected) or self.ids.len > control.MaintenanceScan.limit)
+            return error.ChangefeedCorrupt;
+        var previous = expected.after;
+        for (self.ids) |id| {
+            if (std.mem.allEqual(u8, &id, 0)) return error.ChangefeedCorrupt;
+            if (previous) |prior| if (std.mem.order(u8, &prior, &id) != .lt) return error.ChangefeedCorrupt;
+            previous = id;
+        }
+        if (self.next) |next| {
+            if (std.mem.allEqual(u8, &next, 0)) return error.ChangefeedCorrupt;
+            if (expected.after) |after| if (std.mem.order(u8, &after, &next) != .lt) return error.ChangefeedCorrupt;
+            if (previous) |prior| if (std.mem.order(u8, &prior, &next) == .gt) return error.ChangefeedCorrupt;
+        }
+    }
+};
 pub const Request = struct {
     version: u16 = 1,
     action: Action,
@@ -32,12 +55,15 @@ pub const Request = struct {
     metadata_incarnation: [32]u8,
     id: ?control.Id = null,
     write: ?[]const u8 = null,
+    scan: ?ScanRequest = null,
     pub fn validate(self: Request) !void {
         if (self.version != 1 or self.metadata_group_id == 0 or std.mem.allEqual(u8, &self.metadata_incarnation, 0)) return error.InvalidChangefeed;
+        if ((self.action == .scan_maintenance) != (self.scan != null)) return error.InvalidChangefeed;
         switch (self.action) {
             .read => if (self.id == null or self.write != null) return error.InvalidChangefeed,
             .authority => if (self.id != null or self.write != null) return error.InvalidChangefeed,
             .mutate => if (self.id != null or self.write == null or self.write.?.len == 0 or self.write.?.len > control.max_state_bytes) return error.InvalidChangefeed,
+            .scan_maintenance => if (self.id != null or self.write != null or self.scan.?.now == 0) return error.InvalidChangefeed,
         }
     }
 };
@@ -49,9 +75,22 @@ pub const Reply = struct {
     id: ?control.Id = null,
     state: ?[]const u8 = null,
     authority: ?control.Stamp = null,
+    scan: ?ScanReply = null,
+    pub fn jsonStringify(self: Reply, jw: anytype) !void {
+        try jw.beginObject();
+        inline for (comptime std.meta.fieldNames(Reply)) |field| {
+            if (!std.mem.eql(u8, field, "scan") or self.scan != null) {
+                try jw.objectField(field);
+                try jw.write(@field(self, field));
+            }
+        }
+        try jw.endObject();
+    }
+
     pub fn validate(self: Reply, a: A, request: Request) !void {
         try request.validate();
         if (self.version != 1 or self.action != request.action or self.metadata_group_id != request.metadata_group_id or !std.mem.eql(u8, &self.metadata_incarnation, &request.metadata_incarnation)) return error.ChangefeedCorrupt;
+        if ((self.action == .scan_maintenance) != (self.scan != null)) return error.ChangefeedCorrupt;
         switch (self.action) {
             .read => {
                 if (self.id == null or !std.mem.eql(u8, &self.id.?, &request.id.?) or self.state == null or self.authority != null) return error.ChangefeedCorrupt;
@@ -64,6 +103,10 @@ pub const Reply = struct {
                 if (self.authority) |stamp| if (stamp.sequence == 0 or std.mem.allEqual(u8, &stamp.incarnation, 0)) return error.ChangefeedCorrupt;
             },
             .mutate => if (self.id != null or self.state != null or self.authority != null) return error.ChangefeedCorrupt,
+            .scan_maintenance => {
+                if (self.id != null or self.state != null or self.authority != null) return error.ChangefeedCorrupt;
+                try self.scan.?.validate(request.scan.?);
+            },
         }
     }
 };
@@ -190,6 +233,36 @@ pub const Port = struct {
         return .{ .ptr = svc, .read_fn = Adapter.read, .mutate_fn = Adapter.mutate, .authority_fn = Adapter.authority };
     }
 };
+/// Metadata HTTP serves this alongside the existing state port. Keeping the
+/// scanner local to that server preserves the runtime callback layout.
+pub const ScanPort = struct {
+    ptr: *anyopaque,
+    scan_fn: *const fn (*anyopaque, A, ScanRequest, Context) anyerror!control.MaintenanceScan,
+
+    pub fn scan(self: ScanPort, a: A, input: ScanRequest, context: Context) !control.MaintenanceScan {
+        try Port.authorize(context);
+        if (input.now == 0) return error.InvalidChangefeed;
+        const result = try self.scan_fn(self.ptr, a, input, context);
+        try context.ensureActive();
+        if (result.count > control.MaintenanceScan.limit) return error.ChangefeedCorrupt;
+        try (ScanReply{ .request = input, .ids = result.items(), .next = result.next }).validate(input);
+        return result;
+    }
+
+    pub fn fromService(svc: anytype) ScanPort {
+        const Service = @typeInfo(@TypeOf(svc)).pointer.child;
+        const Adapter = struct {
+            fn scan(raw: *anyopaque, a: A, input: ScanRequest, context: Context) !control.MaintenanceScan {
+                const self: *Service = @ptrCast(@alignCast(raw));
+                try self.ensureLinearizableReadWithContext(context);
+                const store = self.projectedStore() orelse return error.MissingMetadataStore;
+                return store.scanChangefeedMaintenance(a, self.metadata_group_id, input.now, input.after);
+            }
+        };
+        return .{ .ptr = svc, .scan_fn = Adapter.scan };
+    }
+};
+
 /// Request-scoped facade accepted by the shared feed/root/spool owners. No
 /// synthetic proposal receipt or local projection is manufactured for a port.
 pub const Client = struct {

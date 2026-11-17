@@ -29031,7 +29031,7 @@ const RemoteMetadataSource = struct {
         return last_err;
     }
 
-    fn accessChangefeedMetadata(self: *RemoteMetadataSource, a: std.mem.Allocator, action: @import("../api/changefeed_metadata.zig").Action, id: ?@import("../metadata/changefeed_control.zig").Id, write: ?[]const u8, original: antfly.public_api.operation.RequestContext) !std.json.Parsed(@import("../api/changefeed_metadata.zig").Reply) {
+    fn accessChangefeedMetadata(self: *RemoteMetadataSource, a: std.mem.Allocator, action: @import("../api/changefeed_metadata.zig").Action, id: ?@import("../metadata/changefeed_control.zig").Id, write: ?[]const u8, scan: ?@import("../api/changefeed_metadata.zig").ScanRequest, original: antfly.public_api.operation.RequestContext) !std.json.Parsed(@import("../api/changefeed_metadata.zig").Reply) {
         const feeds = @import("../api/changefeed_metadata.zig");
         var request = original;
         request.deadline_ns = try requestDeadlineOnClock(original, self.awakeNs(), 5 * std.time.ns_per_s);
@@ -29042,7 +29042,7 @@ const RemoteMetadataSource = struct {
         // identity only; the state endpoint always executes its own strong read.
         const head = try self.fetchHeadWithBudget(budget);
         const incarnation = head.metadata_incarnation orelse return error.MetadataIncarnationUnavailable;
-        const input: feeds.Request = .{ .action = action, .id = id, .write = write, .metadata_group_id = head.metadata_group_id, .metadata_incarnation = incarnation };
+        const input: feeds.Request = .{ .action = action, .id = id, .write = write, .scan = scan, .metadata_group_id = head.metadata_group_id, .metadata_incarnation = incarnation };
         const first = try self.metadataReadApiIndexForAttemptWithBudget(0, budget);
         var last_error: anyerror = error.MissingMetadataApi;
         // A mutation gets exactly one selected peer. An unknown outcome must
@@ -29070,7 +29070,7 @@ const RemoteMetadataSource = struct {
 
     fn remoteChangefeedRead(ptr: *anyopaque, a: std.mem.Allocator, id: @import("../metadata/changefeed_control.zig").Id, request: antfly.public_api.operation.RequestContext) ![]u8 {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
-        var reply = try self.accessChangefeedMetadata(a, .read, id, null, request);
+        var reply = try self.accessChangefeedMetadata(a, .read, id, null, null, request);
         defer reply.deinit();
         return a.dupe(u8, reply.value.state.?);
     }
@@ -29079,15 +29079,24 @@ const RemoteMetadataSource = struct {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         const bytes = try @import("../metadata/changefeed_control.zig").encodeWrite(a, write);
         defer a.free(bytes);
-        var reply = try self.accessChangefeedMetadata(a, .mutate, null, bytes, request);
+        var reply = try self.accessChangefeedMetadata(a, .mutate, null, bytes, null, request);
         defer reply.deinit();
     }
 
     fn remoteChangefeedAuthority(ptr: *anyopaque, a: std.mem.Allocator, request: antfly.public_api.operation.RequestContext) !?@import("../metadata/changefeed_control.zig").Stamp {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
-        var reply = try self.accessChangefeedMetadata(a, .authority, null, null, request);
+        var reply = try self.accessChangefeedMetadata(a, .authority, null, null, null, request);
         defer reply.deinit();
         return reply.value.authority;
+    }
+
+    pub fn scanChangefeedMaintenance(self: *RemoteMetadataSource, a: std.mem.Allocator, input: @import("../api/changefeed_metadata.zig").ScanRequest, request: antfly.public_api.operation.RequestContext) !@import("../metadata/changefeed_control.zig").MaintenanceScan {
+        var reply = try self.accessChangefeedMetadata(a, .scan_maintenance, null, null, input, request);
+        defer reply.deinit();
+        const page = reply.value.scan.?;
+        var result: @import("../metadata/changefeed_control.zig").MaintenanceScan = .{ .count = page.ids.len, .next = page.next };
+        @memcpy(result.ids[0..result.count], page.ids);
+        return result;
     }
 
     fn remotePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.PrivacyPolicyBinding {

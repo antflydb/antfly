@@ -1998,6 +1998,7 @@ pub const MetadataHttpServer = struct {
     alloc: std.mem.Allocator = std.heap.page_allocator,
     transfers: snapshot_transfer.Transfers = .{},
     source: AdminSource,
+    changefeed_scan: ?@import("../api/changefeed_metadata.zig").ScanPort = null,
     internal_service_auth_capability: ?[]const u8 = null,
     setting_authority_secret: ?[]const u8 = null,
     setting_authority_issuer: ?[]const u8 = null,
@@ -2688,6 +2689,13 @@ pub const MetadataHttpServer = struct {
             },
             .authority => {
                 reply.authority = port.authority(ctx.allocator, request) catch |err| return metadataReadError(ctx, err);
+                return ctx.json(reply);
+            },
+            .scan_maintenance => {
+                const scan_port = self.changefeed_scan orelse return ctx.status(503).text("changefeed maintenance unavailable");
+                const input = parsed.value.scan.?;
+                const result = scan_port.scan(ctx.allocator, input, request) catch |err| return metadataReadError(ctx, err);
+                reply.scan = .{ .request = input, .ids = result.items(), .next = result.next };
                 return ctx.json(reply);
             },
             .mutate => {
@@ -7277,6 +7285,52 @@ test "metadata changefeed state transport rejects unsigned migration requests" {
     try std.testing.expectEqual(@as(u16, 403), response.status.code);
 }
 
+test "metadata changefeed state transport correlates sparse bounded maintenance scans" {
+    const feeds = @import("../api/changefeed_metadata.zig");
+    const control = @import("changefeed_control.zig");
+    const a = std.testing.allocator;
+    const Fake = struct {
+        fn identity(_: *anyopaque) !metadata_api.CatalogIdentity {
+            return .{ .metadata_group_id = 77, .metadata_incarnation = @splat(1) };
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, input: feeds.ScanRequest, request: operation.RequestContext) !control.MaintenanceScan {
+            try std.testing.expectEqualStrings("changefeed-maintenance", request.principal.?.subject);
+            try std.testing.expectEqual(@as(u64, 200), input.now);
+            try std.testing.expectEqual(@as(control.Id, @splat(2)), input.after.?);
+            return .{ .next = @splat(3) };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var marker: u8 = 0;
+    var server = MetadataHttpServer.init(a, .{}, .{
+        .ptr = &marker,
+        .vtable = &.{ .catalog_identity = Fake.identity, .status = Fake.status, .admin_snapshot = undefined, .free_admin_snapshot = undefined },
+        .changefeeds = .{ .ptr = &marker, .read_fn = undefined, .mutate_fn = undefined, .authority_fn = undefined },
+    });
+    server.changefeed_scan = .{ .ptr = &marker, .scan_fn = Fake.scan };
+    const input: feeds.Request = .{ .action = .scan_maintenance, .metadata_group_id = 77, .metadata_incarnation = @splat(1), .scan = .{ .now = 200, .after = @splat(2) } };
+    const body = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(body);
+    var request = try httpx.Request.init(a, .POST, feeds.path);
+    defer request.deinit();
+    try request.setBody(body);
+    try request.setHeader(@import("../api/internal_service_auth.zig").header_name, "verified-by-host-fixture");
+    try request.setHeader(routes.routing_remaining_ms_header, "1000");
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try server.metadataChangefeedState(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var reply = try std.json.parseFromSlice(feeds.Reply, a, response.body.?, .{});
+    defer reply.deinit();
+    try reply.value.validate(a, input);
+    try std.testing.expectEqual(@as(usize, 0), reply.value.scan.?.ids.len);
+    reply.value.scan.?.next = input.scan.?.after;
+    try std.testing.expectError(error.ChangefeedCorrupt, reply.value.validate(a, input));
+}
+
 test "metadata changefeed state transport fences cluster identity before authority access" {
     const feeds = @import("../api/changefeed_metadata.zig");
     const control = @import("changefeed_control.zig");
@@ -7325,6 +7379,7 @@ test "metadata changefeed state transport fences cluster identity before authori
             var reply = try std.json.parseFromSlice(feeds.Reply, a, response.body.?, .{});
             defer reply.deinit();
             try reply.value.validate(a, input);
+            try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"scan\"") == null);
             try std.testing.expectEqual(@as(u64, 42), reply.value.authority.?.sequence);
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
         }
