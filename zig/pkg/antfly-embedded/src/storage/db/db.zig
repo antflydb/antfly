@@ -14540,6 +14540,8 @@ pub const DB = struct {
     /// Cheap generation, replay, and cardinality checks run first so routine
     /// lag avoids a tree walk. The validation read transaction is stable while
     /// foreground writes continue through the ordinary derived stream.
+    const operator_validation_replay_wait_ns: u64 = 2 * std.time.ns_per_s;
+
     fn validateOperatorDenseGenerationForOnlineRebuild(
         self: *DB,
         alloc: Allocator,
@@ -18292,7 +18294,22 @@ pub const DB = struct {
             var durable_entry = try self.loadIndexRepairEntryById(alloc, repair_id);
             defer durable_entry.deinit(alloc);
             if (durable_entry.intent.trigger == .operator_generation_validation) {
-                switch (try self.validateOperatorDenseGenerationForOnlineRebuild(alloc, cfg, options)) {
+                var validation = try self.validateOperatorDenseGenerationForOnlineRebuild(alloc, cfg, options);
+                if (validation == .replay_pending) {
+                    // The failure this repair settles is already durable, but
+                    // the async executor may not have replayed past it yet.
+                    // Drive this index's replay to the current target once,
+                    // bounded, instead of deferring the forced repair to a
+                    // turn nothing schedules.
+                    const clock = self.backend_runtime.monotonicClock();
+                    const index_names = [_][]const u8{cfg.name};
+                    _ = self.waitForCurrentIndexTargets(&index_names, clock.nowRealtimeNs() +| operator_validation_replay_wait_ns) catch |err| switch (err) {
+                        error.EnrichmentWaitTimeout, error.EnrichmentWaitCanceled => {},
+                        else => return err,
+                    };
+                    validation = try self.validateOperatorDenseGenerationForOnlineRebuild(alloc, cfg, options);
+                }
+                switch (validation) {
                     .online_safe => try self.updateIndexRepairIntent(alloc, repair_id, .{
                         .trigger = .operator_generation_rebuild,
                         .replace_last_error = true,
