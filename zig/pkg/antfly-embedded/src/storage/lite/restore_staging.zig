@@ -737,6 +737,18 @@ fn stageNativeAfbRestoreBackup(
     // The caller holds the shared lock and supplies the stat from before its
     // header/manifest reads. Also reject writers that ignore advisory locks.
     if (!backups_api.localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
+    {
+        const metadata_path = try std.fmt.allocPrint(allocator, "{s}-metadata.json", .{root_manifest.backup_id});
+        defer allocator.free(metadata_path);
+        const bytes = try backup_bundle_io.readNativeObjectAlloc(allocator, io, source, initial_stat.size, root_manifest, metadata_path, backups_api.max_backup_manifest_bytes);
+        defer allocator.free(bytes);
+        var embedded = try backups_api.parseTableBackupManifest(allocator, bytes, root_manifest.backup_id);
+        defer embedded.deinit(allocator);
+        if (embedded.format != .native or !std.mem.eql(u8, embedded.table_name, root_manifest.table_name))
+            return error.BackupArtifactFormatMismatch;
+        if (!backups_api.localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
+        if (hasActiveMigration(&embedded)) return error.UnsupportedBackupMigrationState;
+    }
     const staging_root = try temporaryPreparationPath(allocator, io, "antfly-afb2-", "");
     defer allocator.free(staging_root);
     defer std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
@@ -2542,6 +2554,27 @@ test "backup preflight native multishard scans later shards and table producers"
     defer a.free(target);
     const location = try std.fmt.allocPrint(a, "file://{s}", .{target});
     defer a.free(location);
+    if (comptime builtin.link_libc and builtin.os.tag != .windows) {
+        const Environment = struct {
+            extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+            extern fn unsetenv(name: [*:0]const u8) c_int;
+        };
+        const env = @import("antfly_platform").env;
+        const saved = if (env.getenv("TMPDIR")) |value| try a.dupeSentinel(u8, value, 0) else null;
+        defer if (saved) |value| a.free(value);
+        defer {
+            if (saved) |value| {
+                _ = Environment.setenv("TMPDIR", value, 1);
+            } else {
+                _ = Environment.unsetenv("TMPDIR");
+            }
+        }
+        // The archive is a regular file, so it cannot hold scratch output.
+        const unavailable = try a.dupeSentinel(u8, bundle_path, 0);
+        defer a.free(unavailable);
+        try std.testing.expectEqual(@as(c_int, 0), Environment.setenv("TMPDIR", unavailable, 1));
+        try std.testing.expectError(error.UnsupportedBackupMigrationState, stageInputRestoreBackup(a, bundle_path, "restored", "", location));
+    }
     try std.testing.expectError(error.UnsupportedBackupMigrationState, stageInputRestoreBackup(a, bundle_path, "restored", "", location));
     try std.testing.expect(!fileExists(io, target));
 }

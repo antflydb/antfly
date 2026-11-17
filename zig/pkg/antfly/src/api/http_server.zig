@@ -21723,6 +21723,10 @@ pub const ApiHttpServer = struct {
             return mapped;
         };
         defer manifest.deinit(op_alloc);
+        if (req.admitted_manifest_sha256) |expected| {
+            const actual = manifest.persisted_sha256 orelse return error.BackupIntegrityFailure;
+            if (!std.mem.eql(u8, expected, &actual)) return error.BackupIntegrityFailure;
+        }
 
         preflightClusterRestoreExtensions(self, &manifest) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
@@ -21734,7 +21738,21 @@ pub const ApiHttpServer = struct {
 
         var owned_table_names: ?[][]u8 = null;
         defer if (owned_table_names) |names| freeOwnedTableNames(op_alloc, names);
-        const table_names: []const []const u8 = if (req.single_table_destination) |destination| single: {
+        const table_names: []const []const u8 = if (req.admitted_table_ordinals) |ordinals| blk: {
+            const names = op_alloc.alloc([]u8, ordinals.len) catch return error.InternalFailure;
+            var initialized: usize = 0;
+            errdefer {
+                for (names[0..initialized]) |name| op_alloc.free(name);
+                op_alloc.free(names);
+            }
+            for (ordinals, names) |ordinal, *name| {
+                if (ordinal >= manifest.tables.len) return error.BackupIntegrityFailure;
+                name.* = op_alloc.dupe(u8, manifest.tables[ordinal].name) catch return error.InternalFailure;
+                initialized += 1;
+            }
+            owned_table_names = names;
+            break :blk names;
+        } else if (req.single_table_destination) |destination| single: {
             if (req.table_names != null) return error.InvalidRequest;
             var selected: ?[]const u8 = null;
             for (manifest.tables) |entry| if (std.mem.eql(u8, entry.table_backup_id, req.backup_id)) {
@@ -21747,7 +21765,7 @@ pub const ApiHttpServer = struct {
             owned_table_names = owned;
             break :single owned;
         } else if (req.table_names) |values| blk: {
-            const names = resolveClusterRestoreSelectionAlloc(op_alloc, &manifest, values) catch |err| return switch (err) {
+            const names = resolveClusterRestoreSelectionAlloc(op_alloc, &manifest, values, null) catch |err| return switch (err) {
                 error.InvalidRequest => error.InvalidRequest,
                 else => error.InternalFailure,
             };
@@ -25212,6 +25230,8 @@ pub const ApiHttpServer = struct {
         defer location.deinit(self.alloc);
         self.ensureAsyncRestoreWorker() catch |err| return try restoreJobStartErrorResponse(self.alloc, err);
         var source_kind: restore_jobs.SourceKind = .table_snapshot;
+        var admitted_digest: ?[64]u8 = null;
+        var admitted_ordinal: [1]u16 = undefined;
         var manifest = manifest: {
             var independent = backups_api.readManifestFromLocationWithArtifactBackupId(self.alloc, &location, parsed.value.backup_id, parsed.value.backup_id) catch |err| switch (err) {
                 error.FileNotFound => null,
@@ -25233,7 +25253,11 @@ pub const ApiHttpServer = struct {
                 // existing independent table snapshot. Only the explicit
                 // one-table adapter's matching entry upgrades its source kind.
                 if (backups_api.findClusterTableByStorageName(&aggregate_source, value.table_name)) |selected| {
-                    if (aggregate_source.cohort_json.len != 0 and std.mem.eql(u8, selected.table_backup_id, parsed.value.backup_id)) source_kind = .cluster_cohort;
+                    if (aggregate_source.cohort_json.len != 0 and std.mem.eql(u8, selected.table_backup_id, parsed.value.backup_id)) {
+                        source_kind = .cluster_cohort;
+                        admitted_digest = aggregate_source.persisted_sha256.?;
+                        admitted_ordinal[0] = backups_api.clusterTableOrdinal(&aggregate_source, selected);
+                    }
                 }
                 independent_owned = false;
                 break :manifest value;
@@ -25245,6 +25269,8 @@ pub const ApiHttpServer = struct {
             const selected_manifest = backups_api.readManifestFromLocationWithArtifactBackupId(self.alloc, &location, selected.table_backup_id, selected.artifact_backup_id orelse selected.table_backup_id) catch
                 return try contextualJsonErrorResponse(self.alloc, 400, "invalid table artifact manifest");
             source_kind = .cluster_cohort;
+            admitted_digest = aggregate_source.persisted_sha256.?;
+            admitted_ordinal[0] = backups_api.clusterTableOrdinal(&aggregate_source, selected);
             break :manifest selected_manifest;
         };
         defer manifest.deinit(self.alloc);
@@ -25314,6 +25340,7 @@ pub const ApiHttpServer = struct {
         const admission = self.restore_job_store.startRecoverableGuarded(self.alloc, .{
             .scope = .table,
             .source_kind = source_kind,
+            .cluster_binding = if (admitted_digest) |*digest| .{ .manifest_sha256 = digest, .selected_ordinals = &admitted_ordinal } else null,
             .restore_mode = if (source_kind == .cluster_cohort) "overwrite" else "fail_if_exists",
             .table_name = table_name,
             .backup_id = parsed.value.backup_id,
@@ -25361,6 +25388,7 @@ pub const ApiHttpServer = struct {
         }) catch |err| return try contextualJsonErrorResponse(self.alloc, 400, backups_api.backupLocationErrorMessage(err) orelse "invalid restore location");
         defer location.deinit(self.alloc);
 
+        var prechecked_digest: ?[64]u8 = null;
         if (self.hotStandbyMutationPolicy().failover_safe_mutations_only) {
             const restore_io = self.backupLocationIo(&location) orelse
                 return try contextualJsonErrorResponse(self.alloc, 503, "restore service unavailable");
@@ -25369,6 +25397,7 @@ pub const ApiHttpServer = struct {
             var manifest = backups_api.readClusterManifestForRestoreAdmissionWithCache(self.alloc, restore_io, &location, req.backup_id, &verification_cache) catch
                 return try contextualJsonErrorResponse(self.alloc, 400, "invalid cluster backup manifest");
             defer manifest.deinit(self.alloc);
+            prechecked_digest = manifest.persisted_sha256.?;
             if (manifest.cohort_json.len == 0)
                 return try contextualJsonErrorResponse(self.alloc, 422, "hot-standby restore requires a dependency-complete native cluster cohort");
         }
@@ -25393,6 +25422,12 @@ pub const ApiHttpServer = struct {
                     if (err == error.BackupManifestTooLarge) backups_api.manifest_too_large_message else "invalid cluster backup manifest",
                 );
                 defer cluster_manifest.deinit(self.alloc);
+                const manifest_digest = cluster_manifest.persisted_sha256.?;
+                if (prechecked_digest) |expected| {
+                    if (!std.mem.eql(u8, &expected, &manifest_digest))
+                        return try contextualJsonErrorResponse(self.alloc, 409, "backup manifest changed during admission");
+                }
+                prechecked_digest = manifest_digest;
                 const count = if (req.table_names) |names| names.len else cluster_manifest.tables.len;
                 if (count > restore_jobs.max_cluster_tables_per_job)
                     return try contextualJsonErrorResponse(self.alloc, 400, "too many tables requested");
@@ -25426,7 +25461,7 @@ pub const ApiHttpServer = struct {
             null,
         );
         defer self.alloc.free(idempotency_namespace);
-        const start_request: restore_jobs.StartRequest = .{
+        var start_request: restore_jobs.StartRequest = .{
             .scope = .cluster,
             .backup_id = req.backup_id,
             .location = req.location,
@@ -25455,8 +25490,16 @@ pub const ApiHttpServer = struct {
             var manifest = backups_api.readClusterManifestForRestoreAdmissionWithCache(self.alloc, restore_io, &location, req.backup_id, &verification_cache) catch |err|
                 return try contextualJsonErrorResponse(self.alloc, if (err == error.BackupManifestTooLarge) 413 else 400, "invalid cluster backup manifest");
             defer manifest.deinit(self.alloc);
+            const manifest_digest = manifest.persisted_sha256.?;
+            if (prechecked_digest) |expected| {
+                if (!std.mem.eql(u8, &expected, &manifest_digest))
+                    return try contextualJsonErrorResponse(self.alloc, 409, "backup manifest changed during admission");
+            }
+            const ordinals = if (req.table_names) |names| try self.alloc.alloc(u16, names.len) else null;
+            defer if (ordinals) |values| self.alloc.free(values);
+            start_request.cluster_binding = .{ .manifest_sha256 = &manifest_digest, .selected_ordinals = ordinals };
             const selected = if (req.table_names) |names|
-                resolveClusterRestoreSelectionAlloc(self.alloc, &manifest, names) catch |err| switch (err) {
+                resolveClusterRestoreSelectionAlloc(self.alloc, &manifest, names, ordinals) catch |err| switch (err) {
                     error.InvalidRequest => return try contextualJsonErrorResponse(self.alloc, 400, "unknown, ambiguous, or duplicate backup table selection"),
                     else => return err,
                 }
@@ -25811,6 +25854,8 @@ pub const ApiHttpServer = struct {
                         .location = state.location,
                         .connection = state.connection,
                         .single_table_destination = table_name,
+                        .admitted_manifest_sha256 = if (state.cluster_binding) |binding| binding.manifest_sha256 else null,
+                        .admitted_table_ordinals = if (state.cluster_binding) |binding| binding.selected_ordinals else null,
                         .restore_mode = state.restore_mode,
                     }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                         if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
@@ -25939,6 +25984,8 @@ pub const ApiHttpServer = struct {
                 .location = state.location,
                 .connection = state.connection,
                 .table_names = state.table_names,
+                .admitted_manifest_sha256 = if (state.cluster_binding) |binding| binding.manifest_sha256 else null,
+                .admitted_table_ordinals = if (state.cluster_binding) |binding| binding.selected_ordinals else null,
                 .restore_mode = state.restore_mode,
             }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                 if (restoreJobErrorIsRetryable(err)) {
@@ -28415,7 +28462,7 @@ fn tableNamesFromAdminSnapshotAlloc(
 
 /// Requests use public names, while cohort proofs and artifact manifests bind
 /// storage names. Resolve once before handing the selection to the executor.
-fn resolveClusterRestoreSelectionAlloc(alloc: std.mem.Allocator, manifest: *const backups_api.ClusterBackupManifest, selected: []const []const u8) ![][]u8 {
+fn resolveClusterRestoreSelectionAlloc(alloc: std.mem.Allocator, manifest: *const backups_api.ClusterBackupManifest, selected: []const []const u8, ordinals: ?[]u16) ![][]u8 {
     if (selected.len > restore_jobs.max_cluster_tables_per_job) return error.InvalidRequest;
     var names: std.ArrayListUnmanaged([]u8) = .empty;
     errdefer {
@@ -28426,9 +28473,10 @@ fn resolveClusterRestoreSelectionAlloc(alloc: std.mem.Allocator, manifest: *cons
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(alloc);
     var selection: backups_api.ClusterTableSelection = .{ .manifest = manifest };
-    for (selected) |name| {
+    for (selected, 0..) |name, i| {
         const entry = selection.find(name) orelse return error.InvalidRequest;
         if ((try seen.getOrPut(alloc, entry.name)).found_existing) return error.InvalidRequest;
+        if (ordinals) |out| out[i] = backups_api.clusterTableOrdinal(manifest, entry);
         names.appendAssumeCapacity(try alloc.dupe(u8, entry.name));
     }
     return try names.toOwnedSlice(alloc);

@@ -113,6 +113,7 @@ pub const JobState = struct {
     connection: []const u8,
     restore_mode: []const u8 = "fail_if_exists",
     table_names: ?[]const []const u8 = null,
+    cluster_binding: ?ClusterRestoreBinding = null,
     active_table_index: ?u16 = null,
     durability_pending_table_ranges: ?[]const TableIndexRange = null,
     published_table_ranges: ?[]const TableIndexRange = null,
@@ -136,6 +137,13 @@ pub const JobState = struct {
     expires_at_ms: u64,
 };
 
+/// The original selection remains in table_names for idempotency. The worker
+/// uses these ordinals only after checking the exact persisted manifest.
+pub const ClusterRestoreBinding = struct {
+    manifest_sha256: []const u8,
+    selected_ordinals: ?[]const u16 = null,
+};
+
 pub const StartRequest = struct {
     scope: Scope,
     source_kind: SourceKind = .table_snapshot,
@@ -145,6 +153,7 @@ pub const StartRequest = struct {
     connection: []const u8,
     restore_mode: []const u8 = "fail_if_exists",
     table_names: ?[]const []const u8 = null,
+    cluster_binding: ?ClusterRestoreBinding = null,
     idempotency_namespace: []const u8,
     idempotency_key: ?[]const u8 = null,
     destination_authorization_fingerprint: []const u8 = "",
@@ -637,6 +646,7 @@ pub const Store = struct {
                         .connection = parsed.value.connection,
                         .restore_mode = parsed.value.restore_mode,
                         .table_names = parsed.value.table_names,
+                        .cluster_binding = parsed.value.cluster_binding,
                         .active_table_index = parsed.value.active_table_index,
                         .durability_pending_table_ranges = parsed.value.durability_pending_table_ranges,
                         .published_table_ranges = parsed.value.published_table_ranges,
@@ -934,6 +944,7 @@ pub const Store = struct {
                 .connection = parsed.value.connection,
                 .restore_mode = parsed.value.restore_mode,
                 .table_names = parsed.value.table_names,
+                .cluster_binding = parsed.value.cluster_binding,
                 .active_table_index = parsed.value.active_table_index,
                 .durability_pending_table_ranges = parsed.value.durability_pending_table_ranges,
                 .published_table_ranges = parsed.value.published_table_ranges,
@@ -1088,6 +1099,7 @@ pub const Store = struct {
                         .connection = parsed.value.connection,
                         .restore_mode = parsed.value.restore_mode,
                         .table_names = parsed.value.table_names,
+                        .cluster_binding = parsed.value.cluster_binding,
                         .active_table_index = parsed.value.active_table_index,
                         .durability_pending_table_ranges = parsed.value.durability_pending_table_ranges,
                         .published_table_ranges = parsed.value.published_table_ranges,
@@ -1148,6 +1160,7 @@ pub const Store = struct {
             .connection = req.connection,
             .restore_mode = req.restore_mode,
             .table_names = req.table_names,
+            .cluster_binding = req.cluster_binding,
             .idempotency_namespace = req.idempotency_namespace,
             .idempotency_key = idempotency_key,
             .idempotency_explicit = explicit_idempotency_key != null,
@@ -2109,6 +2122,7 @@ pub const Store = struct {
             .connection = current.connection,
             .restore_mode = current.restore_mode,
             .table_names = current.table_names,
+            .cluster_binding = current.cluster_binding,
             .active_table_index = if (update.clear_active_table_index) null else update.active_table_index orelse current.active_table_index,
             .durability_pending_table_ranges = update.durability_pending_table_ranges orelse current.durability_pending_table_ranges,
             .published_table_ranges = update.published_table_ranges orelse current.published_table_ranges,
@@ -2507,6 +2521,7 @@ fn validateStartRequest(req: StartRequest) !void {
         },
         .cluster => if (req.table_name != null) return error.InvalidRestoreJobScope,
     }
+    if (!validClusterRestoreBinding(req.scope, req.source_kind, req.table_names, req.cluster_binding)) return error.InvalidRestoreJobScope;
     if (req.table_names) |names| {
         if (names.len > max_explicit_tables_per_job) return error.TooManyRestoreTables;
         for (names, 0..) |name, i| {
@@ -2516,6 +2531,23 @@ fn validateStartRequest(req: StartRequest) !void {
             }
         }
     }
+}
+
+fn validClusterRestoreBinding(scope: Scope, source_kind: SourceKind, names: ?[]const []const u8, binding: ?ClusterRestoreBinding) bool {
+    const value = binding orelse return true;
+    if (value.manifest_sha256.len != 64) return false;
+    for (value.manifest_sha256) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return false;
+    const ordinals = value.selected_ordinals orelse return scope == .cluster and names == null;
+    switch (scope) {
+        .table => if (source_kind != .cluster_cohort or ordinals.len != 1) return false,
+        .cluster => if (ordinals.len != (names orelse return false).len) return false,
+    }
+    var seen: std.StaticBitSet(max_cluster_tables_per_job) = .empty;
+    for (ordinals) |ordinal| {
+        if (ordinal >= max_cluster_tables_per_job or seen.isSet(ordinal)) return false;
+        seen.set(ordinal);
+    }
+    return true;
 }
 
 pub fn containsTableIndex(ranges: []const TableIndexRange, needle: u16) bool {
@@ -2703,6 +2735,7 @@ fn validateProgressState(state: JobState) !void {
         },
         .cluster => if (state.table_name != null) return error.CorruptRestoreJobStore,
     }
+    if (!validClusterRestoreBinding(state.scope, state.source_kind, state.table_names, state.cluster_binding)) return error.CorruptRestoreJobStore;
     const durability_pending = state.durability_pending_table_ranges orelse &.{};
     const published = state.published_table_ranges orelse &.{};
     const completed = state.completed_table_ranges orelse &.{};
@@ -4055,6 +4088,10 @@ test "retryable restore contention durably requeues progress and honors cancella
         .location = "s3://archive/daily",
         .connection = "archive-reader",
         .table_names = &.{ "docs", "events" },
+        .cluster_binding = .{
+            .manifest_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            .selected_ordinals = &.{ 4, 1 },
+        },
         .idempotency_namespace = "principal:admin:cluster",
     });
     defer std.testing.allocator.free(started);
@@ -4100,6 +4137,9 @@ test "retryable restore contention durably requeues progress and honors cancella
         .{},
     );
     defer parsed_retried.deinit();
+    const binding = parsed_retried.value.cluster_binding.?;
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", binding.manifest_sha256);
+    try std.testing.expectEqualSlices(u16, &.{ 4, 1 }, binding.selected_ordinals.?);
     try std.testing.expectEqual(Phase.queued, parsed_retried.value.phase);
     try std.testing.expectEqual(@as(?u16, 0), parsed_retried.value.active_table_index);
     try std.testing.expectEqualStrings(
@@ -4766,6 +4806,10 @@ test "restore runtime store persists checkpoints and requeues interrupted work" 
             .location = "s3://archive/daily",
             .connection = "archive-reader",
             .table_names = &.{ "docs", "users" },
+            .cluster_binding = .{
+                .manifest_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                .selected_ordinals = &.{ 2, 1 },
+            },
             .idempotency_namespace = "principal:admin:cluster",
             .idempotency_key = "restore-daily",
         });
@@ -4802,6 +4846,9 @@ test "restore runtime store persists checkpoints and requeues interrupted work" 
     defer alloc.free(recovered);
     var parsed = try std.json.parseFromSlice(JobState, alloc, recovered, .{});
     defer parsed.deinit();
+    const recovered_binding = parsed.value.cluster_binding.?;
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", recovered_binding.manifest_sha256);
+    try std.testing.expectEqualSlices(u16, &.{ 2, 1 }, recovered_binding.selected_ordinals.?);
     try std.testing.expectEqual(Phase.queued, parsed.value.phase);
     try std.testing.expectEqual(@as(usize, 0), tableIndexRangeCount(parsed.value.durability_pending_table_ranges orelse &.{}));
     try std.testing.expectEqualSlices(TableIndexRange, &.{.{ 0, 0 }}, parsed.value.published_table_ranges.?);

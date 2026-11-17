@@ -140,6 +140,83 @@ pub fn readManifestFromFileLimited(alloc: std.mem.Allocator, io: std.Io, source:
     return try bundle.parseManifest(alloc, manifest_block.payload);
 }
 
+/// Read and verify one included native object without extracting the archive.
+pub fn readNativeObjectAlloc(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source: std.Io.File,
+    source_size: u64,
+    manifest: bundle.Manifest,
+    path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    if (manifest.representation != .native or manifest.mode != .full) return error.BackupArtifactFormatMismatch;
+    const object = for (manifest.objects) |object| {
+        if (std.mem.eql(u8, object.logical_path, path)) break object;
+    } else return error.BackupArtifactMissing;
+    if (object.size_bytes > max_bytes) return error.BackupManifestTooLarge;
+    var digest: [Sha256.digest_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, object.sha256) catch return error.InvalidBackupManifest;
+    const ordinal = for (manifest.blobs, 0..) |blob, ordinal| {
+        if (std.mem.eql(u8, blob.sha256, object.sha256)) break ordinal;
+    } else return error.InvalidBackupManifest;
+    const descriptor = manifest.blobs[ordinal];
+    const index_entry_bytes = Sha256.digest_length + 2 * @sizeOf(u64);
+    const index_count_bytes = @sizeOf(u32);
+    const expected_footer_size = index_count_bytes + manifest.blobs.len * index_entry_bytes;
+    const trailer = try readTrailerFromFile(io, source, source_size);
+    if (trailer.footer_payload_size != expected_footer_size) return error.InvalidBundleFooter;
+    var reader = backup_codec.FileReader.init(io, source, source_size - bundle.trailer_size);
+    reader.pos = trailer.footer_offset;
+    reader.max_block_bytes = expected_footer_size;
+    const footer_block = try reader.readBlock(alloc);
+    defer alloc.free(footer_block.payload);
+    if (footer_block.block_type != .footer_index or footer_block.payload.len != expected_footer_size or reader.hasRemaining() or
+        std.mem.readInt(u32, footer_block.payload[0..index_count_bytes], .little) != manifest.blobs.len)
+        return error.InvalidBundleFooter;
+
+    // A full bundle includes every digest-sorted blob in ordinal order.
+    const offset_in_footer = index_count_bytes + ordinal * index_entry_bytes;
+    const entry = bundle.decodeFooterIndexEntry(footer_block.payload[offset_in_footer..][0..index_entry_bytes]);
+    if (!std.mem.eql(u8, &entry.sha256, &digest)) return error.InvalidBundleFooter;
+    if (entry.header_offset >= trailer.footer_offset or entry.stored_size_bytes != object.size_bytes)
+        return error.InvalidBundleFooter;
+
+    reader = backup_codec.FileReader.init(io, source, trailer.footer_offset);
+    reader.pos = entry.header_offset;
+    const header_block = try reader.readBlock(alloc);
+    defer alloc.free(header_block.payload);
+    if (header_block.block_type != .blob_header) return error.InvalidBackupManifest;
+    var header = try bundle.decodeBlobHeader(alloc, header_block.payload);
+    defer header.deinit(alloc);
+    if (!descriptor.included or descriptor.compression != .none or
+        descriptor.logical_size_bytes != object.size_bytes or descriptor.stored_size_bytes != object.size_bytes or
+        header.ordinal != ordinal or header.compression != .none or header.logical_size_bytes != object.size_bytes or
+        header.stored_size_bytes != object.size_bytes or !std.mem.eql(u8, &header.sha256, &digest) or
+        !std.mem.eql(u8, header.role, "native_blob") or
+        !std.mem.startsWith(u8, header.logical_path, "blobs/") or
+        !std.mem.eql(u8, header.logical_path["blobs/".len..], object.sha256))
+        return error.BackupArtifactIntegrityMismatch;
+
+    const body = try alloc.alloc(u8, @intCast(object.size_bytes));
+    errdefer alloc.free(body);
+    var offset: usize = 0;
+    while (offset < body.len) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block.block_type != .blob_chunk) return error.InvalidNativeFileChunk;
+        const chunk = try bundle.decodeBlobChunk(block.payload);
+        if (chunk.ordinal != ordinal or chunk.offset != offset or chunk.bytes.len == 0 or chunk.bytes.len > body.len - offset)
+            return error.InvalidNativeFileChunk;
+        @memcpy(body[offset..][0..chunk.bytes.len], chunk.bytes);
+        offset += chunk.bytes.len;
+    }
+    var actual: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(body, &actual, .{});
+    if (!std.mem.eql(u8, &actual, &digest)) return error.BackupArtifactIntegrityMismatch;
+    return body;
+}
+
 fn readTrailerFromFile(io: std.Io, source: std.Io.File, source_size: u64) !bundle.Trailer {
     if (source_size < backup_codec.header_size + bundle.trailer_size)
         return error.InvalidBundleFooter;
