@@ -1828,6 +1828,7 @@ pub const AntflyApiHandler = struct {
             try self.registerProbes(server);
         }
 
+        try server.post("/db/v1/changefeeds", httpx.Handler.bind(self, createChangefeed));
         try server.get("/db/v1/changefeeds/:feed_id/events", httpx.Handler.bind(self, pullChangefeed));
         try server.post("/db/v1/changefeeds/:feed_id/ack", httpx.Handler.bind(self, acknowledgeChangefeed));
 
@@ -4972,6 +4973,27 @@ pub const AntflyApiHandler = struct {
     // Authentication helper
     // ---------------------------------------------------------------
 
+    fn createChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const api = @import("changefeed_public.zig");
+        const key = ctx.header("Idempotency-Key") orelse return jsonErrorResponse(ctx, 400, "missing changefeed idempotency key");
+        const bytes = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "missing changefeed definition");
+        if (bytes.len > 8192) return jsonErrorResponse(ctx, 400, "invalid changefeed definition");
+        const parsed = std.json.parseFromSlice(api.Create, ctx.allocator, bytes, .{}) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed definition");
+        defer parsed.deinit();
+        const result = api.create(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, key, parsed.value, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
+        try ctx.setHeader("cache-control", "no-store");
+        _ = ctx.status(201);
+        return ctx.json(.{
+            .id = std.fmt.bytesToHex(result.id, .lower),
+            .cursor = std.fmt.bytesToHex(result.cursor, .lower),
+            .expires_at = result.expires_at,
+        });
+    }
+
     fn pullChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const feed = @import("../metadata/changefeed_delivery.zig");
         var limits: feed.Limits = .{};
@@ -5004,16 +5026,7 @@ pub const AntflyApiHandler = struct {
         var result = api.execute(self.api_server, ctx.allocator, .{
             .authorization = ctx.header("authorization"),
             .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
-        }, selection, limits, operationContext(ctx, null)) catch |err| switch (err) {
-            error.Forbidden, error.Unauthorized, error.UserNotFound, error.ApiKeyExpired, error.ApiKeyNotFound => return jsonErrorResponse(ctx, 403, "changefeed access denied"),
-            error.InvalidChangefeed => return jsonErrorResponse(ctx, 400, "invalid changefeed request"),
-            error.ChangefeedResynchronizationRequired, error.ChangefeedCursorExpired, error.ChangefeedLeaseExpired, error.HistoryResynchronizationRequired, error.TopologyChanged => return jsonErrorResponse(ctx, 409, "changefeed_resynchronization_required"),
-            error.ChangefeedConflict, error.MetadataMutationOutcomeUnknown => return jsonErrorResponse(ctx, 409, "changefeed_retry_required"),
-            error.ChangefeedBackpressure, error.HistoryTooLarge => return jsonErrorResponse(ctx, 429, "changefeed_backpressure"),
-            error.ChangefeedCapabilityUnsupported => return jsonErrorResponse(ctx, 501, "changefeed_capability_unsupported"),
-            error.ReadUnavailable, error.ReadIndexTimeout, error.StorageReadTemporarilyUnavailable, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DeadlineExceeded => return jsonErrorResponse(ctx, 503, "changefeed_unavailable"),
-            else => return err,
-        };
+        }, selection, limits, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
         defer result.deinit();
         try ctx.setHeader("cache-control", "no-store");
         return switch (result) {
@@ -5026,6 +5039,19 @@ pub const AntflyApiHandler = struct {
             },
             .acknowledged => |checkpoint| ctx.json(.{ .cursor = std.fmt.bytesToHex(checkpoint, .lower) }),
         };
+    }
+
+    fn changefeedError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        switch (err) {
+            error.Forbidden, error.Unauthorized, error.UserNotFound, error.ApiKeyExpired, error.ApiKeyNotFound => return jsonErrorResponse(ctx, 403, "changefeed access denied"),
+            error.InvalidChangefeed => return jsonErrorResponse(ctx, 400, "invalid changefeed request"),
+            error.ChangefeedResynchronizationRequired, error.ChangefeedCursorExpired, error.ChangefeedLeaseExpired, error.HistoryResynchronizationRequired, error.TopologyChanged => return jsonErrorResponse(ctx, 409, "changefeed_resynchronization_required"),
+            error.ChangefeedConflict, error.MetadataMutationOutcomeUnknown => return jsonErrorResponse(ctx, 409, "changefeed_retry_required"),
+            error.ChangefeedBackpressure, error.HistoryTooLarge => return jsonErrorResponse(ctx, 429, "changefeed_backpressure"),
+            error.ChangefeedCapabilityUnsupported => return jsonErrorResponse(ctx, 501, "changefeed_capability_unsupported"),
+            error.ReadUnavailable, error.ReadIndexTimeout, error.StorageReadTemporarilyUnavailable, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DeadlineExceeded => return jsonErrorResponse(ctx, 503, "changefeed_unavailable"),
+            else => return err,
+        }
     }
 
     fn authenticate(self: *AntflyApiHandler, ctx: *httpx.Context) !?AuthenticatedIdentity {
@@ -19448,6 +19474,25 @@ test "httpx source legacy inventory refuses missing and invalid authority in leg
             defer response.deinit();
             try std.testing.expectEqual(@as(u16, 401), response.status.code);
         }
+    }
+}
+
+test "httpx changefeed create requires an idempotency key and authenticated credential" {
+    const a = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(a, .{}, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    for ([_]?[]const u8{ null, "request-1" }, [_]u16{ 400, 403 }) |key, expected| {
+        var request = try httpx.Request.init(a, .POST, "http://node/db/v1/changefeeds");
+        defer request.deinit();
+        if (key) |value| try request.setHeader("Idempotency-Key", value);
+        request.body = "{\"tables\":[\"docs\"]}";
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.createChangefeed(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(expected, response.status.code);
     }
 }
 

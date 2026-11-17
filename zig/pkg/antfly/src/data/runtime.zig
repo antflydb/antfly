@@ -45253,6 +45253,69 @@ fn consumerTests() type {
                         try std.testing.expectEqual(feed_control.Phase.deleted, deleted.value.phase);
                     }
                 }
+                const PublicFeedHarness = struct {
+                    const api = @import("../api/changefeed_public.zig");
+                    const Http = @import("../api/http_server.zig");
+                    const Table = antfly.metadata.table_manager.TableRecord;
+                    fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                        return .{ .metadata_group_id = 1, .metrics = .{} };
+                    }
+                    fn record(raw: *anyopaque, allocator: std.mem.Allocator, name: []const u8) !?Table {
+                        const table: *Table = @ptrCast(@alignCast(raw));
+                        if (!std.mem.eql(u8, table.name, name)) return null;
+                        return try antfly.metadata.table_manager.cloneTable(allocator, table.*);
+                    }
+                    noinline fn run(allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: Table, backend: *backend_runtime_mod.BackendRuntime) !void {
+                        var auth_storage = antfly.lsm_backend.Backend.init(allocator, .{ .flush_threshold = 1 });
+                        defer auth_storage.close();
+                        var store = try auth_storage.runtimeNamespaceStore(allocator);
+                        defer store.deinit();
+                        var users = antfly.usermgr.StorageUserStore.init(allocator, store);
+                        var access = antfly.usermgr.StorageCasbinAdapter.init(allocator, store);
+                        var manager = try antfly.usermgr.UserManager.init(allocator, users.iface(), try antfly.usermgr.initDefaultEnforcer(allocator, access.iface()));
+                        defer manager.deinit();
+                        var grant_permission = try antfly.usermgr.Permission.initOwned(allocator, .table, table.name, .replicate);
+                        defer grant_permission.deinit(allocator);
+                        var user = try manager.createUser("alice", "test-password", &.{grant_permission});
+                        defer user.deinit(allocator);
+                        const http_api = try allocator.create(Http.ApiHttpServer);
+                        defer allocator.destroy(http_api);
+                        var record_value = table;
+                        http_api.* = try Http.ApiHttpServer.initWithConfig(allocator, .{ .auth_enabled = true, .user_manager = &manager, .native_history_roots = source, .backend_runtime = backend }, .{
+                            .ptr = &record_value,
+                            .vtable = &.{ .status = status, .table_record = record },
+                            .changefeeds = @import("../api/changefeed_metadata.zig").Port.fromService(svc),
+                        }, null, null);
+                        defer http_api.deinit();
+                        const credential: Http.AuthenticatedRequest = .{ .authorization = "Basic YWxpY2U6dGVzdC1wYXNzd29yZA==" };
+                        const definition: api.Create = .{ .tables = &.{table.name} };
+                        const created = try api.create(http_api, allocator, credential, "live-feed", definition, .{});
+                        const repeated = try api.create(http_api, allocator, credential, "live-feed", definition, .{});
+                        try std.testing.expectEqualDeep(created, repeated);
+                        var pulled = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = created.cursor }, .{}, .{});
+                        defer pulled.deinit();
+                        try std.testing.expect(pulled == .page);
+                        var ack = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = pulled.page.cursor }, null, .{});
+                        defer ack.deinit();
+                        try std.testing.expectEqual(pulled.page.cursor, ack.acknowledged);
+                    }
+                };
+                {
+                    const Worker = struct {
+                        fn run(result: *anyerror!void, allocator: std.mem.Allocator, svc: *feed_fixture.Service, source: @import("../api/history_roots.zig").Source, table: antfly.metadata.table_manager.TableRecord, backend: *backend_runtime_mod.BackendRuntime) void {
+                            result.* = PublicFeedHarness.run(allocator, svc, source, table, backend);
+                        }
+                    };
+                    // This fixture supplies one immutable peer generation and
+                    // has no metadata HTTP server. Password checks can exceed
+                    // the production cache TTL within the test workflow.
+                    metadata_source.control_read_generation_at_ms = std.math.maxInt(u64);
+                    defer metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                    var outcome: anyerror!void = undefined;
+                    const thread = try std.Thread.spawn(.{ .stack_size = 32 * 1024 * 1024 }, Worker.run, .{ &outcome, a, &feed_svc, origin.historyRootsSource(), feed_table, runtime.ptr() });
+                    thread.join();
+                    try outcome;
+                }
                 // Closing must dispatch retirement cleanup rather than cancel
                 // every prepared command solely because the feed is closed.
                 try feed_svc.mutate(a, .close);

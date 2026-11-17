@@ -163,3 +163,202 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
     defer confirmed.deinit();
     return .{ .acknowledged = confirmed.value.acknowledged_cursor };
 }
+
+pub const Create = struct {
+    tables: []const []const u8,
+    start: control.Start = .now,
+    events: []const enum { document_committed } = &.{.document_committed},
+    include: control.Projection = .keys_and_versions,
+    lease_seconds: u32 = 3600,
+};
+
+pub const Created = struct {
+    id: control.Id,
+    cursor: control.Digest,
+    expires_at: u64,
+};
+
+const enrollment = @import("../metadata/root_control_driver.zig");
+const source_api = @import("history_roots.zig");
+const metadata_api = @import("../metadata/api.zig");
+
+const EnrollmentPolicy = struct {
+    access: Policy,
+    source: source_api.Source,
+    allocator: A,
+
+    pub fn authorizeRoot(self: *@This(), state: control.State, _: control.Namespace, request: Context) !void {
+        try self.access.authorize(state, request);
+    }
+
+    pub fn validateRoot(self: *@This(), state: control.State, namespace: control.Namespace, fence: metadata_api.CatalogRouteFence, table: []const u8, request: Context) !void {
+        try self.source.validate(self.allocator, state, namespace, fence, table, request);
+    }
+
+    pub fn newAttempt(self: *@This(), _: control.State, _: control.Namespace, _: Context) !control.Id {
+        var id: control.Id = undefined;
+        self.access.api.inferenceIo().random(&id);
+        return id;
+    }
+
+    pub fn context(_: *@This(), request: Context) !Context {
+        return request;
+    }
+};
+
+fn load(client: *config.Client, a: A, id: control.Id, request: Context) !control.Parsed {
+    const bytes = try client.readChangefeedState(a, id, request);
+    defer a.free(bytes);
+    return control.parse(a, bytes);
+}
+
+fn change(client: *config.Client, a: A, state: control.State, mutation: control.Mutation, request: Context) !void {
+    const definition = state.definition.?;
+    try client.mutateChangefeedState(a, .{
+        .id = state.id,
+        .authority = state.authority,
+        .owner = definition.owner,
+        .authorization = definition.authorization,
+        .expected_revision = state.revision,
+        .expected_epoch = state.epoch,
+        .mutation = mutation,
+    }, request);
+}
+
+/// The client-generated request key is scoped to the durable credential.
+/// Repeating creation resumes the original enrollment and returns its cursor.
+pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequest, key: []const u8, input: Create, public: Context) !Created {
+    try public.ensureActive();
+    if (key.len == 0 or key.len > 128 or input.lease_seconds == 0 or input.lease_seconds > control.max_lease_seconds)
+        return error.InvalidChangefeed;
+    if (input.tables.len != 1 or input.start != .now or input.events.len != 1)
+        return error.ChangefeedCapabilityUnsupported;
+    const requested = input.tables[0];
+    if (requested.len == 0 or requested.len > 1024) return error.InvalidChangefeed;
+    var identity = try authenticate(api, credential);
+    defer identity.deinit(api.alloc);
+    const caller = try owner(identity);
+    if (!try http.tablePermissionCurrentlyAllowed(identity, requested, .replicate)) return error.Forbidden;
+    const meta = api.source.changefeeds orelse return error.ChangefeedCapabilityUnsupported;
+    const source = api.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
+    const internal: Context = .{
+        .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" },
+        .deadline_ns = public.deadline_ns,
+        .deadline_io = public.deadline_io,
+        .cancellation = public.cancellation,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const record = (try api.source.tableRecord(scratch, requested)) orelse return error.Forbidden;
+    if (record.storage.engine != .local) return error.ChangefeedCapabilityUnsupported;
+    const filter = try http.resolveEffectiveRowFilterJson(scratch, identity, requested);
+    const tables: []const control.Table = &.{.{
+        .table_id = record.table_id,
+        .binding = control.tableBinding(record),
+        .policy_revision = 1,
+        .contract = .native_document,
+    }};
+    const definition: control.Definition = .{
+        .owner = caller,
+        .authorization = authorization(identity, tables, filter),
+        .tables = tables,
+        .projection = input.include,
+    };
+    var captured = try source.capture(a, definition, internal);
+    defer captured.deinit();
+    if (captured.roots.len != 1) return error.ChangefeedCapabilityUnsupported;
+    const root = captured.roots[0];
+    if (!std.mem.eql(u8, root.table_name, requested)) return error.TopologyChanged;
+    const authority = try @import("history_policy_provisioning.zig").authority(root.fence);
+    const id: control.Id = control.hash(.{ .domain = "antfly:public-changefeed-create:v1", .owner = caller, .key = key })[0..16].*;
+    var client: config.Client = .{ .port = meta };
+    var policy: EnrollmentPolicy = .{
+        .access = .{ .api = api, .credential = credential, .table = root.table_name, .filter = filter },
+        .source = source,
+        .allocator = a,
+    };
+    const now = try policy.access.nowSeconds(internal);
+    for (0..8) |_| {
+        var parsed = try load(&client, a, id, internal);
+        defer parsed.deinit();
+        const state = parsed.value;
+        if (state.phase == .empty) {
+            try policy.access.authorize(.{ .definition = definition }, internal);
+            if (try meta.authority(a, internal)) |registered| {
+                if (!same(registered.incarnation, authority)) return error.ChangefeedResynchronizationRequired;
+            }
+            try client.mutateChangefeedState(a, .{
+                .id = id,
+                .authority = authority,
+                .owner = caller,
+                .authorization = definition.authorization,
+                .expected_revision = 0,
+                .expected_epoch = 0,
+                .mutation = .{ .create = .{ .id = id, .definition = definition, .now = now, .expires_at = now + input.lease_seconds } },
+            }, internal);
+            continue;
+        }
+        if (!same(definition.identity(), state.definition.?.identity()) or !same(authority, state.authority))
+            return error.ChangefeedConflict;
+        try policy.access.authorize(state, internal);
+        if (now >= state.expires_at) return error.ChangefeedLeaseExpired;
+        if (state.phase == .streaming) {
+            var active = try roots.Routed.init(source, &captured);
+            _ = try active.validateScope(state);
+            return .{ .id = id, .cursor = state.acknowledged_cursor, .expires_at = state.expires_at };
+        }
+        if (state.phase != .enrolling) return error.ChangefeedResynchronizationRequired;
+        if (state.roots.len == 0) {
+            try change(&client, a, state, .{ .plan_roots = &.{.{ .namespace = root.namespace, .ownership_epoch = 1 }} }, internal);
+            continue;
+        }
+        if (state.roots.len != 1 or !std.mem.eql(u8, &state.roots[0].namespace, &root.namespace))
+            return error.ChangefeedResynchronizationRequired;
+        const item = state.roots[0];
+        if (item.consumer_epoch != 0) {
+            try policy.validateRoot(state, root.namespace, root.fence, root.table_name, internal);
+            const cut = control.hash(.{
+                .domain = "antfly:public-changefeed-start:v1",
+                .authority = authority,
+                .definition = definition.identity(),
+                .namespace = item.namespace,
+                .epoch = item.consumer_epoch,
+                .start = item.start,
+            });
+            try change(&client, a, state, .{ .seal = .{ .cut = cut } }, internal);
+            continue;
+        }
+        if (item.pending_control == null) {
+            const request: @import("history_control_operations.zig").wire.Request = .{
+                .version = 1,
+                .operation = .submit,
+                .command = .{ .enroll = .{
+                    .namespace = root.namespace,
+                    .authority = authority,
+                    .consumer = state.consumerId(),
+                    .definition = definition.identity(),
+                    .sequence = item.grant_sequence,
+                    .expires_at_seconds = state.expires_at,
+                    .policy_revision = tables[0].policy_revision,
+                } },
+            };
+            const body = try std.json.Stringify.valueAlloc(a, request, .{});
+            defer a.free(body);
+            const fence = try std.json.Stringify.valueAlloc(a, root.fence, .{});
+            defer a.free(fence);
+            try enrollment.prepare(&client, &policy, a, id, root.namespace, .{ .command = body, .fence = fence, .table = root.table_name }, internal);
+            continue;
+        }
+        const result = if (item.pending_control.?.stage == .dispatching)
+            try enrollment.reconcile(&client, &policy, source.grants, a, id, root.namespace, internal)
+        else
+            try enrollment.drive(&client, &policy, source.controls, a, id, root.namespace, internal);
+        switch (result.status) {
+            .settled, .reconciled => continue,
+            else => return result.deferred_error orelse error.MetadataMutationOutcomeUnknown,
+        }
+    }
+    return error.MetadataMutationOutcomeUnknown;
+}
