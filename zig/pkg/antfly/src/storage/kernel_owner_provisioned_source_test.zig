@@ -84,7 +84,7 @@ test "ordered history routed pages retain real images and discard failed final f
     // The progress lane deliberately yields once while replacing that owner.
     var applied = false;
     for (0..100) |_| {
-        owners.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(a, 7, "docs", descriptor, .{ .writes = &.{.{ .key = "one", .value = "{\"v\":1}" }} }, 1, 2) catch |err| switch (err) {
+        owners.applyPreparedTimestampedBatchGroupLocalAtRaftEntry(a, 7, "docs", descriptor, .{ .source_producer = .ordinary, .writes = &.{.{ .key = "one", .value = "{\"v\":1}" }} }, 1, 2, 1_700_000_000_000_000_000) catch |err| switch (err) {
             error.StorageBusy, error.WriterLocked => {
                 try std.testing.io.sleep(.fromMilliseconds(2), .awake);
                 continue;
@@ -101,6 +101,7 @@ test "ordered history routed pages retain real images and discard failed final f
     var page = try owners.orderedHistoryPageRouted(a, fence, "docs", request);
     defer page.deinit();
     try std.testing.expectEqualStrings("{\"v\":1}", page.events[0].after.?);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_000_000_000), page.header.?.committed_at_ns);
     try std.testing.expectEqual(@as(usize, 2), fixture.validations);
     fixture.validations = 0;
     const recovery: history.history_ordered.Lookup = .{ .command = .{ .enroll = grant }, .entry = .{ .term = 1, .index = 1 }, .minimum_applied_index = 1 };

@@ -1726,6 +1726,35 @@ pub const ProvisionedKernelOwnerSource = struct {
         raft_term: u64,
         raft_index: u64,
     ) !void {
+        return self.applyPreparedRowEntry(alloc, group_id, table_name, descriptor, req, raft_term, raft_index, null);
+    }
+
+    pub fn applyPreparedTimestampedBatchGroupLocalAtRaftEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        req: db_types.BatchRequest,
+        raft_term: u64,
+        raft_index: u64,
+        committed_at_ns: i64,
+    ) !void {
+        if (committed_at_ns <= 0 or req.source_producer != .ordinary or req.transaction != null) return error.InvalidBatchRequest;
+        return self.applyPreparedRowEntry(alloc, group_id, table_name, descriptor, req, raft_term, raft_index, committed_at_ns);
+    }
+
+    fn applyPreparedRowEntry(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+        req: db_types.BatchRequest,
+        raft_term: u64,
+        raft_index: u64,
+        committed_at_ns: ?i64,
+    ) !void {
         // The Raft progress driver owns the committed entry and its retry
         // checkpoint. Yield admission conflicts to it immediately: waiting for
         // another owner lease here stalls unrelated groups and can deadlock a
@@ -1750,6 +1779,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
+        if (committed_at_ns) |clock| {
+            return lease.owner().timestampedBatchAtRaftEntry(table_name, request_json, raft_term, raft_index, clock);
+        }
         var response = try lease.owner().replicatedBatchAtRaftEntryJson(
             table_name,
             request_json,
