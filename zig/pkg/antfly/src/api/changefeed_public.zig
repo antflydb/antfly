@@ -188,9 +188,15 @@ const RootPolicy = struct {
     access: Policy,
     source: source_api.Source,
     allocator: A,
+    closing: bool = false,
 
     pub fn authorizeRoot(self: *@This(), state: control.State, _: control.Namespace, request: Context) !void {
-        try self.access.authorize(state, request);
+        if (!self.closing) return self.access.authorize(state, request);
+        try request.ensureActive();
+        if (state.phase != .closing or state.slot != null) return error.ChangefeedConflict;
+        var identity = try authenticate(self.access.api, self.access.credential);
+        defer identity.deinit(self.access.api.alloc);
+        try requireOwner(identity, state.definition orelse return error.Forbidden);
     }
 
     pub fn validateRoot(self: *@This(), state: control.State, namespace: control.Namespace, fence: metadata_api.CatalogRouteFence, table: []const u8, request: Context) !void {
@@ -433,6 +439,79 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
             continue;
         }
         try driveRoot(&client, &policy, a, state, root.namespace, internal);
+    }
+    return error.MetadataMutationOutcomeUnknown;
+}
+
+/// Close the metadata feed first, then fence each planned grant before
+/// finalizing its tombstone. Repeating a DELETE resumes those same controls.
+pub fn close(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequest, id: control.Id, public: Context) !void {
+    try public.ensureActive();
+    var identity = try authenticate(api, credential);
+    defer identity.deinit(api.alloc);
+    const metadata = api.source.changefeeds orelse return error.ChangefeedCapabilityUnsupported;
+    const source = api.cfg.native_history_roots orelse return error.ChangefeedCapabilityUnsupported;
+    const internal: Context = .{
+        .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" },
+        .deadline_ns = public.deadline_ns,
+        .deadline_io = public.deadline_io,
+        .cancellation = public.cancellation,
+    };
+    var client: config.Client = .{ .port = metadata };
+    for (0..10) |_| {
+        var parsed = try load(&client, a, id, internal);
+        defer parsed.deinit();
+        const state = parsed.value;
+        const definition = state.definition orelse return error.Forbidden;
+        try requireOwner(identity, definition);
+        if (state.slot != null or definition.start != .now) return error.ChangefeedCapabilityUnsupported;
+        if (state.phase == .deleted) return;
+        if (state.phase != .closing) {
+            try change(&client, a, state, .close, internal);
+            continue;
+        }
+
+        const item = for (state.roots) |candidate| {
+            if (!candidate.released) break candidate;
+        } else {
+            try change(&client, a, state, .finish_close, internal);
+            continue;
+        };
+        var discovered = try source.capture(a, definition, internal);
+        defer discovered.deinit();
+        const root = try discovered.find(item.namespace);
+        var policy: RootPolicy = .{
+            .access = .{ .api = api, .credential = credential, .table = root.table_name, .filter = null },
+            .source = source,
+            .allocator = a,
+            .closing = true,
+        };
+        if (item.pending_control) |pending| {
+            if (pending.stage != .prepared) {
+                const observed = try enrollment.reconcile(&client, &policy, source.grants, a, id, item.namespace, internal);
+                if (observed.status == .reconciled) continue;
+                if (observed.status != .unproven) return error.MetadataMutationOutcomeUnknown;
+                try enrollment.prepareRetirementFence(&client, &policy, a, id, item.namespace, internal);
+            } else {
+                const result = try enrollment.drive(&client, &policy, source.controls, a, id, item.namespace, internal);
+                if (result.status != .settled and result.status != .cancelled_prepared)
+                    return result.deferred_error orelse error.MetadataMutationOutcomeUnknown;
+            }
+            continue;
+        }
+        const command: @import("history_control_operations.zig").wire.Request = .{
+            .version = 1,
+            .operation = .submit,
+            .command = .{ .retire = .{
+                .namespace = item.namespace,
+                .authority = state.authority,
+                .consumer = state.consumerId(),
+                .definition = definition.identity(),
+                .sequence = state.authority_sequence,
+                .grant = item.grant_sequence,
+            } },
+        };
+        try prepareRoot(&client, &policy, a, id, root, command, internal);
     }
     return error.MetadataMutationOutcomeUnknown;
 }

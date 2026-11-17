@@ -45317,9 +45317,30 @@ fn consumerTests() type {
                         var repeated_ack = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = pulled.page.cursor }, null, .{});
                         defer repeated_ack.deinit();
                         try std.testing.expectEqual(ack.acknowledged, repeated_ack.acknowledged);
-                        lockAtomic(&node.data_raft_mutex);
-                        defer node.data_raft_mutex.unlock();
-                        try std.testing.expectEqual(before_collect + 1, node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index);
+                        {
+                            lockAtomic(&node.data_raft_mutex);
+                            defer node.data_raft_mutex.unlock();
+                            try std.testing.expectEqual(before_collect + 1, node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index);
+                        }
+                        try api.close(http_api, allocator, credential, created.id, .{});
+                        try api.close(http_api, allocator, credential, created.id, .{});
+                        const observation = try source.grants.read(allocator, fence, table.name, .{
+                            .version = 1,
+                            .identity = .{
+                                .namespace = item.namespace,
+                                .authority = current.value.authority,
+                                .consumer = current.value.consumerId(),
+                                .definition = current.value.definition.?.identity(),
+                                .sequence = item.grant_sequence,
+                                .policy_revision = current.value.definition.?.tables[0].policy_revision,
+                            },
+                        }, .{});
+                        try std.testing.expect(observation == .retired);
+                        const tombstone = try svc.store.getChangefeedControl(allocator, svc.metadata_group_id, created.id);
+                        defer allocator.free(tombstone);
+                        var deleted = try feed_control.parse(allocator, tombstone);
+                        defer deleted.deinit();
+                        try std.testing.expectEqual(feed_control.Phase.deleted, deleted.value.phase);
                     }
                 };
                 {

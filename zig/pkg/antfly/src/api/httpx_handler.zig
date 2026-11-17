@@ -1829,6 +1829,7 @@ pub const AntflyApiHandler = struct {
         }
 
         try server.post("/db/v1/changefeeds", httpx.Handler.bind(self, createChangefeed));
+        try server.delete("/db/v1/changefeeds/:feed_id", httpx.Handler.bind(self, closeChangefeed));
         try server.get("/db/v1/changefeeds/:feed_id/events", httpx.Handler.bind(self, pullChangefeed));
         try server.post("/db/v1/changefeeds/:feed_id/ack", httpx.Handler.bind(self, acknowledgeChangefeed));
 
@@ -4992,6 +4993,20 @@ pub const AntflyApiHandler = struct {
             .cursor = std.fmt.bytesToHex(result.cursor, .lower),
             .expires_at = result.expires_at,
         });
+    }
+
+    fn closeChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const api = @import("changefeed_public.zig");
+        var id: @import("../metadata/changefeed_control.zig").Id = undefined;
+        const raw = ctx.param("feed_id") orelse "";
+        if (raw.len != id.len * 2) return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        _ = std.fmt.hexToBytes(&id, raw) catch return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        api.close(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, id, operationContext(ctx, null)) catch |err| return changefeedError(ctx, err);
+        try ctx.setHeader("cache-control", "no-store");
+        return ctx.status(204).text("");
     }
 
     fn pullChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
