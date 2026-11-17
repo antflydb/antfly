@@ -625,7 +625,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 67 adds original terminal legacy resolution under physical closure.
 /// Version 68 returns atomically retained legacy resolution outcomes.
 /// Version 69 adds snapshot-bound read-only legacy recovery outcomes.
-pub const descriptor_version: u32 = 70;
+pub const descriptor_version: u32 = 71;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

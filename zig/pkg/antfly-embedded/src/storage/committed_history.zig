@@ -526,6 +526,7 @@ pub const Capture = struct {
     rows: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     row_bytes: usize = 0,
     schema_before: ?[]const u8 = null,
+    native_commit_time_ns: i64 = 0,
     schema_checked: bool = false,
     raft_marker: ?[16]u8 = null,
     reservations: std.AutoHashMapUnmanaged([16]u8, Reservation) = .empty,
@@ -801,7 +802,7 @@ pub const Capture = struct {
                     transaction_id = frame.digest(&identity)[0..16].*;
                 }
                 const schema_after = try optional(txn, keys.public_schema_json_key);
-                const encoded = try frame.encode(scratch, .{ .namespace = state.namespace, .sequence = sequence, .transaction_id = transaction_id, .transaction_scope = if (self.transaction_id == null) .root_local else .coordinated, .source_position = position, .schema_before = self.schema_before, .schema_after = schema_after }, events.items);
+                const encoded = try frame.encode(scratch, .{ .namespace = state.namespace, .sequence = sequence, .transaction_id = transaction_id, .transaction_scope = if (self.transaction_id == null) .root_local else .coordinated, .source_position = position, .committed_at_ns = if (self.transaction_id == null and self.initial_authority.?.kind == .native) self.native_commit_time_ns else 0, .schema_before = self.schema_before, .schema_after = schema_after }, events.items);
                 const descriptor_raw = try frame.Descriptor.encode(scratch, state.namespace, sequence, encoded);
                 const descriptor = try frame.Descriptor.decode(descriptor_raw, state.namespace, sequence);
                 if (descriptor.storedBytes() > state.limit - state.retained_bytes - state.reserved_bytes) return error.HistoryFull;

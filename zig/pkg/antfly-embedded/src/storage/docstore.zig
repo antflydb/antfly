@@ -2396,7 +2396,7 @@ pub const DocStore = struct {
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
     ) !void {
-        return self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, null);
+        return self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, null, 0);
     }
 
     fn putBatchWithReplayOnceAndParticipant(
@@ -2406,6 +2406,7 @@ pub const DocStore = struct {
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
+        native_commit_time_ns: i64,
     ) !void {
         const has_owner_job = blk: {
             for (writes) |write| if (internal_keys.isGraphOwnerReplayJobKey(write.key)) break :blk true;
@@ -2417,6 +2418,7 @@ pub const DocStore = struct {
         // so bulk ingestion never needs a foreground whole-store backfill.
         var batch = try self.beginWriteBatchWithOptions(options);
         errdefer batch.abort();
+        batch.history.native_commit_time_ns = native_commit_time_ns;
         if (participant) |observer| try batch.setCommitParticipant(observer);
         var txn = batch.asTxn();
         const graph_bulk = bulk_candidate and !try graphBulkIncomingNeedsDelete(self.alloc, txn, writes);
@@ -2477,9 +2479,24 @@ pub const DocStore = struct {
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
     ) !void {
+        return self.putBatchWithNativeHistoryTime(io, writes, deletes, replay, options, participant, 0);
+    }
+
+    /// The caller supplies the clock sampled for the native mutation. Ordered
+    /// replay continues to use the legacy frame bytes until separately gated.
+    pub fn putBatchWithNativeHistoryTime(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        native_commit_time_ns: i64,
+    ) !void {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
-            self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, participant) catch |err| switch (err) {
+            self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, participant, native_commit_time_ns) catch |err| switch (err) {
                 error.WriterLocked => {
                     if (attempt >= writer_locked_retry_count) return err;
                     backoffWriterLockRetry(io);
@@ -3787,6 +3804,7 @@ test "docstore committed history captures initial and final images atomically ac
         try batch.put(internal_keys.public_schema_json_key, "schema-two");
         try batch.put(a, "final");
         try batch.delete(b);
+        batch.history.native_commit_time_ns = 123456789;
         try batch.commit();
     }
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -3802,6 +3820,7 @@ test "docstore committed history captures initial and final images atomically ac
         defer source.deinit();
         var reader: committed_history.frame.Reader = .{ .descriptor = descriptor, .source = source.source() };
         const header = try reader.header(scratch);
+        try std.testing.expectEqual(@as(i64, if (sequence == 1) 0 else 123456789), header.value.committed_at_ns);
         try std.testing.expectEqual(committed_history.frame.TransactionScope.root_local, header.value.transaction_scope);
         try std.testing.expectEqual(@as(u32, 2), header.count);
         try std.testing.expectEqualStrings("schema-one", header.value.schema_before.?);
