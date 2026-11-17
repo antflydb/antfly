@@ -4620,6 +4620,37 @@ pub fn storageOwnerOrderedSourceScopeOutcome(owner: ?*anyopaque, request: *const
     const result = handle.db.orderedSourceScopeOutcome(recovery) catch |err| return storageOwnerStatusFromError(err);
     return sourceScopeResponse(out, recovery.command, recovery.entry, result);
 }
+// Private apply-only boundary: the trusted Raft proposal path must obtain the
+// coordinator observation independently before this command reaches storage.
+pub fn storageOwnerOrderedSourceRetirement(owner: ?*anyopaque, request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const retirement = @import("antfly_local_sources").storage_source_scope_retirement;
+    const ordered = @import("antfly_local_sources").storage_source_scope_retirement_ordered;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.raft_term == 0 or request.raft_index == 0 or request.request_json.len > retirement.max_command_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var command = retirement.decodeCommand(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    defer command.deinit();
+    const result = handle.db.applyOrderedSourceRetirement(command.value, .{ .term = request.raft_term, .index = request.raft_index }, true) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    const bytes = ordered.encodeOutcome(std.heap.c_allocator, command.value, .{ .term = request.raft_term, .index = request.raft_index }, result) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+pub fn storageOwnerSourceRetirementOutcome(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    const ordered = @import("antfly_local_sources").storage_source_scope_retirement_ordered;
+    out.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len > ordered.max_query_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var query = ordered.decodeQuery(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    defer query.deinit();
+    const result = handle.db.orderedSourceRetirementOutcome(query.value) catch |err| return storageOwnerStatusFromError(err);
+    const bytes = ordered.encodeOutcome(std.heap.c_allocator, query.value.command, query.value.entry, result) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
 pub fn storageOwnerSourceScopeObservation(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     const wire = @import("antfly_local_sources").storage_source_scope_control;
     out.* = .{};

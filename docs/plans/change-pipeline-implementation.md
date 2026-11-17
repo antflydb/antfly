@@ -5994,3 +5994,53 @@ Final `history-control-apply-test -Dstrip=true -j1` exited 0
 local tests passed, zero reported skips/failures/leaks. Guarded repository cache
 cleanup completed and preserved active/recent outputs
 (`source-retirement-db-gc.log`). The full goal remains active.
+
+
+### Native owner retirement boundary and qualified exact recovery
+
+Owner ABI 111 adds private ordered source retirement and exact outcome recovery
+using the existing versioned JSON/entry headers. The apply boundary rejects old
+ABI, reserved fields, missing entry cuts and oversized requests, keeps the decoded
+coordinator admission arena alive, and invokes engine 58 with its actual entry.
+It is a trusted apply boundary, not caller-supplied coordinator authorization.
+No external retirement mutation endpoint or data Raft retirement entry exists yet.
+
+Bounded request codecs retain all dynamic coordinator admission participants and
+locator bytes. Response envelopes correlate the full command fingerprint and
+actual entry for every outcome, including rejection and supersession. Positive
+responses additionally validate the original intent, coordinator record digest
+and actual apply cut. Corrupt, oversized, unrelated or malformed responses remain
+errors. These values are fixed after decoding; no borrowed dynamic response data
+escapes a parsed arena.
+
+Qualified retirement recovery uses the shared native routed read machinery:
+current catalog/physical owner admission, leader ReadIndex, frozen barrier
+validation before/after the owner call, minimum applied cut, deadline and
+cancellation checks. No mutation or current-registry inference is introduced.
+Native fixtures exercise absent-receipt supersession, route mismatch, future
+minimum refusal, cancellation and ABI guards; their modeled ABORT is used only
+for a read-only query. It does not prove production coordinator-read provenance.
+
+Full generation completed (`source-retirement-owner-generate.log`); only the
+intended generated source control catalog remains, and unrelated model explorer
+outputs were discarded. Contract checks passed
+(`source-retirement-owner-contract-check.log`). The selected real NativeKV
+retirement helper covers owned query decoding after input release and correlated
+success/rejection/supersession response decoding, including changed command read
+cut and changed entry term rejection. All 15 retained-history tests passed in
+`source-retirement-owner-test.log`; linked results follow when complete.
+
+Engine 58, API kernel 31, data 40, metadata 105 and failure 89 remain unchanged.
+The next retirement step still needs a versioned data Raft entry, trusted proposal
+construction from a fresh independent coordinator read and authenticated transport.
+The broader original goal remains active with both issues open.
+
+The first linked compile caught a fixture assigning a scope cut directly to the
+nominally distinct coordinator publication position. Explicit field conversion
+fixed it. Final `history-control-apply-test -Dstrip=true -j1` exited 0
+(`source-retirement-owner-linked-retry-test.log`): 27 selected linked and six local
+tests passed, zero skips/failures/leaks. This includes real opaque owner retirement
+recovery and ABI guard calls. Guarded cache cleanup completed
+(`source-retirement-owner-gc.log`), preserving active/recent outputs. The private
+ordered apply ABI is compiled/exported; successful retirement mutation through a
+real versioned Raft entry is still unqualified and remains required next.

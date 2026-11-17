@@ -653,6 +653,27 @@ pub const Owner = struct {
         return ordered.decodeOutcome(a, response.bytes(), recovery.command, recovery.entry);
     }
 
+    pub fn orderedSourceRetirement(self: *Owner, a: std.mem.Allocator, table: []const u8, command: @import("antfly_local_sources").storage_source_scope_retirement.Command, term: u64, index: u64) !@import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery {
+        const retirement = @import("antfly_local_sources").storage_source_scope_retirement;
+        const ordered = @import("antfly_local_sources").storage_source_scope_retirement_ordered;
+        if (term == 0 or index == 0) return error.InvalidSourceAdmission;
+        const bytes = try retirement.encodeCommand(a, command);
+        defer a.free(bytes);
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_ordered_source_retirement(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes), .raft_term = term, .raft_index = index }, &response.buffer));
+        defer response.deinit();
+        return ordered.decodeOutcome(a, response.bytes(), command, .{ .term = term, .index = index });
+    }
+    pub fn sourceRetirementOutcome(self: *Owner, a: std.mem.Allocator, table: []const u8, query: @import("antfly_local_sources").storage_source_scope_retirement_ordered.Query) !@import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery {
+        const ordered = @import("antfly_local_sources").storage_source_scope_retirement_ordered;
+        const bytes = try ordered.encodeQuery(a, query);
+        defer a.free(bytes);
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_source_retirement_outcome(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes) }, &response.buffer));
+        defer response.deinit();
+        return ordered.decodeOutcome(a, response.bytes(), query.command, query.entry);
+    }
+
     pub fn sourceScopeObservation(self: *Owner, a: std.mem.Allocator, table: []const u8, input: @import("antfly_local_sources").storage_source_scope_control.Query) !@import("antfly_local_sources").storage_source_scope_control.Observation {
         const wire = @import("antfly_local_sources").storage_source_scope_control;
         try input.validate();

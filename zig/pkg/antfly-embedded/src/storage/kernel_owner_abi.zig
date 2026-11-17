@@ -33,7 +33,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 107 adds qualified checkpoint receipt observations.
 // Version 109 adds qualified source-scope registry observations.
 // Version 110 adds ordered source-scope controls and exact outcome recovery.
-pub const abi_version: u32 = 110;
+// Version 111 adds ordered source retirement and exact outcome recovery.
+pub const abi_version: u32 = 111;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1990,6 +1991,8 @@ pub extern fn antfly_storage_owner_native_source_plan_control(owner: ?*anyopaque
 pub extern fn antfly_storage_owner_ordered_source_plan_control(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_ordered_source_scope_control(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_ordered_source_scope_outcome(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_ordered_source_retirement(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_source_retirement_outcome(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_source_scope_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_source_checkpoint_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_source_plan_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;

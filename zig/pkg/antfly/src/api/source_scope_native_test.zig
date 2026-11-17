@@ -34,6 +34,8 @@ pub fn verify(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRoute
     try verifyReadFence(a, owner, fence, query, observed.cut.index);
     try verifyOutcome(a, owner, fence, source_owner, observed.cut);
     try verifyControlGuards();
+    try verifyRetirementGuards();
+    try verifyRetirementOutcome(a, owner, fence, source_owner, observed.cut);
 }
 fn verifyReadFence(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRouteFence, query: wire.Query, index: u64) !void {
     var future = query;
@@ -96,6 +98,67 @@ fn verifyControlGuards() !void {
     request.raft_index = 1;
     request.request_json.len = wire.max_bytes + 1;
     try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_ordered_source_scope_control(null, &request, &response));
+    try std.testing.expectEqual(@as(usize, 0), response.len);
+}
+
+fn verifyRetirementOutcome(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRouteFence, source_owner: @FieldType(completion.Intent, "owner"), cut: wire.scope.Cut) !void {
+    const txn = @import("antfly_local_sources").storage_transaction_completion;
+    const ordered = @import("antfly_local_sources").storage_source_scope_retirement_ordered;
+    const members = [_]txn.Participant{.{ .namespace = source_owner.namespace, .owner_fence = source_owner.digest(), .roles = txn.Roles.checkpoint, .input_digest = @splat(5), .locator = "checkpoint", .routed_owner = source_owner }};
+    const admission: txn.Admission = .{ .version = 3, .transaction_id = @splat(9), .admission_digest = @splat(11), .coordinator_namespace = source_owner.namespace, .coordinator_fence = source_owner.digest(), .participants = &members };
+    const reference: wire.scope.Reference = .{ .domain = @splat(71), .binding = @splat(73), .generation = 1, .token = 10, .sequence = 1 };
+    const decision_query: @FieldType(completion.Intent, "coordinator") = .{ .owner = source_owner, .transaction_id = admission.transaction_id, .minimum_applied_index = 1 };
+    // Modeled evidence qualifies only a read-only exact receipt query. No
+    // coordinator authorization or retirement mutation is submitted here.
+    const command: completion.Command = .{ .version = 1, .intent = .{ .version = 1, .owner = source_owner, .coordinator = decision_query, .reference = reference, .source_purpose = @splat(12), .admission_digest = admission.digest() }, .observation = .{ .request_digest = decision_query.digest(), .cut = .{ .term = cut.term, .index = cut.index }, .decision = .{ .record = .{ .status = .aborted, .begin_timestamp = 10, .created_at_ns = 11, .commit_version = 0, .finalized_at_ns = 20, .prepared = true, .intents_resolved = true, .digest = @splat(13), .source_purpose = @splat(12), .source_scope = reference }, .admission = .{ .admission = admission, .digest = admission.digest() } } } };
+    var query: ordered.Query = .{ .command = command, .entry = cut, .minimum_applied_index = cut.index };
+    for (0..1000) |_| {
+        const result = owner.sourceRetirementOutcomeRouted(a, fence, "docs", query) catch |err| switch (err) {
+            error.ReadUnavailable => {
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(result == .superseded);
+        break;
+    } else return error.TestReadFenceUnavailable;
+    var changed_fence = fence;
+    changed_fence.route.group_id += 1;
+    try std.testing.expectError(error.TopologyChanged, owner.sourceRetirementOutcomeRouted(a, changed_fence, "docs", query));
+    query.minimum_applied_index += 1000000;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.sourceRetirementOutcomeRouted(a, fence, "docs", query));
+    query.minimum_applied_index = cut.index;
+    var cancelled: std.atomic.Value(bool) = .init(true);
+    var cancelled_fence = fence;
+    cancelled_fence.admission_cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled);
+    try std.testing.expectError(error.Canceled, owner.sourceRetirementOutcomeRouted(a, cancelled_fence, "docs", query));
+}
+
+fn verifyRetirementGuards() !void {
+    const abi = @import("kernel_owner_abi");
+    const ordered = @import("antfly_local_sources").storage_source_scope_retirement_ordered;
+    var request: abi.ReplicatedBatchAtRaftEntryRequest = .{ .version = abi.abi_version - 1, .raft_term = 1, .raft_index = 1 };
+    var response: abi.OwnedBytes = .{ .len = 99 };
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_ordered_source_retirement(null, &request, &response));
+    try std.testing.expectEqual(@as(usize, 0), response.len);
+    request.version = abi.abi_version;
+    request._reserved0 = 1;
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_ordered_source_retirement(null, &request, &response));
+    request._reserved0 = 0;
+    request.raft_index = 0;
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_ordered_source_retirement(null, &request, &response));
+    request.raft_index = 1;
+    request.request_json.len = completion.max_command_bytes + 1;
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_ordered_source_retirement(null, &request, &response));
+    var query: abi.JsonOperationRequest = .{ .version = abi.abi_version - 1 };
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_source_retirement_outcome(null, &query, &response));
+    query.version = abi.abi_version;
+    query._reserved0 = 1;
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_source_retirement_outcome(null, &query, &response));
+    query._reserved0 = 0;
+    query.request_json.len = ordered.max_query_bytes + 1;
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_source_retirement_outcome(null, &query, &response));
     try std.testing.expectEqual(@as(usize, 0), response.len);
 }
 

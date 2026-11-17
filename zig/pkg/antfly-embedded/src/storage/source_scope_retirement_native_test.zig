@@ -80,6 +80,25 @@ pub fn run(a: std.mem.Allocator, path: [:0]const u8) !void {
         }
         const reply = try manager.retireScopedSourceAttempt(command, .{ .term = 3, .index = 20 }, &.{marker});
         try reply.validate(command.intent);
+        // The owner wire retains coordinator admission ownership and correlates
+        // even negative replies with the complete command and actual entry.
+        const query_bytes = try ordered.encodeQuery(a, .{ .command = command, .entry = reply.cut, .minimum_applied_index = reply.cut.index });
+        var decoded_query = try ordered.decodeQuery(a, query_bytes);
+        defer decoded_query.deinit();
+        a.free(query_bytes);
+        try std.testing.expectEqualDeep(command, decoded_query.value.command);
+        const outcomes = [_]ordered.Recovery{ .{ .applied = reply }, .{ .rejected = .pending }, .superseded };
+        for (outcomes) |outcome| {
+            const bytes = try ordered.encodeOutcome(a, command, reply.cut, outcome);
+            defer a.free(bytes);
+            try std.testing.expectEqualDeep(outcome, try ordered.decodeOutcome(a, bytes, command, reply.cut));
+            var changed_command = command;
+            changed_command.observation.cut.index += 1;
+            try std.testing.expectError(error.SourceAdmissionCorrupt, ordered.decodeOutcome(a, bytes, changed_command, reply.cut));
+            try std.testing.expectError(error.SourceAdmissionCorrupt, ordered.decodeOutcome(a, bytes, command, .{ .term = reply.cut.term + 1, .index = reply.cut.index }));
+        }
+        try std.testing.expectError(error.InvalidSourceAdmission, ordered.decodeQuery(a, "{}"));
+        try std.testing.expectError(error.SourceAdmissionCorrupt, ordered.decodeOutcome(a, "{}", command, reply.cut));
         try std.testing.expectEqual(@TypeOf(reply.disposition).fenced, reply.disposition);
         try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(admission.transaction_id));
         const stored_marker = try store.get(a, marker.key);

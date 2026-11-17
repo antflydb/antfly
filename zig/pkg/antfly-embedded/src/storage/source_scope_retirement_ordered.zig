@@ -52,6 +52,47 @@ pub const Query = struct {
         if (self.entry.term == 0 or self.entry.index == 0 or self.minimum_applied_index < self.entry.index) return error.InvalidSourceAdmission;
     }
 };
+// Decoded coordinator admissions contain owned participant/locator slices.
+// Keep the parsed arena alive until the owner operation finishes.
+pub const max_query_bytes = retirement.max_command_bytes + 1024;
+pub fn decodeQuery(a: A, bytes: []const u8) !std.json.Parsed(Query) {
+    if (bytes.len == 0 or bytes.len > max_query_bytes) return error.InvalidSourceAdmission;
+    var parsed = std.json.parseFromSlice(Query, a, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSourceAdmission;
+    errdefer parsed.deinit();
+    try parsed.value.validate();
+    return parsed;
+}
+pub fn encodeQuery(a: A, query: Query) ![]u8 {
+    try query.validate();
+    const bytes = try std.json.Stringify.valueAlloc(a, query, .{});
+    errdefer a.free(bytes);
+    if (bytes.len > max_query_bytes) return error.InvalidSourceAdmission;
+    return bytes;
+}
+const Response = struct { version: u8 = 1, command: scope.Digest, entry: scope.Cut, outcome: Recovery };
+fn validateOutcome(command: retirement.Command, entry: scope.Cut, outcome: Recovery) !void {
+    const proof = try command.proof();
+    if (entry.term == 0 or entry.index == 0) return error.InvalidSourceAdmission;
+    if (outcome == .applied) {
+        try outcome.applied.validate(command.intent);
+        if (!std.meta.eql(outcome.applied.cut, entry) or !std.meta.eql(outcome.applied.coordinator_record_digest, proof.coordinator_record_digest)) return error.SourceAdmissionCorrupt;
+    }
+}
+pub fn encodeOutcome(a: A, command: retirement.Command, entry: scope.Cut, outcome: Recovery) ![]u8 {
+    try validateOutcome(command, entry, outcome);
+    const bytes = try std.json.Stringify.valueAlloc(a, Response{ .command = try fingerprint(a, command), .entry = entry, .outcome = outcome }, .{});
+    errdefer a.free(bytes);
+    if (bytes.len > max_record_bytes) return error.SourceAdmissionCorrupt;
+    return bytes;
+}
+pub fn decodeOutcome(a: A, bytes: []const u8, command: retirement.Command, entry: scope.Cut) !Recovery {
+    if (bytes.len == 0 or bytes.len > max_record_bytes) return error.SourceAdmissionCorrupt;
+    var parsed = std.json.parseFromSlice(Response, a, bytes, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.SourceAdmissionCorrupt;
+    defer parsed.deinit();
+    if (parsed.value.version != 1 or !std.meta.eql(parsed.value.command, try fingerprint(a, command)) or !std.meta.eql(parsed.value.entry, entry)) return error.SourceAdmissionCorrupt;
+    try validateOutcome(command, entry, parsed.value.outcome);
+    return parsed.value.outcome;
+}
 const Record = struct { version: u8 = 2, root: scope.Basis, entry: scope.Cut, command: scope.Digest, outcome: Recovery };
 const Envelope = struct { record: Record, checksum: scope.Digest };
 fn checksum(a: A, record: Record) !scope.Digest {
