@@ -1980,8 +1980,13 @@ const RaftTableApplyStateMachine = struct {
         table_name: []const u8,
         req: antfly.db.types.BatchRequest,
         storage_owner_descriptor: ?kernel_owner_descriptor.Descriptor,
+        history_commit_time_ns: ?i64,
     ) !void {
-        if (try @import("../common/data_raft_protocol.zig").completionProtocolVersion(self.alloc, req)) |required| {
+        const required_protocol = if (history_commit_time_ns != null)
+            @import("history_clock_entry.zig").required_protocol_version
+        else
+            try @import("../common/data_raft_protocol.zig").completionProtocolVersion(self.alloc, req);
+        if (required_protocol) |required| {
             if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
             const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
             const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
@@ -2033,15 +2038,28 @@ const RaftTableApplyStateMachine = struct {
                 if (@import("builtin").is_test) self.test_faults.document_apply_successes += 1;
                 return;
             };
-            try owner_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
-                self.alloc,
-                group_id,
-                table_name,
-                descriptor,
-                req,
-                entry.term,
-                entry.index,
-            );
+            if (history_commit_time_ns) |clock| {
+                try owner_source.applyPreparedTimestampedBatchGroupLocalAtRaftEntry(
+                    self.alloc,
+                    group_id,
+                    table_name,
+                    descriptor,
+                    req,
+                    entry.term,
+                    entry.index,
+                    clock,
+                );
+            } else {
+                try owner_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
+                    self.alloc,
+                    group_id,
+                    table_name,
+                    descriptor,
+                    req,
+                    entry.term,
+                    entry.index,
+                );
+            }
             // The descriptor-pinned owner call intentionally bypasses the
             // ProvisionedTableWriteSource mutation vtable. Publish the
             // corresponding control-plane cache invalidation and status wake
@@ -2510,7 +2528,7 @@ const RaftTableApplyStateMachine = struct {
                         // Advance the native marker without its effects before
                         // publishing the same typed outcome to the proposer.
                         if (batchRequiresDocumentDbApply(decoded.batch.req)) {
-                            self.applyDocumentBatchForEntry(group_id, entry.index, entry.term, decoded.table_name, .{}, if (decoded.storage_owner_descriptor) |*value| value.view() else null) catch |err| switch (err) {
+                            self.applyDocumentBatchForEntry(group_id, entry.index, entry.term, decoded.table_name, .{}, if (decoded.storage_owner_descriptor) |*value| value.view() else null, null) catch |err| switch (err) {
                                 error.RaftApplyWriterUnavailable, error.StorageOwnerAdmissionPending, error.RetainedEffectsFull, error.OnlineSourcePinPending, error.ResourceBudgetExceeded, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
                                 else => return err,
                             };
@@ -2541,6 +2559,7 @@ const RaftTableApplyStateMachine = struct {
                         decoded.table_name,
                         decoded.batch.req,
                         if (decoded.storage_owner_descriptor) |*value| value.view() else null,
+                        decoded.history_commit_time_ns,
                     ) catch |err| {
                         // Writer contention can arise during receipt recovery
                         // or lifecycle publication, beyond mutation admission.
@@ -13057,8 +13076,16 @@ pub const DataServer = struct {
         // must not reject a v23 command that a mixed v26/v27 group can admit.
         // Once the floor is active, later writes can negotiate the revision
         // upgrade without probing both protocols on every mixed-group write.
-        if (batchMutatesDocuments(req) and (active >= minimum or minimum <= data_raft_batch.timestamp_protocol_version) and now_ns >= probe_after_ns)
+        if (batchMutatesDocuments(req) and (active >= minimum or minimum <= data_raft_batch.timestamp_protocol_version) and now_ns >= probe_after_ns) {
+            const history = @import("history_clock_entry.zig");
+            if (comptime linked_storage) {
+                // Preserve the legacy-resolution rollout before selecting
+                // the timestamped history format for ordinary writers.
+                if (active >= @max(minimum, @import("source_legacy_terminal_entry.zig").required_protocol_version) and history.eligible(req))
+                    return @max(minimum, history.required_protocol_version);
+            }
             return @max(minimum, @import("../common/data_raft_protocol.zig").batch_document_revisions_protocol_version);
+        }
         return minimum;
     }
 
@@ -14884,21 +14911,28 @@ pub const DataServer = struct {
                             if (minimum_protocol_version >= data_raft_batch.merge_transition_protocol_version)
                                 return error.RaftBatchMergeProtocolUnavailable;
                         }
-                        proposal_req = try raftBatchRequestForActiveProtocol(
-                            req,
-                            active_protocol_version,
-                            self.dataRaftRealtimeNs(),
-                        );
+                        const realtime_ns = self.dataRaftRealtimeNs();
+                        proposal_req = try raftBatchRequestForActiveProtocol(req, active_protocol_version, realtime_ns);
                         const proposal_term = status.hard.current_term;
-                        const encoded = if (comptime linked_storage)
-                            try data_raft_batch.encodeWithStorageOwnerDescriptor(
-                                alloc,
-                                table_name,
-                                proposal_req,
-                                if (restore_owner_descriptor) |*descriptor| descriptor.view() else storage_owner_descriptor.?.view(),
-                            )
-                        else
-                            try data_raft_batch.encode(alloc, table_name, proposal_req);
+                        const encoded = if (comptime linked_storage) blk: {
+                            const descriptor = if (restore_owner_descriptor) |*value| value.view() else storage_owner_descriptor.?.view();
+                            const history = @import("history_clock_entry.zig");
+                            if (active_protocol_version >= history.required_protocol_version and history.eligible(proposal_req) and
+                                descriptor.restore == null and !descriptor.restore_cancel_recovery and !descriptor.restore_ha_replay and
+                                descriptor.restore_bootstrap_json.len == 0 and descriptor.initial_child_bootstrap_json.len == 0 and
+                                (descriptor.table_storage == null or descriptor.table_storage.?.engine == .local))
+                            {
+                                const body = try @import("antfly_local_sources").api_internal_batch.encodeBatchRequest(alloc, proposal_req);
+                                defer alloc.free(body);
+                                break :blk try history.encode(alloc, .{
+                                    .table = table_name,
+                                    .storage_owner = descriptor,
+                                    .history_commit_time_ns = std.math.cast(i64, realtime_ns) orelse return error.InvalidBatchRequest,
+                                    .row_batch_json = body,
+                                }, active_protocol_version);
+                            }
+                            break :blk try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, table_name, proposal_req, descriptor);
+                        } else try data_raft_batch.encode(alloc, table_name, proposal_req);
                         defer alloc.free(encoded);
                         var accepted_index: ?u64 = null;
                         raft.host.http_host.proposeWithReceipt(group_id, encoded, &accepted_index) catch |err| {
@@ -45739,6 +45773,29 @@ fn consumerTests() type {
             try std.testing.expectEqual(@import("source_producer_closure_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
             try @import("source_legacy_terminal_proposal_native_test.zig").run(a, server, route.fence().?, producer_closure_owner orelse return error.TestExpectedProducerOwner, DataRequestLifecycleEvent, ClosureHarness);
             try std.testing.expectEqual(@import("source_legacy_terminal_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+
+            const ClockHarness = struct {
+                noinline fn run(allocator: std.mem.Allocator, node: *DataServer, kernel: *antfly.public_api.ProvisionedKernelOwnerSource, captured: antfly.metadata_api.CatalogRouteFence, consumer: control.Reference) !void {
+                    const group = captured.route.group_id;
+                    var before = try kernel.orderedHistoryPageRouted(allocator, captured, "docs", .{ .reference = consumer, .after = .{}, .now_seconds = 100 });
+                    defer before.deinit();
+                    const earliest = node.dataRaftRealtimeNs();
+                    try node.proposeRaftBatchGroupWithLeaderWait(allocator, group, "docs", .{
+                        .source_producer = .ordinary,
+                        .timestamp_ns = 1000,
+                        .writes = &.{.{ .key = "timestamped-history-row", .value = "{\"clock\":true}" }},
+                    }, .{ .discovery = .cached, .allow_remote_forward = false, .write_route_fence = captured }, 5 * std.time.ns_per_s);
+                    const latest = node.dataRaftRealtimeNs();
+                    var page = try kernel.orderedHistoryPageRouted(allocator, captured, "docs", .{ .reference = consumer, .after = .{ .sequence = before.observed_latest }, .now_seconds = 100 });
+                    defer page.deinit();
+                    try std.testing.expectEqual(@as(usize, 1), page.events.len);
+                    try std.testing.expectEqualStrings("{\"clock\":true}", page.events[0].after.?);
+                    const clock: u64 = @intCast(page.header.?.committed_at_ns);
+                    try std.testing.expect(clock >= earliest and clock <= latest);
+                }
+            };
+            try ClockHarness.run(a, server, &owner, route.fence().?, ref);
+            try std.testing.expectEqual(@import("history_clock_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
         }
 
         test "data raft ordered history table producer capability refuses lossy fallback" {

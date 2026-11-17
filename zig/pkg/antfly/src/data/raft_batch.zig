@@ -59,6 +59,7 @@ pub const OwnedReplicatedBatch = struct {
     batch: batch_api.OwnedBatchRequest,
     storage_owner_descriptor: ?OwnedStorageOwnerDescriptor = null,
     protocol_barrier_version: ?u16 = null,
+    history_commit_time_ns: ?i64 = null,
 
     pub fn deinit(self: *OwnedReplicatedBatch, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
@@ -142,7 +143,9 @@ pub fn looksLikeEnvelope(payload: []const u8) bool {
     const trimmed = std.mem.trim(u8, payload, " \t\r\n");
     if (!std.mem.startsWith(u8, trimmed, "{")) return false;
     return std.mem.indexOf(u8, trimmed, "\"table\"") != null and
-        std.mem.indexOf(u8, trimmed, "\"batch\"") != null;
+        (std.mem.indexOf(u8, trimmed, "\"batch\"") != null or
+            std.mem.indexOf(u8, trimmed, "\"history_commit_time_ns\"") != null or
+            std.mem.indexOf(u8, trimmed, "\"row_batch_json\"") != null);
 }
 
 fn cloneStorageOwnerDescriptor(
@@ -184,6 +187,22 @@ pub fn decodeForApply(alloc: std.mem.Allocator, payload: []const u8) !OwnedApply
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidReplicatedBatch;
+    if (parsed.value.object.contains("history_commit_time_ns") or parsed.value.object.contains("row_batch_json")) {
+        const clock = @import("history_clock_entry.zig");
+        if (payload.len > clock.max_bytes) return error.InvalidReplicatedBatch;
+        var entry = try clock.decodeValue(alloc, parsed.value);
+        defer entry.deinit();
+        var batch = try entry.value.rowBatch(alloc);
+        errdefer batch.deinit(alloc);
+        const table = try alloc.dupe(u8, entry.value.table);
+        errdefer alloc.free(table);
+        return .{ .batch = .{
+            .table_name = table,
+            .batch = batch,
+            .storage_owner_descriptor = try cloneStorageOwnerDescriptor(alloc, entry.value.storage_owner),
+            .history_commit_time_ns = entry.value.history_commit_time_ns,
+        } };
+    }
     if (parsed.value.object.contains("source_legacy_terminal")) {
         const legacy = @import("source_legacy_terminal_entry.zig");
         if (payload.len > legacy.max_bytes) return error.InvalidReplicatedBatch;
@@ -221,7 +240,7 @@ fn decodeBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedRepli
     if (value != .object) return error.InvalidReplicatedBatch;
     const root = value.object;
     if (root.contains("source_owner")) return error.UnsupportedRaftBatchProtocolVersion;
-    if (root.contains("source_legacy_terminal") or root.contains("history_control") or root.contains("source_plan") or root.contains("source_scope_control") or root.contains("source_retirement") or root.contains("source_producer_closure")) return error.UnsupportedRaftBatchProtocolVersion;
+    if (root.contains("history_commit_time_ns") or root.contains("row_batch_json") or root.contains("source_legacy_terminal") or root.contains("history_control") or root.contains("source_plan") or root.contains("source_scope_control") or root.contains("source_retirement") or root.contains("source_producer_closure")) return error.UnsupportedRaftBatchProtocolVersion;
     const table_value = root.get("table") orelse return error.InvalidReplicatedBatch;
     if (table_value != .string) return error.InvalidReplicatedBatch;
     const batch_value = root.get("batch") orelse return error.InvalidReplicatedBatch;

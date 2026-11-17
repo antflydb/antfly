@@ -2479,6 +2479,10 @@ pub const RaftApplyStore = struct {
             return;
         }
         const decoded = applying.batch;
+        if (decoded.history_commit_time_ns != null) {
+            if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
+            try operations.append(alloc, .{ .require_batch_protocol = @import("../history_clock_entry.zig").required_protocol_version });
+        }
         if (decoded.protocol_barrier_version) |version| {
             try operations.append(alloc, .{ .set_raft_batch_protocol = version });
             return;

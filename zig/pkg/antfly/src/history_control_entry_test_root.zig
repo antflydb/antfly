@@ -15,6 +15,7 @@
 
 test {
     _ = @import("antfly_local_sources").storage_source_legacy_terminal_ordered;
+    _ = @import("data/history_clock_entry.zig");
     _ = @import("data/history_control_entry.zig");
     _ = @import("data/source_plan_entry.zig");
     _ = @import("data/source_scope_entry.zig");
