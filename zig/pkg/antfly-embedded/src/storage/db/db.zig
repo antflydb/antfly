@@ -40217,6 +40217,7 @@ pub const DB = struct {
             .identity_namespace = target_identity,
             .prefer_existing_identity_namespace = true,
             .unpublished_staging = true,
+            .detach_uncoordinated_cohort = true,
         });
         portable_backup.validateCompleteDatabaseImageAlloc(alloc, self.core.store) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -41375,6 +41376,7 @@ pub const DB = struct {
         if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
         try portable_backup.importPortableFileWithOptions(alloc, self.core.store, io, file, file_size, .{
             .cohort = cohort,
+            .detach_uncoordinated_cohort = cohort == null,
             .cancellation = cancellation,
             .identity_namespace = target_identity,
             .prefer_existing_identity_namespace = true,

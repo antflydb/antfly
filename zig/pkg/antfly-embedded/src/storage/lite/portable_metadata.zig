@@ -201,3 +201,63 @@ fn appendJsonU64(
     defer allocator.free(encoded);
     try out.appendSlice(allocator, encoded);
 }
+
+/// Translate persisted runtime catalogs at every Lite-to-public boundary.
+pub const CatalogDestination = enum { table_restore, embedded_adoption };
+
+pub fn publicTableIndexesJsonAlloc(alloc: Allocator, stored: []const u8, destination: CatalogDestination) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidEmbeddedLiteIndex;
+    const arena = parsed.arena.allocator();
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+        const value = entry.value_ptr.*;
+        if (value != .object) return error.InvalidEmbeddedLiteIndex;
+        // Server archives already carry the public catalog shape.
+        if (value.object.get("type")) |kind| {
+            if (kind != .string) return error.InvalidEmbeddedLiteIndex;
+            if (destination == .embedded_adoption and !std.mem.eql(u8, kind.string, "full_text")) return error.UnsupportedEmbeddedLiteIndex;
+            continue;
+        }
+        const kind = value.object.get("kind") orelse return error.InvalidEmbeddedLiteIndex;
+        if (kind != .string) return error.InvalidEmbeddedLiteIndex;
+        const full_text = std.mem.eql(u8, kind.string, "full_text");
+        if (destination == .embedded_adoption and !full_text) return error.UnsupportedEmbeddedLiteIndex;
+        const raw = value.object.get("config_json") orelse return error.InvalidEmbeddedLiteIndex;
+        if (raw != .string) return error.InvalidEmbeddedLiteIndex;
+        var config = try std.json.parseFromSliceLeaky(std.json.Value, arena, raw.string, .{});
+        if (config != .object) return error.InvalidEmbeddedLiteIndex;
+        const dense = std.mem.eql(u8, kind.string, "dense_vector");
+        const sparse = std.mem.eql(u8, kind.string, "sparse_vector");
+        if (dense or sparse) {
+            // Native managed generators are lowered executable programs; there
+            // is no lossless public inverse. Artifact and external consumers
+            // retain their authoritative vectors and can be translated exactly.
+            if (config.object.contains("generator") or config.object.contains("embedder")) return error.UnsupportedEmbeddedLiteIndex;
+            const artifact_backed = config.object.contains("sources") or config.object.contains("embedding_name");
+            if (!artifact_backed) {
+                // Sparse external lowering stores only the vector field (and
+                // optional execution/coverage policy), unlike dense lowering.
+                // With neither a producer nor an artifact source this is the
+                // native external sparse representation.
+                if (config.object.get("external")) |external| {
+                    if (external != .bool or !external.bool) return error.UnsupportedEmbeddedLiteIndex;
+                } else if (!sparse or !config.object.contains("field")) return error.UnsupportedEmbeddedLiteIndex;
+                try config.object.put(arena, "external", .{ .bool = true });
+            }
+            _ = config.object.orderedRemove("field");
+            if (config.object.fetchOrderedRemove("dims")) |field| try config.object.put(arena, "dimension", field.value);
+            if (config.object.fetchOrderedRemove("metric")) |field| try config.object.put(arena, "distance_metric", field.value);
+            if (sparse) try config.object.put(arena, "sparse", .{ .bool = true });
+            try config.object.put(arena, "type", .{ .string = "embeddings" });
+        } else if (full_text or std.mem.eql(u8, kind.string, "graph") or std.mem.eql(u8, kind.string, "algebraic")) {
+            try config.object.put(arena, "type", kind);
+        } else return error.UnsupportedEmbeddedLiteIndex;
+        if (value.object.get("coverage_generation")) |generation|
+            try config.object.put(arena, "_index_incarnation", generation);
+        entry.value_ptr.* = config;
+    }
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}

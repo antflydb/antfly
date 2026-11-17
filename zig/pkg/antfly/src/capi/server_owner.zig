@@ -4985,6 +4985,7 @@ pub fn prepareStorageRestore(
     var db = try local_write.openStorageKernelRestoreDb(
         alloc,
         staged.path(),
+        scope.manifest.value.schema_json,
         scope.manifest.value.indexes_json,
         request.lsm_root_generation,
         backend_runtime.ptr(),
@@ -5014,6 +5015,7 @@ pub fn prepareStorageRestore(
         var verify_db = try local_write.openStorageKernelRestoreDb(
             alloc,
             staged.path(),
+            scope.manifest.value.schema_json,
             scope.manifest.value.indexes_json,
             request.lsm_root_generation,
             backend_runtime.ptr(),

@@ -207,7 +207,7 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         const bid = opts.backup_id orelse cli.argumentError("--backup-id is required", .{});
         try client.backupTable(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection, .format = selected_format });
         if (opts.bundle_out) |output_path|
-            try writeBundleFromLocalBackup(allocator, io, opts.location, bid, tbl, output_path);
+            try writeBundleFromLocalBackup(allocator, io, opts.location, bid, output_path);
         try cli.output.acknowledge("backup");
         if (!cli.isAgent()) cli.output.notice("Backup command successful.\n", .{});
         return;
@@ -263,14 +263,14 @@ fn writeBundleFromLocalBackup(
     io: std.Io,
     location_uri: []const u8,
     backup_id: []const u8,
-    table_name: []const u8,
     output_path: []const u8,
 ) !void {
     const backup_root = try backups_api.parseFileLocation(location_uri);
     var manifest = try backups_api.readManifest(allocator, backup_root, backup_id);
     defer manifest.deinit(allocator);
-    if (!std.mem.eql(u8, manifest.table_name, table_name))
-        return error.BackupArtifactFormatMismatch;
+    // The authorized backup endpoint binds the logical request to an immutable
+    // physical identity. Preserve that identity in the bundle; a logical name
+    // can change after capture and is not an artifact format check.
 
     if (manifest.format == .portable) {
         if (manifest.shards.len != 1) return error.UnsupportedMultiRangeTable;
@@ -307,7 +307,7 @@ fn writeBundleFromLocalBackup(
         backup_root,
         selected.items,
         &writer.interface,
-        .{ .backup_id = backup_id, .table_name = table_name },
+        .{ .backup_id = backup_id, .table_name = manifest.table_name },
     );
     try writer.end();
     try file.sync(io);
@@ -619,9 +619,10 @@ pub const usage =
     \\  It must grant backup.write (and restore.read to restore). For example:
     \\    {"connections":{"bk":{"kind":"external_io","capabilities":["backup.write","restore.read"],"external_io":{"protocol":"filesystem","root":"/srv/backups"}}}}
     \\  Use --connection bk --location file:///srv/backups with this configuration.
+    \\  file:// paths are absolute and must be inside the connection root.
     \\  Table and cluster backups default to the portable format.
     \\  Backup listing returns one page and includes next_cursor when more results remain.
-    \\  `--out` packages a native backup from a shared file:// location as a self-contained AFB2 artifact.
+    \\  `--out` packages a portable or native backup from a shared file:// location as a self-contained AFB2 artifact.
     \\  Use `antfly lite backup <db.aflite> --out <backup.afb>` for a local portable AFB2 artifact.
     \\
 ;

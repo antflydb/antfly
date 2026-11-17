@@ -28,6 +28,7 @@ from pathlib import Path
 import requests
 from conftest import DEFAULT_ANTFLY_BIN, StandaloneAntflyServer, resolve_binary_path
 from helpers import wait_until
+from port_reservations import LoopbackPortReservations
 
 
 class SeededLiteServer(StandaloneAntflyServer):
@@ -101,6 +102,35 @@ def test_binary_schema_adoption_refuses_transfer_and_allows_embedded_repair(tmp_
         check=True,
         timeout=60,
     )
+    # Neither transfer entry point may invent a public default for a binary-only
+    # schema, or publish an artifact before the source owner repairs its contract.
+    with LoopbackPortReservations() as ports:
+        target = f"http://127.0.0.1:{ports.reserve()}"
+        for source in (archive, seed):
+            stage = tmp_path / ("stage-" + source.suffix[1:])
+            stage.mkdir()
+            transfer = subprocess.run(
+                [
+                    binary,
+                    "--no-agent",
+                    "restore",
+                    "--input",
+                    str(source),
+                    "--table",
+                    "binary_only",
+                    "--connection",
+                    "unused",
+                    "--location",
+                    stage.as_uri(),
+                    "--url",
+                    target,
+                ],
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+            assert transfer.returncode != 0, transfer.stdout
+            assert not list(stage.iterdir()), transfer.stdout + transfer.stderr
     refused = subprocess.run(
         [
             binary,
@@ -237,3 +267,41 @@ def test_lite_schema_migration_and_document_survive_file_only_handoff(tmp_path):
     finally:
         for server in reversed(servers):
             server.stop(test_failed=failed)
+
+
+def test_embedded_text_segments_survive_standalone_adoption(tmp_path):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    seed = tmp_path / "search.aflite"
+    subprocess.run([binary, "lite", "init", str(seed)], capture_output=True, check=True)
+    batch = tmp_path / "batch.json"
+    batch.write_text(
+        json.dumps({"inserts": {"a": {"title": "alpha"}, "b": {"title": "beta"}}})
+    )
+    for args in [
+        ["batch", str(seed), "--file", str(batch)],
+        ["run-until-idle", str(seed)],
+    ]:
+        subprocess.run(
+            [binary, "lite", *args], capture_output=True, check=True, timeout=60
+        )
+    server = SeededLiteServer(binary, seed)
+    failed = True
+    try:
+        url = server.api_url + "/tables/default/query"
+
+        def ready():
+            for search, count in [({"match_all": {}}, 2), ({"query": "alpha"}, 1)]:
+                response = requests.post(
+                    url, json={"full_text_search": search}, timeout=10
+                )
+                if response.status_code == 503:
+                    return False
+                assert response.ok, response.text
+                hits = response.json()["responses"][0]["hits"]
+                assert hits["total"]["value"] == count, response.text
+            return True
+
+        wait_until(ready, timeout_s=60)
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

@@ -11829,7 +11829,7 @@ export interface components {
             backup_id: string;
             /**
              * @description Storage location for the backup. Supports multiple backends:
-             *     - Scoped filesystem connection: `file:///logical/path`
+             *     - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
              *     - Amazon S3: `s3://bucket-name/path/to/backup`
              *     - Google Cloud Storage: `gs://bucket-name/path/to/backup`
              *
@@ -11891,7 +11891,7 @@ export interface components {
             backup_id: string;
             /**
              * @description Storage location for the backup. Supports multiple backends:
-             *     - Scoped filesystem connection: `file:///logical/path`
+             *     - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
              *     - Amazon S3: `s3://bucket-name/path/to/backup`
              *     - Google Cloud Storage: `gs://bucket-name/path/to/backup`
              *
@@ -15951,12 +15951,6 @@ export interface components {
         User: {
             /** @example johndoe */
             username: string;
-            /**
-             * Format: byte
-             * @description Base64 encoded password hash. Exposing this is a security risk.
-             * @example JGFyZ29uMm...
-             */
-            password_hash: string;
             /**
              * @description Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
              * @example {

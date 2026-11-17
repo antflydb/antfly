@@ -7091,7 +7091,7 @@ components:
           maxLength: 4096
           description: |
             Storage location for the backup. Supports multiple backends:
-            - Scoped filesystem connection: `file:///logical/path`
+            - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
             - Amazon S3: `s3://bucket-name/path/to/backup`
             - Google Cloud Storage: `gs://bucket-name/path/to/backup`
 
@@ -7177,7 +7177,7 @@ components:
           maxLength: 4096
           description: |
             Storage location for the backup. Supports multiple backends:
-            - Scoped filesystem connection: `file:///logical/path`
+            - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
             - Amazon S3: `s3://bucket-name/path/to/backup`
             - Google Cloud Storage: `gs://bucket-name/path/to/backup`
 

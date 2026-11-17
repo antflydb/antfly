@@ -558,7 +558,12 @@ fn prepareRestoreSnapshotIfNeeded(
         if (try system_catalog.isRestoreTarget(name)) {
             if (options.expected_identity_namespace) |namespace| {
                 try restore.cancellation.check();
-                const open_options = try preparedRestoreOpenOptionsForRepair(&prepared, restore, options);
+                var open_options = try preparedRestoreOpenOptionsForRepair(&prepared, restore, options);
+                // This owner only rebinds primary identity. The destination
+                // schema and index catalog are installed by the repair owner;
+                // building source projections here gives them the wrong witness.
+                open_options.defer_index_backfill_on_open = true;
+                open_options.defer_derived_replay_on_open = true;
                 var db = try db_mod.DB.open(alloc, prepared.path(), open_options);
                 defer db.close();
                 if (!db.core.identity_namespace.eql(namespace))
