@@ -238,6 +238,95 @@ pub fn encodeReplicationTuple(
     return tuple;
 }
 
+const history_sources = @import("antfly_local_sources");
+const HistoryRow = history_sources.storage_db_algebraic_relational_row_codec;
+const HistorySchema = history_sources.storage_schema;
+
+/// Derive wire types from the retained schema rather than the current table
+/// or the values in the row. Unsupported physical types fail closed.
+pub fn historicalColumn(column: HistorySchema.RelationalColumn) !Column {
+    const kind: Type = switch (column.column_type) {
+        .string => if (column.sql_element_type == .uuid) .uuid else .string,
+        .boolean => .boolean,
+        .datetime => .datetime,
+        .integer => .integer,
+        .number, .numeric => .number,
+        .json => .json,
+        .sql_array => .array,
+        else => return error.ChangefeedCapabilityUnsupported,
+    };
+    const descriptor: Column = .{
+        .name = column.name,
+        .type = kind,
+        .element_type = column.sql_element_type,
+        .numeric_modifier = column.numeric_modifier,
+    };
+    _ = try columnOid(descriptor);
+    _ = try columnModifier(descriptor);
+    if (column.column_type == .numeric and descriptor.element_type != .numeric) return error.InvalidResult;
+    return descriptor;
+}
+
+/// Decode a retained row image against the schema bound to that image. The
+/// returned cells own their bytes and may outlive the image and scratch arena.
+pub fn encodeHistoricalRow(
+    alloc: std.mem.Allocator,
+    schema: HistorySchema.TableSchema,
+    layout: *const HistoryRow.PhysicalLayout,
+    image: []const u8,
+    format: u16,
+    byte_limit: usize,
+) ![]const @import("pgoutput.zig").Cell {
+    if (schema.relational_columns.len == 0 or schema.relational_columns.len > std.math.maxInt(u16)) return error.ChangefeedCapabilityUnsupported;
+    const row = try HistoryRow.ordinalRowView(image, schema, layout);
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const columns = try a.alloc(Column, schema.relational_columns.len);
+    const cells = try a.alloc(@import("backend.zig").Cell, columns.len);
+    for (schema.relational_columns, columns, cells, 0..) |column, *descriptor, *cell, ordinal| {
+        descriptor.* = try historicalColumn(column);
+        const stored = try row.findCell(ordinal) orelse {
+            cell.* = .{ .sql_null = true };
+            continue;
+        };
+        if (stored.is_null) {
+            cell.* = .{ .sql_null = true };
+        } else if (column.column_type == .json) {
+            cell.* = .{ .sql_null = false, .json_bytes = stored.value.bytes_val };
+        } else {
+            cell.* = .{ .sql_null = false, .value = try row.materializeCellAlloc(a, stored) };
+        }
+    }
+    return encodeReplicationTuple(alloc, columns, cells, format, byte_limit);
+}
+
+test "pgwire retained ordinal row preserves historical column types and null identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema: HistorySchema.TableSchema = .{
+        .version = 9,
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .column_type = .integer, .sql_element_type = .int32 },
+            .{ .name = "j", .path = "j", .column_type = .json, .is_json = true, .json_kind = .any, .sql_element_type = .jsonb },
+            .{ .name = "missing", .path = "missing", .column_type = .string, .allows_null = true },
+        },
+    };
+    const image = try HistoryRow.serializeOrdinal(a, schema.version, schema.relational_columns, &.{
+        .{ .ordinal = 0, .path = "id", .value_type = .i64_val, .value = .{ .i64_val = 17 } },
+        .{ .ordinal = 1, .path = "j", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "null" } },
+    }, @splat(0));
+    var layout = try HistoryRow.PhysicalLayout.init(a, schema);
+    defer layout.deinit();
+    const tuple = try encodeHistoricalRow(a, schema, &layout, image, 1, 128);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 17 }, tuple[0].binary);
+    try std.testing.expectEqualSlices(u8, "\x01null", tuple[1].binary);
+    try std.testing.expect(tuple[2] == .null);
+    try std.testing.expectEqual(@as(u32, 23), try columnOid(try historicalColumn(schema.relational_columns[0])));
+}
+
 test "pgwire replication tuples preserve exact numeric and distinguish JSON null from SQL NULL" {
     const backend = @import("backend.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
