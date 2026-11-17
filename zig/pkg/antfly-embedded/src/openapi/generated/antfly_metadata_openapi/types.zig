@@ -1645,7 +1645,7 @@ pub const BackupOutcomeAmbiguousConflict = struct {
 pub const BackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: an absolute `file:///path/inside/connection/root` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
     /// ID of a configured `external_io` connection. Required for every network API backup and restore. Object locations enforce bucket and prefix scopes; filesystem URI paths resolve beneath the connection root.
     connection: []const u8,
@@ -2140,7 +2140,7 @@ pub const ChatGPTOutcome = struct {
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: `file:///logical/path` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
+    /// Storage location for the backup. Supports multiple backends: - Scoped filesystem connection: an absolute `file:///path/inside/connection/root` - Amazon S3: `s3://bucket-name/path/to/backup` - Google Cloud Storage: `gs://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
     location: []const u8,
     /// Required configured `external_io` connection with the `backup.write` capability.
     connection: []const u8,

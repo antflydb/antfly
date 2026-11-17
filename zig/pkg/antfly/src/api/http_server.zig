@@ -8728,10 +8728,10 @@ pub const ApiHttpServer = struct {
 
         if (std.mem.startsWith(u8, value, "Basic ")) {
             const encoded = value["Basic ".len..];
-            const raw_size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+            const raw_size = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.Unauthorized;
             const raw = try self.alloc.alloc(u8, raw_size);
             defer self.alloc.free(raw);
-            try std.base64.standard.Decoder.decode(raw, encoded);
+            std.base64.standard.Decoder.decode(raw, encoded) catch return error.Unauthorized;
             const colon_pos = std.mem.indexOfScalar(u8, raw, ':') orelse return error.Unauthorized;
             var user = try manager.authenticateUser(raw[0..colon_pos], raw[colon_pos + 1 ..]);
             defer user.deinit(manager.alloc);
@@ -8751,10 +8751,10 @@ pub const ApiHttpServer = struct {
 
         if (std.mem.startsWith(u8, value, "ApiKey ") or std.mem.startsWith(u8, value, "Bearer ")) {
             const encoded = if (std.mem.startsWith(u8, value, "ApiKey ")) value["ApiKey ".len..] else value["Bearer ".len..];
-            const raw_size = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+            const raw_size = std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.Unauthorized;
             const raw = try self.alloc.alloc(u8, raw_size);
             defer self.alloc.free(raw);
-            try std.base64.standard.Decoder.decode(raw, encoded);
+            std.base64.standard.Decoder.decode(raw, encoded) catch return error.Unauthorized;
             const colon_pos = std.mem.indexOfScalar(u8, raw, ':') orelse return error.Unauthorized;
             var validated = try manager.validateApiKey(raw[0..colon_pos], raw[colon_pos + 1 ..]);
             defer validated.deinit(manager.alloc);
@@ -13602,11 +13602,20 @@ pub const ApiHttpServer = struct {
 
         var created_metadata = false;
         var storage_committed = false;
+        errdefer if (created_metadata and !storage_committed) self.source.dropTable(self.alloc, table_name) catch {};
         if (!target_exists) {
             var create_req = backups_api.createTableRequestFromManifest(self.alloc, &manifest) catch {
                 return error.UnsupportedBackupFormat;
             };
             defer create_req.deinit(self.alloc);
+            // Creation reserves a fresh catalog identity at generation zero.
+            // Publish the authenticated source generation with storage through
+            // the same definition hook used for replacement restores below.
+            if (create_req.schema_json) |schema| {
+                const initial_schema = try tables_api.normalizeSchemaVersion(self.alloc, schema, 0);
+                self.alloc.free(schema);
+                create_req.schema_json = initial_schema;
+            }
             const logical_target = try system_catalog.restoreTarget(self.alloc, table_name);
             defer if (logical_target) |target| target.deinit(self.alloc);
             const logical_name = if (logical_target) |target| try target.value.resourceNameAlloc(self.alloc) else try self.alloc.dupe(u8, table_name);
@@ -13615,13 +13624,10 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedOperation => {},
                 else => return err,
             };
-            self.waitForMetadataProjection(table_name, manifest.schema_json, manifest.indexes_json) catch |err| switch (err) {
-                error.TableVisibilityTimeout => return error.TableVisibilityTimeout,
-                else => return err,
-            };
             if (try self.tableExists(table_name)) created_metadata = true;
+            try self.waitForMetadataProjection(table_name, tables_api.effectiveSchemaJson(create_req.schema_json), create_req.indexes_json orelse tables_api.default_indexes_json);
+            created_metadata = true;
         }
-        errdefer if (created_metadata and !storage_committed) self.source.dropTable(self.alloc, table_name) catch {};
 
         var previous_definition: ?metadata_table_manager.TableRecord = null;
         defer if (previous_definition) |definition| metadata_table_manager.freeTable(self.alloc, definition);
@@ -13629,7 +13635,7 @@ pub const ApiHttpServer = struct {
         var publication_hook: ?backups_api.RestorePublicationHook = null;
         var replacement_indexes: ?[]u8 = null;
         defer if (replacement_indexes) |value| self.alloc.free(value);
-        if (replace_existing) {
+        if (replace_existing or created_metadata) {
             previous_definition = (try self.loadOwnedTableRecord(self.alloc, table_name)) orelse return error.TableNotFound;
             // Keep authenticated source bytes for storage validation. Only the
             // destination definition loses source-owned operational checkpoints.
@@ -15180,6 +15186,8 @@ pub const ApiHttpServer = struct {
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
             error.ReembedSetupRetry => return error.ReembedSetupRetry,
+            error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
+            error.LibpqUnavailable => return error.LibpqUnavailable,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation => return error.GraphMinWeightDomainViolation,
             error.GraphMaxWeightDomainViolation => return error.GraphMaxWeightDomainViolation,
@@ -15538,6 +15546,8 @@ pub const ApiHttpServer = struct {
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
                 error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
                 error.ReembedSetupRetry => return error.ReembedSetupRetry,
+                error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
+                error.LibpqUnavailable => return error.LibpqUnavailable,
                 error.GraphWorkBudgetExceeded,
                 error.GraphMinWeightDomainViolation,
                 error.GraphMaxWeightDomainViolation,
@@ -15616,6 +15626,8 @@ pub const ApiHttpServer = struct {
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
             error.ReembedSetupRetry => return error.ReembedSetupRetry,
+            error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
+            error.LibpqUnavailable => return error.LibpqUnavailable,
             error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation,
             error.GraphMaxWeightDomainViolation,
@@ -15741,6 +15753,8 @@ pub const ApiHttpServer = struct {
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.ReembedBudgetExceeded => return error.ReembedBudgetExceeded,
             error.ReembedSetupRetry => return error.ReembedSetupRetry,
+            error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
+            error.LibpqUnavailable => return error.LibpqUnavailable,
             error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation,
             error.GraphMaxWeightDomainViolation,
@@ -23912,9 +23926,11 @@ pub const ApiHttpServer = struct {
         err: anyerror,
     ) !contextual_operations.OwnedResponse {
         return switch (err) {
+            error.ForeignConnectionFailed => try contextualForeignSourceFailureResponse(self.alloc, table_name, false),
+            error.LibpqUnavailable => try contextualForeignSourceFailureResponse(self.alloc, table_name, true),
             error.ObjectTableJoinUnsupported => try contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported"),
             error.Forbidden => try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden"),
-            error.PreparedGenerationChanged, error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
+            error.PreparedGenerationChanged, error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
             error.InvalidCatalogName => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid table target"),
             error.InvalidComposedGraphIdentity, error.InvalidQueryRequest => if (db_mod.peekLastSortRejectionDiagnostic() != null)
                 try contextualUnsupportedExactSortResponse(self.alloc)
@@ -28558,6 +28574,12 @@ fn contextualQueryTemporarilyUnavailableResponse(
     return try contextualResponseFromPublicTable(alloc, response);
 }
 
+fn contextualForeignSourceFailureResponse(alloc: std.mem.Allocator, source: []const u8, driver_unavailable: bool) !contextual_operations.OwnedResponse {
+    var response = try public_table_http.foreignSourceFailureOwnedResponse(alloc, source, driver_unavailable);
+    defer response.deinit(alloc);
+    return try contextualResponseFromPublicTable(alloc, response);
+}
+
 fn contextualQueryDependencyErrorResponse(
     alloc: std.mem.Allocator,
     status: u16,
@@ -33091,7 +33113,6 @@ pub fn makeListedUsers(alloc: std.mem.Allocator, users: []const []const u8) ![]L
 pub fn userToOpenApi(alloc: std.mem.Allocator, user: usermgr.User) !usermgr_openapi.User {
     return .{
         .username = user.username,
-        .password_hash = user.password_hash,
         .metadata = if (user.metadata_json.len > 0)
             .{ .value = try parseOwnedJsonObjectMapAlloc(alloc, user.metadata_json) }
         else
@@ -64047,4 +64068,27 @@ test "index alias admission accepts empty object fleets and fences incompatible 
     stores[0].artifact_sources_protocol_version = 4;
     try server.ensureIndexAliasAdmission(.{});
     try std.testing.expectEqual(@as(usize, 4), fake.frees);
+}
+
+test "api http query binding generation races return retryable unavailable" {
+    const a = std.testing.allocator;
+    var server: ApiHttpServer = undefined;
+    server.alloc = a;
+    for ([_]anyerror{ error.PreparedGenerationChanged, error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired }) |err| {
+        var response = try server.publicQueryOperationErrorResponse("docs", "{}", err);
+        defer response.deinit(a);
+        try std.testing.expectEqual(@as(u16, 503), response.status);
+        var retry_after = false;
+        for (response.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "Retry-After")) {
+                try std.testing.expectEqualStrings("1", header.value);
+                retry_after = true;
+            }
+        }
+        try std.testing.expect(retry_after);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("retryable").?.bool);
+        try std.testing.expectEqualStrings("storage_read_temporarily_unavailable", parsed.value.object.get("code").?.string);
+    }
 }

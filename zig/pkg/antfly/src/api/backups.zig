@@ -2138,13 +2138,25 @@ test "filesystem backup location returns the canonical authorized identity" {
     defer alloc.free(alias);
     try std.Io.Dir.symLinkAbsolute(io, physical, alias, .{ .is_directory = true });
 
-    // A connection-scoped file URI is rooted at configured_root; its URI path
-    // is intentionally relative to that capability root.
-    const resolved = try resolveFilesystemLocationAlloc(alloc, root, "file:///alias/new/backup", io);
+    const location = try std.fmt.allocPrint(alloc, "file://{s}/alias/new/backup", .{root});
+    defer alloc.free(location);
+    const resolved = try resolveFilesystemLocationAlloc(alloc, root, location, io);
+    try std.testing.expectError(error.ConnectionPrefixDenied, resolveFilesystemLocationAlloc(alloc, root, "file:///outside-capability-root/new", io));
     defer alloc.free(resolved);
     const expected = try std.fs.path.join(alloc, &.{ physical, "new", "backup" });
     defer alloc.free(expected);
     try std.testing.expectEqualStrings(expected, resolved);
+
+    var outside = std.testing.tmpDir(.{});
+    defer outside.cleanup();
+    const outside_root = try outside.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(outside_root);
+    const escape = try std.fs.path.join(alloc, &.{ root, "escape" });
+    defer alloc.free(escape);
+    try std.Io.Dir.symLinkAbsolute(io, outside_root, escape, .{ .is_directory = true });
+    const escaped_location = try std.fmt.allocPrint(alloc, "file://{s}/escape/new", .{root});
+    defer alloc.free(escaped_location);
+    try std.testing.expectError(error.ConnectionPrefixDenied, resolveFilesystemLocationAlloc(alloc, root, escaped_location, io));
 
     var opened = try openOrCreateBackupRootNoFollow(io, resolved);
     opened.close(io);
