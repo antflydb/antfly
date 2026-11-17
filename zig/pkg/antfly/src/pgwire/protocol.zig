@@ -1088,6 +1088,25 @@ pub const Session = struct {
             const kind: backend.Type = if (command_value == .identify_system and index == 1) .integer else .string;
             if (!std.mem.eql(u8, column.name, name) or column.type != kind or column.element_type != null or column.numeric_modifier != null) return error.InvalidResult;
         }
+        if (command_value == .create_slot) {
+            const create = command_value.create_slot;
+            // Administration results are one materialized row. Validate the
+            // exact values that will go on the wire before sending metadata.
+            if (result.cells != null) return error.InvalidResult;
+            const name = try result.cell(a, 0, 0);
+            const point = try result.cell(a, 0, 1);
+            const snapshot = try result.cell(a, 0, 2);
+            const plugin = try result.cell(a, 0, 3);
+            if (name.sql_null or name.value != .string or !std.mem.eql(u8, name.value.string, create.slot)) return error.InvalidResult;
+            if (point.sql_null or point.value != .string) return error.InvalidResult;
+            const lsn = replication_commands.parseLsn(point.value.string) catch return error.InvalidResult;
+            if (@backingInt(lsn) == 0) return error.InvalidResult;
+            if (plugin.sql_null or plugin.value != .string or !std.mem.eql(u8, plugin.value.string, "pgoutput")) return error.InvalidResult;
+            switch (create.snapshot) {
+                .export_snapshot => if (snapshot.sql_null or snapshot.value != .string or snapshot.value.string.len == 0 or std.mem.indexOfScalar(u8, snapshot.value.string, 0) != null) return error.InvalidResult,
+                .use_snapshot, .nothing => if (!snapshot.sql_null) return error.InvalidResult,
+            }
+        }
         owner.authorize(owner.context, a, request_value, command_value) catch |err| {
             if (mutates) self.diagnostic.set("40003", "replication command committed; authorization changed before reply; inspect slot state", null, null);
             return err;

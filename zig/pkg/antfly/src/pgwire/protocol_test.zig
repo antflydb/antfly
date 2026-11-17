@@ -27,6 +27,7 @@ const Mock = struct {
     replication_opens: usize = 0,
     replication_closes: usize = 0,
     replication_checks: usize = 0,
+    invalid_slot_reply: enum { none, name, lsn, snapshot, plugin } = .none,
     replication_commands: usize = 0,
     replication_stream_enabled: bool = false,
     replication_stream_opens: usize = 0,
@@ -214,7 +215,12 @@ const Mock = struct {
             return .{ .columns = &.{ .{ .name = "systemid", .type = .string }, .{ .name = "timeline", .type = .integer }, .{ .name = "xlogpos", .type = .string }, .{ .name = "dbname", .type = .string } }, .rows = rows, .command_tag = "IDENTIFY_SYSTEM" };
         }
         if (command == .create_slot) {
-            rows[0] = try a.dupe(std.json.Value, &.{ .{ .string = command.create_slot.slot }, .{ .string = "0/1" }, .{ .string = "snapshot-fixture" }, .{ .string = "pgoutput" } });
+            rows[0] = try a.dupe(std.json.Value, &.{
+                .{ .string = if (self.invalid_slot_reply == .name) "other-slot" else command.create_slot.slot },
+                .{ .string = if (self.invalid_slot_reply == .lsn) "0/0" else "0/1" },
+                if (command.create_slot.snapshot == .export_snapshot and self.invalid_slot_reply != .snapshot) .{ .string = "snapshot-fixture" } else .null,
+                .{ .string = if (self.invalid_slot_reply == .plugin) "other-plugin" else "pgoutput" },
+            });
             return .{ .columns = &.{ .{ .name = "slot_name", .type = .string }, .{ .name = "consistent_point", .type = .string }, .{ .name = "snapshot_name", .type = .string }, .{ .name = "output_plugin", .type = .string } }, .rows = rows, .command_tag = "CREATE_REPLICATION_SLOT", .mutation_outcome = .committed };
         }
         if (command != .drop_slot) return error.TestUnexpectedResult;
@@ -2844,6 +2850,22 @@ test "pgwire logical startup authenticates and dispatches replication administra
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "snapshot-fixture") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "CREATE_REPLICATION_SLOT") != null);
 }
+test "pgwire logical slot creation withholds mismatched slot results" {
+    for ([_]@FieldType(Mock, "invalid_slot_reply"){ .name, .lsn, .snapshot, .plugin }) |invalid| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, "replication\x00database\x00");
+        try frame(&input.writer, 'Q', "CREATE_REPLICATION_SLOT s LOGICAL pgoutput EXPORT_SNAPSHOT\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .replication_enabled = true, .invalid_slot_reply = invalid };
+        var out = try run(&mock, input.written(), .{});
+        defer out.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.replication_commands);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "CREATE_REPLICATION_SLOT") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "40003") != null);
+    }
+}
+
 test "pgwire logical startup requires backend capability and explicit live authorization" {
     for ([_]bool{ false, true }) |enabled| {
         var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
