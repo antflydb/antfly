@@ -20155,7 +20155,7 @@ pub const ApiHttpServer = struct {
     /// One scheduling slice of the EXISTING restore job. Native row pages,
     /// global constraint activation, publication, and cancellation all retain
     /// the same durable staging incarnation across execution retries.
-    fn driveStagedRestore(self: *ApiHttpServer, restore: RestoreCancellation, staging_attempt: u64, initial: []const u8, table_names: []const []const u8) anyerror![]u8 {
+    fn driveStagedRestore(self: *ApiHttpServer, restore: RestoreCancellation, staging_attempt: u64, initial: []const u8) anyerror![]u8 {
         var zig017_return_error: ?anyerror = null;
         if (self.cfg.deployment_mode == .standalone) _ = (self.source.runRound() catch |zig017_err| {
             zig017_return_error = zig017_err;
@@ -21004,16 +21004,20 @@ pub const ApiHttpServer = struct {
                             return zig017_err;
                         });
                         self.alloc.free(resolved);
-                        const statuses = (self.alloc.alloc(backups_api.ClusterTableRestoreStatus, table_names.len) catch |zig017_err| {
+                        // Use the durable plan after both initial execution and
+                        // resume. The request may name a public catalog alias.
+                        const targets = job.value.plan.targets;
+                        const skipped = job.value.plan.skipped_tables;
+                        const statuses = (self.alloc.alloc(backups_api.ClusterTableRestoreStatus, targets.len + skipped.len) catch |zig017_err| {
                             zig017_return_error = zig017_err;
                             return zig017_err;
                         });
                         defer self.alloc.free(statuses);
-                        for (table_names, statuses) |name, *status| {
-                            const present = for (job.value.plan.targets) |target| {
-                                if (std.mem.eql(u8, target.table.name, name)) break true;
-                            } else false;
-                            status.* = .{ .name = name, .status = if (present) "committed" else "skipped", .@"error" = null };
+                        for (targets, statuses[0..targets.len]) |target, *status| {
+                            status.* = .{ .name = target.table.name, .status = "committed", .@"error" = null };
+                        }
+                        for (skipped, statuses[targets.len..]) |name, *status| {
+                            status.* = .{ .name = name, .status = "skipped", .@"error" = null };
                         }
                         return backups_api.encodeClusterRestoreResponse(self.alloc, statuses) catch |zig017_err| {
                             zig017_return_error = zig017_err;
@@ -21387,7 +21391,7 @@ pub const ApiHttpServer = struct {
         const context = control.context();
         if (try self.source.getRestoreStaging(self.alloc, id, context)) |existing| {
             defer self.alloc.free(existing);
-            return self.driveStagedRestore(restore, staging_attempt, existing, if (req.single_table_destination) |destination| &.{destination} else names);
+            return self.driveStagedRestore(restore, staging_attempt, existing);
         }
         const sources = try a.alloc(driver.SourceTable, names.len);
         const logical_state = if (self.source.vtable.system_catalog != null)
@@ -21477,7 +21481,7 @@ pub const ApiHttpServer = struct {
         const encoded = try std.json.Stringify.valueAlloc(a, stages.Command{ .id = id, .action = .reserve, .plan = plan }, .{});
         const reserved = try self.source.applyRestoreStaging(self.alloc, encoded, context);
         defer self.alloc.free(reserved);
-        return self.driveStagedRestore(restore, staging_attempt, reserved, if (req.single_table_destination) |destination| &.{destination} else names);
+        return self.driveStagedRestore(restore, staging_attempt, reserved);
     }
 
     fn stagedRestoreError(err: anyerror) cluster_api_http.ClusterApi.ExecuteRestoreError {
@@ -21537,16 +21541,7 @@ pub const ApiHttpServer = struct {
         const id = try stages.idForAttempt(state.job_id, state.staging_attempt_id);
         if (try self.source.getRestoreStaging(self.alloc, id, context)) |existing| {
             defer self.alloc.free(existing);
-            var arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena.deinit();
-            const parsed = try std.json.parseFromSlice(stages.Job, arena.allocator(), existing, .{});
-            const names = state.table_names orelse names: {
-                const values = try arena.allocator().alloc([]const u8, parsed.value.plan.targets.len + parsed.value.plan.skipped_tables.len);
-                for (parsed.value.plan.targets, values[0..parsed.value.plan.targets.len]) |target, *name| name.* = target.table.name;
-                @memcpy(values[parsed.value.plan.targets.len..], parsed.value.plan.skipped_tables);
-                break :names values;
-            };
-            return self.driveStagedRestore(restore, state.staging_attempt_id, existing, names);
+            return self.driveStagedRestore(restore, state.staging_attempt_id, existing);
         }
         if (!state.cancel_requested and state.staging_failure.len == 0) return error.RestoreValidationPending;
         const command = try std.json.Stringify.valueAlloc(self.alloc, stages.Command{ .id = id, .action = .cancel_reservation }, .{});
@@ -21637,16 +21632,7 @@ pub const ApiHttpServer = struct {
                 var staged_control = StagedRestoreControl{ .server = self, .restore = restore };
                 if (self.source.getRestoreStaging(self.alloc, id, staged_control.context()) catch |err| return stagedRestoreError(err)) |existing| {
                     defer self.alloc.free(existing);
-                    var arena = std.heap.ArenaAllocator.init(self.alloc);
-                    defer arena.deinit();
-                    const parsed = std.json.parseFromSlice(@import("../metadata/restore_staging.zig").Job, arena.allocator(), existing, .{}) catch return error.InternalFailure;
-                    const names = req.table_names orelse names: {
-                        const values = arena.allocator().alloc([]const u8, parsed.value.plan.targets.len + parsed.value.plan.skipped_tables.len) catch return error.InternalFailure;
-                        for (parsed.value.plan.targets, values[0..parsed.value.plan.targets.len]) |target, *name| name.* = target.table.name;
-                        @memcpy(values[parsed.value.plan.targets.len..], parsed.value.plan.skipped_tables);
-                        break :names values;
-                    };
-                    return self.driveStagedRestore(restore, state.value.staging_attempt_id, existing, names) catch |err| return stagedRestoreError(err);
+                    return self.driveStagedRestore(restore, state.value.staging_attempt_id, existing) catch |err| return stagedRestoreError(err);
                 }
                 // Fence absent reservations durably. A delayed reserve must
                 // not recreate targets after cancellation has terminalized.
@@ -26764,11 +26750,11 @@ test "staged restore published metadata wins cancellation only after every owner
     const encoded = try std.json.Stringify.valueAlloc(alloc, job, .{});
     defer alloc.free(encoded);
     const restore: ApiHttpServer.RestoreCancellation = .{ .job_id = worker.value.job_id, .attempt_id = worker.value.attempt_id };
-    try std.testing.expectError(error.RestoreStagingYield, server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}));
+    try std.testing.expectError(error.RestoreStagingYield, server.driveStagedRestore(restore, worker.value.attempt_id, encoded));
     try std.testing.expectEqual(@as(usize, 1), fixture.calls[0]);
     for (fixture.calls[1..]) |count| try std.testing.expectEqual(@as(usize, 0), count);
     for (0..130) |_| {
-        const unexpected = server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}) catch |err| {
+        const unexpected = server.driveStagedRestore(restore, worker.value.attempt_id, encoded) catch |err| {
             if (err == error.RestoreStagingYield) continue;
             try std.testing.expectEqual(error.Timeout, err);
             break;
@@ -26782,7 +26768,7 @@ test "staged restore published metadata wins cancellation only after every owner
     defer progress.deinit();
     try std.testing.expectEqual(.active, progress.value.staging_resolution);
     const result = for (0..3) |_| {
-        break server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}) catch |err| {
+        break server.driveStagedRestore(restore, worker.value.attempt_id, encoded) catch |err| {
             if (err == error.RestoreStagingYield) continue;
             return err;
         };
