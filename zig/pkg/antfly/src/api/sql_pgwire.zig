@@ -3805,6 +3805,15 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
     const dropped = try slots.drop(alloc, .{ .drop_slot = .{ .slot = "docs_slot", .wait = false } }, authority.request, .{});
     try std.testing.expectEqualStrings("DROP_REPLICATION_SLOT", dropped.command_tag);
     try std.testing.expectEqual(publication_control.Phase.closing, fixture.slot_state.phase);
+    fixture.slot_state = try (publication_control.Mutation{ .release_root = .{
+        .namespace = namespace,
+        .ownership_epoch = 1,
+        .proof = @splat(10),
+    } }).apply(alloc, fixture.slot_state, .{ .incarnation = incarnation, .sequence = fixture.slot_state.authority_sequence + 1 });
+    const metadata = server.source.changefeeds.?;
+    const maintenance = CatalogReplicationSlots.maintenanceContext(.{});
+    try @import("changefeed_public.zig").maintainNativeFeed(metadata, undefined, std.testing.io, alloc, id, maintenance);
+    try std.testing.expectEqual(publication_control.Phase.deleted, fixture.slot_state.phase);
     fixture.database_id = 99;
     try std.testing.expectError(error.ChangefeedResynchronizationRequired, slots.readOwned(alloc, "docs_slot", .{}));
     try std.testing.expect(fixture.slot_reads > 4);

@@ -198,8 +198,9 @@ const RootPolicy = struct {
             return access.authorize(state, request);
         }
         try request.ensureActive();
-        if ((state.phase != .closing and state.phase != .reset_required) or state.slot != null)
+        if (state.phase != .closing and state.phase != .reset_required)
             return error.ChangefeedConflict;
+        if (state.slot != null and self.access != null) return error.Forbidden;
         if (self.access) |access| {
             var identity = try authenticate(access.api, access.credential);
             defer identity.deinit(access.api.alloc);
@@ -407,7 +408,7 @@ pub fn maintainNativeFeed(metadata: config.Port, source: source_api.Source, io: 
     var parsed = try load(&client, a, id, request);
     defer parsed.deinit();
     const state = parsed.value;
-    if ((state.phase != .closing and state.phase != .reset_required) or state.slot != null or state.definition.?.start != .now)
+    if ((state.phase != .closing and state.phase != .reset_required) or state.definition.?.start != .now)
         return;
     var policy: RootPolicy = .{ .access = null, .io = io, .source = source, .allocator = a, .closing = true };
     _ = try retireOne(&client, &policy, a, state, request);
@@ -419,6 +420,9 @@ fn retireOne(client: *config.Client, policy: *RootPolicy, a: A, state: control.S
         if (!candidate.released) break candidate;
     } else {
         if (state.phase == .reset_required) return false;
+        // Slot garbage is collected by its artifact owner. Native history
+        // retirement can run first, but the tombstone waits for both owners.
+        if (state.slot) |slot| if (slot.spool.records.len != 0) return false;
         try policy.authorizeRoot(state, @splat(0), request);
         try change(client, a, state, .finish_close, request);
         return true;
