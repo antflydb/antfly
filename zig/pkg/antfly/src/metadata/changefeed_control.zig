@@ -178,6 +178,18 @@ pub const Delivery = struct {
         return hash(.{ .domain = "antfly:changefeed-cursor:v1", .id = id, .epoch = epoch, .sequence = self.sequence, .before = self.before, .authority = self.authority, .issued_at = self.issued_at, .advances = self.advances });
     }
 };
+pub const MaintenanceScan = struct {
+    pub const limit = 32;
+    ids: [limit]Id = undefined,
+    count: usize = 0,
+    /// Exclusive position of the last inspected row, including ineligible
+    /// rows. A sparse or empty page must still make forward progress.
+    next: ?Id = null,
+
+    pub fn items(self: *const MaintenanceScan) []const Id {
+        return self.ids[0..self.count];
+    }
+};
 pub const Phase = enum { empty, enrolling, bootstrap, streaming, reset_required, closing, deleted };
 pub const Reset = enum { none, policy_changed, table_retired, history_expired, bootstrap_expired, lease_expired, topology_lost, quota };
 pub const Stamp = struct { incarnation: Digest, sequence: u64 };
@@ -217,6 +229,18 @@ pub const State = struct {
         }
         return error.ChangefeedConflict;
     }
+    pub fn needsMaintenance(self: State, now: u64) bool {
+        return switch (self.phase) {
+            .empty, .deleted => false,
+            .closing => true,
+            .reset_required => for (self.roots) |root| {
+                if (!root.released or (root.snapshot != null and !root.snapshot_released)) break true;
+            } else if (self.slot) |slot| slot.spool.records.len != 0 else false,
+            .enrolling, .bootstrap, .streaming => now >= self.expires_at or
+                (self.phase != .streaming and self.bootstrap_expires_at != 0 and now >= self.bootstrap_expires_at),
+        };
+    }
+
     pub fn consumerId(self: State) Id {
         return hash(.{ .domain = "antfly:changefeed-consumer:v1", .authority = self.authority, .id = self.id, .epoch = self.epoch })[0..16].*;
     }
@@ -1065,8 +1089,15 @@ pub fn parseAuthority(a: A, bytes: []const u8) !Stamp {
 pub fn prefixForGroup(buffer: []u8, group: u64) ![]const u8 {
     return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:changefeeds:{d}:", .{group});
 }
+pub fn statePrefixForGroup(buffer: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:changefeeds:{d}:state:", .{group});
+}
 pub fn keyForGroup(buffer: []u8, group: u64, id: Id) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:changefeeds:{d}:state:{s}", .{ group, std.fmt.bytesToHex(id, .lower) });
+    const prefix = try statePrefixForGroup(buffer, group);
+    const hex = std.fmt.bytesToHex(id, .lower);
+    if (buffer.len - prefix.len < hex.len) return error.NoSpaceLeft;
+    @memcpy(buffer[prefix.len..][0..hex.len], &hex);
+    return buffer[0 .. prefix.len + hex.len];
 }
 pub fn authorityKey(buffer: []u8, group: u64) ![]const u8 {
     return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:changefeeds:{d}:authority", .{group});

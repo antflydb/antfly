@@ -15312,6 +15312,49 @@ pub const RaftApplyStore = struct {
             else => err,
         };
     }
+    /// Scan a bounded number of existing state keys in one projection cut.
+    /// Only identity candidates leave this read transaction. The driver must
+    /// reread each identity and use its current CAS revision before mutating.
+    pub fn scanChangefeedMaintenance(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, now: u64, after: ?changefeed_control.Id) !changefeed_control.MaintenanceScan {
+        if (group_id == 0 or now == 0) return error.InvalidChangefeed;
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var prefix_buf: [96]u8 = undefined;
+        const prefix = try changefeed_control.statePrefixForGroup(&prefix_buf, group_id);
+        var key_buf: [128]u8 = undefined;
+        const start = if (after) |id| try changefeed_control.keyForGroup(&key_buf, group_id, id) else prefix;
+        var row = try cursor.seekAtOrAfter(start);
+        if (after != null) if (row) |item| {
+            if (std.mem.eql(u8, item.key, start)) row = try cursor.next();
+        };
+        var scan: changefeed_control.MaintenanceScan = .{};
+        var last: ?changefeed_control.Id = null;
+        for (0..changefeed_control.MaintenanceScan.limit) |_| {
+            const item = row orelse break;
+            if (!std.mem.startsWith(u8, item.key, prefix)) break;
+            const hex = item.key[prefix.len..];
+            var id: changefeed_control.Id = undefined;
+            if (hex.len != id.len * 2) return error.ChangefeedCorrupt;
+            _ = std.fmt.hexToBytes(&id, hex) catch return error.ChangefeedCorrupt;
+            var parsed = try changefeed_control.parse(a, item.value);
+            defer parsed.deinit();
+            if (!std.mem.eql(u8, &parsed.value.id, &id) or parsed.value.phase == .empty)
+                return error.ChangefeedCorrupt;
+            if (parsed.value.needsMaintenance(now)) {
+                scan.ids[scan.count] = id;
+                scan.count += 1;
+            }
+            last = id;
+            row = try cursor.next();
+        }
+        if (row) |item| if (std.mem.startsWith(u8, item.key, prefix)) {
+            scan.next = last;
+        };
+        return scan;
+    }
+
     pub fn getChangefeedAuthority(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64) !?changefeed_control.Stamp {
         var buffer: [256]u8 = undefined;
         const bytes = self.store.get(a, try changefeed_control.authorityKey(&buffer, group_id)) catch |err| switch (err) {
@@ -45575,6 +45618,45 @@ test "metadata source control snapshot installs pending source authority and ret
     var txn = try target.store.beginWriteTxn();
     defer txn.abort();
     try std.testing.expectError(error.TableTransitionActive, target.removeTableTxn(&txn, group_id, table.table_id, 0));
+}
+
+test "metadata changefeed control maintenance scan advances over a full ineligible page" {
+    const a = std.testing.allocator;
+    const control = changefeed_control;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/changefeed-maintenance", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    const group = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "docs", .schema_json = "{}" };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const definition: control.Definition = .{ .owner = @splat(1), .authorization = @splat(2), .tables = &.{.{ .table_id = 7, .binding = control.tableBinding(table), .policy_revision = 1, .contract = .native_document }} };
+    for (1..control.MaintenanceScan.limit + 3) |n| {
+        const id: control.Id = @splat(@as(u8, @intCast(n)));
+        const write: control.Write = .{
+            .id = id,
+            .authority = @splat(9),
+            .owner = definition.owner,
+            .authorization = definition.authorization,
+            .expected_revision = 0,
+            .expected_epoch = 0,
+            .mutation = .{ .create = .{ .id = id, .definition = definition, .now = 100, .expires_at = if (n == control.MaintenanceScan.limit + 1) 200 else 1000 } },
+        };
+        const command = try control.encodeWrite(a, write);
+        defer a.free(command);
+        try store.applyStandaloneCommand(group, .{ .apply_changefeed_control = command });
+    }
+    const first = try store.scanChangefeedMaintenance(a, group, 200, null);
+    try std.testing.expectEqual(@as(usize, 0), first.count);
+    try std.testing.expectEqual(@as(control.Id, @splat(control.MaintenanceScan.limit)), first.next.?);
+    const second = try store.scanChangefeedMaintenance(a, group, 200, first.next);
+    try std.testing.expectEqualSlices(control.Id, &.{@splat(control.MaintenanceScan.limit + 1)}, second.items());
+    try std.testing.expect(second.next == null);
+    const other = try store.scanChangefeedMaintenance(a, group + 1, 200, null);
+    try std.testing.expectEqual(@as(usize, 0), other.count);
+    try std.testing.expect(other.next == null);
 }
 
 test "metadata changefeed control persists cursor debt fences bindings and survives reopen" {
