@@ -2052,8 +2052,9 @@ pub fn tableGroupDescriptorProjection(
 /// One catalog-clock budget covers eventual capture, authoritative miss
 /// confirmation, and projection. Cancellation prevents admission after a
 /// completed capture; the original deadline bounds capture I/O itself.
-/// An authoritative point miss is final for a stale owner refresh.
-pub fn refreshTableGroupDescriptor(
+/// Capture the applied point projection without a quorum barrier or an admin
+/// scan. Storage owner admission can already hold a structural read lease.
+pub fn appliedTableGroupDescriptor(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,
     table_name: []const u8,
@@ -2061,7 +2062,7 @@ pub fn refreshTableGroupDescriptor(
     budget: RoutingBudget,
 ) !?TableGroupDescriptorProjection {
     try budget.checkpoint();
-    const capture = catalog.vtable.linearizable_table_routing_snapshot orelse return error.CatalogRoutingUnavailable;
+    const capture = catalog.vtable.table_routing_snapshot orelse return error.CatalogRoutingUnavailable;
     if (catalog.vtable.free_routing_snapshot == unsupportedFreeRoutingSnapshot)
         return error.CatalogRoutingUnavailable;
     var snapshot = try capture(catalog.ptr, table_name, budget.deadline_ns);

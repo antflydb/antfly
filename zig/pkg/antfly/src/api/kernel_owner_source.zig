@@ -223,7 +223,7 @@ test "source owner lookup and descriptor admission preserve one cancellable cata
             var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", .{ .ptr = &fixture, .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&catalog_io), .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .table_routing_snapshot = Fixture.capture, .linearizable_table_routing_snapshot = Fixture.confirm, .free_routing_snapshot = Fixture.freeRouting } }, read_gate.alreadyReadSafeBarrier());
             const opts: db_types.LookupOptions = .{ .execution_deadline_ns = fixture.request_now + std.time.ns_per_s, .execution_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&request_io), .cancellation = .fromAtomic(&fixture.canceled) };
             const expected: anyerror = switch (mode) {
-                .confirm => error.DescriptorProbeComplete,
+                .confirm => error.TableNotFound,
                 .cancel => error.Canceled,
                 .expire => error.CatalogRoutingSnapshotTimeout,
             };
@@ -233,7 +233,7 @@ test "source owner lookup and descriptor admission preserve one cancellable cata
                 try std.testing.expectError(expected, source.acquireWithControls(7, "rows", .from(opts)));
             }
             try std.testing.expectEqual(@as(usize, 1), fixture.captures);
-            try std.testing.expectEqual(@as(usize, if (mode == .confirm) 1 else 0), fixture.confirmations);
+            try std.testing.expectEqual(@as(usize, 0), fixture.confirmations);
         }
     }
 }
@@ -3082,10 +3082,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         group_id: u64,
         table_name: []const u8,
         budget: table_catalog.RoutingBudget,
-        refresh: bool,
+        applied_only: bool,
     ) !LoadedDescriptor {
-        var projection = (if (refresh)
-            try table_catalog.refreshTableGroupDescriptor(alloc, self.catalog, table_name, group_id, budget)
+        var projection = (if (applied_only)
+            try table_catalog.appliedTableGroupDescriptor(alloc, self.catalog, table_name, group_id, budget)
         else
             try table_catalog.tableGroupDescriptorProjectionControlled(alloc, self.catalog, table_name, group_id, budget)) orelse return error.TableNotFound;
         errdefer projection.deinit(alloc);
@@ -3156,17 +3156,21 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !Lease {
         try controls.check();
         const budget = controls.catalogBudget(self.catalog);
+        const has_point_projection = self.catalog.vtable.table_routing_snapshot != null;
+        if (!has_point_projection and self.catalog.vtable.linearizable_table_routing_snapshot != null)
+            return error.CatalogRoutingUnavailable;
         var refreshed = false;
         while (true) {
-            var descriptor = try self.loadDescriptorForAdmission(self.alloc, group_id, table_name, budget, refreshed);
+            var descriptor = try self.loadDescriptorForAdmission(self.alloc, group_id, table_name, budget, has_point_projection);
             defer descriptor.deinit(self.alloc);
             try controls.check();
             return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, descriptor.readControls(controls)) catch |err| {
                 if (err != error.StorageKernelOwnerStaleDescriptor or refreshed) return err;
-                // Nothing has reached the owner. Refresh the rejected physical
-                // contract once through its authoritative point projection;
-                // never replay a storage operation or reset the request budget.
-                if (self.catalog.vtable.linearizable_table_routing_snapshot == null) return err;
+                // Recheck the applied catalog once. A quorum barrier here
+                // could wait for apply while the caller holds read admission.
+                // If the cut is still stale, return to the routing caller,
+                // which can retry after unwinding admission.
+                if (!has_point_projection) return err;
                 refreshed = true;
                 continue;
             };
@@ -7896,15 +7900,16 @@ test "owner descriptor admission refreshes stale point captures once before exec
         fn capture(ptr: *anyopaque, _: []const u8, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.captures += 1;
-            return snapshot(41, false);
-        }
-        fn confirm(ptr: *anyopaque, _: []const u8, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.confirmations += 1;
+            if (self.captures == 1) return snapshot(41, false);
             if (self.cancel) self.canceled.store(true, .release);
             var result = snapshot(if (self.keep_stale) 41 else 42, !self.keep_stale);
             if (self.missing) result.ranges = &.{};
             return result;
+        }
+        fn confirm(ptr: *anyopaque, _: []const u8, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.confirmations += 1;
+            return error.UnexpectedReadIndexUnderAdmission;
         }
         fn freeRouting(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
         fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
@@ -7943,8 +7948,8 @@ test "owner descriptor admission refreshes stale point captures once before exec
         } else {
             try std.testing.expectError(if (mode == 1) error.StorageKernelOwnerStaleDescriptor else if (mode == 2) error.Canceled else error.TableNotFound, source.acquireWithControls(2, "docs", controls));
         }
-        try std.testing.expectEqual(@as(usize, 1), fixture.captures);
-        try std.testing.expectEqual(@as(usize, 1), fixture.confirmations);
+        try std.testing.expectEqual(@as(usize, 2), fixture.captures);
+        try std.testing.expectEqual(@as(usize, 0), fixture.confirmations);
         try std.testing.expect(!entry.retired);
         try std.testing.expectEqual(@as(u64, 0), source.owner_cache_misses.load(.monotonic));
     }
