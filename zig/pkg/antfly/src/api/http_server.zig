@@ -21719,7 +21719,7 @@ pub const ApiHttpServer = struct {
         if (table_names.len > restore_jobs.max_cluster_tables_per_job) return error.InvalidRequest;
 
         if (manifest.cohort_json.len == 0 and
-            (clusterPortableForeignKeyRestoreGuarded(op_alloc, location, &manifest, table_names, .storage, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch return error.InvalidRequest))
+            (clusterPortableForeignKeyRestoreGuarded(op_alloc, location, &manifest, table_names, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch return error.InvalidRequest))
             return error.PortableForeignKeyRestoreUnavailable;
 
         if (manifest.cohort_json.len != 0) {
@@ -25413,7 +25413,15 @@ pub const ApiHttpServer = struct {
             var manifest = backups_api.readClusterManifestForRestoreAdmissionWithCache(self.alloc, restore_io, &location, req.backup_id, &verification_cache) catch |err|
                 return try contextualJsonErrorResponse(self.alloc, if (err == error.BackupManifestTooLarge) 413 else 400, "invalid cluster backup manifest");
             defer manifest.deinit(self.alloc);
-            const guarded = clusterPortableForeignKeyRestoreGuarded(self.alloc, &location, &manifest, req.table_names, .public, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch
+            const selected = if (req.table_names) |names|
+                resolveClusterRestoreSelectionAlloc(self.alloc, &manifest, names) catch |err| switch (err) {
+                    error.InvalidRequest => return try contextualJsonErrorResponse(self.alloc, 400, "unknown, ambiguous, or duplicate backup table selection"),
+                    else => return err,
+                }
+            else
+                null;
+            defer if (selected) |names| freeOwnedTableNames(self.alloc, names);
+            const guarded = clusterPortableForeignKeyRestoreGuarded(self.alloc, &location, &manifest, selected, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch
                 return try contextualJsonErrorResponse(self.alloc, 400, "invalid relational backup declarations");
             admission = self.restore_job_store.startRecoverableGuarded(self.alloc, start_request, !guarded) catch |err|
                 return try restoreJobStartErrorResponse(self.alloc, err);
@@ -26914,7 +26922,6 @@ fn clusterPortableForeignKeyRestoreGuarded(
     location: *backups_api.BackupLocation,
     manifest: *const backups_api.ClusterBackupManifest,
     selected_names: ?[]const []const u8,
-    name_kind: enum { storage, public },
     test_permit: bool,
 ) !bool {
     if (builtin.is_test and test_permit) return false;
@@ -26924,12 +26931,8 @@ fn clusterPortableForeignKeyRestoreGuarded(
         if (proof.value.artifact_format == .native) return false;
     }
     if (selected_names) |names| {
-        var selection: backups_api.ClusterTableSelection = .{ .manifest = manifest };
         for (names) |name| {
-            const entry = (switch (name_kind) {
-                .storage => backups_api.findClusterTableByStorageName(manifest, name),
-                .public => selection.find(name),
-            }) orelse return error.InvalidBackupRequest;
+            const entry = backups_api.findClusterTableByStorageName(manifest, name) orelse return error.InvalidBackupRequest;
             var table = try backups_api.readManifestFromLocationWithArtifactBackupId(alloc, location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id);
             defer table.deinit(alloc);
             if (!std.mem.eql(u8, table.table_name, entry.name)) return error.BackupIntegrityFailure;

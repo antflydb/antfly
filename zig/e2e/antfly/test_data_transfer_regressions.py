@@ -64,10 +64,10 @@ def test_lite_server_backup_roundtrip_under_connection_root(
     }
     env.pop("ANTFLY_TOKEN", None)
 
-    def cli(*args, check=True):
+    def cli(*args, check=True, extra_env=None):
         result = subprocess.run(
             [binary, *([] if args[0] == "lite" else ["--no-agent"]), *map(str, args)],
-            env=env,
+            env={**env, **(extra_env or {})},
             capture_output=True,
             text=True,
             timeout=120,
@@ -415,6 +415,8 @@ def test_lite_server_backup_roundtrip_under_connection_root(
                     == "unsupported_schema_migration"
                 )
                 migration_target = root / "migration-blocked"
+                unavailable_scratch = tmp_path / "unavailable-scratch"
+                unavailable_scratch.write_text("regular file")
                 failure = cli(
                     "restore",
                     "--input",
@@ -429,6 +431,7 @@ def test_lite_server_backup_roundtrip_under_connection_root(
                     server.url,
                     "--wait",
                     check=False,
+                    extra_env={"TMPDIR": str(unavailable_scratch)},
                 )
                 assert failure.returncode != 0
                 assert "finish the migration on the source server" in failure.stderr

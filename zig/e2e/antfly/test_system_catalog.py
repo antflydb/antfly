@@ -413,6 +413,21 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
             item["selector"] for item in selectors if item["name"] == display_collision
         ]
         assert len(set(collisions)) == 2
+        other_location = (Path(directory) / "other").as_uri()
+        api.cluster_backup(backup_id="catalog-cluster", location=other_location)
+        rejected = api.s.post(
+            f"{api.url}/restore",
+            json={
+                "backup_id": "catalog-cluster",
+                "location": other_location,
+                "connection": E2E_BACKUP_CONNECTION,
+                "restore_mode": "overwrite",
+                "table_names": [collisions[0]],
+            },
+            timeout=30,
+        )
+        assert rejected.status_code == 400, rejected.text
+        assert "backup table selection" in rejected.text
         # The API assertions below exercise the durable manifest after names
         # have disappeared from the live catalog; they cannot pass through a
         # cache of existing bindings.
