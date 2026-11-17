@@ -28,7 +28,17 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
     const sa = scratch.allocator();
     var state = try local.metadata_lake_index_catalog.parse(sa, table.lake_index_catalog_json);
     defer state.deinit();
-    const publication = state.value.published orelse return &.{};
+    const publication = state.value.published orelse {
+        if (state.value.pending != null or state.value.failure != null or
+            (table.indexes_json.len != 0 and !std.mem.eql(u8, table.indexes_json, "{}")) or
+            std.mem.indexOf(u8, table.schema_json, "\"relational_indexes\"") != null or
+            std.mem.indexOf(u8, table.schema_json, "iceberg_writer") != null)
+        {
+            try request.ensureActive();
+            try server.requestLakePublication(table.name);
+        }
+        return &.{};
+    };
     const eligible = for (publication.declarations) |declaration| {
         if ((declaration.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(declaration.artifact.metadata_version)) or declaration.artifact.kind == .ordered_row_index) break true;
     } else false;
@@ -86,6 +96,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         try context.ensureActive();
         if (err == error.OutOfMemory) return err;
         switch (err) {
+            error.ExternalLakeIndexNotPublished,
             error.ExternalLakeIndexUnavailable,
             error.InvalidLogicalRowIdentity,
             error.LakeIndexArtifactUnavailable,

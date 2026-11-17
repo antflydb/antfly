@@ -216,6 +216,7 @@ def qualification_fakes(tmp_path, monkeypatch):
         def __exit__(self, *_):
             self.close()
 
+    state.server_factory = FakeServer
     monkeypatch.setattr(bench, "Monitor", FakeMonitor)
     monkeypatch.setattr(bench, "StandaloneAntflyServer", FakeServer)
     monkeypatch.setattr(bench.requests, "Session", FakeSession)
@@ -382,7 +383,7 @@ def test_cleanup_failure_fails_an_otherwise_completed_qualification(
 
     state = qualification_fakes
     measurements = bench.ProcessMeasurements()
-    server = bench.StandaloneAntflyServer(
+    server = state.server_factory(
         "/unused", "", 1, on_process_started=measurements.start
     )
     session = bench.requests.Session()

@@ -4220,6 +4220,8 @@ pub const ApiHttpServer = struct {
     index_installation_worker_in_flight: std.atomic.Value(bool) = .init(false),
     index_installation_mutex: std.atomic.Mutex = .unlocked,
     index_installation_apply_mutex: std.atomic.Mutex = .unlocked,
+    // Borrowed keys are owned by the corresponding queued publication.
+    pending_lake_publications: std.StringHashMapUnmanaged(void) = .empty,
     index_installation_queue: std.ArrayListUnmanaged(PendingIndexInstallation) = .empty,
     index_installation_reserved_slots: usize = 0,
     index_installation_next_generation: u64 = 1,
@@ -5092,6 +5094,7 @@ pub const ApiHttpServer = struct {
             if (self.index_installation_owner_id != 0) runtime.durable_jobs.closeOwner(self.index_installation_owner_id);
         }
         platform_sync.lockYielding(&self.index_installation_mutex);
+        self.pending_lake_publications.deinit(std.heap.page_allocator);
         for (self.index_installation_queue.items) |*entry| entry.deinit();
         self.index_installation_queue.deinit(std.heap.page_allocator);
         self.index_installation_mutex.unlock();
@@ -13003,6 +13006,14 @@ pub const ApiHttpServer = struct {
             return error.InternalFailure;
         }
 
+        fn preparationError(self: *@This(), cause: anyerror) cluster_api_http.ClusterApi.ExecuteBackupError![]u8 {
+            return switch (cause) {
+                error.Canceled, error.Cancelled => error.Canceled,
+                error.Timeout, error.DeadlineExceeded => error.DeadlineExceeded,
+                else => self.internal(cause),
+            };
+        }
+
         fn logFailure(self: *const @This(), public_err: anyerror) void {
             if (public_err != error.InternalFailure) return;
             std.log.err("cluster backup failed phase={s} class={s}", .{
@@ -17426,6 +17437,8 @@ pub const ApiHttpServer = struct {
             alloc,
             self.index_installation_reserved_slots + 1,
         );
+        if (std.mem.eql(u8, index_name, "__lake_publication"))
+            try self.pending_lake_publications.ensureUnusedCapacity(alloc, @intCast(self.index_installation_reserved_slots + 1));
         self.index_installation_reserved_slots += 1;
         payload_transferred = true;
         return .{
@@ -17475,6 +17488,12 @@ pub const ApiHttpServer = struct {
         if (self.index_installation_next_generation == 0) self.index_installation_next_generation = 1;
         std.debug.assert(self.index_installation_reserved_slots > 0);
         self.index_installation_reserved_slots -= 1;
+        const lake_publication = maintenance_table_id == null and std.mem.eql(u8, prepared.index_name, "__lake_publication");
+        if (lake_publication) {
+            // A replacement transfers ownership of the key along with the job.
+            _ = self.pending_lake_publications.remove(prepared.table_name);
+            self.pending_lake_publications.putAssumeCapacity(prepared.table_name, {});
+        }
         if (existing) |pending| {
             pending.deinit();
             pending.* = .{
@@ -17603,6 +17622,11 @@ pub const ApiHttpServer = struct {
     /// periodic inventory sweep. Coalesce that hint without resetting an active
     /// build's generation, failure count, or retry deadline on every poll.
     pub fn requestLakePublication(self: *ApiHttpServer, table_name: []const u8) !void {
+        platform_sync.lockYielding(&self.index_installation_mutex);
+        const queued = self.pending_lake_publications.contains(table_name);
+        self.index_installation_mutex.unlock();
+        if (queued) return;
+
         var prepared = (try self.prepareLakeCommit(table_name)) orelse return;
         defer prepared.deinit(self);
         _ = self.activatePreparedIndexInstallationWithReplacement(&prepared, true, false, 0, null);
@@ -18001,6 +18025,8 @@ pub const ApiHttpServer = struct {
         for (self.index_installation_queue.items, 0..) |*pending, index| {
             if (pending.generation != generation) continue;
             var removed = self.index_installation_queue.orderedRemove(index);
+            if (removed.maintenance_table_id == null and std.mem.eql(u8, removed.index_name, "__lake_publication"))
+                _ = self.pending_lake_publications.remove(removed.table_name);
             removed.deinit();
             if (self.index_installation_queue.items.len == 0) {
                 self.index_installation_cursor = 0;
@@ -19670,16 +19696,32 @@ pub const ApiHttpServer = struct {
                 },
             };
             trace.enter(.cohort_preparation);
+            var freeze_retry_ms: u32 = 25;
             while (true) {
-                switch (cohort_session.?.prepareSlice() catch |err| return trace.internal(err) catch |zig017_err| {
-                    zig017_return_error = zig017_err;
-                    return zig017_err;
-                }) {
-                    .ready => break,
-                    .advanced => {},
-                    .waiting => backup_io.sleep(.fromMilliseconds(10), .awake) catch |err| return trace.internal(err) catch |zig017_err| {
+                if (lease_heartbeat.lost.load(.acquire))
+                    return trace.internal(error.BackupAttemptLeaseLost) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
+                    };
+                const preparation = cohort_session.?.prepareSlice() catch |err| return trace.preparationError(err) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                };
+                switch (preparation) {
+                    .ready => break,
+                    .advanced => freeze_retry_ms = 25,
+                    .waiting, .waiting_for_producers => {
+                        const delay_ms: u32 = if (preparation == .waiting_for_producers) freeze_retry_ms else 10;
+                        const remaining_ms = operation_request.remainingTimeoutMs() catch |err| return trace.preparationError(err) catch |zig017_err| {
+                            zig017_return_error = zig017_err;
+                            return zig017_err;
+                        };
+                        const sleep_ns = @as(u64, @min(delay_ms, remaining_ms orelse delay_ms)) * std.time.ns_per_ms;
+                        sleepNsCancellable(backup_io, sleep_ns, operation_request.cancellation) catch |err| return trace.preparationError(err) catch |zig017_err| {
+                            zig017_return_error = zig017_err;
+                            return zig017_err;
+                        };
+                        if (preparation == .waiting_for_producers) freeze_retry_ms = @min(250, freeze_retry_ms * 2);
                     },
                 }
             }
@@ -27094,6 +27136,7 @@ test "authoritative catalog mutation boundaries reject orphaned semantic produce
     const orphan_enrichment =
         "{\"name\":\"orphan_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3,\"producer_json\":\"{\\\"version\\\":2,\\\"provider\\\":\\\"antfly\\\",\\\"model\\\":\\\"model-a\\\",\\\"endpoint\\\":\\\"antfly:embedded\\\",\\\"region\\\":\\\"\\\",\\\"request_format\\\":\\\"\\\",\\\"sparse\\\":false,\\\"multimodal\\\":false,\\\"input_type\\\":\\\"\\\",\\\"truncate\\\":\\\"\\\"}\"}";
     const FakeService = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
         table: metadata_table_manager.TableRecord = .{
             .table_id = 7,
             .name = "docs",
@@ -27190,6 +27233,7 @@ test "stamped catalog mutations retain their commit stamp when the post-commit r
         .index = 19,
     };
     const FakeService = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
         table: metadata_table_manager.TableRecord = .{
             .table_id = 42,
             .name = "docs",
@@ -61551,6 +61595,26 @@ test "external lake scheduled maintenance runs outside publication and coalesces
     for (server.lake_scheduled_maintenance_tables) |table| try std.testing.expect(table == null);
 }
 
+test "backup preparation preserves interruption errors" {
+    var trace: ApiHttpServer.ClusterBackupExecutionTrace = .{ .phase = .cohort_preparation };
+    const expired: api_operation.RequestContext = .{ .deadline_ns = 0 };
+    if (expired.remainingTimeoutMs()) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectError(error.DeadlineExceeded, trace.preparationError(err));
+    }
+    var canceled: std.atomic.Value(bool) = .init(true);
+    if (sleepNsCancellable(std.testing.io, std.time.ns_per_ms, CancellationToken.fromAtomic(&canceled))) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectError(error.Canceled, trace.preparationError(err));
+    }
+    try std.testing.expectError(error.Canceled, trace.preparationError(error.Canceled));
+    try std.testing.expect(trace.cause == null);
+    try std.testing.expectError(error.InternalFailure, trace.preparationError(error.CommitDecisionUnknown));
+    try std.testing.expectEqual(error.CommitDecisionUnknown, trace.cause.?);
+}
+
 test "external lake read refresh hints coalesce without superseding active publication work" {
     const a = std.testing.allocator;
     var runtime = try db_mod.background_runtime.BackendRuntime.init(a, .{ .backend = .io_threaded });
@@ -61586,6 +61650,11 @@ test "external lake read refresh hints coalesce without superseding active publi
     try std.testing.expectEqual(@as(u8, 0), server.index_installation_queue.items[0].failures);
     try std.testing.expectEqual(@as(u64, 0), server.index_installation_queue.items[0].retry_after_ns);
     server.completeIndexInstallation(generation);
+    try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
+    try std.testing.expect(server.pending_lake_publications.contains("docs"));
+    server.completeIndexInstallation(server.index_installation_queue.items[0].generation);
+    try std.testing.expect(!server.pending_lake_publications.contains("docs"));
+    try server.requestLakePublication("docs");
     try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
 }
 
