@@ -7686,3 +7686,51 @@ store/history qualification passed 18 cases in the preceding combined run.
 Contract and whitespace checks passed. The managed ordered proposal, compatible
 applying-member barrier, native owner ABI, authenticated transport, global cohort
 drainage and all remaining issue acceptance are still required.
+
+### Apply-only original terminal recovery through the opaque native owner
+
+Native owner ABI 120 adds ordered_legacy_terminal_resolution, a void apply-only
+call using the actual Raft term/index. Its bounded version-1 command contains
+full original routed owner and exact closure/record proof, with no selectable
+outcome/version. The proof type now lives in the lightweight producer policy
+contract and TxnManager aliases it. Strict decoding requires explicit material
+owner fields (including zero root generation), rejects duplicate/unknown fields,
+zero identities/digests and owner/root mismatch, and preserves allocation errors.
+The DB and record reader also validate proof identity before use.
+
+The production export, typed client and provisioned apply-only owner acquisition
+now dispatch the existing materialized DB method. Guards reject wrong ABI,
+reserved fields, missing/oversized/invalid buffers, zero entry positions, wrong
+table and wrong serving group before mutation. The result is native apply
+completion, not a public source ACK or an original distributed decision proof.
+
+Qualification adds strict command codec coverage plus a physical-owner fixture
+that seeds an original terminal record, closes, reopens through the actual opaque
+C ABI, rejects pending/wrong-group work, resolves, replays, closes/reopens again
+and verifies the primary row and marker. The dedicated physical suite also runs
+the preexisting shared-context handoff regression. Its prior configuration
+incorrectly marked this physical root control-only, preventing both tests from
+accessing DB. That root now explicitly selects physical sources; the handoff test
+passes. The first recovery fixture then hit the valid unprovisioned-root guard:
+BEGIN/PREPARE alone had not durably established primary identity/authority. The
+fixture now performs an actual ordered primary seed before closure; guards are
+unchanged. Final qualification runs in
+`source-legacy-terminal-owner-physical-final-test.log`.
+
+Store/history tests passed 18 cases, wire/control tests 35, and the new command
+codec passed in the 14-case local suite. The sandbox skipped its unrelated HTTP
+listener case; rerunning that exact compiled local binary with loopback access
+passed all 14 cases, zero skips/failures/leaks
+(`source-legacy-terminal-owner-local-qualified.log`). Contract checks passed
+(`source-legacy-terminal-owner-contract-check.log`). The authenticated managed
+recovery transport, decoder-floor/Raft command integration, durable rejection
+handling, original pending coordinator decisions, global drainage and all full
+issue acceptance remain open.
+
+Final physical-owner qualification passed both actual linked cases, zero
+skips/failures/leaks (`source-legacy-terminal-owner-physical-final-test.log`).
+The new case crosses the opaque native ABI for original terminal recovery,
+retains pending decisions, rejects wrong-group input, recognizes exact replay,
+reopens twice and verifies the row/actual marker afterward. Physical handoff
+reopen remains passing. Whitespace checks passed. No production proposal,
+authenticated recovery RPC, drainage or strict activation is claimed.

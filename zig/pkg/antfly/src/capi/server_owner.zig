@@ -4624,6 +4624,18 @@ pub fn storageOwnerOrderedSourceScopeOutcome(owner: ?*anyopaque, request: *const
 // coordinator observation independently before this command reaches storage.
 // Apply-only: the term/index come from the actual committed Raft entry.
 // This closes producer intake; it does not authorize first-strict activation.
+pub fn storageOwnerOrderedLegacyTerminalResolution(owner: ?*anyopaque, request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest) callconv(.c) kernel_owner_abi.Status {
+    const policy = @import("antfly_local_sources").storage_source_producer_policy;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.raft_term == 0 or request.raft_index == 0 or request.request_json.len == 0 or request.request_json.len > policy.max_legacy_terminal_command_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const command = policy.decodeLegacyTerminalCommand(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    if (command.owner.group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.HistoryResynchronizationRequired);
+    handle.db.resolveOrderedClosedLegacyTerminal(command.owner, command.proof, .{ .term = request.raft_term, .index = request.raft_index }) catch |err| return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    return .ok;
+}
+
 pub fn storageOwnerOrderedSourceProducerClosure(owner: ?*anyopaque, request: *const kernel_owner_abi.ReplicatedBatchAtRaftEntryRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     const policy = @import("antfly_local_sources").storage_source_producer_policy;
     const RoutedOwner = @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion.RoutedOwner;

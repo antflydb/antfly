@@ -653,6 +653,14 @@ pub const Owner = struct {
         return ordered.decodeOutcome(a, response.bytes(), recovery.command, recovery.entry);
     }
 
+    pub fn orderedLegacyTerminalResolution(self: *Owner, a: std.mem.Allocator, table: []const u8, command: @import("antfly_local_sources").storage_source_producer_policy.LegacyTerminalCommand, term: u64, index: u64) !void {
+        const policy = @import("antfly_local_sources").storage_source_producer_policy;
+        if (term == 0 or index == 0) return error.InvalidSourceAdmission;
+        const bytes = try policy.encodeLegacyTerminalCommand(a, command);
+        defer a.free(bytes);
+        try statusToError(abi.antfly_storage_owner_ordered_legacy_terminal_resolution(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes), .raft_term = term, .raft_index = index }));
+    }
+
     pub fn orderedSourceProducerClosure(self: *Owner, a: std.mem.Allocator, table: []const u8, owner: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_resolution_wire.completion.RoutedOwner, term: u64, index: u64) !@import("antfly_local_sources").storage_source_producer_policy.Closure {
         const policy = @import("antfly_local_sources").storage_source_producer_policy;
         const scope = @import("antfly_local_sources").storage_source_scope;

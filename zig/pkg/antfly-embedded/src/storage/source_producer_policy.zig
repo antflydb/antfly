@@ -32,6 +32,48 @@ pub fn rowProducer(request: Producer, admission: Producer) !Producer {
     if (request != .unlabelled and admission != .unlabelled and request != admission) return error.SourceTransactionIdentityConflict;
     return if (request != .unlabelled) request else admission;
 }
+/// Local original-decision recovery proof. No requested outcome/version is
+/// carried: storage derives them from the exact retained terminal record.
+pub const LegacyTerminalResolution = struct {
+    root: scope.Basis,
+    transaction_id: [16]u8,
+    record_digest: [32]u8,
+    pub fn validate(self: LegacyTerminalResolution) !void {
+        try self.root.validate();
+        if (std.mem.allEqual(u8, &self.transaction_id, 0) or std.mem.allEqual(u8, &self.record_digest, 0)) return error.InvalidSourceAdmission;
+    }
+};
+pub const LegacyTerminalCommand = struct {
+    version: u8,
+    owner: @import("transaction_completion.zig").RoutedOwner,
+    proof: LegacyTerminalResolution,
+    pub fn validate(self: LegacyTerminalCommand) !void {
+        try self.owner.validate();
+        try self.proof.validate();
+        if (self.version != 1 or !std.meta.eql(self.proof.root, try scope.Basis.fromOwner(self.owner))) return error.InvalidSourceAdmission;
+    }
+};
+pub const max_legacy_terminal_command_bytes = 8192;
+pub fn encodeLegacyTerminalCommand(a: A, command: LegacyTerminalCommand) ![]u8 {
+    try command.validate();
+    const bytes = try std.json.Stringify.valueAlloc(a, command, .{});
+    errdefer a.free(bytes);
+    if (bytes.len > max_legacy_terminal_command_bytes) return error.InvalidSourceAdmission;
+    return bytes;
+}
+pub fn decodeLegacyTerminalCommand(a: A, bytes: []const u8) !LegacyTerminalCommand {
+    if (bytes.len == 0 or bytes.len > max_legacy_terminal_command_bytes) return error.InvalidSourceAdmission;
+    var raw = std.json.parseFromSlice(std.json.Value, a, bytes, .{ .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSourceAdmission;
+    defer raw.deinit();
+    if (raw.value != .object) return error.InvalidSourceAdmission;
+    const owner = raw.value.object.get("owner") orelse return error.InvalidSourceAdmission;
+    if (owner != .object) return error.InvalidSourceAdmission;
+    for ([_][]const u8{ "version", "metadata_group_id", "metadata_incarnation", "namespace", "table_binding", "root_generation", "group_id", "topology_epoch" }) |name| if (!owner.object.contains(name)) return error.InvalidSourceAdmission;
+    var parsed = std.json.parseFromValue(LegacyTerminalCommand, a, raw.value, .{ .ignore_unknown_fields = false }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidSourceAdmission;
+    defer parsed.deinit();
+    try parsed.value.validate();
+    return parsed.value;
+}
 pub const Closure = struct {
     version: u8 = 1,
     root: scope.Basis,
@@ -152,3 +194,31 @@ pub const Store = struct {
         try requireProducer(producer);
     }
 };
+
+test "history control entry legacy terminal command preserves exact owner and forbids replacement outcomes" {
+    const a = std.testing.allocator;
+    const owner: @import("transaction_completion.zig").RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 2, .topology_epoch = 3 };
+    const command: LegacyTerminalCommand = .{ .version = 1, .owner = owner, .proof = .{ .root = try scope.Basis.fromOwner(owner), .transaction_id = @splat(3), .record_digest = @splat(4) } };
+    const bytes = try encodeLegacyTerminalCommand(a, command);
+    defer a.free(bytes);
+    try std.testing.expectEqualDeep(command, try decodeLegacyTerminalCommand(a, bytes));
+    var changed = command;
+    changed.proof.root.root_generation += 1;
+    try std.testing.expectError(error.InvalidSourceAdmission, encodeLegacyTerminalCommand(a, changed));
+    changed = command;
+    changed.proof.record_digest = @splat(0);
+    try std.testing.expectError(error.InvalidSourceAdmission, encodeLegacyTerminalCommand(a, changed));
+    var raw = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer raw.deinit();
+    _ = raw.value.object.getPtr("owner").?.object.swapRemove("root_generation");
+    const missing = try std.json.Stringify.valueAlloc(a, raw.value, .{});
+    defer a.free(missing);
+    try std.testing.expectError(error.InvalidSourceAdmission, decodeLegacyTerminalCommand(a, missing));
+    const replacement = try std.fmt.allocPrint(a, "{s},\"status\":\"committed\"}}", .{bytes[0 .. bytes.len - 1]});
+    defer a.free(replacement);
+    try std.testing.expectError(error.InvalidSourceAdmission, decodeLegacyTerminalCommand(a, replacement));
+    const duplicate = try std.fmt.allocPrint(a, "{s},\"version\":1}}", .{bytes[0 .. bytes.len - 1]});
+    defer a.free(duplicate);
+    try std.testing.expectError(error.InvalidSourceAdmission, decodeLegacyTerminalCommand(a, duplicate));
+    try std.testing.expectError(error.InvalidSourceAdmission, decodeLegacyTerminalCommand(a, "{}"));
+}

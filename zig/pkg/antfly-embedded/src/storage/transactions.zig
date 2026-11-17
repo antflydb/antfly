@@ -299,11 +299,7 @@ const SourceRetirement = struct {
 
 /// Internal recovery of an already durable terminal decision. This can never
 /// decide pending work: the native writer rechecks the exact original record.
-pub const LegacyTerminalResolution = struct {
-    root: source_scope.Basis,
-    transaction_id: TxnId,
-    record_digest: [32]u8,
-};
+pub const LegacyTerminalResolution = @import("source_producer_policy.zig").LegacyTerminalResolution;
 pub const ResolutionExtraBatch = struct {
     source_scope_cut: ?source_scope.Cut = null,
     /// Private ordered retirement receipt, staged after scope resolution in the
@@ -1249,6 +1245,7 @@ pub const TxnManager = struct {
 
     pub const LegacyTerminalDecision = struct { status: TxnStatus, timestamp: u64 };
     pub fn closedLegacyTerminalDecision(self: *TxnManager, proof: LegacyTerminalResolution) !LegacyTerminalDecision {
+        try proof.validate();
         var read = try self.store.beginRead();
         defer read.abort();
         _ = (try @import("source_producer_policy.zig").Store.read(self.alloc, &read, proof.root)) orelse return error.SourcePendingWork;
