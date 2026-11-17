@@ -486,9 +486,16 @@ pub fn Adapter(comptime native: type) type {
             const io = self.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;
             const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
             const outcomes = dependencies.sql_errors;
-            const txn_id = self.db.beginTransaction(now) catch |err| return outcomes.notApplied(err);
+            var txn_id: types.TxnId = undefined;
+            try io.randomSecure(&txn_id);
+            {
+                var raw_policy_lease = self.db.local_execution.row_policy_gate.enterRaw() catch |err| return outcomes.notApplied(err);
+                defer raw_policy_lease.release();
+                _ = self.db.beginProducerTransactionScoped(txn_id, now, now, &.{}, false, false, null, .ordinary) catch |err| return outcomes.notApplied(err);
+            }
             self.outcome_transaction_id = txn_id;
             self.db.writeTransaction(txn_id, .{
+                .completion_ordinary_producer = true,
                 .schema_version = request.schema_version,
                 .relational_schema_version = request.relational_schema_version,
                 .relational_integrity_generation_set = request.relational_integrity_generation_set,
@@ -1124,7 +1131,7 @@ pub fn Adapter(comptime native: type) type {
                 };
                 const input_writes = try temporary.alloc(types.TransactionWrite, writes.items.len);
                 for (writes.items, input_writes) |write, *out| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
-                const input: contract.TableCommitRequest = .{ .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = table.schema_version, .relational_integrity_generation_set = generation, .integrity_commands = commands.items };
+                const input: contract.TableCommitRequest = .{ .source_producer = .ordinary, .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = table.schema_version, .relational_integrity_generation_set = generation, .integrity_commands = commands.items };
                 // Preparation only reads: any failure here is not applied.
                 prepared = integrity.prepareWithRepairAdmission(scratch_alloc, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{}) catch |err| return outcomes.notApplied(err);
                 if (self.handle) |handle| return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);

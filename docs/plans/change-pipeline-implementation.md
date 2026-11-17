@@ -7268,3 +7268,58 @@ special maintenance classification, physical closure/drainage, destination
 integration, public retained-history/feed/bootstrap/retention contracts,
 production pgoutput and actual Antfly existing-client qualification remain
 required. Issues #1698/#1639 remain open and PR #1700 remains draft.
+
+### Embedded ordinary ingress (in progress)
+
+Public C batch/JSON and plain SQL tracked batches now attach ordinary provenance
+at the exported local serving boundary, preserving the complete request copy and
+rejecting conflicting/scoped transaction controls. Fresh explicit C BEGIN and
+PREPARE carry ordinary bits while preserving their existing non-coordinator role
+and terminal-retention behavior. Fresh embedded SQL/graph two-phase decisions
+validate generic origin before any recovery hint, create ordinary coordinator/
+participant records, and prepare matching ordinary intents. Single-owner SQL
+coordinated mutations use the same native producer entry point. Integrity
+preparation receives ordinary origin so generated dependency/cascade effects
+retain it. Existing retained recovery paths are unchanged and continue using
+original records.
+
+The C transaction lifecycle check now inspects actual original producer identity,
+checks conflicting legacy BEGIN refusal, reopens and verifies persistence, then
+creates an old unlabelled pending record and requires fresh public BEGIN/PREPARE
+to refuse promotion without changing that original record. Focused lifecycle,
+SQL outcome and SQL/graph coordinator recovery qualification is running
+(`source-embedded-ordinary-producer-test.log`). This milestone is not qualified
+or committed yet; all remaining issue acceptance stays open.
+
+The first embedded provenance qualification passed all 25 local SQL/graph/outcome
+cases and the C transaction lifecycle case, zero failures/skips/leaks
+(`source-embedded-ordinary-producer-test.log`). The SQL/graph live-preparation
+recovery check now additionally inspects the real coordinator and every named
+participant for ordinary identity and absence of legacy origin. Three direct
+native SQL integrity fixtures now install explicit native authority, matching
+the real Lite connection factory instead of an unqualified raw DB. Functional
+batch/SQL document mutations, uniqueness/FK cascades, expression arbitration,
+composite-conflict reopen, transaction staging and scratch-reclamation checks
+are running (`source-embedded-ordinary-functional-test.log`).
+
+Embedded functional qualification passed two local SQL/graph coordinator checks
+and seven real batch/SQL cases, zero failures/skips/leaks
+(`source-embedded-ordinary-functional-test.log`). Review also caught an admission
+barrier difference: shared producer BEGIN permits metadata-only serving admission,
+whereas the public raw C BEGIN and handleless SQL BEGIN previously entered the
+raw row-policy gate. Those public boundaries now retain that original gate around
+producer BEGIN. The existing policy-transition test additionally requires raw
+BEGIN to return unsupported and leave no transaction record. Final policy,
+lifecycle/reopen and actual FK/cascade checks are running
+(`source-embedded-ordinary-policy-test.log`). Contract checks passed
+(`source-embedded-ordinary-contract-check.log`).
+
+Final embedded policy/lifecycle/FK qualification passed all three selected cases,
+zero failures/skips/leaks (`source-embedded-ordinary-policy-test.log`). Together
+with the preceding 25 local outcome/recovery + one lifecycle and two local
+SQL/graph + seven functional cases, this qualifies the fresh embedded ingress
+provenance milestone, including retained identity after reopen and refusal to
+promote old pending records. Raw policy BEGIN remains fenced without creating a
+record during transition. Contract and whitespace checks passed. No issue
+acceptance box, first-strict activation, retained-history/feed availability or
+actual Antfly pgoutput/client qualification is discharged by this milestone.

@@ -1222,7 +1222,13 @@ pub fn beginWithIdAndParticipants(
     for (participants, 0..) |*entry, i| {
         entry.* = participants_ptr.?[i].bytes();
     }
-    _ = try handle.database().*.beginTransactionWithIdAndParticipants(txn_id, timestamp_ns, participants);
+    // Preserve the raw C API's policy barrier. The shared producer BEGIN
+    // allows metadata-only admission for authenticated serving paths.
+    var raw_policy_lease = try handle.database().local_execution.row_policy_gate.enterRaw();
+    defer raw_policy_lease.release();
+    // The exported local C API is trusted ordinary ingress. Preserve its
+    // original follower role and terminal-retention behavior.
+    _ = try handle.database().*.beginProducerTransactionScoped(txn_id, timestamp_ns, timestamp_ns, participants, false, false, null, .ordinary);
 }
 
 pub fn writeIntentsInternal(
@@ -1261,6 +1267,7 @@ pub fn writeIntentsInternal(
     }
 
     try handle.database().*.writeTransaction(txn_id, .{
+        .completion_ordinary_producer = true,
         .writes = writes[0..write_len],
         .deletes = deletes.items,
         .predicates = predicates,
@@ -1325,11 +1332,14 @@ pub fn batchInternal(
 /// `table_name` names the SQL table whose database `database` is (null for
 /// the handle's root database), so its receipt finds the marker.
 pub fn trackedBatch(database: *db_mod.DB, req: db_mod.types.BatchRequest, primary_committed: *bool, table_name: ?[]const u8) anyerror!void {
+    if ((req.source_producer != .unlabelled and req.source_producer != .ordinary) or req.transaction != null or req.online_source != null) return error.SourceTransactionIdentityConflict;
+    var ordinary = req;
+    ordinary.source_producer = .ordinary;
     const receipts = @import("outcome_receipts.zig");
-    const writer = receipts.activeWriter() orelse return database.batchTracked(req, primary_committed);
+    const writer = receipts.activeWriter() orelse return database.batchTracked(ordinary, primary_committed);
     const named = if (table_name) |name| (if (std.mem.eql(u8, name, "default")) null else name) else null;
     const marker = writer.next(named);
-    database.batchTrackedWithMarker(req, primary_committed, marker) catch |err| {
+    database.batchTrackedWithMarker(ordinary, primary_committed, marker) catch |err| {
         if (!primary_committed.* and antfly.capi_dependencies.sql_errors.isUnknownOutcome(err))
             writer.retire(marker, if (named) |name| .{ .name = name, .id = database.core.identity_namespace.table_id } else null);
         return err;
