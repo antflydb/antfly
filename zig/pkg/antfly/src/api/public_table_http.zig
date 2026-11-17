@@ -971,6 +971,7 @@ pub fn queryDependencyErrorOwnedResponse(
             .retryable = retryable,
         }, .{}),
         .json = true,
+        .retry_after_seconds = if (retryable) 1 else null,
     };
 }
 

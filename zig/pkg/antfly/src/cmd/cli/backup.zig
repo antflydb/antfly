@@ -276,14 +276,7 @@ fn writeBundleFromLocalBackup(
         if (manifest.shards.len != 1) return error.UnsupportedMultiRangeTable;
         const source_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ backup_root, manifest.shards[0].snapshot_path });
         defer allocator.free(source_path);
-        try backups_api.verifyShardArtifactIntegrity(allocator, io, .portable, source_path, &manifest.shards[0]);
-        const source_manifest = try backups_api.metadataPath(allocator, backup_root, backup_id);
-        defer allocator.free(source_manifest);
-        const output_manifest = try std.fmt.allocPrint(allocator, "{s}.manifest.json", .{output_path});
-        defer allocator.free(output_manifest);
-        try publishCopiedBundleFile(allocator, io, source_manifest, output_manifest);
-        errdefer deleteFile(io, output_manifest) catch {};
-        try publishCopiedBundleFile(allocator, io, source_path, output_path);
+        try publishPortableBackup(allocator, io, source_path, output_path, &manifest);
         return;
     }
 
@@ -323,23 +316,58 @@ fn writeBundleFromLocalBackup(
     temporary_exists = false;
 }
 
-fn publishCopiedBundleFile(
+fn publishPortableBackup(
     allocator: std.mem.Allocator,
     io: std.Io,
     source_path: []const u8,
     output_path: []const u8,
+    manifest: *const backups_api.TableBackupManifest,
 ) !void {
     if (std.fs.path.dirname(output_path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    const companion_path = try std.fmt.allocPrint(allocator, "{s}.manifest.json", .{output_path});
+    defer allocator.free(companion_path);
+    const companion = try std.json.Stringify.valueAlloc(allocator, manifest.*, .{});
+    defer allocator.free(companion);
+    if (companion.len > backups_api.max_backup_manifest_bytes) return error.BackupManifestTooLarge;
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
     const nonce_hex = std.fmt.bytesToHex(nonce, .lower);
     const temporary_path = try std.fmt.allocPrint(allocator, "{s}.partial-{s}", .{ output_path, &nonce_hex });
     defer allocator.free(temporary_path);
-    var temporary_exists = true;
-    defer if (temporary_exists) deleteFile(io, temporary_path) catch {};
-    _ = try fs_paths.copyFileDurablePortable(io, source_path, temporary_path);
+    const temporary_companion = try std.fmt.allocPrint(allocator, "{s}.json", .{temporary_path});
+    defer allocator.free(temporary_companion);
+    var reserved = try fs_paths.createFilePortable(io, temporary_path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    reserved.close(io);
+    defer deleteFile(io, temporary_path) catch {};
+    const stat = try std.Io.Dir.cwd().statFile(io, source_path, .{});
+    if (stat.size != manifest.shards[0].artifact_size_bytes) return error.BackupArtifactIntegrityMismatch;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    try @import("antfly_local_sources").api_local_backups.copyFileAndHashCancellable(io, source_path, temporary_path, stat, &hasher, .none);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    if (!std.mem.eql(u8, &std.fmt.bytesToHex(digest, .lower), manifest.shards[0].artifact_sha256))
+        return error.BackupArtifactIntegrityMismatch;
+
+    {
+        var file = try fs_paths.createFilePortable(io, temporary_companion, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer file.close(io);
+        errdefer deleteFile(io, temporary_companion) catch {};
+        try file.writePositionalAll(io, companion, 0);
+        try file.sync(io);
+    }
+    defer deleteFile(io, temporary_companion) catch {};
+    publishTemporaryFileNoReplace(io, temporary_companion, companion_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            const existing = try cli.readFileAlloc(io, allocator, companion_path, backups_api.max_backup_manifest_bytes);
+            defer allocator.free(existing);
+            if (!std.mem.eql(u8, existing, companion)) return error.PathAlreadyExists;
+            try fs_paths.syncDirPortable(io, std.fs.path.dirname(companion_path) orelse ".");
+        },
+        else => return err,
+    };
+    // The archive is the commit marker. An interrupted attempt can leave the
+    // companion, which an identical retry can reuse without replacing it.
     try publishTemporaryFileNoReplace(io, temporary_path, output_path);
-    temporary_exists = false;
 }
 
 /// Atomically publishes a fully synced temporary file without ever replacing

@@ -586,16 +586,27 @@ fn stagePortableFile(
     defer if (integrity_owned) allocator.free(integrity.sha256);
     const snapshot_path = try std.fmt.allocPrint(allocator, "{s}.afb", .{portable_backup_id});
     errdefer allocator.free(snapshot_path);
-    const manifest = if (try detachedPortableManifest(allocator, path, table_name, portable_backup_id, snapshot_path, integrity)) |detached|
-        detached
-    else blk: {
-        const metadata = try portableFileMetadataAlloc(allocator, io, source, .{
-            .max_input_bytes = max_input_bytes,
-            .max_logical_bytes = max_prepared_bytes,
-        });
+    var detached = try detachedPortableManifest(allocator, path, table_name, portable_backup_id, snapshot_path, integrity);
+    defer if (detached) |*manifest| manifest.deinit(allocator);
+    const inspection_options: portable_backup.FileInspectionOptions = .{
+        .max_input_bytes = max_input_bytes,
+        .max_logical_bytes = max_prepared_bytes,
+    };
+    // Validate exactly the bytes that will be published. A companion only
+    // supplies the public table definition and cannot relax archive limits.
+    const pinned = try std.Io.Dir.cwd().openFile(io, scratch, .{});
+    defer pinned.close(io);
+    const manifest = if (detached) |original| blk: {
+        const Validate = struct {
+            fn visit(_: void, _: backup_codec.BlockType, _: []const u8) !void {}
+        };
+        _ = try portable_backup.inspectPortableFileBlocks(allocator, io, pinned, inspection_options, {}, Validate.visit);
+        detached = null;
+        break :blk original;
+    } else blk: {
+        const metadata = try portableFileMetadataAlloc(allocator, io, pinned, inspection_options);
         errdefer allocator.free(metadata.schema_json);
         errdefer allocator.free(metadata.indexes_json);
-        if (!backups_api.localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
         const synthesized = try manifestFromParts(allocator, table_name, portable_backup_id, snapshot_path, integrity, metadata.schema_json, metadata.indexes_json, "Restored from portable Antfly backup");
         integrity_owned = false;
         break :blk synthesized;
