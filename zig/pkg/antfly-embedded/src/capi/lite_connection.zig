@@ -1190,6 +1190,10 @@ pub const WriterLane = struct {
     /// checked-out writer; the read takes no kernel lock and leaves a
     /// parked lease parked.
     reading: bool = false,
+    /// Thread that last checked the lane out; meaningful only while
+    /// `checked_out`. Lets the commit leader tell a different writer still
+    /// staging (worth waiting for) from its own unreleased checkout.
+    holder: std.Thread.Id = 0,
     /// Same-process readers currently relying on this lane's kernel
     /// lease staying held through a *synthetic* (kernel-lock-free) lease
     /// of their own -- see `PathGate.pinLocalWriterLeaseForRead` and
@@ -1331,6 +1335,8 @@ pub const WriterLane = struct {
             if (if (self.reading) null else self.parked) |parked| {
                 self.parked = null;
                 self.checked_out = true;
+                self.holder = std.Thread.getCurrentId();
+                self.holder = std.Thread.getCurrentId();
                 const likely_root = self.last_root;
                 self.mutex.unlock(io);
                 const take_fast_path = likely_root != null and likely_root == connection.owner.current and
@@ -1376,6 +1382,8 @@ pub const WriterLane = struct {
             }
             if (!self.checked_out and !self.reading) {
                 self.checked_out = true;
+                self.holder = std.Thread.getCurrentId();
+                self.holder = std.Thread.getCurrentId();
                 self.mutex.unlock(io);
                 // Cold path: nothing parked yet. Do the full admission
                 // dance exactly as a non-lane call would, then keep the
@@ -1464,6 +1472,7 @@ pub const WriterLane = struct {
         defer self.mutex.unlock(io);
         if (self.checked_out or self.reading) return .busy;
         self.checked_out = true;
+        self.holder = std.Thread.getCurrentId();
         const lease = self.parked orelse return .fresh;
         self.parked = null;
         self.parked_store = null;
@@ -1940,6 +1949,7 @@ pub const WriterLane = struct {
         self.parked = null;
         self.foreign_release_due = false;
         self.checked_out = true;
+        self.holder = std.Thread.getCurrentId();
         const store = self.parked_store;
         self.parked_store = null;
         self.mutex.unlock(io);
@@ -4841,7 +4851,7 @@ pub const Connection = struct {
         const io = h.handleLockIo();
         lane.mutex.lockUncancelable(io);
         defer lane.mutex.unlock(io);
-        return lane.checked_out;
+        return lane.checked_out and lane.holder != std.Thread.getCurrentId();
     }
 
     pub fn detach(self: *Connection) void {

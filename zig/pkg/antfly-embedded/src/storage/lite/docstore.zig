@@ -3199,6 +3199,10 @@ pub const Store = struct {
     /// its own queue has drained to empty, to decide whether to wait briefly
     /// for that caller instead of going idle -- see its own use for why.
     pending_admission_hint: ?PendingAdmissionHint = null,
+    /// Duration of the last durable group commit; bounds how long a leader
+    /// waits for a staging writer (`driveMutationCoordinator`). Written by
+    /// the leader only.
+    last_group_sync_ns: i96 = 0,
     /// Set on a maintenance snapshot's store (lite-writer-authority.md
     /// W1, W3): the snapshot computes on its own pinned state, but every
     /// write it makes -- queued commits and direct store maintenance -- is
@@ -6165,44 +6169,27 @@ pub const Store = struct {
     /// the deferred-publication path and never actually fsync.
     fn driveMutationCoordinator(self: *Store, force_durable: bool, own_request: ?*MutationRequest) void {
         const io = self.file.runtime();
-        // Bounds `pending_admission_hint`'s wait below: long enough to
-        // cover a caller already admitted past the writer lane finishing
-        // its own staging (validation, mutation application, replication
-        // payload construction) -- measured at several hundred
-        // microseconds in a Debug build for a single-document write --
-        // short enough that a hint which never resolves (a stuck or
-        // very large concurrent write) costs this leader only a bounded
-        // delay, not an unbounded one.
+        // Group commit: writers stage one at a time under the writer lane,
+        // so a writer still staging when this leader drains would otherwise
+        // pay its own sync right after this one. Wait for it, but never
+        // longer than one sync costs (the last group's), since past that
+        // it is cheaper for the late writer to lead its own group.
         const pending_admission_max_wait_ns: i96 = 2 * std.time.ns_per_ms;
-        const pending_admission_poll_ns: i96 = 100 * std.time.ns_per_us;
+        const pending_admission_poll_ns: i96 = 25 * std.time.ns_per_us;
         var pending_admission_waited_ns: i96 = 0;
         while (true) {
             self.commit_mutex.lockUncancelable(io);
+            if (self.pending_admission_hint) |hint| {
+                const budget = @min(pending_admission_max_wait_ns, self.last_group_sync_ns);
+                while (pending_admission_waited_ns < budget and self.non_ride_along_pending_count != 0 and hint.active(hint.ptr)) {
+                    self.commit_mutex.unlock(io);
+                    io.sleep(.fromNanoseconds(@intCast(pending_admission_poll_ns)), .awake) catch {};
+                    pending_admission_waited_ns += pending_admission_poll_ns;
+                    self.commit_mutex.lockUncancelable(io);
+                }
+            }
             const batch = self.drainMutationBatchLocked();
             const head = batch.head orelse {
-                // The queue is empty. Normally that means this leader's
-                // group is done and the lane may go idle. But if the
-                // writer lane already let another caller past admission
-                // (`WriterLane.checkout`) before it has staged its write,
-                // that caller's own `enqueue` -- and so its chance to
-                // share this leader's still-open group -- is still ahead
-                // of it. Without this wait, the leader almost always
-                // finds the queue empty and parks before that caller
-                // reaches `enqueue`, because staging (parsing, applying
-                // the mutation, building the replication payload) is
-                // typically slower than this group's own apply-plus-sync
-                // (confirmed empirically: perf/lwa-groupcommit). Wait
-                // briefly, bounded, only while the hint says someone is
-                // actually in flight -- a lone writer sees the hint false
-                // immediately and pays nothing extra.
-                if (self.pending_admission_hint) |hint| {
-                    if (pending_admission_waited_ns < pending_admission_max_wait_ns and hint.active(hint.ptr)) {
-                        self.commit_mutex.unlock(io);
-                        io.sleep(.fromNanoseconds(@intCast(pending_admission_poll_ns)), .awake) catch {};
-                        pending_admission_waited_ns += pending_admission_poll_ns;
-                        continue;
-                    }
-                }
                 self.commit_draining = false;
                 self.commit_ready.broadcast(io);
                 self.commit_mutex.unlock(io);
@@ -6257,31 +6244,8 @@ pub const Store = struct {
             // it forever (observed live: a derived worker deadlocked
             // against the main thread waiting on it, both parked, nothing
             // left to ever lead the queue again).
-            var stop_here = if (own_request) |req| req.done and self.non_ride_along_pending_count == 0 else false;
-            // This leader's own request is covered and nothing else is
-            // queued -- the common case is that this group really is
-            // done and the lane should go idle. But this is the point
-            // reached right after `applyMutationGroup` (apply plus
-            // sync), which is exactly where a concurrently-admitted
-            // caller's own staging (still ahead of it; see
-            // `pending_admission_hint`'s doc comment) most often has not
-            // caught up yet. Give it the same bounded chance to land in
-            // this still-open queue as the top-of-loop empty check does
-            // for a barrier call (`own_request == null`), rather than
-            // parking and forcing that caller to lead its own separate
-            // group a moment later.
-            if (stop_here) if (self.pending_admission_hint) |hint| {
-                while (pending_admission_waited_ns < pending_admission_max_wait_ns and
-                    self.non_ride_along_pending_count == 0 and hint.active(hint.ptr))
-                {
-                    self.commit_mutex.unlock(io);
-                    io.sleep(.fromNanoseconds(@intCast(pending_admission_poll_ns)), .awake) catch {};
-                    pending_admission_waited_ns += pending_admission_poll_ns;
-                    self.commit_mutex.lockUncancelable(io);
-                }
-                stop_here = self.non_ride_along_pending_count == 0;
-            };
-            if (stop_here) self.commit_draining = false else pending_admission_waited_ns = 0;
+            const stop_here = if (own_request) |req| req.done and self.non_ride_along_pending_count == 0 else false;
+            if (stop_here) self.commit_draining = false;
             self.commit_ready.broadcast(io);
             self.commit_mutex.unlock(io);
 
@@ -6507,7 +6471,9 @@ pub const Store = struct {
         // knows whether to relock. Two different commits' gates are never
         // confused with each other, since each owns its own stack frame.
         var sync_gate: SyncExclusiveGate = .{ .store = self };
+        const commit_started = std.Io.Clock.awake.now(self.file.runtime()).nanoseconds;
         try self.file.commitTransactionWithDurability(durable, .{ .context = &sync_gate, .release = releaseStoreMutexForSync, .reacquire = reacquireStoreMutexAfterSync });
+        if (durable) self.last_group_sync_ns = std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - commit_started;
         // Regression-B test hook: stamp every member with the sequence this
         // group's commit just landed at, while `self.mutex` is still held
         // (acquired at this function's top) so no other group can have
