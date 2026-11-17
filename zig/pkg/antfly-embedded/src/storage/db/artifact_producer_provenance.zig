@@ -1998,9 +1998,15 @@ test "ordered artifact proofs bind enrichment assets to their rendered context" 
     const alloc = std.testing.allocator;
     const source = publication.Source{ .document_key = "person:1", .content_digest = @splat(1), .timestamp = 3, .input_position = .{ .raft = .{ .term = 1, .index = 4 } } };
     const output = publication.Mutation{ .family = .document_artifact, .key = "brief-output", .value = null, .source_index = 0 };
-    var command: publication.Command = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .enrichment, .producer_name = "brief", .producer_generation = 1, .producer_artifact_name = "brief", .sources = (&source)[0..1], .mutations = (&output)[0..1], .publication_digest = @splat(0) };
+    const before = publication.ArtifactSource{ .key = "brief-output", .content_digest = null, .input_position = null, .source_index = 0 };
+    var command: publication.Command = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .enrichment, .producer_name = "brief", .producer_generation = 1, .producer_artifact_name = "brief", .sources = (&source)[0..1], .mutation_preconditions = (&before)[0..1], .mutations = (&output)[0..1], .publication_digest = @splat(0) };
     command.execution_identity = @splat(5);
     command.publication_digest = command.digest();
+    try command.validate(alloc);
+    // Scoped enrichment units carry no identity.
+    var scoped_command = command;
+    scoped_command.producer_scope_key = "unit";
+    try std.testing.expectError(error.InvalidBatchRequest, scoped_command.validate(alloc));
     const first_input = command.inputDigest();
     var prepared = try fromCommand(alloc, command);
     defer prepared.deinit();
