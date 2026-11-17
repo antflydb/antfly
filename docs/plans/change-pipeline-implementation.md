@@ -7986,3 +7986,57 @@ decision authority, complete cohort handover/drainage, destination integration,
 public feeds, coherent bootstrap/retention, production pgoutput and actual
 Antfly existing-client qualification remain outstanding. Issues stay open and
 PR 1700 stays draft.
+
+### Physical-cut legacy work inventory (in progress)
+
+Legacy work discovery is moving behind the native DB boundary. A private query
+carries the complete routed owner, minimum applied index, strictly-after cursor
+and a maximum of 256 inspected records. The DB validates physical authority and
+root generation and reads the actual ordered marker, immutable closure and
+canonical transaction records in one read snapshot. The transaction scanner now
+accepts that existing snapshot; its standalone helper preserves its prior
+behavior. Shared inventory values avoid importing a concrete transaction manager
+into thin owner clients. The storage engine descriptor becomes 70 for this new
+read operation.
+
+Observation validation binds the owner, closure root and read cut, enforces the
+inspection bound, orders returned IDs after the input cursor, and ensures the
+resume cursor covers every returned record. Omitted ordinary/scoped or resolved
+terminal records still consume inspection credit. Empty pages and reached_end
+remain work-discovery results only: they cannot establish a coherent multi-page
+drainage cut or enable the first strict activation. Qualification and the opaque
+native/ReadIndex transport still need completion.
+
+The initial actual DB inventory fixture passed after reopening the physical
+engine and inspecting pending/original COMMIT/ABORT records. Contract checks
+passed. The first broad Raft run was sandboxed and failed its loopback listener
+with errno 1; the explicit loopback rerun passed all 6 local and 50 linked cases.
+The new inventory checks themselves run through the selected compiled-engine
+source-scope fixture, including bounded pagination and actual marker stability.
+
+Inventory now has bounded strict query/observation codecs (4 KiB/256 KiB), opaque
+owner ABI 123 and client-owned decoded item storage. The C boundary validates
+ABI, reserved bits, buffer limits, table and owner group and clears outputs on
+rejection. Provisioned owner reads reuse complete catalog/descriptor admission,
+fresh frozen quorum ReadIndex, physical identity and pre/post read validation.
+Late errors release inventory buffers at both provisioned and DataServer layers.
+The live managed fixture reads inventory without appending and rejects stale or
+cancelled owner queries. Native-owner tests cover pending work, omitted resolved
+terminals, empty continuation, bounds, stale groups, minimum cuts and reopen.
+Qualification is running (`source-legacy-inventory-native-test.log`). No public
+inventory HTTP route, global coordinator, pending-decision authority or coherent
+all-root drainage certificate is claimed by this step.
+
+Physical inventory qualification passed all 2 physical-owner, 1 actual compiled
+DB, 6 local apply, 50 linked native/live-Raft and 68 transaction cases, zero
+failures/skips/leaks (`source-legacy-inventory-native-test.log`, exit 0).
+Selected tests exercised pending and original terminal records through opaque
+native ownership, reopen, resolved-record omission, empty continuation with its
+original cursor, wrong group/root/cohort, future cuts, invalid ABI/output clearing,
+strict wire round trips and malformed nested owner rejection. The actual linked
+Raft helper invoked the new provisioned frozen-ReadIndex path and verified stale
+and cancelled reads produce no append. Transaction scanner compatibility and
+original terminal recovery regressions passed. Contract checks passed
+(`source-legacy-inventory-native-contracts.log`). This is private bounded work
+discovery, not an all-root scan certificate, pending decision, worker handover,
+strict activation, source acknowledgement or completion of either issue.

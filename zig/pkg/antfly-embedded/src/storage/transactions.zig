@@ -100,11 +100,7 @@ const hot_standby_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
 
 pub const TxnId = [16]u8;
 
-pub const TxnStatus = enum(u8) {
-    pending = 0,
-    committed = 1,
-    aborted = 2,
-};
+pub const TxnStatus = @import("source_legacy_inventory.zig").Status;
 
 pub const WriteIntent = struct {
     key: []const u8,
@@ -1681,35 +1677,20 @@ pub const TxnManager = struct {
     /// Private migration work discovery. Each page uses one read snapshot,
     /// including the immutable physical closure. Pagination is not a coherent
     /// all-record cut and an empty page is never a drainage certificate.
-    pub const LegacyRecoveryItem = struct {
-        transaction_id: TxnId,
-        record_digest: [32]u8,
-        status: TxnStatus,
-        prepared: bool,
-        prepared_known: bool,
-        coordinator: bool,
-        coordinator_known: bool,
-        intents_resolved: bool,
-        intents_resolved_known: bool,
-    };
-    pub const LegacyRecoveryPage = struct {
-        closure: @import("source_producer_policy.zig").Closure,
-        items: []LegacyRecoveryItem,
-        scanned_records: usize,
-        /// Last inspected record, including ordinary/scoped records omitted
-        /// from items. Resume strictly after it; null only before any record.
-        next_after: ?TxnId,
-        reached_end: bool,
-        pub fn deinit(self: *@This(), alloc: Allocator) void {
-            alloc.free(self.items);
-            self.* = undefined;
-        }
-    };
+    pub const LegacyRecoveryItem = @import("source_legacy_inventory.zig").Item;
+    pub const LegacyRecoveryPage = @import("source_legacy_inventory.zig").Page;
     pub fn legacyRecoveryPage(self: *TxnManager, alloc: Allocator, root: source_scope.Basis, after: ?TxnId, max_records: usize) !LegacyRecoveryPage {
         if (max_records == 0 or max_records > 256) return error.InvalidSourceAdmission;
         var read = try self.store.beginRead();
         defer read.abort();
-        const closure = (try @import("source_producer_policy.zig").Store.read(alloc, &read, root)) orelse return error.SourcePendingWork;
+        return legacyRecoveryPageInRead(alloc, &read, root, after, max_records);
+    }
+
+    /// Reuse the caller's read snapshot so physical authority, applied marker,
+    /// closure and inspected records cannot come from different cuts.
+    pub fn legacyRecoveryPageInRead(alloc: Allocator, read: anytype, root: source_scope.Basis, after: ?TxnId, max_records: usize) !LegacyRecoveryPage {
+        if (max_records == 0 or max_records > @import("source_legacy_inventory.zig").max_records) return error.InvalidSourceAdmission;
+        const closure = (try @import("source_producer_policy.zig").Store.read(alloc, read, root)) orelse return error.SourcePendingWork;
         var cursor = try read.openCursor();
         defer cursor.close();
         var items: std.ArrayListUnmanaged(LegacyRecoveryItem) = .empty;

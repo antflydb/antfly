@@ -566,6 +566,7 @@ pub const VTable = struct {
     orderedSourceScopeOutcome: *const fn (*DB, @import("source_scope_ordered.zig").Recovery) Outcome(@import("source_scope_ordered.zig").Outcome),
     applyOrderedSourceRetirement: *const fn (*DB, @import("source_scope_retirement.zig").Command, types.OrderedApplyReceipt, bool) Outcome(@import("source_scope_retirement_ordered.zig").Recovery),
     orderedSourceRetirementOutcome: *const fn (*DB, @import("source_scope_retirement_ordered.zig").Query) Outcome(@import("source_scope_retirement_ordered.zig").Recovery),
+    legacyRecoveryInventory: *const fn (*DB, Allocator, @import("source_legacy_inventory.zig").Query) Outcome(@import("source_legacy_inventory.zig").Observation),
     legacyTerminalOutcome: *const fn (*DB, @import("source_legacy_terminal_ordered.zig").Query) Outcome(@import("source_legacy_terminal_ordered.zig").Observation),
     sourceProducerClosureObservation: *const fn (*DB, @import("source_producer_policy.zig").Query) Outcome(@import("source_producer_policy.zig").Observation),
     sourceScopeObservation: *const fn (*DB, @import("source_scope_control.zig").Query) Outcome(@import("source_scope_control.zig").Observation),
@@ -624,7 +625,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 67 adds original terminal legacy resolution under physical closure.
 /// Version 68 returns atomically retained legacy resolution outcomes.
 /// Version 69 adds snapshot-bound read-only legacy recovery outcomes.
-pub const descriptor_version: u32 = 69;
+pub const descriptor_version: u32 = 70;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

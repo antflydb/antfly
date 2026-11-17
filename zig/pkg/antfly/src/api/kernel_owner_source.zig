@@ -1932,13 +1932,14 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     const source_plan_http = @import("../data/source_plan_http_wire.zig");
-    const SourcePlanReadKind = enum { observation, chunk, outcome, checkpoint, scope, scope_outcome, retirement_outcome, producer_closure, legacy_terminal };
+    const SourcePlanReadKind = enum { observation, chunk, outcome, checkpoint, scope, scope_outcome, retirement_outcome, producer_closure, legacy_terminal, legacy_inventory };
     fn SourcePlanReadInput(comptime kind: SourcePlanReadKind) type {
         return switch (kind) {
             .observation => source_plan_http.ObserveRequest,
             .scope => @import("antfly_local_sources").storage_source_scope_control.Query,
             .producer_closure => @import("antfly_local_sources").storage_source_producer_policy.Query,
             .legacy_terminal => @import("antfly_local_sources").storage_source_legacy_terminal_ordered.Query,
+            .legacy_inventory => @import("antfly_local_sources").storage_source_legacy_inventory.Query,
             .scope_outcome => @import("antfly_local_sources").storage_source_scope_ordered.Recovery,
             .retirement_outcome => @import("antfly_local_sources").storage_source_scope_retirement_ordered.Query,
             .checkpoint => @import("antfly_local_sources").storage_source_checkpoint_read.Request,
@@ -1952,6 +1953,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .scope => @import("antfly_local_sources").storage_source_scope_control.Observation,
             .producer_closure => @import("antfly_local_sources").storage_source_producer_policy.Observation,
             .legacy_terminal => @import("antfly_local_sources").storage_source_legacy_terminal_ordered.Observation,
+            .legacy_inventory => @import("antfly_local_sources").storage_source_legacy_inventory.Observation,
             .scope_outcome => @import("antfly_local_sources").storage_source_scope_ordered.Outcome,
             .retirement_outcome => @import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery,
             .checkpoint => @import("antfly_local_sources").storage_source_checkpoint_read.Reply,
@@ -1964,6 +1966,9 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
     pub fn sourceScopeOutcomeRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_scope_ordered.Recovery) !@import("antfly_local_sources").storage_source_scope_ordered.Outcome {
         return self.sourcePlanReadRouted(a, fence, table, .scope_outcome, request);
+    }
+    pub fn legacyRecoveryInventoryRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_legacy_inventory.Query) !@import("antfly_local_sources").storage_source_legacy_inventory.Observation {
+        return self.sourcePlanReadRouted(a, fence, table, .legacy_inventory, request);
     }
     pub fn legacyTerminalOutcomeRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_legacy_terminal_ordered.Query) !@import("antfly_local_sources").storage_source_legacy_terminal_ordered.Observation {
         return self.sourcePlanReadRouted(a, fence, table, .legacy_terminal, request);
@@ -1992,7 +1997,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             try request.validate(a);
             if (request.operation != .recover) return error.InvalidSourcePlanWire;
         } else try request.validate();
-        const expected = if (kind == .scope or kind == .producer_closure or kind == .legacy_terminal) request.owner else if (kind == .scope_outcome or kind == .retirement_outcome) request.command.intent.owner else request.source_owner;
+        const expected = if (kind == .scope or kind == .producer_closure or kind == .legacy_terminal or kind == .legacy_inventory) request.owner else if (kind == .scope_outcome or kind == .retirement_outcome) request.command.intent.owner else request.source_owner;
         const group = fence.route.group_id;
         if (expected.group_id != group) return error.TopologyChanged;
         const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
@@ -2010,7 +2015,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (proof.incarnation == 0 or proof.term == 0 or proof.applied_index == 0) return error.ReadUnavailable;
         const minimum = switch (kind) {
             .observation => request.query.minimum_applied_index,
-            .checkpoint, .scope, .scope_outcome, .retirement_outcome, .producer_closure, .legacy_terminal => request.minimum_applied_index,
+            .checkpoint, .scope, .scope_outcome, .retirement_outcome, .producer_closure, .legacy_terminal, .legacy_inventory => request.minimum_applied_index,
             .chunk => request.request.query.minimum_applied_index,
             .outcome => request.receipt.?.index,
         };
@@ -2026,6 +2031,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .scope => try lease.owner().sourceScopeObservation(a, table, request),
             .producer_closure => try lease.owner().sourceProducerClosureObservation(a, table, request),
             .legacy_terminal => try lease.owner().legacyTerminalOutcome(a, table, request),
+            .legacy_inventory => try lease.owner().legacyRecoveryInventory(a, table, request),
             .scope_outcome => try lease.owner().sourceScopeOutcome(a, table, request),
             .retirement_outcome => try lease.owner().sourceRetirementOutcome(a, table, request),
             .checkpoint => try lease.owner().sourceCheckpointObservation(a, table, request),
@@ -2033,6 +2039,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .outcome => try lease.owner().sourcePlanOutcome(a, table, .{ .command = request.command, .entry = request.receipt.?, .minimum_applied_index = minimum }),
         };
         errdefer if (comptime kind == .chunk) a.free(result.bytes);
+        errdefer if (comptime kind == .legacy_inventory) {
+            var owned = result;
+            owned.deinit(a);
+        };
         try @import("completion_owner_admission.zig").require(a, self.catalog, table, fence, descriptor.view(), expected, context);
         try validate(barrier.ptr, group, proof, context.deadline_ns, fence.admission_cancellation);
         try self.validateRoutedRead(a, fence, group, table);

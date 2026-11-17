@@ -20,6 +20,7 @@ const local = @import("antfly_local_sources");
 const db_mod = local.storage_db_db;
 const policy = local.storage_source_producer_policy;
 const ordered = local.storage_source_legacy_terminal_ordered;
+const inventory = local.storage_source_legacy_inventory;
 const completion = local.api_local_table_writes.table_write_source.history_resolution_wire.completion;
 
 test "storage owner legacy terminal resolution crosses native ABI and survives reopen" {
@@ -59,6 +60,7 @@ test "storage owner legacy terminal resolution crosses native ABI and survives r
     {
         var native = try client.Owner.open(open);
         defer native.deinit();
+        try checkInventory(&native, a, command.owner, 2, false);
         const rejected = try native.orderedLegacyTerminalResolution(a, "docs", pending, 1, 3);
         try std.testing.expect(rejected == .rejected and rejected.rejected == .unresolved);
         var wrong = command;
@@ -75,6 +77,7 @@ test "storage owner legacy terminal resolution crosses native ABI and survives r
         const reopened = try native.orderedLegacyTerminalResolution(a, "docs", command, 1, 4);
         try std.testing.expect(reopened == .applied and reopened.applied.kind == .committed and reopened.applied.timestamp == 200);
         const query: ordered.Query = .{ .version = 1, .owner = command.owner, .command = command, .entry = .{ .term = 1, .index = 4 }, .minimum_applied_index = 4 };
+        try checkInventory(&native, a, command.owner, 4, true);
         const observed = try native.legacyTerminalOutcome(a, "docs", query);
         try std.testing.expectEqualDeep(reopened, observed.outcome);
         try std.testing.expectEqual(@as(u64, 4), observed.cut.index);
@@ -109,6 +112,11 @@ test "storage owner legacy terminal resolution crosses native ABI and survives r
         try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_ordered_legacy_terminal_resolution(null, &request, &response));
     }
     {
+        var native = try client.Owner.open(open);
+        defer native.deinit();
+        try checkInventory(&native, a, command.owner, 4, true);
+    }
+    {
         var db = try db_mod.DB.open(a, path, options);
         defer db.close();
         const row = (try db.get(a, "recovered")) orelse return error.TestExpectedOrdinaryDocument;
@@ -117,4 +125,35 @@ test "storage owner legacy terminal resolution crosses native ABI and survives r
         try std.testing.expectEqual(@as(u64, 4), (try db.orderedApplyReceipt()).?.index);
         try std.testing.expectEqual(local.storage_transactions.TxnStatus.pending, try db.getTransactionStatus(pending_id));
     }
+}
+
+fn checkInventory(native: *client.Owner, a: std.mem.Allocator, owner: completion.RoutedOwner, index: u64, resolved: bool) !void {
+    const query: inventory.Query = .{ .version = 1, .owner = owner, .after = null, .max_records = 256, .minimum_applied_index = index };
+    var observed = try native.legacyRecoveryInventory(a, "docs", query);
+    defer observed.deinit(a);
+    try std.testing.expectEqual(index, observed.cut.index);
+    try std.testing.expectEqual(@as(usize, 2), observed.page.scanned_records);
+    try std.testing.expectEqual(@as(usize, if (resolved) 1 else 2), observed.page.items.len);
+    try std.testing.expectEqualDeep(@as(?[16]u8, @splat(232)), observed.page.next_after);
+    try std.testing.expect(observed.page.reached_end);
+    var wrong = query;
+    wrong.owner.group_id += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, native.legacyRecoveryInventory(a, "docs", wrong));
+    wrong = query;
+    wrong.minimum_applied_index += 1;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, native.legacyRecoveryInventory(a, "docs", wrong));
+    wrong = query;
+    wrong.after = @splat(232);
+    var empty = try native.legacyRecoveryInventory(a, "docs", wrong);
+    defer empty.deinit(a);
+    try std.testing.expect(empty.page.reached_end and empty.page.items.len == 0 and empty.page.scanned_records == 0);
+    try std.testing.expectEqualDeep(wrong.after, empty.page.next_after);
+    var response: abi.OwnedBytes = .{ .len = 99 };
+    var request: abi.JsonOperationRequest = .{ .version = abi.abi_version - 1 };
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_legacy_recovery_inventory(null, &request, &response));
+    try std.testing.expectEqual(@as(usize, 0), response.len);
+    request.version = abi.abi_version;
+    request.request_json.len = inventory.max_query_bytes + 1;
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_legacy_recovery_inventory(null, &request, &response));
+    try std.testing.expectEqual(@as(usize, 0), response.len);
 }

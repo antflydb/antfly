@@ -30,6 +30,16 @@ pub fn run(a: std.mem.Allocator, server: anytype, fence: metadata.CatalogRouteFe
     const command: legacy.policy.LegacyTerminalCommand = .{ .version = 1, .owner = owner, .proof = .{ .root = try local.storage_source_scope.Basis.fromOwner(owner), .transaction_id = @splat(249), .record_digest = record.digest } };
     const previous_last = Harness.last(server, owner.group_id);
     const before_documents = Harness.documentApplies(server);
+    const inventory = local.storage_source_legacy_inventory;
+    const inventory_query: inventory.Query = .{ .version = 1, .owner = owner, .after = null, .max_records = 256, .minimum_applied_index = 1 };
+    var work = try server.legacyRecoveryInventoryLocal(a, fence, "docs", inventory_query);
+    defer work.deinit(a);
+    try work.validate(inventory_query);
+    for (work.page.items) |item| try std.testing.expect(!std.meta.eql(item.transaction_id, command.proof.transaction_id));
+    try std.testing.expectEqual(previous_last, Harness.last(server, owner.group_id));
+    var stale_inventory = inventory_query;
+    stale_inventory.owner.root_generation += 1;
+    try std.testing.expectError(error.TopologyChanged, server.legacyRecoveryInventoryLocal(a, fence, "docs", stale_inventory));
     var wrong = command;
     wrong.owner.root_generation += 1;
     wrong.proof.root.root_generation += 1;
@@ -38,6 +48,7 @@ pub fn run(a: std.mem.Allocator, server: anytype, fence: metadata.CatalogRouteFe
     var cancelled: std.atomic.Value(bool) = .init(true);
     var cancelled_fence = fence;
     cancelled_fence.admission_cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled);
+    try std.testing.expectError(error.Canceled, server.legacyRecoveryInventoryLocal(a, cancelled_fence, "docs", inventory_query));
     try std.testing.expectError(error.Canceled, server.submitLegacyTerminalLocal(a, cancelled_fence, "docs", command));
     try std.testing.expectEqual(previous_last, Harness.last(server, owner.group_id));
     const Interrupted = struct {

@@ -20,6 +20,7 @@ const completion = @import("../transaction_completion.zig");
 const transactions = @import("../transactions.zig");
 const scope = @import("../source_scope.zig");
 const ordered = @import("../source_legacy_terminal_ordered.zig");
+const inventory = @import("../source_legacy_inventory.zig");
 const wire = @import("../../api/batch_internal.zig");
 pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions, owner: completion.RoutedOwner) !void {
     const path = try std.fmt.allocPrint(a, "{s}/legacy-terminal-recovery", .{parent});
@@ -65,11 +66,14 @@ pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions
         var pending_read = try db.core.store.beginReadTxn();
         pending = .{ .root = try scope.Basis.fromOwner(owner), .transaction_id = pending_id, .record_digest = completion.bytesDigest(try pending_read.get(&(completion.record_prefix.* ++ pending_id))) };
         pending_read.abort();
+        try std.testing.expectError(error.SourcePendingWork, db.legacyRecoveryInventory(a, .{ .version = 1, .owner = owner, .after = null, .max_records = 256, .minimum_applied_index = 5 }));
         _ = try db.applyOrderedSourceProducerClosure(owner, .{ .term = 1, .index = 6 }, false);
+        try checkInventory(&db, a, owner, 6, false);
     }
     {
         var db = try db_mod.DB.open(a, path, options);
         defer db.close();
+        try checkInventory(&db, a, owner, 6, false);
         var stale = owner;
         stale.root_generation += 1;
         try std.testing.expectError(error.InvalidSourceAdmission, db.resolveOrderedClosedLegacyTerminal(stale, proofs[0], .{ .term = 1, .index = 7 }));
@@ -132,6 +136,7 @@ pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions
         try std.testing.expect(try db.get(a, "legacy-abort") == null);
         try std.testing.expectEqual(@as(u64, 10), (try db.orderedApplyReceipt()).?.index);
         try std.testing.expectEqual(transactions.TxnStatus.pending, try db.getTransactionStatus(pending.transaction_id));
+        try checkInventory(&db, a, owner, 10, true);
         var after_abort = try db.orderedHistoryPage(a, .{ .reference = reference, .after = page.next, .now_seconds = 1 }, 10);
         defer after_abort.deinit();
         try std.testing.expect(after_abort.caught_up and after_abort.events.len == 0);
@@ -143,6 +148,7 @@ pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions
         _ = try db.resolveOrderedClosedLegacyTerminal(owner, proofs[1], .{ .term = 1, .index = 10 });
         try std.testing.expect(try db.resolveOrderedClosedLegacyTerminal(owner, pending, .{ .term = 1, .index = 7 }) == .superseded);
         const query: ordered.Query = .{ .version = 1, .owner = owner, .command = .{ .version = 1, .owner = owner, .proof = proofs[1] }, .entry = .{ .term = 1, .index = 10 }, .minimum_applied_index = 10 };
+        try checkInventory(&db, a, owner, 10, true);
         const reopened = try db.legacyTerminalOutcome(query);
         try std.testing.expect(reopened.outcome == .applied and reopened.outcome.applied.kind == .aborted and reopened.outcome.applied.timestamp == 201);
         var expired = query;
@@ -155,4 +161,71 @@ pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions
         defer a.free(row);
         try std.testing.expect(try db.get(a, "legacy-abort") == null);
     }
+}
+
+fn checkInventory(db: *db_mod.DB, a: std.mem.Allocator, owner: completion.RoutedOwner, index: u64, resolved: bool) !void {
+    const query: inventory.Query = .{ .version = 1, .owner = owner, .after = null, .max_records = 256, .minimum_applied_index = index };
+    const before = try db.orderedApplyReceipt();
+    var observed = try db.legacyRecoveryInventory(a, query);
+    defer observed.deinit(a);
+    try observed.validate(query);
+    try std.testing.expectEqual(index, observed.cut.index);
+    try std.testing.expectEqual(@as(usize, 3), observed.page.scanned_records);
+    try std.testing.expectEqual(@as(usize, if (resolved) 1 else 3), observed.page.items.len);
+    try std.testing.expect(observed.page.reached_end);
+    try std.testing.expectEqual(@as(u64, 6), observed.page.closure.first_closed_at.index);
+    try std.testing.expectEqualDeep(@as(?[16]u8, @splat(230)), observed.page.next_after);
+    try std.testing.expectEqualDeep(before, try db.orderedApplyReceipt());
+    const encoded_query = try inventory.encodeQuery(a, query);
+    defer a.free(encoded_query);
+    try std.testing.expectEqualDeep(query, try inventory.decodeQuery(a, encoded_query));
+    const encoded = try inventory.encodeObservation(a, query, observed);
+    defer a.free(encoded);
+    var decoded = try inventory.decodeObservation(a, encoded, query);
+    defer decoded.deinit(a);
+    try std.testing.expectEqualDeep(observed, decoded);
+    var raw = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+    defer raw.deinit();
+    _ = raw.value.object.getPtr("owner").?.object.swapRemove("root_generation");
+    const stripped = try std.json.Stringify.valueAlloc(a, raw.value, .{});
+    defer a.free(stripped);
+    try std.testing.expectError(error.SourceAdmissionCorrupt, inventory.decodeObservation(a, stripped, query));
+    var bounded = query;
+    bounded.max_records = 1;
+    var scanned: usize = 0;
+    var returned: usize = 0;
+    while (true) {
+        var page = try db.legacyRecoveryInventory(a, bounded);
+        defer page.deinit(a);
+        try std.testing.expect(page.page.scanned_records <= 1);
+        scanned += page.page.scanned_records;
+        returned += page.page.items.len;
+        if (page.page.reached_end) break;
+        bounded.after = page.page.next_after;
+    }
+    try std.testing.expectEqual(observed.page.scanned_records, scanned);
+    try std.testing.expectEqual(observed.page.items.len, returned);
+    bounded = query;
+    bounded.minimum_applied_index += 1;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.legacyRecoveryInventory(a, bounded));
+    bounded = query;
+    bounded.owner.root_generation += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, db.legacyRecoveryInventory(a, bounded));
+    bounded = query;
+    bounded.owner.metadata_incarnation[0] ^= 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, db.legacyRecoveryInventory(a, bounded));
+    bounded = query;
+    bounded.max_records = 0;
+    try std.testing.expectError(error.InvalidSourceAdmission, db.legacyRecoveryInventory(a, bounded));
+    bounded.max_records = 257;
+    try std.testing.expectError(error.InvalidSourceAdmission, db.legacyRecoveryInventory(a, bounded));
+    var forged = observed;
+    forged.page.scanned_records = 0;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, forged.validate(query));
+    forged = observed;
+    forged.page.next_after = @splat(0);
+    try std.testing.expectError(error.SourceAdmissionCorrupt, forged.validate(query));
+    forged = observed;
+    forged.cut.index -= 1;
+    try std.testing.expectError(error.SourceAdmissionCorrupt, forged.validate(query));
 }

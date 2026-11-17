@@ -1203,6 +1203,9 @@ fn orderedSourceRetirementOutcome(self: *DB, query: @import("source_scope_retire
 fn orderedSourceScopeOutcome(self: *DB, recovery: @import("source_scope_ordered.zig").Recovery) engine.Outcome(@import("source_scope_ordered.zig").Outcome) {
     return .{ .value = self.orderedSourceScopeOutcome(recovery) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn legacyRecoveryInventory(self: *DB, a: Allocator, query: @import("source_legacy_inventory.zig").Query) engine.Outcome(@import("source_legacy_inventory.zig").Observation) {
+    return .{ .value = self.legacyRecoveryInventory(a, query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn legacyTerminalOutcome(self: *DB, query: @import("source_legacy_terminal_ordered.zig").Query) engine.Outcome(@import("source_legacy_terminal_ordered.zig").Observation) {
     return .{ .value = self.legacyTerminalOutcome(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

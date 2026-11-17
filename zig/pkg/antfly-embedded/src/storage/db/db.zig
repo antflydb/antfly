@@ -27791,6 +27791,24 @@ pub const DB = struct {
         return ordered.replay(self.alloc, &read, command, cut);
     }
 
+    /// Private work discovery only. The caller qualifies ownership and quorum
+    /// ReadIndex; this snapshot binds physical authority, closure, marker and
+    /// records. An empty page is never a migration/drainage certificate.
+    pub fn legacyRecoveryInventory(self: *DB, a: Allocator, query: @import("../source_legacy_inventory.zig").Query) !@import("../source_legacy_inventory.zig").Observation {
+        if (comptime storage_engine.enabled) return storage_engine.call("legacyRecoveryInventory", .{ self, a, query });
+        const inventory = @import("../source_legacy_inventory.zig");
+        try query.validate();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = query.owner.namespace, .generation = query.owner.root_generation, .fence = query.owner.digest() });
+        const cut = try orderedHistoryReadCut(&txn, query.minimum_applied_index);
+        var result: inventory.Observation = .{ .version = 1, .owner = query.owner, .cut = .{ .term = cut.term, .index = cut.index }, .page = try transactions_mod.TxnManager.legacyRecoveryPageInRead(a, &txn, try @import("../source_scope.zig").Basis.fromOwner(query.owner), query.after, query.max_records) };
+        errdefer result.deinit(a);
+        try result.validate(query);
+        return result;
+    }
+
     /// Caller first qualifies current ownership and quorum ReadIndex. Native
     /// closure, receipt and actual applied cut share this read-only snapshot.
     pub fn legacyTerminalOutcome(self: *DB, query: @import("../source_legacy_terminal_ordered.zig").Query) !@import("../source_legacy_terminal_ordered.zig").Observation {

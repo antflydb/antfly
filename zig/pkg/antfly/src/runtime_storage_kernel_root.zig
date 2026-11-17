@@ -181,6 +181,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerOrderedSourceProducerClosure, "antfly_storage_owner_ordered_source_producer_closure");
     exportInternal(&storage_kernel_exports.storageOwnerSourceRetirementOutcome, "antfly_storage_owner_source_retirement_outcome");
     exportInternal(&storage_kernel_exports.storageOwnerSourceScopeObservation, "antfly_storage_owner_source_scope_observation");
+    exportInternal(&storage_kernel_exports.storageOwnerLegacyRecoveryInventory, "antfly_storage_owner_legacy_recovery_inventory");
     exportInternal(&storage_kernel_exports.storageOwnerLegacyTerminalOutcome, "antfly_storage_owner_legacy_terminal_outcome");
     exportInternal(&storage_kernel_exports.storageOwnerSourceProducerClosureObservation, "antfly_storage_owner_source_producer_closure_observation");
     exportInternal(&storage_kernel_exports.storageOwnerSourceCheckpointObservation, "antfly_storage_owner_source_checkpoint_observation");

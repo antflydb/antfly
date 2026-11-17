@@ -899,6 +899,7 @@ pub const storage_read_session_contract = @import("storage/read_session_contract
 pub const storage_read_session_values = @import("storage/read_session_values.zig");
 
 pub const storage_transaction_completion = @import("storage/transaction_completion.zig");
+pub const storage_source_legacy_inventory = @import("storage/source_legacy_inventory.zig");
 pub const storage_source_legacy_terminal_ordered = @import("storage/source_legacy_terminal_ordered.zig");
 pub const storage_source_producer_policy = @import("storage/source_producer_policy.zig");
 pub const storage_source_scope_retirement = @import("storage/source_scope_retirement.zig");
