@@ -270,6 +270,17 @@ backups to Lite to retain direct-field indexing. For a server transfer, prepare
 an explicit external sparse index and supply its vectors as embedding artifacts
 before exporting.
 
+For an older server portable backup whose archive omits the external marker,
+restore by backup ID from the original repository with
+`antfly restore --table <target> --backup-id <id> --connection <connection>
+--location <repository-uri>`. This uses the backup manifest's public index
+definition together with its recorded shard digests. Keep the manifest and
+shard files together. To make a transferable file after restore, export a
+native AFB2 bundle with `antfly backup --format native --out <path>` so it
+includes the public manifest. A detached portable archive without the manifest cannot distinguish the old
+server format from a Lite direct-field index. Recover the original manifest
+and shard files or restore the archive into Lite to access its data.
+
 For an offline source inventory and compatibility report, use:
 
 ```bash

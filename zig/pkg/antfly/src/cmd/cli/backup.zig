@@ -450,7 +450,12 @@ pub fn prepareInputRestorePlan(
     location: []const u8,
     connection: []const u8,
 ) !InputRestorePlan {
-    const staged = try lite_restore_staging.stageInputRestoreBackup(allocator, input_path, table_name, backup_id orelse "", location);
+    const staged = lite_restore_staging.stageInputRestoreBackup(allocator, input_path, table_name, backup_id orelse "", location) catch |err| {
+        if (err == error.UnsupportedEmbeddedLiteIndex) {
+            std.log.err("the backup contains an index without a server catalog equivalent; restore to Lite, or for a server backup use its original repository manifest with --backup-id", .{});
+        }
+        return err;
+    };
     errdefer {
         var owned_staged = staged;
         owned_staged.deinit(allocator);

@@ -256,6 +256,7 @@ def test_lite_server_backup_roundtrip_under_connection_root(
             )
             assert result.returncode != 0
             assert "UnsupportedEmbeddedLiteIndex" in result.stderr
+            assert "index without a server catalog equivalent" in result.stderr
             assert (
                 requests.get(
                     server.api_url + "/tables/direct_sparse", timeout=10

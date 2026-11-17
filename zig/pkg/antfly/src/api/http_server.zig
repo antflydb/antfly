@@ -13639,7 +13639,13 @@ pub const ApiHttpServer = struct {
             previous_definition = (try self.loadOwnedTableRecord(self.alloc, table_name)) orelse return error.TableNotFound;
             // Keep authenticated source bytes for storage validation. Only the
             // destination definition loses source-owned operational checkpoints.
-            if (!created_metadata) replacement_indexes = try @import("antfly_local_sources").privacy_catalog.prepareRestore(self.alloc, manifest.indexes_json);
+            if (!created_metadata) {
+                const prepared = try @import("antfly_local_sources").privacy_catalog.prepareRestore(self.alloc, manifest.indexes_json);
+                defer self.alloc.free(prepared);
+                var nonce: [32]u8 = undefined;
+                try staging_io.randomSecure(&nonce);
+                replacement_indexes = try @import("antfly_local_sources").api_index_metadata.aliases.renewRestoreEpoch(self.alloc, prepared, &std.fmt.bytesToHex(nonce, .lower));
+            }
             const destination_indexes = replacement_indexes orelse previous_definition.?.indexes_json;
             var destination_manifest = manifest;
             destination_manifest.indexes_json = destination_indexes;
@@ -15189,6 +15195,8 @@ pub const ApiHttpServer = struct {
             error.ReembedSetupRetry => return error.ReembedSetupRetry,
             error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
             error.ForeignQueryFailed => return error.ForeignQueryFailed,
+            error.ForeignAuthFailed => return error.ForeignAuthFailed,
+            error.ForeignTableNotFound => return error.ForeignTableNotFound,
             error.LibpqUnavailable => return error.LibpqUnavailable,
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation => return error.GraphMinWeightDomainViolation,
@@ -15550,6 +15558,8 @@ pub const ApiHttpServer = struct {
                 error.ReembedSetupRetry => return error.ReembedSetupRetry,
                 error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
                 error.ForeignQueryFailed => return error.ForeignQueryFailed,
+                error.ForeignAuthFailed => return error.ForeignAuthFailed,
+                error.ForeignTableNotFound => return error.ForeignTableNotFound,
                 error.LibpqUnavailable => return error.LibpqUnavailable,
                 error.GraphWorkBudgetExceeded,
                 error.GraphMinWeightDomainViolation,
@@ -15631,6 +15641,8 @@ pub const ApiHttpServer = struct {
             error.ReembedSetupRetry => return error.ReembedSetupRetry,
             error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
             error.ForeignQueryFailed => return error.ForeignQueryFailed,
+            error.ForeignAuthFailed => return error.ForeignAuthFailed,
+            error.ForeignTableNotFound => return error.ForeignTableNotFound,
             error.LibpqUnavailable => return error.LibpqUnavailable,
             error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation,
@@ -15759,6 +15771,8 @@ pub const ApiHttpServer = struct {
             error.ReembedSetupRetry => return error.ReembedSetupRetry,
             error.ForeignConnectionFailed => return error.ForeignConnectionFailed,
             error.ForeignQueryFailed => return error.ForeignQueryFailed,
+            error.ForeignAuthFailed => return error.ForeignAuthFailed,
+            error.ForeignTableNotFound => return error.ForeignTableNotFound,
             error.LibpqUnavailable => return error.LibpqUnavailable,
             error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation,
@@ -23933,6 +23947,8 @@ pub const ApiHttpServer = struct {
         return switch (err) {
             error.ForeignConnectionFailed => try contextualForeignSourceFailureResponse(self.alloc, table_name, .connection),
             error.ForeignQueryFailed => try contextualForeignSourceFailureResponse(self.alloc, table_name, .execution),
+            error.ForeignAuthFailed => try contextualForeignSourceFailureResponse(self.alloc, table_name, .authentication),
+            error.ForeignTableNotFound => try contextualForeignSourceFailureResponse(self.alloc, table_name, .missing_relation),
             error.LibpqUnavailable => try contextualForeignSourceFailureResponse(self.alloc, table_name, .driver),
             error.ObjectTableJoinUnsupported => try contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported"),
             error.Forbidden => try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden"),
@@ -64080,6 +64096,21 @@ test "api http query binding generation races return retryable unavailable" {
     const a = std.testing.allocator;
     var server: ApiHttpServer = undefined;
     server.alloc = a;
+    for ([_]struct { err: anyerror, code: []const u8 }{
+        .{ .err = error.ForeignQueryFailed, .code = "foreign_source_query_failed" },
+        .{ .err = error.ForeignAuthFailed, .code = "foreign_source_auth_failed" },
+        .{ .err = error.ForeignTableNotFound, .code = "foreign_source_relation_not_found" },
+    }) |case| {
+        var response = try server.publicQueryOperationErrorResponse("remote_docs", "{}", case.err);
+        defer response.deinit(a);
+        try std.testing.expectEqual(@as(u16, 502), response.status);
+        try std.testing.expectEqual(@as(usize, 0), response.headers.len);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.code, parsed.value.object.get("code").?.string);
+        try std.testing.expectEqualStrings("remote_docs", parsed.value.object.get("source").?.string);
+        try std.testing.expect(!parsed.value.object.get("retryable").?.bool);
+    }
     for ([_]anyerror{ error.PreparedGenerationChanged, error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired }) |err| {
         var response = try server.publicQueryOperationErrorResponse("docs", "{}", err);
         defer response.deinit(a);
