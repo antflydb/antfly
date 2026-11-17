@@ -4114,15 +4114,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         raw_descriptor: descriptor_contract.Descriptor,
         needs_index_catalog: bool,
     ) !Lease {
-        var physical = self.physical_catalogs.acquire(self.alloc, group_id, raw_descriptor.indexes_json) catch |err|
-            return if (err == error.OutOfMemory or err == error.CatalogProjectionBusy) error.RaftApplyWriterUnavailable else err;
-        defer physical.deinit();
+        var physical = self.physical_catalogs.lookup(group_id, raw_descriptor.indexes_json) catch return error.RaftApplyWriterUnavailable;
+        defer if (physical) |*projection| projection.deinit();
         var descriptor = raw_descriptor;
-        descriptor.indexes_json = physical.bytes;
+        if (physical) |projection| descriptor.indexes_json = projection.bytes;
 
         if (!self.mutex.tryLock()) return error.RaftApplyWriterUnavailable;
-        const initial = self.tryAcquireWarmApplyLocked(group_id, table_name, descriptor, needs_index_catalog);
-        if (initial != null) self.physical_catalogs.retainAdmitted(self.alloc, &physical);
+        const initial = if (physical != null) self.tryAcquireWarmApplyLocked(group_id, table_name, descriptor, needs_index_catalog) else null;
         const may_queue = !self.quiescing and !self.apply_control_stopping and
             !self.publicationPendingLocked(group_id, table_name) and self.apply_control_io != null and
             !self.applyRequestPendingLocked(group_id, table_name) and
@@ -4133,7 +4131,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // A committed descriptor may carry large schema and index JSON. Clone
         // it outside the owner registry mutex, then recheck the exact binding
         // before enqueueing; another control worker may have opened it meanwhile.
-        const pending = ApplyOpen.init(self.alloc, self.replica_root_dir, group_id, table_name, descriptor) catch
+        const pending = ApplyOpen.init(self.alloc, self.replica_root_dir, group_id, table_name, raw_descriptor) catch
             return error.RaftApplyWriterUnavailable;
         // Prepare graph namespaces on the control executor before deriving
         // document field edges or applying graph mutations. Historical opens
@@ -4145,9 +4143,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer self.mutex.unlock();
         if (self.quiescing or self.apply_control_stopping or
             self.publicationPendingLocked(group_id, table_name)) return error.RaftApplyWriterUnavailable;
-        if (self.tryAcquireWarmApplyLocked(group_id, table_name, descriptor, needs_index_catalog)) |lease| {
-            self.physical_catalogs.retainAdmitted(self.alloc, &physical);
-            return lease;
+        // The control executor may have admitted the raw cut while we
+        // prepared the queue item. Recheck without building a projection.
+        if (physical == null)
+            physical = self.physical_catalogs.lookup(group_id, raw_descriptor.indexes_json) catch return error.RaftApplyWriterUnavailable;
+        if (physical) |projection| {
+            descriptor.indexes_json = projection.bytes;
+            if (self.tryAcquireWarmApplyLocked(group_id, table_name, descriptor, needs_index_catalog)) |lease| return lease;
         }
         if (self.apply_control_io == null or self.applyRequestPendingLocked(group_id, table_name) or
             self.apply_control_pending.items.len + @as(usize, @intFromBool(self.apply_control_active != null)) >= apply_control_max_pending)
@@ -7045,6 +7047,7 @@ test "committed owner apply never opens or closes storage under the raft apply l
     const first: descriptor_contract.Descriptor = .{
         .lsm_root_generation = table_reads.backend_current_root_generation,
         .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .indexes_json = "{\"_index_alias_epoch\":\"restore-epoch\"}",
         .schema_json = "{\"version\":0}",
     };
     const second: descriptor_contract.Descriptor = .{
@@ -7075,8 +7078,18 @@ test "committed owner apply never opens or closes storage under the raft apply l
     // The worker is held before physical open; a repeated committed apply
     // remains a bounded retry and cannot itself open the owner.
     try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1));
+    {
+        Source.lock(&source.mutex);
+        defer source.mutex.unlock();
+        const pending = source.apply_control_active orelse return error.TestColdOwnerDidNotQueue;
+        try std.testing.expectEqualStrings(first.indexes_json, pending.descriptor.indexes_json);
+    }
+    try std.testing.expect((try source.physical_catalogs.lookup(1, first.indexes_json)) == null);
     gate.cold_release.set(io);
     try gate.applyCommitted(&source, first, first_batch, 1);
+    var admitted = (try source.physical_catalogs.lookup(1, first.indexes_json)) orelse return error.TestWarmOwnerDidNotAdmit;
+    defer admitted.deinit();
+    try std.testing.expectEqualStrings("{}", admitted.bytes);
     // A different group's cold open can hold the owner registry while a
     // recovery callback awaits Raft progress. The already-admitted apply
     // lease must be releasable even in that exact lock order.
