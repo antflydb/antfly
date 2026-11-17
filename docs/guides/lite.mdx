@@ -257,6 +257,36 @@ backups retain their bytes; Lite exports retain the metadata from the same
 snapshot as their documents. A native AFB2 bundle keeps its native representation.
 Delta bundles need their base and are not supported by this input path.
 
+When upgrading from a release that interpreted filesystem backup URIs relative
+to the connection root, update backup and restore commands to name the existing
+directory by its absolute path. For example, with a connection rooted at
+`/srv/antfly/backups`, change `file:///nightly` to
+`file:///srv/antfly/backups/nightly`. Keep the same connection and backup ID.
+The existing backup files can stay where they are.
+
+Native Lite sparse indexes that extract vectors directly from document fields
+cannot be represented by the server's public index catalog. Restore those
+backups to Lite to retain direct-field indexing. For a server transfer, prepare
+an explicit external sparse index and supply its vectors as embedding artifacts
+before exporting.
+
+Portable server exports write a companion manifest named
+`<archive>.manifest.json`. Keep it next to the archive when transferring the
+files. If export stops after the server backup completes, resume it locally
+with `antfly backup --export-existing --backup-id <id> --location <file-uri>
+--out <archive>`. An identical companion left by the interrupted export can
+be reused. Server restore checks that the manifest's shard size and SHA-256 match
+the archive before using the public catalog. For an older detached server
+export, copy the original `<backup-id>-metadata.json` to that companion
+filename. You can also restore directly from the original repository with
+`antfly restore --table <target> --backup-id <id> --connection <connection>
+--location <repository-uri>`. An archive whose public definition is unavailable
+can still be opened in Lite to access its data.
+
+When selecting tables from a cluster backup, use the `selector` in
+`backup --list --output json` under `table_selectors` if display names
+collide. Pass it unchanged to `restore --tables`.
+
 For an offline source inventory and compatibility report, use:
 
 ```bash

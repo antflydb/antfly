@@ -248,20 +248,10 @@ pub fn publicTableIndexesJsonAlloc(alloc: Allocator, stored: []const u8, destina
                 if (config.object.contains("sources")) return error.UnsupportedEmbeddedLiteIndex;
             }
             const artifact_backed = config.object.contains("sources") or config.object.contains("embedding_name");
-            if (!artifact_backed) {
-                // Released sparse external lowering omitted the external
-                // marker. Recognize its implicit field for compatibility;
-                // current producers persist the marker explicitly.
-                if (config.object.get("external")) |marker| {
-                    if (marker != .bool or !marker.bool) return error.UnsupportedEmbeddedLiteIndex;
-                } else {
-                    const field = config.object.get("field") orelse return error.UnsupportedEmbeddedLiteIndex;
-                    // Released server lowering used this exact implicit field.
-                    // Other native direct-field indexes have no public inverse.
-                    if (!sparse or field != .string or !std.mem.eql(u8, field.string, "embedding")) return error.UnsupportedEmbeddedLiteIndex;
-                }
-                try config.object.put(arena, "external", .{ .bool = true });
-            }
+            // An unmarked native sparse index can extract vectors from
+            // documents. Only the public catalog identifies legacy external
+            // definitions; native direct fields have no public inverse.
+            if (!artifact_backed and !external) return error.UnsupportedEmbeddedLiteIndex;
             _ = config.object.orderedRemove("field");
             if (config.object.fetchOrderedRemove("dims")) |field| try config.object.put(arena, "dimension", field.value);
             if (config.object.fetchOrderedRemove("metric")) |field| try config.object.put(arena, "distance_metric", field.value);

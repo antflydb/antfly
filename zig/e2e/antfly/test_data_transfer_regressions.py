@@ -15,6 +15,7 @@
 
 """Public CLI transfer boundaries must agree on catalogs, identities and paths."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -33,10 +34,10 @@ pytestmark = pytest.mark.e2e_resource("antfly_process")
 
 
 @pytest.mark.parametrize(
-    "schema_version,legacy_sparse", [(0, False), (3, False), (0, True)]
+    "schema_version,direct_sparse", [(0, False), (3, False), (0, True)]
 )
 def test_lite_server_backup_roundtrip_under_connection_root(
-    tmp_path, schema_version, legacy_sparse
+    tmp_path, schema_version, direct_sparse
 ):
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     root = (tmp_path / "backups").resolve()
@@ -63,7 +64,7 @@ def test_lite_server_backup_roundtrip_under_connection_root(
     }
     env.pop("ANTFLY_TOKEN", None)
 
-    def cli(*args):
+    def cli(*args, check=True):
         result = subprocess.run(
             [binary, *([] if args[0] == "lite" else ["--no-agent"]), *map(str, args)],
             env=env,
@@ -71,7 +72,7 @@ def test_lite_server_backup_roundtrip_under_connection_root(
             text=True,
             timeout=120,
         )
-        assert result.returncode == 0, (
+        assert not check or result.returncode == 0, (
             result.stdout
             + result.stderr
             + "\nSERVER:\n"
@@ -213,7 +214,7 @@ def test_lite_server_backup_roundtrip_under_connection_root(
                     "config_json": json.dumps(
                         {
                             "field": "embedding",
-                            **({} if legacy_sparse else {"external": True}),
+                            **({} if direct_sparse else {"external": True}),
                         }
                     ),
                 }
@@ -238,6 +239,33 @@ def test_lite_server_backup_roundtrip_under_connection_root(
         assert initial["responses"][0]["hits"]["hits"][0]["_id"] == "a", initial
         portable = tmp_path / "seed.afb"
         cli("lite", "backup", seed, "--out", portable)
+        if direct_sparse:
+            result = cli(
+                "restore",
+                "--input",
+                portable,
+                "--table",
+                "direct_sparse",
+                "--connection",
+                "bk",
+                "--location",
+                root.as_uri(),
+                "--url",
+                server.url,
+                "--wait",
+                check=False,
+            )
+            assert result.returncode != 0
+            assert "UnsupportedEmbeddedLiteIndex" in result.stderr
+            assert "index without a server catalog equivalent" in result.stderr
+            assert (
+                requests.get(
+                    server.api_url + "/tables/direct_sparse", timeout=10
+                ).status_code
+                == 404
+            )
+            failed = False
+            return
         for name, source in [("from_file", seed), ("from_archive", portable)]:
             location = root / name
             cli(
@@ -269,7 +297,70 @@ def test_lite_server_backup_roundtrip_under_connection_root(
             (root / "promoted").as_uri(),
         )
         expect_docs("promoted")
+        blocked_output = tmp_path / "occupied.afb"
+        blocked_output.symlink_to(tmp_path / "missing-target")
+        conflict = cli(
+            "backup",
+            "--table",
+            "from_file",
+            "--backup-id",
+            "blocked-output",
+            "--connection",
+            "bk",
+            "--location",
+            root.as_uri(),
+            "--out",
+            blocked_output,
+            "--url",
+            server.url,
+            check=False,
+        )
+        assert conflict.returncode != 0 and "PathAlreadyExists" in conflict.stderr
+        assert not (root / "blocked-output-metadata.json").exists()
+        blocked_companion = tmp_path / "blocked-companion.afb"
+        blocked_companion.with_name(
+            blocked_companion.name + ".manifest.json"
+        ).write_text("occupied")
+        conflict = cli(
+            "backup",
+            "--table",
+            "from_file",
+            "--backup-id",
+            "blocked-companion",
+            "--connection",
+            "bk",
+            "--location",
+            root.as_uri(),
+            "--out",
+            blocked_companion,
+            "--url",
+            server.url,
+            check=False,
+        )
+        assert conflict.returncode != 0 and "PathAlreadyExists" in conflict.stderr
+        assert not (root / "blocked-companion-metadata.json").exists()
+        assert not blocked_companion.exists()
+
         for format in ("portable", "native"):
+            if format == "native":
+                alias = requests.put(
+                    server.api_url + "/tables/from_file/index-aliases/live",
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                    json={
+                        "index": "sparse_vectors",
+                        "idempotency_key": "restore-alias",
+                        "require": "queryable",
+                    },
+                    timeout=10,
+                )
+                assert alias.ok, alias.text
+                source_alias = requests.get(
+                    server.api_url + "/tables/from_file/index-aliases/live",
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                    timeout=10,
+                )
+                assert source_alias.ok, source_alias.text
+                source_etag = source_alias.headers["ETag"]
             output = tmp_path / f"server-{format}.afb"
             cli(
                 "backup",
@@ -290,6 +381,88 @@ def test_lite_server_backup_roundtrip_under_connection_root(
             )
             assert output.stat().st_size > 0
             assert (root / f"export-{format}-metadata.json").exists()
+            if format == "portable":
+                sidecar = output.with_name(output.name + ".manifest.json")
+                captured = sidecar.read_bytes()
+                report = json.loads(cli("backup", "inspect", "--input", output).stdout)
+                assert report["completeness"]["scan_complete"]
+                assert report["source"]["catalog_source"] == "companion"
+                assert (
+                    report["source"]["catalog_sha256"]
+                    == hashlib.sha256(captured).hexdigest()
+                )
+                output.unlink()
+                cli(
+                    "backup",
+                    "--export-existing",
+                    "--backup-id",
+                    f"export-{format}",
+                    "--location",
+                    root.as_uri(),
+                    "--out",
+                    output,
+                )
+                assert sidecar.read_bytes() == captured
+                assert output.stat().st_size > 0
+                migrating = json.loads(captured)
+                migrating["read_schema_json"] = migrating["schema_json"]
+                sidecar.write_text(json.dumps(migrating))
+                report = json.loads(cli("backup", "inspect", "--input", output).stdout)
+                assert report["completeness"]["scan_complete"]
+                assert report["compatibility"]["verdict"] == "blocked"
+                assert (
+                    report["compatibility"]["restore_blocker"]
+                    == "unsupported_schema_migration"
+                )
+                modified = json.loads(captured)
+                modified["shards"][0]["artifact_sha256"] = "0" * 64
+                sidecar.write_text(json.dumps(modified))
+                report = json.loads(cli("backup", "inspect", "--input", output).stdout)
+                assert not report["completeness"]["scan_complete"]
+                assert (
+                    report["completeness"]["failure_code"]
+                    == "artifact_integrity_mismatch"
+                )
+                failure = cli(
+                    "restore",
+                    "--input",
+                    output,
+                    "--table",
+                    "mismatched_sidecar",
+                    "--connection",
+                    "bk",
+                    "--location",
+                    root.as_uri(),
+                    "--url",
+                    server.url,
+                    "--wait",
+                    check=False,
+                )
+                assert failure.returncode != 0
+                sidecar.write_bytes(captured)
+            elif schema_version:
+                manifest = json.loads(
+                    (root / f"export-{format}-metadata.json").read_bytes()
+                )
+                shard = root / manifest["shards"][0]["snapshot_path"]
+                extra = shard / "unexpected"
+                extra.write_bytes(b"not present in the captured tree")
+                rejected = tmp_path / "damaged-native.afb"
+                failure = cli(
+                    "backup",
+                    "--export-existing",
+                    "--backup-id",
+                    f"export-{format}",
+                    "--location",
+                    root.as_uri(),
+                    "--out",
+                    rejected,
+                    check=False,
+                )
+                assert failure.returncode != 0
+                assert "BackupArtifactIntegrityMismatch" in failure.stderr
+                assert not rejected.exists()
+                extra.unlink()
             cli(
                 "restore",
                 "--input",
@@ -305,6 +478,14 @@ def test_lite_server_backup_roundtrip_under_connection_root(
                 "--wait",
             )
             expect_docs(f"returned_{format}")
+            if format == "native":
+                restored_alias = requests.get(
+                    server.api_url + "/tables/returned_native/index-aliases/live",
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                    timeout=10,
+                )
+                assert restored_alias.ok, restored_alias.text
+                assert restored_alias.headers["ETag"] != source_etag
             if format == "portable":
                 restored = tmp_path / "returned.aflite"
                 cli("lite", "restore", output, "--out", restored)
@@ -380,7 +561,8 @@ def test_foreign_source_failure_preserves_safe_cause():
             "foreign_source_driver_unavailable",
         )
         assert body["source"] == "unreachable_source"
-        assert body["retryable"] is (body["code"] == "foreign_source_unavailable")
+        assert body["retryable"] is False
+        assert "Retry-After" not in response.headers
         assert "never-return-this-password" not in response.text
         failed = False
     finally:

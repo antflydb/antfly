@@ -32949,6 +32949,22 @@ components:
           example:
             - users
             - products
+        table_selectors:
+          type: array
+          description: Exact restore selectors paired with display names, in the same order as tables.
+            Use selector in ClusterRestoreRequest.table_names to disambiguate identical display names.
+          items:
+            type: object
+            required:
+              - name
+              - selector
+            properties:
+              name:
+                type: string
+                description: Display name of the backed-up table.
+              selector:
+                type: string
+                description: Opaque identifier accepted by restore for this backup.
         location:
           type: string
           description: Storage location of the backup

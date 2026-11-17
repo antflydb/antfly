@@ -12155,6 +12155,13 @@ export interface components {
              *     ]
              */
             tables: string[];
+            /** @description Exact restore selectors paired with display names, in the same order as tables. Use selector in ClusterRestoreRequest.table_names to disambiguate identical display names. */
+            table_selectors?: {
+                /** @description Display name of the backed-up table. */
+                name: string;
+                /** @description Opaque identifier accepted by restore for this backup. */
+                selector: string;
+            }[];
             /**
              * @description Storage location of the backup
              * @example s3://mybucket/antfly-backups/cluster/2025-01-15

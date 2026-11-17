@@ -2973,6 +2973,11 @@ pub fn checkArtifactDocumentLimit(alloc: Allocator, payload: []const u8, max_byt
 /// opened. A callback must keep its output private until this function returns:
 /// a late checksum failure or source mutation invalidates the entire report.
 /// This validates the portable format, not destination/model/media eligibility.
+/// Validate a pinned file without replaying its blocks through a visitor.
+pub fn validatePortableFileWithLimits(alloc: Allocator, io: std.Io, file: std.Io.File, options: FileInspectionOptions) !void {
+    _ = try inspectPortableFile(alloc, io, file, options, {}, null);
+}
+
 pub fn inspectPortableFileBlocks(
     alloc: Allocator,
     io: std.Io,
@@ -2980,6 +2985,17 @@ pub fn inspectPortableFileBlocks(
     options: FileInspectionOptions,
     context: anytype,
     comptime visit: fn (@TypeOf(context), backup_codec.BlockType, []const u8) anyerror!void,
+) !FileInspection {
+    return try inspectPortableFile(alloc, io, file, options, context, visit);
+}
+
+fn inspectPortableFile(
+    alloc: Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    options: FileInspectionOptions,
+    context: anytype,
+    comptime visitor: ?fn (@TypeOf(context), backup_codec.BlockType, []const u8) anyerror!void,
 ) !FileInspection {
     try options.cancellation.check();
     if (!try file.tryLock(io, .shared)) return error.WriterLocked;
@@ -2999,32 +3015,38 @@ pub fn inspectPortableFileBlocks(
     // constraint schemas and admission records remain rejected by the reader.
     try validatePortableImportReader(alloc, &reader, .{ .cancellation = options.cancellation, .detach_uncoordinated_cohort = true });
     const fingerprint = try reader.verifiedFingerprint();
-    try reader.reset(alloc);
-    if (options.metadata_first) {
-        _ = try reader.readHeader();
+    var format_version: u32 = undefined;
+    if (comptime visitor) |visit| {
+        try reader.reset(alloc);
+        if (options.metadata_first) {
+            _ = try reader.readHeader();
+            while (reader.hasRemaining()) {
+                const block = try reader.readBlock(alloc);
+                defer alloc.free(block.payload);
+                if (block.block_type == .metadata_batch) try visit(context, block.block_type, block.payload);
+            }
+            try reader.inner.verifyFingerprint(fingerprint);
+            try reader.reset(alloc);
+        }
+        format_version = (try reader.readHeader()).format_version;
         while (reader.hasRemaining()) {
             const block = try reader.readBlock(alloc);
             defer alloc.free(block.payload);
-            if (block.block_type == .metadata_batch) try visit(context, block.block_type, block.payload);
+            if (!options.metadata_first or block.block_type != .metadata_batch)
+                try visit(context, block.block_type, block.payload);
         }
         try reader.inner.verifyFingerprint(fingerprint);
-        try reader.reset(alloc);
+    } else {
+        var header_reader = backup_codec.FileReader.init(io, file, initial_stat.size);
+        format_version = (try header_reader.readHeader()).format_version;
     }
-    const header = try reader.readHeader();
-    while (reader.hasRemaining()) {
-        const block = try reader.readBlock(alloc);
-        defer alloc.free(block.payload);
-        if (!options.metadata_first or block.block_type != .metadata_batch)
-            try visit(context, block.block_type, block.payload);
-    }
-    try reader.inner.verifyFingerprint(fingerprint);
     const final_stat = try file.stat(io);
     if (final_stat.size != initial_stat.size or
         !std.meta.eql(final_stat.mtime, initial_stat.mtime) or
         !std.meta.eql(final_stat.ctime, initial_stat.ctime)) return error.SourceFileChanged;
     try options.cancellation.check();
     return .{
-        .format_version = header.format_version,
+        .format_version = format_version,
         .size_bytes = initial_stat.size,
         .logical_bytes = reader.logical_bytes,
         .fingerprint = fingerprint,
@@ -7941,7 +7963,7 @@ test "public catalog translation preserves runtime config and incarnation" {
     defer a.free(again);
     try std.testing.expectEqualStrings(translated, again);
     const vectors = try publicTableIndexesJsonAlloc(a,
-        \\{"dense":{"kind":"dense_vector","config_json":"{\"dims\":2,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"dense\",\"field\":\"embedding\"}"},"sparse":{"kind":"sparse_vector","config_json":"{\"field\":\"embedding\"}"},"links":{"kind":"graph","config_json":"{}"}}
+        \\{"dense":{"kind":"dense_vector","config_json":"{\"dims\":2,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"dense\",\"field\":\"embedding\"}"},"sparse":{"kind":"sparse_vector","config_json":"{\"field\":\"embedding\",\"external\":true}"},"links":{"kind":"graph","config_json":"{}"}}
     , .table_restore);
     defer a.free(vectors);
     var public = try std.json.parseFromSlice(std.json.Value, a, vectors, .{});
@@ -7966,6 +7988,9 @@ test "public catalog translation preserves runtime config and incarnation" {
     , .table_restore));
     try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,
         \\{"sparse":{"kind":"sparse_vector","config_json":"{\"field\":\"body\"}"}}
+    , .table_restore));
+    try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,
+        \\{"sparse":{"kind":"sparse_vector","config_json":"{\"field\":\"embedding\"}"}}
     , .table_restore));
     try std.testing.expectEqualStrings("graph", public.value.object.get("links").?.object.get("type").?.string);
     try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,
