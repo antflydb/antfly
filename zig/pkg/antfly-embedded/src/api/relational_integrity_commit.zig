@@ -1061,6 +1061,7 @@ fn prepareModeWithTiming(alloc: Allocator, source: reads.TableReadSource, metada
 }
 
 fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_tables: []const []const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool, modes: []const native.ConstraintTiming, repair_admission: ?RepairAdmission) !Prepared {
+    const producer = try contract.transactionProducer(requests);
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .ranges = ranges, .control = try boundedControl(request_control), .repair_tables = repair_tables, .repair_admission = repair_admission, .statement = statement, .previous = previous, .constraint_timing = modes };
@@ -1195,6 +1196,9 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
     }
     if (validate_statement) try builder.validateStatement();
     for (builder.output.items, builder.command_lists.items, builder.predicate_lists.items) |*table, commands, predicates| {
+        // Generated cascades, claims and read dependencies belong to the same
+        // initiating transaction; no absent label becomes independent authority.
+        table.source_producer = producer;
         _ = try planner.storage.validateCommandAdmission(commands.items);
         table.integrity_commands = commands.items;
         table.predicates = predicates.items;
@@ -2302,6 +2306,7 @@ test "distributed txn session statement checks immediate references and overlays
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
     inline for (.{ false, true }) |deferred| inline for (.{ "cascade", "restrict", "no_action" }) |action| {
+        const producer: @FieldType(contract.TableCommitRequest, "source_producer") = if (deferred) .legacy_cdc else .ordinary;
         const child_schema = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"foreign_keys\":[{\"name\":\"fk\",\"child_columns\":[\"id\"],\"parent_table\":\"p\",\"parent_columns\":[\"id\"],\"on_update\":\"" ++ action ++ "\",\"on_delete\":\"" ++ action ++ "\",\"deferrable\":true,\"timing\":\"" ++ (if (deferred) "deferred" else "immediate") ++ "\"}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
         const p = try testCatalogEnvelope(alloc, 1, parent_schema);
         defer alloc.free(p);
@@ -2325,15 +2330,17 @@ test "distributed txn session statement checks immediate references and overlays
         var fake: Fake = .{ .p = p, .c = c };
         const reader: reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } };
         const metadata = [_]TableRecord{ .{ .table_id = 1, .name = "p", .schema_json = parent_schema }, .{ .table_id = 2, .name = "c", .schema_json = child_schema } };
-        const child = [_]contract.TableCommitRequest{.{ .table_name = "c", .writes = &.{.{ .key = "child", .value = "{\"id\":1}" }} }};
+        const child = [_]contract.TableCommitRequest{.{ .source_producer = producer, .table_name = "c", .writes = &.{.{ .key = "child", .value = "{\"id\":1}" }} }};
         if (deferred) {
             var accepted = try prepareModeInternal(alloc, reader, &metadata, &child, .{}, &.{}, true, &.{}, true);
+            for (accepted.tables) |table| try std.testing.expectEqual(producer, table.source_producer);
             accepted.deinit();
         } else try std.testing.expectError(error.ForeignKeyParentMissing, prepareModeInternal(alloc, reader, &metadata, &child, .{}, &.{}, true, &.{}, true));
-        const initial = [_]contract.TableCommitRequest{ .{ .table_name = "p", .writes = &.{.{ .key = "parent", .value = "{\"id\":1}" }} }, child[0] };
+        const initial = [_]contract.TableCommitRequest{ .{ .source_producer = producer, .table_name = "p", .writes = &.{.{ .key = "parent", .value = "{\"id\":1}" }} }, child[0] };
         var previous = try prepareModeInternal(alloc, reader, &metadata, &initial, .{}, &.{}, true, &.{}, true);
         defer previous.deinit();
-        const change = [_]contract.TableCommitRequest{.{ .table_name = "p", .writes = &.{.{ .key = "parent", .value = "{\"id\":2}" }} }};
+        for (previous.tables) |table| try std.testing.expectEqual(producer, table.source_producer);
+        const change = [_]contract.TableCommitRequest{.{ .source_producer = producer, .table_name = "p", .writes = &.{.{ .key = "parent", .value = "{\"id\":2}" }} }};
         if (comptime std.mem.eql(u8, action, "restrict")) {
             try std.testing.expectError(error.ForeignKeyReferenced, prepareModeInternal(alloc, reader, &metadata, &change, .{}, &.{}, true, previous.tables, true));
         } else if (comptime std.mem.eql(u8, action, "no_action") and !deferred) {
@@ -2341,15 +2348,16 @@ test "distributed txn session statement checks immediate references and overlays
         } else {
             var next = try prepareModeInternal(alloc, reader, &metadata, &change, .{}, &.{}, true, previous.tables, true);
             defer next.deinit();
+            for (next.tables) |table| try std.testing.expectEqual(producer, table.source_producer);
             if (comptime std.mem.eql(u8, action, "cascade")) {
                 const generated = for (next.tables) |table| {
                     if (std.mem.eql(u8, table.table_name, "c")) break table;
                 } else return error.TestExpectedEqual;
                 try std.testing.expectEqualStrings("{\"id\":2}", generated.writes[0].value);
-                const normalized = [_]contract.TableCommitRequest{ .{ .table_name = "p", .writes = change[0].writes }, .{ .table_name = "c", .writes = generated.writes } };
+                const normalized = [_]contract.TableCommitRequest{ .{ .source_producer = producer, .table_name = "p", .writes = change[0].writes }, .{ .source_producer = producer, .table_name = "c", .writes = generated.writes } };
                 var staged_again = try prepareModeInternal(alloc, reader, &metadata, &normalized, .{}, &.{}, true, &.{}, false);
                 defer staged_again.deinit();
-                var third = try prepareModeInternal(alloc, reader, &metadata, &.{.{ .table_name = "p", .writes = &.{.{ .key = "parent", .value = "{\"id\":3}" }} }}, .{}, &.{}, true, staged_again.tables, true);
+                var third = try prepareModeInternal(alloc, reader, &metadata, &.{.{ .source_producer = producer, .table_name = "p", .writes = &.{.{ .key = "parent", .value = "{\"id\":3}" }} }}, .{}, &.{}, true, staged_again.tables, true);
                 defer third.deinit();
                 for (third.tables) |table| if (std.mem.eql(u8, table.table_name, "c")) try std.testing.expectEqualStrings("{\"id\":3}", table.writes[0].value);
             }
@@ -3090,4 +3098,9 @@ test "distributed txn MATCH PARTIAL nullable witnesses survive alternate deletio
             return error.TestExpectedError;
         }
     }
+}
+
+test "distributed txn integrity producer rejects mixed origins before metadata reads" {
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, prepare(std.testing.allocator, undefined, &.{}, &.{ .{ .table_name = "p", .source_producer = .ordinary }, .{ .table_name = "c", .source_producer = .legacy_cdc } }));
+    try std.testing.expectError(error.InvalidSourceAdmission, prepare(std.testing.allocator, undefined, &.{}, &.{.{ .table_name = "p", .source_producer = .scoped_source }}));
 }

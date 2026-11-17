@@ -7124,3 +7124,23 @@ changed; versions remain owner/API/engine/data/metadata/failure
 qualified global legacy drainage/closure, source-granted destination integration
 and all original retained/public history, bootstrap, retention, pgoutput and
 actual Antfly existing-client acceptance remain open.
+
+### Integrity expansion retains initiating producer
+
+Relational integrity preparation validates one common explicit producer before
+metadata IO and retains it on every final table request, including generated
+cascades, claims and read dependencies. Existing unlabelled requests stay
+unlabelled; generic scoped-source labels and mixed origins fail before reads.
+The class is inherited from the initiating transaction, not inferred from a
+child table or missing source purpose.
+
+The existing immediate/deferred session cascade scenario now covers ordinary and
+legacy producers through initial statements, generated cascade rows and
+subsequent normalized statements. A separate check rejects mixed/scoped origins
+with an undefined reader, proving the rejection precedes IO. Final transaction
+suites passed (`source-producer-integrity-test.log`): 43 local cases and 78 API
+integration cases, zero failures, skips or leaks. Source-catalog, engine-error,
+OpenAPI and `git diff --check` passed
+(`source-producer-integrity-contract-check.log`). Versions remain unchanged.
+Public ordinary ingress and remaining special mutation provenance still require
+implementation; first-strict activation and all original acceptance stay open.
