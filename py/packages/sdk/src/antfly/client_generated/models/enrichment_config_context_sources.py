@@ -19,8 +19,9 @@ class EnrichmentConfigContextSources:
     block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields,
     query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present)
     invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments
-    whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite); distributed
-    tables reject the declaration explicitly.
+    whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite) and by
+    distributed tables, where context sources are declared through the artifact enrichment endpoint (not inline at table
+    creation) and admission resolves table names and rejects cross-table generated-input cycles.
 
     """
 
