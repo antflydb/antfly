@@ -140,6 +140,33 @@ background write admission.
 3. Remove store self-scheduled writes on lease-managed stores (W4); folds
    via inline threshold and owner jobs.
 4. Delete the dead paths and turn W1/W2 violations into assertions.
+5. Plain reads take the lane's reader slot instead of the writer lease (W6).
+
+### 5.1 As implemented
+
+- Step 1: `Store.write_target` forwards a maintenance snapshot's
+  `enqueueRequest`, `maintainOnce`, vacuum, redo fold and index sync to the
+  owner's current root store; the snapshot adopts the writer's tip after
+  each forwarded commit.
+- Step 2: `WriterLane.borrowLease` is the one acquisition path outside
+  `checkout`. It reuses a parked or gate-retained lease, or acquires through
+  the fair queue, and lends it (`PathWriterLock.return_to`): closing a lent
+  lease parks it back on the lane with no cached root, so the next checkout
+  refreshes. Long detached work (a maintenance turn's capture, the
+  allocator proof walk) gives the lease up with `releaseBorrowed` instead.
+  Once `Owner.deinit` starts, returned leases are released, not parked.
+- Step 3: the owner folds an idle redo log before releasing an idle parked
+  lease (`maintainParkedLease` -> `Store.foldIdleRedoLog`); the store's own
+  idle turn stays refused on lease-managed stores.
+- Step 4: the parked-lease lookups that bypassed the lane are deleted; the
+  lane asserts it never parks a second lease or acquires one while parked.
+- Step 5: `Connection.admitRead` takes the gate and `WriterLane.beginRead`;
+  writers wait for the reader slot, and the read serves from `refresh`'s
+  in-memory fast paths. A read that needs a replacement open, pending SQL
+  recovery or capacity admission takes the writer path instead.
+- Not yet done: snapshot files still open writable and
+  `enterMaintenanceWriter` still rebases them; removing that is the
+  remaining W1 work.
 
 ## 6. Tests
 
