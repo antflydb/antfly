@@ -308,7 +308,13 @@ def test_lite_server_backup_roundtrip_under_connection_root(
                     timeout=10,
                 )
                 assert alias.ok, alias.text
-                source_etag = alias.headers["ETag"]
+                source_alias = requests.get(
+                    server.api_url + "/tables/from_file/index-aliases/live",
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                    timeout=10,
+                )
+                assert source_alias.ok, source_alias.text
+                source_etag = source_alias.headers["ETag"]
             output = tmp_path / f"server-{format}.afb"
             cli(
                 "backup",
