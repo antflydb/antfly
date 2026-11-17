@@ -5617,3 +5617,44 @@ explicit prepared admission, owner substitution rejection and refusing source
 fallback when every owner lacks retained-history capability. The original
 public-feed/bootstrap/retention/pgoutput/client qualification scope is unchanged
 and remains unfinished.
+
+### Route source effects through the ordinary transaction planner
+
+Ordinary multi-table commit and scoped source planning now share the same
+participant partitioning function. Source planning preserves the ordinary
+handling of writes, deletes, transforms, graph effects, predicates, integrity
+operations, range guards, schema fences, restore fences and index maintenance.
+`prepareSourceCommit` enlists the stable checkpoint root even without effects,
+attaches the same source purpose/reference to every participant, freezes the
+complete plan with checkpoint coordinator authority, and verifies the freshly
+captured coordinator against the durable physical checkpoint reference.
+Retired authorities, mismatched bindings/sequences and legacy receipt commands
+are rejected before transaction admission. This compiles a plan; metadata
+reservation/seal and native lifecycle registration still precede its admission.
+
+The integration fixture now supplies the administrative topology snapshot as
+well as its immutable routing generation. The original run correctly failed
+because the previous fixture deliberately rejected administrative reads; the
+ordinary router requires that snapshot to check structural transitions. The
+qualified rerun exercises the shared router with two-root write/delete effects,
+checkpoint-only planning, root-generation substitution, sequence substitution
+and unchanged decision/write/publication counters. Final results follow below.
+This does not yet expose the planner through the production worker destination
+callback or implement the remaining original issue scope.
+
+Final `history-control-apply-test -Dstrip=true -j1` exited 0
+(`source-routed-preparation-final-test.log`): all 27 selected linked tests and
+six selected local tests passed, zero skips/failures/leaks. The sequence mismatch
+regression changes the scope reference while keeping a valid checkpoint command;
+changing the checkpoint sequence alone without its predecessor correctly fails
+earlier with SourceCheckpointConflict. Additional coverage verifies fresh plan
+fences with stable physical checkpoint identity, rejects retired authorities and
+legacy receipt commands, and requires release of captured topology snapshots
+when a checkpoint table or its ranges are absent. The shared topology capture
+now releases those snapshots on both successful null-return paths.
+Source-catalog, engine-error and OpenAPI checks passed
+(`source-routed-preparation-contract-check.log`), including nine schema fragment
+tests. No persisted format, protocol or runtime ABI changes are introduced.
+Production destination callback/worker wiring and the original remaining
+history/public-feed/bootstrap/retention/pgoutput/client qualification scope
+remain unfinished; both issues stay open.

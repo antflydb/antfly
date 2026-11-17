@@ -1497,12 +1497,19 @@ pub fn transactionRoutingSnapshot(
 ) !?TransactionRoutingSnapshot {
     var snapshot = try catalog.adminSnapshot();
     errdefer catalog.freeAdminSnapshot(&snapshot);
-    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse {
+        catalog.freeAdminSnapshot(&snapshot);
+        return null;
+    };
     try validateTransactionTopologyStableSnapshot(&snapshot, table.*);
 
     const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
     errdefer metadata_admin.freeRangeRefs(alloc, ranges);
-    if (ranges.len == 0) return null;
+    if (ranges.len == 0) {
+        metadata_admin.freeRangeRefs(alloc, ranges);
+        catalog.freeAdminSnapshot(&snapshot);
+        return null;
+    }
     sortRangeRefs(ranges);
 
     return .{

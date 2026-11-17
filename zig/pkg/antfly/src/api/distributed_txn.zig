@@ -1351,24 +1351,15 @@ pub fn executeMultiTableCommitWithOptions(
     return executeMultiTableCommitOnce(alloc, catalog, worker, txn_id, begin_timestamp, commit_version, tables, sync_level, trace_writer, options);
 }
 
-fn executeMultiTableCommitOnce(
-    alloc: std.mem.Allocator,
-    catalog: table_catalog.CatalogSource,
-    worker: ParticipantWorker,
-    txn_id: db_mod.types.TxnId,
-    begin_timestamp: u64,
-    commit_version: u64,
-    tables: []const TableCommitRequest,
-    sync_level: db_mod.types.SyncLevel,
-    trace_writer: ?tracing.AntflyTraceWriter,
-    options: ExecuteOptions,
-) !CommitOutcome {
+/// Shared read-only partitioning for ordinary transactions and retained source
+/// planning. Payload slices are borrowed until completion preparation owns them.
+fn routeCommitParticipants(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, tables: []const TableCommitRequest) !std.ArrayListUnmanaged(ParticipantTxn) {
+    for (tables) |table| if (table.source_admission != null) return error.UnsupportedOperation;
     var participants = std.ArrayListUnmanaged(ParticipantTxn).empty;
-    defer {
+    errdefer {
         for (participants.items) |*participant| participant.deinit(alloc);
         participants.deinit(alloc);
     }
-
     for (tables) |table| {
         var routing = (try table_catalog.transactionRoutingSnapshot(alloc, catalog, table.table_name)) orelse return error.TableNotFound;
         defer routing.deinit(alloc);
@@ -1489,6 +1480,82 @@ fn executeMultiTableCommitOnce(
             } else participant.restore_staging_plan_id = routed_restore_plan;
             try validateRestorePlan(participant.restore_staging_scope, participant.restore_staging_plan_id);
         }
+    }
+
+    return participants;
+}
+
+pub const SourceGrant = struct {
+    authority: @import("../metadata/source_checkpoint_authority.zig").Spec,
+    reference: @import("antfly_local_sources").storage_source_scope.Reference,
+    checkpoint: @import("antfly_local_sources").storage_source_checkpoint.Command,
+    pub fn validate(self: SourceGrant) !void {
+        try self.authority.validate();
+        try self.reference.validate();
+        try self.checkpoint.validate();
+        if (self.authority.retirement != null or self.checkpoint.receipt_window == 0 or
+            !std.mem.eql(u8, &self.reference.binding, &self.authority.binding) or
+            !std.mem.eql(u8, &self.reference.binding, &self.checkpoint.binding) or
+            self.reference.sequence != self.checkpoint.sequence) return error.SourceBindingConflict;
+    }
+};
+
+/// Compile the same routed effects as ordinary commit, then enlist the stable
+/// checkpoint root even for an empty source transaction. No transaction admission
+/// occurs here: the actor must reserve and seal this frozen plan before admission.
+pub fn prepareSourceCommit(
+    alloc: std.mem.Allocator,
+    coordinator: @import("completion_admission.zig").Coordinator,
+    txn_id: db_mod.types.TxnId,
+    begin_timestamp: u64,
+    tables: []const TableCommitRequest,
+    grant: SourceGrant,
+    context: @import("antfly_local_sources").api_operation.RequestContext,
+) !@import("completion_admission.zig").Prepared {
+    try context.ensureActive();
+    try grant.validate();
+    var participants = try routeCommitParticipants(alloc, coordinator.recovery.catalog, tables);
+    defer {
+        for (participants.items) |*participant| participant.deinit(alloc);
+        participants.deinit(alloc);
+    }
+    var routing = (try table_catalog.transactionRoutingSnapshot(alloc, coordinator.recovery.catalog, grant.authority.table_name)) orelse return error.TableNotFound;
+    defer routing.deinit(alloc);
+    _ = try ensureParticipantTxn(alloc, &participants, grant.authority.table_name, grant.authority.owner.group_id, routing.topology_epoch);
+    const inputs = try alloc.alloc(@import("completion_admission.zig").Input, participants.items.len);
+    defer alloc.free(inputs);
+    for (participants.items, inputs) |*participant, *input| {
+        var intent = participant.intentRequest();
+        intent.completion_source_purpose = grant.checkpoint.purpose;
+        intent.completion_source_scope = grant.reference;
+        if (participant.group_id == grant.authority.owner.group_id and std.mem.eql(u8, participant.table_name, grant.authority.table_name)) intent.completion_source_checkpoint = grant.checkpoint;
+        input.* = .{ .table_name = participant.table_name, .group_id = participant.group_id, .topology_epoch = participant.topology_epoch, .intent = intent };
+    }
+    try context.ensureActive();
+    var prepared = (try coordinator.prepare(alloc, txn_id, begin_timestamp, inputs, context)) orelse return error.ChangefeedCapabilityUnsupported;
+    errdefer prepared.deinit();
+    const captured = try prepared.plan.admission.recoveryOwner(prepared.plan.admission.coordinator_namespace);
+    try grant.authority.requireOwner(captured);
+    try context.ensureActive();
+    return prepared;
+}
+
+fn executeMultiTableCommitOnce(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    worker: ParticipantWorker,
+    txn_id: db_mod.types.TxnId,
+    begin_timestamp: u64,
+    commit_version: u64,
+    tables: []const TableCommitRequest,
+    sync_level: db_mod.types.SyncLevel,
+    trace_writer: ?tracing.AntflyTraceWriter,
+    options: ExecuteOptions,
+) !CommitOutcome {
+    var participants = try routeCommitParticipants(alloc, catalog, tables);
+    defer {
+        for (participants.items) |*participant| participant.deinit(alloc);
+        participants.deinit(alloc);
     }
 
     const participant_ids = try alloc.alloc([]const u8, participants.items.len);

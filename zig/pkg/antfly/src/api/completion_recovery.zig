@@ -229,6 +229,8 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         visibility_calls: [2]usize = .{ 0, 0 },
         decision_reads: usize = 0,
         capture_epoch_delta: u64 = 0,
+        admin_frees: usize = 0,
+        omit_admin_ranges: bool = false,
         cancelled: std.atomic.Value(bool) = .init(false),
         cancel_final_read: bool = false,
         follower_reads: usize = 0,
@@ -247,8 +249,14 @@ test "data raft ordered history completion recovery retains guard checkpoints an
             self.generation.retain();
             return self.generation;
         }
-        fn admin(_: *anyopaque) !metadata.AdminSnapshot {
-            return error.TestUnexpectedResult;
+        fn admin(ptr: *anyopaque) !metadata.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const snapshot = self.generation.indexed.snapshot.value;
+            return .{ .status = .{ .metadata_group_id = snapshot.metadata_group_id, .metadata_incarnation = snapshot.metadata_incarnation, .metadata_epoch = snapshot.catalog_revision, .metrics = .{} }, .tables = snapshot.tables, .ranges = if (self.omit_admin_ranges) &.{} else snapshot.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn freeAdmin(ptr: *anyopaque, _: *metadata.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.admin_frees += 1;
         }
         fn decision(ptr: *anyopaque, alloc: A, _: metadata.CatalogRouteFence, _: []const u8, input: decision_ops.Request, _: Context) !decision_ops.Reply {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -326,7 +334,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         }
     };
     var fake: Fake = .{ .generation = generation, .admission = admission };
-    const recovery: Recovery = .{ .catalog = .{ .ptr = &fake, .vtable = &.{ .admin_snapshot = Fake.admin, .free_admin_snapshot = undefined, .acquire_routing_generation = Fake.acquire } }, .decisions = .{ .ptr = &fake, .read_fn = Fake.decision }, .resolutions = .{ .ptr = &fake, .read_fn = Fake.resolution }, .publications = .{ .ptr = &fake, .read_fn = Fake.publication }, .participants = .{ .writer = .{ .ptr = &fake, .write_fn = Fake.write } } };
+    const recovery: Recovery = .{ .catalog = .{ .ptr = &fake, .vtable = &.{ .admin_snapshot = Fake.admin, .free_admin_snapshot = Fake.freeAdmin, .acquire_routing_generation = Fake.acquire } }, .decisions = .{ .ptr = &fake, .read_fn = Fake.decision }, .resolutions = .{ .ptr = &fake, .read_fn = Fake.resolution }, .publications = .{ .ptr = &fake, .read_fn = Fake.publication }, .participants = .{ .writer = .{ .ptr = &fake, .write_fn = Fake.write } } };
     const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = owners[0].metadata_incarnation, .catalog_revision = 10, .table_id = 7, .topology_epoch = view.topology_epoch, .route = .{ .group_id = 9, .range_id = 9, .identity_namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 9 } } };
     try std.testing.expectEqual(.complete, try recovery.run(a, owners[0], fence, "docs", admission.transaction_id, .{}));
     try std.testing.expectEqual(@as(usize, 1), fake.resolves);
@@ -448,6 +456,63 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqualDeep(scope_ref, reopened_prepared.plan.source_scope.?);
     try std.testing.expectEqual(preparation_reads, fake.decision_reads);
     try std.testing.expectEqual(preparation_writes, fake.resolves);
+    // Source effects use ordinary routing while the checkpoint enlists even
+    // without rows. No decision or destination write is part of planning.
+    const routed_source = @import("distributed_txn.zig");
+    const grant: routed_source.SourceGrant = .{
+        .authority = .{ .binding = scope_ref.binding, .table_name = "docs", .owner = owners[1] },
+        .reference = scope_ref,
+        .checkpoint = source_inputs[1].intent.completion_source_checkpoint.?,
+    };
+    var routed = try routed_source.prepareSourceCommit(a, coordinator, admission.transaction_id, 10, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }}, .deletes = &.{"z"} }}, grant, .{});
+    defer routed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), routed.plan.participants.len);
+    try std.testing.expectEqualDeep(owners[1], try routed.plan.admission.recoveryOwner(routed.plan.admission.coordinator_namespace));
+    var first_input = try routed.plan.prepare(a, 0);
+    defer first_input.deinit(a);
+    var second_input = try routed.plan.prepare(a, 1);
+    defer second_input.deinit(a);
+    try std.testing.expectEqualStrings("a", first_input.req.writes[0].key);
+    try std.testing.expectEqualStrings("z", second_input.req.deletes[0]);
+    try std.testing.expect(first_input.req.transaction.?.prepare.source_checkpoint == null);
+    try std.testing.expectEqualDeep(grant.checkpoint, second_input.req.transaction.?.prepare.source_checkpoint.?);
+    var empty_source = try routed_source.prepareSourceCommit(a, coordinator, admission.transaction_id, 10, &.{}, grant, .{});
+    defer empty_source.deinit();
+    try std.testing.expectEqual(@as(usize, 1), empty_source.plan.participants.len);
+    try std.testing.expectEqualDeep(scope_ref, empty_source.plan.source_scope.?);
+    try std.testing.expectEqualDeep(owners[1], try empty_source.plan.admission.recoveryOwner(empty_source.plan.admission.coordinator_namespace));
+    // Durable checkpoint identity permits a fresh plan's current fences,
+    // without permitting a different physical root generation.
+    var old_fences = grant;
+    old_fences.authority.owner.topology_epoch += 1;
+    var fresh_checkpoint = try routed_source.prepareSourceCommit(a, coordinator, admission.transaction_id, 10, &.{}, old_fences, .{});
+    defer fresh_checkpoint.deinit();
+    try std.testing.expectEqualDeep(owners[1], try fresh_checkpoint.plan.admission.recoveryOwner(fresh_checkpoint.plan.admission.coordinator_namespace));
+    var missing_checkpoint = grant;
+    missing_checkpoint.authority.table_name = "missing";
+    var releases_before_missing = fake.admin_frees;
+    try std.testing.expectError(error.TableNotFound, routed_source.prepareSourceCommit(a, coordinator, admission.transaction_id, 10, &.{}, missing_checkpoint, .{}));
+    try std.testing.expectEqual(releases_before_missing + 1, fake.admin_frees);
+    fake.omit_admin_ranges = true;
+    releases_before_missing = fake.admin_frees;
+    try std.testing.expectError(error.TableNotFound, routed_source.prepareSourceCommit(a, coordinator, admission.transaction_id, 10, &.{}, grant, .{}));
+    try std.testing.expectEqual(releases_before_missing + 1, fake.admin_frees);
+    fake.omit_admin_ranges = false;
+    var retired_checkpoint = grant;
+    retired_checkpoint.authority.retirement = @splat(34);
+    try std.testing.expectError(error.SourceBindingConflict, routed_source.prepareSourceCommit(a, coordinator, admission.transaction_id, 10, &.{}, retired_checkpoint, .{}));
+    var legacy_checkpoint = grant;
+    legacy_checkpoint.checkpoint.receipt_window = 0;
+    try std.testing.expectError(error.SourceBindingConflict, routed_source.prepareSourceCommit(a, coordinator, admission.transaction_id, 10, &.{}, legacy_checkpoint, .{}));
+    var wrong_root = grant;
+    wrong_root.authority.owner.root_generation += 1;
+    try std.testing.expectError(error.SourceBindingConflict, routed_source.prepareSourceCommit(a, coordinator, admission.transaction_id, 10, &.{}, wrong_root, .{}));
+    var wrong_sequence = grant;
+    wrong_sequence.reference.sequence += 1;
+    try std.testing.expectError(error.SourceBindingConflict, routed_source.prepareSourceCommit(a, coordinator, admission.transaction_id, 10, &.{}, wrong_sequence, .{}));
+    try std.testing.expectEqual(preparation_reads, fake.decision_reads);
+    try std.testing.expectEqual(preparation_writes, fake.resolves);
+    try std.testing.expectEqual(preparation_publications, fake.publishes);
     fake.capture_epoch_delta = 1;
     try std.testing.expectError(error.TopologyChanged, coordinator.restorePrepared(a, encoded_prepared, try plan_mod.frozenDigest(encoded_prepared), .{}));
     fake.capture_epoch_delta = 0;
