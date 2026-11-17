@@ -825,14 +825,14 @@ const PathGate = struct {
     references: usize = 1,
     owners: std.ArrayList(*Owner) = .empty,
 
-    /// True while some writer-mode `Owner` sharing this gate (any
-    /// `Connection` to the same path -- including a different Owner than
-    /// the caller's own, per `compatible`'s own open-mode split) currently
-    /// holds this process's one cross-process writer lease through its
-    /// `WriterLane`, whether actively checked out mid-call or merely
-    /// parked between writes (lite-writer-authority.md W2 keeps that
-    /// lease's kernel lock open while parked, so back-to-back writers
-    /// skip the kernel round trip).
+    /// Finds a writer-mode `Owner` sharing this gate (any `Connection` to
+    /// the same path -- including a different Owner than the caller's
+    /// own, per `compatible`'s own open-mode split) whose `WriterLane`
+    /// currently holds this process's one cross-process writer lease
+    /// (actively checked out, or merely parked between writes --
+    /// lite-writer-authority.md W2 keeps that lease's kernel lock open
+    /// while parked, so back-to-back writers skip the kernel round
+    /// trip), and pins it there for the lifetime of one synthetic read.
     ///
     /// Lets a reader's legacy (non-region) kernel lock attempt -- taken
     /// only when `shared_lock_region.Region.open` itself reports the
@@ -843,21 +843,28 @@ const PathGate = struct {
     /// writer's. Only the kernel can see the former as a lock conflict;
     /// in-process state is the only way to know it is not one.
     ///
+    /// A pin, not just a point-in-time check, matters: see
+    /// `WriterLane.local_reader_activity`'s own doc comment for why
+    /// nothing would otherwise stop the lease moving to a foreign writer
+    /// (or this lane being freed outright) while the synthetic read is
+    /// still in flight.
+    ///
     /// Caller holds `self.mutex` (`acquirePathLeaseAssumeLocked`'s own
-    /// precondition); this takes each candidate `Owner`'s own
-    /// `writer_lane.mutex` in turn, never nested with another one, so it
-    /// cannot cycle against `WriterLane.checkout`'s own sequential (never
-    /// nested) hold of the two mutexes.
-    fn hasLocalWriterLease(self: *PathGate) bool {
-        const io = h.handleLockIo();
+    /// precondition); `Connection.close()`'s own last-connection teardown
+    /// removes an `Owner` from `self.owners` under the same mutex before
+    /// ever calling `Owner.deinit` (which is what actually frees it), so
+    /// every candidate this iterates is guaranteed live for the whole
+    /// call -- a reader whose writer owner is already gone never finds
+    /// it here. This takes each candidate's own `writer_lane.mutex` in
+    /// turn, never nested with another one, so it cannot cycle against
+    /// `WriterLane.checkout`'s own sequential (never nested) hold of the
+    /// two mutexes.
+    fn pinLocalWriterLeaseForRead(self: *PathGate) ?*WriterLane {
         for (self.owners.items) |owner| {
             if (!h.liteOpenModeCanWrite(owner.options.open_mode)) continue;
-            owner.writer_lane.mutex.lockUncancelable(io);
-            const held = owner.writer_lane.checked_out or owner.writer_lane.parked != null;
-            owner.writer_lane.mutex.unlock(io);
-            if (held) return true;
+            if (owner.writer_lane.pinForLocalRead()) return &owner.writer_lane;
         }
-        return false;
+        return null;
     }
 };
 var registry_mutex: std.Io.Mutex = .init;
@@ -1178,6 +1185,32 @@ pub const WriterLane = struct {
     /// Set once `Owner.deinit` starts: nothing will hand a parked lease
     /// off again, so a lent lease's `close` releases it instead.
     closing: bool = false,
+    /// Same-process readers currently relying on this lane's kernel
+    /// lease staying held through a *synthetic* (kernel-lock-free) lease
+    /// of their own -- see `PathGate.pinLocalWriterLeaseForRead` and
+    /// `Connection.acquirePathLeaseAssumeLocked`'s reader branch, which
+    /// grants one only when the legacy (non-region) kernel lock attempt
+    /// collides with exactly this lane's own held lease, never a foreign
+    /// writer's. A point-in-time check that the lease was held at grant
+    /// time is not enough: without a pin, nothing would stop
+    /// `maintainParkedLease`'s idle/foreign release, `checkinImpl`'s own
+    /// force-release, or `Owner.deinit`'s final teardown from giving the
+    /// kernel lease to a foreign writer (or freeing this lane outright)
+    /// while that synthetic read is still in flight -- letting a foreign
+    /// writer reuse pages the read is still looking at. While this is
+    /// nonzero: `maintainParkedLease` defers its release and retries
+    /// shortly instead; `checkinImpl` parks instead of closing even on a
+    /// forced release; and `Owner.deinit` waits for it to drain (under
+    /// `self.mutex`, with `closing` already set so no new pin can start)
+    /// before closing the parked/held lease and freeing this lane.
+    local_reader_activity: @import("maintenance_activity.zig").Activity = .{},
+
+    /// How long `maintainParkedLease` waits before checking again while
+    /// `local_reader_activity` is nonzero -- short because a synthetic
+    /// read is expected to be brief (a snapshot copy, not a long scan),
+    /// and this only ever delays a release that was going to happen
+    /// anyway, never blocks a reader's own progress.
+    const local_reader_pin_retry_ns: i96 = 1 * std.time.ns_per_ms;
 
     const poll_initial_ns: i96 = 50 * std.time.ns_per_us;
     const poll_max_ns: i96 = 2 * std.time.ns_per_ms;
@@ -1268,7 +1301,14 @@ pub const WriterLane = struct {
         var backoff_ns: i96 = poll_initial_ns;
         self.mutex.lockUncancelable(io);
         while (true) {
-            if (self.parked != null and self.foreign_release_due) {
+            // A same-process synthetic reader (`pinForLocalRead`) is
+            // relying on this exact parked lease staying held -- see
+            // `local_reader_activity`'s own doc comment. Defer the
+            // foreign release until it drains; fall through to the
+            // ordinary "take the parked lease" branch below instead,
+            // which keeps the kernel lease open (just reused by this
+            // local writer) rather than closing it.
+            if (self.parked != null and self.foreign_release_due and self.local_reader_activity.count == 0) {
                 var overdue = self.parked.?;
                 const overdue_store = self.parked_store;
                 self.parked = null;
@@ -1422,7 +1462,14 @@ pub const WriterLane = struct {
         const lease = self.parked orelse return .fresh;
         self.parked = null;
         self.parked_store = null;
-        if (self.foreign_release_due) {
+        // A same-process synthetic reader is relying on this exact
+        // parked lease staying held -- see `local_reader_activity`'s own
+        // doc comment. Defer the foreign release until it drains: hand
+        // this same lease to the local maintenance borrower instead
+        // (`.parked`, never `.overdue`), which keeps it open rather than
+        // closing it. `foreign_release_due` is left set so a later
+        // checkout can still act on it once the pin drains.
+        if (self.foreign_release_due and self.local_reader_activity.count == 0) {
             self.foreign_release_due = false;
             return .{ .overdue = lease };
         }
@@ -1432,6 +1479,49 @@ pub const WriterLane = struct {
     /// Marks a lease this lane checked out so its `close` parks it back here.
     pub fn lendLease(self: *WriterLane, lease: *native.PathWriterLock) void {
         lease.return_to = .{ .ptr = self, .give_back = returnLease };
+    }
+
+    /// Pins this lane's kernel lease against release for the lifetime of
+    /// one synthetic (kernel-lock-free) reader lease -- see
+    /// `local_reader_activity`'s own doc comment. Returns `false` (no pin
+    /// taken) unless the lease is actually held right now (checked out or
+    /// parked) and this lane is not already closing: a lane with neither
+    /// has no lease to protect, and `Owner.deinit` setting `closing`
+    /// before it waits for existing pins to drain means a caller must
+    /// never start a new one afterward, or that wait could complete while
+    /// this one is still in flight.
+    pub fn pinForLocalRead(self: *WriterLane) bool {
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.closing or (!self.checked_out and self.parked == null)) return false;
+        self.local_reader_activity.begin();
+        return true;
+    }
+
+    /// Ends one `pinForLocalRead` pin.
+    fn unpinLocalRead(self: *WriterLane) void {
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.local_reader_activity.finish(io);
+    }
+
+    /// `PathWriterLock.ReturnTo.give_back` for a synthetic reader lease
+    /// granted by `pinForLocalRead`: the lease itself carries no real
+    /// resource (`file`/`region` both `null`), so there is nothing to
+    /// release here beyond the pin itself.
+    fn giveBackLocalReadPin(ptr: *anyopaque, lease: native.PathWriterLock) void {
+        _ = lease;
+        const self: *WriterLane = @ptrCast(@alignCast(ptr));
+        self.unpinLocalRead();
+    }
+
+    /// Marks a synthetic reader lease so its `close` ends the pin that
+    /// granted it. Caller already holds that pin (a successful
+    /// `pinForLocalRead`).
+    pub fn lendLocalReadPin(self: *WriterLane, lease: *native.PathWriterLock) void {
+        lease.return_to = .{ .ptr = self, .give_back = giveBackLocalReadPin };
     }
 
     pub const Borrowed = struct {
@@ -1529,6 +1619,15 @@ pub const WriterLane = struct {
     pub fn releaseBorrowed(self: *WriterLane, owner: *Owner, lease: *native.PathWriterLock) void {
         const lent = if (lease.return_to) |to| to.ptr == @as(*anyopaque, self) else false;
         if (!lent) return lease.close();
+        // A same-process synthetic reader needs this lease held: return it
+        // to the lane (parked) instead of giving it up.
+        {
+            const io = h.handleLockIo();
+            self.mutex.lockUncancelable(io);
+            const pinned = self.local_reader_activity.count != 0;
+            self.mutex.unlock(io);
+            if (pinned) return lease.close();
+        }
         // Drain only: a full `sync` can enter maintenance writer admission,
         // which takes the gate this caller already holds.
         if (owner.currentStore()) |store| store.ensureDurableForReuse();
@@ -1692,7 +1791,11 @@ pub const WriterLane = struct {
         // commit of its own) closes the lease here. A writer checking in
         // before its durability wait still has to drive its own group under
         // this lease, and draining for it from here waits on itself.
-        if (!force_release) {
+        // A nonzero `local_reader_activity` overrides even an explicit
+        // release: a same-process synthetic reader is relying on this
+        // exact lease staying held (see its own doc comment), so park
+        // instead of closing regardless of why this call asked to.
+        if (!force_release or self.local_reader_activity.count != 0) {
             if (foreign_overdue) self.foreign_release_due = true;
             self.parked = lease;
             self.parked_since_ns = now;
@@ -1761,6 +1864,16 @@ pub const WriterLane = struct {
             self.mutex.unlock(io);
             return null;
         };
+        // A same-process synthetic reader (`WriterLane.pinForLocalRead`)
+        // is relying on this exact lease staying held -- see
+        // `local_reader_activity`'s own doc comment. Defer any release
+        // (idle or foreign) until it drains, retrying shortly rather than
+        // computing overdue status against a lease that must not move
+        // yet regardless of the answer.
+        if (self.local_reader_activity.count != 0) {
+            self.mutex.unlock(io);
+            return local_reader_pin_retry_ns;
+        }
 
         const own_pid = antfly_platform.process.currentId() orelse 0;
         const now = std.Io.Clock.awake.now(io).nanoseconds;
@@ -4139,6 +4252,14 @@ pub const Owner = struct {
         // with `FileBusy`/`WouldBlock` on every caller that needed it.
         self.writer_lane.mutex.lockUncancelable(h.handleLockIo());
         self.writer_lane.closing = true;
+        // `closing = true` (just set, under the same mutex) stops
+        // `WriterLane.pinForLocalRead` from starting any new pin from
+        // here on; wait out whichever pins already exist -- same-process
+        // synthetic reads relying on the lease this call is about to
+        // close staying held until they finish (`local_reader_activity`'s
+        // own doc comment) -- before closing it and freeing this lane
+        // out from under them.
+        self.writer_lane.local_reader_activity.wait(h.handleLockIo(), &self.writer_lane.mutex);
         self.writer_lane.mutex.unlock(h.handleLockIo());
         if (self.writer_lane.parked) |*lease| lease.close();
         self.writer_lane.parked = null;
@@ -4413,15 +4534,24 @@ pub const Connection = struct {
                 // exclusion from a same-process writer either (copy-on-
                 // write, same reasoning as the fast path's own doc
                 // comment), so this is never a real conflict -- only a
-                // genuinely foreign writer's lock is. `hasLocalWriterLease`
-                // tells the two apart; the self-collision case resolves at
-                // once, with no kernel lock ever taken, exactly like the
-                // fast path's own `.file = null` lease. See
+                // genuinely foreign writer's lock is.
+                // `pinLocalWriterLeaseForRead` tells the two apart *and*
+                // pins the lease against release for as long as this read
+                // holds the synthetic lease it hands back: a point-in-time
+                // check alone would not stop `maintainParkedLease`'s idle/
+                // foreign release, `checkinImpl`'s own force-release, or
+                // `checkout`'s/`beginMaintenanceCheckout`'s own foreign-
+                // overdue handling from giving this exact kernel lease to
+                // a foreign writer while this read is still in flight. See
                 // lite-writer-authority.md: a read-only handle in this
                 // process must never be blocked by this process's own
                 // parked writer lease.
                 error.FileBusy, error.WouldBlock => {
-                    if (self.gate.hasLocalWriterLease()) return self.owner.withReadRegistrationBatch(.{ .io_impl = undefined, .borrowed_io = io, .file = null });
+                    if (self.gate.pinLocalWriterLeaseForRead()) |lane| {
+                        var synthetic: native.PathWriterLock = .{ .io_impl = undefined, .borrowed_io = io, .file = null };
+                        lane.lendLocalReadPin(&synthetic);
+                        return self.owner.withReadRegistrationBatch(synthetic);
+                    }
                     return err;
                 },
                 else => return err,
@@ -8308,12 +8438,14 @@ test "capi native fresh readonly connection takes a stable snapshot after vacuum
 // stamp (now compounded by a *second* generation swap: this test runs
 // both `antfly_lite_compact_json` and `antfly_lite_vacuum_json`, as the Go
 // test does) survives long enough for a zero-timeout reader to collide
-// with it. Fixed by `PathGate.hasLocalWriterLease`: a reader's legacy
-// fallback that collides with a kernel lock this process's own writer
-// lane holds (checked out or merely parked between writes) resolves at
-// once instead of ever treating that self-collision as busy -- see its
-// own doc comment, and `acquirePathLeaseAssumeLocked`'s reader branch
-// where it is consulted.
+// with it. Fixed by `PathGate.pinLocalWriterLeaseForRead`: a reader's
+// legacy fallback that collides with a kernel lock this process's own
+// writer lane holds (checked out or merely parked between writes)
+// resolves at once instead of ever treating that self-collision as
+// busy -- and pins the lease so it cannot move while the read is still
+// in flight (`WriterLane.local_reader_activity`'s own doc comment) --
+// see `acquirePathLeaseAssumeLocked`'s reader branch where it is
+// consulted.
 test "capi native readonly snapshot copy with zero timeout ignores a same-process open transaction" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("open-txn-snapshot-fresh-reader", 1000, .batch);
@@ -8347,6 +8479,87 @@ test "capi native readonly snapshot copy with zero timeout ignores a same-proces
     var snapshot_out: h.capi.Buffer = .{};
     defer api.antfly_buffer_free_zero(&snapshot_out);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_lite_copy_stable_snapshot_file_json(path_c, snapshot_path, false, &snapshot_out));
+}
+
+// Safety follow-up to the preceding test: the synthetic, kernel-lock-free
+// lease `Connection.acquirePathLeaseAssumeLocked`'s reader branch hands
+// out on a same-process self-collision carries no kernel lock of its
+// own -- it is safe only because `WriterLane.pinForLocalRead` keeps the
+// lane's *real* kernel lease pinned for as long as that synthetic lease
+// stays open. A point-in-time check alone would not be enough:
+// `maintainParkedLease`'s own idle release, or `beginMaintenanceCheckout`'s
+// foreign-overdue handling, could give the kernel lease to a foreign
+// writer while the synthetic read is still in flight, letting that
+// writer reuse pages the read is still looking at. This holds a pin
+// exactly as that reader branch does, then asks the lane to release for
+// both reasons `local_reader_activity`'s own doc comment names (idle,
+// and a foreign waiter overdue -- simulated here via `foreign_release_due`
+// directly, since provoking a genuinely foreign process's own overdue
+// wait is not practical from a single-process unit test) and asserts
+// the parked lease stays open through both. Releasing the pin afterward
+// confirms the deferred release is not simply swallowed -- it goes
+// through on the very next call once nothing still needs the lease held.
+test "capi native local reader pin keeps the writer lane's parked lease held through idle and foreign release" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var tmp = try api.TestDirectory.init("local-reader-pin-holds-lease");
+    defer tmp.cleanup();
+    const io = h.handleLockIo();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/database.aflite", .{tmp.path()});
+    defer std.testing.allocator.free(path);
+
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true, .busy_timeout_ms = 1000 }, true);
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    if (owner.worker) |worker| worker.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+
+    const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("doc:seed"), .value = .fromSlice("{\"text\":\"seed\"}"), .is_delete = false }};
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(id, &writes, writes.len, null, 0, 0, 0));
+    // The write's own checkin parks the lane's lease (lite-writer-authority.md
+    // W2) rather than releasing it.
+    try std.testing.expect(owner.writer_lane.parked != null);
+
+    try std.testing.expect(owner.writer_lane.pinForLocalRead());
+
+    // Idle release: make the parked lease look long overdue for
+    // `maintainParkedLease`'s own idle bound. With the pin held, it must
+    // defer (returning a short retry) instead of closing the lease.
+    owner.writer_lane.parked_since_ns = std.Io.Clock.awake.now(io).nanoseconds - WriterLane.parked_idle_release_ns - std.time.ns_per_s;
+    const idle_retry = owner.writer_lane.maintainParkedLease();
+    try std.testing.expect(idle_retry != null);
+    try std.testing.expect(owner.writer_lane.parked != null);
+
+    // Foreign-waiter-overdue release: `beginMaintenanceCheckout` acts on
+    // `foreign_release_due` directly (set here exactly as a real overdue
+    // foreign waiter's `checkin`/`returnLease` would). With the pin
+    // held, it must hand the *same* lease to a local borrower (`.parked`,
+    // never `.overdue`, which would close it) rather than releasing it.
+    owner.writer_lane.foreign_release_due = true;
+    switch (owner.writer_lane.beginMaintenanceCheckout()) {
+        .parked => |lease| {
+            // Hand it straight back, as a real local borrower eventually
+            // would once its own turn finishes.
+            var returned = lease;
+            owner.writer_lane.lendLease(&returned);
+            returned.close();
+        },
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expect(owner.writer_lane.foreign_release_due);
+    try std.testing.expect(owner.writer_lane.parked != null);
+
+    // Releasing the pin lets the still-pending idle release through on
+    // the very next call: the defer was never a permanent swallow.
+    owner.writer_lane.unpinLocalRead();
+    owner.writer_lane.parked_since_ns = std.Io.Clock.awake.now(io).nanoseconds - WriterLane.parked_idle_release_ns - std.time.ns_per_s;
+    try std.testing.expect(owner.writer_lane.maintainParkedLease() == null);
+    try std.testing.expect(owner.writer_lane.parked == null);
 }
 
 // Regression: `WriterLane.checkout`'s cold path marks the lane checked out
