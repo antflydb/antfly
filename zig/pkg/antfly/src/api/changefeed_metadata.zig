@@ -104,6 +104,29 @@ pub const Port = struct {
         // Cancellation after a successful callback cannot certify non-commit.
         context.ensureActive() catch return error.MetadataMutationOutcomeUnknown;
     }
+    /// Complete an authorized slot seal, or recover its exact start after an
+    /// ambiguous write. The caller supplies the qualified cut and allocation.
+    pub fn sealSlot(self: Port, a: A, write: control.Write, now: u64, context: Context) !control.SlotStart {
+        try write.validate();
+        if (write.mutation != .seal or write.mutation.seal.slot == null or now == 0) return error.InvalidChangefeed;
+        const uncertain = blk: {
+            self.mutate(a, write, context) catch |err| {
+                if (err == error.MetadataMutationOutcomeUnknown) break :blk true;
+                return err;
+            };
+            break :blk false;
+        };
+        const bytes = self.read(a, write.id, context) catch |err| {
+            if (uncertain) return error.MetadataMutationOutcomeUnknown;
+            return err;
+        };
+        defer a.free(bytes);
+        var observed = try control.parse(a, bytes);
+        defer observed.deinit();
+        if (uncertain and observed.value.phase == .enrolling and observed.value.epoch == write.expected_epoch and observed.value.revision == write.expected_revision) return error.MetadataMutationOutcomeUnknown;
+        return control.recoverSlotStart(observed.value, write, now);
+    }
+
     pub fn authority(self: Port, a: A, context: Context) !?control.Stamp {
         try authorize(context);
         const result = try Boundary.call("authority", self.boundary_dispatch, self.authority_fn, .{ self.ptr, a, context });
@@ -189,6 +212,7 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try std.testing.expectError(error.ChangefeedConflict, control.mutateOnService(&client, a, write, authorized));
         try std.testing.expectEqual(@as(u64, 1), svc.proposals);
         try std.testing.expectError(error.DeadlineExceeded, port.read(a, svc.id, .{ .principal = authorized.principal, .deadline_ns = 1 }));
+        try slotSealRecovery(authorized);
         // Physical cache allocations vary between reads. Exercise the port's
         // owned response and parser cleanup against a deterministic callback.
         const Fixed = struct {
@@ -209,6 +233,54 @@ pub const test_support = if (@import("builtin").is_test) struct {
             try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
         }
     }
+    fn slotSealRecovery(context: Context) !void {
+        const a = std.testing.allocator;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const configuration: control.pg_slot.Configuration = .{ .database = @splat(8), .name = "slot", .consistent_lsn = 8192 };
+        const id = control.pg_slot.feedId(configuration.database, configuration.name);
+        const definition: control.Definition = .{
+            .owner = @splat(1),
+            .authorization = @splat(2),
+            .projection = .rows,
+            .tables = &.{.{ .table_id = 7, .binding = @splat(3), .policy_revision = 1, .contract = .native_relational }},
+        };
+        const namespace: control.Namespace = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 7 } ++ @as([16]u8, @splat(1));
+        const stamp: control.Stamp = .{ .incarnation = @splat(9), .sequence = 1 };
+        var state = try (control.Mutation{ .create = .{ .id = id, .definition = definition, .now = 100, .expires_at = 1000 } }).apply(scratch, .{}, stamp);
+        state = try (control.Mutation{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} }).apply(scratch, state, .{ .incarnation = stamp.incarnation, .sequence = 2 });
+        state = try (control.Mutation{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = state.roots[0].grant_sequence, .consumer_epoch = 1, .start = 10 } }).apply(scratch, state, .{ .incarnation = stamp.incarnation, .sequence = 3 });
+        const write: control.Write = .{ .id = id, .authority = stamp.incarnation, .owner = definition.owner, .authorization = definition.authorization, .expected_revision = state.revision, .expected_epoch = state.epoch, .mutation = .{ .seal = .{ .cut = @splat(7), .slot = configuration } } };
+        const sealed = try write.apply(scratch, state, 4);
+        const Fake = struct {
+            state: control.State,
+            sealed: control.State,
+            commit: bool = true,
+            mutations: usize = 0,
+
+            fn read(raw: *anyopaque, allocator: A, _: control.Id, _: Context) anyerror![]u8 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return control.encode(allocator, self.state);
+            }
+            fn mutate(raw: *anyopaque, _: A, _: control.Write, _: Context) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.mutations += 1;
+                if (self.commit) self.state = self.sealed;
+                return error.MetadataMutationOutcomeUnknown;
+            }
+        };
+        var fake: Fake = .{ .state = state, .sealed = sealed, .commit = false };
+        const port: Port = .{ .ptr = &fake, .read_fn = Fake.read, .mutate_fn = Fake.mutate, .authority_fn = undefined };
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.sealSlot(a, write, 101, context));
+        try std.testing.expectEqual(@as(usize, 1), fake.mutations);
+        fake.commit = true;
+        const start = try port.sealSlot(a, write, 101, context);
+        try std.testing.expectEqual(configuration.consistent_lsn, start.consistent_lsn);
+        try std.testing.expectEqual(sealed.latest_cursor, start.cursor);
+        try std.testing.expectEqual(@as(usize, 2), fake.mutations);
+    }
+
     fn readAllocations(a: A, port: Port, id: control.Id, context: Context) !void {
         const bytes = try port.read(a, id, context);
         defer a.free(bytes);

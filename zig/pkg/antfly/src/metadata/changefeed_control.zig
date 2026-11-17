@@ -685,7 +685,7 @@ pub const Mutation = union(enum) {
                 }
                 next.cut = sealed.cut;
                 next.phase = if (state.definition.?.start == .snapshot_then_changes) .bootstrap else .streaming;
-                next.latest_cursor = hash(.{ .domain = "antfly:changefeed-cut:v1", .id = state.id, .epoch = state.epoch, .authority = state.authority, .definition = state.definition.?.identity(), .cut = sealed.cut });
+                next.latest_cursor = initialCursor(state, sealed.cut);
                 next.acknowledged_cursor = next.latest_cursor;
                 if (sealed.slot) |configuration| {
                     try slotDefinition(state.definition.?);
@@ -884,6 +884,44 @@ fn bootstrapLease(start: Start, now: u64, expires: u64, bootstrap: u64) !void {
         if (bootstrap != 0) return error.InvalidChangefeed;
     } else if (bootstrap <= now or bootstrap > expires or bootstrap - now > max_bootstrap_seconds) return error.InvalidChangefeed;
 }
+fn initialCursor(state: State, cut: Digest) Digest {
+    return hash(.{
+        .domain = "antfly:changefeed-cut:v1",
+        .id = state.id,
+        .epoch = state.epoch,
+        .authority = state.authority,
+        .definition = state.definition.?.identity(),
+        .cut = cut,
+    });
+}
+
+pub const SlotStart = struct {
+    consistent_lsn: u64,
+    cursor: Digest,
+};
+
+/// Recover the original start after an ambiguous seal. The caller must supply
+/// freshly authorized state from a linearizable metadata read.
+pub fn recoverSlotStart(state: State, original: Write, now: u64) !SlotStart {
+    try original.validate();
+    try state.validate();
+    if (original.mutation != .seal) return error.InvalidChangefeed;
+    const seal = original.mutation.seal;
+    const configuration = seal.slot orelse return error.InvalidChangefeed;
+    if (state.phase != .bootstrap and state.phase != .streaming) return error.ChangefeedResynchronizationRequired;
+    if (now < state.created_at) return error.InvalidChangefeed;
+    if (now >= state.expires_at or (state.phase == .bootstrap and now >= state.bootstrap_expires_at)) return error.ChangefeedLeaseExpired;
+    const definition = state.definition.?;
+    const slot = state.slot orelse return error.ChangefeedConflict;
+    if (state.revision <= original.expected_revision or state.epoch != original.expected_epoch or
+        !equal(state.id, original.id) or !equal(state.authority, original.authority) or
+        !equal(definition.owner, original.owner) or !equal(definition.authorization, original.authorization) or
+        !equal(state.cut, seal.cut) or !equal(slot.database, configuration.database) or
+        !std.mem.eql(u8, slot.name, configuration.name) or slot.byte_limit != configuration.byte_limit or
+        slot.consistent_lsn != configuration.consistent_lsn) return error.ChangefeedConflict;
+    return .{ .consistent_lsn = slot.consistent_lsn, .cursor = initialCursor(state, state.cut) };
+}
+
 pub const Write = struct {
     id: Id,
     authority: Digest,
@@ -1419,6 +1457,15 @@ test "changefeed logical slot confirms native ACK atomically and fences ordinary
     const lsn = 4096;
     var state = try testSlotStateAt(a, lsn);
     try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .slot = .{ .configure = .{ .database = @splat(1), .name = "slot", .consistent_lsn = lsn + 1 } } }));
+    const original: Write = .{
+        .id = state.id,
+        .authority = state.authority,
+        .owner = state.definition.?.owner,
+        .authorization = state.definition.?.authorization,
+        .expected_revision = state.revision - 2,
+        .expected_epoch = state.epoch,
+        .mutation = .{ .seal = .{ .cut = state.cut, .slot = .{ .database = @splat(1), .name = "slot", .consistent_lsn = lsn } } },
+    };
     const initial = state.latest_cursor;
     const session = state.slot.?.session.?;
     const delivery = testDelivery(state, &.{.{ .namespace = testNamespace(7), .position = .{ .sequence = 11 } }});
@@ -1438,6 +1485,16 @@ test "changefeed logical slot confirms native ACK atomically and fences ordinary
     try std.testing.expectEqual(@as(u64, 11), state.roots[0].acknowledged.sequence);
     try std.testing.expectEqual(@as(u64, 10), state.roots[0].reclaimed_through);
     try std.testing.expectEqual(@as(u64, lsn + 100), state.slot.?.confirmed_lsn);
+    const start = try recoverSlotStart(state, original, 103);
+    try std.testing.expectEqual(@as(u64, lsn), start.consistent_lsn);
+    try std.testing.expectEqual(initial, start.cursor);
+    var mismatched = original;
+    mismatched.mutation.seal.cut[0] ^= 1;
+    try std.testing.expectError(error.ChangefeedConflict, recoverSlotStart(state, mismatched, 103));
+    mismatched = original;
+    mismatched.expected_epoch += 1;
+    try std.testing.expectError(error.ChangefeedConflict, recoverSlotStart(state, mismatched, 103));
+    try std.testing.expectError(error.ChangefeedLeaseExpired, recoverSlotStart(state, original, state.expires_at));
     try std.testing.expectEqual(@as(usize, 0), state.cursors.len);
     try std.testing.expectEqual(@as(usize, 0), state.slot.?.entries.len);
     state = try step(a, state, .{ .slot = .{ .acquire = .{ .actor = @splat(3), .expected = 1, .now = 150, .expires = 200 } } });
