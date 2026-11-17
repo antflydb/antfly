@@ -4181,6 +4181,8 @@ pub const AntflyApiHandler = struct {
         err: internal_group_operations.Error,
         phase: InternalTxnPhase,
     ) !httpx.Response {
+        if (@import("dag_errors.zig").classify(err)) |reason|
+            return textResponse(ctx, 409, @errorName(reason));
         if (@import("relational_row_errors.zig").classify(err)) |reason|
             return textResponse(ctx, @import("relational_row_errors.zig").status(reason), @errorName(reason));
         if (@import("relational_integrity_errors.zig").classify(err)) |relational_error|

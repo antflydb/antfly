@@ -92,6 +92,7 @@ test "distributed txn range guard wire preserves absent and exact counters" {
 }
 
 const PrepareExtensions = struct {
+    dag_domains: []const db_mod.types.DagDomainPrepare = &.{},
     commit_requires: ?db_mod.types.CommitRequires = null,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
@@ -1264,7 +1265,7 @@ pub fn executeCrossGroup(
     req: db_mod.types.TransactionIntentRequest,
     trace_writer: ?tracing.AntflyTraceWriter,
 ) !ExecuteResult {
-    if (req.range_guards.len != 0) return error.InvalidTxnRequest;
+    if (req.range_guards.len != 0 or req.dag_domains.len != 0) return error.InvalidTxnRequest;
     const tables = [_]TableCommitRequest{.{
         .table_name = table_name,
         .commit_requires = req.commit_requires,
@@ -1429,6 +1430,16 @@ fn executeMultiTableCommitOnce(
             const group_id = routing.resolveGroupForKey(&command.address.routing) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
             try participant.integrity_commands.append(alloc, command);
+        }
+        for (table.dag_owners) |owner| {
+            if (owner.domains.len == 0 or owner.domains.len > 64 or table.restore_staging_scope != null) return error.InvalidTxnRequest;
+            const present = for (routing.ranges) |range| {
+                if (range.group_id == owner.group_id) break true;
+            } else false;
+            if (!present) return error.TopologyChanged;
+            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, owner.group_id, topology_epoch);
+            if (participant.dag_domains.len != 0) return error.InvalidTxnRequest;
+            participant.dag_domains = owner.domains;
         }
         if (table.relational_activation) |command| {
             const group_id = routing.resolveGroupForKey(command.routing_key) orelse return error.UnknownGroup;
@@ -1645,6 +1656,11 @@ fn executeMultiTableCommitOnce(
         if (firstFanoutError(fanout_slots)) |participant_index| {
             const participant = participants.items[participant_index];
             const err = fanout_slots[participant_index].err.?;
+            if (@import("dag_errors.zig").classify(err)) |reason| {
+                abort_on_error = false;
+                try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
+                return reason;
+            }
             switch (err) {
                 error.IntentConflict, error.VersionConflict, error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced => {
                     if (trace_writer) |tw| {
@@ -2042,6 +2058,7 @@ const ParticipantTxn = struct {
     predicates: std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate) = .empty,
     integrity: std.ArrayListUnmanaged(db_mod.types.TransactionIntegrityOperation) = .empty,
     integrity_commands: std.ArrayListUnmanaged(integrity_wire.Command) = .empty,
+    dag_domains: []const db_mod.types.DagDomainPrepare = &.{},
     relational_activation: ?integrity_activation.Command = null,
     relational_retirement: ?integrity_retirement.Command = null,
     relational_index_maintenance: ?@import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Command = null,
@@ -2155,7 +2172,13 @@ const PrepareFanoutTask = struct {
     ) void {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        worker.prepareGroup(arena.allocator(), participant.group_id, participant.table_name, .{
+        const alloc = arena.allocator();
+        const dag_domains = alloc.dupe(db_mod.types.DagDomainPrepare, participant.dag_domains) catch |err| {
+            slot.err = err;
+            return;
+        };
+        for (dag_domains) |*domain| domain.attempt.transaction = txn_id;
+        worker.prepareGroup(alloc, participant.group_id, participant.table_name, .{
             .route_fence = participant.route_fence,
             .txn_id = txn_id,
             .topology_epoch = participant.topology_epoch,
@@ -2174,6 +2197,7 @@ const PrepareFanoutTask = struct {
                 .integrity = participant.integrity.items,
                 .integrity_commands = participant.integrity_commands.items,
                 .range_guards = participant.range_guards.items,
+                .dag_domains = dag_domains,
                 .relational_activation = participant.relational_activation,
                 .relational_retirement = participant.relational_retirement,
                 .relational_index_maintenance = participant.relational_index_maintenance,
@@ -2445,13 +2469,21 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
     const guarded = req.req.range_guards.len != 0;
     const row_semantics = @import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
     const gated = req.req.commit_requires == .direct_enrichments;
-    if (gated) try out.appendSlice(alloc, "[\"prepared-enrichments-prepare-v1\",") else if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
+    const dag = req.req.dag_domains.len != 0;
+    if (dag and (req.req.dag_domains.len > 64 or req.req.restore_staging_scope != null)) return error.InvalidTxnRequest;
+    if (dag) try out.appendSlice(alloc, "[\"dag-prepare-v1\",") else if (gated) try out.appendSlice(alloc, "[\"prepared-enrichments-prepare-v1\",") else if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
     try out.appendSlice(alloc, "\",\"topology_epoch\":");
     const epoch = try std.fmt.allocPrint(alloc, "{d}", .{req.topology_epoch});
     defer alloc.free(epoch);
     try out.appendSlice(alloc, epoch);
+    if (dag) {
+        const bytes = try std.json.Stringify.valueAlloc(alloc, req.req.dag_domains, .{ .emit_strings_as_arrays = true });
+        defer alloc.free(bytes);
+        try out.appendSlice(alloc, ",\"dag_domains\":");
+        try out.appendSlice(alloc, bytes);
+    }
     if (req.route_fence) |fence| {
         const bytes = try std.json.Stringify.valueAlloc(alloc, fence, .{});
         defer alloc.free(bytes);
@@ -2578,7 +2610,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         try out.appendSlice(alloc, encoded);
     }
     try out.append(alloc, '}');
-    if (gated or guarded or row_semantics) try out.append(alloc, ']');
+    if (dag or gated or guarded or row_semantics) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -2749,22 +2781,27 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     const wrapped = parsed.value == .array;
     var row_semantics = false;
     var gated = false;
+    var dag = false;
     const root = if (wrapped) blk: {
         const entries = parsed.value.array.items;
         if (entries.len != 2 or entries[0] != .string) return error.InvalidTxnRequest;
         gated = std.mem.eql(u8, entries[0].string, "prepared-enrichments-prepare-v1");
         row_semantics = gated or std.mem.eql(u8, entries[0].string, "row-semantics-prepare-v1");
-        if (!row_semantics and !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
+        dag = std.mem.eql(u8, entries[0].string, "dag-prepare-v1");
+        if (!dag and !row_semantics and !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
         break :blk entries[1];
     } else parsed.value;
     const obj = switch (root) {
         .object => |obj| obj,
         else => return error.InvalidTxnRequest,
     };
+    if (obj.get("dag_domains")) |domains| {
+        if (!dag or domains != .array or domains.array.items.len == 0 or domains.array.items.len > 64) return error.InvalidTxnRequest;
+    } else if (dag) return error.InvalidTxnRequest;
     var extensions = try std.json.parseFromValue(PrepareExtensions, alloc, root, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     errdefer extensions.deinit();
     const ext = extensions.value;
-    if (gated != (ext.commit_requires == .direct_enrichments)) return error.InvalidTxnRequest;
+    if (!dag and gated != (ext.commit_requires == .direct_enrichments)) return error.InvalidTxnRequest;
     if ((ext.row_policy_principal_proof.len == 0) != (ext.row_policy_database.len == 0) or
         (ext.row_policy_principal_proof.len == 0) != (ext.row_policy_admitted_at_seconds == 0) or
         ext.row_policy_admitted_at_seconds < 0) return error.InvalidTxnRequest;
@@ -2810,14 +2847,16 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     if (range_guards_owner != null and range_guards_owner.?.value.len != 0 and route_fence == null) return error.InvalidTxnRequest;
     const has_guards = range_guards_owner != null and range_guards_owner.?.value.len != 0;
     if (has_guards and !wrapped) return error.InvalidTxnRequest;
-    if (wrapped and !row_semantics and !has_guards) return error.InvalidTxnRequest;
-    if (@import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics) return error.InvalidTxnRequest;
+    if (dag and restore_staging_scope != null) return error.InvalidTxnRequest;
+    if (wrapped and !dag and !row_semantics and !has_guards) return error.InvalidTxnRequest;
+    if (@import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(writes, predicates) and !dag and !row_semantics) return error.InvalidTxnRequest;
     return .{
         .extensions_owner = extensions,
         .route_fence = if (route_fence) |fence| fence.value else null,
         .txn_id = txn_id,
         .topology_epoch = try optionalU64(obj, "topology_epoch"),
         .req = .{
+            .dag_domains = ext.dag_domains,
             .commit_requires = ext.commit_requires,
             .row_policy_principal_proof = ext.row_policy_principal_proof,
             .row_policy_database = ext.row_policy_database,
@@ -7072,4 +7111,35 @@ test "distributed txn prepare retains signed graph mutations and normalized rows
     var decoded = try parseTxnPrepareRequest(alloc, encoded);
     defer freeTxnPrepareRequest(alloc, &decoded);
     try std.testing.expectEqualDeep(request.req, decoded.req);
+}
+
+test "distributed txn DAG prepare preserves binary contributions on both private transports" {
+    const alloc = std.testing.allocator;
+    const id: db_mod.types.TxnId = @splat(6);
+    const domains: []const db_mod.types.DagDomainPrepare = &.{.{
+        .domain = @splat(1),
+        .epoch = 2,
+        .revision = 3,
+        .attempt = .{ .id = @splat(4), .transaction = id, .candidate = @splat(5) },
+        .producer_versions = @splat(7),
+        .replacements = &.{.{ .owner = @splat(8), .source = "\xff\x00", .targets = &.{"\x00\xfe"} }},
+    }};
+    const encoded = try encodeTxnPrepareRequest(alloc, .{ .txn_id = id, .topology_epoch = 9, .req = .{ .dag_domains = domains } });
+    defer alloc.free(encoded);
+    var parsed = try parseTxnPrepareRequest(alloc, encoded);
+    defer freeTxnPrepareRequest(alloc, &parsed);
+    try std.testing.expectEqualDeep(domains, parsed.req.dag_domains);
+    const head = "[\"dag-prepare-v1\",";
+    try std.testing.expect(std.mem.startsWith(u8, encoded, head));
+    try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(alloc, encoded[head.len .. encoded.len - 1]));
+
+    const batch = @import("antfly_local_sources").api_internal_batch;
+    const batch_wire = try batch.encodeBatchRequest(alloc, .{
+        .transaction = .{ .prepare = .{ .txn_id = id, .topology_epoch = 9, .dag_domains = domains } },
+    });
+    defer alloc.free(batch_wire);
+    var batch_parsed = try batch.parseInternalBatchRequest(alloc, batch_wire);
+    defer batch_parsed.deinit(alloc);
+    try std.testing.expectEqualDeep(domains, batch_parsed.req.transaction.?.prepare.dag_domains);
+    try std.testing.expectError(error.InvalidBatchRequest, batch.parseBatchRequest(alloc, batch_wire));
 }

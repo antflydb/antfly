@@ -205,6 +205,8 @@ pub const MergeReplicationCheckpoint = struct {
 /// Private data-Raft command used by the distributed transaction protocol.
 /// Every value that can affect durable state is carried in the command so
 /// replay is deterministic on followers and after restart.
+pub const DagDomainPrepare = transactions_mod.DagDomainPrepare;
+
 pub const TransactionMutation = union(enum) {
     begin: struct {
         txn_id: TxnId,
@@ -220,6 +222,7 @@ pub const TransactionMutation = union(enum) {
     prepare: struct {
         txn_id: TxnId,
         topology_epoch: u64,
+        dag_domains: []const DagDomainPrepare = &.{},
     },
     resolve: struct {
         txn_id: TxnId,
@@ -1758,6 +1761,7 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    dag_domains: []const DagDomainPrepare = &.{},
     commit_requires: ?CommitRequires = null,
     prepared_enrichments_json: ?[]const u8 = null,
     document_version_scheme: DocumentVersionScheme = .admit_current,

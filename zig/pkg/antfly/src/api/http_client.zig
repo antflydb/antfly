@@ -4517,6 +4517,7 @@ fn isTxnPreDecisionNotProposedResponse(resp: http_common.HttpResponse) bool {
 }
 
 fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
+    if (@import("dag_errors.zig").decode(body)) |err| return err;
     if (@import("relational_integrity_errors.zig").decode(body)) |err| return err;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;

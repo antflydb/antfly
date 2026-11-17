@@ -6140,6 +6140,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .restore_staging_scope = req.restore_staging_scope,
             .restore_staging_plan_id = req.restore_staging_plan_id,
             .transaction = .{ .prepare = .{
+                .dag_domains = req.dag_domains,
                 .txn_id = txn_id,
                 .topology_epoch = topology_epoch,
             } },

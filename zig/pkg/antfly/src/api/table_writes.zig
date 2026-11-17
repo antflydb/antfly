@@ -22362,7 +22362,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         const table_req = tables[0];
         if (table_req.graph_writes.len != 0 or table_req.graph_deletes.len != 0) return null;
-        if (table_req.range_guards.len != 0) return null;
+        if (table_req.range_guards.len != 0 or table_req.dag_owners.len != 0) return null;
         if (table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
         const has_mutations = table_req.writes.len != 0 or
             table_req.deletes.len != 0 or
@@ -22448,7 +22448,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len != 1) return null;
         const table_req = tables[0];
         if (table_req.graph_writes.len != 0 or table_req.graph_deletes.len != 0) return null;
-        if (table_req.range_guards.len != 0) return null;
+        if (table_req.range_guards.len != 0 or table_req.dag_owners.len != 0) return null;
         if (table_req.predicates.len != 0 or table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
         if (try tableCommitHasGraphProjectionTransform(table_req)) return null;
 
@@ -23481,7 +23481,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .graph_writes = req.graph_writes,
                 .graph_deletes = req.graph_deletes,
                 .predicates = req.predicates,
-                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .dag_domains = req.dag_domains } },
                 .integrity = req.integrity,
                 .integrity_commands = req.integrity_commands,
                 .range_guards = req.range_guards,
@@ -23513,7 +23513,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .graph_writes = req.graph_writes,
                 .graph_deletes = req.graph_deletes,
                 .predicates = req.predicates,
-                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .dag_domains = req.dag_domains } },
                 .integrity = req.integrity,
                 .integrity_commands = req.integrity_commands,
                 .range_guards = req.range_guards,
@@ -26900,7 +26900,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             .graph_writes = req.graph_writes,
             .graph_deletes = req.graph_deletes,
             .predicates = req.predicates,
-            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch, .dag_domains = req.dag_domains } },
             .integrity = req.integrity,
             .integrity_commands = req.integrity_commands,
             .range_guards = req.range_guards,
@@ -27954,7 +27954,7 @@ fn sleepStatelessBatchRetry(source: anytype, attempt: u8) !void {
 
 fn statelessBatchMayRetry(tables: []const distributed_txn.TableCommitRequest) bool {
     for (tables) |table| {
-        if (table.range_guards.len != 0) return false;
+        if (table.range_guards.len != 0 or table.dag_owners.len != 0) return false;
         if (table.predicates.len != 0 or table.integrity.len != 0 or table.integrity_commands.len != 0 or table.relational_activation != null or table.relational_retirement != null or table.relational_index_maintenance != null) return false;
     }
     return true;

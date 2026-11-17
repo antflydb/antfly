@@ -49,7 +49,7 @@ fn logUnknownTransitionFailure(group_id: u64, action: metadata_mod.TransitionAct
     std.log.warn("private transition failed group_id={} action={s} err={s}", .{ group_id, @tagName(action), @errorName(err) });
 }
 
-pub const Error = operation.ApiError || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
+pub const Error = operation.ApiError || @import("dag_errors.zig").Error || @import("relational_integrity_errors.zig").Error || @import("relational_row_errors.zig").Error || error{
     ResourceBudgetExceeded,
     RetainedEffectsFull,
     AuthoritativeLookupMissing,
@@ -790,6 +790,7 @@ pub const Operations = struct {
                 // One registry drives Raft terminal results and participant
                 // transport; adding a lifecycle fence must not silently turn
                 // its recoverable typed rejection into an HTTP 500.
+                if (@import("dag_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 return error.Internal;

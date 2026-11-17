@@ -537,6 +537,7 @@ pub const OwnedBatchRequest = struct {
     leann_record_bytes: ?[]u8 = null,
     merge_proof_adoption: ?std.json.Parsed(@import("../storage/db/merge_proof_adoption.zig").Command) = null,
     transaction_participants: [][]const u8 = &.{},
+    dag_domains: ?std.json.Parsed([]const db_mod.types.DagDomainPrepare) = null,
     split_checkpoint_range_start: ?[]u8 = null,
     split_checkpoint_range_end: ?[]u8 = null,
     split_transition_key: ?[]u8 = null,
@@ -551,6 +552,7 @@ pub const OwnedBatchRequest = struct {
     req: db_mod.types.BatchRequest = .{},
 
     pub fn deinit(self: *OwnedBatchRequest, alloc: std.mem.Allocator) void {
+        if (self.dag_domains) |*domains| domains.deinit();
         if (self.prepared_enrichments_json) |json| alloc.free(json);
         @import("relational_integrity_wire.zig").free(alloc, self.integrity);
         if (self.integrity_commands) |*commands| commands.deinit();
@@ -1529,6 +1531,8 @@ fn parseBatchRequestWithOptions(
         for (transaction_participants[0..transaction_participants_initialized]) |participant| alloc.free(participant);
         if (transaction_participants.len > 0) alloc.free(transaction_participants);
     }
+    var dag_domains: ?std.json.Parsed([]const db_mod.types.DagDomainPrepare) = null;
+    errdefer if (dag_domains) |*domains| domains.deinit();
     const transaction: ?db_mod.types.TransactionMutation = transaction: {
         const value = root.get("_transaction") orelse break :transaction null;
         if (!allow_internal or value != .object) return error.InvalidBatchRequest;
@@ -1559,11 +1563,21 @@ fn parseBatchRequestWithOptions(
                 .participants = transaction_participants,
             } };
         }
+        const dag_prepare = std.mem.eql(u8, phase_value.string, "prepare_dag_v1");
         const guarded_prepare = std.mem.eql(u8, phase_value.string, "prepare_ranges_v1");
-        if (guarded_prepare != (range_guards != null and range_guards.?.value.len != 0)) return error.InvalidBatchRequest;
-        if (std.mem.eql(u8, phase_value.string, "prepare") or guarded_prepare) break :transaction .{ .prepare = .{
+        if (!dag_prepare and guarded_prepare != (range_guards != null and range_guards.?.value.len != 0)) return error.InvalidBatchRequest;
+        if (dag_prepare) {
+            const domains = object.get("domains") orelse return error.InvalidBatchRequest;
+            if (domains != .array or domains.array.items.len == 0 or domains.array.items.len > 64) return error.InvalidBatchRequest;
+            dag_domains = std.json.parseFromValue([]const db_mod.types.DagDomainPrepare, alloc, domains, .{ .allocate = .alloc_always }) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return error.InvalidBatchRequest;
+            };
+        } else if (object.contains("domains")) return error.InvalidBatchRequest;
+        if (std.mem.eql(u8, phase_value.string, "prepare") or guarded_prepare or dag_prepare) break :transaction .{ .prepare = .{
             .txn_id = txn_id,
             .topology_epoch = try parseInternalU64(object.get("topology_epoch") orelse return error.InvalidBatchRequest),
+            .dag_domains = if (dag_domains) |domains| domains.value else &.{},
         } };
         if (std.mem.eql(u8, phase_value.string, "resolve")) {
             const status_value = object.get("status") orelse return error.InvalidBatchRequest;
@@ -1708,6 +1722,7 @@ fn parseBatchRequestWithOptions(
         .leann_record_bytes = leann_record_bytes,
         .merge_proof_adoption = merge_proof_adoption,
         .transaction_participants = transaction_participants,
+        .dag_domains = dag_domains,
         .split_checkpoint_range_start = checkpoint_start,
         .split_checkpoint_range_end = checkpoint_end,
         .split_transition_key = transition_key,
@@ -2366,7 +2381,11 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
             },
             .prepare => |prepare| {
                 const txn_hex = std.fmt.bytesToHex(prepare.txn_id, .lower);
-                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ if (req.range_guards.len != 0) "prepare_ranges_v1" else "prepare", &txn_hex, prepare.topology_epoch });
+                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ if (prepare.dag_domains.len != 0) "prepare_dag_v1" else if (req.range_guards.len != 0) "prepare_ranges_v1" else "prepare", &txn_hex, prepare.topology_epoch });
+                if (prepare.dag_domains.len != 0) {
+                    if (prepare.dag_domains.len > 64 or req.restore_staging_scope != null) return error.InvalidBatchRequest;
+                    try writer.print(",\"domains\":{f}", .{std.json.fmt(prepare.dag_domains, .{ .emit_strings_as_arrays = true })});
+                }
             },
             .resolve => |resolve| {
                 const txn_hex = std.fmt.bytesToHex(resolve.txn_id, .lower);

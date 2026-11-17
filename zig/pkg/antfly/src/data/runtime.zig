@@ -1336,6 +1336,15 @@ const RaftTableApplyStateMachine = struct {
         SqlFeatureNotSupported,
         SqlArraySubscriptError,
 
+        GraphCycle,
+        GraphConstraintCapacity,
+        GraphConstraintNotReady,
+        GraphConstraintOwnerChanged,
+        GraphConstraintRevisionChanged,
+        GraphConstraintBusy,
+        GraphConstraintAttemptConflict,
+        InvalidDagMutation,
+
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
                 if (err == @field(@import("antfly_local_sources").storage_db_online_source_contract.Rejection, field)) return @field(ExpectedApplyFailure, field);
@@ -1401,6 +1410,9 @@ const RaftTableApplyStateMachine = struct {
             inline for (@typeInfo(@import("../api/relational_integrity_errors.zig").Error).error_set.error_names.?) |field| {
                 if (self == @field(ExpectedApplyFailure, field)) return @field(@import("../api/relational_integrity_errors.zig").Error, field);
             }
+            inline for (@typeInfo(@import("../api/dag_errors.zig").Error).error_set.error_names.?) |field| {
+                if (self == @field(ExpectedApplyFailure, field)) return @field(@import("../api/dag_errors.zig").Error, field);
+            }
             return switch (self) {
                 .InvalidArtifactCatalogCommand => error.InvalidArtifactCatalogCommand,
                 .ArtifactCatalogEpochChanged => error.ArtifactCatalogEpochChanged,
@@ -1432,6 +1444,11 @@ const RaftTableApplyStateMachine = struct {
         }
 
         fn forRequest(err: anyerror, req: antfly.db.types.BatchRequest) ?ExpectedApplyFailure {
+            if (req.transaction) |control| if (control == .prepare and control.prepare.dag_domains.len != 0) {
+                inline for (@typeInfo(@import("../api/dag_errors.zig").Error).error_set.error_names.?) |field| {
+                    if (err == @field(@import("../api/dag_errors.zig").Error, field)) return @field(ExpectedApplyFailure, field);
+                }
+            };
             // A committed transaction decision cannot be converted into a
             // rejected participant mutation by late retention pressure or a
             // newly retired FK generation. Both conditions must be prevented

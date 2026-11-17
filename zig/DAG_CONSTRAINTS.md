@@ -36,8 +36,11 @@ an ordered set of authority domains atomically with its participant vote.
 It persists a versioned candidate packet and resolves the recorded domains in
 the same batch as the participant decision, including authority-only participants
 and resolution after authority owner changes. Ordinary transactions keep their
-original record format and skip authority lookups. The hosted coordinator and
-production graph writers do not yet supply the authority domains or replacements. The authority also stages bounded activation pages into a private
+original record format and skip authority lookups. The hosted coordinator can
+carry an explicitly routed authority participant supplied by the caller. Its
+private HTTP and ordered Raft prepare envelopes have distinct version tags and
+carry binary contribution identifiers. Production graph writers still need to
+derive owner routes and supply authoritative replacements. The authority also stages bounded activation pages into a private
 ledger and persists the pinned snapshot and scan cursor atomically with each
 page. The catalog still needs to fence writes, enumerate the stable snapshot
 completely, and certify end of input before the authority becomes active.

@@ -26003,6 +26003,7 @@ pub const DB = struct {
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
     ) !void {
+        if (incoming_req.dag_domains.len != 0 and incoming_req.restore_staging_scope != null) return error.InvalidBatchRequest;
         var req = incoming_req;
         var packet = if (req.prepared_enrichments_json) |json|
             try std.json.parseFromSlice(execution_resources.PreparedEnrichments, preparation_alloc, json, .{ .allocate = .alloc_always })
@@ -26409,6 +26410,20 @@ pub const DB = struct {
             }
         };
 
+        const dag_validation = @import("../../graph/dag_validation.zig");
+        const DagClock = struct {
+            fn now(_: *anyopaque) u64 {
+                return 0;
+            }
+        };
+        var dag_budget: dag_validation.Budget = .{ .clock = .{ .context = self, .now = DagClock.now } };
+        var dag_witness: dag_validation.Witness = .{};
+        const dag_prepare: ?transactions_mod.DagPrepare = if (req.dag_domains.len != 0) .{
+            .domains = req.dag_domains,
+            .budget = &dag_budget,
+            .witness = &dag_witness,
+        } else null;
+
         if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         if (ordered_receipt) |identity| {
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
@@ -26421,10 +26436,11 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .prepared_enrichments_json = req.prepared_enrichments_json, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .dag_prepare = dag_prepare, .prepared_enrichments_json = req.prepared_enrichments_json, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .dag_prepare = dag_prepare,
                 .prepared_enrichments_json = req.prepared_enrichments_json,
                 .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
@@ -155931,4 +155947,48 @@ test "privacy scoped readiness status isolates shared catch-up telemetry" {
     pending.projection_checkpoint_status = "rebuilding";
     try std.testing.expect(DB.denseCatchUpAffectsIndex(pending, progress));
     try std.testing.expect(!DB.denseCatchUpAffectsIndex(pending, .{}));
+}
+
+test "db DAG authority prepare commits through the native transaction path" {
+    const a = std.testing.allocator;
+    const dag = @import("../../graph/dag_authority.zig");
+    var directory = try TestDirectory.init("dag-authority-prepare");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    const domain: dag.Digest = @splat(1);
+    {
+        var writer = try db.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        try dag.Storage.create(&writer, domain, 1);
+        try dag.Storage.activateNewIncarnation(&writer, domain, 1);
+        try writer.commit();
+    }
+    const producer_versions: dag.Digest = @splat(2);
+    const txn_id = try db.beginTransaction(100);
+    const replacements: []const dag.Contributions.Replacement = &.{.{ .owner = @splat(3), .source = "left", .targets = &.{"right"} }};
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "left", .value = "{}" }},
+        .dag_domains = &.{.{
+            .domain = domain,
+            .epoch = 1,
+            .revision = 0,
+            .attempt = .{
+                .id = @splat(4),
+                .transaction = txn_id,
+                .candidate = dag.Contributions.candidate(producer_versions, replacements),
+            },
+            .producer_versions = producer_versions,
+            .replacements = replacements,
+        }},
+    });
+    try db.commitTransaction(txn_id, 200);
+    const value = (try db.get(a, "left")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("{}", value);
+    var reader = try db.core.store.beginReadTxn();
+    defer reader.abort();
+    const state = try dag.Storage.load(&reader, domain);
+    try std.testing.expectEqual(@as(u64, 1), state.revision);
+    try std.testing.expect(state.pending == null);
 }
