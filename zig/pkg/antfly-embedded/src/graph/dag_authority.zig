@@ -346,6 +346,12 @@ pub const Storage = struct {
         if (state.owner_epoch != epoch) return error.GraphConstraintOwnerChanged;
         if (state.phase == .active) return;
         if (state.phase != .validating or state.revision != 0) return error.GraphConstraintNotReady;
+        try requireEmptyLedger(txn, id);
+        state.phase = .active;
+        try save(txn, state);
+    }
+
+    fn requireEmptyLedger(txn: anytype, id: Digest) !void {
         var cursor = try txn.openCursor();
         defer cursor.close();
         const suffix = std.fmt.bytesToHex(id, .lower);
@@ -354,8 +360,7 @@ pub const Storage = struct {
         try requireEmptyPrefix(&cursor, &(Contributions.prefix.* ++ id));
         try requireEmptyPrefix(&cursor, &(receipt_prefix.* ++ suffix));
         try requireEmptyPrefix(&cursor, &proofKey(id));
-        state.phase = .active;
-        try save(txn, state);
+        try requireEmptyPrefix(&cursor, &Contributions.activationKey(id));
     }
 
     fn requireEmptyPrefix(cursor: anytype, prefix: []const u8) !void {
@@ -749,6 +754,7 @@ pub const Contributions = struct {
     const validation = @import("dag_validation.zig");
     const A = std.mem.Allocator;
     const prefix = "\x00\x00__metadata__:dag-contribution:";
+    const activation_prefix = "\x00\x00__metadata__:dag-activation:";
 
     pub const Replacement = struct {
         owner: Digest,
@@ -861,6 +867,102 @@ pub const Contributions = struct {
         return target;
     }
 
+    fn activationKey(id: Digest) [activation_prefix.len + @sizeOf(Digest)]u8 {
+        return activation_prefix.* ++ id;
+    }
+
+    fn activationState(txn: anytype, id: Digest, epoch: u64) !State {
+        const state = try Storage.load(txn, id);
+        if (state.owner_epoch != epoch) return error.GraphConstraintOwnerChanged;
+        if (state.phase != .validating or state.revision != 0) return error.GraphConstraintNotReady;
+        return state;
+    }
+
+    /// The catalog must fence writes and pin the authoritative contribution
+    /// snapshot before invoking this function. The cursor is the concatenation
+    /// of the last owner digest and source. Each page commits atomically with
+    /// its new cursor and is checked against every previous accepted page.
+    pub fn seedActivationPage(
+        alloc: A,
+        txn: anytype,
+        id: Digest,
+        epoch: u64,
+        snapshot: Digest,
+        expected_after: ?[]const u8,
+        replacements: []const Replacement,
+        budget: *validation.Budget,
+        witness: *validation.Witness,
+    ) !void {
+        _ = try activationState(txn, id, epoch);
+        try requireActivationCursor(txn, id, snapshot, expected_after);
+        if (expected_after == null) try Storage.requireEmptyLedger(txn, id);
+        if (replacements.len == 0) return error.InvalidDagMutation;
+        const first = replacements[0];
+        if (expected_after) |after| {
+            const owner_order = std.mem.order(u8, after[0..@sizeOf(Digest)], &first.owner);
+            if (owner_order == .gt or (owner_order == .eq and
+                std.mem.order(u8, after[@sizeOf(Digest)..], first.source) != .lt)) return error.InvalidDagMutation;
+        }
+        var memory: validation.Memory = .{ .parent = alloc, .budget = budget };
+        seedPage(memory.allocator(), txn, id, snapshot, replacements, budget, witness) catch |err| {
+            if (err == error.OutOfMemory and memory.denied) {
+                budget.exhausted = .memory;
+                return error.GraphConstraintCapacity;
+            }
+            return err;
+        };
+    }
+
+    fn seedPage(alloc: A, txn: anytype, id: Digest, snapshot: Digest, replacements: []const Replacement, budget: *validation.Budget, witness: *validation.Witness) !void {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const delta = try plan(arena.allocator(), txn, id, replacements, budget);
+        const reader: Adjacency.Reader(@TypeOf(txn)) = .{ .txn = txn, .domain_id = id };
+        try validation.validate(alloc, reader, delta.adjacency, budget, witness);
+        try Adjacency.stage(alloc, txn, id, delta.adjacency);
+        try Membership.stage(alloc, txn, id, delta.membership);
+        try stageManifests(alloc, txn, id, replacements);
+        const last = replacements[replacements.len - 1];
+        const progress = try std.mem.concat(alloc, u8, &.{ &snapshot, &last.owner, last.source });
+        defer alloc.free(progress);
+        try txn.put(&activationKey(id), progress);
+    }
+
+    /// Load the persisted cursor for the pinned snapshot when resuming work.
+    pub fn activationCursor(alloc: A, txn: anytype, id: Digest, epoch: u64, snapshot: Digest) !?[]u8 {
+        _ = try activationState(txn, id, epoch);
+        const raw = txn.get(&activationKey(id)) catch |err| {
+            if (err == error.NotFound) return null;
+            return err;
+        };
+        if (raw.len < 2 * @sizeOf(Digest)) return error.InvalidDagAuthority;
+        if (!std.mem.eql(u8, raw[0..@sizeOf(Digest)], &snapshot)) return error.GraphConstraintRevisionChanged;
+        return try alloc.dupe(u8, raw[@sizeOf(Digest)..]);
+    }
+
+    fn requireActivationCursor(txn: anytype, id: Digest, snapshot: Digest, expected_after: ?[]const u8) !void {
+        const raw = txn.get(&activationKey(id)) catch |err| {
+            if (err != error.NotFound) return err;
+            if (expected_after != null) return error.GraphConstraintRevisionChanged;
+            return;
+        };
+        if (raw.len < 2 * @sizeOf(Digest)) return error.InvalidDagAuthority;
+        const after = expected_after orelse return error.GraphConstraintRevisionChanged;
+        if (!std.mem.eql(u8, raw[0..@sizeOf(Digest)], &snapshot) or
+            !std.mem.eql(u8, raw[@sizeOf(Digest)..], after)) return error.GraphConstraintRevisionChanged;
+    }
+
+    /// Call only after the fenced snapshot reader has certified end of input
+    /// at this exact cursor. Publish the catalog's enforcing state in the same
+    /// transaction or through its authoritative terminal decision.
+    pub fn finishActivation(txn: anytype, id: Digest, epoch: u64, snapshot: Digest, after: []const u8) !void {
+        var state = try activationState(txn, id, epoch);
+        try requireActivationCursor(txn, id, snapshot, after);
+        try txn.delete(&activationKey(id));
+        state.phase = .active;
+        try Storage.save(txn, state);
+    }
+
     /// Stage the participant's vote in the reserved snapshot.
     pub fn prepare(alloc: A, txn: anytype, token: Token, versions: Digest, replacements: []const Replacement, budget: *validation.Budget, witness: *validation.Witness) !void {
         var memory: validation.Memory = .{ .parent = alloc, .budget = budget };
@@ -904,8 +1006,13 @@ pub const Contributions = struct {
         };
         const delta = try plan(arena.allocator(), txn, token.domain, replacements, &replay_budget);
         const receipt = try Storage.accept(alloc, txn, token, delta.adjacency, delta.membership);
+        try stageManifests(alloc, txn, token.domain, replacements);
+        return receipt;
+    }
+
+    fn stageManifests(alloc: A, txn: anytype, id: Digest, replacements: []const Replacement) !void {
         for (replacements) |replacement| {
-            const storage_key = try key(alloc, token.domain, replacement);
+            const storage_key = try key(alloc, id, replacement);
             defer alloc.free(storage_key);
             if (replacement.targets.len == 0) {
                 txn.delete(storage_key) catch |err| if (err != error.NotFound) return err;
@@ -922,7 +1029,6 @@ pub const Contributions = struct {
             }
             try txn.put(storage_key, encoded.items);
         }
-        return receipt;
     }
 
     fn replayTime(_: *anyopaque) u64 {
@@ -1151,6 +1257,31 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
             _ = try Storage.reject(&txn, reverse_token, .semantic_rejection);
         }
     }
+    const existing_id: Digest = @splat(2);
+    try Storage.create(&txn, existing_id, 1);
+    var budget: Contributions.validation.Budget = .{ .clock = .{ .now = Txn.now, .context = &txn } };
+    var witness: Contributions.validation.Witness = .{};
+    try Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, null, &initial, &budget, &witness);
+    try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, existing_id, 1));
+    try std.testing.expectError(error.GraphConstraintNotReady, Storage.begin(&txn, existing_id, 1, 0, testAttempt(7)));
+    try Storage.takeover(&txn, existing_id, 1, 2);
+    const first_cursor = (try Contributions.activationCursor(alloc, &txn, existing_id, 2, versions)).?;
+    defer alloc.free(first_cursor);
+    const cycle: []const Contributions.Replacement = &.{
+        .{ .owner = @splat(1), .source = "b", .targets = &.{"a"} },
+    };
+    try std.testing.expectError(error.GraphConstraintOwnerChanged, Contributions.seedActivationPage(alloc, &txn, existing_id, 1, versions, first_cursor, cycle, &budget, &witness));
+    try std.testing.expectError(error.GraphCycle, Contributions.seedActivationPage(alloc, &txn, existing_id, 2, versions, first_cursor, cycle, &budget, &witness));
+    const valid_page: []const Contributions.Replacement = &.{
+        .{ .owner = @splat(1), .source = "b", .targets = &.{"c"} },
+    };
+    try Contributions.seedActivationPage(alloc, &txn, existing_id, 2, versions, first_cursor, valid_page, &budget, &witness);
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, Contributions.finishActivation(&txn, existing_id, 2, versions, first_cursor));
+    const last_cursor = (try Contributions.activationCursor(alloc, &txn, existing_id, 2, versions)).?;
+    defer alloc.free(last_cursor);
+    try Contributions.finishActivation(&txn, existing_id, 2, versions, last_cursor);
+    _ = try Storage.begin(&txn, existing_id, 2, 0, testAttempt(7));
+
     try Storage.retire(&txn, id, 1);
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, id, 1));
 }

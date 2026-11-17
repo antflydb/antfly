@@ -32,9 +32,10 @@ owner manifests against accepted storage, binds those replacements and producer
 versions to the attempt, and writes the resulting manifests with the terminal
 receipt. Committed replay recomputes the delta at the reserved accepted revision
 without a new admission deadline. Production writers do not yet call these
-adapters. The validator's
-`validateExisting` entry point requires complete enumeration; it does not provide
-resumable activation or a certificate of enumeration completeness.
+adapters. The authority also stages bounded activation pages into a private
+ledger and persists the pinned snapshot and scan cursor atomically with each
+page. The catalog still needs to fence writes, enumerate the stable snapshot
+completely, and certify end of input before the authority becomes active.
 
 ## Constraint domain and authority
 
