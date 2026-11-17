@@ -21,7 +21,7 @@ const A = std.mem.Allocator;
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
-pub const protocol_version: u16 = 107;
+pub const protocol_version: u16 = 108;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -544,7 +544,8 @@ pub const Mutation = union(enum) {
             },
             .slot => |operation| {
                 const cleanup = (operation == .reclaim_spool or operation == .checkpoint_spool_cleanup) and (state.phase == .closing or state.phase == .reset_required);
-                if (state.phase != .streaming and state.phase != .bootstrap and !cleanup) return error.ChangefeedResynchronizationRequired;
+                if (operation != .drop and state.phase != .streaming and state.phase != .bootstrap and !cleanup) return error.ChangefeedResynchronizationRequired;
+                if (state.phase == .empty) return error.ChangefeedConflict;
                 try slotDefinition(state.definition.?);
                 switch (operation) {
                     .configure => |configuration| {
@@ -556,6 +557,15 @@ pub const Mutation = union(enum) {
                         if (state.cursors.len != 0) return error.ChangefeedConflict;
                         for (state.roots) |root| if (root.acknowledged.event != 0) return error.ChangefeedConflict;
                         next.slot = try pg_slot.State.initializeAt(configuration.database, configuration.name, state.acknowledged_cursor, configuration.byte_limit, configuration.consistent_lsn);
+                    },
+                    .drop => |drop| {
+                        const slot = state.slot orelse return error.ChangefeedConflict;
+                        if (!equal(slot.database, drop.database) or !std.mem.eql(u8, slot.name, drop.name)) return error.ChangefeedConflict;
+                        if (state.phase == .closing or state.phase == .deleted) return state;
+                        if (drop.now < slot.observed_at) return error.ChangefeedConflict;
+                        if (slot.session != null and drop.now < slot.session_expires_at and state.phase != .reset_required) return error.ChangefeedConflict;
+                        next.phase = .closing;
+                        next.reset_reason = .none;
                     },
                     .acquire => |claim| {
                         if (claim.now >= state.expires_at or claim.expires > state.expires_at) return error.ChangefeedLeaseExpired;
@@ -1500,6 +1510,27 @@ test "changefeed logical slot confirms native ACK atomically and fences ordinary
     state = try step(a, state, .{ .slot = .{ .acquire = .{ .actor = @splat(3), .expected = 1, .now = 150, .expires = 200 } } });
     try std.testing.expectError(error.ChangefeedConflict, step(a, state, .{ .slot = .{ .confirm = .{ .session = session, .now = 151, .flushed = lsn + 100 } } }));
 }
+test "changefeed logical slot drop waits for the lease and preserves cleanup ownership" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state = try testSlotStateAt(a, 8192);
+    var mutation: Mutation = .{ .slot = .{ .drop = .{ .database = @splat(1), .name = "slot", .now = 149 } } };
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, mutation));
+    mutation.slot.drop.now = 150;
+    mutation.slot.drop.database[0] ^= 1;
+    try std.testing.expectError(error.ChangefeedConflict, step(a, state, mutation));
+    mutation.slot.drop.database[0] ^= 1;
+    const closing = try step(a, state, mutation);
+    try std.testing.expectEqual(Phase.closing, closing.phase);
+    try std.testing.expect(closing.slot.?.spool_retired);
+    try std.testing.expectEqual(@as(u64, 8192), closing.slot.?.consistent_lsn);
+    try std.testing.expect(!closing.roots[0].released);
+    try std.testing.expectEqualDeep(closing, try step(a, closing, mutation));
+    try std.testing.expectError(error.ChangefeedConflict, step(a, closing, .finish_close));
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, step(a, closing, .{ .slot = .{ .acquire = .{ .actor = @splat(3), .expected = 1, .now = 150, .expires = 200 } } }));
+}
+
 test "changefeed logical slot rejects partial frame endpoints and document table compatibility" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

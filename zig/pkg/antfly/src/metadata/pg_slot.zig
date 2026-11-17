@@ -91,6 +91,7 @@ pub const Configuration = struct {
 
 pub const Mutation = union(enum) {
     configure: Configuration,
+    drop: struct { database: Digest, name: []const u8, now: u64 },
     acquire: struct { actor: Id, expected: u64, now: u64, expires: u64 },
     release: struct { session: Session, now: u64 },
     issue: struct { session: Session, now: u64, transaction: Prepared },
@@ -106,6 +107,7 @@ pub const Mutation = union(enum) {
     pub fn validate(self: Mutation) !void {
         switch (self) {
             .configure => |configuration| try configuration.validate(),
+            .drop => |drop| if (!nz(drop.database) or !validName(drop.name) or drop.now == 0) return error.InvalidChangefeed,
             .acquire => |v| if (!nz(v.actor) or v.now == 0 or v.expires <= v.now or v.expires - v.now > max_session_seconds) return error.InvalidChangefeed,
             .issue => |v| {
                 try v.transaction.validate();

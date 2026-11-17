@@ -136,7 +136,8 @@ const std = @import("std");
 /// Version 105 retains frozen source recovery manifests through reclamation.
 /// Version 106 persists the allocated initial position for logical slots.
 /// Version 107 atomically seals the feed cut and initializes its logical slot.
-pub const current_version: u16 = 107;
+/// Version 108 fences logical slot drop against an active stream lease.
+pub const current_version: u16 = 108;
 pub const changefeed_control_version: u16 = @import("changefeed_control.zig").protocol_version;
 pub const source_control_version: u16 = @import("source_control.zig").protocol_version;
 pub const sql_completion_admission_version: u16 = 78;
