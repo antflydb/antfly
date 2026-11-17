@@ -5542,3 +5542,29 @@ fails the test, and only the outer deadline or inner ReadIndex timeout qualifies
 as bounded unavailability. Final source-catalog, engine-error and OpenAPI checks
 also exited 0 (`source-scope-control-http-final-contract-check.log`), including
 nine schema-fragment tests. These checks do not close the remaining full scope.
+
+### Bind destination planning grants to scoped admission identity
+
+Scoped source delivery now supplies the reserved native scope reference to both
+initial frozen planning and replacement planning. The reference derives from the
+same validated metadata state and checkpoint owner used by lifecycle capture;
+it carries the exact source generation, binding, domain, sequence and upload
+token. A returned frozen plan must advertise the identical reference and a
+retained artifact with the same binding and token before metadata checkpoint
+binding or reservation can advance. Missing or substituted identities fail
+closed. Legacy unscoped plans keep their null reference.
+
+The shared derivation does not prove physical owner registration, legacy worker
+drainage or successful admission. No existing single-root adapter is advertised
+as a distributed/scoped destination. Production replication still needs the full
+adapter and destination-aware worker integration.
+
+`source-control-test -Dstrip=true -j1 --summary all` exited 0 with all 90 build
+steps successful (`source-scope-planning-final-test.log`). Its selected delivery
+regression covers derivation against the scope specification, exact artifact
+matching, missing scope/artifact, substituted sequence/token and unexpected
+scope on an unscoped grant. Existing metadata storage/reopen/capture and HTTP
+service tests also passed, with zero reported failures or leaks. This is an
+internal adapter-contract change; no persisted format or runtime ABI changes.
+The original destination, retained history, public feeds, bootstrap/retention,
+pgoutput and actual Antfly client qualification scope remains open.

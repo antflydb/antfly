@@ -23,6 +23,7 @@
 const std = @import("std");
 const control = @import("source_control.zig");
 const A = std.mem.Allocator;
+const scope_binding = @import("source_scope_binding.zig");
 pub const Input = struct {
     batch_id: []const u8,
     checkpoint: []const u8,
@@ -36,8 +37,10 @@ pub const Plan = struct {
     manifest: []const u8,
     artifact: ?control.artifact_control.Spec = null,
     checkpoint_authority: ?control.checkpoint_authority.Spec = null,
+    /// Exact scope identity actually encoded in the frozen native plan.
+    source_scope: ?scope_binding.native.Reference = null,
 };
-pub const PlanOptions = struct { source_sequence: u64, upload_token: u64, source_purpose: control.Digest, checkpoint_authority: ?control.checkpoint_authority.Spec = null };
+pub const PlanOptions = struct { source_sequence: u64, upload_token: u64, source_purpose: control.Digest, checkpoint_authority: ?control.checkpoint_authority.Spec = null, source_scope: ?scope_binding.native.Reference = null };
 fn AdapterType(comptime T: type) type {
     return if (@typeInfo(T) == .pointer) @typeInfo(T).pointer.child else T;
 }
@@ -55,7 +58,8 @@ fn requireArtifactAdapter(adapter: anytype, state: control.State) !void {
     if (state.artifact_control != null and !@hasDecl(AdapterType(@TypeOf(adapter)), "sealArtifact")) return error.UnsupportedOperation;
 }
 fn options(state: control.State, sequence: u64, purpose: control.Digest) !PlanOptions {
-    return .{ .source_sequence = sequence, .source_purpose = purpose, .checkpoint_authority = state.checkpoint_authority, .upload_token = std.math.add(u64, if (state.artifact_control) |ledger| ledger.next_token else 0, 1) catch return error.SourceReceiptExpired };
+    const token = std.math.add(u64, if (state.artifact_control) |ledger| ledger.next_token else 0, 1) catch return error.SourceReceiptExpired;
+    return .{ .source_sequence = sequence, .source_purpose = purpose, .checkpoint_authority = state.checkpoint_authority, .upload_token = token, .source_scope = try scope_binding.reference(state, sequence, token) };
 }
 pub const Replan = struct {
     plan: Plan,
@@ -273,10 +277,12 @@ pub fn deliver(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catal
         const previous: ?[]const u8 = if (state.value.accepted.sequence == 0) null else state.value.accepted.checkpoint;
         if (!equalOptional(input.expected_checkpoint, previous)) return error.SourceCheckpointConflict;
         const sequence = std.math.add(u64, state.value.accepted.sequence, 1) catch return error.SourceReceiptExpired;
+        const grant = try options(state.value, sequence, try control.inputFingerprint(scope, .{ .source_sequence = sequence, .batch_id = input.batch_id, .checkpoint = input.checkpoint, .expected_checkpoint = input.expected_checkpoint, .payload_digest = input.payload_digest, .accepted_at_ns = input.accepted_at_ns }));
         const plan: Plan = if (comptime @hasDecl(AdapterType(@TypeOf(adapter)), "planFrozen"))
-            try adapter.planFrozen(scratch, scope, input, payload, try options(state.value, sequence, try control.inputFingerprint(scope, .{ .source_sequence = sequence, .batch_id = input.batch_id, .checkpoint = input.checkpoint, .expected_checkpoint = input.expected_checkpoint, .payload_digest = input.payload_digest, .accepted_at_ns = input.accepted_at_ns })), request)
+            try adapter.planFrozen(scratch, scope, input, payload, grant, request)
         else
             try adapter.plan(scratch, scope, input, payload);
+        try scope_binding.requirePlan(grant.source_scope, plan.source_scope, plan.artifact);
         if (plan.artifact != null and !@hasDecl(AdapterType(@TypeOf(adapter)), "sealArtifact")) return error.UnsupportedOperation;
         if (@hasDecl(AdapterType(@TypeOf(adapter)), "admitRetained") and plan.artifact == null) return error.UnsupportedOperation;
         try bindCheckpoint(svc, adapter, a, scope, catalog, &state, plan, request);
@@ -363,10 +369,12 @@ pub fn replan(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catalo
         state.deinit();
         return next;
     }
+    const grant = try options(state.value, pending.sequence, try pending.inputFingerprint(scope));
     const replacement: Replan = if (comptime @hasDecl(AdapterType(@TypeOf(adapter)), "replanFrozen"))
-        try adapter.replanFrozen(scratch, scope, pending, payload, try options(state.value, pending.sequence, try pending.inputFingerprint(scope)), request)
+        try adapter.replanFrozen(scratch, scope, pending, payload, grant, request)
     else
         try adapter.replan(scratch, scope, pending, payload, request);
+    try scope_binding.requirePlan(grant.source_scope, replacement.plan.source_scope, replacement.plan.artifact);
     if (replacement.plan.artifact != null and !@hasDecl(AdapterType(@TypeOf(adapter)), "sealArtifact")) return error.UnsupportedOperation;
     if (@hasDecl(AdapterType(@TypeOf(adapter)), "admitRetained") and replacement.plan.artifact == null) return error.UnsupportedOperation;
     try bindCheckpoint(svc, adapter, a, scope, catalog, &state, replacement.plan, request);
@@ -801,4 +809,38 @@ test "delivery closing source preserves sealed pending authority without fresh a
     try std.testing.expectError(error.SourcePendingWork, admitRetained(&adapter, a, scope, recovered.value, Context{}));
     const input: Input = .{ .batch_id = pending.batch_id, .checkpoint = pending.checkpoint, .payload_digest = pending.payload_digest, .accepted_at_ns = pending.accepted_at_ns };
     try std.testing.expectError(error.SourcePendingWork, deliver(&service, &adapter, a, scope, @splat(13), input, @as([]const u8, ""), Context{}));
+}
+
+test "delivery recovers scoped planning identity without accepting a substituted attempt" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const scope: control.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
+    var state = try (control.Mutation{ .configure = scope }).apply(allocator, .{});
+    try std.testing.expectEqual(@as(?scope_binding.native.Reference, null), try scope_binding.reference(state, 1, 1));
+    const authority: control.checkpoint_authority.Spec = .{ .binding = scope.identity(), .table_name = "checkpoint", .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .table_binding = @splat(5), .root_generation = 0, .group_id = 17, .topology_epoch = 1 } };
+    state = try (control.Mutation{ .bind_checkpoint = authority }).apply(allocator, state);
+    state = try (control.Mutation{ .enable_scope_fencing = {} }).apply(allocator, state);
+    const grant = try options(state, 1, @splat(7));
+    const frozen = grant.source_scope.?;
+    try std.testing.expectEqual(scope.identity(), frozen.binding);
+    try std.testing.expectEqual((try scope_binding.spec(state)).?.domain(), frozen.domain);
+    try std.testing.expectEqual(grant.upload_token, frozen.token);
+    try std.testing.expectEqual(@as(u64, 1), frozen.sequence);
+    var attempt: [16]u8 = @splat(1);
+    std.mem.writeInt(u64, attempt[0..8], grant.upload_token, .big);
+    var artifact: control.artifact_control.Spec = .{ .namespace = @splat(9), .binding = scope.identity(), .domain = control.artifact_control.domainFor(scope.identity()), .attempt = attempt, .bytes = 128, .checksum = @splat(10), .plan_digest = @splat(11) };
+    try scope_binding.requirePlan(frozen, frozen, artifact);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, scope_binding.requirePlan(frozen, null, artifact));
+    var substituted = frozen;
+    substituted.sequence += 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, scope_binding.requirePlan(frozen, substituted, artifact));
+    substituted = frozen;
+    substituted.token += 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, scope_binding.requirePlan(frozen, substituted, artifact));
+    try std.testing.expectError(error.UnsupportedOperation, scope_binding.requirePlan(frozen, frozen, null));
+    std.mem.writeInt(u64, artifact.attempt[0..8], frozen.token + 1, .big);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, scope_binding.requirePlan(frozen, frozen, artifact));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, scope_binding.requirePlan(null, frozen, artifact));
 }

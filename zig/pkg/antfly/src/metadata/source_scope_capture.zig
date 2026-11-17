@@ -76,8 +76,7 @@ pub fn capture(a: A, query: Query, applied_index: u64, incarnation: [32]u8, deco
     const source = state.scope orelse return error.SourceBindingConflict;
     const authority = state.checkpoint_authority orelse return error.SourceBindingConflict;
     if (!state.scope_fencing or source.destination != .native or source.table_id != query.actor_table_id or !std.meta.eql(source.source_id, query.source_id) or authority.owner.metadata_group_id != query.metadata_group_id or !std.meta.eql(authority.owner.metadata_incarnation, incarnation)) return error.SourceBindingConflict;
-    const spec: native.Spec = .{ .actor_table_id = source.table_id, .source_id = source.source_id, .generation = source.generation, .binding = source.identity(), .checkpoint_owner = try native.Basis.fromOwner(authority.owner) };
-    try spec.validate();
+    const spec = (try @import("source_scope_binding.zig").spec(state)) orelse return error.SourceBindingConflict;
     const definition = control.definitionDigest(a, sources_json, source.source_ordinal) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => null,
