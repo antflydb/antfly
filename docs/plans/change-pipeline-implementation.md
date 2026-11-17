@@ -6277,3 +6277,51 @@ blocking the old source path. Zero reported skips/failures/leaks. Guarded cache
 cleanup completed (`source-legacy-intake-gc.log`). These results qualify new-round
 intake only; durable old-writer fencing and in-flight handover remain required.
 The full original goal remains active.
+
+
+### Active legacy CDC ownership checks
+
+Legacy runners now revalidate destination-actor ownership at their entry and
+mutation/progress boundaries, not only when a round selects a source. Snapshot
+query/row/checkpoint/finalization checks also cover sources without an exact
+cutover authority id. Exact-cutover claim, provider mutation checks and retirement
+completion callbacks use the same actor ownership guard. Streaming checks bracket
+provider polling, atomic destination groups and checkpoint publication, including
+idle polls. If ownership is transferred or its census is unproven, the runner
+stops. Its error path must revalidate before writing legacy failure status, so it
+cannot overwrite status after a new actor takes ownership.
+
+Focused lifecycle fixtures transfer ownership after a snapshot destination commit,
+after a stream poll and after a stream destination commit. They verify the old
+snapshot checkpoint/offset and stream checkpoint remain unchanged, no failure
+status is published under transferred ownership, no destination commit occurs
+when transfer preceded apply, and a completed destination effect alone grants no
+provider frontier. These are modeled boundary interleavings through the production
+runner kernel; the qualified production metadata and standalone gate implementations
+were exercised in the preceding native host/store tests.
+
+`source-transaction-test -Dstrip=true -j1` exited 0
+(`source-legacy-active-worker-test.log`): all 30 selected CDC cases, four selected
+transaction/effect cases and 12 discovery anchors passed; zero reported skips,
+failures or leaks. Source-catalog, engine-error and OpenAPI checks passed
+(`source-legacy-active-worker-contract-check.log`). No schema, protocol or ABI
+change occurs here.
+
+These checks do not make metadata read and destination dispatch one atomic fence.
+A remote write already sent may still arrive after a transfer, and old binaries
+may not perform these checks. Persisted producer/ingress fencing, durable worker
+handover and old transaction recovery are still required before first strict
+native scope activation can succeed. The existing native activation gate remains
+closed. All other outstanding original destination, retained-history/public-feed,
+bootstrap/retention, pgoutput and actual Antfly CDC client acceptance requirements
+remain open, and the full goal remains active.
+
+The final idle-poll ownership transfer case also passed: no destination commit or
+legacy status/checkpoint publication occurs after the poll reports transferred
+ownership. Final `source-transaction-test -Dstrip=true -j1` exited 0
+(`source-legacy-active-worker-final-test.log`), again with all 30 selected CDC and
+four effect/transaction cases passing plus 12 discovery anchors, zero reported
+skips/failures/leaks. Guarded cache cleanup completed
+(`source-legacy-active-worker-gc.log`). These checks still do not authorize first
+strict activation or claim durable old-producer fencing. The full goal remains
+active.

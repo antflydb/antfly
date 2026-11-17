@@ -312,6 +312,7 @@ pub const SnapshotBackfillRunner = struct {
             &progress_cutover_provider_identity,
         ) catch |err| {
             self.checkpointWork() catch return err;
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
             var parsed = parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer) catch return err;
             defer parsed.deinit(self.alloc);
 
@@ -384,6 +385,7 @@ pub const SnapshotBackfillRunner = struct {
         progress_cutover_provider_identity: *foreign_mod.ExactCutoverIntent.ProviderIdentity,
     ) !BackfillSummary {
         try self.checkpointWork();
+        try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
         var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer);
         defer parsed.deinit(self.alloc);
 
@@ -563,6 +565,7 @@ pub const SnapshotBackfillRunner = struct {
             alloc: Allocator,
             runner: *SnapshotBackfillRunner,
             status_sink: @TypeOf(status_sink),
+            table: metadata_table_manager.TableRecord,
             expected_replication_sources_json: []const u8,
             expected_authority_id: u64,
             record: metadata_table_manager.ReplicationSourceStatusRecord,
@@ -614,6 +617,7 @@ pub const SnapshotBackfillRunner = struct {
                 // started and an async status write must not manufacture proof.
                 var record = ctx.record;
                 record.cutover_provider_identity = provider_identity;
+                try requireLegacyOwnership(ctx.status_sink, ctx.alloc, ctx.table, ctx.record.source_ordinal);
                 try callClaimCutoverStatusDurable(
                     ctx.status_sink,
                     ctx.expected_replication_sources_json,
@@ -651,6 +655,7 @@ pub const SnapshotBackfillRunner = struct {
             fn check(ptr: *anyopaque) !void {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
                 try ctx.runner.checkpointWork();
+                try requireLegacyOwnership(ctx.status_sink, ctx.alloc, ctx.table, ctx.record.source_ordinal);
                 try callCheckCutoverAuthority(
                     ctx.status_sink,
                     ctx.expected_replication_sources_json,
@@ -681,6 +686,7 @@ pub const SnapshotBackfillRunner = struct {
             .alloc = self.alloc,
             .runner = self,
             .status_sink = status_sink,
+            .table = table,
             .expected_replication_sources_json = table.replication_sources_json,
             .expected_authority_id = if (resume_pending_authority)
                 cutover_authority_id
@@ -817,6 +823,7 @@ pub const SnapshotBackfillRunner = struct {
             effective_publication_name,
         );
         try checkProgressCutoverAuthority(
+            self.alloc,
             status_sink,
             table,
             source_ordinal,
@@ -896,6 +903,7 @@ pub const SnapshotBackfillRunner = struct {
         while (true) {
             try self.checkpointWork();
             try checkProgressCutoverAuthority(
+                self.alloc,
                 status_sink,
                 table,
                 source_ordinal,
@@ -941,6 +949,7 @@ pub const SnapshotBackfillRunner = struct {
             defer result.deinit(self.alloc);
             try self.checkpointWork();
             try checkProgressCutoverAuthority(
+                self.alloc,
                 status_sink,
                 table,
                 source_ordinal,
@@ -975,6 +984,7 @@ pub const SnapshotBackfillRunner = struct {
                 for (result.rows) |row| {
                     try self.checkpointWork();
                     try checkProgressCutoverAuthority(
+                        self.alloc,
                         status_sink,
                         table,
                         source_ordinal,
@@ -1021,6 +1031,7 @@ pub const SnapshotBackfillRunner = struct {
             try self.checkpointWork();
 
             try checkProgressCutoverAuthority(
+                self.alloc,
                 status_sink,
                 table,
                 source_ordinal,
@@ -1109,6 +1120,7 @@ pub const SnapshotBackfillRunner = struct {
 
         try self.checkpointWork();
         try checkProgressCutoverAuthority(
+            self.alloc,
             status_sink,
             table,
             source_ordinal,
@@ -1123,6 +1135,7 @@ pub const SnapshotBackfillRunner = struct {
         try finishBackfillBulkIngestWindow(self.alloc, self.write_source, bulk_ingest_tables.items);
         try self.checkpointWork();
         try checkProgressCutoverAuthority(
+            self.alloc,
             status_sink,
             table,
             source_ordinal,
@@ -1378,6 +1391,13 @@ fn nextCursorAfterYield(
 }
 
 const LegacyIntake = enum { allowed, destination_actor, unproven };
+fn requireLegacyOwnership(service: anytype, a: Allocator, table: metadata_table_manager.TableRecord, ordinal: u32) !void {
+    switch (try legacyIntake(service, a, table, ordinal)) {
+        .allowed => {},
+        .destination_actor => return error.SourcePendingWork,
+        .unproven => return error.SourceOutcomeUnresolved,
+    }
+}
 fn legacyIntake(service: anytype, a: Allocator, table: metadata_table_manager.TableRecord, ordinal: u32) !LegacyIntake {
     const Service = switch (@typeInfo(@TypeOf(service))) {
         .pointer => |pointer| pointer.child,
@@ -1628,6 +1648,7 @@ pub const StreamingReplicationRunner = struct {
 
         return self.runTableSourceInner(status_sink, table, source_ordinal, snapshot_offset, cutover_mode, resume_checkpoint, existing_status, &progress_checkpoint) catch |err| {
             self.checkpointWork() catch return err;
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
             var parsed = parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer) catch return err;
             defer parsed.deinit(self.alloc);
             const prior_failures = if (existing_status) |status|
@@ -1720,6 +1741,7 @@ pub const StreamingReplicationRunner = struct {
         progress_checkpoint: *std.ArrayListUnmanaged(u8),
     ) !StreamSummary {
         try self.checkpointWork();
+        try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
         var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer);
         defer parsed.deinit(self.alloc);
 
@@ -1777,6 +1799,7 @@ pub const StreamingReplicationRunner = struct {
             .{ table.name, source_ordinal, snapshot_offset, if (resume_checkpoint) |value| value.len else 0 },
         );
         try self.checkpointWork();
+        try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
         if (existing_status) |status| {
             try callCheckCutoverAuthority(
                 status_sink,
@@ -1787,6 +1810,7 @@ pub const StreamingReplicationRunner = struct {
         var result = try source.pollChanges(self.alloc, params);
         defer result.deinit(self.alloc);
         try self.checkpointWork();
+        try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
         if (existing_status) |status| {
             try callCheckCutoverAuthority(
                 status_sink,
@@ -1810,6 +1834,7 @@ pub const StreamingReplicationRunner = struct {
         var summary: StreamSummary = .{};
 
         if (result.changes.len == 0) {
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
             if (result.checkpoint.len > 0) {
                 progress_checkpoint.clearRetainingCapacity();
                 try progress_checkpoint.appendSlice(self.alloc, result.checkpoint);
@@ -1874,6 +1899,7 @@ pub const StreamingReplicationRunner = struct {
         while (try transactions.next()) |transaction| {
             const change = transaction[transaction.len - 1];
             try self.checkpointWork();
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
             if (existing_status) |status| {
                 try callCheckCutoverAuthority(
                     status_sink,
@@ -1895,6 +1921,7 @@ pub const StreamingReplicationRunner = struct {
                 );
             }
             try self.checkpointWork();
+            try requireLegacyOwnership(status_sink, self.alloc, table, source_ordinal);
             if (existing_status) |status| {
                 try callCheckCutoverAuthority(
                     status_sink,
@@ -3301,6 +3328,7 @@ fn callCompleteCutoverRetirementDurable(
 }
 
 fn checkProgressCutoverAuthority(
+    alloc: Allocator,
     status_sink: anytype,
     table: metadata_table_manager.TableRecord,
     source_ordinal: u32,
@@ -3312,6 +3340,7 @@ fn checkProgressCutoverAuthority(
     cutover_config_fingerprint: [cutover_config_fingerprint_len]u8,
     cutover_provider_identity: foreign_mod.ExactCutoverIntent.ProviderIdentity,
 ) !void {
+    try requireLegacyOwnership(status_sink, alloc, table, source_ordinal);
     if (cutover_authority_id == 0) return;
     try callCheckCutoverAuthority(
         status_sink,
@@ -5386,6 +5415,33 @@ test "metadata replication backfill coordinator resumes and then skips completed
     try std.testing.expectEqual(@as(usize, 1), second.sources_considered);
     try std.testing.expectEqual(@as(usize, 1), second.sources_skipped_complete);
     try std.testing.expectEqual(@as(usize, 0), second.sources_completed);
+    const Handover = struct {
+        fn reach(ptr: *anyopaque, event: ReplicationLifecycleEvent) !void {
+            const sink: *FakeService = @ptrCast(@alignCast(ptr));
+            if (event.phase == .snapshot_batch_applied) sink.legacy_allowed = false;
+        }
+    };
+    try service.upsertReplicationSourceStatus(.{
+        .table_id = 22,
+        .source_ordinal = 0,
+        .source_kind = "postgres",
+        .external_table = "users",
+        .phase = "snapshot",
+        .checkpoint = "snapshot_keyset:[\"doc:1\"]",
+        .snapshot_offset = 1,
+        .cutover_mode = "exported_snapshot",
+        .prepared_checkpoint = "lsn:resume",
+        .last_error = "",
+        .lag_records = 0,
+        .updated_at_ms = 1,
+    });
+    service.legacy_allowed = true;
+    coordinator.runner.lifecycle_hook = .{ .ptr = &service, .reach_fn = Handover.reach };
+    try std.testing.expectError(error.SourcePendingWork, coordinator.runner.runTableSourceFromStatus(&service, service.table, 0, 1, service.statuses.items[0]));
+    try std.testing.expect(!service.legacy_allowed);
+    try std.testing.expectEqualStrings("snapshot", service.statuses.items[0].phase);
+    try std.testing.expectEqualStrings("snapshot_keyset:[\"doc:1\"]", service.statuses.items[0].checkpoint);
+    try std.testing.expectEqual(@as(u64, 1), service.statuses.items[0].snapshot_offset);
 }
 
 test "metadata replication backfill coordinator continues past one source's retryable failure" {
@@ -7905,6 +7961,7 @@ test "metadata replication stream coordinator waits for snapshot completion and 
 
     const StreamCtx = struct {
         poll_calls: usize = 0,
+        next_checkpoint: []const u8 = "lsn:5",
         checkpoints: std.ArrayListUnmanaged([]u8) = .empty,
 
         pub fn deinit(self: *@This(), inner_alloc: Allocator) void {
@@ -7939,7 +7996,7 @@ test "metadata replication stream coordinator waits for snapshot completion and 
                 const changes = try inner_alloc.alloc(foreign_mod.ReplicationChange, 1);
                 changes[0] = .{
                     .op = .insert,
-                    .checkpoint = try inner_alloc.dupe(u8, "lsn:5"),
+                    .checkpoint = try inner_alloc.dupe(u8, self.ctx.next_checkpoint),
                     .row = try std.json.parseFromSliceLeaky(std.json.Value, inner_alloc, "{\"id\":\"doc:1\",\"name\":\"alpha\"}", .{}),
                 };
                 return .{ .changes = changes, .lag_records = 0 };
@@ -7975,8 +8032,10 @@ test "metadata replication stream coordinator waits for snapshot completion and 
 
     const NullSource = struct {
         var sentinel: u8 = 0;
+        var commits: usize = 0;
 
         fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            commits += 1;
             return {};
         }
     };
@@ -7985,6 +8044,16 @@ test "metadata replication stream coordinator waits for snapshot completion and 
         alloc: Allocator,
         table: metadata_table_manager.TableRecord,
         statuses: std.ArrayListUnmanaged(metadata_table_manager.ReplicationSourceStatusRecord) = .empty,
+        legacy_allowed: bool = true,
+        close_at: ReplicationLifecyclePhase = .stream_polled,
+        upserts: usize = 0,
+        pub fn legacyReplicationSourceIntakeAllowed(self: *@This(), _: u64, _: u32, _: [32]u8) !bool {
+            return self.legacy_allowed;
+        }
+        fn handover(ptr: *anyopaque, event: ReplicationLifecycleEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (event.phase == self.close_at) self.legacy_allowed = false;
+        }
 
         pub fn deinit(self: *@This()) void {
             for (self.statuses.items) |record| metadata_table_manager.freeReplicationSourceStatus(self.alloc, record);
@@ -8067,6 +8136,7 @@ test "metadata replication stream coordinator waits for snapshot completion and 
         }
 
         pub fn upsertReplicationSourceStatus(self: *@This(), record: metadata_table_manager.ReplicationSourceStatusRecord) !void {
+            self.upserts += 1;
             for (self.statuses.items) |*existing| {
                 if (existing.table_id == record.table_id and existing.source_ordinal == record.source_ordinal) {
                     metadata_table_manager.freeReplicationSourceStatus(self.alloc, existing.*);
@@ -8078,6 +8148,7 @@ test "metadata replication stream coordinator waits for snapshot completion and 
         }
     };
 
+    NullSource.commits = 0;
     var service: FakeService = .{
         .alloc = alloc,
         .table = .{
@@ -8141,6 +8212,29 @@ test "metadata replication stream coordinator waits for snapshot completion and 
     try std.testing.expectEqualStrings("lsn:5", stream_ctx.checkpoints.items[1]);
     try std.testing.expectEqualStrings("lsn:prepared", service.statuses.items[0].prepared_checkpoint);
     try std.testing.expectEqualStrings("lsn:5", service.statuses.items[0].stream_checkpoint);
+    coordinator.runner.lifecycle_hook = .{ .ptr = &service, .reach_fn = FakeService.handover };
+    stream_ctx.next_checkpoint = "lsn:6";
+    for ([_]ReplicationLifecyclePhase{ .stream_polled, .stream_change_applied }) |phase| {
+        service.legacy_allowed = true;
+        service.close_at = phase;
+        stream_ctx.poll_calls = 0;
+        const commits_before = NullSource.commits;
+        const upserts_before = service.upserts;
+        try std.testing.expectError(error.SourcePendingWork, coordinator.runner.runTableSourceFromCheckpoint(&service, service.table, 0, 2, "exported_snapshot", "lsn:5", service.statuses.items[0]));
+        try std.testing.expect(!service.legacy_allowed);
+        if (phase == .stream_polled) try std.testing.expectEqual(commits_before, NullSource.commits) else try std.testing.expect(NullSource.commits > commits_before);
+        try std.testing.expectEqual(upserts_before, service.upserts);
+        try std.testing.expectEqualStrings("streaming", service.statuses.items[0].phase);
+        try std.testing.expectEqualStrings("lsn:5", service.statuses.items[0].stream_checkpoint);
+    }
+    service.legacy_allowed = true;
+    service.close_at = .stream_polled;
+    stream_ctx.poll_calls = 1; // The provider's next poll returns no changes.
+    const idle_upserts_before = service.upserts;
+    const idle_commits_before = NullSource.commits;
+    try std.testing.expectError(error.SourcePendingWork, coordinator.runner.runTableSourceFromCheckpoint(&service, service.table, 0, 2, "exported_snapshot", "lsn:5", service.statuses.items[0]));
+    try std.testing.expectEqual(idle_upserts_before, service.upserts);
+    try std.testing.expectEqual(idle_commits_before, NullSource.commits);
 }
 
 test "metadata replication stream coordinator recovers after transient polling failure" {
