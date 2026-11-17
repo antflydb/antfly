@@ -1,0 +1,175 @@
+---
+title: "Connect Agents to Antfly Over MCP"
+description: "A coding agent such as Claude Code or Cursor that inspects, queries, and (when its key allows) writes to your self-hosted Antfly through the built-in MCP server"
+order: 16
+---
+
+<Questions>
+- Does Antfly have an MCP server?
+- How do I connect Claude Code or Cursor to Antfly?
+- Which tools does the Antfly MCP server expose?
+- How do I stop an agent from writing to my tables over MCP?
+- Why does my agent see fewer MCP tools than expected?
+</Questions>
+
+## The Result
+
+Your agent lists your tables, inspects their schemas, and runs queries against your instance as tool calls, with no SDK code in between. Its API key decides which tools it is offered. A read-only key gets the read tools and none of the write tools:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "tools": [
+      { "name": "list_tables" },
+      { "name": "describe_table" },
+      { "name": "list_indexes" },
+      { "name": "describe_indexes" },
+      { "name": "get_document" },
+      { "name": "sample_documents" },
+      { "name": "query" },
+      { "name": "describe_query_request" },
+      { "name": "describe_mcp_capabilities" }
+    ]
+  }
+}
+```
+
+That is a trimmed `tools/list` response for a key that can read one table; `batch`, `create_table`, and `drop_index` are absent because the key cannot use them.
+
+## Before You Start
+
+Antfly running in standalone mode with authentication on and a table to query (the examples use `docs`). [Secure a self-hosted Antfly](/docs/guides/access-control) covers both:
+
+```bash
+curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" http://127.0.0.1:8080/db/v1/tables/docs
+```
+
+The MCP server needs no separate process or flag. It is served at `/mcp/v1` on the same port as the HTTP API, behind the same authentication. On an instance with authentication off, MCP is unauthenticated and every tool is offered, so do not share a default local instance with an agent you would not give admin rights.
+
+## Build It
+
+### 1. Create a Key for the Agent
+
+Create a user or reuse one, then issue a key narrowed to what the agent should do. This one can read `docs` and nothing else:
+
+```bash
+curl -s -u "admin:$ANTFLY_ADMIN_PASSWORD" -X POST http://127.0.0.1:8080/auth/v1/users/alice/api-keys \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "claude-code",
+    "expires_in": "720h",
+    "permissions": [{"resource": "docs", "resource_type": "table", "type": "read"}]
+  }' | jq -r .encoded
+```
+
+Save the printed value as `ANTFLY_MCP_KEY`. It is shown once. The key carries its owner's row filters, so the agent sees the same rows the owner would.
+
+### 2. Check the Endpoint by Hand
+
+MCP runs over streamable HTTP, protocol version `2025-06-18`. `initialize` returns an `Mcp-Session-Id` header that later requests send back, along with the credential on every request:
+
+```bash
+SESSION=$(curl -s -D - -o /dev/null -X POST http://127.0.0.1:8080/mcp/v1 \
+  -H "Authorization: Bearer $ANTFLY_MCP_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+       "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                  "clientInfo": {"name": "setup-check", "version": "1.0"}}}' \
+  | awk 'tolower($1) == "mcp-session-id:" {print $2}' | tr -d '\r')
+echo "$SESSION"
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/mcp/v1 \
+  -H "Authorization: Bearer $ANTFLY_MCP_KEY" \
+  -H "Mcp-Session-Id: $SESSION" \
+  -H "Mcp-Protocol-Version: 2025-06-18" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}'
+```
+
+The second call returns the tool list from The Result. A `401` means the key is missing or wrong. A request with no session ID returns `400`, and one with an unknown session ID returns `404`; run `initialize` again. `DELETE /mcp/v1` with the session header closes the session.
+
+### 3. Add Antfly to Your Agent
+
+Use the URL without a trailing slash. For Claude Code:
+
+```bash
+claude mcp add --transport http antfly http://127.0.0.1:8080/mcp/v1 \
+  --header "Authorization: Bearer $ANTFLY_MCP_KEY"
+```
+
+That records the server for you in the current project. `--scope project` writes a shared `.mcp.json` at the project root instead. For Cursor, add the same server to `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "antfly": {
+      "type": "http",
+      "url": "http://127.0.0.1:8080/mcp/v1",
+      "headers": {
+        "Authorization": "Bearer YOUR_ENCODED_KEY"
+      }
+    }
+  }
+}
+```
+
+Paste the key value in place of `YOUR_ENCODED_KEY`, and keep the file out of version control. Ask the agent to list the Antfly tools it can use and the tables it can see to confirm the connection.
+
+### 4. Query Through the Agent
+
+The `query` tool takes a `tableName` and either shorthand arguments (`fullTextSearch`, `fullTextSearchField`, `semanticSearch`, `indexes`, `fields`, `limit`, `orderBy`, `filterPrefix`) or a complete `queryRequest`, the same body `POST /db/v1/tables/{table}/query` accepts. The two forms cannot be mixed. A raw call looks like this:
+
+```json
+{
+  "tableName": "docs",
+  "queryRequest": {
+    "full_text_search": { "match": "renewal terms", "field": "title" },
+    "fields": ["title"],
+    "limit": 5
+  }
+}
+```
+
+Agents do best with a discovery pass first: `describe_mcp_capabilities`, then `describe_table` and `sample_documents` to learn the schema, then `describe_query_request` for the compact query contract, then `query`. Semantic search through `query` needs `indexes`, as it does over REST.
+
+### The Tool Set
+
+| Permission needed | Tools |
+|---|---|
+| none | `describe_mcp_capabilities`, `describe_query_request` |
+| `read` | `list_tables` (returns only the tables the key can read), `describe_table`, `list_indexes`, `describe_indexes`, `get_document`, `sample_documents`, `query` |
+| `write` | `batch` (inserts, deletes, and transforms) |
+| `admin` | `create_table`, `drop_table`, `create_index`, `drop_index`, `backup`, `restore` |
+
+Installed extensions can add their own tools. Native agent memory has separate MCP servers at `/memory/v1/mcp/agent` and `/memory/v1/mcp`, covered in [Agent memory](/docs/guides/agent-memory).
+
+## Tradeoffs
+
+The decision you own is the key's scope, because it is the only thing between the agent and your data. `tools/list` hides tools the key has no grant for on any table, but that filtering is a convenience. Antfly re-checks the key's permission on the specific `tableName` before running every tool call, so a stale tool list or a hand-written call cannot get past it. Give an exploring agent a read key, and a separate key with `write` on one table to an agent that loads data.
+
+Tool results are capped at 96 KiB by default, including text and structured content. An oversized result is replaced with an error that tells the agent to reduce `limit` or `fields`; it is never truncated. Raise or disable the cap with `mcp.max_tool_result_bytes` in the config file (0 disables it, and nonzero values must be at least 512) only if your client accepts larger results. On hierarchical documents, request focused `fields` instead of `_chunks.*`, which expands the whole chunk array.
+
+Antfly serves MCP over HTTP only. A client that supports only stdio servers cannot connect to it directly.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Create a read-only API key for the docs table on my local Antfly and add Antfly as an MCP server in this project", and use this page to judge the result.
+
+## Next Steps
+
+- [Antfly Cloud MCP](/docs/cloud/mcp): the hosted endpoint, where an instance API key replaces the user setup above
+- [Use Antfly from n8n](/docs/guides/n8n): an n8n AI Agent that answers from an Antfly table over MCP
+- [Secure a self-hosted Antfly](/docs/guides/access-control): row filters and narrower keys for the agent's credential

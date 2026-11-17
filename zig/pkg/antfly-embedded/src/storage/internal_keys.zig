@@ -134,13 +134,13 @@ pub const GlobalReplayKind = enum(u8) {
     replay_init = 0x01,
     // Journal sharing: moved from 0x02 to sit immediately next to
     // `outcome_receipt`/`journal_format_version`/`journal_credit_ledger`
-    // below (0x55-0x57) rather than at the head of the family. Those four
+    // below (0x55, 0x57-0x58) rather than at the head of the family. Those four
     // keys are now written in the same append transaction on every single
     // commit (head sequence, receipt, ledger); consecutive ordinals put
     // them on the same B-tree leaf regardless of which other, far less
     // frequently written, replay-metadata families this store happens to
     // have populated in between.
-    next_sequence = 0x58,
+    next_sequence = 0x59,
     latest_sequence = 0x03,
     replication_applied = 0x04,
     ordered_document_applied = 0x05,
@@ -173,14 +173,15 @@ pub const GlobalReplayKind = enum(u8) {
     promoted_keys_state = 0x44,
     graph_expiration = 0x54,
     outcome_receipt = 0x55,
+    primary_source_revision = 0x56,
     /// WS5: durable replay-journal format version. Absent (on a store that
     /// already has replay entries) means the pre-ledger v1 layout, which this
     /// build refuses rather than silently reinterpreting.
-    journal_format_version = 0x56,
+    journal_format_version = 0x57,
     /// WS5: journal credit ledger, {bytes, records} charged by every replay
     /// append and released only once the matching retirement transaction
     /// durably deletes the entries. See `JournalCreditLedger`.
-    journal_credit_ledger = 0x57,
+    journal_credit_ledger = 0x58,
 };
 
 pub fn globalReplayPrefix(comptime kind: GlobalReplayKind) [3]u8 {
@@ -268,6 +269,9 @@ pub const ordered_document_applied_entry_key = globalReplayPrefix(.ordered_docum
 /// that writer's last applied call. See `db/apply_receipts.zig`.
 pub const outcome_receipt_prefix = globalReplayPrefix(.outcome_receipt);
 pub const artifact_presence_key = globalReplayPrefix(.artifact_presence);
+/// Last replay sequence carrying primary upserts, deletes or replacements.
+/// Committed with that record; artifact-only sibling work never advances it.
+pub const primary_source_revision_key = globalReplayPrefix(.primary_source_revision);
 pub const asset_artifact_source_index_kind: u8 = @backingInt(GlobalReplayKind.asset_source_index);
 pub const document_child_range_outbox_kind: u8 = @backingInt(GlobalReplayKind.child_range_outbox);
 pub const artifact_repair_issue_kind: u8 = @backingInt(GlobalReplayKind.artifact_repair_issue);

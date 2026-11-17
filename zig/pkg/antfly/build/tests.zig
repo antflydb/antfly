@@ -227,7 +227,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const batch_contract_tests = b.addTest(.{
         .name = "storage-batch-contract-tests",
         .root_module = batch_contract_mod,
-        .filters = selectTestFilters(b, &.{ "result collectors", "bounded dense legacy providers", "parallel dense inference preserves order", "ordered artifact inventory chunk vector", "privacy ordered artifact tombstone", "privacy base vectors", "privacy local source audit", "privacy base vector source updates", "privacy publication callback", "privacy independent roots", "privacy ID scans", "privacy discovery", "public graph metric borrowed wire document scan" }),
+        .filters = selectTestFilters(b, &.{ "result collectors", "bounded dense legacy providers", "parallel dense inference preserves order", "ordered artifact inventory chunk vector", "ordered artifact inventory input capture", "materialized chunk embeddings", "db quarantined dense bootstrap", "db templated dense backfill", "db sequential managed dense backfills", "db online vector publication", "db online vector repair", "privacy progress cannot replace", "privacy scoped readiness", "privacy ordered artifact tombstone", "privacy base vectors", "privacy local source audit", "privacy base vector source updates", "privacy publication callback", "privacy independent roots", "privacy ID scans", "privacy discovery", "public graph metric borrowed wire document scan" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("storage-batch-contract-test", "Verify collector OOM ownership and bounded provider batches without HTTP discovery")
@@ -7119,6 +7119,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-producer-recovery-test", "Verify pending producer recovery preserves publication debt and retires deleted inputs")
         .dependOn(&addFilteredTestRunArtifact(b, producer_recovery_tests).step);
+    const protected_backfill_tests = b.addTest(.{
+        .name = "protected-backfill-tests",
+        // These are physical DB regressions, not HTTP integration tests.
+        // Reuse the focused storage root to avoid compiling unrelated API owners.
+        .root_module = batch_contract_mod,
+        .filters = selectTestFilters(b, &.{"privacy protected model migration"}),
+        .max_rss = 12 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-protected-backfill-test", "Verify protected model migration batching without model inference")
+        .dependOn(&addFilteredTestRunArtifact(b, protected_backfill_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
     const inference_evaluation_tests = b.addTest(.{
         .name = "inference-evaluation-storage-tests",
@@ -7776,6 +7787,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.graph_field_plan.",
             "storage.db.owned_keys.",
             "storage.db.read_projection.",
+            "storage.db.privacy_read.",
             "storage.db.replay_vector_collectors.",
             "storage.db.publication_recovery_owner.",
             "storage.db.artifact_publication_transport_codec.",

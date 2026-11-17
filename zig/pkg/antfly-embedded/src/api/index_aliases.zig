@@ -111,10 +111,29 @@ fn envelopeValue(a: A, value: V) A.Error!bool {
     return false;
 }
 
+// Privacy job cursors and coverage hints belong to the authoritative metadata
+// controller. They are not serving evidence or storage-owner configuration.
+// Reuse its exact allowlist; policy, generation, consumer recipes and unknown
+// fields remain in the descriptor so semantic changes still replace owners.
+fn removePrivacyProgress(root: *V) bool {
+    if (root.* != .object) return false;
+    const resource = root.object.getPtr("_privacy") orelse return false;
+    if (resource.* != .object) return false;
+    const before = resource.object.count();
+    @import("../privacy/catalog.zig").removeProgress(root);
+    return before != resource.object.count();
+}
+
+pub fn mayContainOwnerControls(bytes: []const u8) bool {
+    return std.mem.indexOfScalar(u8, bytes, '\\') != null or
+        std.mem.indexOf(u8, bytes, "_index_alias") != null or
+        std.mem.indexOf(u8, bytes, "_privacy") != null;
+}
+
 /// Null means the original bytes are already the physical recipe. The fast
 /// path allocates nothing; catalogs containing controls are parsed only once.
 pub fn physicalProjectionIfNeeded(out: A, bytes: []const u8) !?[]u8 {
-    if (std.mem.indexOfScalar(u8, bytes, '\\') == null and std.mem.indexOf(u8, bytes, "_index_alias") == null) return null;
+    if (!mayContainOwnerControls(bytes)) return null;
     var arena = std.heap.ArenaAllocator.init(out);
     defer arena.deinit();
     var root = try std.json.parseFromSliceLeaky(V, arena.allocator(), bytes, .{});
@@ -122,7 +141,8 @@ pub fn physicalProjectionIfNeeded(out: A, bytes: []const u8) !?[]u8 {
     const removed_aliases = root.object.orderedRemove(key);
     const removed_receipts = root.object.orderedRemove(receipts_key);
     const removed_epoch = root.object.orderedRemove("_index_alias_epoch");
-    if (!removed_aliases and !removed_receipts and !removed_epoch) return null;
+    const removed_privacy_progress = removePrivacyProgress(&root);
+    if (!removed_aliases and !removed_receipts and !removed_epoch and !removed_privacy_progress) return null;
     return try std.json.Stringify.valueAlloc(out, root, .{});
 }
 pub fn physicalProjection(out: A, bytes: []const u8) ![]u8 {
@@ -131,13 +151,14 @@ pub fn physicalProjection(out: A, bytes: []const u8) ![]u8 {
 
 /// Materialize at catalog publication, never on the query hot path.
 pub fn queryProjectionIfNeeded(out: A, bytes: []const u8) !?[]u8 {
-    if (std.mem.indexOfScalar(u8, bytes, '\\') == null and std.mem.indexOf(u8, bytes, "_index_alias") == null) return null;
+    if (!mayContainOwnerControls(bytes)) return null;
     var arena = std.heap.ArenaAllocator.init(out);
     defer arena.deinit();
     const a = arena.allocator();
     var root = try std.json.parseFromSliceLeaky(V, a, bytes, .{});
     if (root != .object) return error.InvalidTableIndexMetadata;
-    if (!root.object.contains(key) and !root.object.contains(receipts_key) and !root.object.contains("_index_alias_epoch")) return null;
+    const removed_privacy_progress = removePrivacyProgress(&root);
+    if (!root.object.contains(key) and !root.object.contains(receipts_key) and !root.object.contains("_index_alias_epoch") and !removed_privacy_progress) return null;
     _ = root.object.orderedRemove("_index_alias_epoch");
     _ = root.object.orderedRemove(receipts_key);
     if (root.object.getPtr(key)) |declarations| {

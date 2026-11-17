@@ -21,6 +21,9 @@
 //! reopened, preventing duplicate commits after a failed fsync.
 
 const std = @import("std");
+
+/// Test-only count at the corpus-work boundary, including failed builds.
+pub var test_native_base_build_attempts: std.atomic.Value(usize) = .init(0);
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const lsm_backend = @import("lsm_backend/mod.zig");
@@ -2537,6 +2540,7 @@ pub const Opened = struct {
         }
         const shard_count: usize = @intCast(manifest.shard_count);
         if (!self.store.wal_has_mutations and manifest.segments.len == baseSegmentCount(manifest)) return null;
+        if (builtin.is_test) _ = test_native_base_build_attempts.fetchAdd(1, .monotonic);
         const flattened_wal = if (self.store.wal_has_mutations)
             self.store.walPrefixBoundary()
         else
@@ -2612,6 +2616,7 @@ pub const Opened = struct {
         spool_buffer_bytes: usize,
     ) !StagedBaseBuild {
         const manifest = self.store.manifest orelse return error.MissingVectorBlockManifest;
+        if (builtin.is_test) _ = test_native_base_build_attempts.fetchAdd(1, .monotonic);
         const flattened_wal = if (self.store.wal_has_mutations)
             self.store.walPrefixBoundary()
         else
@@ -5681,7 +5686,19 @@ fn testNativeCompactionSuffix(sealed: bool) !void {
     var old_query = try Store.openWithBlocks(alloc, memory.storage(), root);
     defer old_query.deinit();
     const prefix = old_query.store.walPrefixBoundary();
+    const attempts_before = test_native_base_build_attempts.load(.acquire);
+    {
+        // Allocation failure happens after admission to corpus staging and
+        // must remain visible in the work budget even without a staged result.
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        const original = old_query.store.alloc;
+        old_query.store.alloc = failing.allocator();
+        defer old_query.store.alloc = original;
+        try std.testing.expectError(error.OutOfMemory, old_query.stageDeltasToBaseWithShardCount(1, 4096));
+        try std.testing.expectEqual(attempts_before + 1, test_native_base_build_attempts.load(.acquire));
+    }
     var staged = (try old_query.stageDeltasToBaseWithShardCount(1, 4096)).?;
+    try std.testing.expectEqual(attempts_before + 2, test_native_base_build_attempts.load(.acquire));
     defer staged.deinit();
     try std.testing.expectEqual(@as(u64, 1), store.manifest.?.latest_generation);
     // These source effects commit after the encoder selected its immutable

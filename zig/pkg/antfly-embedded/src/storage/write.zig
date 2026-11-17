@@ -310,12 +310,9 @@ fn persistOwnerCatalogContract(alloc: std.mem.Allocator, db: *db_mod.DB, indexes
 
 fn persistPrivacyExecution(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !void {
     if (indexes_json.len == 0) return;
-    var tree = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer tree.deinit();
-    var resource = (try @import("../privacy/catalog.zig").current(alloc, tree.value)) orelse return;
-    defer resource.deinit();
+    const execution = (try @import("../privacy/catalog.zig").ownerExecution(alloc, indexes_json)) orelse return;
     const document = @import("../privacy/document.zig");
-    const raw = try std.json.Stringify.valueAlloc(alloc, document.ExecutionOverride{ .policy_version = resource.value.policy_version, .execution = resource.value.policy.execution }, .{});
+    const raw = try std.json.Stringify.valueAlloc(alloc, execution, .{});
     defer alloc.free(raw);
     const prior = try db.core.getStoreValue(alloc, document.execution_key);
     defer if (prior) |value| alloc.free(value);

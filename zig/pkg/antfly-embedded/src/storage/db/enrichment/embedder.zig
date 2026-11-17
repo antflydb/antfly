@@ -88,6 +88,8 @@ pub const SparseEmbedding = @import("antfly_sparse_embedding").SparseEmbedding;
 /// Optional pure-computation memo. Every artifact publication still validates
 /// its source revision and generation; cached vectors carry no write authority.
 pub const DenseResultCache = struct {
+    /// Opt in only when lookup/remember may overlap on this cache owner.
+    concurrent: bool = false,
     ptr: *anyopaque,
     lookup: *const fn (*anyopaque, Allocator, [32]u8) anyerror!?[]f32,
     remember: *const fn (*anyopaque, [32]u8, []const f32) void,

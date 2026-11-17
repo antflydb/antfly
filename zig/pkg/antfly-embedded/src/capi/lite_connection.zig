@@ -3796,7 +3796,7 @@ pub const Owner = struct {
         const maintenance_entry_header = store.file.header;
         if (run_database) if (database.enrichment_runtime) |runtime| {
             if (self.embedding_memo == null) self.embedding_memo = memo_mod.QueryEmbeddingCache.init(alloc, io, .{ .max_bytes = embedding_memo_bytes, .ttl_ns = std.time.ns_per_min });
-            runtime.dense_result_cache = .{ .ptr = self, .lookup = lookupEmbedding, .remember = rememberEmbedding };
+            runtime.dense_result_cache = .{ .concurrent = true, .ptr = self, .lookup = lookupEmbedding, .remember = rememberEmbedding };
             runtime.generated_publication = .{ .ptr = &publication, .commit = PreparedPublication.commit, .heartbeat = PreparedPublication.heartbeat, .acquire_store = PreparedPublication.acquireStore };
         };
         database.borrowed_group_source_state = group_state;

@@ -269,6 +269,7 @@ class StandaloneAuthServer:
                 command.extend(["--storage-engine", storage_engine])
                 if storage_engine == "lite":
                     command.extend(["--storage-path", str(root / "db.aflite")])
+            self.command = tuple(command)
             self.proc: subprocess.Popen[str] | None = None
             setup.pop_all()
         try:
@@ -307,6 +308,30 @@ class StandaloneAuthServer:
     def debug_logs(self) -> str:
         self.log_file.flush()
         return _read_log_tail(self.log_path)
+
+    def restart(self) -> None:
+        """Crash and reopen the same owned database without removing its root."""
+        assert self.proc is not None
+        self.proc.kill()
+        self.proc.wait(timeout=10)
+        self.proc = subprocess.Popen(
+            self.command,
+            env={
+                **os.environ,
+                "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+            },
+            stdout=self.log_file,
+            stderr=subprocess.STDOUT,
+            cwd=self.root,
+        )
+        if not wait_for_server(
+            self.api_url, allow_unauthorized=True, processes=[("server", self.proc)]
+        ):
+            raise RuntimeError(f"Auth standalone restart failed\n{self.debug_logs()}")
+        if not _wait_for_admin_auth(AuthApi._auth_url_from_db_url(self.api_url)):
+            raise RuntimeError(
+                f"Auth standalone restart authentication failed\n{self.debug_logs()}"
+            )
 
     def _poll_metadata_admin_url(self) -> str:
         deadline = time.monotonic() + 5.0

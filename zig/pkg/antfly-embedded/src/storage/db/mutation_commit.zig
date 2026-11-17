@@ -129,7 +129,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const replication_schema_outbox_key = D.replication_schema_outbox_key;
         const saveAppliedSequencesBatchLockedContext = D.saveAppliedSequencesBatchLockedContext;
         const GeneratedWriteReadSnapshot = S.GeneratedWriteReadSnapshot;
-        const appendArtifactSourceRevisionWritesFromReplay = S.appendArtifactSourceRevisionWritesFromReplay;
+        const appendSourceRevisionWritesForEffects = S.appendSourceRevisionWritesForEffects;
         const appendAssetArtifactSourceIndexMutations = S.appendAssetArtifactSourceIndexMutations;
         const appendDenseArtifactCounterMutations = S.appendDenseArtifactCounterMutations;
         const appendDirectGraphTtlDueWrite = S.appendDirectGraphTtlDueWrite;
@@ -2986,11 +2986,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const append_derived_replay = !opts.suppress_derived_replay_append and
                 !elide_semantic_noop_replay;
             if (append_derived_replay) {
-                try appendArtifactSourceRevisionWritesFromReplay(
+                try appendSourceRevisionWritesForEffects(
                     S.ownerField(self, "alloc").*,
-                    replay_payload,
                     sequence,
                     &write_buffers.store_writes,
+                    write_buffers.delete_keys.items,
+                    &.{},
+                    &.{},
                     &write_buffers.owned_store_keys,
                     &write_buffers.owned_store_values,
                 );

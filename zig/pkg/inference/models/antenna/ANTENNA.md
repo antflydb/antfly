@@ -54,7 +54,7 @@ trail following), as this model is one encoder with many heads.
 
 | Property | Value | Source |
 | --- | --- | --- |
-| Base | `fastino/gliner2-large-v1`, architecture `span` (`SpanExtractor`), `max_width` 8, `markerV0` span mode, `count_lstm` | [model card](https://huggingface.co/fastino/GLiNER2.5-Decide) and `config.json` at `7ee5da4c2415e32259bcdc0b1a7367c32ce8d6f6` |
+| Base | `fastino/gliner2-large-v1`, architecture `span` (`SpanExtractor`), `max_width` 8, `markerV0` span mode, `count_lstm` | [model card](https://huggingface.co/fastino/GLiNER2.5-Decide) and `config.json` at `5a7adf72a23b4d311abae6ce050d7f0012bb3416` |
 | Encoder | `microsoft/deberta-v3-large`: 24 layers, hidden 1024, 128,011-token English vocabulary, relative positions (256 buckets) | `encoder_config/config.json` |
 | Parameters | 340M (vendor figure) | blog |
 | License | Apache-2.0 | model card |
@@ -673,7 +673,7 @@ places the gap in the classification label markers.
 ## References
 
 - Laya tree packing: [antflydb/antfly#875](https://github.com/antflydb/antfly/pull/875), [LAYA.md](../laya/LAYA.md)
-- GLiNER2.5-Decide: [blog](https://fastino.ai/blog/gliner-2-5-decide-open-weight-decision-model), [model](https://huggingface.co/fastino/GLiNER2.5-Decide) (`7ee5da4c2415e32259bcdc0b1a7367c32ce8d6f6`)
+- GLiNER2.5-Decide: [blog](https://fastino.ai/blog/gliner-2-5-decide-open-weight-decision-model), [model](https://huggingface.co/fastino/GLiNER2.5-Decide) (`5a7adf72a23b4d311abae6ce050d7f0012bb3416`)
 - GLiNER2 base: [fastino/gliner2-large-v1](https://huggingface.co/fastino/gliner2-large-v1) (`bf90d758a5d482bbfc276041b8cb7b570e5318e3`)
 - GLiNER2 library: [fastino-ai/GLiNER2](https://github.com/fastino-ai/GLiNER2) (`55656fbfa01d3d4a77485e1a1eeeaf682990ccdf`); paper [arXiv:2507.18546](https://arxiv.org/abs/2507.18546)
 - GLiNER2.5 boundary checkpoints and pins: `scripts/gliner25/oracle_manifest.json`
