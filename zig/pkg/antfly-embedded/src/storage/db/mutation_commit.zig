@@ -1015,7 +1015,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             {
                 var producer_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer producer_read.abort();
-                try @import("../source_producer_policy.zig").Store.requirePhysical(preparation_alloc, &producer_read, @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace), S.ownerField(self, "core").*.root_generation, opts.source_producer);
+                // Scoped resolution already carries original native scope and
+                // admission identity; it is not ordinary/legacy row inference.
+                const producer = if (opts.transaction_resolution != null and opts.transaction_resolution.?.source_scope != null) @import("../source_producer_policy.zig").Producer.scoped_source else opts.source_producer;
+                try @import("../source_producer_policy.zig").Store.requirePhysical(preparation_alloc, &producer_read, @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace), S.ownerField(self, "core").*.root_generation, producer);
             }
 
             var merge_page_value: ?[]u8 = null;

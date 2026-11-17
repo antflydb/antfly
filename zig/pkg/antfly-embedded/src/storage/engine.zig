@@ -606,7 +606,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 57 adds physical ordered source-scope controls and outcome recovery.
 /// Version 58 adds ordered source attempt retirement and exact outcome recovery.
 /// Version 59 adds physical-root producer closure and trusted classification.
-pub const descriptor_version: u32 = 59;
+/// Version 60 requires producer closure on transaction-record mutation.
+pub const descriptor_version: u32 = 60;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

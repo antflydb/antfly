@@ -24,15 +24,27 @@ const policy = @import("../source_producer_policy.zig");
 pub fn run(a: std.mem.Allocator, path: []const u8, options: db_mod.OpenOptions, owner: completion.RoutedOwner, domain: scope.Digest) !void {
     const before: @import("types.zig").BatchRequest = .{ .writes = &.{.{ .key = "producer-before", .value = "{}" }}, .sync_level = .write };
     const late: @import("types.zig").BatchRequest = .{ .writes = &.{.{ .key = "producer-late", .value = "{}" }}, .sync_level = .write };
+    const legacy_id: [16]u8 = @splat(231);
+    const blocked_id: [16]u8 = @splat(232);
+    const legacy_prepare: @import("types.zig").TransactionIntentRequest = .{ .writes = &.{.{ .key = "producer-legacy-txn", .value = "{}" }} };
     const ordinary: @import("types.zig").BatchRequest = .{ .writes = &.{.{ .key = "producer-ordinary", .value = "{}" }}, .sync_level = .write };
     {
         var db = try db_mod.DB.open(a, path, options);
         defer db.close();
         try db.applyOrderedCommittedMutation(before, .{ .term = 1, .index = 11 }, false);
+        _ = try db.beginTransactionScoped(legacy_id, 10, 11, &.{"legacy-participant"}, true, false, null);
+        try db.writeTransaction(legacy_id, legacy_prepare);
         const closed = try db.applyOrderedSourceProducerClosure(owner, .{ .term = 1, .index = 12 }, false);
         try std.testing.expectEqual(@as(u64, 12), closed.first_closed_at.index);
         try std.testing.expectEqualDeep(closed, try db.applyOrderedSourceProducerClosure(owner, .{ .term = 1, .index = 12 }, false));
         try std.testing.expectError(error.SourceOutcomeUnresolved, db.applyOrderedSourceProducerClosure(owner, .{ .term = 1, .index = 11 }, false));
+        try std.testing.expectError(error.SourcePendingWork, db.beginReplicatedTransactionAtOrderedReceipt(blocked_id, 10, 11, &.{"legacy-participant"}, true, false, .{ .term = 1, .index = 13 }));
+        try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(blocked_id));
+        try std.testing.expectError(error.SourcePendingWork, db.writeReplicatedTransactionAtOrderedReceipt(legacy_id, legacy_prepare, .{ .term = 1, .index = 13 }));
+        try std.testing.expectError(error.SourcePendingWork, db.resolveReplicatedTransactionAtOrderedReceipt(legacy_id, .committed, 20, .write, .none, .{ .term = 1, .index = 13 }, null));
+        try std.testing.expectError(error.SourcePendingWork, db.resolveReplicatedTransactionAtOrderedReceipt(legacy_id, .aborted, 20, .write, .none, .{ .term = 1, .index = 13 }, null));
+        try std.testing.expectEqual(@import("../transactions.zig").TxnStatus.pending, try db.getTransactionStatus(legacy_id));
+        try std.testing.expect(try db.get(a, "producer-legacy-txn") == null);
         try std.testing.expectError(error.SourcePendingWork, db.applyOrderedCommittedMutation(late, .{ .term = 1, .index = 13 }, false));
         try std.testing.expect(try db.get(a, "producer-late") == null);
         try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.sourceScopeObservation(.{ .version = 1, .owner = owner, .domain = domain, .minimum_applied_index = 13 }));
@@ -44,6 +56,7 @@ pub fn run(a: std.mem.Allocator, path: []const u8, options: db_mod.OpenOptions, 
         var db = try db_mod.DB.open(a, path, options);
         defer db.close();
         try std.testing.expectError(error.SourcePendingWork, db.applyOrderedCommittedMutation(late, .{ .term = 1, .index = 15 }, false));
+        try std.testing.expectEqual(@import("../transactions.zig").TxnStatus.pending, try db.getTransactionStatus(legacy_id));
         // Ordered replay is recognized before checking a newly closed policy.
         try db.applyOrderedCommittedMutation(ordinary, .{ .term = 1, .index = 13 }, false);
         const stored = (try db.get(a, "producer-ordinary")) orelse return error.TestExpectedOrdinaryDocument;

@@ -3094,10 +3094,21 @@ pub const TxnManager = struct {
         if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
         var scope_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer scope_arena.deinit();
+        // Producer closure and transaction admission share this exact native
+        // writer. Metadata-only ACK/cleanup does not create new row authority.
+        const producer_policy = @import("source_producer_policy.zig");
+        const producer_closed = try producer_policy.Store.readStored(scope_arena.allocator(), &batch);
         // Scope state and the retained record/effects share this physical commit.
         // Inspect original records before staging any replacement record bytes.
         for (writes) |write| {
             if (write.key.len != records_prefix.len + 16 or !std.mem.startsWith(u8, write.key, records_prefix)) continue;
+            if (producer_closed != null) {
+                const record = try decodeRecord(write.value);
+                // A plain/legacy record cannot acquire new authority by writing
+                // after closure. Explicit ordinary transaction ingress is still
+                // required; never infer it from intent contents or txn identity.
+                if (record.source_scope == null) return error.SourcePendingWork;
+            }
             if (write.value.len == txn_record_v8_size) {
                 const legacy = try decodeRecord(write.value);
                 if (legacy.status == .pending and legacy.source_purpose != null) {
@@ -3142,6 +3153,7 @@ pub const TxnManager = struct {
             const coordinator = try admission.member(admission.coordinator_namespace);
             if (coordinator.roles & completion.Roles.checkpoint == 0 or next.coordinator != std.mem.eql(u8, namespace, &admission.coordinator_namespace)) return error.InvalidParticipant;
             const root = try source_scope.Basis.fromOwner(member.routed_owner.?);
+            try producer_policy.Store.require(scope_arena.allocator(), &batch, root, .scoped_source);
             const coordinator_root = try source_scope.Basis.fromOwner(coordinator.routed_owner.?);
             const slot: source_scope.Slot = .{ .reference = reference, .transaction_id = id, .source_purpose = next.source_purpose.?, .admission_digest = parsed.value.digest };
             if (prior == null) {

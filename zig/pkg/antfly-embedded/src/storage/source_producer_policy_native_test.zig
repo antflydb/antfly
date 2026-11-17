@@ -28,7 +28,7 @@ fn apply(a: std.mem.Allocator, store: *DocStore, root: scope.Basis, producer: po
     try txn.put(effect_key, value);
     try txn.commit();
 }
-pub fn run(a: std.mem.Allocator, path: [:0]const u8, root: scope.Basis) !void {
+pub fn run(a: std.mem.Allocator, path: [:0]const u8, root: scope.Basis, original: @import("source_scope_retirement.zig").Command) !void {
     const entry: scope.Cut = .{ .term = 3, .index = 100 };
     {
         var store = try DocStore.open(a, path.ptr, .{});
@@ -87,6 +87,23 @@ pub fn run(a: std.mem.Allocator, path: [:0]const u8, root: scope.Basis) !void {
         const retained = try store.get(a, effect_key);
         defer a.free(retained);
         try std.testing.expectEqualStrings("authenticated-ordinary", retained);
+        {
+            const transactions = @import("transactions.zig");
+            var manager = try transactions.TxnManager.init(a, &store);
+            defer manager.deinit();
+            var admission = original.observation.decision.?.admission.admission;
+            admission.transaction_id = @splat(233);
+            admission.admission_digest = @splat(235);
+            var reference = original.intent.reference;
+            reference.token = 13;
+            const purpose: scope.Digest = @splat(234);
+            const member = try admission.member(root.namespace);
+            const extra: transactions.MutationExtraBatch = .{ .source_scope = reference, .source_purpose = purpose, .completion_owner = original.intent.owner, .completion_input_digest = member.input_digest };
+            try manager.initParticipantWithCompletionAdmission(admission, 30, 31, true, extra);
+            try manager.writeIntentsExtraBatch(admission.transaction_id, &.{}, &.{}, extra);
+            _ = try manager.resolveIntentsWithExtraBatch(admission.transaction_id, .aborted, 40, .{ .source_scope = reference, .source_purpose = purpose, .completion_owner = original.intent.owner, .source_scope_cut = .{ .term = 3, .index = 101 } });
+            try std.testing.expectEqual(transactions.TxnStatus.aborted, try manager.getTransactionStatus(admission.transaction_id));
+        }
         {
             var corrupt = try store.beginWriteTxn();
             defer corrupt.abort();

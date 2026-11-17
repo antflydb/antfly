@@ -6389,3 +6389,62 @@ outputs. This qualifies the storage primitive and ordinary primary commit path,
 not complete durable producer fencing across transaction admission, every special
 mutation path or network ingress. First strict activation remains closed. The
 full original goal and both issues remain open.
+
+
+### Native transaction-record producer closure
+
+Storage engine 60 requires the producer closure check inside the transaction
+manager's shared native writer. A new/replaced unclassified transaction record
+cannot commit after producer closure: BEGIN, intent preparation and terminal
+resolution all encounter the same fence before their record/intent/credit/marker
+batch can become durable. This is a writer-atomic check, not another metadata
+preflight. Metadata-only ACK/cleanup paths do not manufacture new row authority;
+all special/control paths still need the complete activation audit.
+
+A protocol-39 scoped record retains a separate, native-validated admission. Its
+original v3 membership supplies the physical root, coordinator and scope slot;
+the producer policy is checked against that root before scope entry/preparation/
+resolution in the same writer. No ordinary classification is inferred from
+transaction IDs or intent contents. Primary materialization of scoped resolution
+also retains its source classification from the original scoped resolution
+context, while the transaction manager independently checks the retained scope,
+purpose and admission before committing effects.
+
+The actual DB/compiled-engine fixture prepares a legacy transaction before
+closure, then refuses delayed new BEGIN, PREPARE, COMMIT and ABORT after closure.
+It confirms the new transaction record was not created, legacy row effects did
+not appear, the old transaction remains pending across reopen, and rejected
+entries did not advance the apply marker. It does not presume abort or call that
+pending transaction drained. A positive NativeKV fixture separately begins,
+prepares and resolves an original-membership scoped participant under the closed
+policy, using an explicitly bound fixture scope and modeled trusted ABORT/cut.
+This is not successful production source activation or an independent remote
+coordinator decision read.
+
+Initial `source-scope-native-control-test docstore-history-test -Dstrip=true -j1`
+passed the actual DB case and all 15 retained-history cases
+(`source-producer-transaction-test.log`). Full generation completed
+(`source-producer-transaction-generate.log`), with unrelated model explorer outputs
+discarded. Source-catalog, engine-error and OpenAPI checks passed
+(`source-producer-transaction-contract-check.log`). Final positive scoped and
+linked results follow below.
+
+Owner ABI 111, API kernel 32, data 41, metadata 105 and failure 89 are unchanged.
+Classified ordinary transaction ingress and persistence of producer identity still
+need end-to-end plumbing; unclassified transaction records remain refused under
+closure, including terminal resolution. Qualified recovery/drainage of old pending
+transactions, producer-label transport, closure RPC/Raft activation, every special
+mutation path and snapshot/cohort transfer still remain required. The first-strict
+scope activation gate is unchanged and closed. All other original destination,
+retained history/public feeds, bootstrap/retention, pgoutput and actual Antfly CDC
+client acceptance requirements remain open, with the full goal active.
+
+Final native and linked verification passed in
+`source-producer-transaction-final-test.log`: one actual DB case, six local linked
+cases, 30 linked control cases and all 15 retained-history cases, with zero
+failures, skips or leaks. This includes the positive scoped participant under the
+closed producer policy. Guarded `make gc` completed successfully
+(`source-producer-transaction-gc.log`), preserving recent and active caches;
+21.3 GiB remained free. `git diff --check` passed. These results qualify the
+engine-60 transaction guard only; they do not qualify legacy drainage or complete
+the original feature set.
