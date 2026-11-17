@@ -618,7 +618,7 @@ pub const DocStore = struct {
     // every progress-v2 record, done at drain time), not this field. Kept
     // for `noteSafeRetirementWatermark` callers/tests that want to assert
     // on the last value the DB layer's catalog walk computed.
-    known_safe_retirement_watermark: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    known_safe_retirement_watermark: @import("antfly_platform").atomic.Value(u64) = .init(std.math.maxInt(u64)),
     // WS5 (a): consumer-generic clamp hook. `apply_state.
     // minAppliedSequenceAcrossAllConsumers` only covers managed-index
     // progress-v2 records; enrichment (`enrichment/enrichment_state.zig`)

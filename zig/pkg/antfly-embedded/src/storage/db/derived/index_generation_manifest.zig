@@ -160,14 +160,23 @@ pub fn load(alloc: Allocator, index_path: []const u8) !Manifest {
 pub fn loadWithStorage(storage: ?Storage, alloc: Allocator, index_path: []const u8) !Manifest {
     const path = try manifestPathAlloc(alloc, index_path);
     defer alloc.free(path);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
     const raw = if (storage) |files|
         try files.readFileAlloc(alloc, path, max_manifest_bytes)
     else
-        try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_manifest_bytes));
+        try readLocalManifestAlloc(alloc, path);
     defer alloc.free(raw);
     return try decode(alloc, raw);
+}
+
+/// WebAssembly builds have no local filesystem; they always pass `Storage`.
+fn readLocalManifestAlloc(alloc: Allocator, path: []const u8) ![]u8 {
+    if (comptime @import("builtin").cpu.arch.isWasm()) {
+        return error.Unsupported;
+    } else {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_manifest_bytes));
+    }
 }
 
 pub fn validateReady(

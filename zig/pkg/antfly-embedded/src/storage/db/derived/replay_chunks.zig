@@ -67,7 +67,7 @@ pub fn clampRetireTarget(requested_up_to: u64, min_consumer_progress: u64) u64 {
 /// forward: a stale or reordered caller can never push it backwards and
 /// resurrect journal entries a faster caller already allowed to retire.
 pub const RetirementQueue = struct {
-    requested_through: std.atomic.Value(u64) = .init(0),
+    requested_through: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn request(self: *RetirementQueue, min_progress: u64) void {
         var current = self.requested_through.load(.monotonic);

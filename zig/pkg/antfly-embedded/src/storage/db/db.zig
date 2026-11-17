@@ -36170,7 +36170,8 @@ pub const DB = struct {
         // transient class, not a repair driver; `repairRecoverableStartupIndexFailures`'s
         // own `wake` decision is authoritative for whether anything is due
         // right now.
-        if (!openModeRequiresReadOnlyBackends(self.open_mode)) {
+        // Shadow rebuilds need a local filesystem; freestanding builds have none.
+        if (builtin.os.tag != .freestanding and !openModeRequiresReadOnlyBackends(self.open_mode)) {
             var repair_rounds: usize = 0;
             while (repair_rounds < run_until_idle_max_replay_rounds) : (repair_rounds += 1) {
                 const repair_result = self.repairRecoverableStartupIndexFailures(self.alloc, 8, .{}) catch |err| switch (err) {
@@ -58774,7 +58775,7 @@ fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates(
     }
 }
 
-var status_persist_count: std.atomic.Value(u64) = .init(0);
+var status_persist_count: @import("antfly_platform").atomic.Value(u64) = .init(0);
 
 /// Count of durable status-snapshot writes actually committed (piggybacked
 /// into a progress commit or, rarely, standalone), as opposed to updates

@@ -228,13 +228,23 @@ pub fn futexWaitSharedBounded(io: std.Io, ptr: *const u32, expect: u32, deadline
 /// live process already holds it. Never blocks, so (like
 /// `futexWakeShared`) there is no `Io`-aware variant to prefer.
 pub fn fcntlTryLock(fd: std.posix.fd_t, offset: i64, lock_type: i16) bool {
-    var fl: std.c.Flock = .{ .start = offset, .len = 1, .pid = 0, .type = lock_type, .whence = std.c.SEEK.SET };
+    // Zeroed first: some platforms' Flock carries padding fields.
+    var fl = std.mem.zeroes(std.c.Flock);
+    fl.start = offset;
+    fl.len = 1;
+    fl.type = lock_type;
+    fl.whence = std.c.SEEK.SET;
     return std.c.fcntl(fd, std.c.F.SETLK, &fl) != -1;
 }
 
 /// Releases a byte range `fcntlTryLock` took. Never blocks.
 pub fn fcntlUnlock(fd: std.posix.fd_t, offset: i64) void {
-    var fl: std.c.Flock = .{ .start = offset, .len = 1, .pid = 0, .type = std.c.F.UNLCK, .whence = std.c.SEEK.SET };
+    // Zeroed first: some platforms' Flock carries padding fields.
+    var fl = std.mem.zeroes(std.c.Flock);
+    fl.start = offset;
+    fl.len = 1;
+    fl.type = std.c.F.UNLCK;
+    fl.whence = std.c.SEEK.SET;
     _ = std.c.fcntl(fd, std.c.F.SETLK, &fl);
 }
 
