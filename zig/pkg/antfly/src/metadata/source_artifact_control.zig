@@ -49,12 +49,34 @@ pub const Spec = struct {
     }
 };
 pub const Phase = enum { reserved, sealed, accepted, garbage };
+pub const max_manifest_bytes = 64 * 1024;
+pub const RecoveryManifest = struct {
+    digest: Digest,
+    bytes: []const u8,
+    pub fn validate(self: RecoveryManifest) !void {
+        if (!nz(self.digest) or self.bytes.len == 0 or self.bytes.len > max_manifest_bytes or !std.unicode.utf8ValidateSlice(self.bytes)) return error.InvalidSourceControl;
+    }
+};
 pub const Record = struct {
     reservation: Digest,
     spec: Spec,
     phase: Phase = .reserved,
     stamp: ?Digest = null,
     retirement: ?Digest = null,
+    recovery: ?RecoveryManifest = null,
+    pub fn jsonStringify(self: Record, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(Record).@"struct".field_names) |name| {
+            if (comptime !std.mem.eql(u8, name, "recovery")) {
+                try stream.objectField(name);
+                try stream.write(@field(self, name));
+            } else if (self.recovery != null) {
+                try stream.objectField(name);
+                try stream.write(self.recovery);
+            }
+        }
+        try stream.endObject();
+    }
 };
 pub const Reclaimed = struct { reservation: Digest, spec: Spec, retirement: Digest, proof: Digest };
 pub const State = struct {
@@ -67,6 +89,7 @@ pub const State = struct {
     pub fn validate(self: State) !void {
         if (self.current) |record| {
             try record.spec.validate();
+            if (record.recovery) |manifest| try manifest.validate();
             if (!nz(record.reservation) or record.spec.token() != self.next_token) return error.InvalidSourceControl;
             if (record.stamp) |stamp| if (!nz(stamp)) return error.InvalidSourceControl;
             if (record.retirement) |proof| if (!nz(proof)) return error.InvalidSourceControl;
@@ -96,6 +119,21 @@ pub const State = struct {
         var next = self;
         next.next_token = spec.token();
         next.current = .{ .reservation = reservation, .spec = spec };
+        try next.validate();
+        return next;
+    }
+    pub fn retainManifest(self: State, reservation: Digest, manifest: RecoveryManifest) !State {
+        try self.validate();
+        try manifest.validate();
+        const record = self.current orelse return error.SourcePendingWork;
+        if (!same(record.reservation, reservation)) return error.SourcePayloadConflict;
+        if (record.recovery) |saved| {
+            if (!same(saved.digest, manifest.digest) or !std.mem.eql(u8, saved.bytes, manifest.bytes)) return error.SourcePayloadConflict;
+            return self;
+        }
+        if (record.phase != .reserved) return error.SourcePendingWork;
+        var next = self;
+        next.current.?.recovery = manifest;
         try next.validate();
         return next;
     }

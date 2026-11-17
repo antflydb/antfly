@@ -48,7 +48,8 @@ pub fn verify(a: A, origin: anytype, fence: @import("../metadata/api.zig").Catal
     pending.delivery_manifest = delivery.manifest;
     pending.plan_digest = delivery.digest;
     pending.artifact = delivery.artifact;
-    var record: artifact.Record = .{ .reservation = pending.identity(actor), .spec = delivery.artifact.? };
+    pending.retain_manifest = delivery.retain_manifest;
+    var record: artifact.Record = .{ .reservation = pending.identity(actor), .spec = delivery.artifact.?, .recovery = .{ .digest = pending.plan_digest, .bytes = pending.delivery_manifest } };
     record.stamp = try transfer.seal(a, record, frozen.bytes, .{});
     const sealed = try ports.observations.read(a, fence, "docs", quota_input, .{});
     // Native seal alone never substitutes for the metadata seal transition.

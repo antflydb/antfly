@@ -42,6 +42,8 @@ pub const Grant = struct {
         if (scope.destination != .native or pending.destination != .native or pending.artifact == null or !std.meta.eql(pending.artifact.?, record.spec) or !std.mem.eql(u8, &pending.identity(scope), &record.reservation)) return error.SourceTransactionIdentityConflict;
         var manifest = try destination.parse(a, pending.delivery_manifest, pending.plan_digest);
         errdefer manifest.deinit();
+        const retained = record.recovery orelse return error.SourcePendingWork;
+        if (!pending.retain_manifest or !std.mem.eql(u8, &retained.digest, &pending.plan_digest) or !std.mem.eql(u8, retained.bytes, pending.delivery_manifest)) return error.SourceTransactionIdentityConflict;
         const value = manifest.value;
         const plan = try value.deliveryPlan(a, pending.delivery_manifest);
         const purpose = try pending.inputFingerprint(scope);
@@ -51,7 +53,9 @@ pub const Grant = struct {
         if (!std.meta.eql(plan.artifact.?, record.spec) or !std.mem.eql(u8, &pending.transaction_id, &value.transaction_id) or
             !std.mem.eql(u8, &binding.domain(), &value.source_scope.domain) or binding.generation != value.source_scope.generation or
             !std.mem.eql(u8, &checkpoint.digest(), &value.checkpoint.digest())) return error.SourceTransactionIdentityConflict;
-        return .{ .manifest = manifest, .record = record };
+        var owned_record = record;
+        owned_record.recovery.?.bytes = try manifest.arena.allocator().dupe(u8, retained.bytes);
+        return .{ .manifest = manifest, .record = owned_record };
     }
 };
 /// Fixed owned native evidence. It proves acceptance at the original checkpoint
@@ -124,9 +128,18 @@ test "completion frozen plan source admission binds metadata grant before checkp
     pending.delivery_manifest = compiled.manifest;
     pending.plan_digest = compiled.digest;
     pending.artifact = compiled.artifact;
-    const record: artifact.Record = .{ .reservation = pending.identity(scope), .spec = compiled.artifact.? };
+    pending.retain_manifest = compiled.retain_manifest;
+    const record: artifact.Record = .{ .reservation = pending.identity(scope), .spec = compiled.artifact.?, .recovery = .{ .digest = pending.plan_digest, .bytes = pending.delivery_manifest } };
     var grant = try Grant.init(a, scope, pending, record);
     defer grant.deinit();
+    var transient_pending = pending;
+    transient_pending.delivery_manifest = try a.dupe(u8, pending.delivery_manifest);
+    var transient_record = record;
+    transient_record.recovery.?.bytes = transient_pending.delivery_manifest;
+    var independent = try Grant.init(a, scope, transient_pending, transient_record);
+    defer independent.deinit();
+    a.free(transient_pending.delivery_manifest);
+    try std.testing.expectEqualStrings(pending.delivery_manifest, independent.record.recovery.?.bytes);
     const Fake = struct {
         committed: bool = false,
         forge: bool = false,

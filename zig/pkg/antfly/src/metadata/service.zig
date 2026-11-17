@@ -23952,7 +23952,7 @@ test "selected owner readiness transition index cancels while observations are l
 test "source control requires its coordinated decoder floor before metadata proposal" {
     const contract = @import("source_control.zig");
     const a = std.testing.allocator;
-    try std.testing.expectEqual(contract.closing_protocol_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_source_control = "{}" }));
+    try std.testing.expectEqual(contract.manifest_protocol_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_source_control = "{}" }));
     const scope: contract.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(4) };
     var write: contract.Write = .{ .table_id = 7, .source_id = scope.source_id, .expected_revision = 0, .expected_binding = scope.identity(), .expected_catalog_digest = @splat(5), .mutation = .{ .configure = scope } };
     const legacy = try contract.encodeWrite(a, write);
@@ -23974,6 +23974,10 @@ test "source control requires its coordinated decoder floor before metadata prop
     const closing = try contract.encodeWrite(a, write);
     defer a.free(closing);
     try std.testing.expectEqual(contract.closing_protocol_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_source_control = closing }));
+    write.mutation = .{ .reserve = .{ .sequence = 1, .batch_id = "one", .checkpoint = "cp1", .accepted_at_ns = 1, .payload_digest = @splat(6), .plan_digest = @splat(7), .transaction_id = @splat(8), .destination = .native, .delivery_manifest = "retained", .retain_manifest = true, .artifact = .{ .namespace = @splat(9), .binding = scope.identity(), .domain = contract.artifact_control.domainFor(scope.identity()), .attempt = .{ 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, .bytes = 128, .checksum = @splat(10), .plan_digest = @splat(11) } } };
+    const retained = try contract.encodeWrite(a, write);
+    defer a.free(retained);
+    try std.testing.expectEqual(contract.manifest_protocol_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_source_control = retained }));
 }
 
 test "changefeed control requires its coordinated decoder floor before metadata proposal" {

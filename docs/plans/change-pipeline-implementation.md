@@ -5791,3 +5791,55 @@ metadata acceptance must retain sufficient original manifest authority for later
 completion/reclamation instead of losing it when the pending reservation clears.
 That durability contract, actor/worker wiring and all remaining original issue
 acceptance criteria are unfinished.
+
+### Metadata protocol 105 retains recovery manifests after acceptance
+
+Source reservations and replans can now negotiate retained manifest authority.
+The persistent artifact record keeps its opaque manifest and plan digest through
+reserved, sealed, accepted and garbage phases. Acceptance can clear the pending
+reservation without losing cleanup routing. Only proven reclamation removes the
+manifest. The source state retains the negotiated mode across subsequent grants
+and same-destination reseeding; downgrade attempts and adapters without the
+retention capability fail closed. New retained reservation identities use v3;
+existing unretained v1/v2 identities and omitted-default JSON remain unchanged.
+
+Metadata topology protocol 105 gates the new command/state decoder contract.
+Encoded command inspection recognizes field presence even for explicit false
+and escaped field names, so an older decoder cannot be admitted accidentally.
+Recovery manifests are capped at 64 KiB, independently of row/frozen payload
+capacity, keeping duplicated pending/ledger JSON safely bounded within existing
+state limits. Native destination manifests negotiate the mode and admission
+requires the ledger's exact retained manifest rather than a transient copy.
+
+The first `source-control-test completion-frozen-plan-test -Dstrip=true -j1`
+passed (`source-manifest-retention-test.log`). Expanded source-control, focused
+and linked runs also passed (`source-manifest-retention-qualified-test.log`).
+Coverage includes original/retained delivery modes with lost native/metadata
+seal replies, acceptance, committed cleanup debt, manifest persistence through
+store reopen and snapshot installation, final removal on reclamation, scoped
+identity checks, downgrade refusal, replanning after fenced reclamation and
+protocol classification. The final field-presence qualification follows below.
+
+This supplies durable manifest authority for production cleanup; it does not
+implement all-owner release/retirement, legacy worker handover or production
+source actor wiring. All original outstanding acceptance criteria remain open.
+
+Final generation exited 0 (`source-manifest-retention-generate.log`); only the
+two unrelated model-explorer outputs were restored. Final `source-control-test
+completion-frozen-plan-test history-control-apply-test -Dstrip=true -j1` exited
+0 (`source-manifest-retention-owner-final-test.log`). All five focused tests,
+27 selected linked tests, six selected local tests and the selected metadata
+storage/service tests passed, zero reported skips/failures/leaks. This includes
+explicit-false/escaped retention field negotiation and grant ownership after
+the original metadata manifest buffer is freed. The owned grant duplicates its
+bounded recovery bytes into the parsed manifest arena, avoiding a snapshot
+lifetime dependency introduced by the retained record field.
+
+Final source-catalog, engine-error and OpenAPI checks passed
+(`source-manifest-retention-contract-check.log`), including nine schema fragment
+tests. Metadata protocol 105 is the only version change; engine 57, storage owner
+ABI 110, API kernel 31, data profile 40 and failure envelope 89 stay unchanged.
+All original scope remains active: durable manifest retention is implemented,
+while production destination/worker integration, real lifecycle handover and
+all-owner release plus the original feeds/bootstrap/retention/pgoutput/actual
+Antfly client qualification acceptance criteria remain unfinished.

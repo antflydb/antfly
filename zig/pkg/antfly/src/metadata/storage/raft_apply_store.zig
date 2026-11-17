@@ -45986,7 +45986,7 @@ test "metadata source control artifact debt survives reopening and keeps table r
             try actor.apply(.{ .bind_checkpoint = authority });
             try std.testing.expectEqual(incarnation, (try store.getMetadataIncarnation(group)).?);
         }
-        const reservation: source_control.Reservation = .{ .sequence = 1, .batch_id = "batch", .checkpoint = "cp1", .accepted_at_ns = 1, .payload_digest = @splat(4), .plan_digest = @splat(5), .transaction_id = @splat(6), .destination = .native, .delivery_manifest = "frozen-reference", .artifact = .{ .namespace = @splat(9), .binding = scope.identity(), .domain = source_control.artifact_control.domainFor(scope.identity()), .attempt = .{ 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, .bytes = 1024, .checksum = @splat(10), .plan_digest = @splat(11) } };
+        const reservation: source_control.Reservation = .{ .sequence = 1, .batch_id = "batch", .checkpoint = "cp1", .accepted_at_ns = 1, .payload_digest = @splat(4), .plan_digest = @splat(5), .transaction_id = @splat(6), .destination = .native, .delivery_manifest = "frozen-reference", .retain_manifest = checkpoint_mode, .artifact = .{ .namespace = @splat(9), .binding = scope.identity(), .domain = source_control.artifact_control.domainFor(scope.identity()), .attempt = .{ 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, .bytes = 1024, .checksum = @splat(10), .plan_digest = @splat(11) } };
         const id = reservation.identity(scope);
         try actor.apply(.{ .reserve = reservation });
         try actor.expectWork(1);
@@ -45999,8 +45999,27 @@ test "metadata source control artifact debt survives reopening and keeps table r
         defer sealed.deinit();
         try std.testing.expectEqual(.sealed, sealed.value.artifact_control.?.current.?.phase);
         if (checkpoint_mode) try std.testing.expect(sealed.value.checkpoint_authority.?.sameAuthority(authority));
+        if (checkpoint_mode) {
+            try std.testing.expect(sealed.value.manifest_retention);
+            try std.testing.expectEqualStrings(reservation.delivery_manifest, sealed.value.artifact_control.?.current.?.recovery.?.bytes);
+        } else try std.testing.expect(sealed.value.artifact_control.?.current.?.recovery == null);
         try std.testing.expectEqual(@as(u64, 1024), sealed.value.artifact_control.?.chargedBytes());
         try actor.apply(.{ .accept = .{ .reservation_digest = id, .receipt = "native-receipt", .commit_reference = "native-commit" } });
+        if (checkpoint_mode) {
+            const accepted_snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+            defer a.free(accepted_snapshot);
+            const accepted_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source-manifest-snapshot", .{tmp.sub_path});
+            defer a.free(accepted_root);
+            var accepted_target = try RaftApplyStore.init(a, .{ .root_dir = accepted_root });
+            defer accepted_target.deinit();
+            try RaftApplyStore.installSnapshotFromRaft(&accepted_target, a, group, 99, accepted_snapshot);
+            const copied: Actor = .{ .a = a, .store = &accepted_target, .group = group, .scope = scope, .catalog = actor.catalog };
+            var accepted_state = try copied.read();
+            defer accepted_state.deinit();
+            try std.testing.expect(accepted_state.value.pending == null);
+            try std.testing.expect(accepted_state.value.manifest_retention);
+            try std.testing.expectEqualStrings(reservation.delivery_manifest, accepted_state.value.artifact_control.?.current.?.recovery.?.bytes);
+        }
         // Committed source progress does not clear artifact retention debt.
         try actor.expectWork(1);
         try actor.apply(.{ .retire_artifact = .{ .reservation_digest = id, .proof = @splat(13), .reason = .committed } });
@@ -46011,6 +46030,7 @@ test "metadata source control artifact debt survives reopening and keeps table r
         var garbage = try actor.read();
         defer garbage.deinit();
         try std.testing.expectEqual(.garbage, garbage.value.artifact_control.?.current.?.phase);
+        if (checkpoint_mode) try std.testing.expectEqualStrings(reservation.delivery_manifest, garbage.value.artifact_control.?.current.?.recovery.?.bytes);
         try std.testing.expectEqual(@as(u64, 1024), garbage.value.artifact_control.?.chargedBytes());
         try actor.expectWork(1);
         try actor.apply(.{ .reclaim_artifact = .{ .reservation_digest = id, .proof = @splat(14) } });

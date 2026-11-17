@@ -36,6 +36,7 @@ pub const Plan = struct {
     transaction_id: [16]u8,
     manifest: []const u8,
     artifact: ?control.artifact_control.Spec = null,
+    retain_manifest: bool = false,
     checkpoint_authority: ?control.checkpoint_authority.Spec = null,
     /// Exact scope identity actually encoded in the frozen native plan.
     source_scope: ?scope_binding.native.Reference = null,
@@ -52,7 +53,12 @@ fn supportsScopeFencing(adapter: anytype) bool {
     if (comptime @hasDecl(AdapterType(@TypeOf(adapter)), "scope_fencing_capable")) return AdapterType(@TypeOf(adapter)).scope_fencing_capable;
     return false;
 }
+fn supportsManifestRetention(adapter: anytype) bool {
+    if (comptime @hasDecl(AdapterType(@TypeOf(adapter)), "manifest_retention_capable")) return AdapterType(@TypeOf(adapter)).manifest_retention_capable;
+    return false;
+}
 fn requireArtifactAdapter(adapter: anytype, state: control.State) !void {
+    if (state.manifest_retention and !supportsManifestRetention(adapter)) return error.UnsupportedOperation;
     if (state.scope_fencing and !supportsScopeFencing(adapter)) return error.UnsupportedOperation;
     if (state.checkpoint_authority != null and !supportsCheckpoint(adapter)) return error.UnsupportedOperation;
     if (state.artifact_control != null and !@hasDecl(AdapterType(@TypeOf(adapter)), "sealArtifact")) return error.UnsupportedOperation;
@@ -283,6 +289,7 @@ pub fn deliver(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catal
         else
             try adapter.plan(scratch, scope, input, payload);
         try scope_binding.requirePlan(grant.source_scope, plan.source_scope, plan.artifact);
+        if (plan.retain_manifest and !supportsManifestRetention(adapter)) return error.UnsupportedOperation;
         if (plan.artifact != null and !@hasDecl(AdapterType(@TypeOf(adapter)), "sealArtifact")) return error.UnsupportedOperation;
         if (@hasDecl(AdapterType(@TypeOf(adapter)), "admitRetained") and plan.artifact == null) return error.UnsupportedOperation;
         try bindCheckpoint(svc, adapter, a, scope, catalog, &state, plan, request);
@@ -298,6 +305,7 @@ pub fn deliver(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catal
             .destination = scope.destination,
             .delivery_manifest = plan.manifest,
             .artifact = plan.artifact,
+            .retain_manifest = plan.retain_manifest,
         };
         try mutate(svc, a, scope, catalog, state.value, .{ .reserve = reservation }, request);
         const next = try load(svc, a, scope, request);
@@ -375,6 +383,7 @@ pub fn replan(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catalo
     else
         try adapter.replan(scratch, scope, pending, payload, request);
     try scope_binding.requirePlan(grant.source_scope, replacement.plan.source_scope, replacement.plan.artifact);
+    if (replacement.plan.retain_manifest and !supportsManifestRetention(adapter)) return error.UnsupportedOperation;
     if (replacement.plan.artifact != null and !@hasDecl(AdapterType(@TypeOf(adapter)), "sealArtifact")) return error.UnsupportedOperation;
     if (@hasDecl(AdapterType(@TypeOf(adapter)), "admitRetained") and replacement.plan.artifact == null) return error.UnsupportedOperation;
     try bindCheckpoint(svc, adapter, a, scope, catalog, &state, replacement.plan, request);
@@ -384,6 +393,7 @@ pub fn replan(svc: anytype, adapter: anytype, a: A, scope: control.Scope, catalo
         .transaction_id = replacement.plan.transaction_id,
         .delivery_manifest = replacement.plan.manifest,
         .artifact = replacement.plan.artifact,
+        .retain_manifest = replacement.plan.retain_manifest,
         .not_admitted_receipt = replacement.not_admitted_receipt,
     } }, request);
     const next = try load(svc, a, scope, request);
@@ -529,7 +539,14 @@ test "delivery recovers lost destination and metadata acknowledgments before rel
 
 test "delivery recovers sealed source artifacts after a lost metadata reply without provider rows" {
     for ([_]bool{ false, true }) |native_reply_lost| {
-        for ([_]bool{ false, true }) |checkpoint_mode| {
+        for ([_]struct { checkpoint: bool, manifest: bool }{
+            .{ .checkpoint = false, .manifest = false },
+            .{ .checkpoint = true, .manifest = false },
+            .{ .checkpoint = false, .manifest = true },
+            .{ .checkpoint = true, .manifest = true },
+        }) |mode| {
+            const checkpoint_mode = mode.checkpoint;
+            const manifest_mode = mode.manifest;
             const a = std.testing.allocator;
             const Context = struct {
                 pub fn ensureActive(_: @This()) !void {}
@@ -577,6 +594,8 @@ test "delivery recovers sealed source artifacts after a lost metadata reply with
             const Storage = struct { bytes: ?[]u8 = null, receipt: ?[]u8 = null, uploads: usize = 0, admissions: usize = 0, sealed: bool = false, seal_reads: usize = 0 };
             const Adapter = struct {
                 pub const checkpoint_capable = true;
+                pub const manifest_retention_capable = true;
+                keep_manifest: bool = false,
                 want_checkpoint: bool = false,
                 lose_native_reply: bool = false,
                 candidate_group: u64 = 17,
@@ -590,7 +609,7 @@ test "delivery recovers sealed source artifacts after a lost metadata reply with
                     try std.testing.expectEqual(@as(u64, 1), grant.source_sequence);
                     var attempt: [16]u8 = @splat(1);
                     std.mem.writeInt(u64, attempt[0..8], grant.upload_token, .big);
-                    return .{ .digest = @splat(4), .transaction_id = @splat(5), .manifest = "original-frozen-owner", .checkpoint_authority = if (self.want_checkpoint) grant.checkpoint_authority orelse control.checkpoint_authority.Spec{ .binding = scope.identity(), .table_name = "checkpoint-owner", .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(5), .root_generation = 0, .group_id = self.candidate_group, .topology_epoch = 1 } } else null, .artifact = .{ .namespace = @splat(9), .binding = scope.identity(), .domain = control.artifact_control.domainFor(scope.identity()), .attempt = attempt, .bytes = payload.len, .checksum = control.digest(payload), .plan_digest = @splat(11) } };
+                    return .{ .retain_manifest = self.keep_manifest, .digest = @splat(4), .transaction_id = @splat(5), .manifest = "original-frozen-owner", .checkpoint_authority = if (self.want_checkpoint) grant.checkpoint_authority orelse control.checkpoint_authority.Spec{ .binding = scope.identity(), .table_name = "checkpoint-owner", .owner = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .namespace = @splat(1), .table_binding = @splat(5), .root_generation = 0, .group_id = self.candidate_group, .topology_epoch = 1 } } else null, .artifact = .{ .namespace = @splat(9), .binding = scope.identity(), .domain = control.artifact_control.domainFor(scope.identity()), .attempt = attempt, .bytes = payload.len, .checksum = control.digest(payload), .plan_digest = @splat(11) } };
                 }
                 pub fn sealArtifact(self: *@This(), _: A, scope: control.Scope, pending: control.Reservation, payload: []const u8, request: Context) !control.Digest {
                     var journal = try load(self.svc, self.backing, scope, request);
@@ -671,7 +690,7 @@ test "delivery recovers sealed source artifacts after a lost metadata reply with
             var storage: Storage = .{};
             defer if (storage.bytes) |bytes| a.free(bytes);
             defer if (storage.receipt) |receipt| a.free(receipt);
-            var adapter: Adapter = .{ .backing = a, .svc = &svc, .storage = &storage };
+            var adapter: Adapter = .{ .backing = a, .svc = &svc, .storage = &storage, .keep_manifest = manifest_mode };
             const scope: control.Scope = .{ .table_id = 7, .source_id = @splat(1), .source_ordinal = 0, .generation = 1, .definition = @splat(2), .provider = @splat(3), .destination = .native, .destination_binding = @splat(6) };
             const payload: [128]u8 = @splat(1);
             const input: Input = .{ .batch_id = "one", .checkpoint = "cp1", .payload_digest = control.digest(&payload), .accepted_at_ns = 123 };
@@ -690,7 +709,7 @@ test "delivery recovers sealed source artifacts after a lost metadata reply with
             try std.testing.expectError(if (native_reply_lost) error.TestLostNativeSealReply else error.MetadataMutationOutcomeUnknown, deliver(&svc, &adapter, a, scope, @splat(9), input, &payload, Context{}));
             try std.testing.expectEqual(@as(usize, 1), storage.uploads);
             try std.testing.expectEqual(@as(usize, 0), storage.admissions);
-            try std.testing.expectEqual(if (checkpoint_mode) control.checkpoint_authority.protocol_version else control.artifact_control.protocol_version, svc.floor);
+            try std.testing.expectEqual(if (manifest_mode) control.manifest_protocol_version else if (checkpoint_mode) control.checkpoint_authority.protocol_version else control.artifact_control.protocol_version, svc.floor);
             var pending = try load(&svc, a, scope, Context{});
             defer pending.deinit();
             try std.testing.expectEqual(@as(control.artifact_control.Phase, if (native_reply_lost) .reserved else .sealed), pending.value.artifact_control.?.current.?.phase);
@@ -715,6 +734,7 @@ test "delivery recovers sealed source artifacts after a lost metadata reply with
             try std.testing.expectEqual(@as(u64, 1), recovered.value.committed.sequence);
             try std.testing.expectEqual(@as(u64, 0), recovered.value.artifact_control.?.chargedBytes());
             try std.testing.expect(!control.hasWork(recovered.value));
+            try std.testing.expectEqual(manifest_mode, recovered.value.manifest_retention);
             try std.testing.expectEqual(@as(usize, 1), storage.admissions);
             try std.testing.expectEqual(@as(usize, 1), storage.uploads);
             var duplicate = try deliver(&svc, &restarted, a, scope, @splat(9), input, &payload, Context{});

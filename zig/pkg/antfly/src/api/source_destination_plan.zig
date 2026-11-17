@@ -25,7 +25,7 @@ const control = local.storage_source_plan_control;
 const storage = local.storage_source_plan_storage;
 const A = std.mem.Allocator;
 const Digest = [32]u8;
-pub const max_manifest_bytes = @import("../metadata/source_control.zig").max_pending_bytes;
+pub const max_manifest_bytes = @import("../metadata/source_artifact_control.zig").max_manifest_bytes;
 fn sha(bytes: []const u8) Digest {
     var result: Digest = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &result, .{});
@@ -114,7 +114,7 @@ pub const Manifest = struct {
         const canonical = try std.json.Stringify.valueAlloc(a, self, .{});
         defer a.free(canonical);
         if (!std.mem.eql(u8, canonical, encoded)) return error.SourcePayloadConflict;
-        return .{ .digest = manifestDigest(encoded), .transaction_id = self.transaction_id, .manifest = encoded, .source_scope = self.source_scope, .checkpoint_authority = self.checkpoint_authority, .artifact = .{ .namespace = self.artifact.namespace, .binding = self.artifact.binding, .domain = self.artifact.domain, .attempt = self.artifact.attempt, .bytes = self.artifact.bytes, .checksum = self.artifact.checksum, .plan_digest = self.artifact.plan_digest } };
+        return .{ .retain_manifest = true, .digest = manifestDigest(encoded), .transaction_id = self.transaction_id, .manifest = encoded, .source_scope = self.source_scope, .checkpoint_authority = self.checkpoint_authority, .artifact = .{ .namespace = self.artifact.namespace, .binding = self.artifact.binding, .domain = self.artifact.domain, .attempt = self.artifact.attempt, .bytes = self.artifact.bytes, .checksum = self.artifact.checksum, .plan_digest = self.artifact.plan_digest } };
     }
 };
 pub fn parse(a: A, encoded: []const u8, expected: Digest) !std.json.Parsed(Manifest) {
