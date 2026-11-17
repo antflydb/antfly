@@ -277,6 +277,33 @@ pub const Storage = struct {
     const state_prefix = "\x00\x00__metadata__:dag-state:";
     const receipt_prefix = "\x00\x00__metadata__:dag-receipt:";
 
+    const validation = @import("dag_validation.zig");
+    const proof_prefix = "\x00\x00__metadata__:dag-proof:";
+
+    fn proofKey(id: Digest) [proof_prefix.len + 64]u8 {
+        return proof_prefix.* ++ std.fmt.bytesToHex(id, .lower);
+    }
+
+    fn proof(token: Token, changes: []const validation.Change) Digest {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly/dag-adjacency-proof/v1");
+        hash.update(&token.attempt.id);
+        hash.update(&token.attempt.transaction);
+        hash.update(&token.attempt.candidate);
+        var size: [8]u8 = undefined;
+        std.mem.writeInt(u64, &size, token.revision, .little);
+        hash.update(&size);
+        for (changes) |change| {
+            for ([_][]const u8{ change.source, change.target }) |key| {
+                std.mem.writeInt(u64, &size, key.len, .little);
+                hash.update(&size);
+                hash.update(key);
+            }
+            hash.update(&.{@intFromBool(change.present)});
+        }
+        return hash.finalResult();
+    }
+
     fn stateKey(id: Digest) [state_prefix.len + 64]u8 {
         return state_prefix.* ++ std.fmt.bytesToHex(id, .lower);
     }
@@ -314,10 +341,37 @@ pub const Storage = struct {
         return .{ .reserved = token };
     }
 
-    pub fn validated(txn: anytype, token: Token) !void {
+    /// Validate against the accepted adjacency in the same snapshot as the
+    /// reservation. The digest must bind the reconciled changes and all source
+    /// versions used to produce them.
+    pub fn validate(
+        alloc: std.mem.Allocator,
+        txn: anytype,
+        token: Token,
+        changes: []const validation.Change,
+        budget: *validation.Budget,
+        witness: *validation.Witness,
+    ) !void {
         var state = try load(txn, token.domain);
+        try state.require(token);
+        const reader: Adjacency.Reader(@TypeOf(txn)) = .{ .txn = txn, .domain_id = token.domain };
+        try validation.validate(alloc, reader, changes, budget, witness);
+        const digest = proof(token, changes);
+        if (state.pending.?.validated) {
+            try requireProof(txn, token.domain, digest);
+            return;
+        }
+        try txn.put(&proofKey(token.domain), &digest);
         try state.validated(token);
         try save(txn, state);
+    }
+
+    fn requireProof(txn: anytype, id: Digest, digest: Digest) !void {
+        const saved = txn.get(&proofKey(id)) catch |err| {
+            if (err == error.NotFound) return error.GraphConstraintNotValidated;
+            return err;
+        };
+        if (!std.mem.eql(u8, saved, &digest)) return error.GraphConstraintAttemptConflict;
     }
 
     pub fn takeover(txn: anytype, id: Digest, expected_epoch: u64, new_epoch: u64) !void {
@@ -326,7 +380,14 @@ pub const Storage = struct {
         try save(txn, state);
     }
 
-    pub fn resolve(txn: anytype, token: Token, outcome: Outcome) !Receipt {
+    pub fn reject(txn: anytype, token: Token, outcome: enum { semantic_rejection, aborted }) !Receipt {
+        return resolve(txn, token, switch (outcome) {
+            .semantic_rejection => .semantic_rejection,
+            .aborted => .aborted,
+        });
+    }
+
+    fn resolve(txn: anytype, token: Token, outcome: Outcome) !Receipt {
         var state = try load(txn, token.domain);
         if (state.owner_epoch != token.owner_epoch) return error.GraphConstraintOwnerChanged;
         if (try readReceipt(txn, token.domain, token.attempt)) |receipt| {
@@ -347,6 +408,26 @@ pub const Storage = struct {
         receiptChecksum(&key, raw[0..57], raw[57..89]);
         try txn.put(&key, &raw);
         try save(txn, state);
+        return receipt;
+    }
+
+    /// Stage accepted adjacency with the terminal receipt. The transaction
+    /// must also stage the source/artifact changes, and abort on any error.
+    pub fn accept(
+        alloc: std.mem.Allocator,
+        txn: anytype,
+        token: Token,
+        changes: []const validation.Change,
+    ) !Receipt {
+        if (try readReceipt(txn, token.domain, token.attempt)) |_| {
+            return resolve(txn, token, .accepted);
+        }
+        const state = try load(txn, token.domain);
+        try state.require(token);
+        if (!state.pending.?.validated) return error.GraphConstraintNotValidated;
+        try requireProof(txn, token.domain, proof(token, changes));
+        const receipt = try resolve(txn, token, .accepted);
+        try Adjacency.stage(alloc, txn, token.domain, changes);
         return receipt;
     }
 
@@ -387,10 +468,33 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
     const Txn = struct {
         state: ?[State.encoded_len]u8 = null,
         receipt: ?[89]u8 = null,
+        proof_value: ?Digest = null,
+        edges: usize = 0,
+
+        const Cursor = struct {
+            const Entry = struct { key: []const u8 };
+            fn close(_: *@This()) void {}
+            fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
+                return null;
+            }
+            fn next(_: *@This()) !?Entry {
+                return null;
+            }
+        };
+
+        fn openCursor(_: *@This()) !Cursor {
+            return .{};
+        }
+        fn delete(_: *@This(), _: []const u8) !void {}
+        fn now(_: *anyopaque) u64 {
+            return 0;
+        }
 
         fn get(self: *@This(), key: []const u8) ![]const u8 {
             if (std.mem.startsWith(u8, key, Storage.state_prefix)) {
                 if (self.state) |*raw| return raw;
+            } else if (std.mem.startsWith(u8, key, Storage.proof_prefix)) {
+                if (self.proof_value) |*raw| return raw;
             } else if (self.receipt) |*raw| return raw;
             return error.NotFound;
         }
@@ -398,6 +502,10 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
         fn put(self: *@This(), key: []const u8, raw: []const u8) !void {
             if (std.mem.startsWith(u8, key, Storage.state_prefix)) {
                 self.state = raw[0..State.encoded_len].*;
+            } else if (std.mem.startsWith(u8, key, Storage.proof_prefix)) {
+                self.proof_value = raw[0..32].*;
+            } else if (std.mem.startsWith(u8, key, Adjacency.prefix)) {
+                self.edges += 1;
             } else {
                 self.receipt = raw[0..89].*;
             }
@@ -409,13 +517,21 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
     try std.testing.expectError(error.GraphConstraintAlreadyExists, Storage.create(&txn, state.domain, 1));
     try Storage.save(&txn, state);
     const token = (try Storage.begin(&txn, state.domain, 1, 0, testAttempt(1))).reserved;
-    try Storage.validated(&txn, token);
+    const alloc = std.testing.allocator;
+    const changes: []const Storage.validation.Change = &.{.{ .source = "a", .target = "b", .present = true }};
+    var budget: Storage.validation.Budget = .{ .clock = .{ .context = &txn, .now = Txn.now } };
+    var witness: Storage.validation.Witness = .{};
+    try std.testing.expectError(error.GraphConstraintNotValidated, Storage.accept(alloc, &txn, token, changes));
+    try Storage.validate(alloc, &txn, token, changes, &budget, &witness);
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, Storage.accept(alloc, &txn, token, &.{}));
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, Storage.validate(alloc, &txn, token, &.{}, &budget, &witness));
     try Storage.takeover(&txn, state.domain, 1, 2);
-    try std.testing.expectError(error.GraphConstraintOwnerChanged, Storage.resolve(&txn, token, .accepted));
+    try std.testing.expectError(error.GraphConstraintOwnerChanged, Storage.accept(alloc, &txn, token, changes));
     const recovered = try Storage.load(&txn, state.domain);
     const current = (try recovered.recoveryToken(2)).?;
-    const receipt = try Storage.resolve(&txn, current, .accepted);
-    try std.testing.expectEqualDeep(receipt, try Storage.resolve(&txn, current, .accepted));
+    const receipt = try Storage.accept(alloc, &txn, current, changes);
+    try std.testing.expectEqualDeep(receipt, try Storage.accept(alloc, &txn, current, changes));
+    try std.testing.expectEqual(@as(usize, 1), txn.edges);
     try std.testing.expectEqualDeep(receipt, (try Storage.begin(&txn, state.domain, 2, 0, testAttempt(1))).terminal);
     var conflicting = testAttempt(1);
     conflicting.candidate = @splat(2);
