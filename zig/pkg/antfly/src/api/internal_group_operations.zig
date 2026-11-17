@@ -735,7 +735,7 @@ pub const Operations = struct {
 
     pub fn txnPrepare(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnPrepareRequest) Error!void {
         try ensurePreDecisionRequestActive(request);
-        if (input.req.range_guards.len != 0 and input.route_fence == null) return error.InvalidArgument;
+        if ((input.req.range_guards.len != 0 or input.req.dag_domains.len != 0) and input.route_fence == null) return error.InvalidArgument;
         if (input.route_fence) |fence| {
             if (fence.route.group_id != group_id or fence.topology_epoch != input.topology_epoch) return error.TopologyChanged;
         }

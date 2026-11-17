@@ -1387,6 +1387,10 @@ fn executeMultiTableCommitOnce(
                 fence.route.identity_namespace.shard_id != manager.rangeDocIdentityShardId(range.*) or
                 fence.route.identity_namespace.range_id != manager.rangeDocIdentityRangeId(range.*)) return error.TopologyChanged;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, fence.route.group_id, topology_epoch);
+            if (participant.dag_domains.len != 0) {
+                const existing = participant.route_fence orelse return error.TopologyChanged;
+                if (!std.meta.eql(existing.nativeJsonProjection(), fence.nativeJsonProjection())) return error.TopologyChanged;
+            }
             participant.route_fence = fence;
             for (owner.proofs) |proof| try participant.range_guards.append(alloc, proof);
         }
@@ -1433,12 +1437,24 @@ fn executeMultiTableCommitOnce(
         }
         for (table.dag_owners) |owner| {
             if (owner.domains.len == 0 or owner.domains.len > 64 or table.restore_staging_scope != null) return error.InvalidTxnRequest;
-            const present = for (routing.ranges) |range| {
-                if (range.group_id == owner.group_id) break true;
-            } else false;
-            if (!present) return error.TopologyChanged;
-            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, owner.group_id, topology_epoch);
+            const fence = owner.fence;
+            if (routing.snapshot.status.metadata_group_id != fence.metadata_group_id or
+                !std.meta.eql(routing.snapshot.status.metadata_incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
+                return error.TopologyChanged;
+            const range = for (routing.ranges) |candidate| {
+                if (candidate.group_id == fence.route.group_id) break candidate;
+            } else return error.TopologyChanged;
+            const manager = @import("../metadata/table_manager.zig");
+            if (range.table_id != fence.table_id or
+                manager.rangeDocIdentityRangeId(range.*) != fence.route.range_id or
+                fence.route.identity_namespace.table_id != range.table_id or
+                fence.route.identity_namespace.shard_id != manager.rangeDocIdentityShardId(range.*) or
+                fence.route.identity_namespace.range_id != manager.rangeDocIdentityRangeId(range.*)) return error.TopologyChanged;
+            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, fence.route.group_id, topology_epoch);
             if (participant.dag_domains.len != 0) return error.InvalidTxnRequest;
+            if (participant.route_fence) |existing|
+                if (!std.meta.eql(existing.nativeJsonProjection(), fence.nativeJsonProjection())) return error.TopologyChanged;
+            participant.route_fence = fence;
             participant.dag_domains = owner.domains;
         }
         if (table.relational_activation) |command| {
@@ -2470,7 +2486,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
     const row_semantics = @import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
     const gated = req.req.commit_requires == .direct_enrichments;
     const dag = req.req.dag_domains.len != 0;
-    if (dag and (req.req.dag_domains.len > 64 or req.req.restore_staging_scope != null)) return error.InvalidTxnRequest;
+    if (dag and (req.req.dag_domains.len > 64 or req.req.restore_staging_scope != null or req.route_fence == null)) return error.InvalidTxnRequest;
     if (dag) try out.appendSlice(alloc, "[\"dag-prepare-v1\",") else if (gated) try out.appendSlice(alloc, "[\"prepared-enrichments-prepare-v1\",") else if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
@@ -2847,7 +2863,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     if (range_guards_owner != null and range_guards_owner.?.value.len != 0 and route_fence == null) return error.InvalidTxnRequest;
     const has_guards = range_guards_owner != null and range_guards_owner.?.value.len != 0;
     if (has_guards and !wrapped) return error.InvalidTxnRequest;
-    if (dag and restore_staging_scope != null) return error.InvalidTxnRequest;
+    if (dag and (restore_staging_scope != null or route_fence == null)) return error.InvalidTxnRequest;
     if (wrapped and !dag and !row_semantics and !has_guards) return error.InvalidTxnRequest;
     if (@import("antfly_local_sources").api_internal_batch.requiresRowSemanticsEnvelope(writes, predicates) and !dag and !row_semantics) return error.InvalidTxnRequest;
     return .{
@@ -7124,11 +7140,20 @@ test "distributed txn DAG prepare preserves binary contributions on both private
         .producer_versions = @splat(7),
         .replacements = &.{.{ .owner = @splat(8), .source = "\xff\x00", .targets = &.{"\x00\xfe"} }},
     }};
-    const encoded = try encodeTxnPrepareRequest(alloc, .{ .txn_id = id, .topology_epoch = 9, .req = .{ .dag_domains = domains } });
+    const fence: @import("../metadata/api.zig").CatalogRouteFence = .{
+        .metadata_group_id = 1,
+        .catalog_revision = 2,
+        .table_id = 3,
+        .topology_epoch = 9,
+        .route = .{ .group_id = 4, .range_id = 5, .identity_namespace = .{ .table_id = 3, .shard_id = 4, .range_id = 5 } },
+    };
+    try std.testing.expectError(error.InvalidTxnRequest, encodeTxnPrepareRequest(alloc, .{ .txn_id = id, .topology_epoch = 9, .req = .{ .dag_domains = domains } }));
+    const encoded = try encodeTxnPrepareRequest(alloc, .{ .txn_id = id, .topology_epoch = 9, .route_fence = fence, .req = .{ .dag_domains = domains } });
     defer alloc.free(encoded);
     var parsed = try parseTxnPrepareRequest(alloc, encoded);
     defer freeTxnPrepareRequest(alloc, &parsed);
     try std.testing.expectEqualDeep(domains, parsed.req.dag_domains);
+    try std.testing.expectEqualDeep(fence.nativeJsonProjection(), parsed.route_fence.?.nativeJsonProjection());
     const head = "[\"dag-prepare-v1\",";
     try std.testing.expect(std.mem.startsWith(u8, encoded, head));
     try std.testing.expectError(error.InvalidTxnRequest, parseTxnPrepareRequest(alloc, encoded[head.len .. encoded.len - 1]));

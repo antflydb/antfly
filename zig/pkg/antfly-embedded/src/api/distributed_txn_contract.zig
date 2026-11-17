@@ -57,7 +57,7 @@ pub const TxnStatusRequest = struct {
 };
 
 pub const DagOwnerPrepare = struct {
-    group_id: u64,
+    fence: @import("../metadata/catalog_route_contract.zig").CatalogRouteFence,
     domains: []const db_types.DagDomainPrepare,
 };
 
