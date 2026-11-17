@@ -86,6 +86,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
         try context.ensureActive();
         if (err == error.OutOfMemory) return err;
         switch (err) {
+            error.ExternalLakeIndexNotPublished,
             error.ExternalLakeIndexUnavailable,
             error.InvalidLogicalRowIdentity,
             error.LakeIndexArtifactUnavailable,

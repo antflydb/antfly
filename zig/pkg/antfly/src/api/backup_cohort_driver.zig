@@ -212,7 +212,13 @@ pub fn Session(comptime Source: type) type {
             const owner = state.owners[state.cursor];
             switch (state.phase) {
                 .freezing => {
-                    try self.control(owner, .begin);
+                    self.control(owner, .begin) catch |err| switch (err) {
+                        // Producer-bearing owners drain pending publication
+                        // before installing the freeze. Keep this durable
+                        // phase and its exact idempotent fence while they do.
+                        error.IntegrityTopologyBusy => return .waiting,
+                        else => return err,
+                    };
                     try self.next(.draining, null);
                 },
                 .draining => {
@@ -288,4 +294,51 @@ pub fn Session(comptime Source: type) type {
             }
         }
     };
+}
+
+test "backup cohort admission waits for producer drain without advancing or replaying unknown outcomes" {
+    const A = std.mem.Allocator;
+    const Fake = struct {
+        failure: ?anyerror = error.IntegrityTopologyBusy,
+        actions: usize = 0,
+        checkpoints: usize = 0,
+        fn batch(ptr: *anyopaque, _: A, _: []const u8, req: @import("antfly_local_sources").storage_db_types.BatchRequest) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.actions += 1;
+            try std.testing.expectEqual(.begin, req.relational_topology.?.action);
+            try std.testing.expectEqual(@as(u64, 1), req.relational_topology.?.fence.transition_id);
+            if (self.failure) |err| return err;
+            return {};
+        }
+        fn compareAndSetBackupCohort(self: *@This(), _: A, req: anytype, _: operation.RequestContext) !void {
+            try std.testing.expectEqual(@as(u64, 1), req.expected_revision);
+            self.checkpoints += 1;
+        }
+    };
+    const job: cohort.Job = .{ .id = 1, .revision = 1, .backup_id = "backup", .location = "file:///fixture", .connection = "default", .tables = &.{.{ .table_id = 1, .name = "docs", .definition = @splat(1) }}, .state = .{ .metadata_digest = @splat(2), .owners = &.{.{ .table_name = "docs", .range_start = "", .range_end = "", .artifact_id = "pin", .fence = .{ .transition_id = 1, .attempt = 1, .admission_epoch = 1, .owner_group_id = 2, .peer_group_id = 2, .role = .backup_snapshot, .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .catalog_digest = @splat(3) } }} } };
+    const a = std.testing.allocator;
+    const json = try std.json.Stringify.valueAlloc(a, job, .{});
+    defer a.free(json);
+    var fake: Fake = .{};
+    var write_vtable: writes.TableWriteSource.VTable = undefined;
+    write_vtable.batch = Fake.batch;
+    var session: Session(*Fake) = .{ .alloc = a, .source = &fake, .read = undefined, .write = .{ .ptr = &fake, .vtable = &write_vtable }, .request = .{}, .parsed = try std.json.parseFromSlice(cohort.Job, a, json, .{}), .seal_capacity = &.{}, .plan_digest = @splat(4) };
+    defer session.deinit();
+    try std.testing.expectEqual(.waiting, try session.prepareSlice());
+    try std.testing.expectEqual(@as(u64, 1), session.parsed.value.revision);
+    try std.testing.expectEqual(.freezing, session.parsed.value.state.phase);
+    try std.testing.expectEqual(@as(usize, 0), fake.checkpoints);
+    fake.failure = error.CommitDecisionUnknown;
+    try std.testing.expectError(error.CommitDecisionUnknown, session.prepareSlice());
+    try std.testing.expectEqual(@as(usize, 2), fake.actions);
+    try std.testing.expectEqual(@as(usize, 0), fake.checkpoints);
+    fake.failure = null;
+    try std.testing.expectEqual(.advanced, try session.prepareSlice());
+    try std.testing.expectEqual(@as(usize, 3), fake.actions);
+    try std.testing.expectEqual(@as(usize, 1), fake.checkpoints);
+    try std.testing.expectEqual(.draining, session.parsed.value.state.phase);
+    var canceled: std.atomic.Value(bool) = .init(true);
+    session.request.cancellation = .fromAtomic(&canceled);
+    try std.testing.expectError(error.Canceled, session.prepareSlice());
+    try std.testing.expectEqual(@as(usize, 3), fake.actions);
 }

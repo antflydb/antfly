@@ -27081,6 +27081,7 @@ test "authoritative catalog mutation boundaries reject orphaned semantic produce
     const orphan_enrichment =
         "{\"name\":\"orphan_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3,\"producer_json\":\"{\\\"version\\\":2,\\\"provider\\\":\\\"antfly\\\",\\\"model\\\":\\\"model-a\\\",\\\"endpoint\\\":\\\"antfly:embedded\\\",\\\"region\\\":\\\"\\\",\\\"request_format\\\":\\\"\\\",\\\"sparse\\\":false,\\\"multimodal\\\":false,\\\"input_type\\\":\\\"\\\",\\\"truncate\\\":\\\"\\\"}\"}";
     const FakeService = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
         table: metadata_table_manager.TableRecord = .{
             .table_id = 7,
             .name = "docs",
@@ -27177,6 +27178,7 @@ test "stamped catalog mutations retain their commit stamp when the post-commit r
         .index = 19,
     };
     const FakeService = struct {
+        alloc: std.mem.Allocator = std.testing.allocator,
         table: metadata_table_manager.TableRecord = .{
             .table_id = 42,
             .name = "docs",

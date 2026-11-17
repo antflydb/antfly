@@ -23,6 +23,7 @@ import time
 
 import pytest
 import requests
+from helpers import PhaseTimings
 from conftest import (
     AUTH_BOOTSTRAP_PASSWORD,
     DEFAULT_ANTFLY_BIN,
@@ -102,6 +103,7 @@ def test_logical_identity_reuses_reordered_native_indexes(
     import pyarrow as pa
     import pyarrow.parquet as pq
 
+    timings = PhaseTimings(f"lake-row-identity-{file_format}-{native_ordering}")
     count, base = 257, 9007199254740993
     root = tmp_path / "lake"
     objects = root / "buckets" / "antfly" / "objects"
@@ -209,6 +211,7 @@ def test_logical_identity_reuses_reordered_native_indexes(
                 )
 
     write(0)
+    timings.mark("initial-source-fixture")
     server = StandaloneAntflyServer(
         resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
         "127.0.0.1",
@@ -393,6 +396,7 @@ def test_logical_identity_reuses_reordered_native_indexes(
 
         attach("logical", True)
         revision = ready("logical")
+        timings.mark("initial-publication")
         first = states()
         assert first, "Logical identity state was not published"
         original = next(root for root in first if root.get("indexes") is None)
@@ -408,7 +412,9 @@ def test_logical_identity_reuses_reordered_native_indexes(
         text_after_body_update = None
         for step in (1, 2, 5, 3, 6, 4, 7):
             write(step)
+            timings.mark(f"transition-{step}-source-fixture")
             revision = ready("logical", revision)
+            timings.mark(f"transition-{step}-logical-publication")
             candidates = states()
             current = candidates[-1]
             reused = {
@@ -489,7 +495,9 @@ def test_logical_identity_reuses_reordered_native_indexes(
                 assert current["artifacts"] != original["artifacts"], current
             oracle = f"oracle{step}"
             attach(oracle, False)
+            timings.mark(f"transition-{step}-fresh-oracle-admission")
             ready(oracle)
+            timings.mark(f"transition-{step}-fresh-oracle-publication")
             requests_ = [
                 dict(
                     text,
@@ -641,6 +649,13 @@ def test_logical_identity_reuses_reordered_native_indexes(
                     "POST", "/sql", {"statement": statement.format(table=oracle)}
                 )["rows"]
                 assert actual == expected
+            timings.mark(f"transition-{step}-query-comparisons")
+            if step != 7:
+                # Each oracle proves this transition against a fresh physical
+                # build. Retiring it now prevents later source changes and
+                # restarts from rebuilding every obsolete oracle as well.
+                call("DELETE", f"/tables/{oracle}")
+                timings.mark(f"transition-{step}-oracle-retirement")
             if step in (2, 6, 7):
                 before = call("POST", "/tables/logical/query", text)
                 server.restart()
@@ -648,6 +663,7 @@ def test_logical_identity_reuses_reordered_native_indexes(
                 assert normalize(
                     call("POST", "/tables/logical/query", text)
                 ) == normalize(before)
+                timings.mark(f"transition-{step}-restart")
         # A new projection verifies its own cohort against the retained key
         # census; both external formats keep membership while publishing it.
         membership = states()[-1]["current"]["by_id"]

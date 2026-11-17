@@ -2190,6 +2190,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "backup cohort admission waits for producer drain",
         "admission routing",
         "native memory",
         "httpx internal control routes call typed operations directly",

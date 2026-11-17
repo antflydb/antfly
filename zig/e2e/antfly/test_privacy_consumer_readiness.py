@@ -31,7 +31,7 @@ from test_privacy_indexed_activation import privacy_provider as privacy_provider
 
 
 def test_protected_tenant_serves_a_during_held_b_and_rolls_back(
-    auth_api,
+    auth_api,  # noqa: F811 -- imported pytest fixture
     privacy_provider,  # noqa: F811 -- imported pytest fixtures
 ):
     api = auth_api

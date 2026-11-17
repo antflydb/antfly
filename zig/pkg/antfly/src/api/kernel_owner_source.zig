@@ -4096,6 +4096,16 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, false);
     }
 
+    fn acquireOwnerCatalog(self: *ProvisionedKernelOwnerSource, group_id: u64, descriptor: descriptor_contract.Descriptor) !@import("owner_catalog_projection.zig").Cache.Lease {
+        // A hidden restore owner is bound to the exact immutable bootstrap,
+        // including its complete index catalog. Projecting out operational
+        // fields changes that authority and fails bootstrap validation. Normal
+        // public owners still reuse physical cuts across progress-only changes.
+        if (descriptor.restore_bootstrap_json.len != 0)
+            return .{ .bytes = descriptor.indexes_json };
+        return self.physical_catalogs.acquire(self.alloc, group_id, descriptor.indexes_json);
+    }
+
     fn acquireApplyOnlyWithCatalog(
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
@@ -4103,7 +4113,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         raw_descriptor: descriptor_contract.Descriptor,
         needs_index_catalog: bool,
     ) !Lease {
-        var physical = self.physical_catalogs.acquire(self.alloc, group_id, raw_descriptor.indexes_json) catch |err|
+        var physical = self.acquireOwnerCatalog(group_id, raw_descriptor) catch |err|
             return if (err == error.OutOfMemory or err == error.CatalogProjectionBusy) error.RaftApplyWriterUnavailable else err;
         defer physical.deinit();
         var descriptor = raw_descriptor;
@@ -4193,7 +4203,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         residency: Residency,
         controls: ReadControls,
     ) !Lease {
-        var physical = self.physical_catalogs.acquire(self.alloc, group_id, raw_descriptor.indexes_json) catch |err|
+        var physical = self.acquireOwnerCatalog(group_id, raw_descriptor) catch |err|
             return if (err == error.CatalogProjectionBusy) error.StorageKernelOwnerTransitionRequired else err;
         defer physical.deinit();
         var descriptor = raw_descriptor;
@@ -8632,6 +8642,28 @@ test "source owner privacy progress keeps writer and apply leases warm" {
 
 // A warm cut must remain usable even when no new allocation can succeed.
 // Retained leases also outlive eviction and a failed replacement build.
+test "source owner restore bootstrap retains its exact catalog authority" {
+    const a = std.testing.allocator;
+    var source = ProvisionedKernelOwnerSource.init(a, "/unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.physical_catalogs.deinit(a);
+    const raw = "{\"_privacy\":{\"generation\":1,\"coverage\":{},\"scans\":[]}}";
+    var descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = 0,
+        .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .indexes_json = raw,
+        .restore_bootstrap_json = "immutable restore authority",
+    };
+    var hidden = try source.acquireOwnerCatalog(2, descriptor);
+    defer hidden.deinit();
+    try std.testing.expectEqualStrings(raw, hidden.bytes);
+    try std.testing.expect(hidden.entry == null);
+    descriptor.restore_bootstrap_json = "";
+    var public = try source.acquireOwnerCatalog(2, descriptor);
+    defer public.deinit();
+    try std.testing.expect(!std.mem.eql(u8, raw, public.bytes));
+    try std.testing.expectEqual(@as(usize, 0), source.physical_catalogs.entries.count());
+}
+
 test "source owner privacy projection caches exact cuts without warm allocations" {
     const Cache = @import("owner_catalog_projection.zig").Cache;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
