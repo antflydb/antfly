@@ -1530,6 +1530,14 @@ fn parseBatchRequestWithOptions(
         if (phase_value != .string or txn_value != .string or txn_value.string.len != 32) return error.InvalidBatchRequest;
         var txn_id: db_mod.types.TxnId = undefined;
         _ = std.fmt.hexToBytes(&txn_id, txn_value.string) catch return error.InvalidBatchRequest;
+        const ordinary_begin = std.mem.eql(u8, phase_value.string, "begin_ordinary_completion_v1");
+        const ordinary_prepare = std.mem.eql(u8, phase_value.string, "prepare_ordinary_completion_v1");
+        const ordinary_phase = ordinary_begin or ordinary_prepare;
+        if (ordinary_phase != object.contains("ordinary_producer")) return error.InvalidBatchRequest;
+        if (ordinary_phase) {
+            const marker = object.get("ordinary_producer").?;
+            if (marker != .bool or !marker.bool) return error.InvalidBatchRequest;
+        }
         const scoped_begin = std.mem.eql(u8, phase_value.string, "begin_source_scope_v1");
         const scoped_prepare = std.mem.eql(u8, phase_value.string, "prepare_source_scope_v1");
         const scoped_resolve = std.mem.eql(u8, phase_value.string, "resolve_source_scope_v1");
@@ -1576,9 +1584,9 @@ fn parseBatchRequestWithOptions(
             if (!std.mem.eql(u8, &checkpoint.purpose, &source_purpose.?)) return error.SourceTransactionIdentityConflict;
             if (source_scope) |scope| if (!std.mem.eql(u8, &scope.binding, &checkpoint.binding) or scope.sequence != checkpoint.sequence) return error.SourceTransactionIdentityConflict;
         }
-        const completion_begin = source_begin or std.mem.eql(u8, phase_value.string, "begin_completion_v1");
+        const completion_begin = ordinary_begin or source_begin or std.mem.eql(u8, phase_value.string, "begin_completion_v1");
         if (completion_begin != object.contains("completion_admission")) return error.InvalidBatchRequest;
-        const completion_prepare = source_prepare or std.mem.eql(u8, phase_value.string, "prepare_completion_v1");
+        const completion_prepare = ordinary_prepare or source_prepare or std.mem.eql(u8, phase_value.string, "prepare_completion_v1");
         const completion_resolve = source_resolve or std.mem.eql(u8, phase_value.string, "resolve_completion_v1");
         const completion_publish = std.mem.eql(u8, phase_value.string, "publish_completion_v1");
         if (completion_publish != object.contains("completion_certificate")) return error.InvalidBatchRequest;
@@ -1614,9 +1622,12 @@ fn parseBatchRequestWithOptions(
                 const raw = object.get("completion_admission").?;
                 if (raw != .string) return error.InvalidBatchRequest;
                 try validateCompletionBegin(alloc, raw.string, txn_id, transaction_participants, completion_owner, try parseInternalU64(object.get("topology_epoch") orelse return error.InvalidBatchRequest));
+                if (ordinary_begin) try validateOrdinaryCompletionBegin(alloc, raw.string);
                 transaction_completion_admission = try alloc.dupe(u8, raw.string);
             }
+            if (ordinary_begin and completion_owner == null) return error.InvalidBatchRequest;
             break :transaction .{ .begin = .{
+                .ordinary_producer = ordinary_begin,
                 .txn_id = txn_id,
                 .begin_timestamp = try parseInternalU64(object.get("begin_timestamp") orelse return error.InvalidBatchRequest),
                 .created_at_ns = try parseInternalU64(object.get("created_at_ns") orelse return error.InvalidBatchRequest),
@@ -1643,6 +1654,7 @@ fn parseBatchRequestWithOptions(
         const guarded_prepare = std.mem.eql(u8, phase_value.string, "prepare_ranges_v1") or (completion_prepare and range_guards != null and range_guards.?.value.len != 0);
         if (guarded_prepare != (range_guards != null and range_guards.?.value.len != 0)) return error.InvalidBatchRequest;
         if (std.mem.eql(u8, phase_value.string, "prepare") or guarded_prepare or completion_prepare) break :transaction .{ .prepare = .{
+            .ordinary_producer = ordinary_prepare,
             .txn_id = txn_id,
             .topology_epoch = try parseInternalU64(object.get("topology_epoch") orelse return error.InvalidBatchRequest),
             .completion_owner = completion_owner,
@@ -2440,6 +2452,8 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         try writer.writeAll(",\"_transaction\":{");
         switch (mutation) {
             .begin => |begin| {
+                if (begin.ordinary_producer and (begin.completion_admission == null or begin.completion_owner == null or begin.source_purpose != null or begin.source_scope != null or begin.source_checkpoint or begin.source_checkpoint_receipts)) return error.InvalidBatchRequest;
+                if (begin.ordinary_producer) try validateOrdinaryCompletionBegin(alloc, begin.completion_admission.?);
                 try validateSourceCompletionPurpose(begin.source_purpose, begin.completion_owner);
                 if (begin.source_purpose != null and !begin.retain_terminal) return error.InvalidBatchRequest;
                 if (begin.source_checkpoint and begin.source_purpose == null) return error.InvalidBatchRequest;
@@ -2451,13 +2465,14 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
                 if (begin.completion_admission == null and begin.completion_owner != null) return error.InvalidBatchRequest;
                 const txn_hex = std.fmt.bytesToHex(begin.txn_id, .lower);
                 try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"begin_timestamp\":\"{d}\",\"created_at_ns\":\"{d}\",\"topology_epoch\":\"{d}\",\"retain_terminal\":{},\"participants\":[", .{
-                    if (begin.source_scope != null) "begin_source_scope_v1" else if (begin.source_checkpoint_receipts) "begin_source_checkpoint_v2" else if (begin.source_checkpoint) "begin_source_checkpoint_v1" else if (begin.source_purpose != null) "begin_source_completion_v1" else if (begin.completion_admission != null) "begin_completion_v1" else "begin", &txn_hex, begin.begin_timestamp, begin.created_at_ns, begin.topology_epoch, begin.retain_terminal,
+                    if (begin.ordinary_producer) "begin_ordinary_completion_v1" else if (begin.source_scope != null) "begin_source_scope_v1" else if (begin.source_checkpoint_receipts) "begin_source_checkpoint_v2" else if (begin.source_checkpoint) "begin_source_checkpoint_v1" else if (begin.source_purpose != null) "begin_source_completion_v1" else if (begin.completion_admission != null) "begin_completion_v1" else "begin", &txn_hex, begin.begin_timestamp, begin.created_at_ns, begin.topology_epoch, begin.retain_terminal,
                 });
                 for (begin.participants, 0..) |participant, i| {
                     if (i != 0) try writer.writeByte(',');
                     try writer.print("{f}", .{std.json.fmt(participant, .{})});
                 }
                 try writer.writeByte(']');
+                if (begin.ordinary_producer) try writer.writeAll(",\"ordinary_producer\":true");
                 if (begin.completion_admission) |raw| {
                     try validateCompletionControlRequest(req);
                     try validateCompletionBegin(alloc, raw, begin.txn_id, begin.participants, begin.completion_owner, begin.topology_epoch);
@@ -2470,6 +2485,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
                 }
             },
             .prepare => |prepare| {
+                if (prepare.ordinary_producer and (prepare.completion_owner == null or prepare.source_purpose != null or prepare.source_scope != null or prepare.source_checkpoint != null)) return error.InvalidBatchRequest;
                 try validateSourceCompletionPurpose(prepare.source_purpose, prepare.completion_owner);
                 if (prepare.source_scope) |scope| {
                     try scope.validate();
@@ -2487,7 +2503,8 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
                     if (owner.topology_epoch != prepare.topology_epoch) return error.InvalidBatchRequest;
                 }
                 const txn_hex = std.fmt.bytesToHex(prepare.txn_id, .lower);
-                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ if (prepare.source_scope != null) "prepare_source_scope_v1" else if (prepare.source_checkpoint != null and prepare.source_checkpoint.?.receipt_window != 0) "prepare_source_checkpoint_v2" else if (prepare.source_checkpoint != null) "prepare_source_checkpoint_v1" else if (prepare.source_purpose != null) "prepare_source_completion_v1" else if (prepare.completion_owner != null) "prepare_completion_v1" else if (req.range_guards.len != 0) "prepare_ranges_v1" else "prepare", &txn_hex, prepare.topology_epoch });
+                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ if (prepare.ordinary_producer) "prepare_ordinary_completion_v1" else if (prepare.source_scope != null) "prepare_source_scope_v1" else if (prepare.source_checkpoint != null and prepare.source_checkpoint.?.receipt_window != 0) "prepare_source_checkpoint_v2" else if (prepare.source_checkpoint != null) "prepare_source_checkpoint_v1" else if (prepare.source_purpose != null) "prepare_source_completion_v1" else if (prepare.completion_owner != null) "prepare_completion_v1" else if (req.range_guards.len != 0) "prepare_ranges_v1" else "prepare", &txn_hex, prepare.topology_epoch });
+                if (prepare.ordinary_producer) try writer.writeAll(",\"ordinary_producer\":true");
                 if (prepare.completion_owner) |owner| try writer.print(",\"completion_owner\":{f}", .{std.json.fmt(owner, .{})});
                 if (prepare.source_scope) |scope| try writer.print(",\"source_scope\":{f}", .{std.json.fmt(scope, .{})});
                 if (prepare.source_purpose) |purpose| try writer.print(",\"source_purpose\":{f}", .{std.json.fmt(purpose, .{})});
@@ -3944,6 +3961,12 @@ pub fn validateCompletionPublication(a: std.mem.Allocator, id: [16]u8, owner: @i
     try parsed.value.certificate.manifest.admission().requireRoutedOwner(owner);
 }
 
+fn validateOrdinaryCompletionBegin(a: std.mem.Allocator, raw: []const u8) !void {
+    var parsed = try @import("../storage/transaction_completion.zig").parseAdmission(a, raw);
+    defer parsed.deinit();
+    if (parsed.value.admission.version != 3) return error.ChangefeedCapabilityUnsupported;
+}
+
 pub fn validateCompletionBegin(a: std.mem.Allocator, raw: []const u8, id: [16]u8, participants: []const []const u8, owner: ?@import("../storage/transaction_completion.zig").RoutedOwner, topology_epoch: u64) !void {
     const completion = @import("../storage/transaction_completion.zig");
     var plan = completion.parseAdmission(a, raw) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBatchRequest;
@@ -4309,4 +4332,60 @@ test "completion begin wire scoped source phases retain attempts and reject down
     var changed = prepare;
     changed.transaction.?.prepare.source_scope.?.sequence = 2;
     try std.testing.expectError(error.SourceTransactionIdentityConflict, encodeBatchRequest(a, changed));
+}
+
+test "completion begin wire ordinary producer phases preserve absence and reject downgrade" {
+    const a = std.testing.allocator;
+    const completion = @import("../storage/transaction_completion.zig");
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 2, .topology_epoch = 3 };
+    const id: [16]u8 = @splat(3);
+    const prepare = try (db_mod.types.TransactionIntentRequest{ .completion_ordinary_producer = true, .completion_owner = owner, .writes = &.{.{ .key = "row", .value = "{}" }} }).completionBatch(id, 100, owner.topology_epoch);
+    const input = try completionPrepareInput(a, prepare);
+    defer a.free(input);
+    const members = [_]completion.Participant{.{ .namespace = owner.namespace, .owner_fence = owner.digest(), .input_digest = completion.preparedInputDigest(owner.namespace, input), .roles = completion.Roles.effects, .locator = "table2:00000004:docs:2", .routed_owner = owner }};
+    const admission: completion.Admission = .{ .version = 3, .transaction_id = id, .admission_digest = @splat(4), .coordinator_namespace = owner.namespace, .coordinator_fence = owner.digest(), .participants = &members };
+    const raw = try completion.encodeAdmission(a, admission);
+    defer a.free(raw);
+    const begin: db_mod.types.BatchRequest = .{ .sync_level = .write, .transaction = .{ .begin = .{ .ordinary_producer = true, .txn_id = id, .begin_timestamp = 100, .created_at_ns = 101, .topology_epoch = owner.topology_epoch, .participants = &.{members[0].locator}, .completion_admission = raw, .completion_owner = owner } } };
+    for ([_]db_mod.types.BatchRequest{ begin, prepare }, [_][]const u8{ "begin_ordinary_completion_v1", "prepare_ordinary_completion_v1" }, [_][]const u8{ "begin_completion_v1", "prepare_completion_v1" }) |request, tag, old_tag| {
+        const encoded = try encodeBatchRequest(a, request);
+        defer a.free(encoded);
+        var decoded = try parseInternalBatchRequest(a, encoded);
+        defer decoded.deinit(a);
+        const labelled = switch (decoded.req.transaction.?) {
+            .begin => |value| value.ordinary_producer,
+            .prepare => |value| value.ordinary_producer,
+            else => false,
+        };
+        try std.testing.expect(labelled);
+        try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, encoded));
+        const downgraded = try std.mem.replaceOwned(u8, a, encoded, tag, old_tag);
+        defer a.free(downgraded);
+        try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, downgraded));
+        const stripped = try std.mem.replaceOwned(u8, a, encoded, ",\"ordinary_producer\":true", "");
+        defer a.free(stripped);
+        try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, stripped));
+        const false_marker = try std.mem.replaceOwned(u8, a, encoded, "\"ordinary_producer\":true", "\"ordinary_producer\":false");
+        defer a.free(false_marker);
+        try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, false_marker));
+        var old = request;
+        switch (old.transaction.?) {
+            .begin => |*value| value.ordinary_producer = false,
+            .prepare => |*value| value.ordinary_producer = false,
+            else => unreachable,
+        }
+        const old_encoded = try encodeBatchRequest(a, old);
+        defer a.free(old_encoded);
+        var old_decoded = try parseInternalBatchRequest(a, old_encoded);
+        defer old_decoded.deinit(a);
+        const upgraded = switch (old_decoded.req.transaction.?) {
+            .begin => |value| value.ordinary_producer,
+            .prepare => |value| value.ordinary_producer,
+            else => true,
+        };
+        try std.testing.expect(!upgraded);
+    }
+    var mixed = prepare;
+    mixed.transaction.?.prepare.source_purpose = @splat(5);
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, mixed));
 }

@@ -119,7 +119,7 @@ pub const Coordinator = struct {
             try captured.append(scratch, .{ .input = .{ .owner = qualified.owner, .locator = locator, .roles = roles, .prepare = request }, .fence = fence, .table_name = try scratch.dupe(u8, input.table_name), .retention_limit_bytes = qualified.observation.retention_limit_bytes });
         }
         if (unsupported == inputs.len) {
-            for (inputs) |input| if (input.intent.completion_source_purpose != null or input.intent.completion_source_scope != null or input.intent.completion_source_checkpoint != null or input.intent.source_admission != null) return error.ChangefeedCapabilityUnsupported;
+            for (inputs) |input| if (input.intent.completion_ordinary_producer or input.intent.completion_source_purpose != null or input.intent.completion_source_scope != null or input.intent.completion_source_checkpoint != null or input.intent.source_admission != null) return error.ChangefeedCapabilityUnsupported;
             arena.deinit();
             return null;
         }

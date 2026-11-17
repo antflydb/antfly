@@ -104,7 +104,10 @@ pub fn applyReplicatedTransactionMutationInternal(
                         _ = try db.beginReplicatedScopedSourceCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, entry, purpose, scope)
                     else
                         _ = try db.beginReplicatedSourceCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, entry, purpose);
-                } else _ = try db.beginReplicatedCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, begin.retain_terminal, entry);
+                } else if (begin.ordinary_producer)
+                    _ = try db.beginReplicatedOrdinaryCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, begin.retain_terminal, entry)
+                else
+                    _ = try db.beginReplicatedCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, begin.retain_terminal, entry);
                 return;
             }
             const coordinator = std.mem.eql(u8, begin.participants[0], local_participant);
@@ -142,6 +145,7 @@ pub fn applyReplicatedTransactionMutationInternal(
             defer alloc.free(encoded_input);
             const namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(db.core.identity_namespace);
             const intents: db_mod.types.TransactionIntentRequest = .{
+                .completion_ordinary_producer = prepare.ordinary_producer,
                 .completion_owner = prepare.completion_owner,
                 .completion_source_purpose = prepare.source_purpose,
                 .completion_source_scope = prepare.source_scope,

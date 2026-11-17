@@ -6508,3 +6508,91 @@ cache cleanup completed successfully, preserving active/recent build output and
 leaving 19.4 GiB free (`source-ordinary-transaction-gc.log`). `git diff --check`
 passed. Both source and changefeed issues were re-read and remain open with their
 original acceptance criteria; none is discharged by this storage-only milestone.
+
+### Explicit ordinary completion transport (verification in progress)
+
+The private batch contract now has separate `begin_ordinary_completion_v1` and
+`prepare_ordinary_completion_v1` phases with a required true
+`ordinary_producer` marker. Missing, false, mixed source metadata and old-phase
+labels fail closed. Ordinary completion v1 phases retain the original absent
+classification; parsing, forwarding and replay never upgrade them. Public batch
+parsing still rejects private transaction envelopes. New ordinary BEGIN requires
+full v3 completion membership and a routed physical owner.
+
+`TransactionIntentRequest.completion_ordinary_producer` is explicit trusted native
+input, defaults false and participates in the canonical private PREPARE. Frozen
+plans derive it from all original votes, reject mixed provenance, bind it into
+input/admission digests and preserve it through frozen artifact restore and every
+BEGIN/PREPARE dispatch. The coordinator does not infer ordinary origin merely
+because a source purpose is absent: existing legacy CDC can still enter ordinary
+batch machinery, so that inference would be unsafe.
+
+Data protocol 42 supplies the all-applying-member activation floor for these new
+phases. Native owner ABI 112 fences the new mutation semantics and storage engine
+62 adds a separate explicitly classified ordinary completion BEGIN. Old BEGIN
+methods preserve their old behavior. PREPARE checks the stored provenance even on
+the already-prepared fast path before advancing a fresh marker. Resolution uses
+the immutable retained record and captured intent revision, without a new caller
+label. API kernel 33 independently fences the changed routed callback layout.
+
+The new native DB fixture provisions history on a fresh fixture root, installs a
+modeled ordered producer closure, rejects old unclassified BEGIN, admits explicit
+ordinary BEGIN, rejects unlabelled PREPARE without advancing its marker, prepares
+a nonempty row, reopens the store, rechecks PREPARE provenance, retries the
+original prepared input and resolves the original transaction. It checks row
+materialization and an effects receipt. Closure cuts/policy/owner are explicit
+fixture authority; this is not production closure activation or legacy drainage.
+The authenticated linked HTTP/Raft fixture now explicitly classifies its existing
+nonempty completion transaction and requires profile 42; source transactions later
+in that same group must not regress its activated floor.
+
+An initial run passed the existing 16 history and 30 private-wire cases plus six
+local boundary cases, but the new DB helper failed compilation because it used a
+private `db.types` alias. That import was corrected. The first wire-test addition
+command also used the wrong working directory and added no tests; it was corrected
+at the repository root after the initial run was terminal. Final native, wire,
+frozen-plan and linked results follow below; none is presumed from compilation or
+an earlier milestone.
+
+Trusted ordinary ingress classification itself remains to be connected after all
+legacy producer paths are labeled. Producer closure transport/activation,
+qualified old-transaction decision recovery/drainage, special mutations,
+snapshot/cohort transfer, and first-strict physical activation remain required.
+All original destination/history/public feeds/bootstrap/retention/pgoutput/actual
+Antfly client acceptance requirements remain open under the active full goal.
+
+The first combined final run exposed the missing storage-engine forwarding
+function, a missing `try` in the frozen-plan test and an exhaustive synthetic test
+union; those compile errors were corrected. The native DB fixture now explicitly
+pins revision-v1 semantics, matching its canonical private PREPARE. The subsequent
+run passed all 31 private-wire tests, six local boundary cases, 16 history cases
+and the actual DB/compiled-engine case, including nonempty materialization after
+reopen and a retained effects receipt
+(`source-ordinary-transport-qualified-test.log`). The linked run passed the new
+protocol and frozen-plan tests but failed its large fixture because a manually
+proposed idle barrier still requested version 33 after the ordinary transaction
+had activated 42. That fixture barrier was corrected to preserve the irreversible
+floor; command-specific source checkpoint requirements remain 38.
+
+Generation completed successfully (`source-ordinary-transport-generate.log`), and
+only the two unrelated explorer outputs were discarded. The corrected linked run
+passed all six local and 32 linked cases, zero failures, skips or leaks
+(`source-ordinary-transport-linked-final-test.log`). The frozen-plan test also
+rejects mixed ordinary/unclassified participant votes. Review additionally closed
+the coordinator's unsupported-history fallback: an explicitly classified ordinary
+intent cannot silently fall back to the legacy transaction machinery. Inputs with
+no explicit classification retain existing fallback behavior. Verification of
+that final guard is recorded below. Final source-catalog, engine-error and OpenAPI
+checks passed (`source-ordinary-transport-admission-contract-check.log`).
+
+The final coordinator-guard run passed all six local and 32 linked cases with
+zero failures, skips or leaks
+(`source-ordinary-transport-admission-final-test.log`). This includes the real
+service-authenticated HTTP participant, actual native Raft application and
+ReadIndex/retained-resolution recovery; the explicit ordinary label is trusted
+fixture input, not inferred production ingress. Guarded cache cleanup completed
+successfully (`source-ordinary-transport-gc.log`), preserving active/recent output
+and leaving 14.0 GiB free. `git diff --check` passed. Current versions are engine
+62, owner ABI 112, API kernel 33, data protocol 42, metadata 105 and failure 89.
+The first-strict gate and all remaining full-scope acceptance requirements remain
+open; neither issue is closed and the implementation PR remains a draft.

@@ -25695,30 +25695,38 @@ pub const DB = struct {
     /// are committed in the same native transaction.
     pub fn beginReplicatedCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: ?@import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity });
-        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity, null, null);
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity, null, null, false);
+    }
+
+    /// Private protocol-42 path. Only an explicitly classified new request may
+    /// use it; ordinary completion v1 remains unclassified on replay.
+    pub fn beginReplicatedOrdinaryCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedOrdinaryCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity });
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, retain_terminal, identity, null, null, true);
     }
 
     pub fn beginReplicatedSourceCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: OrderedApplyReceipt, purpose: [32]u8) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedSourceCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, identity, purpose });
         if (std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
-        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, true, identity, purpose, null);
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, true, identity, purpose, null, false);
     }
 
     pub fn beginReplicatedScopedSourceCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: OrderedApplyReceipt, purpose: [32]u8, scope: @import("../source_scope.zig").Reference) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedScopedSourceCompletionTransaction", .{ self, encoded_plan, owner, timestamp_ns, created_at_ns, identity, purpose, scope });
         try scope.validate();
         if (std.mem.allEqual(u8, &purpose, 0)) return error.InvalidSourceAdmission;
-        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, true, identity, purpose, scope);
+        return self.beginReplicatedCompletionTransactionInternal(encoded_plan, owner, timestamp_ns, created_at_ns, true, identity, purpose, scope, false);
     }
 
-    fn beginReplicatedCompletionTransactionInternal(self: *DB, encoded_plan: []const u8, owner: ?@import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt, purpose: ?[32]u8, scope: ?@import("../source_scope.zig").Reference) !transactions_mod.TxnId {
+    fn beginReplicatedCompletionTransactionInternal(self: *DB, encoded_plan: []const u8, owner: ?@import("../transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: OrderedApplyReceipt, purpose: ?[32]u8, scope: ?@import("../source_scope.zig").Reference, ordinary_producer: bool) !transactions_mod.TxnId {
         const completion = @import("../transaction_completion.zig");
         if (self.isClosed()) return error.StorageUnavailable;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var parsed = try completion.parseAdmission(self.alloc, encoded_plan);
         defer parsed.deinit();
         const plan = parsed.value.admission;
-        if (purpose != null and plan.version < 3) return error.ChangefeedCapabilityUnsupported;
+        if (ordinary_producer and (purpose != null or scope != null)) return error.SourceTransactionIdentityConflict;
+        if ((ordinary_producer or purpose != null) and plan.version < 3) return error.ChangefeedCapabilityUnsupported;
         if (purpose != null) {
             var checkpoints: usize = 0;
             for (plan.participants) |member| if (member.roles & completion.Roles.checkpoint != 0) {
@@ -25753,14 +25761,14 @@ pub const DB = struct {
                 defer saved.deinit();
                 if (!std.mem.eql(u8, &saved.value.digest, &parsed.value.digest)) return error.DecisionConflict;
                 if (!std.meta.eql(try manager.getSourcePurpose(plan.transaction_id), purpose)) return error.SourceTransactionIdentityConflict;
-                if (!std.meta.eql(try manager.getSourceScope(plan.transaction_id), scope)) return error.SourceTransactionIdentityConflict;
+                if (!std.meta.eql(try manager.getSourceScope(plan.transaction_id), scope) or try manager.isOrdinaryProducer(plan.transaction_id) != ordinary_producer) return error.SourceTransactionIdentityConflict;
                 return plan.transaction_id;
             },
             .apply => {},
         }
         var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker = orderedApplyReceiptWrite(identity, &value_buf);
-        const extra: transactions_mod.MutationExtraBatch = .{ .writes = &.{marker}, .source_purpose = purpose, .source_scope = scope };
+        const extra: transactions_mod.MutationExtraBatch = .{ .ordinary_producer = ordinary_producer, .writes = &.{marker}, .source_purpose = purpose, .source_scope = scope };
         if (std.mem.eql(u8, &namespace, &plan.coordinator_namespace))
             try manager.initTransactionWithCompletionAdmission(plan, timestamp_ns, created_at_ns, retain_terminal, extra)
         else
@@ -26803,7 +26811,7 @@ pub const DB = struct {
             }
             var manager = try self.core.initTxnManager();
             defer manager.deinit();
-            if (try manager.completionPrepareScopedStatus(txn_id, req.completion_input_digest, source_purpose, req.completion_owner, req.completion_source_scope)) |prepared| {
+            if (try manager.completionPrepareProducerStatus(txn_id, req.completion_input_digest, source_purpose, req.completion_owner, req.completion_source_scope, req.completion_ordinary_producer)) |prepared| {
                 if (ordered_receipt == null) {
                     var read = try self.core.store.beginReadTxn();
                     defer read.abort();
@@ -27220,10 +27228,11 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .completion_owner = req.completion_owner, .completion_input_digest = req.completion_input_digest, .source_purpose = source_purpose, .source_scope = req.completion_source_scope, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .ordinary_producer = req.completion_ordinary_producer, .completion_owner = req.completion_owner, .completion_input_digest = req.completion_input_digest, .source_purpose = source_purpose, .source_scope = req.completion_source_scope, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .ordinary_producer = req.completion_ordinary_producer,
                 .completion_owner = req.completion_owner,
                 .completion_input_digest = req.completion_input_digest,
                 .source_purpose = source_purpose,

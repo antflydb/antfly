@@ -852,8 +852,12 @@ pub const TxnManager = struct {
     }
 
     pub fn completionPrepareScopedStatus(self: *TxnManager, txn_id: TxnId, input_digest: ?[32]u8, source_purpose: ?[32]u8, owner: ?completion.RoutedOwner, scope: ?source_scope.Reference) !?bool {
+        return self.completionPrepareProducerStatus(txn_id, input_digest, source_purpose, owner, scope, false);
+    }
+
+    pub fn completionPrepareProducerStatus(self: *TxnManager, txn_id: TxnId, input_digest: ?[32]u8, source_purpose: ?[32]u8, owner: ?completion.RoutedOwner, scope: ?source_scope.Reference, ordinary_producer: bool) !?bool {
         var frozen = (try self.getCompletionAdmission(self.alloc, txn_id)) orelse {
-            if (owner != null) return error.SourceTransactionIdentityConflict;
+            if (owner != null or ordinary_producer) return error.SourceTransactionIdentityConflict;
             return null;
         };
         defer frozen.deinit();
@@ -876,7 +880,7 @@ pub const TxnManager = struct {
         defer probe.abort();
         try @import("committed_history.zig").requireCompletionReservation(&probe, namespace[0..24].*, plan);
         const record = try self.loadTransactionRecord(txn_id);
-        if (!samePurpose(record.source_purpose, source_purpose) or !sameSourceScope(record.source_scope, scope)) return error.SourceTransactionIdentityConflict;
+        if (record.ordinary_producer != ordinary_producer or !samePurpose(record.source_purpose, source_purpose) or !sameSourceScope(record.source_scope, scope)) return error.SourceTransactionIdentityConflict;
         if (record.status != .pending) return TxnError.DecisionConflict;
         return record.prepared_known and record.prepared;
     }
@@ -2645,6 +2649,10 @@ pub const TxnManager = struct {
         const record = try self.loadTransactionRecord(txn_id);
         if (!samePurpose(record.source_purpose, purpose)) return error.SourceTransactionIdentityConflict;
         if (record.status != .pending or !record.prepared_known or record.prepared or record.intent_revision != 0) return error.SourcePendingWork;
+    }
+
+    pub fn isOrdinaryProducer(self: *TxnManager, txn_id: TxnId) !bool {
+        return (try self.loadTransactionRecord(txn_id)).ordinary_producer;
     }
 
     pub fn getSourceScope(self: *TxnManager, txn_id: TxnId) !?source_scope.Reference {

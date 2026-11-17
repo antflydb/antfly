@@ -35,7 +35,8 @@ pub const StatusDetail = error_abi.Detail;
 // Version 30 adds the qualified source-scope observation callback.
 // Version 31 adds the authenticated source-scope lifecycle control port.
 // Version 32 adds the owned authenticated source retirement control port.
-pub const abi_version: u32 = 32;
+// Version 33 fences routed batches with explicit ordinary transaction origin.
+pub const abi_version: u32 = 33;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

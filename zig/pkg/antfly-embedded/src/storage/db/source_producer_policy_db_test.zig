@@ -73,4 +73,5 @@ pub fn run(a: std.mem.Allocator, path: []const u8, options: db_mod.OpenOptions, 
         try std.testing.expectError(error.SourceAdmissionCorrupt, db.applyOrderedCommittedMutationWithProducer(late, .ordinary, .{ .term = 1, .index = 15 }, false));
         try std.testing.expect(try db.get(a, "producer-late") == null);
     }
+    try @import("source_ordinary_transaction_db_test.zig").run(a, path, options, owner);
 }

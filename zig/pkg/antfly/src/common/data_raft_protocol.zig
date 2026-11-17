@@ -40,7 +40,7 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 41;
+pub const batch_protocol_version: u16 = 42;
 /// Frozen completion BEGIN and owner/input-fenced PREPARE require durable
 /// activation across every applying member before proposal or native apply.
 pub const batch_completion_admission_protocol_version: u16 = 31;
@@ -66,6 +66,12 @@ pub const batch_source_attempt_protocol_version: u16 = 39;
 pub const batch_source_scope_control_protocol_version: u16 = 40;
 /// Version 41 applies original-coordinator-authorized source attempt retirement.
 pub const batch_source_retirement_protocol_version: u16 = 41;
+/// Version 42 retains explicit ordinary transaction producer identity.
+pub const batch_ordinary_producer_protocol_version: u16 = 42;
+fn isOrdinaryProducer(value: anytype) bool {
+    if (comptime !@hasField(@TypeOf(value), "ordinary_producer")) return false;
+    return value.ordinary_producer;
+}
 fn hasSourceScope(value: anytype) bool {
     if (comptime !@hasField(@TypeOf(value), "source_scope")) return false;
     return value.source_scope != null;
@@ -93,8 +99,8 @@ pub fn completionProtocolVersion(a: @import("std").mem.Allocator, request: anyty
     const mutation = request.transaction orelse return null;
     return switch (mutation) {
         .publish_completion => |value| if (try completionEnvelopeVersion(a, value.certificate, true) >= 3) batch_completion_recovery_protocol_version else batch_completion_publication_protocol_version,
-        .begin => |value| if (hasSourceScope(value)) batch_source_attempt_protocol_version else if (hasCheckpoint(value)) checkpointProtocol(value) else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_admission) |bytes| (if (try completionEnvelopeVersion(a, bytes, false) >= 3) batch_completion_recovery_protocol_version else batch_completion_admission_protocol_version) else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
-        .prepare => |value| if (hasSourceScope(value)) batch_source_attempt_protocol_version else if (hasCheckpoint(value)) checkpointProtocol(value) else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
+        .begin => |value| if (isOrdinaryProducer(value)) batch_ordinary_producer_protocol_version else if (hasSourceScope(value)) batch_source_attempt_protocol_version else if (hasCheckpoint(value)) checkpointProtocol(value) else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_admission) |bytes| (if (try completionEnvelopeVersion(a, bytes, false) >= 3) batch_completion_recovery_protocol_version else batch_completion_admission_protocol_version) else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
+        .prepare => |value| if (isOrdinaryProducer(value)) batch_ordinary_producer_protocol_version else if (hasSourceScope(value)) batch_source_attempt_protocol_version else if (hasCheckpoint(value)) checkpointProtocol(value) else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
         .resolve => |value| if (hasSourceScope(value)) batch_source_attempt_protocol_version else if (value.source_purpose != null) batch_source_completion_protocol_version else if (value.completion_owner != null) batch_completion_admission_protocol_version else null,
         else => null,
     };
@@ -233,4 +239,19 @@ test "raft batch scoped source attempts require protocol 39 before every phase" 
     const a = @import("std").testing.allocator;
     for ([_]Request{ .{ .transaction = .{ .begin = .{} } }, .{ .transaction = .{ .prepare = .{} } }, .{ .transaction = .{ .resolve = .{} } } }) |request|
         try @import("std").testing.expectEqual(@as(?u16, 39), try completionProtocolVersion(a, request));
+}
+
+test "data raft ordered history ordinary producer requires its own activation floor" {
+    const std = @import("std");
+    const Mutation = union(enum) {
+        begin: struct { ordinary_producer: bool = false, completion_admission: ?[]const u8 = null, completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
+        prepare: struct { ordinary_producer: bool = false, completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
+        resolve: struct { completion_owner: ?u8 = null, source_purpose: ?[32]u8 = null },
+        publish_completion: struct { certificate: []const u8 },
+        other,
+    };
+    const Request = struct { transaction: ?Mutation };
+    try std.testing.expectEqual(@as(?u16, 42), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .begin = .{ .ordinary_producer = true } } }));
+    try std.testing.expectEqual(@as(?u16, 42), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .prepare = .{ .ordinary_producer = true } } }));
+    try std.testing.expectEqual(@as(?u16, 31), try completionProtocolVersion(std.testing.allocator, Request{ .transaction = .{ .prepare = .{ .completion_owner = 1 } } }));
 }

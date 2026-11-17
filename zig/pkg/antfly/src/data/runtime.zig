@@ -44955,7 +44955,7 @@ fn consumerTests() type {
                         try std.testing.expect(captured.observation.cut.term > 0 and captured.observation.cut.index > 0);
                         try std.testing.expectEqual(@as(u64, 256 * 1024 * 1024), captured.observation.retention_limit_bytes);
                         const txn_id: [16]u8 = @splat(95);
-                        const prepare: antfly.db.types.BatchRequest = .{ .timestamp_ns = 1000, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = current_owner.topology_epoch, .completion_owner = current_owner } }, .writes = &.{.{ .key = "completion-row", .value = "{\"done\":true}" }} };
+                        const prepare: antfly.db.types.BatchRequest = .{ .timestamp_ns = 1000, .document_version_scheme = .revision_v1, .sync_level = .write, .transaction = .{ .prepare = .{ .ordinary_producer = true, .txn_id = txn_id, .topology_epoch = current_owner.topology_epoch, .completion_owner = current_owner } }, .writes = &.{.{ .key = "completion-row", .value = "{\"done\":true}" }} };
                         const prepare_bytes = try @import("antfly_local_sources").api_internal_batch.completionPrepareInput(fixture_alloc, prepare);
                         defer fixture_alloc.free(prepare_bytes);
                         const locator = try @import("antfly_local_sources").api_local_transaction_contract.participantIdForGroupScoped(fixture_alloc, "docs", 601, null, null);
@@ -44979,7 +44979,7 @@ fn consumerTests() type {
                 const plan = frozen.admission;
                 const current_owner = frozen.participants[0].owner;
                 const txn_id = plan.transaction_id;
-                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_ordinary_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
                 const positive_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = txn_id, .owner_fence = current_owner.digest(), .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const positive = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
@@ -45083,10 +45083,10 @@ fn consumerTests() type {
                 try std.testing.expectEqual(.complete, try recovery.run(a, current_owner, route.fence().?, "docs", txn_id, .{}));
                 try server.completionParticipantPort().submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
                 try remote_participant.submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
-                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_ordinary_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
                 // An idle root must remain readable after an ordered protocol
                 // barrier, without requiring another document mutation.
-                const idle_barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", @import("../common/data_raft_protocol.zig").batch_completion_recovery_protocol_version);
+                const idle_barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", @import("../common/data_raft_protocol.zig").batch_ordinary_producer_protocol_version);
                 defer a.free(idle_barrier);
                 const idle_barrier_index = blk: {
                     lockAtomic(&server.data_raft_mutex);
@@ -45395,7 +45395,7 @@ fn consumerTests() type {
             try std.testing.expect(policy_applied.outcome.?.applied.consumer == null);
             const policy_observed = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect_policy = .{ .namespace = namespace, .authority = ref.authority } });
             try std.testing.expectEqualDeep(policy_applied.outcome.?.applied.policy, policy_observed.outcome.?.applied.policy);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_source_checkpoint_receipts_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_ordinary_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
         }
 
         test "data raft ordered history proposal authority fences term membership and missing owners" {
