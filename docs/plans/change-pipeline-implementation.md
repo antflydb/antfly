@@ -5894,3 +5894,55 @@ Source-catalog, engine-error and OpenAPI checks passed
 tests. The receipt is a new versioned opaque internal format; existing Raft,
 metadata and ABI versions are unchanged. No issue is closed, and the full
 original implementation goal remains active.
+
+### Recover source completion against the accepted original admission
+
+Completion recovery now has an explicit source expectation: original admission
+digest, complete scope reference, source purpose and begin/commit versions.
+`runSource` validates those fields against a fresh retained coordinator read
+before routing any terminal or publication mutation. A pending coordinator is
+unresolved, ABORT is a conflict, and missing evidence remains unproven. The
+ordinary retained-job path is unchanged and never gains source expiry authority.
+
+`source_destination_completion.zig` decodes the exact applied metadata acceptance
+receipt, qualifies its original coordinator route and invokes this bound recovery.
+Only original participant resolution/publication can produce complete. It never
+advances metadata committed progress, frees private transaction/registry state,
+returns source ACK or grants retention release. Already reclaimed receipts remain
+idempotent without reconstructing native authority. Unaccepted pending work and
+forged coordinator fences fail before recovery writes.
+
+The first linked run passed (`source-bound-completion-test.log`). Expanded
+qualification links a genuine scoped plan/manifest, modeled positive checkpoint
+observation, applied-in-memory metadata acceptance and durable receipt to the
+existing two-owner recovery port fixture. It checks identity rejection before
+writes, completion at the checkpoint coordinator even when that owner sorts
+second, and unchanged metadata committed progress. This is modeled source-flow
+qualification; successful production metadata/worker activation is still open.
+Final results follow below.
+
+The expanded receipt flow exposed a real ownership bug in frozen manifest
+construction: checkpoint strings referenced a temporary parsed batch's nested
+arena. Deinitializing that batch can return its backing allocation to the outer
+arena; later manifest serialization overwrote the checkpoint bytes. Construction
+now copies both checkpoint and predecessor strings into the retained arena before
+releasing the parsed batch. The original two-owner case reproduced the corruption
+and now verifies the complete original checkpoint command before receipt creation.
+
+A dedicated `source-completion-recovery-test` target selects the actual retained
+two-owner test through a compile discovery anchor and an exact runtime filter;
+no harness-only/empty selection counts as that qualification. Its final focused
+run passed (`source-bound-completion-owned-test.log`). Final
+`source-completion-recovery-test completion-frozen-plan-test
+history-control-apply-test -Dstrip=true -j1` exited 0
+(`source-bound-completion-final-test.log`): the focused source recovery test,
+all six frozen/receipt tests, 27 selected linked tests and six selected local
+tests passed, zero reported skips/failures/leaks. Pending and missing coordinator
+cases also produce no writes. Source-catalog, engine-error and OpenAPI checks
+passed (`source-bound-completion-final-contract-check.log`), including nine schema
+fragment tests. No protocol or ABI version changes occur in this step.
+
+The full goal remains active. These checks qualify internal receipt-bound
+completion and existing native regressions, not successful production source
+activation, all-owner private retirement/release or the remaining original
+public feeds/bootstrap/retention/pgoutput/actual Antfly client acceptance criteria.

@@ -159,7 +159,14 @@ pub const Frozen = struct {
         for (plan.participants, 0..) |participant, index| if (std.mem.eql(u8, &participant.owner.namespace, &owner.namespace)) {
             var input = try plan.prepare(owned, index);
             defer input.deinit(owned);
-            checkpoint = input.req.transaction.?.prepare.source_checkpoint;
+            if (input.req.transaction.?.prepare.source_checkpoint) |command| {
+                var retained_command = command;
+                // The parsed batch owns its strings in a nested arena. Freeing
+                // it can return the outer arena's last allocation for reuse.
+                retained_command.checkpoint = try owned.dupe(u8, command.checkpoint);
+                retained_command.expected_checkpoint = if (command.expected_checkpoint) |previous| try owned.dupe(u8, previous) else null;
+                checkpoint = retained_command;
+            }
         };
         const spec: storage.Spec = .{ .namespace = storage.namespaceFor(try entry.rootFor(owner), quota.quota.epoch), .storage_epoch = quota.quota.epoch, .binding = scope.binding, .domain = storage.domainFor(scope.binding), .attempt = attempt, .bytes = bytes.len, .checksum = sha(bytes), .plan_digest = digest, .chunk_hashes = chunks };
         if (spec.reservationBytes() > storage.max_reserved_bytes - quota.quota.reserved) return error.SourceAdmissionBackpressure;

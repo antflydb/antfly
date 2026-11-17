@@ -107,6 +107,8 @@ test "completion frozen plan acceptance receipts stay bounded and recover cleanu
     defer a.free(accepted.receipt);
     try std.testing.expect(accepted.receipt.len <= receipts.max_bytes);
     try std.testing.expect(accepted.commit_reference == null);
+    const completion: @import("source_destination_completion.zig").Completion = .{ .recovery = undefined };
+    try std.testing.expectError(error.SourcePendingWork, completion.run(a, fixture.state, accepted.receipt, fence, .{}));
     var before = try receipts.decode(a, fixture.state, accepted.receipt);
     defer before.deinit();
     try std.testing.expect(before == .retained);
@@ -124,6 +126,9 @@ test "completion frozen plan acceptance receipts stay bounded and recover cleanu
     var after = try receipts.decode(a, restored.value, accepted.receipt);
     defer after.deinit();
     try std.testing.expect(after == .retained);
+    var wrong_fence = fence;
+    wrong_fence.route.group_id += 1;
+    try std.testing.expectError(error.InvalidCatalogRouteFence, completion.run(a, restored.value, accepted.receipt, wrong_fence, .{}));
     var substituted = after.retained.receipt;
     substituted.checkpoint.cut.index += 1;
     const different = try std.json.Stringify.valueAlloc(a, substituted, .{});
@@ -141,6 +146,7 @@ test "completion frozen plan acceptance receipts stay bounded and recover cleanu
     var reclaimed = try receipts.decode(a, fixture.state, accepted.receipt);
     defer reclaimed.deinit();
     try std.testing.expect(reclaimed == .reclaimed);
+    try std.testing.expectEqual(.reclaimed, try completion.run(a, fixture.state, accepted.receipt, fence, .{}));
     try std.testing.expectError(error.SourceTransactionIdentityConflict, receipts.decode(a, fixture.state, different));
     // Even a self-consistent generic metadata row cannot promote a receipt
     // whose source token is beyond the proven cumulative cleanup floor.

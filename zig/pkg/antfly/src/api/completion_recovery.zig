@@ -30,6 +30,18 @@ const Context = local.api_operation.RequestContext;
 const A = std.mem.Allocator;
 pub const Outcome = enum { unproven, pending, aborted, incomplete, complete };
 
+pub const SourceExpectation = struct {
+    admission_digest: completion.Digest,
+    scope: local.storage_source_scope.Reference,
+    purpose: [32]u8,
+    begin_timestamp: u64,
+    commit_version: u64,
+    pub fn validate(self: SourceExpectation) !void {
+        try self.scope.validate();
+        if (std.mem.allEqual(u8, &self.admission_digest, 0) or std.mem.allEqual(u8, &self.purpose, 0) or self.begin_timestamp == 0 or self.commit_version <= self.begin_timestamp) return error.InvalidSourceAdmission;
+    }
+};
+
 pub const Guard = struct { ptr: *anyopaque, check_fn: *const fn (*anyopaque, Context) anyerror!void };
 
 pub const Recovery = struct {
@@ -49,7 +61,13 @@ pub const Recovery = struct {
     /// a later pass starts again with a fresh authoritative decision read.
     /// Completion is not retention-release authorization or a source ACK.
     pub fn run(self: Recovery, a: A, coordinator: completion.RoutedOwner, coordinator_fence: metadata.CatalogRouteFence, table: []const u8, transaction_id: [16]u8, original: Context) !Outcome {
-        return self.runBound(a, coordinator, coordinator_fence, table, transaction_id, null, original);
+        return self.runBound(a, coordinator, coordinator_fence, table, transaction_id, null, null, original);
+    }
+    /// Completion of an accepted source plan must match the original retained
+    /// admission and scoped ownership before any terminal/publication mutation.
+    pub fn runSource(self: Recovery, a: A, coordinator: completion.RoutedOwner, coordinator_fence: metadata.CatalogRouteFence, table: []const u8, transaction_id: [16]u8, expected: SourceExpectation, original: Context) !Outcome {
+        try expected.validate();
+        return self.runBound(a, coordinator, coordinator_fence, table, transaction_id, null, expected, original);
     }
     pub fn runRetained(self: Recovery, a: A, job: local.storage_history_recovery_wire.Request, original: Context) !Outcome {
         try job.validate();
@@ -63,9 +81,9 @@ pub const Recovery = struct {
         defer session.deinit();
         const fence = try routeRetainedOwner(&session, job.owner, job.coordinator_locator, budget, context);
         const locator = local.api_local_transaction_contract.parseParticipantRef(job.coordinator_locator) orelse return error.InvalidParticipant;
-        return self.runBound(a, job.owner, fence, locator.table_name, job.transaction_id, job, context);
+        return self.runBound(a, job.owner, fence, locator.table_name, job.transaction_id, job, null, context);
     }
-    fn runBound(self: Recovery, a: A, coordinator: completion.RoutedOwner, coordinator_fence: metadata.CatalogRouteFence, table: []const u8, transaction_id: [16]u8, job: ?local.storage_history_recovery_wire.Request, original: Context) !Outcome {
+    fn runBound(self: Recovery, a: A, coordinator: completion.RoutedOwner, coordinator_fence: metadata.CatalogRouteFence, table: []const u8, transaction_id: [16]u8, job: ?local.storage_history_recovery_wire.Request, source_expected: ?SourceExpectation, original: Context) !Outcome {
         var scope = try publication_ops.Scope.init(coordinator_fence, original);
         const context = scope.context();
         try self.checkpoint(context);
@@ -92,6 +110,16 @@ pub const Recovery = struct {
             }
         }
         const decision = observed.value.decision orelse return .unproven;
+        if (source_expected) |expected| {
+            if (!std.mem.eql(u8, &decision.admission.digest, &expected.admission_digest) or decision.record.begin_timestamp != expected.begin_timestamp or
+                !std.meta.eql(decision.record.source_scope, @as(?local.storage_source_scope.Reference, expected.scope)) or
+                !std.meta.eql(decision.record.source_purpose, @as(?[32]u8, expected.purpose))) return error.SourceTransactionIdentityConflict;
+            switch (decision.record.status) {
+                .pending => return error.SourceOutcomeUnresolved,
+                .aborted => return error.DecisionConflict,
+                .committed => if (decision.record.commit_version != expected.commit_version) return error.SourceTransactionIdentityConflict,
+            }
+        }
         switch (decision.record.status) {
             .pending => return .pending,
             .aborted, .committed => {},
@@ -458,14 +486,25 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     const preparation_reads = fake.decision_reads;
     const preparation_writes = fake.resolves;
     const preparation_publications = fake.publishes;
-    const scope_ref: local.storage_source_scope.Reference = .{ .domain = @splat(31), .binding = @splat(32), .generation = 2, .token = 4, .sequence = 1 };
+    const source_control = @import("../metadata/source_control.zig");
+    const actor_scope: source_control.Scope = .{ .table_id = 7, .source_id = @splat(31), .source_ordinal = 0, .generation = 2, .definition = @splat(32), .provider = @splat(33), .destination = .native, .destination_binding = @splat(34) };
+    var actor_arena = std.heap.ArenaAllocator.init(a);
+    defer actor_arena.deinit();
+    const actor_alloc = actor_arena.allocator();
+    const checkpoint_authority: source_control.checkpoint_authority.Spec = .{ .binding = actor_scope.identity(), .table_name = "docs", .owner = owners[1] };
+    var actor_state = try (source_control.Mutation{ .configure = actor_scope }).apply(actor_alloc, .{});
+    actor_state = try (source_control.Mutation{ .bind_checkpoint = checkpoint_authority }).apply(actor_alloc, actor_state);
+    actor_state = try (source_control.Mutation{ .enable_scope_fencing = {} }).apply(actor_alloc, actor_state);
+    var actor_pending: source_control.Reservation = .{ .sequence = 1, .batch_id = "one", .checkpoint = "initial", .accepted_at_ns = 11, .payload_digest = @splat(35), .plan_digest = @splat(36), .transaction_id = admission.transaction_id, .destination = .native, .delivery_manifest = "{}" };
+    const scope_ref = (try @import("../metadata/source_scope_binding.zig").reference(actor_state, 1, 1)).?;
+    const actor_purpose = try actor_pending.inputFingerprint(actor_scope);
     var source_inputs = normal_inputs;
     for (&source_inputs, 0..) |*input, index| input.intent = .{
         .completion_owner = owners[index],
-        .completion_source_purpose = @splat(33),
+        .completion_source_purpose = actor_purpose,
         .completion_source_scope = scope_ref,
     };
-    source_inputs[1].intent.completion_source_checkpoint = .{ .binding = scope_ref.binding, .purpose = @splat(33), .sequence = 1, .checkpoint = "initial", .accepted_at_ns = 11, .receipt_window = 3 };
+    source_inputs[1].intent.completion_source_checkpoint = .{ .binding = scope_ref.binding, .purpose = actor_purpose, .sequence = 1, .checkpoint = "initial", .accepted_at_ns = 11, .receipt_window = 3 };
     var prepared = (try coordinator.prepare(a, admission.transaction_id, 10, &source_inputs, .{})).?;
     defer prepared.deinit();
     try std.testing.expectEqualDeep(owners[1], try prepared.plan.admission.recoveryOwner(prepared.plan.admission.coordinator_namespace));
@@ -649,9 +688,73 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(@as(usize, 4), fake.begins);
     try std.testing.expectEqual(@as(usize, 3), fake.prepares);
     try std.testing.expectEqual(replayed_resolves, fake.resolves);
+    var source_fence = fence;
+    source_fence.route = .{ .group_id = 10, .range_id = 10, .identity_namespace = .{ .table_id = 7, .shard_id = 10, .range_id = 10 } };
+    const expected: SourceExpectation = .{ .admission_digest = prepared.plan.admission.digest(), .scope = prepared.plan.source_scope.?, .purpose = prepared.plan.source_purpose.?, .begin_timestamp = prepared.plan.begin_timestamp, .commit_version = 20 };
+    var wrong_source = expected;
+    wrong_source.scope.token += 1;
+    const resolutions_before_bound = fake.resolves;
+    const publications_before_bound = fake.publishes;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, recovery.runSource(a, owners[1], source_fence, "docs", admission.transaction_id, wrong_source, .{}));
+    wrong_source = expected;
+    wrong_source.commit_version += 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, recovery.runSource(a, owners[1], source_fence, "docs", admission.transaction_id, wrong_source, .{}));
+    try std.testing.expectEqual(resolutions_before_bound, fake.resolves);
+    try std.testing.expectEqual(publications_before_bound, fake.publishes);
+    const committed_record = fake.state;
+    fake.state.status = .pending;
+    fake.state.commit_version = 0;
+    fake.state.finalized_at_ns = 0;
+    fake.state.intents_resolved = false;
+    try std.testing.expectError(error.SourceOutcomeUnresolved, recovery.runSource(a, owners[1], source_fence, "docs", admission.transaction_id, expected, .{}));
+    fake.state = committed_record;
+    fake.absent = true;
+    try std.testing.expectEqual(.unproven, try recovery.runSource(a, owners[1], source_fence, "docs", admission.transaction_id, expected, .{}));
+    fake.absent = false;
+    try std.testing.expectEqual(resolutions_before_bound, fake.resolves);
+    try std.testing.expectEqual(publications_before_bound, fake.publishes);
+    fake.resolved = .{ true, false };
+    fake.published = .{ false, false };
+    const destination = @import("source_destination_plan.zig");
+    var artifact_cut: [32]u8 = @splat(0);
+    std.mem.writeInt(u64, artifact_cut[0..8], 1, .little);
+    std.mem.writeInt(u64, artifact_cut[8..16], 8, .little);
+    artifact_cut[31] = 1;
+    var retained_source = try destination.Frozen.init(a, &prepared.plan, checkpoint_authority, .{ .root = try @import("../data/source_plan_entry.zig").rootFor(owners[1]), .cut = artifact_cut, .quota = .{} }, 20);
+    defer retained_source.deinit();
+    const compiled_source = try retained_source.manifest.deliveryPlan(actor_alloc, retained_source.encoded_manifest);
+    actor_pending.delivery_manifest = compiled_source.manifest;
+    actor_pending.plan_digest = compiled_source.digest;
+    actor_pending.artifact = compiled_source.artifact;
+    actor_pending.retain_manifest = compiled_source.retain_manifest;
+    actor_state = try (source_control.Mutation{ .reserve = actor_pending }).apply(actor_alloc, actor_state);
+    const reservation_id = actor_pending.identity(actor_scope);
+    actor_state = try (source_control.Mutation{ .seal_artifact = .{ .reservation_digest = reservation_id, .stamp = @splat(37) } }).apply(actor_alloc, actor_state);
+    const checkpoint_command = retained_source.manifest.checkpoint;
+    const native_head: local.storage_source_checkpoint.Head = .{ .binding = checkpoint_command.binding, .purpose = checkpoint_command.purpose, .transaction_id = admission.transaction_id, .sequence = 1, .checkpoint = checkpoint_command.checkpoint, .accepted_at_ns = checkpoint_command.accepted_at_ns, .receipt_window = checkpoint_command.receipt_window, .request_digest = checkpoint_command.digest() };
+    const checkpoint_wire = @import("source_checkpoint_operations.zig").wire;
+    const head_bytes = try native_head.encode(actor_alloc);
+    const head_evidence = try checkpoint_wire.Evidence.init(head_bytes);
+    const native_query: checkpoint_wire.Request = .{ .version = 1, .source_owner = owners[1], .transaction_id = admission.transaction_id, .command = checkpoint_command, .minimum_applied_index = 1 };
+    try std.testing.expectEqualDeep(try actor_pending.inputFingerprint(actor_scope), retained_source.manifest.checkpoint.purpose);
+    try std.testing.expectEqualDeep(actor_scope.identity(), retained_source.manifest.source_scope.binding);
+    try std.testing.expectEqualDeep(actor_state.pending.?.transaction_id, retained_source.manifest.transaction_id);
+    try std.testing.expectEqualDeep(source_inputs[1].intent.completion_source_checkpoint.?, checkpoint_command);
+    var checked_grant = try @import("source_destination_admission.zig").Grant.init(a, actor_scope, actor_state.pending.?, actor_state.artifact_control.?.current.?);
+    defer checked_grant.deinit();
+    const accepted_source = try @import("source_destination_receipt.zig").accept(actor_alloc, actor_state, .{ .reservation_digest = reservation_id, .checkpoint = .{ .request_digest = native_query.digest(), .cut = .{ .term = 1, .index = 8 }, .disposition = .committed, .head = head_evidence, .receipt = head_evidence } });
+    actor_state = try (source_control.Mutation{ .accept = .{ .reservation_digest = reservation_id, .receipt = accepted_source.receipt } }).apply(actor_alloc, actor_state);
+    const completing: @import("source_destination_completion.zig").Completion = .{ .recovery = recovery };
+    try std.testing.expectEqual(.complete, try completing.run(a, actor_state, accepted_source.receipt, source_fence, .{}));
+    try std.testing.expectEqual(@as(u64, 0), actor_state.committed.sequence);
+    try std.testing.expectEqual(resolutions_before_bound + 1, fake.resolves);
+    try std.testing.expectEqual(publications_before_bound + 2, fake.publishes);
     fake.state.status = .aborted;
     fake.state.commit_version = 0;
     try std.testing.expectError(error.DecisionConflict, coordinator.commitSourcePrepared(a, &prepared, 20, .{}));
+    const writes_before_aborted_source = fake.resolves;
+    try std.testing.expectError(error.DecisionConflict, recovery.runSource(a, owners[1], source_fence, "docs", admission.transaction_id, expected, .{}));
+    try std.testing.expectEqual(writes_before_aborted_source, fake.resolves);
     try std.testing.expectError(error.UnsupportedOperation, coordinator.commitSourcePrepared(a, &ordinary_prepared, 20, .{}));
     try std.testing.expectEqual(@as(usize, 4), fake.begins);
 }

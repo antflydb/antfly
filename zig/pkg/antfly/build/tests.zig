@@ -513,6 +513,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const completion_plan_tests = b.addTest(.{ .root_module = completion_plan_mod, .filters = &.{"completion frozen plan"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const run_completion_plan_tests = b.addRunArtifact(completion_plan_tests);
     b.step("completion-frozen-plan-test", "Verify owned frozen completion artifacts without current routing or schema").dependOn(&run_completion_plan_tests.step);
+    const source_completion_recovery_tests = b.addTest(.{ .root_module = completion_plan_mod, .filters = &.{ "completion frozen plan discovery", "data raft ordered history completion recovery" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const run_source_completion_recovery_tests = b.addRunArtifact(source_completion_recovery_tests);
+    run_source_completion_recovery_tests.addArgs(&.{ "--suite-filter", "data raft ordered history completion recovery" });
+    b.step("source-completion-recovery-test", "Verify receipt-bound source completion and retained two-owner recovery").dependOn(&run_source_completion_recovery_tests.step);
     const source_plan_wire_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/source_plan_wire.zig"), .target = target, .optimize = optimize });
     const source_plan_wire_tests = b.addTest(.{ .root_module = source_plan_wire_mod });
     const run_source_plan_wire_tests = b.addRunArtifact(source_plan_wire_tests);

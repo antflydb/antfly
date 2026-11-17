@@ -18,6 +18,7 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 
 test "completion frozen plan discovery" {
     _ = @import("api/completion_plan.zig");
+    _ = @import("api/completion_recovery.zig");
     _ = @import("api/source_destination_plan.zig");
     _ = @import("api/source_destination_admission.zig");
     _ = @import("api/source_destination_receipt_test.zig");
