@@ -22,3 +22,7 @@ test "pg spool stream serves retained history over CopyBoth and confirms only co
 test "pg spool stream encodes a retained relational transaction with a historical key change" {
     try @import("metadata/pg_retained_transaction.zig").testRetainedTransaction();
 }
+
+test "pg spool stream stages reserves and publishes retained relational wire bytes" {
+    try @import("pg_spool_upload_test.zig").runRetainedUpload();
+}

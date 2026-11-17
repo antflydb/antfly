@@ -262,3 +262,110 @@ fn runImpl(with_stream: bool) !void {
     try std.testing.expectEqual(try control.pg_slot.spool_control.reservationBytes(104), collected.value.slot.?.spool.charged_bytes);
     if (with_stream) try @import("pg_spool_stream_test.zig").run(&svc, &registry, producer.clock);
 }
+
+pub fn runRetainedUpload() !void {
+    const a = std.testing.allocator;
+    const retained = @import("metadata/pg_retained_transaction.zig");
+    const local = @import("antfly_local_sources");
+    const history = local.api_local_table_writes.table_write_source.history_page;
+    const schema_api = local.schema_mod;
+    const Rows = local.storage_db_algebraic_relational_row_codec;
+    const values = @import("pgwire/values.zig");
+    const schema_json =
+        \\{"version":7,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const Policy = struct {
+        clock: u64 = 110,
+        before: []const u8,
+        after: []const u8,
+
+        pub fn authorize(_: *@This(), state: control.State, request: Request) !void {
+            try request.ensureActive();
+            if (!std.meta.eql(state.definition.?.owner, @as(control.Digest, @splat(1)))) return error.Forbidden;
+        }
+        pub fn nowSeconds(self: *@This(), _: Request) !u64 {
+            return self.clock;
+        }
+        pub fn read(self: *@This(), allocator: A, _: control.State, position: control.Position, _: Request) !?history.Page {
+            if (position.sequence == 11) return null;
+            if (position.sequence != 10 or position.event != 0) return error.TestUnexpectedResult;
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            errdefer arena.deinit();
+            const scratch = arena.allocator();
+            const events = try scratch.dupe(@typeInfo(@FieldType(history.Page, "events")).pointer.child, &.{.{
+                .key = "key",
+                .before = try scratch.dupe(u8, self.before),
+                .after = try scratch.dupe(u8, self.after),
+            }});
+            return .{
+                .arena = arena,
+                .header = .{
+                    .namespace = namespace(),
+                    .sequence = 11,
+                    .transaction_id = @splat(9),
+                    .transaction_scope = .root_local,
+                    .committed_at_ns = 108 * std.time.ns_per_s,
+                    .schema_before = schema_json,
+                    .schema_after = schema_json,
+                },
+                .events = events,
+                .frame_events = 1,
+                .next = .{ .sequence = 11 },
+                .observed_latest = 11,
+                .caught_up = true,
+            };
+        }
+        pub fn relation(_: *@This(), _: control.State, _: anytype, _: Request) !values.HistoricalRelation {
+            return .{ .oid = 42, .namespace = "public", .name = "rows", .identity = .default, .key_ordinals = &.{0} };
+        }
+    };
+    var input = std.heap.ArenaAllocator.init(a);
+    defer input.deinit();
+    const scratch = input.allocator();
+    const schema = try schema_api.deriveRuntimeTableSchema(scratch, try schema_api.parseValidatedTableSchema(scratch, schema_json));
+    var policy: Policy = .{
+        .before = try Rows.serializeOrdinal(scratch, schema.version, schema.relational_columns, &.{
+            .{ .ordinal = 0, .path = "id", .value_type = .i64_val, .value = .{ .i64_val = 17 } },
+        }, @splat(0)),
+        .after = try Rows.serializeOrdinal(scratch, schema.version, schema.relational_columns, &.{
+            .{ .ordinal = 0, .path = "id", .value_type = .i64_val, .value = .{ .i64_val = 18 } },
+        }, @splat(0)),
+    };
+    var producer: retained.Producer(Policy) = .{ .policy = &policy, .allocator = a, .byte_limit = 1024 };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/retained-wire-objects", .{tmp.sub_path});
+    const meta_path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/retained-wire-metadata", .{tmp.sub_path});
+    var fs = try FsStore.init(a, path);
+    defer fs.deinit();
+    var meta = try Store.init(a, .{ .root_dir = meta_path });
+    defer meta.deinit();
+    var registry: Registry = .{ .fs = &fs };
+    const id = control.pg_slot.feedId(@splat(1), "retained_wire");
+    var svc: fixture.Service = .{ .store = &meta, .id = id };
+    const table: Table = .{ .table_id = 7, .name = "rows", .schema_json = schema_json };
+    try meta.applyStandaloneCommand(group, .{ .upsert_table = table });
+    try svc.mutate(a, .{ .create = .{ .id = id, .definition = .{ .owner = @splat(1), .authorization = @splat(2), .projection = .rows, .tables = &.{.{ .table_id = 7, .binding = control.tableBinding(table), .policy_revision = 1, .contract = .native_relational }} }, .now = 100, .expires_at = 1000 } });
+    try svc.mutate(a, .{ .plan_roots = &.{.{ .namespace = namespace(), .ownership_epoch = 1 }} });
+    try svc.mutate(a, .{ .enroll = .{ .namespace = namespace(), .ownership_epoch = 1, .grant_sequence = 2, .consumer_epoch = 1, .start = 10 } });
+    try svc.mutate(a, .{ .seal = .{ .cut = @splat(7), .slot = .{ .database = @splat(1), .name = "retained_wire", .consistent_lsn = 100 } } });
+    try svc.mutate(a, .{ .slot = .{ .acquire = .{ .actor = @splat(2), .expected = 0, .now = 100, .expires = 150 } } });
+    const session: control.pg_slot.Session = .{ .actor = @splat(2), .fence = 1 };
+    try svc.mutate(a, .{ .slot = .{ .bind = .{ .session = session, .now = 101, .binding = .{ .publications = &.{"rows_pub"}, .projection = @splat(8) } } } });
+    const cfg: upload.Config = .{ .require_shared = false };
+    try std.testing.expectEqual(.staged, (try upload.drive(&svc, &registry, &producer, a, id, session, cfg, Request{})).status);
+    policy.clock = 120;
+    try std.testing.expectEqual(.reserved, (try upload.drive(&svc, &registry, &producer, a, id, session, cfg, Request{})).status);
+    policy.clock = 130;
+    const published = try upload.drive(&svc, &registry, &producer, a, id, session, cfg, Request{});
+    try std.testing.expectEqual(.published, published.status);
+    var state = try svc.load(a);
+    defer state.deinit();
+    const record = state.value.slot.?.spool.find(published.reservation).?;
+    try std.testing.expectEqual(@as(u32, 4), record.spec.messages);
+    try std.testing.expectEqual(@as(u64, 100), record.spec.start_lsn);
+    try std.testing.expectEqual(record.spec.start_lsn + record.spec.bytes, state.value.slot.?.next_lsn);
+    try std.testing.expectEqual(record.spec.after, state.value.slot.?.mapped_cursor);
+    try std.testing.expectEqual(@as(u64, 10), state.value.roots[0].acknowledged.sequence);
+}

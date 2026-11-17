@@ -62,9 +62,12 @@ pub const Candidate = struct {
         return control.hash(.{ .domain = "antfly:pg-spool-source-plan:v1", .feed = state.id, .epoch = state.epoch, .definition = state.definition.?.identity(), .before = self.delivery.before, .advances = self.delivery.advances, .context = self.delivery.provider_context, .start_lsn = state.slot.?.next_lsn, .projection = self.projection, .completion = self.completion, .wire = self.wire, .messages = self.messages, .visible_events = self.visible_events, .bytes = self.bytes, .xid = self.xid, .commit_time = self.commit_time });
     }
     fn spec(self: Candidate, state: control.State, scope: ledger.Scope) !ledger.Spec {
+        return self.serializationSpec(state, scope.storageIdentity());
+    }
+    pub fn serializationSpec(self: Candidate, state: control.State, storage: control.Digest) !ledger.Spec {
         if (self.visible_events == 0 or self.visible_events > 65536 or self.messages < 3 or std.mem.allEqual(u8, &self.wire, 0) or self.bytes < 47) return error.InvalidPgSpool;
         if (!same(self.delivery.before, state.slot.?.mapped_cursor) or !same(self.delivery.authority, self.proof(state)) or !same(self.delivery.cursor, self.delivery.identity(state.id, state.epoch))) return error.ChangefeedConflict;
-        const value: ledger.Spec = .{ .feed = state.id, .epoch = state.epoch, .definition = state.definition.?.identity(), .projection = self.projection, .storage = scope.storageIdentity(), .before = self.delivery.before, .after = self.delivery.cursor, .completion = self.completion, .start_lsn = state.slot.?.next_lsn, .bytes = self.bytes, .commit_offset = self.bytes - 26, .xid = self.xid, .commit_time = self.commit_time, .wire = self.wire, .messages = self.messages };
+        const value: ledger.Spec = .{ .feed = state.id, .epoch = state.epoch, .definition = state.definition.?.identity(), .projection = self.projection, .storage = storage, .before = self.delivery.before, .after = self.delivery.cursor, .completion = self.completion, .start_lsn = state.slot.?.next_lsn, .bytes = self.bytes, .commit_offset = self.bytes - 26, .xid = self.xid, .commit_time = self.commit_time, .wire = self.wire, .messages = self.messages };
         try value.validate();
         return value;
     }

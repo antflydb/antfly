@@ -51,7 +51,7 @@ pub fn encode(a: A, state: feeds.State, page: history.Page, relation: relation_v
         header.transaction_scope != .root_local or header.committed_at_ns <= 0 or
         !std.meta.eql(header.namespace, state.roots[0].namespace))
         return error.ChangefeedCapabilityUnsupported;
-    if (page.events.len == 0 or page.first_ordinal != 0 or page.frame_events != page.events.len or page.events.len > 65536 or
+    if (page.events.len == 0 or page.first_ordinal != 0 or page.frame_events != page.events.len or page.events.len > 65533 or
         page.next.event != 0 or page.next.sequence != header.sequence)
         return error.InvalidPgSpool;
     if (byte_limit < 47 or byte_limit > spool.max_bytes) return error.InvalidPgSpool;
@@ -121,6 +121,94 @@ pub fn encode(a: A, state: feeds.State, page: history.Page, relation: relation_v
         if (!std.meta.eql(feeds.hash(receipt), feeds.hash(candidate.delivery))) return error.ChangefeedConflict;
     }
     return .{ .arena = arena, .messages = messages, .candidate = candidate };
+}
+
+/// Source policy owns route qualification and publication membership. Its read
+/// returns one complete frame after the supplied private retained position.
+pub fn Producer(comptime Policy: type) type {
+    return struct {
+        policy: *Policy,
+        allocator: A,
+        byte_limit: usize,
+        const Self = @This();
+        const Spec = feeds.pg_slot.spool_control.Spec;
+
+        pub fn authorize(self: *Self, state: feeds.State, request: anytype) !void {
+            try request.ensureActive();
+            try self.policy.authorize(state, request);
+        }
+
+        pub fn nowSeconds(self: *Self, request: anytype) !u64 {
+            return self.policy.nowSeconds(request);
+        }
+
+        fn transaction(self: *Self, a: A, state: feeds.State, request: anytype) !?Encoded {
+            try self.authorize(state, request);
+            try state.validate();
+            const slot = state.slot orelse return error.ChangefeedCapabilityUnsupported;
+            if (state.roots.len != 1) return error.ChangefeedCapabilityUnsupported;
+            const positions = try state.rootsAt(a, slot.mapped_cursor);
+            defer a.free(positions);
+            const position = positions[0].delivered;
+            var page = (try self.policy.read(a, state, position, request)) orelse return null;
+            defer page.deinit();
+            const header = page.header orelse return error.InvalidPgSpool;
+            const relation = try self.policy.relation(state, header, request);
+            const now = try self.nowSeconds(request);
+            if (now >= state.expires_at or now < state.created_at or header.committed_at_ns <= 0)
+                return error.ChangefeedResynchronizationRequired;
+            // Preflight runs again before an issue receipt exists. Tie its
+            // timestamp to immutable source evidence so crossing a clock
+            // tick cannot move the cursor between prepare and verify.
+            const commit_seconds = @as(u64, @intCast(header.committed_at_ns)) / std.time.ns_per_s;
+            const issued_at = @max(state.created_at, commit_seconds);
+            var encoded = try encode(a, state, page, relation, issued_at, self.byte_limit);
+            errdefer encoded.deinit();
+            try self.authorize(state, request);
+            return encoded;
+        }
+
+        pub fn prepare(self: *Self, a: A, state: feeds.State, request: anytype) !?upload.Candidate {
+            var encoded = (try self.transaction(a, state, request)) orelse return null;
+            defer encoded.deinit();
+            var candidate = encoded.candidate;
+            candidate.delivery.advances = try a.dupe(feeds.Advance, candidate.delivery.advances);
+            return candidate;
+        }
+
+        pub fn verify(self: *Self, state: feeds.State, spec: Spec, request: anytype) !void {
+            var iterator = try self.open(self.allocator, state, spec, request);
+            iterator.deinit();
+        }
+
+        pub fn open(self: *Self, a: A, state: feeds.State, spec: Spec, request: anytype) !Iterator {
+            var encoded = (try self.transaction(a, state, request)) orelse return error.ChangefeedResynchronizationRequired;
+            errdefer encoded.deinit();
+            const candidate = try encoded.candidate.serializationSpec(state, spec.storage);
+            if (!std.meta.eql(candidate, spec)) return error.PgSpoolWireMismatch;
+            return .{ .encoded = encoded };
+        }
+
+        pub const Iterator = struct {
+            encoded: Encoded,
+            position: usize = 0,
+
+            pub fn deinit(self: *Iterator) void {
+                self.encoded.deinit();
+                self.* = undefined;
+            }
+
+            pub fn next(self: *Iterator, a: A, limit: usize, request: anytype) !?[]u8 {
+                try request.ensureActive();
+                if (self.position == self.encoded.messages.len) return null;
+                const bytes = self.encoded.messages[self.position];
+                if (bytes.len > limit) return error.InvalidPgSpool;
+                const copy = try a.dupe(u8, bytes);
+                self.position += 1;
+                return copy;
+            }
+        };
+    };
 }
 
 pub fn testRetainedTransaction() !void {
