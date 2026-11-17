@@ -186,16 +186,31 @@ pub const Owner = struct {
         return .{ .allocator = a, .end_lsn = self.end_lsn, .start_lsn = after, .bytes = bytes };
     }
     pub fn feedback(self: *Owner, svc: anytype, policy: anytype, a: A, positions: Positions, request: anytype) !void {
-        var before = try load(svc, a, self.id, request);
-        defer before.deinit();
-        const now = try self.check(policy, before.value, request);
         if (positions.written > self.ceiling or positions.flushed > self.ceiling or positions.applied > self.ceiling) return error.ChangefeedConflict;
-        const expires = @max(before.value.slot.?.session_expires_at, @min(before.value.expires_at, now +| self.config.lease_seconds));
-        try mutate(svc, a, before.value, .{ .feedback = .{ .session = self.session, .now = now, .expires = expires, .flushed = positions.flushed } }, request);
-        var observed = try load(svc, a, self.id, request);
-        defer observed.deinit();
-        _ = try self.check(policy, observed.value, request);
-        self.end_lsn = observed.value.slot.?.next_lsn;
+        var rejected_revision: ?u64 = null;
+        for (0..4) |_| {
+            var before = try load(svc, a, self.id, request);
+            defer before.deinit();
+            const now = try self.check(policy, before.value, request);
+            // Only a provable pre-admission conflict and a newer state warrant
+            // rebuilding the feedback CAS. Unknown outcomes go to reconnect.
+            if (rejected_revision) |revision| if (before.value.revision <= revision) return error.ChangefeedConflict;
+            const slot = before.value.slot.?;
+            const expires = @max(slot.session_expires_at, @min(before.value.expires_at, now +| self.config.lease_seconds));
+            mutate(svc, a, before.value, .{ .feedback = .{ .session = self.session, .now = now, .expires = expires, .flushed = positions.flushed } }, request) catch |err| switch (err) {
+                error.ChangefeedConflict => {
+                    rejected_revision = before.value.revision;
+                    continue;
+                },
+                else => return err,
+            };
+            var observed = try load(svc, a, self.id, request);
+            defer observed.deinit();
+            _ = try self.check(policy, observed.value, request);
+            self.end_lsn = observed.value.slot.?.next_lsn;
+            return;
+        }
+        return error.ChangefeedConflict;
     }
     /// Internal close context must be independent of a canceled client request.
     /// It releases only this connection's lease and never acknowledges history.

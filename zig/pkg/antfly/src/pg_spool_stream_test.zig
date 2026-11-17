@@ -206,7 +206,29 @@ pub fn run(svc: anytype, registry: anytype, clock: u64) !void {
         defer page.deinit();
         try std.testing.expect(page.bytes != null);
     }
-    try owner.feedback(svc, &host, a, .{ .written = 104, .flushed = 104, .applied = 104 }, Request{});
+    const Concurrent = struct {
+        service: @TypeOf(svc),
+        rejected: bool = false,
+        attempts: usize = 0,
+
+        pub fn readChangefeedState(self: *@This(), alloc: A, id: control.Id, req: Request) ![]u8 {
+            return control.readOnService(self.service, alloc, id, req);
+        }
+
+        pub fn mutateChangefeedState(self: *@This(), alloc: A, write: control.Write, req: Request) !void {
+            self.attempts += 1;
+            if (!self.rejected) {
+                self.rejected = true;
+                var adjacent = write.mutation.slot.feedback;
+                adjacent.flushed = 1;
+                try self.service.mutate(alloc, .{ .slot = .{ .feedback = adjacent } });
+            }
+            return control.mutateOnService(self.service, alloc, write, req);
+        }
+    };
+    var concurrent: Concurrent = .{ .service = svc };
+    try owner.feedback(&concurrent, &host, a, .{ .written = 104, .flushed = 104, .applied = 104 }, Request{});
+    try std.testing.expectEqual(@as(usize, 2), concurrent.attempts);
     {
         var partial = try svc.load(a);
         defer partial.deinit();
