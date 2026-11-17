@@ -383,7 +383,10 @@ pub const Storage = struct {
     pub const Begin = union(enum) { reserved: Token, terminal: Receipt };
 
     pub fn begin(txn: anytype, id: Digest, epoch: u64, revision: u64, attempt: Attempt) !Begin {
-        var state = try load(txn, id);
+        var state = load(txn, id) catch |err| {
+            if (err == error.NotFound) return error.GraphConstraintNotReady;
+            return err;
+        };
         if (state.owner_epoch != epoch) return error.GraphConstraintOwnerChanged;
         if (try readReceipt(txn, id, attempt)) |receipt| return .{ .terminal = receipt };
         const token = try state.begin(epoch, revision, attempt);
@@ -569,6 +572,7 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
     };
     var txn: Txn = .{};
     const state = testState();
+    try std.testing.expectError(error.GraphConstraintNotReady, Storage.begin(&txn, state.domain, 1, 0, testAttempt(1)));
     try Storage.create(&txn, state.domain, 1);
     try std.testing.expectError(error.GraphConstraintAlreadyExists, Storage.create(&txn, state.domain, 1));
     try Storage.save(&txn, state);
