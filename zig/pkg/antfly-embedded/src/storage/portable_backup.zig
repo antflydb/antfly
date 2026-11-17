@@ -1447,7 +1447,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
 /// schema publication derives its own namespace-bound incarnation. Any retired
 /// generation, CHECK activation, routed claim/reference/job, or orphaned state
 /// still requires the coordinated cohort path.
-fn requireUncoordinatedIntegrityState(alloc: Allocator, scan: *DocStore.Txn, raw_catalog: ?[]const u8) !void {
+pub fn requireUncoordinatedIntegrityState(alloc: Allocator, scan: *DocStore.Txn, raw_catalog: ?[]const u8) !void {
     const catalog_mod = @import("db/relational_integrity_catalog.zig");
     if (raw_catalog) |bytes| {
         var catalog = try catalog_mod.decode(alloc, bytes);
@@ -2474,6 +2474,9 @@ pub const ImportOptions = struct {
     /// Expected proof comes from the authenticated aggregate manifest. This
     /// permits only disposable logical decoding, never direct publication.
     cohort: ?CohortProof = null,
+    /// Import a single table into an independent Lite owner. A cohort witness
+    /// is informational only; constraints and coordinated artifacts still fail.
+    detach_uncoordinated_cohort: bool = false,
     source_copy: ?SourceCopyProof = null,
     identity_namespace: ?doc_identity.Namespace = null,
     prefer_existing_identity_namespace: bool = false,
@@ -2926,7 +2929,7 @@ pub const FileInspection = struct {
 /// bounded schema cache and spool, including historical relational row layouts.
 /// Only feed blocks authenticated by inspectPortableFileBlocks.
 pub const InspectionDocumentDecoder = struct {
-    archive: PortableArchiveValidation = .{ .format_version = 2, .min_afb_reader = backup_bundle.afb_reader_version },
+    archive: PortableArchiveValidation = .{ .format_version = 2, .min_afb_reader = backup_bundle.afb_reader_version, .detach_uncoordinated_cohort = true },
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.archive.deinit(alloc);
@@ -2991,7 +2994,10 @@ pub fn inspectPortableFileBlocks(
         .options = options,
     };
     defer reader.inner.deinit(alloc);
-    try validatePortableImportReader(alloc, &reader, .{ .cancellation = options.cancellation });
+    // Inspection carries no destination authority. Accept only the same
+    // informational cohort proofs allowed by unpublished uncoordinated import;
+    // constraint schemas and admission records remain rejected by the reader.
+    try validatePortableImportReader(alloc, &reader, .{ .cancellation = options.cancellation, .detach_uncoordinated_cohort = true });
     const fingerprint = try reader.verifiedFingerprint();
     try reader.reset(alloc);
     if (options.metadata_first) {
@@ -3236,6 +3242,7 @@ pub fn verifySourceCertificateFile(
 pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []const u8, opts: ImportOptions) !void {
     if ((opts.cohort != null or opts.source_copy != null) and !opts.unpublished_staging) return error.InvalidBackupRequest;
     if (opts.cohort != null and opts.source_copy != null) return error.InvalidBackupRequest;
+    if (opts.detach_uncoordinated_cohort and (!opts.unpublished_staging or opts.cohort != null or opts.source_copy != null)) return error.InvalidBackupRequest;
     try opts.cancellation.check();
     if (opts.unpublished_staging) {
         var raw = backup_codec.SliceReader.init(data);
@@ -3276,6 +3283,7 @@ pub fn importPortableFileWithOptions(
 ) !void {
     if ((opts.cohort != null or opts.source_copy != null) and !opts.unpublished_staging) return error.InvalidBackupRequest;
     if (opts.cohort != null and opts.source_copy != null) return error.InvalidBackupRequest;
+    if (opts.detach_uncoordinated_cohort and (!opts.unpublished_staging or opts.cohort != null or opts.source_copy != null)) return error.InvalidBackupRequest;
     // Restore admission must never wait behind an archive writer while the
     // caller may already hold a destination-wide restore lock.
     try opts.cancellation.check();
@@ -3363,6 +3371,7 @@ fn validateAndImportPortableStagingAfterHeader(
         .format_version = header.format_version,
         .schema_cache_bytes = opts.schema_cache_bytes,
         .cohort = opts.cohort,
+        .detach_uncoordinated_cohort = opts.detach_uncoordinated_cohort,
         .source_copy = opts.source_copy,
         .staging_store = store,
         .snapshot_alloc = alloc,
@@ -3472,7 +3481,32 @@ fn importPortablePrimaryBlocks(alloc: Allocator, store: *DocStore, reader: anyty
     return imported_identity;
 }
 
+fn uncoordinatedCohortNamespace(bytes: []const u8) !doc_identity.Namespace {
+    if (bytes.len != 168 or std.mem.allEqual(u8, bytes[136..168], 0)) return error.BackupIntegrityFailure;
+    const fence = @import("db/relational_integrity_topology.zig").Fence.decode(bytes[0..136]) catch return error.BackupIntegrityFailure;
+    if (fence.role != .backup_snapshot) return error.BackupIntegrityFailure;
+    return fence.namespace;
+}
+
 fn finishPortableIdentityImport(alloc: Allocator, store: *DocStore, opts: ImportOptions, imported_identity: bool) !void {
+    if (opts.detach_uncoordinated_cohort) {
+        const raw = store.get(alloc, cohort_proof_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (raw) |bytes| alloc.free(bytes);
+        if (raw) |bytes| {
+            const namespace = try uncoordinatedCohortNamespace(bytes);
+            {
+                var read = try store.beginReadTxn();
+                defer read.abort();
+                const stored = try doc_identity.loadNamespaceTxn(&read) orelse return error.BackupIntegrityFailure;
+                if (!stored.eql(namespace)) return error.BackupIntegrityFailure;
+                try requireUncoordinatedIntegrityState(alloc, &read, null);
+            }
+            try store.delete(cohort_proof_key);
+        }
+    }
     if (imported_identity) {
         try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, store, opts.cancellation);
         try doc_identity.validateStoreAlloc(alloc, store);
@@ -3512,6 +3546,7 @@ fn validatePortableImportReader(alloc: Allocator, reader: anytype, opts: ImportO
         .format_version = header.format_version,
         .schema_cache_bytes = opts.schema_cache_bytes,
         .cohort = opts.cohort,
+        .detach_uncoordinated_cohort = opts.detach_uncoordinated_cohort,
         .source_copy = opts.source_copy,
     };
     defer archive.deinit(alloc);
@@ -3625,6 +3660,8 @@ const PortableArchiveValidation = struct {
     min_afb_reader: u32 = backup_bundle.base_afb_reader_version,
     cohort: ?CohortProof = null,
     saw_cohort: bool = false,
+    detach_uncoordinated_cohort: bool = false,
+    detached_cohort: bool = false,
     source_copy: ?SourceCopyProof = null,
     saw_source_copy: bool = false,
     source_integrity: ?@import("db/merge_page_contract.zig").IntegrityBinding = null,
@@ -4775,9 +4812,17 @@ fn validateMetadataEntries(
             if (coverage.state != .enforced or coverage.schema_version != compiled.schema_version or !std.mem.eql(u8, &coverage.generation_set, &binding.generation_set)) return error.BackupIntegrityFailure;
             archive.source_integrity_activation = true;
         } else if (std.mem.eql(u8, entry.key, cohort_proof_key)) {
-            const expected = archive.cohort orelse return error.CoordinatedConstraintPortableBackupUnsupported;
-            if (archive.saw_cohort or !std.mem.eql(u8, entry.value, &try expected.encode())) return error.BackupIntegrityFailure;
-            archive.saw_cohort = true;
+            if (archive.cohort) |expected| {
+                if (archive.saw_cohort or !std.mem.eql(u8, entry.value, &try expected.encode())) return error.BackupIntegrityFailure;
+                archive.saw_cohort = true;
+            } else {
+                if (!archive.detach_uncoordinated_cohort) return error.CoordinatedConstraintPortableBackupUnsupported;
+                if (archive.detached_cohort) return error.BackupIntegrityFailure;
+                _ = try uncoordinatedCohortNamespace(entry.value);
+                archive.detached_cohort = true;
+                // Deliberately leave saw_cohort false. This proof cannot grant
+                // authority to import UNIQUE/FK schemas or admission records.
+            }
         } else if (std.mem.startsWith(u8, entry.key, source_generation_admission_prefix)) {
             if (archive.min_afb_reader < backup_bundle.source_generation_admission_reader_version or
                 archive.cohort == null or !archive.saw_cohort or
@@ -6023,6 +6068,62 @@ test "portable backup refuses retained retirement and topology authority without
     try store.put(&admission_key, "retained authority");
     try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, exportPortable(alloc, &store, &output));
     try std.testing.expectEqual(@as(usize, 0), output.items.len);
+}
+
+test "portable standalone import detaches informational cohort without granting authority" {
+    const alloc = std.testing.allocator;
+    const namespace: doc_identity.Namespace = .{ .table_id = 10, .shard_id = 20, .range_id = 20 };
+    const proof: CohortProof = .{
+        .seal = .{ .fence = .{
+            .transition_id = 7,
+            .attempt = 1,
+            .peer_group_id = 20,
+            .owner_group_id = 20,
+            .role = .backup_snapshot,
+            .namespace = namespace,
+            .catalog_digest = @splat(3),
+        }, .digest = @splat(4) },
+        .namespace = namespace,
+    };
+    const bytes = try proof.encode();
+    const entry: backup_codec.KeyValueEntry = .{ .key = cohort_proof_key, .value = &bytes };
+    // Exercise the first validation pass as well as the visitor decoder: both
+    // must accept informational proofs without granting constraint authority.
+    var archive_bytes: ArrayList(u8) = .empty;
+    defer archive_bytes.deinit(alloc);
+    try backup_codec.writeHeader(&archive_bytes, alloc, .{ .format_version = backup_codec.legacy_format_version, .flags = 0, .created_at_ns = 0, .backup_id = @splat(0), .table_count = 1, .shard_count = 1 });
+    const payload = try backup_codec.encodeKeyValueBatch(alloc, &.{entry});
+    defer alloc.free(payload);
+    try backup_codec.writeBlock(&archive_bytes, alloc, .metadata_batch, payload);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "cohort.afb", .{ .read = true });
+    defer file.close(std.testing.io);
+    try file.writePositionalAll(std.testing.io, archive_bytes.items, 0);
+    try file.sync(std.testing.io);
+    const Visitor = struct {
+        seen: bool = false,
+        fn visit(self: *@This(), _: backup_codec.BlockType, _: []const u8) !void {
+            self.seen = true;
+        }
+    };
+    var visitor: Visitor = .{};
+    _ = try inspectPortableFileBlocks(alloc, std.testing.io, file, .{}, &visitor, Visitor.visit);
+    try std.testing.expect(visitor.seen);
+    var ordinary: PortableArchiveValidation = .{ .format_version = 2 };
+    defer ordinary.deinit(alloc);
+    try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, validateMetadataEntries(alloc, &.{entry}, &ordinary));
+    var standalone: PortableArchiveValidation = .{ .format_version = 2, .detach_uncoordinated_cohort = true };
+    defer standalone.deinit(alloc);
+    try validateMetadataEntries(alloc, &.{entry}, &standalone);
+    try std.testing.expect(standalone.detached_cohort);
+    try std.testing.expect(!standalone.saw_cohort);
+    try std.testing.expectError(error.BackupIntegrityFailure, validateMetadataEntries(alloc, &.{entry}, &standalone));
+    try std.testing.expectError(error.BackupIntegrityFailure, uncoordinatedCohortNamespace(bytes[0..167]));
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"unique_id","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, validateMetadataEntries(alloc, &.{.{ .key = "\x00\x00__metadata__:schema_json", .value = schema }}, &standalone));
 }
 
 test "portable accepted-generation proof requires a sealed v3 reader and canonical unique scope" {
@@ -7819,4 +7920,77 @@ test "time series portable restore retains signed TTL source independently of ve
         try std.testing.expectEqual(@as(?i128, case.source), try ttl.readSourceTimestamp(&store, a, case.key));
         try std.testing.expect(try ttl.isDocExpired(&store, a, case.key, .{ .duration_ns = 1_000_000_000 }, 2_000_000_000));
     }
+}
+
+test "public catalog translation preserves runtime config and incarnation" {
+    const publicTableIndexesJsonAlloc = @import("lite/portable_metadata.zig").publicTableIndexesJsonAlloc;
+    const a = std.testing.allocator;
+    const translated = try publicTableIndexesJsonAlloc(a,
+        \\{"text":{"name":"text","kind":"full_text","config_json":"{\"field\":\"body\"}","coverage_generation":42},"enrichments":[]}
+    , .table_restore);
+    defer a.free(translated);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, translated, .{});
+    defer parsed.deinit();
+    const index = parsed.value.object.get("text").?.object;
+    try std.testing.expectEqualStrings("full_text", index.get("type").?.string);
+    try std.testing.expectEqualStrings("body", index.get("field").?.string);
+    try std.testing.expectEqual(@as(i64, 42), index.get("_index_incarnation").?.integer);
+    try std.testing.expect(index.get("kind") == null);
+    try std.testing.expect(index.get("config_json") == null);
+    const again = try publicTableIndexesJsonAlloc(a, translated, .table_restore);
+    defer a.free(again);
+    try std.testing.expectEqualStrings(translated, again);
+    const vectors = try publicTableIndexesJsonAlloc(a,
+        \\{"dense":{"kind":"dense_vector","config_json":"{\"dims\":2,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"dense\",\"field\":\"embedding\"}"},"sparse":{"kind":"sparse_vector","config_json":"{\"field\":\"embedding\"}"},"links":{"kind":"graph","config_json":"{}"}}
+    , .table_restore);
+    defer a.free(vectors);
+    var public = try std.json.parseFromSlice(std.json.Value, a, vectors, .{});
+    defer public.deinit();
+    const dense = public.value.object.get("dense").?.object;
+    try std.testing.expectEqualStrings("embeddings", dense.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 2), dense.get("dimension").?.integer);
+    try std.testing.expectEqualStrings("l2_squared", dense.get("distance_metric").?.string);
+    try std.testing.expect(dense.get("field") == null);
+    try std.testing.expect(dense.get("embedding_name") == null);
+    const backed = try publicTableIndexesJsonAlloc(a,
+        \\{"backed":{"kind":"dense_vector","config_json":"{\"dims\":2,\"embedding_name\":\"producer\"}"}}
+    , .table_restore);
+    defer a.free(backed);
+    var backed_public = try std.json.parseFromSlice(std.json.Value, a, backed, .{});
+    defer backed_public.deinit();
+    try std.testing.expectEqualStrings("producer", backed_public.value.object.get("backed").?.object.get("embedding_name").?.string);
+    try std.testing.expect(public.value.object.get("sparse").?.object.get("sparse").?.bool);
+    try std.testing.expect(public.value.object.get("sparse").?.object.get("external").?.bool);
+    try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,
+        \\{"dense":{"kind":"dense_vector","config_json":"{\"field\":\"embedding\",\"dims\":2}"}}
+    , .table_restore));
+    try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,
+        \\{"sparse":{"kind":"sparse_vector","config_json":"{\"field\":\"body\"}"}}
+    , .table_restore));
+    try std.testing.expectEqualStrings("graph", public.value.object.get("links").?.object.get("type").?.string);
+    try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,
+        \\{"vectors":{"kind":"dense_vector","config_json":"{\"external\":true,\"dims\":2}"}}
+    , .embedded_adoption));
+    try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a, vectors, .embedded_adoption));
+    try std.testing.expectError(error.InvalidEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,
+        \\{"text":3}
+    , .table_restore));
+}
+
+test "native backup receipt envelope accounts for only bounded auxiliary bytes" {
+    const a = std.testing.allocator;
+    const seal = @import("db/native_backup_seal.zig");
+    var handle: seal.Handle = .{ .fence = .{ .transition_id = 1, .attempt = 1, .peer_group_id = 9, .owner_group_id = 9, .role = .backup_snapshot, .namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 9 }, .catalog_digest = @splat(3) }, .digest = @splat(4) };
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .handle = handle, .bytes = @as(u64, 1024) }, .{});
+    defer a.free(raw);
+    try seal.validateExportEnvelope(a, raw, 1024, 1024 + raw.len);
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, seal.validateExportEnvelope(a, raw, 1024, 1025 + raw.len));
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, seal.validateExportEnvelope(a, raw, 1023, 1023 + raw.len));
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, seal.validateExportEnvelope(a, "{}", 1024, 1026));
+    handle.digest = @splat(0);
+    const zero = try std.json.Stringify.valueAlloc(a, .{ .handle = handle, .bytes = @as(u64, 1024) }, .{});
+    defer a.free(zero);
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, seal.validateExportEnvelope(a, zero, 1024, 1024 + zero.len));
+    const oversized: [4097]u8 = @splat(0);
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, seal.validateExportEnvelope(a, &oversized, 1024, 1024 + oversized.len));
 }

@@ -558,7 +558,12 @@ fn prepareRestoreSnapshotIfNeeded(
         if (try system_catalog.isRestoreTarget(name)) {
             if (options.expected_identity_namespace) |namespace| {
                 try restore.cancellation.check();
-                const open_options = try preparedRestoreOpenOptionsForRepair(&prepared, restore, options);
+                var open_options = try preparedRestoreOpenOptionsForRepair(&prepared, restore, options);
+                // This owner only rebinds primary identity. The destination
+                // schema and index catalog are installed by the repair owner;
+                // building source projections here gives them the wrong witness.
+                open_options.defer_index_backfill_on_open = true;
+                open_options.defer_derived_replay_on_open = true;
                 var db = try db_mod.DB.open(alloc, prepared.path(), open_options);
                 defer db.close();
                 if (!db.core.identity_namespace.eql(namespace))
@@ -725,11 +730,17 @@ fn applyManifestNativeRestore(
 
     var generation = try db_mod.native_backup.parseManifestBytes(alloc, raw);
     defer generation.deinit();
-    if (try db_mod.native_backup.declaredGenerationBytes(
-        generation.value(),
-        @intCast(raw.len),
-    ) != shard.artifact_size_bytes) {
-        return error.BackupArtifactIntegrityMismatch;
+    const generation_bytes = try db_mod.native_backup.declaredGenerationBytes(generation.value(), @intCast(raw.len));
+    if (generation_bytes != shard.artifact_size_bytes) {
+        const seal = @import("db/native_backup_seal.zig");
+        const receipt_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shard.snapshot_path, seal.export_receipt_name });
+        defer alloc.free(receipt_path);
+        const receipt = backups_api.readFileFromLocationUsingIoLimited(alloc, io, location, receipt_path, 4096) catch |err| switch (err) {
+            error.FileNotFound, error.BackupManifestTooLarge => return error.BackupArtifactIntegrityMismatch,
+            else => return err,
+        };
+        defer alloc.free(receipt);
+        try seal.validateExportEnvelope(alloc, receipt, generation_bytes, shard.artifact_size_bytes);
     }
 
     const staged_path = staged_generation.path();

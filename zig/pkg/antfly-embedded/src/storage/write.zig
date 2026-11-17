@@ -1889,13 +1889,14 @@ test "fenced owner reopen defers index deletion until exact cancellation" {
 pub fn openStorageKernelRestoreDb(
     alloc: std.mem.Allocator,
     path: []const u8,
+    schema_json: []const u8,
     indexes_json: []const u8,
     lsm_root_generation: u64,
     backend_runtime: *db_mod.background_runtime.BackendRuntime,
     identity_namespace: ?doc_identity.Namespace,
     prepared_restore: *const backup_restore.PreparedRestore,
 ) !db_mod.DB {
-    if (comptime storage_engine.enabled) return storage_engine.call("writeOpenStorageKernelRestoreDb", .{ alloc, path, indexes_json, lsm_root_generation, backend_runtime, identity_namespace, prepared_restore });
+    if (comptime storage_engine.enabled) return storage_engine.call("writeOpenStorageKernelRestoreDb", .{ alloc, path, schema_json, indexes_json, lsm_root_generation, backend_runtime, identity_namespace, prepared_restore });
     return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
         alloc,
         path,
@@ -1911,6 +1912,9 @@ pub fn openStorageKernelRestoreDb(
         null,
         identity_namespace,
         .{
+            // Destination schema must own the first reconstructed postings.
+            // Installing it after repair strands a schema-less Lite projection.
+            .schema_json_before_index_load = schema_json,
             .staged_generation = prepared_restore.stagedGeneration(),
             .native_restore_open_plan = prepared_restore.nativeOpenPlan(),
         },

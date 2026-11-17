@@ -62,6 +62,8 @@ antfly lite status app.aflite
 
 An `.afb` bundle's manifest names its representation: `portable` (logical records) or `native` (physical generations). Lite writes and reads the portable representation; a normal instance can also package native generations in the same envelope. AFB1 portable archives remain readable, and new bundles use AFB2, which declares the representation explicitly. The Lite `backup` and `export` commands emit a self-contained `full` bundle. AFB2 also defines `delta` bundles against an exact base for incremental repository workflows; a delta is never treated as a self-contained archive.
 
+For filesystem transfers, `file://` locations name absolute paths on the shared filesystem. The server connection's `root` limits which paths are allowed; it is not prepended to the URI. For example, a connection rooted at `/srv/backups` accepts `file:///srv/backups` or `file:///srv/backups/project`, and the CLI stages and reads the same paths.
+
 Never treat `.aflite` as the backup format. A normal Antfly can restore directly from one, but that is a convenience for promotion, not an archive. The `.aflite` open path accepts the documented native single-file format and fails explicitly on unknown versions or invalid headers; pre-release directory and LSM-container experiments are not read. To keep one of those, export it with the matching development build and restore the resulting portable AFB1 or AFB2 bundle.
 
 ## Writes, Reads, and Indexes

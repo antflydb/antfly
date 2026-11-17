@@ -32382,7 +32382,7 @@ components:
           description: >
             Storage location for the backup. Supports multiple backends:
 
-            - Scoped filesystem connection: `file:///logical/path`
+            - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
 
             - Amazon S3: `s3://bucket-name/path/to/backup`
 
@@ -32489,7 +32489,7 @@ components:
           description: >
             Storage location for the backup. Supports multiple backends:
 
-            - Scoped filesystem connection: `file:///logical/path`
+            - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
 
             - Amazon S3: `s3://bucket-name/path/to/backup`
 
@@ -39493,11 +39493,6 @@ components:
         username:
           type: string
           example: johndoe
-        password_hash:
-          type: string
-          format: byte
-          description: Base64 encoded password hash. Exposing this is a security risk.
-          example: JGFyZ29uMm...
         metadata:
           type: object
           additionalProperties: {}
@@ -39509,7 +39504,6 @@ components:
             department: eng
       required:
         - username
-        - password_hash
     ResourceType:
       type: string
       enum:

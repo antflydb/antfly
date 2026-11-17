@@ -186,9 +186,8 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
                 try inspector.replicationSourcesJson(manifest.replication_sources_json);
                 for (manifest.shards) |shard| {
                     try options.cancellation.check();
-                    const canonical_path = try backups_api.shardSnapshotRelPath(allocator, manifest.backup_id, shard.group_id);
-                    defer allocator.free(canonical_path);
-                    if (!std.mem.eql(u8, canonical_path, shard.snapshot_path)) return error.InvalidBackupManifest;
+                    // Backup IDs and immutable artifact generation IDs differ.
+                    try backups_api.validateArtifactRelativePath(shard.snapshot_path);
                     const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ scratch, shard.snapshot_path }, 0);
                     defer allocator.free(path);
                     var store = try @import("../docstore.zig").DocStore.open(allocator, path, .{ .read_only = true });
@@ -651,10 +650,11 @@ fn stageNativeAfbRestoreBackup(
     if (!backups_api.localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
     var location = try backups_api.openBackupLocation(allocator, location_uri);
     defer location.deinit(allocator);
+    // Server manifests name immutable artifact generations independently of
+    // their public backup ID. Extraction validates every archive path; validate
+    // manifest references too, then rebase copies into this staging repository.
     for (source_manifest.shards) |shard| {
-        const canonical_path = try backups_api.shardSnapshotRelPath(allocator, source_manifest.backup_id, shard.group_id);
-        defer allocator.free(canonical_path);
-        if (!std.mem.eql(u8, canonical_path, shard.snapshot_path)) return error.InvalidBackupManifest;
+        try backups_api.validateArtifactRelativePath(shard.snapshot_path);
         const extracted_shard = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ staging_root, shard.snapshot_path });
         defer allocator.free(extracted_shard);
         try backups_api.copyDirectoryToLocation(allocator, &location, source_manifest.backup_id, shard.group_id, extracted_shard);
@@ -665,6 +665,11 @@ fn stageNativeAfbRestoreBackup(
         target_table_name,
     );
     defer target_manifest.deinit(allocator);
+    for (@constCast(target_manifest.shards)) |*shard| {
+        const staged_path = try backups_api.shardSnapshotRelPath(allocator, target_manifest.backup_id, shard.group_id);
+        allocator.free(@constCast(shard.snapshot_path));
+        shard.snapshot_path = staged_path;
+    }
     try backups_api.writeManifestToLocation(allocator, &location, &target_manifest);
 
     return .{
@@ -676,7 +681,10 @@ fn stageNativeAfbRestoreBackup(
 }
 
 fn portableFileMetadataAlloc(allocator: Allocator, io: std.Io, file: std.Io.File, options: portable_backup.FileInspectionOptions) !PortableManifestMetadata {
-    var schema_json = try allocator.dupe(u8, "{}");
+    // A schema-less embedded owner is served with the public default contract.
+    // Publish that exact contract so metadata readiness compares the same
+    // definition that table creation installs.
+    var schema_json = try allocator.dupe(u8, tables_api.default_schema_json);
     errdefer allocator.free(schema_json);
     var raw_indexes_json: ?[]u8 = null;
     defer if (raw_indexes_json) |value| allocator.free(value);
@@ -688,13 +696,18 @@ fn portableFileMetadataAlloc(allocator: Allocator, io: std.Io, file: std.Io.File
         schema_json: *[]u8,
         raw_indexes_json: *?[]u8,
         raw_enrichments_json: *?[]u8,
+        has_runtime_schema: bool = false,
+        has_public_schema: bool = false,
 
         fn visit(self: *@This(), block_type: backup_codec.BlockType, payload: []const u8) !void {
             if (block_type != .metadata_batch) return;
             const entries = try backup_codec.decodeKeyValueBatch(self.allocator, payload);
             defer freeKeyValueEntries(self.allocator, entries);
             for (entries) |entry| {
-                if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema_json")) {
+                if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema")) {
+                    self.has_runtime_schema = true;
+                } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema_json")) {
+                    self.has_public_schema = true;
                     self.allocator.free(self.schema_json.*);
                     self.schema_json.* = try self.allocator.dupe(u8, entry.value);
                 } else if (std.mem.eql(u8, entry.key, "\x00\x00__metadata__:indexes")) {
@@ -715,7 +728,13 @@ fn portableFileMetadataAlloc(allocator: Allocator, io: std.Io, file: std.Io.File
     };
     _ = try portable_backup.inspectPortableFileBlocks(allocator, io, file, options, &visitor, Visitor.visit);
 
-    const indexes_json = try tableIndexesJsonFromPortableMetadata(allocator, raw_indexes_json, raw_enrichments_json);
+    // A binary-only schema has no lossless public inverse. Do not replace it
+    // with the schema-less default while publishing a server table definition.
+    if (visitor.has_runtime_schema and !visitor.has_public_schema) return error.UnsupportedEmbeddedLiteSchema;
+
+    const stored_indexes = try tableIndexesJsonFromPortableMetadata(allocator, raw_indexes_json, raw_enrichments_json);
+    defer allocator.free(stored_indexes);
+    const indexes_json = try @import("portable_metadata.zig").publicTableIndexesJsonAlloc(allocator, stored_indexes, .table_restore);
     errdefer allocator.free(indexes_json);
 
     return .{
@@ -809,32 +828,7 @@ pub fn embeddedTableDefinition(
     if (indexes != null or enrichments != null) {
         const stored = try tableIndexesJsonFromPortableMetadata(alloc, indexes, enrichments);
         defer alloc.free(stored);
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
-        defer parsed.deinit();
-        const arena = parsed.arena.allocator();
-        var it = parsed.value.object.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
-            const value = entry.value_ptr.*;
-            if (value != .object) return error.InvalidEmbeddedLiteIndex;
-            const kind = value.object.get("kind") orelse return error.InvalidEmbeddedLiteIndex;
-            // Native vector/graph configs need an explicit public catalog
-            // translation. Fail closed until that translation is qualified;
-            // never reinterpret a native index as the default full-text kind.
-            if (kind != .string or !std.mem.eql(u8, kind.string, "full_text")) {
-                std.log.err("embedded Lite adoption cannot translate index {s}; serve a supported full-text fixture or prepare an explicitly supported public catalog before transfer", .{entry.key_ptr.*});
-                return error.UnsupportedEmbeddedLiteIndex;
-            }
-            const raw = value.object.get("config_json") orelse return error.InvalidEmbeddedLiteIndex;
-            if (raw != .string) return error.InvalidEmbeddedLiteIndex;
-            var config = try std.json.parseFromSliceLeaky(std.json.Value, arena, raw.string, .{});
-            if (config != .object) return error.InvalidEmbeddedLiteIndex;
-            try config.object.put(arena, "type", .{ .string = "full_text" });
-            if (value.object.get("coverage_generation")) |generation|
-                try config.object.put(arena, "_index_incarnation", generation);
-            entry.value_ptr.* = config;
-        }
-        definition.indexes_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        definition.indexes_json = try @import("portable_metadata.zig").publicTableIndexesJsonAlloc(alloc, stored, .embedded_adoption);
     }
     return definition;
 }
@@ -1308,7 +1302,7 @@ test "lite restore staging preserves portable afb schema index and enrichment me
     try std.testing.expect(parsed_indexes.value == .object);
     const ft_body = parsed_indexes.value.object.get("ft_body") orelse return error.TestExpectedEqual;
     try std.testing.expect(ft_body == .object);
-    try std.testing.expect(ft_body.object.get("coverage_generation") != null);
+    try std.testing.expect(ft_body.object.get("_index_incarnation") != null);
     const enrichments = parsed_indexes.value.object.get("enrichments") orelse return error.TestExpectedEqual;
     try std.testing.expect(enrichments == .array);
     try std.testing.expectEqual(@as(usize, 1), enrichments.array.items.len);
@@ -1386,7 +1380,7 @@ test "lite restore staging expands a self-contained native AFB2 bundle" {
     const bundle_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/native-table.afb2", .{tmp.sub_path});
     defer allocator.free(bundle_path);
     const backup_id = "native-bundle-test";
-    const snapshot_path = try backups_api.shardSnapshotRelPath(allocator, backup_id, 9);
+    const snapshot_path = try backups_api.shardSnapshotRelPath(allocator, "afbg-0123456789abcdef0123456789abcdef", 9);
     defer allocator.free(snapshot_path);
     const source_shard = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source_root, snapshot_path });
     defer allocator.free(source_shard);
@@ -1460,7 +1454,10 @@ test "lite restore staging expands a self-contained native AFB2 bundle" {
     const restore_table = try backups_api.deriveRestoreTableRecord(allocator, "restored_docs", target_location, &target);
     defer @import("antfly_server_test_sources").local_test_sources.metadata_table_manager.freeTable(allocator, restore_table);
     try std.testing.expectEqualStrings("restored_docs", restore_table.name);
-    const restored_payload = try std.fmt.allocPrint(allocator, "{s}/{s}/primary.bin", .{ target_root, snapshot_path });
+    const canonical_path = try backups_api.shardSnapshotRelPath(allocator, backup_id, 9);
+    defer allocator.free(canonical_path);
+    try std.testing.expectEqualStrings(canonical_path, target.shards[0].snapshot_path);
+    const restored_payload = try std.fmt.allocPrint(allocator, "{s}/{s}/primary.bin", .{ target_root, canonical_path });
     defer allocator.free(restored_payload);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, restored_payload, allocator, .limited(128));
     defer allocator.free(bytes);
@@ -2758,7 +2755,7 @@ test "lite restore staging refuses binary-only or mismatched schemas before owne
 }
 
 test "lite restore staging standalone adoption preserves full text incarnation and rejects unsupported catalogs" {
-    @import("antfly_test_error_logs").expectErrorLogs(5);
+    @import("antfly_test_error_logs").expectErrorLogs(1);
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

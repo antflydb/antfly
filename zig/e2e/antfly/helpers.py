@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -210,3 +211,31 @@ def wait_until(
         if remaining_s > 0:
             time.sleep(min(retry_delay_s, remaining_s))
     return None
+
+
+def run_readonly_psql_with_retry(command, *, input, timeout=45, **kwargs):
+    """Replay read-only scripts only for explicit, uncommitted capacity rejection.
+
+    Callers must supply SELECT-only scripts: partial output from failed attempts
+    is discarded, and no mutation or uncertain commit is ever retried here.
+    """
+    deadline = time.monotonic() + timeout
+    delay = 0.05
+    while True:
+        result = subprocess.run(
+            command,
+            input=input,
+            timeout=max(0.001, deadline - time.monotonic()),
+            capture_output=True,
+            text=True,
+            **kwargs,
+        )
+        if (
+            result.returncode == 0
+            or "53300" not in result.stderr
+            or '"retryable":true' not in result.stderr.replace(" ", "")
+            or time.monotonic() + delay >= deadline
+        ):
+            return result
+        time.sleep(delay)
+        delay = min(delay * 2, 0.5)

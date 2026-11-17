@@ -19,7 +19,7 @@ class BackupRequest:
             Choose a meaningful name that includes date/version information.
              Example: backup-2025-01-15-v2.
         location (str): Storage location for the backup. Supports multiple backends:
-            - Scoped filesystem connection: `file:///logical/path`
+            - Scoped filesystem connection: an absolute `file:///path/inside/connection/root`
             - Amazon S3: `s3://bucket-name/path/to/backup`
             - Google Cloud Storage: `gs://bucket-name/path/to/backup`
 
