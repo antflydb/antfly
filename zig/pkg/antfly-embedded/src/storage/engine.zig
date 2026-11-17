@@ -291,6 +291,8 @@ pub const VTable = struct {
     runPrimaryLsmMaintenanceStepBestEffort: *const fn (self: *DB) Outcome(bool),
     runDueLsmObsoleteReclaimUntilIdle: *const fn (self: *DB, max_steps: usize) Outcome(usize),
     applyOrderedCommittedMutation: *const fn (self: *DB, request: types.BatchRequest, identity: db.OrderedApplyReceipt, bypass_write_gate: bool) Outcome(void),
+    applyOrderedCommittedMutationWithProducer: *const fn (*DB, types.BatchRequest, @import("source_producer_policy.zig").Producer, db.OrderedApplyReceipt, bool) Outcome(void),
+    applyOrderedSourceProducerClosure: *const fn (*DB, @import("transaction_completion.zig").RoutedOwner, db.OrderedApplyReceipt, bool) Outcome(@import("source_producer_policy.zig").Closure),
     recoverOrderedSourceAdmission: *const fn (self: *DB, request: types.BatchRequest, identity: db.OrderedApplyReceipt, bypass_write_gate: bool) Outcome(void),
     batchNativeFkGenerationApply: *const fn (self: *DB, req: types.BatchRequest) Outcome(void),
     pinTransferablePrimarySnapshot: *const fn (self: *DB) Outcome(DB.TransferablePrimarySnapshot),
@@ -603,7 +605,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 56 adds qualified source-scope registry observations.
 /// Version 57 adds physical ordered source-scope controls and outcome recovery.
 /// Version 58 adds ordered source attempt retirement and exact outcome recovery.
-pub const descriptor_version: u32 = 58;
+/// Version 59 adds physical-root producer closure and trusted classification.
+pub const descriptor_version: u32 = 59;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

@@ -6325,3 +6325,67 @@ skips/failures/leaks. Guarded cache cleanup completed
 (`source-legacy-active-worker-gc.log`). These checks still do not authorize first
 strict activation or claim durable old-producer fencing. The full goal remains
 active.
+
+
+### Durable native producer closure and ordinary primary-commit enforcement
+
+A bounded native producer policy records one checksummed, physical-root-bound
+closure with its immutable first actual ordered cut. Repeated closure cannot
+reopen legacy intake or move the original cut. Missing old labels stay explicitly
+unlabelled; they are never inferred to be ordinary from row contents. The private
+trusted classifier distinguishes unlabelled, ordinary, legacy CDC and scoped-source
+producers. After closure, unlabelled and legacy CDC require SourcePendingWork.
+Explicit ordinary/scoped classifications remain subject to their independent
+normal mutation/admission validation. Classification is trusted native ingress
+input, not a new field accepted from public batch JSON.
+
+Storage engine 59 exposes private ordered producer closure and explicitly
+classified committed mutation. Closure validates the actual physical owner and
+source authority, holds the native apply fence, and commits the closure and actual
+apply marker together. Its returned closure is cumulative state with the original
+cut, not an invented exact per-attempt outcome. Replay cannot claim closure at an
+entry predating the first fence. The ordinary primary-commit path checks the policy
+under the same apply mutex before effects, after recognizing durable ordered
+replay. Missing classification defaults to unlabelled. Header corruption or a
+physical namespace/generation mismatch fails closed, including for ordinary writes.
+
+Real NativeKV tests cover atomic rollback, reopen, immutable first closure,
+changed cut/root refusal, delayed unlabelled/tagged-legacy rejection without
+changing the test effect, ordinary classification and corruption/bounds. The real
+DB/compiled-engine fixture additionally applies an ordinary row before closure,
+closes at entry 12, refuses delayed unlabelled row effects without advancing the
+apply marker, admits explicit ordinary effects at 13, refuses tagged legacy,
+retains the original closure through entry 14 and reopen, recognizes old ordered
+replay before policy rejection, and refuses ordinary effects under corrupted
+policy state. Trusted labels/cuts are modeled fixture inputs; they are not new
+production coordinator authority.
+
+`docstore-history-test -Dstrip=true -j1` passed all 15 selected tests with zero
+skips/failures/leaks (`source-producer-policy-test.log`). Final
+`source-scope-native-control-test docstore-history-test -Dstrip=true -j1` exited 0
+(`source-producer-policy-native-test.log`): the actual DB/compiled-engine case and
+all 15 history cases passed, zero reported skips/failures/leaks. Full generation
+completed (`source-producer-policy-generate.log`); the intended source catalog and
+error-name artifacts remain, with unrelated model explorer outputs discarded.
+Source-catalog, engine-error and OpenAPI checks passed
+(`source-producer-policy-contract-check.log`). Final linked results follow below.
+
+Owner ABI 111, API kernel 32, data profile 41, metadata 105 and failure 89 are
+unchanged. No public, owner-C-ABI or Raft producer-closure endpoint is exposed yet.
+Authenticated producer classification must still be carried end to end without
+upgrading old unlabelled internal requests to ordinary. All relevant native
+transaction admission/resolution and special mutation paths still require the
+same audit/enforcement and old unsafe transaction drainage. Snapshot/restore and
+cohort lifecycle qualification also remain required. The first-strict native
+activation gate is still closed; this policy alone is never worker-drain proof.
+All other original destination/public feeds/bootstrap/retention/pgoutput/actual
+Antfly existing-client requirements remain open, with the full goal active.
+
+Final `history-control-apply-test -Dstrip=true -j1` exited 0
+(`source-producer-policy-linked-test.log`): all 30 selected linked and six local
+integration cases passed, zero reported skips/failures/leaks. Guarded cache
+cleanup completed (`source-producer-policy-gc.log`), preserving active/recent
+outputs. This qualifies the storage primitive and ordinary primary commit path,
+not complete durable producer fencing across transaction admission, every special
+mutation path or network ingress. First strict activation remains closed. The
+full original goal and both issues remain open.

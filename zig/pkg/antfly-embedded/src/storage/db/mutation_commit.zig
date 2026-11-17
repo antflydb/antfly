@@ -1009,6 +1009,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
+            // The apply mutex is held across this check and primary commit;
+            // ordered producer closure takes the same mutex. Replay was already
+            // recognized above and cannot execute stale row effects here.
+            {
+                var producer_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer producer_read.abort();
+                try @import("../source_producer_policy.zig").Store.requirePhysical(preparation_alloc, &producer_read, @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace), S.ownerField(self, "core").*.root_generation, opts.source_producer);
+            }
+
             var merge_page_value: ?[]u8 = null;
             defer if (merge_page_value) |value| S.ownerField(self, "alloc").*.free(value);
             var merge_source_catalog_value: ?[]u8 = null;

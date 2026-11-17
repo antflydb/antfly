@@ -7834,12 +7834,18 @@ pub const DB = struct {
     /// share a store transaction; server replay policy is supplied by the caller.
     pub fn applyOrderedCommittedMutation(self: *DB, request: types.BatchRequest, identity: OrderedApplyReceipt, bypass_write_gate: bool) anyerror!void {
         if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedCommittedMutation", .{ self, request, identity, bypass_write_gate });
+        return self.applyOrderedCommittedMutationWithProducer(request, .unlabelled, identity, bypass_write_gate);
+    }
+
+    pub fn applyOrderedCommittedMutationWithProducer(self: *DB, request: types.BatchRequest, producer: @import("../source_producer_policy.zig").Producer, identity: OrderedApplyReceipt, bypass_write_gate: bool) anyerror!void {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedCommittedMutationWithProducer", .{ self, request, producer, identity, bypass_write_gate });
         if (request.graph_endpoint_cleanup and !request.graph_endpoint_cleanup_planned) return error.InvalidBatchRequest;
         try self.batchInternal(request, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
             .bypass_replication_write_gate = bypass_write_gate,
             .ordered_apply_receipt = identity,
+            .source_producer = producer,
         });
     }
 
@@ -26147,6 +26153,42 @@ pub const DB = struct {
             txn_open = false;
             return outcome;
         }
+    }
+
+    /// Private ordered ingress closure. This proves only cumulative producer
+    /// admission closure, never old transaction drainage or source activation.
+    pub fn applyOrderedSourceProducerClosure(self: *DB, owner: @import("../transaction_completion.zig").RoutedOwner, entry: OrderedApplyReceipt, bypass_write_gate: bool) !@import("../source_producer_policy.zig").Closure {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedSourceProducerClosure", .{ self, owner, entry, bypass_write_gate });
+        const policy = @import("../source_producer_policy.zig");
+        const basis = try @import("../source_scope.zig").Basis.fromOwner(owner);
+        const root: source_plan_control.storage.Root = .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() };
+        try self.requireSourcePlanAvailable();
+        var replication_mutation = if (bypass_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!bypass_write_gate) try self.enforceReplicationWriteGate();
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.requireSourcePlanAvailable();
+        try self.requireSourcePlanPhysicalRoot(root);
+        const disposition = try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry);
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, root);
+        if (disposition == .already_applied) {
+            const closed = (try policy.Store.read(self.alloc, &txn, basis)) orelse return error.SourceOutcomeUnresolved;
+            if (closed.first_closed_at.index > entry.index or closed.first_closed_at.term > entry.term) return error.SourceOutcomeUnresolved;
+            if (closed.first_closed_at.index == entry.index and closed.first_closed_at.term != entry.term) return error.ConflictingOrderedApplyReceipt;
+            txn.abort();
+            return closed;
+        }
+        const closed = try policy.Store.close(self.alloc, &txn, basis, .{ .term = entry.term, .index = entry.index });
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+        try txn.put(marker.key, marker.value);
+        try txn.commit();
+        return closed;
     }
 
     /// Ordered local retirement authorized by the original positive coordinator

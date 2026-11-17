@@ -232,4 +232,5 @@ pub fn run(a: std.mem.Allocator, path: [:0]const u8) !void {
             try std.testing.expectError(error.SourceAdmissionCorrupt, ordered.replay(a, &oversized, command, finished.cut));
         }
     }
+    try @import("source_producer_policy_native_test.zig").run(a, path, root);
 }

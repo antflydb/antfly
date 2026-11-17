@@ -78,4 +78,5 @@ pub fn run(a: std.mem.Allocator, path: []const u8, options: db_mod.OpenOptions, 
         try std.testing.expectEqual(@as(u64, 10), recovered.applied.cut.index);
         try std.testing.expectEqual(@as(u64, 10), recovered.applied.closed_through_token);
     }
+    try @import("source_producer_policy_db_test.zig").run(a, path, options, owner, spec.domain());
 }
