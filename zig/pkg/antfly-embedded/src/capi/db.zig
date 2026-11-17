@@ -821,6 +821,10 @@ pub const HandleGuard = struct {
     /// Set only on a successful mutation-intent entry to a writer-mode
     /// connection; never set on a failed or pinned/read entry.
     lane_managed: bool = false,
+    /// lite-writer-authority.md W6: a plain read admitted without the writer
+    /// lease (`Connection.admitRead`); holds the gate and the lane's reader
+    /// slot instead.
+    read_slot: bool = false,
     /// The root `WriterLane.checkout` pinned (`Handle.lane_pins`) for this
     /// guard, set alongside `lane_managed`. Unpinned exactly once in
     /// `leaveWithRegistry`, after this call's own durability wait has
@@ -909,6 +913,10 @@ pub const HandleGuard = struct {
             owned.close();
         }
         self.path_lease = null;
+        if (self.read_slot) {
+            connection.owner.writer_lane.endRead();
+            self.read_slot = false;
+        }
         self.connection_gate_held = false;
         connection.gate.mutex.unlock(handleLockIo());
         connection.mutex.unlock(handleLockIo());
@@ -1146,6 +1154,9 @@ pub const HandleGuard = struct {
                     owned.close();
                 }
             }
+            // W6: this read staged nothing (the sequence may still move: a
+            // writer drives its own group after checking the lane in).
+            if (guard.read_slot) connection.owner.writer_lane.endRead();
             if (guard.connection_gate_held) connection.gate.mutex.unlock(io);
             if (writer_lane_owes_connection_mutex_release) connection.mutex.unlock(io);
             return;
@@ -1373,7 +1384,22 @@ fn enterCapturedHandleWithDeadline(entry: HandleEntry, access: HandleAccess, int
             guard.lane_managed = true;
             guard.lane_pinned_root = root;
             guard.connection_gate_held = true;
-        } else {
+        } else admit: {
+            // lite-writer-authority.md W6: a plain read on a writer-mode
+            // connection uses the lane's reader slot, not the writer lease,
+            // whenever the current root can serve it.
+            if (!pinned and access == .read and intent == .read_only and liteOpenModeCanWrite(connection.options.open_mode)) {
+                const served = connection.admitRead() catch |err| {
+                    guard.entry_error = capi.mapError(err);
+                    return guard;
+                };
+                if (served) |read_root| {
+                    root = read_root;
+                    guard.read_slot = true;
+                    guard.connection_gate_held = true;
+                    break :admit;
+                }
+            }
             if (!pinned) {
                 guard.path_lease = (if (access == .maintain) connection.acquireForMaintenance() else connection.acquire()) catch |err| {
                     guard.entry_error = capi.mapError(err);

@@ -1143,6 +1143,11 @@ pub const WriterLane = struct {
     /// Set once `Owner.deinit` starts: nothing will hand a parked lease
     /// off again, so a lent lease's `close` releases it instead.
     closing: bool = false,
+    /// lite-writer-authority.md W6: a plain read is using the current root
+    /// without the writer lease. Writers wait for it, the same as for a
+    /// checked-out writer; the read takes no kernel lock and leaves a
+    /// parked lease parked.
+    reading: bool = false,
 
     const poll_initial_ns: i96 = 50 * std.time.ns_per_us;
     const poll_max_ns: i96 = 2 * std.time.ns_per_ms;
@@ -1233,7 +1238,7 @@ pub const WriterLane = struct {
         var backoff_ns: i96 = poll_initial_ns;
         self.mutex.lockUncancelable(io);
         while (true) {
-            if (self.parked != null and self.foreign_release_due) {
+            if (!self.reading and self.parked != null and self.foreign_release_due) {
                 var overdue = self.parked.?;
                 const overdue_store = self.parked_store;
                 self.parked = null;
@@ -1248,7 +1253,7 @@ pub const WriterLane = struct {
                 self.mutex.lockUncancelable(io);
                 continue;
             }
-            if (self.parked) |parked| {
+            if (if (self.reading) null else self.parked) |parked| {
                 self.parked = null;
                 self.checked_out = true;
                 const likely_root = self.last_root;
@@ -1294,7 +1299,7 @@ pub const WriterLane = struct {
                 self.mutex.unlock(io);
                 return root;
             }
-            if (!self.checked_out) {
+            if (!self.checked_out and !self.reading) {
                 self.checked_out = true;
                 self.mutex.unlock(io);
                 // Cold path: nothing parked yet. Do the full admission
@@ -1503,7 +1508,7 @@ pub const WriterLane = struct {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.checked_out) return .busy;
+        if (self.checked_out or self.reading) return .busy;
         self.checked_out = true;
         const lease = self.parked orelse return .fresh;
         self.parked = null;
@@ -1518,6 +1523,41 @@ pub const WriterLane = struct {
     /// Marks a lease this lane checked out so its `close` parks it back here.
     pub fn lendLease(self: *WriterLane, lease: *native.PathWriterLock) void {
         lease.return_to = .{ .ptr = self, .give_back = returnLease };
+    }
+
+    /// lite-writer-authority.md W6: take the lane's reader slot. Waits for
+    /// an in-process writer (or another plain read) to finish, without a
+    /// kernel lease; releases `gate` while waiting, as `borrowLease` does.
+    pub fn beginRead(self: *WriterLane, owner: *Owner, gate: *QueuedMutex, deadline: i96, unconditional: bool) !void {
+        const io = h.handleLockIo();
+        var backoff_ns: i96 = poll_initial_ns;
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            if (!self.checked_out and !self.reading) {
+                self.reading = true;
+                self.mutex.unlock(io);
+                return;
+            }
+            const epoch = self.release_epoch.load(.acquire);
+            self.mutex.unlock(io);
+            const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+            if (!unconditional and remaining <= 0) return error.FileBusy;
+            const wait_ns = if (unconditional) @min(backoff_ns, poll_max_ns) else @min(backoff_ns, remaining);
+            gate.unlock(io);
+            io.futexWaitTimeout(u32, &self.release_epoch.raw, epoch, .{ .duration = .{ .raw = .fromNanoseconds(@intCast(wait_ns)), .clock = .awake } }) catch {};
+            gate.lockUncancelable(io);
+            backoff_ns = @min(backoff_ns * 2, poll_max_ns);
+            if (owner.stopping.load(.acquire)) return error.Canceled;
+        }
+    }
+
+    pub fn endRead(self: *WriterLane) void {
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        std.debug.assert(self.reading);
+        self.reading = false;
+        self.mutex.unlock(io);
+        self.signalReleased(io);
     }
 
     pub const Borrowed = struct {
@@ -1648,7 +1688,9 @@ pub const WriterLane = struct {
         self.parked = lease;
         self.parked_since_ns = now;
         self.parked_store = if (owner.current) |current| current.owned_lite_backend.?.native_docstore else null;
-        self.last_root = owner.current;
+        // A borrower may have released and reacquired the lease, or written
+        // through another instance: the next checkout must refresh.
+        self.last_root = null;
         self.checked_out = false;
         self.mutex.unlock(io);
         self.signalReleased(io);
@@ -1895,6 +1937,11 @@ pub const WriterLane = struct {
             self.mutex.unlock(io);
             return null;
         };
+        // Releasing drains the store, which a W6 read may be using.
+        if (self.reading) {
+            self.mutex.unlock(io);
+            return 1 * std.time.ns_per_ms;
+        }
 
         const own_pid = antfly_platform.process.currentId() orelse 0;
         const now = std.Io.Clock.awake.now(io).nanoseconds;
@@ -2287,6 +2334,18 @@ pub const Owner = struct {
     /// caller holding the writer lease (`Connection.refresh`) can give the
     /// lease back and wait for the turn instead of failing at once.
     fn refreshOrTurnBusy(self: *Owner) !*h.Handle {
+        return (try self.refreshImpl(false)).?;
+    }
+
+    /// lite-writer-authority.md W6: the serving root for a plain read that
+    /// holds no writer lease, or null when only a replacement open would
+    /// serve it. A writer-mode open can run recovery writes, so that case
+    /// goes back through the writer path.
+    pub fn refreshForRead(self: *Owner) !?*h.Handle {
+        return self.refreshImpl(true);
+    }
+
+    fn refreshImpl(self: *Owner, fast_only: bool) !?*h.Handle {
         wal_trace.recordOp(.serving_runtime_refresh);
         if (comptime h.builtin.is_test) _ = self.test_refresh_count.fetchAdd(1, .release);
         var known_maintenance: ?*h.Handle = null;
@@ -2382,6 +2441,7 @@ pub const Owner = struct {
             // was last caught up.
             if (file.redo != null) try file.refreshCrossProcessRedoOverlay();
         }
+        if (fast_only) return null;
         var options = self.options;
         options.externally_locked = true;
         if (known_maintenance orelse self.current) |verified| options.allocator_verification_owner = &verified.owned_lite_backend.?.native_docstore.?.file;
@@ -4425,6 +4485,43 @@ pub const Connection = struct {
 
     pub fn acquire(self: *Connection) !native.PathWriterLock {
         return self.acquireWithMaintenance(false, false);
+    }
+
+    /// lite-writer-authority.md W6: admit a plain read on a writer-mode
+    /// connection without the writer lease. Holds the gate and the lane's
+    /// reader slot on success (released by `endRead` and the gate unlock).
+    /// Returns null, holding nothing, when the read needs a replacement
+    /// open or capacity admission; the caller then takes the writer path.
+    pub fn admitRead(self: *Connection) !?*h.Handle {
+        const io = h.handleLockIo();
+        self.gate.mutex.lockUncancelable(io);
+        const lane = &self.owner.writer_lane;
+        const unconditional = self.admission_deadline_ns == null and self.options.busy_timeout_ms == 0;
+        lane.beginRead(self.owner, &self.gate.mutex, self.admissionDeadline(), unconditional) catch |err| {
+            self.gate.mutex.unlock(io);
+            return err;
+        };
+        const served = self.owner.refreshForRead() catch |err| {
+            lane.endRead();
+            self.gate.mutex.unlock(io);
+            return err;
+        };
+        const root = served orelse {
+            lane.endRead();
+            self.gate.mutex.unlock(io);
+            return null;
+        };
+        // Pending SQL recovery writes on entry; capacity admission may prove.
+        if (root.sql_commit_recovery_needed or root.sql_ddl_recovery_needed or
+            (self.options.profile == .native and self.options.open_mode == .writer and usesCapacityAdmission(root)))
+        {
+            lane.endRead();
+            self.gate.mutex.unlock(io);
+            return null;
+        }
+        self.current = root;
+        self.attach(root);
+        return root;
     }
 
     pub fn acquireForMaintenance(self: *Connection) !native.PathWriterLock {
@@ -8653,3 +8750,54 @@ test "capi native parked writer lease releases for a foreign waiter within the f
 // in `Owner.deinit()`, which supplies that durability barrier
 // (`Store.syncIndexContents()`, which reaches `NativeFile.sync()`) for the
 // owner's own final generation instead of skipping it.
+
+test "capi native writer authority W6 plain reads take no writer lease and run while another writer holds it" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("writer-authority-w6-reads");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    {
+        var seed = try native.NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
+        seed.close();
+    }
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    const owner = wrapper.lite_connection.?.owner;
+    const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("doc"), .value = .fromSlice("{\"text\":\"written\"}"), .is_delete = false }};
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(id, &writes, writes.len, null, 0, 0, 0));
+    // Give up the lease the write parked, as an idle release would.
+    {
+        const lane = &owner.writer_lane;
+        lane.mutex.lockUncancelable(io);
+        var parked = lane.parked;
+        const store = lane.parked_store;
+        lane.parked = null;
+        lane.parked_store = null;
+        lane.mutex.unlock(io);
+        if (parked) |*lease| {
+            if (store) |held| held.ensureDurableForReuse();
+            lease.close();
+        }
+    }
+    // Another writer holds the cross-process lease; a plain read still runs
+    // at once, and leaves this process holding no lease.
+    var foreign = try native.lockWriterPathWithIo(a, io, path);
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&out);
+    for (0..4) |_| {
+        api.antfly_buffer_free_zero(&out);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_lookup_json(id, .fromSlice("doc"), &out));
+        try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "written") != null);
+    }
+    try std.testing.expect(owner.writer_lane.parked == null);
+    try std.testing.expect(!owner.writer_lane.checked_out and !owner.writer_lane.reading);
+    foreign.close();
+    // With the foreign writer gone, nothing in this process holds the lease.
+    var probe = try native.lockWriterPathWithIo(a, io, path);
+    probe.close();
+}
