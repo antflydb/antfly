@@ -14793,6 +14793,9 @@ pub const ApiHttpServer = struct {
         request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBatchError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        // This is the public serving role. Private/source commands use their
+        // own qualified ingress and cannot acquire ordinary authority here.
+        if ((req.source_producer != .unlabelled and req.source_producer != .ordinary) or req.transaction != null or req.online_source != null) return error.InvalidBatchRequest;
         try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
         self.validateTableWritesAgainstSchemaWithContext(request, table_name, req.writes) catch |err| switch (err) {
@@ -14816,6 +14819,7 @@ pub const ApiHttpServer = struct {
         const txn_writes: []const db_mod.types.TransactionWrite = @ptrCast(req.writes);
         const tables = [_]distributed_txn.TableCommitRequest{.{
             .table_name = table_name,
+            .source_producer = .ordinary,
             .writes = txn_writes,
             .deletes = req.deletes,
             .transforms = req.transforms,
@@ -14834,6 +14838,7 @@ pub const ApiHttpServer = struct {
         var retained_preparation: ?@import("antfly_local_sources").api_relational_integrity_commit.Prepared = null;
         defer if (retained_preparation) |*prepared| prepared.deinit();
         const outcome = (self.commitPublicTableBatchWithIntegrity(alloc, source, &tables, req.sync_level, request, &retained_preparation) catch |err| switch (err) {
+            error.ChangefeedCapabilityUnsupported => return error.Unavailable,
             error.RelationalIndexKeyTooLarge => return error.RelationalIndexKeyTooLarge,
             error.UniqueConstraintViolation => return error.UniqueConstraintViolation,
             error.RelationalCheckViolation => return error.RelationalCheckViolation,
@@ -43065,6 +43070,7 @@ test "api http server routes table batches through the batch commit hook" {
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = self,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -43578,7 +43584,7 @@ test "api http server serves public transaction commit route" {
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/public-txn", .{tmp.sub_path});
     defer alloc.free(path);
 
-    var db = try db_mod.DB.open(alloc, path, .{});
+    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .online_source_authority = .native });
     defer db.close();
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
@@ -43692,6 +43698,7 @@ test "api http server surfaces structured participant diagnostics for unavailabl
         fn source(_: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = undefined,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -43809,6 +43816,7 @@ test "api http server surfaces structured decision conflicts for transaction com
         fn source(_: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = undefined,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -43916,6 +43924,7 @@ test "api http server surfaces structured doc identity conflicts for transaction
         fn source(_: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = undefined,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -44025,6 +44034,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
         fn source(_: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = undefined,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -44131,6 +44141,7 @@ test "api http server surfaces structured torn-state conflicts when txn record i
         fn source(_: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = undefined,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,

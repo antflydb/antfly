@@ -7036,7 +7036,7 @@ fn consumerTests() type {
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
-            var db = try db_mod.DB.open(alloc, path, .{});
+            var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .online_source_authority = .native });
             defer {
                 db.close();
                 std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -8377,6 +8377,19 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
     const bound_writes = @import("antfly_local_sources").api_local_table_writes;
     const contract = @import("antfly_local_sources").api_local_transaction_contract;
     const StatusSource = struct {
+        fn snapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            const tables = @import("../metadata/table_manager.zig");
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]tables.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
+                .ranges = @constCast((&[_]tables.RangeRecord{.{ .table_id = 7, .group_id = 2, .range_id = 2, .start_key = "", .end_key = null }})[0..]),
+                .stores = @constCast((&[_]tables.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]@import("../raft/reconciler.zig").PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]@import("../metadata/transition_state.zig").SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]@import("../metadata/transition_state.zig").MergeTransitionRecord{})[0..]),
+            };
+        }
+        fn freeSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
         fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
@@ -8388,8 +8401,28 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
     defer db.close();
     var bound = bound_writes.BoundTableWriteSource.init("docs", &db);
     bound.owner_group_id = 2;
+    const Capture = struct {
+        fn transaction(ptr: *anyopaque, allocator: std.mem.Allocator, tables: []const txn_api.TableCommitRequest, sync: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?txn_api.CommitOutcome {
+            for (tables) |table| try std.testing.expectEqual(.ordinary, table.source_producer);
+            return bound_writes.BoundTableWriteSource.commitTransactionWithCancellation(ptr, allocator, tables, sync, cancellation);
+        }
+        fn stable(ptr: *anyopaque, allocator: std.mem.Allocator, id: db_mod.types.TxnId, timestamp: u64, tables: []const txn_api.TableCommitRequest, sync: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?txn_api.CommitOutcome {
+            for (tables) |table| try std.testing.expectEqual(.ordinary, table.source_producer);
+            return bound_writes.BoundTableWriteSource.commitTransactionWithIdAndCancellation(ptr, allocator, id, timestamp, tables, sync, cancellation);
+        }
+        fn commit(ptr: *anyopaque, allocator: std.mem.Allocator, tables: []const txn_api.TableCommitRequest, sync: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) !?txn_api.CommitOutcome {
+            for (tables) |table| try std.testing.expectEqual(.ordinary, table.source_producer);
+            return bound_writes.BoundTableWriteSource.commitBatchWithCancellation(ptr, allocator, tables, sync, cancellation);
+        }
+    };
+    var native_source = bound.source();
+    var native_vtable = native_source.vtable.*;
+    native_vtable.commit_batch_with_cancellation = Capture.commit;
+    native_vtable.commit_transaction_with_cancellation = Capture.transaction;
+    native_vtable.commit_transaction_with_id_with_cancellation = Capture.stable;
+    native_source.vtable = &native_vtable;
     var status_context: u8 = 0;
-    var server = http_server.ApiHttpServer.init(a, .{ .internal_service_secret = "producer-native-http-secret" }, .{ .ptr = &status_context, .vtable = &.{ .status = StatusSource.status } }, null, bound.source());
+    var server = http_server.ApiHttpServer.init(a, .{ .internal_service_secret = "producer-native-http-secret" }, .{ .ptr = &status_context, .vtable = &.{ .status = StatusSource.status, .admin_snapshot = StatusSource.snapshot, .free_admin_snapshot = StatusSource.freeSnapshot } }, null, native_source);
     defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(a, &server);
     defer listener.deinit();
@@ -8426,6 +8459,25 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
             }
         }
     }
+    var public_batch = try client.fetchBatch(base, "docs", "{\"inserts\":{\"public-row\":{}},\"source_producer\":\"legacy_cdc\"}");
+    defer public_batch.deinit(a);
+    const public_row = (try db.get(a, "public-row")) orelse return error.TestExpectedProducerRow;
+    defer a.free(public_row);
+    var public_commit = try client.fetchTransactionCommit(base, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"public-txn-row\":{}}}},\"sync_level\":\"write\",\"source_producer\":\"legacy_cdc\"}");
+    defer public_commit.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), public_commit.status);
+    const public_txn_row = (try db.get(a, "public-txn-row")) orelse return error.TestExpectedProducerRow;
+    defer a.free(public_txn_row);
+    var unreviewed = native_source;
+    unreviewed.supports_transaction_producers = false;
+    server.table_writes = unreviewed;
+    defer server.table_writes = native_source;
+    var unavailable_batch = try client.fetchBatchResponse(base, "docs", "{\"inserts\":{\"unreviewed-row\":{}}}");
+    defer unavailable_batch.deinit(a);
+    try std.testing.expectEqual(@as(u16, 503), unavailable_batch.status);
+    try std.testing.expect(try db.get(a, "unreviewed-row") == null);
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchTransactionCommit(base, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"unreviewed-txn-row\":{}}}},\"sync_level\":\"write\"}"));
+    try std.testing.expect(try db.get(a, "unreviewed-txn-row") == null);
     const row = (try db.get(a, "row")) orelse return error.TestExpectedProducerRow;
     defer a.free(row);
     try std.testing.expectEqualStrings("{}", row);

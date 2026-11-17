@@ -3096,6 +3096,7 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
             self.closes += 1;
         }
         fn commit(ptr: *anyopaque, _: std.mem.Allocator, _: db_types.TxnId, _: u64, tables: []const contract.TableCommitRequest, _: db_types.SyncLevel) !?contract.CommitOutcome {
+            for (tables) |table| try std.testing.expectEqual(.ordinary, table.source_producer);
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.unknown_commit) return error.TestTransportFailure;
             try std.testing.expectEqual(@as(usize, 1), tables.len);
@@ -3135,7 +3136,7 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
         }
     };
     var fake: Fake = .{};
-    var server = http_server.ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.open, .open_relational_read = Fake.openNormalize } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .activate_range_tracking = Fake.activate, .commit_transaction_with_id = Fake.commit } });
+    var server = http_server.ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.open, .open_relational_read = Fake.openNormalize } }, .{ .ptr = &fake, .supports_transaction_producers = true, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .activate_range_tracking = Fake.activate, .commit_transaction_with_id = Fake.commit } });
     defer server.deinit();
     var identity: ?http_server.AuthenticatedIdentity = null;
     var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
@@ -3448,6 +3449,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
             return .{ .committed = .{ .participant_count = 1 } };
         }
         fn commit(ptr: *anyopaque, alloc: std.mem.Allocator, _: db_types.TxnId, _: u64, tables: []const contract.TableCommitRequest, _: db_types.SyncLevel) !?contract.CommitOutcome {
+            for (tables) |table| try std.testing.expectEqual(.ordinary, table.source_producer);
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (self.prepared_cte_merge_case) {
                 try std.testing.expectEqual(@as(usize, 1), tables.len);
@@ -3562,7 +3564,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
     var prepared_store = try prepared_backend.runtimeStore(std.testing.allocator, .{ .name = "merge-prepared-test" });
     defer prepared_store.deinit();
     var prepared_durable = @import("transactions.zig").DurableSessionStore.initRuntime(std.testing.allocator, &prepared_store);
-    var server = http_server.ApiHttpServer.init(std.testing.allocator, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.open, .open_relational_read = Fake.openNormalize } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .commit_batch = Fake.commitBatch, .commit_transaction_with_id = Fake.commit } });
+    var server = http_server.ApiHttpServer.init(std.testing.allocator, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fake.open, .open_relational_read = Fake.openNormalize } }, .{ .ptr = &fake, .supports_transaction_producers = true, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .commit_batch = Fake.commitBatch, .commit_transaction_with_id = Fake.commit } });
     defer server.deinit();
     var permissions = [_]@import("../usermgr/mod.zig").Permission{
         .{ .resource = @constCast("*"), .resource_type = .table, .type = .read },
@@ -4383,6 +4385,7 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
         }
         fn close(_: *anyopaque) void {}
         fn commit(ptr: *anyopaque, allocator: std.mem.Allocator, _: db_types.TxnId, _: u64, tables: []const contract.TableCommitRequest, _: db_types.SyncLevel) !?contract.CommitOutcome {
+            for (tables) |table| try std.testing.expectEqual(.ordinary, table.source_producer);
             const self: *Self = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(usize, 1), tables.len);
             const table = tables[0];
@@ -4444,7 +4447,7 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
     var prepared_store = try prepared_backend.runtimeStore(alloc, .{ .name = "native-conflict-capture-test" });
     defer prepared_store.deinit();
     var durable = @import("transactions.zig").DurableSessionStore.initRuntime(alloc, &prepared_store);
-    var server = http_server.ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, source, .{ .ptr = &fake, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .commit_transaction_with_id = Fake.commit } });
+    var server = http_server.ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.resolve, .supports_query_definitions = true, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, source, .{ .ptr = &fake, .supports_transaction_producers = true, .supports_sql_range_guards = true, .vtable = &.{ .batch = undefined, .commit_transaction_with_id = Fake.commit } });
     defer server.deinit();
     var permissions = [_]@import("../usermgr/mod.zig").Permission{ .{ .resource = @constCast("*"), .resource_type = .table, .type = .read }, .{ .resource = @constCast("*"), .resource_type = .table, .type = .write } };
     var identity = try http_server.cloneCatalogIdentity(alloc, .{ .username = @constCast("native_conflict_writer"), .permissions = &permissions });

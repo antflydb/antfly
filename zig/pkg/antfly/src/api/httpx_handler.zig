@@ -6072,6 +6072,7 @@ pub const AntflyApiHandler = struct {
             .transaction => source.commitTransactionWithCancellation(alloc, prepared.tables, commit_req.sync_level, commit_request.cancellation),
             .multi_batch => source.commitBatchWithCancellation(alloc, prepared.tables, commit_req.sync_level, commit_request.cancellation),
         }) catch |err| switch (err) {
+            error.ChangefeedCapabilityUnsupported => return textResponse(ctx, 503, "transaction capability unavailable"),
             error.TransactionTooLarge => return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions"),
             error.InvalidBatchRequest,
             error.InvalidArgument,
@@ -6912,6 +6913,7 @@ pub const AntflyApiHandler = struct {
             session.sync_level,
             commit_request.cancellation,
         ) catch |err| rejected: {
+            if (err == error.ChangefeedCapabilityUnsupported) return textResponse(ctx, 503, "transaction capability unavailable; retry this transaction id");
             const rejection = transactions_api.classifyCommitRejection(session, err);
             if (rejection == .ambiguous) return textResponse(ctx, 503, "transaction outcome is unknown; reconcile this transaction id before retrying");
             if (rejection == .fresh) {
@@ -13281,6 +13283,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = self,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_transaction = commitTransaction,
@@ -13547,7 +13550,7 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
         next_commit_error: ?anyerror = error.EnrichmentWaitCanceled,
 
         fn source(self: *@This()) table_writes.TableWriteSource {
-            return .{ .ptr = self, .vtable = &.{
+            return .{ .ptr = self, .supports_transaction_producers = true, .vtable = &.{
                 .batch = batch,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,

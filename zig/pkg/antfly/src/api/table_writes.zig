@@ -2206,6 +2206,8 @@ pub const ProvisionedTableWriteCache = struct {
         }
     };
 
+    /// Installed by the serving owner; raw library writers remain unqualified.
+    online_source_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority = null,
     alloc: std.mem.Allocator,
     lsm_cache: ?*lsm_backend.Cache = null,
     hbc_cache: ?*hbc_mod.Cache = null,
@@ -3122,6 +3124,7 @@ pub const ProvisionedTableWriteCache = struct {
                 inference_api_url: ?[]const u8,
                 inference_api_key: ?[]const u8,
                 policy_table_name: []const u8,
+                authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority,
             ) !OpenedDb {
                 const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(open_mode, hot_standby_async_mirror);
                 var db = if (indexes_json) |managed_indexes_json|
@@ -3145,6 +3148,7 @@ pub const ProvisionedTableWriteCache = struct {
                             .schema_json_before_index_load = schema_json,
                             .inference_api_url = inference_api_url,
                             .inference_api_key = inference_api_key,
+                            .online_source_authority = authority,
                             .replication_write_gate = replication_write_gate,
                             .replication_async_effect_mirror = effective_hot_standby_mirror,
                             .replication_async_batch_mirror = effective_hot_standby_mirror,
@@ -3160,6 +3164,7 @@ pub const ProvisionedTableWriteCache = struct {
                         .backend_runtime = runtime,
                         .identity_namespace = identity_namespace,
                         .prefer_existing_identity_namespace = identity_namespace != null,
+                        .online_source_authority = authority,
                         .replication_write_gate = replication_write_gate,
                         .replication_async_effect_mirror = effective_hot_standby_mirror,
                         .replication_async_batch_mirror = effective_hot_standby_mirror,
@@ -3226,6 +3231,7 @@ pub const ProvisionedTableWriteCache = struct {
                 self.inference_api_url,
                 self.inference_api_key,
                 table_name,
+                self.online_source_authority,
             );
             const owned_db = try self.alloc.create(db_mod.DB);
             errdefer self.alloc.destroy(owned_db);
@@ -3283,6 +3289,7 @@ pub const ProvisionedTableWriteCache = struct {
             self.inference_api_url,
             self.inference_api_key,
             table_name,
+            self.online_source_authority,
         );
         errdefer opened.db.close();
         const start_bulk_session = opened.start_bulk_session and self.bulkIngestSessionReadyForTable(table_name);
@@ -7012,6 +7019,8 @@ pub const ProvisionedTableWriteSource = struct {
     /// Set only after startup proves this process is the non-Raft standalone
     /// data owner. A temporarily absent Raft callback is not that proof.
     standalone_sql_range_guards: bool = false,
+    /// Installed by the serving owner; raw library writers remain unqualified.
+    online_source_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority = null,
     native_history_owner: bool = false,
     local_write_owner: ?*ProvisionedTableWriteSource = null,
     /// Optional local physical-operation provider. Top-level routing,
@@ -7606,6 +7615,23 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
+    pub fn withSourceAuthority(self: *ProvisionedTableWriteSource, authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority) !*ProvisionedTableWriteSource {
+        if (self.online_source_authority == authority) return self;
+        if (comptime control_only_storage_sources) {
+            self.online_source_authority = authority;
+            return self;
+        }
+        var locks = WriteCacheTransitionLocks.init(self, true, true);
+        defer locks.deinit();
+        try locks.reserveClearCapacity();
+        self.online_source_authority = authority;
+        if (locks.first) |cache| cache.online_source_authority = authority;
+        if (locks.second) |cache| cache.online_source_authority = authority;
+        locks.clearCaches(false);
+        locks.drainAndRelease();
+        return self;
+    }
+
     pub fn withHotStandbyWriteGate(
         self: *ProvisionedTableWriteSource,
         gate: ?db_mod.ReplicationWriteGate,
@@ -7717,6 +7743,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer cache.unlockOpenMutex();
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
+        cache.online_source_authority = self.online_source_authority;
         cache.setRuntimeHooksLocked(
             self.resolution_candidate_source,
             self.entity_sink,
@@ -12522,6 +12549,7 @@ pub const ProvisionedTableWriteSource = struct {
 
             const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(mode, self.hot_standby_async_mirror);
             var effective_open_options = managed_open_options;
+            effective_open_options.online_source_authority = self.online_source_authority;
             effective_open_options.private_restore_bootstrap = if (preloaded_metadata) |metadata| metadata.restore_reservation != null else false;
             effective_open_options.drain_resolver_backfill = false;
             effective_open_options.defer_resolver_workers = true;
@@ -12594,6 +12622,7 @@ pub const ProvisionedTableWriteSource = struct {
                         .backend_runtime = cache.backend_runtime,
                         .primary_backend = if (local_persisted_metadata) existingPrimaryBackend() else (db_mod.OpenOptions{}).primary_backend,
                         .identity_namespace = identity_namespace,
+                        .online_source_authority = self.online_source_authority,
                         .prefer_existing_identity_namespace = identity_namespace != null,
                         .replication_write_gate = self.replication_write_gate,
                         .replication_async_effect_mirror = effective_hot_standby_mirror,
@@ -13702,7 +13731,7 @@ pub const ProvisionedTableWriteSource = struct {
             return;
         }
 
-        var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+        var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
         db.close();
     }
 
@@ -15732,6 +15761,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.backend_runtime,
                 self.replication_write_gate,
                 null,
+                self.online_source_authority,
             ) catch |err| {
                 if (isTransientWriterOpenConflict(err))
                     return error.HASeedSnapshotRuntimeBusy;
@@ -15756,6 +15786,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.backend_runtime,
             self.replication_write_gate,
             null,
+            self.online_source_authority,
         );
         defer db.close();
         return try captureHotStandbySeedDbSnapshot(alloc, &db, path, snapshot_token, destination_root);
@@ -20356,7 +20387,7 @@ pub const ProvisionedTableWriteSource = struct {
             return try runGraphMetricMaintenanceOrActionJsonAlloc(alloc, cached.db, body);
         }
 
-        var db = openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror) catch |err| switch (err) {
+        var db = openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority) catch |err| switch (err) {
             error.FileNotFound => return error.UnknownGroup,
             else => return err,
         };
@@ -20388,7 +20419,7 @@ pub const ProvisionedTableWriteSource = struct {
             return try cached.db.resolverReviewsJsonAlloc(alloc, body);
         }
 
-        var db = openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror) catch |err| switch (err) {
+        var db = openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority) catch |err| switch (err) {
             error.FileNotFound => return error.UnknownGroup,
             else => return err,
         };
@@ -20443,7 +20474,7 @@ pub const ProvisionedTableWriteSource = struct {
                 defer cached.deinit(alloc);
                 break :blk try applyGraphMetricActionToDb(alloc, cached.db, index_name, metric_name, action);
             } else blk: {
-                var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
                 defer db.close();
                 break :blk try applyGraphMetricActionToDb(alloc, &db, index_name, metric_name, action);
             };
@@ -20875,7 +20906,7 @@ pub const ProvisionedTableWriteSource = struct {
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
 
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try applyLocalTableSchemaJson(alloc, &db, schema_json);
@@ -21681,7 +21712,7 @@ pub const ProvisionedTableWriteSource = struct {
             try applyGroupBatchWithSchemaJson(alloc, cached.db, cached.schema_json, group, req, cancellation);
             cache.publishCachedLeaseGeneration(&cached, target_generation);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGateAndIdentity(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, group.identity_namespace);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGateAndIdentity(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, group.identity_namespace, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespaceExpected(group.identity_namespace, &db);
             try applyGroupBatch(alloc, self.catalog, &db, table_name, group, req, cancellation);
@@ -21886,7 +21917,7 @@ pub const ProvisionedTableWriteSource = struct {
             defer cached.deinit(alloc);
             return try executeBackupPinControl(alloc, cached.db, group_id, request, control);
         }
-        var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+        var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
         defer db.close();
         return try executeBackupPinControl(alloc, &db, group_id, request, control);
     }
@@ -21951,7 +21982,7 @@ pub const ProvisionedTableWriteSource = struct {
                 return try exportPortableBackupShardWithSeal(alloc, cached.db, plan.backup_root, plan.backup_id, group_id, plan.io, try @import("antfly_local_sources").api_backup_contract.sealedHandleForGroup(plan.sealed_handles, group_id), plan.cancellation);
             }
 
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             return try exportPortableBackupShardWithSeal(alloc, &db, plan.backup_root, plan.backup_id, group_id, plan.io, try @import("antfly_local_sources").api_backup_contract.sealedHandleForGroup(plan.sealed_handles, group_id), plan.cancellation);
         }
@@ -21986,7 +22017,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer {
             if (read_cache_exclusive) |*exclusive| exclusive.deinit();
         }
-        var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+        var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
         defer db.close();
         var native_snapshot = try prepareNativeBackupShardSnapshot(alloc, &db, path, group_id, plan);
         defer native_snapshot.deinit(alloc);
@@ -23398,7 +23429,7 @@ pub const ProvisionedTableWriteSource = struct {
             try cached.db.waitForCurrentSyncLevelWithCancellation(sync_level, cancellation);
             self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try db.waitForCurrentSyncLevelWithCancellation(sync_level, cancellation);
@@ -23534,7 +23565,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.markWriteCacheDirty(table_name);
             self.local_db_mutex.unlock();
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try ensurePreDecisionContextActive(context);
@@ -23681,7 +23712,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.markWriteCacheDirty(table_name);
             self.local_db_mutex.unlock();
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, txn_id, table_name, req.writes, req.deletes, req.transforms);
@@ -23795,7 +23826,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (status == .committed and shouldDrainCachedManagedDbAfterBatch(sync_level))
                 try drainManagedDbBeforeClose(cached.db);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try applyReplicatedTransactionMutationWithCancellation(alloc, &db, table_name, group_id, .{
@@ -23855,7 +23886,7 @@ pub const ProvisionedTableWriteSource = struct {
             defer cached.deinit(alloc);
             return try cached.db.getTransactionStatus(txn_id);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             return try db.getTransactionStatus(txn_id);
@@ -23972,7 +24003,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.markWriteCacheDirty(table_name);
             self.local_db_mutex.unlock();
         } else {
-            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try db.markTransactionParticipantResolved(txn_id, participant);
@@ -24276,7 +24307,7 @@ pub const ProvisionedTableWriteSource = struct {
                         return;
                     }
                 } else {
-                    var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                    var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
                     defer db.close();
                     try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
                     if (try corruptEmbeddingArtifactInDb(alloc, &db, doc_key, index_name)) {
@@ -24336,6 +24367,7 @@ pub const ProvisionedTableWriteSource = struct {
                     self.backend_runtime,
                     self.replication_write_gate,
                     self.hot_standby_async_mirror,
+                    self.online_source_authority,
                 );
                 defer db.close();
                 try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
@@ -24684,7 +24716,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const result = try db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
@@ -24764,7 +24796,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const result = try db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
@@ -24844,7 +24876,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const result = try db.applyDocumentArtifactChildRangeBatch(child_batch);
@@ -24922,7 +24954,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const range_result = try db.reprocessDocumentArtifactRange(alloc, artifact_name, req);
@@ -25006,7 +25038,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             break :blk try db.listArtifactRepairIssuesPage(alloc, req);
@@ -25104,7 +25136,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
+                try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror, self.online_source_authority);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const group_result = try db.repairArtifactIssuesWithRequestOptions(alloc, req, effective_options);
@@ -25187,6 +25219,8 @@ pub const HostedProvisionedTableWriteSource = struct {
 
     /// Production metadata writers enable the signed retained-history path.
     /// Physical-only adapters may expose just the legacy local callback set.
+    /// Configure before acquiring hosted physical writers.
+    online_source_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority = null,
     completion_admission: bool = false,
     provision_history_policy: bool = false,
     history_policy_guard: ?@import("history_policy_provisioning.zig").Guard = null,
@@ -25234,6 +25268,26 @@ pub const HostedProvisionedTableWriteSource = struct {
 
     pub fn withCompletionAdmission(self: *HostedProvisionedTableWriteSource) *HostedProvisionedTableWriteSource {
         self.completion_admission = true;
+        return self;
+    }
+
+    /// Serving configuration, never inferred from public JSON or root contents.
+    /// Reconfiguration requires releasing the hosted writer cache first.
+    pub fn withSourceAuthority(self: *HostedProvisionedTableWriteSource, authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority) !*HostedProvisionedTableWriteSource {
+        if (self.online_source_authority == authority) return self;
+        if (comptime !control_only_storage_sources) {
+            if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
+                cache.write_cache.lockOpenMutex();
+                defer cache.write_cache.unlockOpenMutex();
+                lockAtomic(&cache.mutex);
+                defer cache.mutex.unlock();
+                lockAtomic(&cache.write_cache.entry_lifecycle_mutex);
+                defer cache.write_cache.entry_lifecycle_mutex.unlock();
+                if (cache.write_cache.entries.items.len != 0 or cache.write_cache.retired_entries.items.len != 0 or cache.write_cache.closing_entries.items.len != 0) return error.SourcePendingWork;
+                cache.write_cache.online_source_authority = authority;
+            }
+        }
+        self.online_source_authority = authority;
         return self;
     }
 
@@ -25422,6 +25476,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         self: *HostedProvisionedTableWriteSource,
         cache: *HostedManagedDbCache,
     ) void {
+        cache.write_cache.online_source_authority = self.online_source_authority;
         cache.write_cache.backend_runtime = self.backend_runtime;
         cache.write_cache.antfly_provider = providerWithRemoteCapabilityCache(
             self.antfly_provider,
@@ -25441,6 +25496,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         owner: *ProvisionedTableWriteSource,
         cache: *HostedManagedDbCache,
     ) void {
+        owner.online_source_authority = self.online_source_authority;
         owner.catalog = self.catalog;
         owner.backend_runtime = self.backend_runtime;
         owner.remote_capability_cache = &cache.remote_capability_cache;
@@ -25593,6 +25649,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !ProvisionedTableWriteCache.CachedDb {
         if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         const lsm_root_generation = self.visibleRootGeneration(group_id);
+        cache.write_cache.online_source_authority = self.online_source_authority;
         if (self.backend_runtime) |runtime| cache.write_cache.backend_runtime = runtime;
         cache.write_cache.antfly_provider = providerWithRemoteCapabilityCache(
             self.antfly_provider,
@@ -25738,6 +25795,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .inference_api_url = cache.write_cache.inference_api_url,
                     .inference_api_key = cache.write_cache.inference_api_key,
                     .remote_capability_cache = &cache.remote_capability_cache,
+                    .online_source_authority = self.online_source_authority,
                     .replication_write_gate = cache.write_cache.replication_write_gate,
                     .replication_async_effect_mirror = effective_hot_standby_mirror,
                     .replication_async_batch_mirror = effective_hot_standby_mirror,
@@ -25757,6 +25815,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .backend_runtime = cache.write_cache.backend_runtime,
                 .identity_namespace = identity_namespace,
                 .prefer_existing_identity_namespace = identity_namespace != null,
+                .online_source_authority = self.online_source_authority,
                 .replication_write_gate = cache.write_cache.replication_write_gate,
                 .replication_async_effect_mirror = effective_hot_standby_mirror,
                 .replication_async_batch_mirror = effective_hot_standby_mirror,
@@ -28165,7 +28224,7 @@ fn openManagedDbForTableGroupWithRuntime(
     group_id: u64,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !db_mod.DB {
-    return try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, catalog, table_name, group_id, backend_runtime, null, null);
+    return try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, catalog, table_name, group_id, backend_runtime, null, null, null);
 }
 
 fn openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(
@@ -28177,6 +28236,7 @@ fn openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     replication_write_gate: ?db_mod.ReplicationWriteGate,
     hot_standby_async_mirror: ?db_mod.ReplicationAsyncEffectMirror,
+    online_source_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority,
 ) !db_mod.DB {
     return try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGateAndIdentity(
         alloc,
@@ -28188,6 +28248,7 @@ fn openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(
         replication_write_gate,
         hot_standby_async_mirror,
         null,
+        online_source_authority,
     );
 }
 
@@ -28201,8 +28262,9 @@ fn openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGateAndIdentity(
     replication_write_gate: ?db_mod.ReplicationWriteGate,
     hot_standby_async_mirror: ?db_mod.ReplicationAsyncEffectMirror,
     identity_namespace: ?doc_identity.Namespace,
+    online_source_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority,
 ) !db_mod.DB {
-    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGateAndIdentity(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime, replication_write_gate, hot_standby_async_mirror, identity_namespace);
+    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGateAndIdentity(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime, replication_write_gate, hot_standby_async_mirror, identity_namespace, online_source_authority);
 }
 
 fn openManagedDbForTableWithCache(
@@ -28284,6 +28346,7 @@ fn openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGate(
         replication_write_gate,
         hot_standby_async_mirror,
         null,
+        null,
     );
 }
 
@@ -28301,6 +28364,7 @@ fn openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGateAndIdentit
     replication_write_gate: ?db_mod.ReplicationWriteGate,
     hot_standby_async_mirror: ?db_mod.ReplicationAsyncEffectMirror,
     identity_namespace_override: ?doc_identity.Namespace,
+    online_source_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority,
 ) !db_mod.DB {
     const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(.default, hot_standby_async_mirror);
     const identity_namespace = identity_namespace_override orelse
@@ -28314,6 +28378,7 @@ fn openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGateAndIdentit
             .backend_runtime = backend_runtime,
             .identity_namespace = identity_namespace,
             .prefer_existing_identity_namespace = identity_namespace != null,
+            .online_source_authority = online_source_authority,
             .replication_write_gate = replication_write_gate,
             .replication_async_effect_mirror = effective_hot_standby_mirror,
             .replication_async_batch_mirror = effective_hot_standby_mirror,
@@ -28340,6 +28405,7 @@ fn openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGateAndIdentit
         null,
         identity_namespace,
         .{
+            .online_source_authority = online_source_authority,
             .replication_write_gate = replication_write_gate,
             .replication_async_effect_mirror = effective_hot_standby_mirror,
             .replication_async_batch_mirror = effective_hot_standby_mirror,

@@ -317,6 +317,7 @@ pub const OwnedTransactionCommitRequest = struct {
             offset += table_writes.len;
             out[i] = .{
                 .table_name = self.physicalName(table.table_name),
+                .source_producer = .ordinary,
                 .schema_version = table.schema_version,
                 .relational_schema_version = table.relational_schema_version,
                 .relational_integrity_generation_set = if (table.conflict_guards) |guards| guards.value.generation_set else null,
@@ -8264,4 +8265,17 @@ test "durable session mutations publish only after persistence succeeds: shared 
     // contract, and callers can supply Store.write_gate for other providers.
     runtime.write_serialization = .intrinsic;
     try durable.bindRegistrationIssuer(1);
+}
+
+test "distributed txn fresh public execution plans assign ordinary origin without changing older sealed plans" {
+    const a = std.testing.allocator;
+    var request = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"row\":{}}}},\"source_producer\":\"legacy_cdc\"}");
+    defer request.deinit(a);
+    const view = try request.distributedTables(a);
+    defer view.deinit();
+    try std.testing.expectEqual(@as(usize, 1), view.tables.len);
+    try std.testing.expectEqual(@FieldType(distributed_txn.TableCommitRequest, "source_producer").ordinary, view.tables[0].source_producer);
+    var old = try parseExecutionPlan(a, "[{\"table_name\":\"docs\"}]");
+    defer old.deinit();
+    try std.testing.expectEqual(@FieldType(distributed_txn.TableCommitRequest, "source_producer").unlabelled, old.value[0].source_producer);
 }

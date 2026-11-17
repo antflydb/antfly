@@ -7515,6 +7515,22 @@ test "public api smoke integration queries across split ranges" {
 }
 
 test "public api split integration uses distributed global text stats for bm25 and significant_terms" {
+    const Runner = struct {
+        fn run(result: *?anyerror) void {
+            runSplitGlobalStatsIntegration() catch |err| {
+                result.* = err;
+            };
+        }
+    };
+    var result: ?anyerror = null;
+    // Metadata initialization and split reconciliation have large native
+    // frames. Give this complete integration owner an explicit stack budget.
+    const thread = try std.Thread.spawn(.{ .stack_size = 32 * 1024 * 1024 }, Runner.run, .{&result});
+    thread.join();
+    if (result) |err| return err;
+}
+
+fn runSplitGlobalStatsIntegration() !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -7621,6 +7637,9 @@ test "public api split integration uses distributed global text stats for bm25 a
 
     var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(std.testing.allocator, .{
         .replica_root_dir = replica_root,
+        // This fixture uses native owners and no data-Raft engine. Its
+        // explicit serving role must agree with the physical write authority.
+        .api_server_cfg = .{ .deployment_mode = .standalone },
     }, metadata_api);
     defer data_server.deinit();
     try data_server.start();

@@ -7337,6 +7337,9 @@ pub const DataServer = struct {
         self.write_source.completion_coordinator = if (linked_storage and self.data_raft != null) .{ .owners = self.historyOwnerPort(), .recovery = self.completionRecovery() } else null;
         _ = self.write_source.withStandaloneSqlRangeGuards(self.data_raft == null and api_server_cfg.deployment_mode == .standalone);
         _ = self.write_source.withNativeHistoryOwner(self.data_raft == null and api_server_cfg.deployment_mode == .standalone);
+        const physical_authority: ?@import("antfly_local_sources").storage_db_online_source_contract.Authority = if (self.data_raft != null) .raft else if (api_server_cfg.deployment_mode == .standalone) .native else null;
+        _ = try self.write_source.withSourceAuthority(physical_authority);
+        if (self.data_raft_apply) |apply_sm| _ = try apply_sm.write_source.withSourceAuthority(physical_authority);
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
             apply_sm.write_source.completion_coordinator = self.write_source.completion_coordinator;

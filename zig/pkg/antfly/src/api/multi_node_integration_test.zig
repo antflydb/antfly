@@ -759,6 +759,8 @@ fn startPublicApiServersWithSharedSessionStorePath(
         );
         _ = write_sources[i].withInternalServiceAuth(internal_service_test_secret, internal_service_test_issuer);
         _ = write_sources[i].withBackendRuntime(cluster.backendRuntime(i));
+        // These routing fixtures use native physical writers, without data Raft.
+        _ = try write_sources[i].withSourceAuthority(.native);
         // These stateful API fixtures issue visibility assertions immediately
         // after writes. Opt into the hosted source's explicit foreground
         // derived-progress contract instead of depending on worker timing.
@@ -834,6 +836,8 @@ fn startPublicApiServersWithOptionalSessions(
         );
         _ = write_sources[i].withInternalServiceAuth(internal_service_test_secret, internal_service_test_issuer);
         _ = write_sources[i].withBackendRuntime(cluster.backendRuntime(i));
+        // These routing fixtures use native physical writers, without data Raft.
+        _ = try write_sources[i].withSourceAuthority(.native);
         _ = write_sources[i].withForegroundDerivedProgress();
         servers[i] = api_http_server.ApiHttpServer.init(
             std.testing.allocator,

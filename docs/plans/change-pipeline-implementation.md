@@ -7144,3 +7144,127 @@ OpenAPI and `git diff --check` passed
 (`source-producer-integrity-contract-check.log`). Versions remain unchanged.
 Public ordinary ingress and remaining special mutation provenance still require
 implementation; first-strict activation and all original acceptance stay open.
+
+### Ordinary public serving origin (in progress)
+
+The actual public serving method now assigns ordinary origin to newly admitted
+batch/typed-SQL table requests. It rejects private transaction/retention commands
+and explicit legacy/scoped origins presented through that public role. Public
+JSON parsing/data promotion stays unlabelled and cannot grant authority from
+client fields. Fresh public transaction execution plans likewise assign ordinary
+origin; parsing older sealed plan bytes preserves their original unlabelled
+interpretation. Unreviewed destination capability returns write unavailability
+instead of an unlabelled lower fallback.
+
+The real native HTTP fixture now captures the destination whole-commit input,
+requires ordinary origin despite a client `legacy_cdc` JSON property, and checks
+physical row visibility. A public-plan check verifies ordinary fresh plans and
+unlabelled older sealed bytes. The first broader build caught a nonexistent
+batch field in the defensive guard; that field belongs to transaction intents
+and was removed. Public HTTP contract cases passed. The next transaction run
+passed 78 existing/new cases but its new public HTTP write correctly required
+catalog metadata absent from the private-phase-only fixture. The fixture now
+exposes its actual document table/range metadata, preserving public admission
+checks. Latest contract checks passed; affected transaction verification is
+running (`source-public-ordinary-ingress-catalog-test.log`). Native C API and
+special maintenance provenance, physical root migration/drainage, first-strict
+activation and all original issue acceptance remain open.
+
+The catalog-complete native fixture passed public batch visibility and the
+ordinary-origin callback assertion despite a client legacy label. Its transaction
+suite passed all 43 local and 79 integration cases
+(`source-public-ordinary-ingress-catalog-test.log`). The preceding broader run
+also passed 36 public HTTP contract cases and six local/37 linked history cases;
+its only remaining failure was the subsequently corrected missing-catalog fixture.
+The same real native server now additionally exercises public transaction commit,
+checking its actual anonymous/stable destination callbacks for ordinary origin
+and physical transaction-row visibility. Final affected transaction checks are
+running (`source-public-ordinary-ingress-transaction-test.log`); latest contract
+checks passed (`source-public-ordinary-ingress-transaction-contract-check.log`).
+
+The wider public API parity run passed 245 cases but identified 11 fixtures using
+older commit callbacks without declaring producer support, plus a standalone
+native transaction fixture opened without the explicit native authority used by
+current C API factories. Reviewed whole-commit mocks now opt in; guarded SQL,
+cross-table MERGE and conflict-scalar callbacks assert ordinary origin. Native
+public transaction fixtures open with explicit nonzero identity/native authority.
+No production capability check was removed.
+
+Public anonymous/stable transaction handlers now map missing producer capability
+to unavailability; stable handlers preserve sealed execution state instead of
+fabricating terminal abort. The real native HTTP test disables whole-commit
+capability and verifies public batch/transaction writes remain unavailable with
+no rows created. Focused parity passed all 13 affected/native HTTP cases
+(`source-public-ordinary-ingress-parity-focused-test.log`), zero failures, skips
+or leaks. Full public parity is running again
+(`source-public-ordinary-ingress-parity-final-test.log`). These checks supplement
+the passing 43/79 transaction suites and 36 public HTTP/six local/37 linked
+response/history suites; original acceptance remains open.
+
+The final public parity owner passed all 54 local and 256 parity cases, with
+zero failures or leaks (`source-public-ordinary-ingress-parity-final-test.log`).
+The separate six-case integration owner stopped at its split/global-statistics
+case. LLDB identified a main-thread stack overflow before assertions; rerunning
+with a larger stack exposed an actual unknown transaction outcome at the
+post-split public batch. The fixture now uses an explicit 32 MiB worker stack
+and error-only HTTP diagnostics; the coordinator BEGIN cause is being traced.
+Neither the integration suite nor the full ingress milestone is qualified yet.
+No capability guard or unknown-outcome classification has been weakened.
+
+The complete rerun passed four of six integration cases; split/global-statistics
+and non-host CRUD still return UnexpectedHttpStatus. Explicit standalone role
+alone did not fix the split case: its producer coordinator BEGIN still reports
+OnlineSourceScopeChanged (`source-public-ordinary-ingress-split-authority-test.log`).
+The physical provisioned writer open helpers do not currently install an
+explicit source authority, whereas the linked kernel owner path supplies one.
+A diagnostic run distinguishes absent authority, kind/namespace mismatch and
+retained ordered-receipt conflicts before selecting a provisioning correction.
+This remains a real qualification failure, not a reason to permit unlabelled
+ordinary writes or manufacture native authority from an absent marker.
+
+The physical diagnostic confirmed `source authority unavailable required=native`
+before coordinator BEGIN, rather than an existing-kind/namespace conflict.
+The provisioned source now accepts an explicit serving-owner authority through
+`withSourceAuthority`, invalidates resident writers on configuration changes,
+and supplies it to both managed/indexed and direct cached opens. DataServer
+installs native authority only for configured standalone owners without data
+Raft, Raft authority for actual data-Raft owners, and no authority for otherwise
+unqualified owners. Raw DB/default managed opens still remain unqualified.
+Existing binding validation is unchanged. A Zig declaration-placement mistake
+was caught by formatting, its build was stopped, and fields were moved to the
+proper field sections. The corrected split qualification is running
+(`source-public-ordinary-ingress-split-provision-test.log`); transient uncached
+opens and the separate non-host integration case still need qualification.
+
+Explicit physical provisioning fixed the real split/global-statistics case:
+one passed, zero failures/skips/leaks
+(`source-public-ordinary-ingress-split-provision-test.log`). Source-catalog,
+engine-error and OpenAPI checks passed
+(`source-public-ordinary-ingress-provision-contract-check.log`). Hosted native
+routing fixtures now explicitly configure native authority before their first
+writer. Hosted sources keep the default unqualified and reject authority
+reconfiguration while retained writer entries remain. Their managed/direct
+opens and persistent control owners receive the explicit configuration.
+The non-host CRUD check is running
+(`source-public-ordinary-ingress-hosted-provision-test.log`).
+
+Hosted non-host CRUD passed with zero failures/skips/leaks
+(`source-public-ordinary-ingress-hosted-provision-test.log`). Explicit authority
+now also reaches uncached group opens, including identity-pinned group opens.
+The managed restore path preserves its frozen authority when no serving override
+is supplied. Temporary authority/BEGIN diagnostics were removed. Full parity and
+all six integration cases are running together against these final changes
+(`source-public-ordinary-ingress-final-provision-test.log`); final catalog/error/
+OpenAPI checks passed (`source-public-ordinary-ingress-final-contract-check.log`).
+
+Final ordinary public ingress/provisioning qualification passed all 54 local,
+256 public parity and six integration cases, zero failures/skips/leaks
+(`source-public-ordinary-ingress-final-provision-test.log`). The split case
+qualifies actual post-split multi-range writes and distributed text statistics;
+the non-host case qualifies real routed CRUD with explicit native hosted
+writers. Final source-catalog/error/OpenAPI checks and diff whitespace checks
+passed. This completes this ingress milestone only. Embedded C/SQL provenance,
+special maintenance classification, physical closure/drainage, destination
+integration, public retained-history/feed/bootstrap/retention contracts,
+production pgoutput and actual Antfly existing-client qualification remain
+required. Issues #1698/#1639 remain open and PR #1700 remains draft.
