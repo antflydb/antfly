@@ -99,4 +99,5 @@ pub fn run(a: std.mem.Allocator, path: []const u8) !void {
         try std.testing.expect(observed.record == null);
         try std.testing.expectEqual(@as(u64, 7), observed.cut.index);
     }
+    try @import("source_scope_retirement_db_test.zig").run(a, path, options, owner);
 }

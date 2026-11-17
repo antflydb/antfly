@@ -99,6 +99,9 @@ pub fn run(a: std.mem.Allocator, path: [:0]const u8) !void {
             try std.testing.expectEqual(@as(u64, 10), recovered.closed_through_token);
             try std.testing.expectError(error.ConflictingOrderedApplyReceipt, ordered.replay(a, &read, command, .{ .term = 4, .index = 20 }));
             var changed = command;
+            changed.observation.cut.index += 1;
+            try std.testing.expectError(error.ConflictingOrderedApplyReceipt, ordered.replay(a, &read, changed, .{ .term = 3, .index = 20 }));
+            changed = command;
             changed.intent.coordinator.minimum_applied_index += 1;
             changed.observation.request_digest = changed.intent.coordinator.digest();
             try std.testing.expectError(error.ConflictingOrderedApplyReceipt, ordered.replay(a, &read, changed, .{ .term = 3, .index = 20 }));

@@ -1169,6 +1169,12 @@ fn applyOrderedSourcePlanControl(self: *DB, request: @import("source_plan_contro
 fn applyOrderedSourceScopeControl(self: *DB, command: @import("source_scope_control.zig").Command, entry: types.OrderedApplyReceipt, bypass_write_gate: bool) engine.Outcome(@import("source_scope_ordered.zig").Outcome) {
     return .{ .value = self.applyOrderedSourceScopeControl(command, entry, bypass_write_gate) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn applyOrderedSourceRetirement(self: *DB, command: @import("source_scope_retirement.zig").Command, entry: types.OrderedApplyReceipt, bypass_write_gate: bool) engine.Outcome(@import("source_scope_retirement_ordered.zig").Recovery) {
+    return .{ .value = self.applyOrderedSourceRetirement(command, entry, bypass_write_gate) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn orderedSourceRetirementOutcome(self: *DB, query: @import("source_scope_retirement_ordered.zig").Query) engine.Outcome(@import("source_scope_retirement_ordered.zig").Recovery) {
+    return .{ .value = self.orderedSourceRetirementOutcome(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn orderedSourceScopeOutcome(self: *DB, recovery: @import("source_scope_ordered.zig").Recovery) engine.Outcome(@import("source_scope_ordered.zig").Outcome) {
     return .{ .value = self.orderedSourceScopeOutcome(recovery) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

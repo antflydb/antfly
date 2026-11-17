@@ -26149,6 +26149,67 @@ pub const DB = struct {
         }
     }
 
+    /// Ordered local retirement authorized by the original positive coordinator
+    /// ABORT. Success/fencing, outcome and apply marker share one native commit.
+    pub fn applyOrderedSourceRetirement(self: *DB, command: @import("../source_scope_retirement.zig").Command, entry: OrderedApplyReceipt, bypass_write_gate: bool) !@import("../source_scope_retirement_ordered.zig").Recovery {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedSourceRetirement", .{ self, command, entry, bypass_write_gate });
+        const ordered = @import("../source_scope_retirement_ordered.zig");
+        _ = try command.proof();
+        try self.requireSourcePlanAvailable();
+        const owner = command.intent.owner;
+        const root: source_plan_control.storage.Root = .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() };
+        var replication_mutation = if (bypass_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!bypass_write_gate) try self.enforceReplicationWriteGate();
+        var admission = self.core.snapshot_admission.acquireMutation();
+        defer admission.release();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        try self.requireSourcePlanAvailable();
+        try self.requireSourcePlanPhysicalRoot(root);
+        const cut: @import("../source_scope.zig").Cut = .{ .term = entry.term, .index = entry.index };
+        const disposition = try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry);
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try self.requireSourcePlanRoot(&read, root);
+            switch (disposition) {
+                .already_applied => return ordered.replay(self.alloc, &read, command, cut),
+                .apply => {},
+            }
+        }
+        var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+        var manager = try transactions_mod.TxnManager.init(self.alloc, self.core.store);
+        defer manager.deinit();
+        const reply = manager.retireScopedSourceAttempt(command, cut, &.{marker}) catch |err| {
+            const reason = ordered.Rejection.fromError(err) orelse return err;
+            // The failed transaction manager operation aborts staged mutations.
+            // Persist only a narrow deterministic rejection and its real marker.
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            _ = try self.requireSourcePlanRoot(&txn, root);
+            try ordered.stageRejected(self.alloc, &txn, command, cut, reason);
+            try txn.put(marker.key, marker.value);
+            try txn.commit();
+            return .{ .rejected = reason };
+        };
+        return .{ .applied = reply };
+    }
+
+    pub fn orderedSourceRetirementOutcome(self: *DB, recovery: @import("../source_scope_retirement_ordered.zig").Query) !@import("../source_scope_retirement_ordered.zig").Recovery {
+        if (comptime storage_engine.enabled) return storage_engine.call("orderedSourceRetirementOutcome", .{ self, recovery });
+        try recovery.validate();
+        try self.requireSourcePlanAvailable();
+        const owner = recovery.command.intent.owner;
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() });
+        const cut = try orderedHistoryReadCut(&txn, recovery.minimum_applied_index);
+        if (cut.index == recovery.entry.index and cut.term != recovery.entry.term) return error.ConflictingOrderedApplyReceipt;
+        return @import("../source_scope_retirement_ordered.zig").replay(self.alloc, &txn, recovery.command, recovery.entry);
+    }
+
     pub fn orderedSourceScopeOutcome(self: *DB, recovery: @import("../source_scope_ordered.zig").Recovery) !@import("../source_scope_ordered.zig").Outcome {
         if (comptime storage_engine.enabled) return storage_engine.call("orderedSourceScopeOutcome", .{ self, recovery });
         try recovery.validate();

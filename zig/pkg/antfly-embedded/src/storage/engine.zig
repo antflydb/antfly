@@ -556,6 +556,8 @@ pub const VTable = struct {
     applyOrderedSourcePlanControl: *const fn (*DB, @import("source_plan_control.zig").Request, types.OrderedApplyReceipt, bool) Outcome(@import("source_plan_control.zig").Outcome),
     applyOrderedSourceScopeControl: *const fn (*DB, @import("source_scope_control.zig").Command, types.OrderedApplyReceipt, bool) Outcome(@import("source_scope_ordered.zig").Outcome),
     orderedSourceScopeOutcome: *const fn (*DB, @import("source_scope_ordered.zig").Recovery) Outcome(@import("source_scope_ordered.zig").Outcome),
+    applyOrderedSourceRetirement: *const fn (*DB, @import("source_scope_retirement.zig").Command, types.OrderedApplyReceipt, bool) Outcome(@import("source_scope_retirement_ordered.zig").Recovery),
+    orderedSourceRetirementOutcome: *const fn (*DB, @import("source_scope_retirement_ordered.zig").Query) Outcome(@import("source_scope_retirement_ordered.zig").Recovery),
     sourceScopeObservation: *const fn (*DB, @import("source_scope_control.zig").Query) Outcome(@import("source_scope_control.zig").Observation),
     sourceCheckpointObservation: *const fn (*DB, @import("source_checkpoint_read.zig").Request) Outcome(@import("source_checkpoint_read.zig").Reply),
     sourcePlanObservation: *const fn (*DB, @import("source_plan_control.zig").Query) Outcome(@import("source_plan_control.zig").Observation),
@@ -600,7 +602,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 54 adds qualified source checkpoint observations.
 /// Version 56 adds qualified source-scope registry observations.
 /// Version 57 adds physical ordered source-scope controls and outcome recovery.
-pub const descriptor_version: u32 = 57;
+/// Version 58 adds ordered source attempt retirement and exact outcome recovery.
+pub const descriptor_version: u32 = 58;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

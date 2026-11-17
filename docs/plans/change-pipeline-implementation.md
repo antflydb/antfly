@@ -5946,3 +5946,51 @@ The full goal remains active. These checks qualify internal receipt-bound
 completion and existing native regressions, not successful production source
 activation, all-owner private retirement/release or the remaining original
 public feeds/bootstrap/retention/pgoutput/actual Antfly client acceptance criteria.
+
+
+### Ordered source retirement through the compiled storage engine
+
+The DB facade now exposes ordered retirement and exact outcome recovery through
+storage engine contract version 58. A positive original coordinator ABORT remains
+mandatory. The native writer commits the scope token floor, local enlisted ABORT
+resolution when present, retirement outcome and actual apply marker together.
+The DB holds the physical owner/apply fence throughout. Narrow deterministic
+rejections are persisted with their marker only after the mutation writer aborts;
+unresolved evidence, corruption and storage errors remain errors.
+
+The bounded retirement journal uses an explicit version-2 key and checksum domain.
+Its command fingerprint includes the entire qualified coordinator observation,
+including its actual read cut. A changed observation at the same entry conflicts.
+An absent or superseded journal never proves a local or global transaction result.
+The previous journal key is not misread as the new envelope.
+
+The actual DB/compiled-engine source-scope fixture now also exercises an
+unenlisted retirement, exact retry, restart recovery, changed observation cut,
+binding rejection without a changed token floor, future minimum refusal,
+supersession and final reopen. Registry binding and the positive remote ABORT
+observation are explicit fixture setup, not successful production legacy handover
+or an independently executed remote coordinator read.
+
+`source-scope-native-control-test -Dstrip=true -j1` passed its selected native DB
+case (`source-retirement-db-test.log`). `docstore-history-test -Dstrip=true -j1`
+passed all 15 selected tests with zero skips/failures/leaks
+(`source-retirement-history-test.log`), including the changed-read-cut regression
+in the real NativeKV reopen helper. Full `make generate` completed successfully
+(`source-retirement-db-generate.log`); unrelated generated model explorer outputs
+were discarded. Source-catalog, engine-error and OpenAPI checks passed, including
+nine schema fragment tests (`source-retirement-db-contract-check.log`). Linked
+qualification results are recorded below when complete.
+
+Owner ABI 110, API kernel 31, data protocol 40, metadata protocol 105 and failure
+contract 89 are unchanged. Retirement is not yet exposed through the opaque owner
+ABI, a data Raft entry or authenticated remote transport. Those proposal boundaries
+must obtain fresh independent coordinator evidence; accepting a caller-provided
+observation would not meet the contract. All-owner retirement/release and the full
+original destination/public feeds/bootstrap/retention/pgoutput/actual Antfly CDC
+client acceptance scope remain open. The goal and both issues remain open.
+
+Final `history-control-apply-test -Dstrip=true -j1` exited 0
+(`source-retirement-db-linked-test.log`): all 27 selected linked and six selected
+local tests passed, zero reported skips/failures/leaks. Guarded repository cache
+cleanup completed and preserved active/recent outputs
+(`source-retirement-db-gc.log`). The full goal remains active.

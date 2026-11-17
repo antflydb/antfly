@@ -1189,7 +1189,7 @@ pub const TxnManager = struct {
             defer probe.abort();
             return switch (try @import("source_scope_retirement_ordered.zig").replay(arena.allocator(), &probe, command, applied)) {
                 .applied => |reply| reply,
-                .superseded => error.SourceOutcomeUnresolved,
+                .rejected, .superseded => error.SourceOutcomeUnresolved,
             };
         }
         var batch = try self.store.beginBatch();

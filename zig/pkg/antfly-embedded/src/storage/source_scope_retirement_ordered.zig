@@ -13,23 +13,60 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! One bounded successful retirement receipt per physical root. It commits
-//! after the token floor and transaction resolution, before the same batch's
-//! actual ordered marker becomes durable. Expiry conveys no transaction outcome.
+//! One bounded retirement outcome per physical root. Success commits with the
+//! token floor and transaction resolution; deterministic rejection commits only
+//! after the failed writer aborts. Both include the actual ordered marker.
+//! Expiry conveys no transaction outcome.
 const std = @import("std");
 const scope = @import("source_scope.zig");
 const retirement = @import("source_scope_retirement.zig");
 const A = std.mem.Allocator;
-pub const receipt_key = "\x00\x00__metadata__:source_scope:retirement_outcome";
+pub const receipt_key = "\x00\x00__metadata__:source_scope:retirement_outcome_v2";
 pub const max_record_bytes = 8192;
-const Record = struct { root: scope.Basis, reply: retirement.Reply };
+pub const Rejection = enum {
+    invalid,
+    scope_changed,
+    conflict,
+    expired,
+    pending,
+    backpressure,
+    pub fn fromError(err: anyerror) ?Rejection {
+        return switch (err) {
+            error.InvalidSourceAdmission => .invalid,
+            error.HistoryResynchronizationRequired, error.IdentityNamespaceMismatch => .scope_changed,
+            error.DecisionConflict, error.SourceCheckpointConflict, error.SourceTransactionIdentityConflict => .conflict,
+            error.SourceReceiptExpired => .expired,
+            error.SourcePendingWork, error.IntegrityTopologyBusy => .pending,
+            error.SourceAdmissionBackpressure => .backpressure,
+            else => null,
+        };
+    }
+};
+pub const Recovery = union(enum) { applied: retirement.Reply, rejected: Rejection, superseded: void };
+pub const Query = struct {
+    command: retirement.Command,
+    entry: scope.Cut,
+    minimum_applied_index: u64,
+    pub fn validate(self: Query) !void {
+        _ = try self.command.proof();
+        if (self.entry.term == 0 or self.entry.index == 0 or self.minimum_applied_index < self.entry.index) return error.InvalidSourceAdmission;
+    }
+};
+const Record = struct { version: u8 = 2, root: scope.Basis, entry: scope.Cut, command: scope.Digest, outcome: Recovery };
 const Envelope = struct { record: Record, checksum: scope.Digest };
-pub const Recovery = union(enum) { applied: retirement.Reply, superseded: void };
 fn checksum(a: A, record: Record) !scope.Digest {
     const bytes = try std.json.Stringify.valueAlloc(a, record, .{});
     defer a.free(bytes);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly:source-scope-retirement-outcome:v1");
+    hash.update("antfly:source-scope-retirement-outcome:v2");
+    hash.update(bytes);
+    return hash.finalResult();
+}
+pub fn fingerprint(a: A, command: retirement.Command) !scope.Digest {
+    const bytes = try retirement.encodeCommand(a, command);
+    defer a.free(bytes);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly:source-scope-retirement-command:v1");
     hash.update(bytes);
     return hash.finalResult();
 }
@@ -50,14 +87,32 @@ pub fn resolvedReply(a: A, txn: anytype, command: retirement.Command, cut: scope
 pub fn stage(a: A, txn: anytype, command: retirement.Command, reply: retirement.Reply) !void {
     const expected = try resolvedReply(a, txn, command, reply.cut, reply.disposition == .already_fenced);
     if (!std.meta.eql(expected, reply)) return error.SourceAdmissionCorrupt;
-    const record: Record = .{ .root = try scope.Basis.fromOwner(command.intent.owner), .reply = reply };
+    try stageOutcome(a, txn, command, reply.cut, .{ .applied = reply });
+}
+/// Called only after the failed mutation writer was aborted. Unexpected storage
+/// errors and unresolved coordinator evidence cannot become durable rejection.
+pub fn stageRejected(a: A, txn: anytype, command: retirement.Command, cut: scope.Cut, reason: Rejection) !void {
+    try stageOutcome(a, txn, command, cut, .{ .rejected = reason });
+}
+fn validateRecord(record: Record) !void {
+    try record.root.validate();
+    if (record.version != 2 or record.entry.term == 0 or record.entry.index == 0 or std.mem.allEqual(u8, &record.command, 0) or record.outcome == .superseded) return error.SourceAdmissionCorrupt;
+    if (record.outcome == .applied) {
+        const reply = record.outcome.applied;
+        if (reply.version != 1 or !std.meta.eql(reply.cut, record.entry) or reply.closed_through_token == 0 or std.mem.allEqual(u8, &reply.request_digest, 0) or std.mem.allEqual(u8, &reply.coordinator_record_digest, 0)) return error.SourceAdmissionCorrupt;
+    }
+}
+fn stageOutcome(a: A, txn: anytype, command: retirement.Command, cut: scope.Cut, outcome: Recovery) !void {
+    const proof = try command.proof();
+    const record: Record = .{ .root = proof.root, .entry = cut, .command = try fingerprint(a, command), .outcome = outcome };
+    try validateRecord(record);
     const bytes = try std.json.Stringify.valueAlloc(a, Envelope{ .record = record, .checksum = try checksum(a, record) }, .{});
     defer a.free(bytes);
     if (bytes.len > max_record_bytes) return error.SourceAdmissionCorrupt;
     try txn.put(receipt_key, bytes);
 }
-/// Requires independent physical owner and applied-index qualification. Do not
-/// re-read the live scope: a newer attempt may have advanced it after this cut.
+/// Physical owner and applied-index qualification belong to the DB caller.
+/// Re-read only this exact command/cut receipt, never today's mutable registry.
 pub fn replay(a: A, txn: anytype, command: retirement.Command, cut: scope.Cut) !Recovery {
     const proof = try command.proof();
     if (cut.term == 0 or cut.index == 0) return error.InvalidSourceAdmission;
@@ -66,12 +121,14 @@ pub fn replay(a: A, txn: anytype, command: retirement.Command, cut: scope.Cut) !
     var parsed = std.json.parseFromSlice(Envelope, a, bytes, .{ .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.SourceAdmissionCorrupt;
     defer parsed.deinit();
     const record = parsed.value.record;
-    try record.root.validate();
+    try validateRecord(record);
     if (!std.meta.eql(parsed.value.checksum, try checksum(a, record))) return error.SourceAdmissionCorrupt;
     if (!std.meta.eql(record.root, proof.root)) return error.HistoryResynchronizationRequired;
-    if (record.reply.cut.term == 0 or record.reply.cut.index == 0 or record.reply.version != 1 or std.mem.allEqual(u8, &record.reply.request_digest, 0) or std.mem.allEqual(u8, &record.reply.coordinator_record_digest, 0)) return error.SourceAdmissionCorrupt;
-    if (record.reply.cut.index != cut.index) return .superseded;
-    if (record.reply.cut.term != cut.term or !std.meta.eql(record.reply.request_digest, command.intent.digest()) or !std.meta.eql(record.reply.coordinator_record_digest, proof.coordinator_record_digest)) return error.ConflictingOrderedApplyReceipt;
-    try record.reply.validate(command.intent);
-    return .{ .applied = record.reply };
+    if (record.entry.index != cut.index) return .superseded;
+    if (record.entry.term != cut.term or !std.meta.eql(record.command, try fingerprint(a, command))) return error.ConflictingOrderedApplyReceipt;
+    if (record.outcome == .applied) {
+        try record.outcome.applied.validate(command.intent);
+        if (!std.meta.eql(record.outcome.applied.coordinator_record_digest, proof.coordinator_record_digest)) return error.SourceAdmissionCorrupt;
+    }
+    return record.outcome;
 }
