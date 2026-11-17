@@ -11,6 +11,36 @@ const Tensor = @import("../backends/tensor.zig").Tensor;
 const Config = @import("../models/gpt.zig").Config;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
+/// Capability selection happens before allocation or execution. Automatic mode
+/// preserves the ordinary PJRT route for unsupported state layouts; explicit
+/// enablement fails rather than hiding an execution failure with a replay.
+pub fn select(source: Session, requested: ?bool) !bool {
+    if (requested == false) return false;
+    const supported = enabled and source.backend() == .pjrt and source.vtable.runCachedDecoder != null and
+        (if (source.model_contract.decoder_config) |cfg| supports(cfg.*) else false);
+    if (requested == true and !supported) return error.UnsupportedResidentDecode;
+    return supported;
+}
+
+pub fn supports(cfg: Config) bool {
+    if (cfg.position_encoding != .rope or cfg.gemma4_mtp_assistant or cfg.usesMoe() or
+        cfg.deepseek_v4_hc_mult != 0 or cfg.deepseek_v4_kv_lora_rank != 0 or
+        cfg.num_kv_shared_layers > cfg.num_hidden_layers or cfg.num_hidden_layers == 0 or cfg.num_attention_heads == 0 or cfg.hidden_size == 0 or
+        cfg.vocab_size == 0 or cfg.max_position_embeddings == 0) return false;
+    if (cfg.qwen35_has_linear_attention and (cfg.qwen35_linear_conv_kernel_dim == 0 or
+        cfg.qwen35_linear_key_head_dim == 0 or cfg.qwen35_linear_value_head_dim == 0 or
+        cfg.qwen35_linear_num_key_heads == 0 or cfg.qwen35_linear_num_value_heads == 0 or
+        cfg.qwen35_linear_num_value_heads % cfg.qwen35_linear_num_key_heads != 0)) return false;
+    for (0..cfg.num_hidden_layers) |layer| {
+        if (cfg.layerUsesQwen35LinearAttention(layer)) continue;
+        const geometry = cfg.kvDonorGeometry(layer) catch return false;
+        const rotary = cfg.layerRopeDim(layer);
+        if (geometry.donor_layer > layer or geometry.num_kv_heads == 0 or geometry.head_dim == 0 or
+            cfg.num_attention_heads % geometry.num_kv_heads != 0 or rotary == 0 or rotary % 2 != 0 or rotary > geometry.head_dim) return false;
+    }
+    return true;
+}
+
 pub const Decoder = struct {
     allocator: std.mem.Allocator,
     source: Session,
@@ -28,7 +58,7 @@ pub const Decoder = struct {
 
     pub fn init(a: std.mem.Allocator, source: Session, limit: usize, control: ?Control) !Decoder {
         const cfg = (source.model_contract.decoder_config orelse return error.UnsupportedResidentDecode).*;
-        if (!enabled or source.backend() != .pjrt or cfg.position_encoding != .rope) return error.UnsupportedResidentDecode;
+        if (!try select(source, true)) return error.UnsupportedResidentDecode;
         const capacity = try capacityFor(limit, cfg.max_position_embeddings);
         var elements: usize = 0;
         for (0..cfg.num_hidden_layers) |layer| {
@@ -144,4 +174,25 @@ test "resident decoder capacity buckets share programs without expanding logical
     try std.testing.expectEqual(@as(usize, 200), try capacityFor(193, 200));
     try std.testing.expectError(error.InvalidResidentDecodePosition, capacityFor(0, 1024));
     try std.testing.expectError(error.InvalidResidentDecodePosition, capacityFor(1025, 1024));
+}
+
+test "resident decoder capability rejects unsupported state layouts before execution" {
+    var cfg = Config{ .position_encoding = .rope };
+    try std.testing.expect(supports(cfg));
+    cfg.position_encoding = .absolute;
+    try std.testing.expect(!supports(cfg));
+    cfg.position_encoding = .alibi;
+    try std.testing.expect(!supports(cfg));
+    cfg.position_encoding = .rope;
+    cfg.gemma4_mtp_assistant = true;
+    try std.testing.expect(!supports(cfg));
+    cfg.gemma4_mtp_assistant = false;
+    cfg.deepseek_v4_kv_lora_rank = 64;
+    try std.testing.expect(!supports(cfg));
+    cfg.deepseek_v4_kv_lora_rank = 0;
+    cfg.num_key_value_heads = 7;
+    try std.testing.expect(!supports(cfg));
+    cfg.num_key_value_heads = 0;
+    cfg.num_kv_shared_layers = cfg.num_hidden_layers + 1;
+    try std.testing.expect(!supports(cfg));
 }

@@ -1315,7 +1315,7 @@ pub const NodeConfig = struct {
     pjrt_precision: session_factory.PjrtSessionOptions.Precision = .f32,
     pjrt_extraction_batch_size: usize = 1,
     pjrt_media_bucket_rows: usize = 0,
-    pjrt_decoder_cache: bool = false,
+    pjrt_decoder_cache: ?bool = null,
     pjrt_gemm: @import("../execution/precision.zig").Gemm = .provider_default,
     audio_readers: []const transcribing_api.NamedConfig = &.{},
     chunking_limits: @import("../pipelines/media_chunk_limits.zig").Limits = .{},
@@ -38444,7 +38444,7 @@ test "whole-model PJRT generation serves real HTTP responses and refunds request
     const domain = node.model_manager.resource_domain.?;
     var previous: ?[]u8 = null;
     defer if (previous) |bytes| a.free(bytes);
-    for ([_]bool{ false, true }) |cached| {
+    for ([_]?bool{ false, true, null }) |cached| {
         node.config.pjrt_decoder_cache = cached;
         for (0..2) |_| {
             var arena = std.heap.ArenaAllocator.init(a);

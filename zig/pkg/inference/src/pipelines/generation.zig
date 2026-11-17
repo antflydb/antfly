@@ -2604,6 +2604,8 @@ pub const DecoderStepPublication = NativeGenerationPipeline.StepPublication;
 
 const ExecutionScope = @import("../ops/execution_scope.zig").Scope;
 
+pub const selectPjrtDecoderCache = @import("../execution/resident_decoder.zig").select;
+
 pub const NativeGenerationPipeline = struct {
     /// Token publication is bounded; GPU steps reuse two frame/logit banks.
     pub const max_gpu_token_burst_width: usize = pending_step.AcceptedTokens.max_count;
@@ -2611,7 +2613,8 @@ pub const NativeGenerationPipeline = struct {
     io: ?std.Io = null,
     cb: ComputeBackend,
     session: ?backends.Session = null,
-    pjrt_decoder_cache: bool = false,
+    pjrt_decoder_cache: ?bool = null,
+    pjrt_decoder_cache_used: bool = false,
     compiled_decoder: ?*@import("../execution/resident_decoder.zig").Decoder = null,
     compiled_media_prefix: ?*@import("../execution/media_prefix.zig").Prefix = null,
     /// Optional observation-only model capability; never changes provider,
@@ -3011,6 +3014,7 @@ pub const NativeGenerationPipeline = struct {
         var compiled_decoder: ?@import("../execution/resident_decoder.zig").Decoder = null;
         const previous_compiled_decoder = self.compiled_decoder;
         self.compiled_decoder = null;
+        self.pjrt_decoder_cache_used = false;
         defer {
             self.compiled_decoder = previous_compiled_decoder;
             if (compiled_decoder) |*decoder| decoder.deinit();
@@ -3685,10 +3689,11 @@ pub const NativeGenerationPipeline = struct {
             }
             if (compiled_prefix) |*prefix| self.compiled_media_prefix = prefix;
         }
-        if (self.usesPjrtSession() and self.pjrt_decoder_cache) {
+        if (self.usesPjrtSession() and try selectPjrtDecoderCache(self.session.?, self.pjrt_decoder_cache)) {
             const capacity = @min(try std.math.add(usize, seq_len, max_tokens), self.gpt_config.max_position_embeddings);
             compiled_decoder = try @import("../execution/resident_decoder.zig").Decoder.init(self.allocator, self.session.?, capacity, self.execution_control);
             self.compiled_decoder = &compiled_decoder.?;
+            self.pjrt_decoder_cache_used = true;
         }
         const prefill_output = if (self.compiled_decoder) |decoder|
             PrefillOutput{ .last_logits = if (self.compiled_media_prefix) |prefix| try prefix.runCached(decoder, token_ids[0..seq_len], allocator, self.execution_control) else try decoder.text(token_ids[0..seq_len], allocator, self.execution_control) }

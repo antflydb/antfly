@@ -394,7 +394,7 @@ const run_usage_options =
     \\  --pjrt-gemm <profile>                 provider_default, vendor, vendor_deterministic
     \\  --pjrt-extraction-batch-size <1..8>  Compiled request batch limit
     \\  --pjrt-media-bucket-rows <0..256>    Media-prefix shape reuse
-    \\  --pjrt-decoder-cache <true|false>    Qualify resident decoder state
+    \\  --pjrt-decoder-cache <auto|true|false> Resident decoder state (default auto)
     \\  --models-dir <path>                 AI model directory
     \\  --ml-dir <path>                     Predictor model directory
     \\  --config <path>                     JSON run configuration

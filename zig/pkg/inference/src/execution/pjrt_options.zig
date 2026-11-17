@@ -14,7 +14,7 @@ pub const Options = struct {
     precision: factory.PjrtSessionOptions.Precision = .f32,
     extraction_batch_size: usize = 1,
     media_bucket_rows: usize = 0,
-    decoder_cache: bool = false,
+    decoder_cache: ?bool = null,
     gemm: @FieldType(factory.PjrtSessionOptions, "gemm") = .provider_default,
 
     pub fn parse(self: *Options, arg: []const u8, value: []const u8) !bool {
@@ -27,7 +27,7 @@ pub const Options = struct {
             self.media_bucket_rows = try std.fmt.parseInt(usize, value, 10);
             if (self.media_bucket_rows > 256) return error.InvalidPjrtBucket;
         } else if (std.mem.eql(u8, arg, "--pjrt-decoder-cache")) {
-            self.decoder_cache = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidPjrtDecoderCache;
+            self.decoder_cache = if (std.mem.eql(u8, value, "auto")) null else if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidPjrtDecoderCache;
         } else if (std.mem.eql(u8, arg, "--pjrt-gemm")) {
             self.gemm = std.meta.stringToEnum(@TypeOf(self.gemm), value) orelse return error.InvalidPjrtGemm;
         } else if (std.mem.eql(u8, arg, "--pjrt-unified-memory")) {
@@ -69,6 +69,14 @@ pub const Options = struct {
 
 test "PJRT options require explicit feasible CUDA capacities and preserve selection" {
     var value: Options = .{};
+    try std.testing.expectEqual(@as(?bool, null), value.decoder_cache);
+    try std.testing.expect(try value.parse("--pjrt-decoder-cache", "true"));
+    try std.testing.expectEqual(@as(?bool, true), value.decoder_cache);
+    try std.testing.expect(try value.parse("--pjrt-decoder-cache", "false"));
+    try std.testing.expectEqual(@as(?bool, false), value.decoder_cache);
+    try std.testing.expect(try value.parse("--pjrt-decoder-cache", "auto"));
+    try std.testing.expectEqual(@as(?bool, null), value.decoder_cache);
+    try std.testing.expectError(error.InvalidPjrtDecoderCache, value.parse("--pjrt-decoder-cache", "yes"));
     try std.testing.expect(try value.parse("--pjrt-device", "cuda"));
     try std.testing.expectError(error.InvalidPjrtMemoryPolicy, value.sessionOptions());
     try std.testing.expect(try value.parse("--pjrt-capacity-bytes", "4096"));

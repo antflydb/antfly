@@ -1110,6 +1110,22 @@ test "PJRT resident decoder caches attention and recurrent history transactional
                 std.debug.print("resident step position={d}\n", .{position});
                 const decode_inputs = try ResidentFixture.inputs(a, &decode, &cb, position);
                 defer ResidentFixture.release(a, &cb, decode_inputs);
+                if (position == 3) {
+                    const Cancel = struct {
+                        checks: usize = 0,
+                        fn check(raw: ?*anyopaque) !void {
+                            const self: *@This() = @ptrCast(@alignCast(raw.?));
+                            self.checks += 1;
+                            if (self.checks == 2) return error.Cancelled;
+                        }
+                    };
+                    var cancellation = Cancel{};
+                    try std.testing.expectError(error.Cancelled, state.run(decode_exec, &cb, decode_inputs, 1, 1, a, .{ .ptr = &cancellation, .check_fn = Cancel.check }));
+                    try std.testing.expectEqual(position, state.position);
+                    var failed = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                    try std.testing.expectError(error.OutOfMemory, state.run(decode_exec, &cb, decode_inputs, 1, 1, failed.allocator(), null));
+                    try std.testing.expectEqual(position, state.position);
+                }
                 const next = try state.run(decode_exec, &cb, decode_inputs, 1, 1, a, null);
                 defer a.free(next);
                 for (next, expected[position * width ..][0..width]) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 2e-5);

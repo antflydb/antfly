@@ -11,6 +11,8 @@ const generation = inference.pipelines.generation;
 pub fn run(init: std.process.Init, model: *inference.server.model_manager.LoadedModel, a: std.mem.Allocator, options: anytype) !void {
     const config = factory.getGptConfig(model.session) orelse return error.MissingDecoderConfig;
     const is_pjrt = options.backend == .xla;
+    const comparison = options.generate_cache_comparison;
+    if (comparison and (!is_pjrt or !try generation.selectPjrtDecoderCache(model.session, true))) return error.UnsupportedResidentDecode;
     const client = factory.getPjrtClientPtr(model.session);
     if (is_pjrt and (model.session.backend() != .pjrt or client == null)) return error.GenerationBackendSelectionMismatch;
     var cb = try factory.getComputeBackend(model.session, a);
@@ -72,8 +74,14 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
     defer a.free(samples);
     var reference: ?generation.GenerationResult = null;
     defer if (reference) |*value| value.deinit();
-    var cold_ns: u64 = 0;
-    for (0..options.warmup + options.iterations) |i| {
+    const cached_samples = try a.alloc(u64, if (comparison) options.iterations else 0);
+    defer a.free(cached_samples);
+    var counts: [2]usize = @splat(0);
+    var cold: [2]u64 = @splat(0);
+    const requests = try std.math.mul(usize, try std.math.add(usize, options.warmup, options.iterations), if (comparison) @as(usize, 2) else 1);
+    for (0..requests) |i| {
+        const mode: usize = if (comparison and (i % 4 == 1 or i % 4 == 2)) 1 else 0;
+        if (comparison) pipeline.pjrt_decoder_cache = mode == 1;
         const start = inference.platform.time.awakeNs(init.io);
         var result = request: {
             var decode: ?generation.NativeDecodeState = if (request_pool) |pool| generation.NativeDecodeState.initPaged(a, &kv, pool, null) else null;
@@ -87,8 +95,12 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
             break :request try pipeline.generate(&messages, .{ .max_tokens = @intCast(options.generate_tokens), .temperature = 0, .enable_thinking = false });
         };
         const elapsed = inference.platform.time.awakeNs(init.io) - start;
-        if (i == 0) cold_ns = elapsed;
-        if (i >= options.warmup) samples[i - options.warmup] = elapsed;
+        if (counts[mode] == 0) cold[mode] = elapsed;
+        if (counts[mode] >= options.warmup) {
+            const destination = if (mode == 1) cached_samples else samples;
+            destination[counts[mode] - options.warmup] = elapsed;
+        }
+        counts[mode] += 1;
         if (reference) |expected| {
             defer result.deinit();
             if (!std.mem.eql(u8, expected.text, result.text) or expected.tokens_used != result.tokens_used) return error.GenerationResetOutputChanged;
@@ -105,20 +117,22 @@ pub fn run(init: std.process.Init, model: *inference.server.model_manager.Loaded
         .pjrt_execution_profile = factory.getPjrtExecutionProfile(model.session),
         .pjrt_device = if (is_pjrt) @tagName(options.pjrt.device) else null,
         .pjrt_media_bucket_rows = options.pjrt.media_bucket_rows,
-        .pjrt_decoder_cache = options.pjrt.decoder_cache,
+        .pjrt_decoder_cache_requested = options.pjrt.decoder_cache,
+        .pjrt_decoder_cache = pipeline.pjrt_decoder_cache_used,
         .pjrt_gemm = if (is_pjrt) @tagName(options.pjrt.gemm) else null,
         .pjrt_precision = if (is_pjrt) @tagName(options.pjrt.precision) else null,
         .whole_model_required = is_pjrt,
         .modalities = .{ .image = image_bytes != null, .audio = audio_bytes != null, .video = video_bytes != null },
-        .decode_execution_scope = if (is_pjrt) (if (options.pjrt.decoder_cache) "request_resident_state" else "offline_full_prefix_recomputation") else "native_paged_kv",
+        .decode_execution_scope = if (comparison) "full_prefix_vs_resident_ABBA" else if (is_pjrt) (if (pipeline.pjrt_decoder_cache_used) "request_resident_state" else "offline_full_prefix_recomputation") else "native_paged_kv",
         .cached_serving_performance_qualified = false,
-        .kv_cached = !is_pjrt or options.pjrt.decoder_cache,
+        .kv_cached = !is_pjrt or pipeline.pjrt_decoder_cache_used,
         .model_load_in_timing = false,
         .model_chat_template = model.chat_tmpl != null,
         .runtime_capabilities = if (cache.compiled_model_runtime) |*runtime| runtime.capabilities() else null,
         .compiled_stage_shapes = factory.getPjrtSpecializationCount(model.session),
         .cached_shapes = cache.specializations.entries.items.len,
-        .cold_request_ns = cold_ns,
+        .cache_comparison = if (comparison) .{ .order = "ABBA", .same_tokens = true, .baseline_samples_ns = samples, .cached_samples_ns = cached_samples, .cached_cold_request_ns = cold[1] } else null,
+        .cold_request_ns = cold[0],
         .samples_ns = samples,
         .warmup = options.warmup,
         .text = held.text,

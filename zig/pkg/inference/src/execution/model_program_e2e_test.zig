@@ -860,3 +860,190 @@ test "model program resident decoder matches full-prefix logits without per-toke
         }
     }
 }
+
+const DecoderQualification = struct {
+    const Session = @import("../backends/session.zig").Session;
+    const Decoder = @import("resident_decoder.zig").Decoder;
+    const control = @import("../execution_control.zig").InferenceExecutionControl{ .native_call_policy = .in_process };
+
+    fn options(precision: factory.PjrtSessionOptions.Precision) !factory.PjrtSessionOptions {
+        const physical = platform.env.getenv("ANTFLY_PJRT_DECODER_DEVICE_BYTES") orelse return .{ .task_override = .generic, .memory_policy = .cpu, .precision = precision };
+        const capacity = platform.env.getenv("ANTFLY_PJRT_DECODER_CAPACITY_BYTES") orelse return error.MissingPjrtCapacity;
+        return .{ .task_override = .generic, .precision = precision, .memory_policy = .{ .cuda = .{
+            .device_bytes = try std.fmt.parseInt(usize, physical, 10),
+            .capacity_bytes = try std.fmt.parseInt(usize, capacity, 10),
+            .unified_memory = platform.env.getenvBool("ANTFLY_PJRT_DECODER_UNIFIED_MEMORY"),
+        } } };
+    }
+
+    fn reference(session: Session, ids: []const i64, a: std.mem.Allocator) ![]f32 {
+        const cfg = session.model_contract.decoder_config.?;
+        const rows = try @import("resident_decoder.zig").capacityFor(ids.len, cfg.max_position_embeddings);
+        const padded = try a.alloc(i64, rows);
+        defer a.free(padded);
+        @memcpy(padded[0..ids.len], ids);
+        @memset(padded[ids.len..], 0);
+        var input = try Tensor.initInt64(a, "input_ids", &.{ 1, @intCast(rows) }, padded);
+        defer input.deinit();
+        var row = try Tensor.initInt64(a, "logits_row", &.{1}, &.{@intCast(ids.len - 1)});
+        defer row.deinit();
+        const outputs = try session.runWithControl(&.{ input, row }, a, control);
+        defer a.free(outputs);
+        defer for (outputs) |*value| value.deinit();
+        return a.dupe(f32, outputs[0].asFloat32());
+    }
+
+    fn accuracy(reference_f32: []const f32, source: []const f32, cached: []const f32, bf16: bool) !void {
+        try std.testing.expectEqual(reference_f32.len, cached.len);
+        var energy: f64 = 0;
+        var source_error: f64 = 0;
+        var cached_error: f64 = 0;
+        var maximum: f32 = 0;
+        for (reference_f32, source, cached) |fp32, before, after| {
+            try std.testing.expect(std.math.isFinite(after));
+            energy += @as(f64, fp32) * fp32;
+            source_error += @as(f64, before - fp32) * (before - fp32);
+            cached_error += @as(f64, after - fp32) * (after - fp32);
+            maximum = @max(maximum, @abs(before - after));
+        }
+        const baseline = @sqrt(source_error / @max(energy, 1e-30));
+        const candidate = @sqrt(cached_error / @max(energy, 1e-30));
+        std.debug.print("decoder qualification bf16={} source_relative={d} cached_relative={d} max_difference={d}\n", .{ bf16, baseline, candidate, maximum });
+        if (bf16) try std.testing.expect(candidate <= @max(@as(f64, 0.003), baseline * 1.5)) else try std.testing.expect(maximum <= 0.003);
+        try std.testing.expectEqual(std.mem.indexOfMax(f32, source), std.mem.indexOfMax(f32, cached));
+    }
+};
+
+test "model program resident decoder qualifies context boundaries and longer continuations" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_PJRT_DECODER_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const f32_session = try factory.createPjrtSessionWithOptions(a, path, try DecoderQualification.options(.f32));
+    defer f32_session.close();
+    const bf16_session = try factory.createPjrtSessionWithOptions(a, path, try DecoderQualification.options(.bf16));
+    defer bf16_session.close();
+    const stress = platform.env.getenvBool("ANTFLY_PJRT_DECODER_STRESS");
+    const steps: usize = if (stress) 16 else 4;
+    const starts = [_]usize{ 31, 63, 65, 255, 1023, 2047 };
+    const tokenizer = try @import("../server/model_manager.zig").loadHuggingFaceTokenizerFromDir(a, path);
+    defer tokenizer.tokenizer().deinitTokenizer();
+    const documents = [_][]const u8{
+        "The quick brown fox jumps over the lazy dog. Autumn brings change and beauty to the world. ",
+        "Invoice 12345. Total USD 42.00. Record the number and amount exactly. ",
+        "Paris is the capital of France. Explain how sunlight helps plants grow. ",
+    };
+    for (starts[0..if (stress) @as(usize, 6) else 4], 0..) |first, case| {
+        const encoded = try tokenizer.tokenizer().encode(a, documents[case % documents.len]);
+        defer a.free(encoded);
+        const history = try a.alloc(i64, first + steps);
+        defer a.free(history);
+        for (history, 0..) |*token, index| token.* = encoded[index % encoded.len];
+        var f32_cached = try DecoderQualification.Decoder.init(a, f32_session, history.len, DecoderQualification.control);
+        defer f32_cached.deinit();
+        var bf16_cached = try DecoderQualification.Decoder.init(a, bf16_session, history.len, DecoderQualification.control);
+        defer bf16_cached.deinit();
+        for (first..history.len + 1) |rows| {
+            const fp32 = try f32_cached.text(history[0..rows], a, DecoderQualification.control);
+            defer a.free(fp32);
+            const bf16 = try bf16_cached.text(history[0..rows], a, DecoderQualification.control);
+            defer a.free(bf16);
+            if (rows != first and rows != history.len and rows % 64 != 0) continue;
+            std.debug.print("decoder context rows={d} first={d}\n", .{ rows, first });
+            const reference = try DecoderQualification.reference(f32_session, history[0..rows], a);
+            defer a.free(reference);
+            const baseline = try DecoderQualification.reference(bf16_session, history[0..rows], a);
+            defer a.free(baseline);
+            try DecoderQualification.accuracy(reference, reference, fp32, false);
+            try DecoderQualification.accuracy(reference, baseline, bf16, true);
+        }
+    }
+}
+
+test "model program resident requests isolate concurrent state and refund failures" {
+    if (comptime !@import("build_options").enable_pjrt) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_PJRT_DECODER_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const loaded = try factory.createPjrtSessionWithOptions(a, path, try DecoderQualification.options(.f32));
+    defer loaded.close();
+    const memory = @import("../runtime/tier/memory.zig");
+    var accounting = memory.AdmissionController{};
+    var session = loaded;
+    session.run_admission = .{ .controller = &accounting, .backend_class = if (platform.env.getenv("ANTFLY_PJRT_DECODER_DEVICE_BYTES") != null) .gpu else .cpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false };
+    const baseline = accounting.snapshot();
+    try std.testing.expect(try @import("resident_decoder.zig").select(session, null));
+    try std.testing.expect(!try @import("resident_decoder.zig").select(session, false));
+    var unsupported = session;
+    var config = session.model_contract.decoder_config.?.*;
+    config.position_encoding = .absolute;
+    unsupported.model_contract.decoder_config = &config;
+    try std.testing.expect(!try @import("resident_decoder.zig").select(unsupported, null));
+    try std.testing.expectError(error.UnsupportedResidentDecode, @import("resident_decoder.zig").select(unsupported, true));
+    var denied = session;
+    denied.run_admission.?.limits = .{ .host_limit_bytes = 1, .backend_limit_bytes = 1, .scratch_limit_bytes = 1 };
+    try std.testing.expectError(error.ResourceLimitExceeded, DecoderQualification.Decoder.init(a, denied, 16, DecoderQualification.control));
+    try std.testing.expectEqualDeep(baseline, accounting.snapshot());
+    const Worker = struct {
+        session: DecoderQualification.Session,
+        ids: [7]i64,
+        expected: []const f32,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.execute() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn execute(self: *@This()) !void {
+            const allocator = std.testing.allocator;
+            for (0..3) |_| {
+                var decoder = try DecoderQualification.Decoder.init(allocator, self.session, 16, DecoderQualification.control);
+                defer decoder.deinit();
+                for (3..8) |length| {
+                    const values = try decoder.text(self.ids[0..length], allocator, DecoderQualification.control);
+                    defer allocator.free(values);
+                    if (length == 7) try DecoderQualification.accuracy(self.expected, self.expected, values, false);
+                }
+            }
+        }
+    };
+    var expected: [4][]f32 = undefined;
+    var initialized: usize = 0;
+    defer for (expected[0..initialized]) |values| a.free(values);
+    var workers: [4]Worker = undefined;
+    for (&workers, 0..) |*worker, index| {
+        worker.* = .{ .session = session, .ids = .{ 1, 2, @intCast(3 + index), 4, 5, @intCast(6 + index), 7 }, .expected = &.{} };
+        expected[index] = try DecoderQualification.reference(session, &worker.ids, a);
+        initialized += 1;
+        worker.expected = expected[index];
+        // Warm the immutable programs before stressing simultaneous invocation
+        // frames. State and output buffers remain private to every worker.
+        try worker.execute();
+    }
+    const before = factory.getPjrtSpecializationCount(session).?;
+    var group: std.Io.Group = .init;
+    defer group.cancel(std.testing.io);
+    for (&workers) |*worker| try group.concurrent(std.testing.io, Worker.run, .{worker});
+    try group.await(std.testing.io);
+    for (workers) |worker| if (worker.failure) |err| return err;
+    try std.testing.expectEqual(before, factory.getPjrtSpecializationCount(session).?);
+    try std.testing.expectEqualDeep(baseline, accounting.snapshot());
+    {
+        var decoder = try DecoderQualification.Decoder.init(a, session, 16, DecoderQualification.control);
+        defer decoder.deinit();
+        const first = try decoder.text(&.{ 1, 2, 3 }, a, DecoderQualification.control);
+        a.free(first);
+        try std.testing.expectError(error.Timeout, decoder.text(&.{ 1, 2, 3, 4 }, a, .{ .native_call_policy = .in_process, .deadline_ns = 0 }));
+        try std.testing.expect(decoder.failed);
+        try std.testing.expectEqual(@as(usize, 3), decoder.position);
+        try std.testing.expectError(error.DecoderRequestFailed, decoder.text(&.{ 1, 2, 3, 4 }, a, DecoderQualification.control));
+    }
+    try std.testing.expectEqualDeep(baseline, accounting.snapshot());
+    {
+        var decoder = try DecoderQualification.Decoder.init(a, session, 16, DecoderQualification.control);
+        defer decoder.deinit();
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, decoder.text(&.{ 1, 2, 3 }, failing.allocator(), DecoderQualification.control));
+        try std.testing.expect(decoder.failed);
+        try std.testing.expectEqual(@as(usize, 0), decoder.position);
+    }
+    try std.testing.expectEqualDeep(baseline, accounting.snapshot());
+}
