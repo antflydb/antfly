@@ -349,7 +349,9 @@ pub fn advance(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan
             const selected = try a.dupe(u8, row.key);
             const revision = (try optionalRevision(&read, selected)).?;
             const witness = verifier.verify(a, &read, root, selected[prefix.len + 32 ..], node) catch |err| switch (err) {
-                error.ArtifactPublicationPending, error.EnrichmentSourceChanged => null,
+                // No producer validation state yet (e.g. a protocol-14 owner)
+                // is unresolved, not a failure: the sweep stays pending.
+                error.ArtifactPublicationPending, error.ArtifactCoverageBaselinePending, error.EnrichmentSourceChanged => null,
                 else => return err,
             };
             try items.append(a, .{ .key = selected, .revision = revision, .witness = witness });
