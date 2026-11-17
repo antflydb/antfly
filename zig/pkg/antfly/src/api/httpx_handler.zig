@@ -1828,6 +1828,9 @@ pub const AntflyApiHandler = struct {
             try self.registerProbes(server);
         }
 
+        try server.get("/db/v1/changefeeds/:feed_id/events", httpx.Handler.bind(self, pullChangefeed));
+        try server.post("/db/v1/changefeeds/:feed_id/ack", httpx.Handler.bind(self, acknowledgeChangefeed));
+
         const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*", routes.memory_mcp_v1, routes.memory_mcp_v1_agent };
         const mcp_handler = httpx.Handler.bind(self, mcpRoute);
         inline for (mcp_paths) |path| {
@@ -4968,6 +4971,62 @@ pub const AntflyApiHandler = struct {
     // ---------------------------------------------------------------
     // Authentication helper
     // ---------------------------------------------------------------
+
+    fn pullChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const feed = @import("../metadata/changefeed_delivery.zig");
+        var limits: feed.Limits = .{};
+        if (ctx.query("limit")) |value| limits.events = std.fmt.parseInt(u32, value, 10) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed limit");
+        if (ctx.query("max_bytes")) |value| limits.bytes = std.fmt.parseInt(u32, value, 10) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed byte limit");
+        return self.changefeedRequest(ctx, ctx.query("after") orelse "", limits);
+    }
+
+    fn acknowledgeChangefeed(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const bytes = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "missing changefeed checkpoint");
+        if (bytes.len > 256) return jsonErrorResponse(ctx, 400, "invalid changefeed checkpoint");
+        const parsed = std.json.parseFromSlice(struct { cursor: []const u8 }, ctx.allocator, bytes, .{}) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed checkpoint");
+        defer parsed.deinit();
+        return self.changefeedRequest(ctx, parsed.value.cursor, null);
+    }
+
+    fn changefeedRequest(self: *AntflyApiHandler, ctx: *httpx.Context, cursor: []const u8, limits: ?@import("../metadata/changefeed_delivery.zig").Limits) !httpx.Response {
+        const api = @import("changefeed_public.zig");
+        var selection: api.Selection = undefined;
+        const id = ctx.param("feed_id") orelse "";
+        if (id.len != selection.id.len * 2) return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        if (cursor.len != selection.after.len * 2) return jsonErrorResponse(ctx, 400, "invalid changefeed cursor");
+        _ = std.fmt.hexToBytes(&selection.id, id) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed id");
+        _ = std.fmt.hexToBytes(&selection.after, cursor) catch
+            return jsonErrorResponse(ctx, 400, "invalid changefeed cursor");
+        var result = api.execute(self.api_server, ctx.allocator, .{
+            .authorization = ctx.header("authorization"),
+            .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
+        }, selection, limits, operationContext(ctx, null)) catch |err| switch (err) {
+            error.Forbidden, error.Unauthorized, error.UserNotFound, error.ApiKeyExpired, error.ApiKeyNotFound => return jsonErrorResponse(ctx, 403, "changefeed access denied"),
+            error.InvalidChangefeed => return jsonErrorResponse(ctx, 400, "invalid changefeed request"),
+            error.ChangefeedResynchronizationRequired, error.ChangefeedCursorExpired, error.ChangefeedLeaseExpired, error.HistoryResynchronizationRequired, error.TopologyChanged => return jsonErrorResponse(ctx, 409, "changefeed_resynchronization_required"),
+            error.ChangefeedConflict, error.MetadataMutationOutcomeUnknown => return jsonErrorResponse(ctx, 409, "changefeed_retry_required"),
+            error.ChangefeedBackpressure, error.HistoryTooLarge => return jsonErrorResponse(ctx, 429, "changefeed_backpressure"),
+            error.ChangefeedCapabilityUnsupported => return jsonErrorResponse(ctx, 501, "changefeed_capability_unsupported"),
+            error.ReadUnavailable, error.ReadIndexTimeout, error.StorageReadTemporarilyUnavailable, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DeadlineExceeded => return jsonErrorResponse(ctx, 503, "changefeed_unavailable"),
+            else => return err,
+        };
+        defer result.deinit();
+        try ctx.setHeader("cache-control", "no-store");
+        return switch (result) {
+            .page => |page| blk: {
+                const latest = std.fmt.bytesToHex(page.cursor, .lower);
+                try ctx.setHeader("Antfly-Changefeed-Cursor", &latest);
+                var body = try ctx.allocator.dupe(u8, page.body);
+                errdefer ctx.allocator.free(body);
+                break :blk try ownedJsonResponse(ctx, 200, &body, ctx.allocator);
+            },
+            .acknowledged => |checkpoint| ctx.json(.{ .cursor = std.fmt.bytesToHex(checkpoint, .lower) }),
+        };
+    }
 
     fn authenticate(self: *AntflyApiHandler, ctx: *httpx.Context) !?AuthenticatedIdentity {
         if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null and
@@ -19389,6 +19448,27 @@ test "httpx source legacy inventory refuses missing and invalid authority in leg
             defer response.deinit();
             try std.testing.expectEqual(@as(u16, 401), response.status.code);
         }
+    }
+}
+
+test "httpx changefeed pull rejects short cursors and requires authentication for valid cursors" {
+    const a = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(a, .{}, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api_server };
+    for ([_][]const u8{ "ab", "abababababababababababababababababababababababababababababababab" }, [_]u16{ 400, 403 }) |cursor, expected| {
+        const url = try std.fmt.allocPrint(a, "http://node/db/v1/changefeeds/{s}/events?after={s}", .{ "01010101010101010101010101010101", cursor });
+        defer a.free(url);
+        var request = try httpx.Request.init(a, .GET, url);
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        const params = [_]httpx.RouteParam{.{ .name = "feed_id", .value = "01010101010101010101010101010101" }};
+        ctx.params = &params;
+        var response = try handler.pullChangefeed(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(expected, response.status.code);
     }
 }
 

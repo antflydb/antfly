@@ -2543,6 +2543,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
     const source_scope_http_auth_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "httpx source scope control", "httpx source producer closure observe", "httpx source producer control", "httpx source legacy terminal", "httpx source legacy inventory" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("source-scope-http-auth-test", "Verify lifecycle RPC service authentication and conservative unknown outcomes").dependOn(&addFilteredTestRunArtifact(b, source_scope_http_auth_tests).step);
+    const changefeed_http_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{"httpx changefeed"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("changefeed-http-test", "Verify public changefeed HTTP request and authorization contracts").dependOn(&addFilteredTestRunArtifact(b, changefeed_http_tests).step);
     const resolver_adjudication_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = &.{ "resolver adjudication public policy", "DistributedCandidateSource", "resolver curation status cloning" },
