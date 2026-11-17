@@ -290,6 +290,42 @@ test "lite allocator detached verification cancels and refuses stale checkpoints
     try std.testing.expect((try captured.check()).valid);
 }
 
+test "lite native allocator certificate survives later redo-diverted commits" {
+    // A peer adopting the tip after the certifying commit plus ordinary
+    // redo-only commits must still inherit the seal: those commits leave the
+    // free map alone. Binding the seal to the whole header made every
+    // cross-process adopter re-prove the allocator.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "certificate-survives-redo.aflite");
+    defer a.free(path);
+    {
+        var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, 256 * 1024);
+        defer file.close();
+        // Connection owners seal live certificates into the free-map root.
+        file.allocator_certificate_on_commit = true;
+        try file.beginTransaction();
+        try file.putCatalogRecord("seed", "value");
+        try file.commitTransaction();
+        try std.testing.expect(try file.certifyAllocator());
+        const sealed = file.activeCheckpoint();
+        for (0..4) |i| {
+            var key: [16]u8 = undefined;
+            try file.beginTransaction();
+            try file.putCatalogRecord(try std.fmt.bufPrint(&key, "later-{d}", .{i}), "value");
+            try file.commitTransaction();
+        }
+        try std.testing.expect(file.activeCheckpoint().commit_sequence != sealed.commit_sequence);
+        try std.testing.expectEqual(sealed.free_map_root_page, file.activeCheckpoint().free_map_root_page);
+    }
+    var peer = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer peer.close();
+    try std.testing.expect(!peer.free_pages_verified);
+    try std.testing.expect(try peer.inheritAllocatorCertificate());
+    try std.testing.expect(peer.free_pages_verified);
+}
+
 test "lite allocator v4 clean certificate carries checked ownership across processes" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -320,10 +356,11 @@ test "lite allocator v4 clean certificate carries checked ownership across proce
         var file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
         defer file.close();
         try std.testing.expect(try file.inheritAllocatorCertificate());
-        const fallback = 1 - file.header.active_checkpoint;
-        file.header.checkpoints[fallback].commit_sequence += 1;
+        // The seal binds the active checkpoint's allocator identity.
+        const active = file.header.active_checkpoint;
+        file.header.checkpoints[active].page_count += 1;
         try std.testing.expect(!try file.inheritAllocatorCertificate());
-        file.header.checkpoints[fallback].commit_sequence -= 1;
+        file.header.checkpoints[active].page_count -= 1;
         const state = try file.loadLedger(file.activeCheckpoint());
         state.counts.items[0] ^= 1;
         try std.testing.expect(!try file.inheritAllocatorCertificate());
@@ -9998,6 +10035,23 @@ pub const NativeFile = struct {
         return digest;
     }
 
+    /// What a sealed free-map root certifies: one checkpoint's allocator
+    /// identity, not the whole header. Commits that leave the free map alone
+    /// (redo-diverted ones, namespace binding, snapshot slot moves) keep the
+    /// seal valid; accepting it still recomputes the allocator digest.
+    fn allocatorRootBinding(slot: CheckpointSlot) [32]u8 {
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        hasher.update("Antfly free-map root binding v1");
+        var fields: [24]u8 = undefined;
+        std.mem.writeInt(u64, fields[0..8], slot.free_map_root_page, .little);
+        std.mem.writeInt(u64, fields[8..16], slot.page_count, .little);
+        std.mem.writeInt(u64, fields[16..24], slot.redo_folded_through, .little);
+        hasher.update(&fields);
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        return digest;
+    }
+
     pub fn headerFingerprint(self: *NativeFile) [32]u8 {
         const header = self.transaction_header orelse self.header;
         if (self.header_fingerprint_cache.lookup(header)) |digest| return digest;
@@ -10062,7 +10116,7 @@ pub const NativeFile = struct {
             defer self.allocator.free(root);
             _ = try allocator_v4.State.decodeRoot(root);
             if (root.len == 192) {
-                if (!std.mem.eql(u8, root[128..160], &self.headerFingerprint())) return false;
+                if (!std.mem.eql(u8, root[128..160], &allocatorRootBinding(checkpoint))) return false;
                 return self.acceptAllocatorDigest(root[160..192], true);
             }
         }
@@ -10132,7 +10186,7 @@ pub const NativeFile = struct {
             const checkpoint = self.activeCheckpoint();
             const root = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
             defer self.allocator.free(root);
-            if (root.len == 192 and std.mem.eql(u8, root[128..160], &self.headerFingerprint())) return true;
+            if (root.len == 192 and std.mem.eql(u8, root[128..160], &allocatorRootBinding(checkpoint))) return true;
         }
         // Use the ordinary rollback/publication boundary. Allocation, budget
         // and page-write errors must leave no unpublished tail at clean close;
@@ -10579,7 +10633,7 @@ pub const NativeFile = struct {
             if (rebased and !retained) {
                 const root = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
                 defer self.allocator.free(root);
-                authenticated = root.len == 192 and std.mem.eql(u8, root[128..160], &self.headerFingerprint()) and
+                authenticated = root.len == 192 and std.mem.eql(u8, root[128..160], &allocatorRootBinding(checkpoint)) and
                     std.mem.eql(u8, root[160..192], &try state.incrementalFingerprint());
             }
             if (rebased and authenticated) {
@@ -16779,12 +16833,8 @@ pub const NativeFile = struct {
             if (destination.header.indexed_reclamation and checkpoint.free_map_root_page != 0) {
                 const root = try destination.readPagePayloadByKindAllocForCheckpoint(destination.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
                 defer destination.allocator.free(root);
-                const post_namespace_fingerprint = fingerprintHeader(destination.header);
-                if (root.len == 192 and std.mem.eql(u8, root[128..160], &post_namespace_fingerprint)) {
-                    var final_header = destination.header;
-                    final_header.checkpoints = .{ snapshot_checkpoint, .{ .page_count = 0 } };
-                    final_header.active_checkpoint = 0;
-                    @memcpy(root[128..160], &fingerprintHeader(final_header));
+                if (root.len == 192 and std.mem.eql(u8, root[128..160], &allocatorRootBinding(checkpoint))) {
+                    @memcpy(root[128..160], &allocatorRootBinding(snapshot_checkpoint));
                     try destination.writePage(checkpoint.free_map_root_page, .free_map, root);
                 }
             }
@@ -20227,23 +20277,10 @@ pub const NativeFile = struct {
     fn sealAllocatorCheckpoint(self: *NativeFile, previous: Header, next: CheckpointSlot) !void {
         for (previous.checkpoints) |slot| if (slot.free_map_root_page == next.free_map_root_page) return;
         const state = try self.loadLedgerForDigest(next, self.allocator_cancel_token, true);
-        var published = previous;
-        // perf/lwa-peer-cert: same prediction `stageAllocatorCertificate`
-        // makes for the identical reason (see its own doc comment) --
-        // this caller's own `next.redo_folded_through` stamp just above
-        // already uses this exact condition to decide whether the
-        // imminent publish is a real physical slot write (flips
-        // `active_checkpoint`) or an in-place redo-log append (does
-        // not); `published` must predict the same outcome, or this
-        // fingerprint disagrees with the real `self.header` on every
-        // later `inheritAllocatorCertificate` replay whenever the commit
-        // diverts.
-        if (self.redo == null or self.redo.?.checkpointing) published.active_checkpoint = 1 - previous.active_checkpoint;
-        published.checkpoints[published.active_checkpoint] = next;
         var root: [192]u8 = @splat(0);
         allocator_v4.State.encodeRoot(state.root, root[0..128]);
         std.mem.writeInt(u64, root[56..64], 3, .little);
-        @memcpy(root[128..160], &fingerprintHeader(published));
+        @memcpy(root[128..160], &allocatorRootBinding(next));
         @memcpy(root[160..192], &try state.incrementalFingerprint());
         try self.writePage(next.free_map_root_page, .free_map, &root);
     }
@@ -21063,18 +21100,9 @@ pub const NativeFile = struct {
     fn bindPrivateEpochNamespace(self: *NativeFile, destination_path: []const u8) !void {
         _ = destination_path; // No longer used: the region is keyed by inode, not a path-resolved namespace.
         if (self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain) return error.InvalidTransactionState;
+        // The free-map seal binds the checkpoint, not the namespace, so it
+        // stays valid without re-stamping (`allocatorRootBinding`).
         const next = self.header;
-        if (next.indexed_reclamation) {
-            const checkpoint = self.activeCheckpoint();
-            if (checkpoint.free_map_root_page != 0) {
-                const root = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
-                defer self.allocator.free(root);
-                if (root.len == 192 and std.mem.eql(u8, root[128..160], &self.headerFingerprint())) {
-                    @memcpy(root[128..160], &fingerprintHeader(next));
-                    try self.writePage(checkpoint.free_map_root_page, .free_map, root);
-                }
-            }
-        }
         var encoded: [header_size]u8 = undefined;
         encodeHeader(&encoded, next);
         try self.file.writePositionalAll(self.runtimeIo(), &encoded, 0);

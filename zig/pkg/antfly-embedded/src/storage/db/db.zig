@@ -26831,14 +26831,18 @@ pub const DB = struct {
             }
             var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(identity, &value_buf);
-            return try self.core.writeIntentsExtraBatchStaged(
+            // Wait here, not in the caller: the staged commit borrows this
+            // scope's index plan, schema view and preparation allocations.
+            const ticket = try self.core.writeIntentsExtraBatchStaged(
                 txn_id,
                 intents.items,
                 predicates.items,
                 .{ .prepared_enrichments_json = req.prepared_enrichments_json, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
+            try ticket.wait();
+            return backend_erased_mod.Ticket.alreadyDurable();
         } else {
-            return try self.core.writeIntentsExtraBatchStaged(txn_id, intents.items, predicates.items, .{
+            const ticket = try self.core.writeIntentsExtraBatchStaged(txn_id, intents.items, predicates.items, .{
                 .prepared_enrichments_json = req.prepared_enrichments_json,
                 .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
@@ -26846,6 +26850,8 @@ pub const DB = struct {
                 .index_span_digests = index_spans,
                 .graph_sources = graph_sources,
             });
+            try ticket.wait();
+            return backend_erased_mod.Ticket.alreadyDurable();
         }
     }
 
@@ -36170,7 +36176,8 @@ pub const DB = struct {
         // transient class, not a repair driver; `repairRecoverableStartupIndexFailures`'s
         // own `wake` decision is authoritative for whether anything is due
         // right now.
-        if (!openModeRequiresReadOnlyBackends(self.open_mode)) {
+        // Shadow rebuilds need a local filesystem; freestanding builds have none.
+        if (builtin.os.tag != .freestanding and !openModeRequiresReadOnlyBackends(self.open_mode)) {
             var repair_rounds: usize = 0;
             while (repair_rounds < run_until_idle_max_replay_rounds) : (repair_rounds += 1) {
                 const repair_result = self.repairRecoverableStartupIndexFailures(self.alloc, 8, .{}) catch |err| switch (err) {
@@ -58774,7 +58781,7 @@ fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates(
     }
 }
 
-var status_persist_count: std.atomic.Value(u64) = .init(0);
+var status_persist_count: @import("antfly_platform").atomic.Value(u64) = .init(0);
 
 /// Count of durable status-snapshot writes actually committed (piggybacked
 /// into a progress commit or, rarely, standalone), as opposed to updates

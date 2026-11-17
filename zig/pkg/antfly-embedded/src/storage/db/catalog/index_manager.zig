@@ -1495,7 +1495,7 @@ pub const IndexManager = struct {
     /// commit at most once per `status_persist_interval_ns`. Shared by both
     /// the sync (`BatchExecutionContext`) and async (`AsyncContext`) applied-
     /// sequence paths, which both hold a pointer to this same `IndexManager`.
-    last_status_persist_ns: std.atomic.Value(u64) = .init(0),
+    last_status_persist_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     status_persist_interval_ns: u64 = default_status_persist_interval_ns,
     vector_block_generation_mu: std.atomic.Mutex = .unlocked,
     // Captures retain manifest-named files before checkpoint publication can

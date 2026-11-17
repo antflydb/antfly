@@ -222,7 +222,7 @@ pub const StatusWrite = struct {
     value: []const u8,
 };
 
-var progress_commit_count: std.atomic.Value(u64) = .init(0);
+var progress_commit_count: @import("antfly_platform").atomic.Value(u64) = .init(0);
 
 /// Count of completed `contributeProgress` commits. Test-only instrumentation:
 /// production code has no reason to read this, since the whole point of the

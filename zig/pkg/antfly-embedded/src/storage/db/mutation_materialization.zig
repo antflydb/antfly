@@ -4002,6 +4002,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !*InlineSparsePublication {
             if (index_ref.kind != .sparse_vector) return error.InlineSparsePublicationUnsupported;
             const entry = index_manager.sparseIndex(index_ref.name) orelse return error.InlineSparsePublicationUnsupported;
+            // Stub builds (no sparse engine) never publish inline.
+            if (comptime !@hasDecl(@TypeOf(entry.index), "prepareInlineSparsePublication")) return error.InlineSparsePublicationUnsupported;
             if (!index_manager.sparseEmbeddingWriteEligibleForInlinePublication(entry, write)) return error.InlineSparsePublicationUnsupported;
             // An outstanding embedding-artifact repair issue for this exact
             // artifact must be cleared the way the slow path would (see

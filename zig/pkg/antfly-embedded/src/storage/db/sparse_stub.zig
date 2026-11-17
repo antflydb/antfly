@@ -133,6 +133,22 @@ pub const WriteProfile = struct {
 };
 
 pub const SparseIndex = struct {
+    /// Stub builds never publish sparse writes inline.
+    pub const InlineSparsePublication = struct {
+        pub fn pendingMutations(_: *const InlineSparsePublication) []const @import("../native_catalog_backend.zig").Mutation {
+            return &.{};
+        }
+
+        pub fn abort(_: *InlineSparsePublication) void {}
+    };
+
+    pub fn installInlineSparsePublication(_: *SparseIndex, _: *InlineSparsePublication) !void {}
+
+    /// Stub builds have no native-catalog sparse index.
+    pub fn nativeCatalogScope(_: *const SparseIndex) ?[]const u8 {
+        return null;
+    }
+
     doc_count: u64 = 0,
     next_doc_num: u64 = 0,
     chunk_size: u32 = 1024,
