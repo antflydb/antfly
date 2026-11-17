@@ -277,6 +277,12 @@ fn writeBundleFromLocalBackup(
         const source_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ backup_root, manifest.shards[0].snapshot_path });
         defer allocator.free(source_path);
         try backups_api.verifyShardArtifactIntegrity(allocator, io, .portable, source_path, &manifest.shards[0]);
+        const source_manifest = try backups_api.metadataPath(allocator, backup_root, backup_id);
+        defer allocator.free(source_manifest);
+        const output_manifest = try std.fmt.allocPrint(allocator, "{s}.manifest.json", .{output_path});
+        defer allocator.free(output_manifest);
+        try publishCopiedBundleFile(allocator, io, source_manifest, output_manifest);
+        errdefer deleteFile(io, output_manifest) catch {};
         try publishCopiedBundleFile(allocator, io, source_path, output_path);
         return;
     }

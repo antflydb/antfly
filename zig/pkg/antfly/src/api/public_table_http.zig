@@ -937,7 +937,8 @@ pub fn foreignSourceFailureOwnedResponse(alloc: std.mem.Allocator, source: []con
         .authentication => .{ "foreign_source_auth_failed", "foreign source rejected authentication; check the configured credentials" },
         .missing_relation => .{ "foreign_source_relation_not_found", "foreign source relation was not found; check the configured remote schema and table" },
     };
-    const retryable = failure == .connection;
+    // libpq does not expose a reliable SQLSTATE for startup failures.
+    // A failed connection can therefore be a permanent credential rejection.
     return .{
         .status = switch (failure) {
             .connection, .driver => 503,
@@ -948,10 +949,9 @@ pub fn foreignSourceFailureOwnedResponse(alloc: std.mem.Allocator, source: []con
             .@"error" = code,
             .source = source,
             .message = message,
-            .retryable = retryable,
+            .retryable = false,
         }, .{}),
         .json = true,
-        .retry_after_seconds = if (retryable) 1 else null,
     };
 }
 
@@ -971,7 +971,6 @@ pub fn queryDependencyErrorOwnedResponse(
             .retryable = retryable,
         }, .{}),
         .json = true,
-        .retry_after_seconds = if (retryable) 1 else null,
     };
 }
 

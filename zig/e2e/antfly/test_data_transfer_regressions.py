@@ -336,6 +336,29 @@ def test_lite_server_backup_roundtrip_under_connection_root(
             )
             assert output.stat().st_size > 0
             assert (root / f"export-{format}-metadata.json").exists()
+            if format == "portable":
+                sidecar = output.with_name(output.name + ".manifest.json")
+                captured = sidecar.read_bytes()
+                modified = json.loads(captured)
+                modified["shards"][0]["artifact_sha256"] = "0" * 64
+                sidecar.write_text(json.dumps(modified))
+                failure = cli(
+                    "restore",
+                    "--input",
+                    output,
+                    "--table",
+                    "mismatched_sidecar",
+                    "--connection",
+                    "bk",
+                    "--location",
+                    root.as_uri(),
+                    "--url",
+                    server.url,
+                    "--wait",
+                    check=False,
+                )
+                assert failure.returncode != 0
+                sidecar.write_bytes(captured)
             cli(
                 "restore",
                 "--input",
@@ -359,6 +382,55 @@ def test_lite_server_backup_roundtrip_under_connection_root(
                 )
                 assert restored_alias.ok, restored_alias.text
                 assert restored_alias.headers["ETag"] != source_etag
+                if schema_version:
+                    repository = (root / "overwrite").as_uri()
+                    cli(
+                        "backup",
+                        "--tables",
+                        "from_file",
+                        "--backup-id",
+                        "overwrite",
+                        "--connection",
+                        "bk",
+                        "--location",
+                        repository,
+                        "--format",
+                        "native",
+                        "--url",
+                        server.url,
+                    )
+                    cli(
+                        "restore",
+                        "--tables",
+                        "from_file",
+                        "--backup-id",
+                        "overwrite",
+                        "--connection",
+                        "bk",
+                        "--location",
+                        repository,
+                        "--mode",
+                        "overwrite",
+                        "--url",
+                        server.url,
+                        "--wait",
+                    )
+                    stale = requests.delete(
+                        server.api_url + "/tables/from_file/index-aliases/live",
+                        auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                        headers={"If-Match": source_etag},
+                        timeout=10,
+                    )
+                    assert stale.status_code == 412, stale.text
+                    current = requests.get(
+                        server.api_url + "/tables/from_file/index-aliases/live",
+                        auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                        timeout=10,
+                    )
+                    assert current.ok and current.json()["index"] == "sparse_vectors", (
+                        current.text
+                    )
+                    expect_docs("from_file")
             if format == "portable":
                 restored = tmp_path / "returned.aflite"
                 cli("lite", "restore", output, "--out", restored)
@@ -434,7 +506,8 @@ def test_foreign_source_failure_preserves_safe_cause():
             "foreign_source_driver_unavailable",
         )
         assert body["source"] == "unreachable_source"
-        assert body["retryable"] is (body["code"] == "foreign_source_unavailable")
+        assert body["retryable"] is False
+        assert "Retry-After" not in response.headers
         assert "never-return-this-password" not in response.text
         failed = False
     finally:
