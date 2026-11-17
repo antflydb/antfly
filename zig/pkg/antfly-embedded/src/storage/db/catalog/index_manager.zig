@@ -18255,9 +18255,26 @@ pub const IndexManager = struct {
         const dense = try parseDenseConfig(self.alloc, cfg.config_json);
         defer dense.deinit(self.alloc);
         if (dense.external or dense.embedding_names.len > 1) return true;
-        var refs = try self.artifactRefsFromConfig(cfg);
-        defer refs.deinit(self.alloc);
-        return refs.chunk_name != null;
+        const generator = try parseDenseGeneratorConfig(self.alloc, cfg.config_json);
+        defer if (generator) |value| value.deinit(self.alloc);
+        return self.denseChunkSourceName(dense, generator) != null;
+    }
+
+    // Keep resident construction, quarantine accounting and artifact references
+    // on the same grammar, including a single member of the sources array.
+    fn denseChunkSourceName(self: *const IndexManager, dense: DenseConfig, generator: ?GeneratorConfig) ?[]const u8 {
+        if (generator) |value| return if (generatorHasChunking(value)) value.artifact_name else null;
+        if (!dense.external) if (dense.embedding_name) |name| {
+            if (self.getEnrichment(.embedding, name)) |embedding| {
+                if (embedding.source_artifact_name.len > 0) return embedding.source_artifact_name;
+            }
+        };
+        for (dense.embedding_names) |name| {
+            if (self.getEnrichment(.embedding, name)) |embedding| {
+                if (embedding.source_artifact_name.len > 0) return embedding.source_artifact_name;
+            }
+        }
+        return null;
     }
 
     fn artifactRefsFromConfig(self: *const IndexManager, cfg: types.IndexConfig) !ArtifactRefs {
@@ -18277,17 +18294,8 @@ pub const IndexManager = struct {
                 defer dense_cfg.deinit(self.alloc);
                 const dense_generator = try parseDenseGeneratorConfig(self.alloc, cfg.config_json);
                 defer if (dense_generator) |generator| generator.deinit(self.alloc);
-                const referenced_embedding = if (dense_generator == null and dense_cfg.embedding_name != null and !dense_cfg.external)
-                    self.getEnrichment(.embedding, dense_cfg.embedding_name.?)
-                else
-                    null;
                 return .{
-                    .chunk_name = if (dense_generator) |generator|
-                        if (generatorHasChunking(generator)) try self.alloc.dupe(u8, generator.artifact_name) else null
-                    else if (referenced_embedding) |embedding_cfg|
-                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
-                    else
-                        null,
+                    .chunk_name = if (self.denseChunkSourceName(dense_cfg, dense_generator)) |name| try self.alloc.dupe(u8, name) else null,
                     .embedding_name = if (dense_generator) |generator|
                         if (generator.embedding_name) |embedding_name| try self.alloc.dupe(u8, embedding_name) else try self.alloc.dupe(u8, cfg.name)
                     else if (dense_cfg.embedding_name) |embedding_name|
@@ -24277,7 +24285,6 @@ pub const IndexManager = struct {
                         return error.InvalidIndexConfig;
                     }
                 }
-                var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
                 var multi_source_supports_unit_grouping = dense_cfg.embedding_names.len > 0;
                 var multi_source_vector_space: ?[]const u8 = null;
                 var multi_source_has_implicit_vector_space = false;
@@ -24301,9 +24308,6 @@ pub const IndexManager = struct {
                                 multi_source_vector_space = embedding_cfg.vector_space;
                             }
                         }
-                    }
-                    if (first_multi_source_embedding == null and embedding_cfg.source_artifact_name.len > 0) {
-                        first_multi_source_embedding = embedding_cfg;
                     }
                     multi_source_supports_unit_grouping = multi_source_supports_unit_grouping and
                         self.embeddingSourceSupportsUnitGrouping(embedding_cfg);
@@ -24548,14 +24552,7 @@ pub const IndexManager = struct {
                     .leann_transient = leann_transient,
                     .leann_text_only = leann_storage == .auto,
                     .leann_media_int8 = leann_transient and if (dense_cfg.leann) |leann_opts| leann_opts.media_int8 else false,
-                    .chunk_name = if (dense_generator) |generator|
-                        if (generatorHasChunking(generator)) try self.alloc.dupe(u8, generator.artifact_name) else null
-                    else if (referenced_embedding) |embedding_cfg|
-                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
-                    else if (first_multi_source_embedding) |embedding_cfg|
-                        if (embedding_cfg.source_artifact_name.len > 0) try self.alloc.dupe(u8, embedding_cfg.source_artifact_name) else null
-                    else
-                        null,
+                    .chunk_name = if (self.denseChunkSourceName(dense_cfg, dense_generator)) |name| try self.alloc.dupe(u8, name) else null,
                     .embedding_name = if (dense_generator) |generator|
                         if (generator.embedding_name) |embedding_name| try self.alloc.dupe(u8, embedding_name) else try self.alloc.dupe(u8, cfg.name)
                     else if (dense_cfg.embedding_name) |embedding_name|

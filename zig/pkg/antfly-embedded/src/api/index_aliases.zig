@@ -124,7 +124,7 @@ fn removePrivacyProgress(root: *V) bool {
     return before != resource.object.count();
 }
 
-fn mayContainOwnerControls(bytes: []const u8) bool {
+pub fn mayContainOwnerControls(bytes: []const u8) bool {
     return std.mem.indexOfScalar(u8, bytes, '\\') != null or
         std.mem.indexOf(u8, bytes, "_index_alias") != null or
         std.mem.indexOf(u8, bytes, "_privacy") != null;

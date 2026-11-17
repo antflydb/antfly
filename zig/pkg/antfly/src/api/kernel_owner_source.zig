@@ -291,6 +291,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     owns_context: bool = true,
     context_init_mutex: std.atomic.Mutex = .unlocked,
     mutex: std.atomic.Mutex = .unlocked,
+    physical_catalogs: @import("owner_catalog_projection.zig").Cache = .{},
     quiescing: bool = false,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     // Retain per-group admission watermarks across owner close/reopen gaps. Otherwise
@@ -828,6 +829,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.catalog_observations.deinit(self.alloc);
         self.catalog_observations = .empty;
         self.mutex.unlock();
+        self.physical_catalogs.deinit(self.alloc);
         if (self.owns_context) self.context.deinit();
     }
 
@@ -2644,6 +2646,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 break;
             }
         } else unreachable;
+        self.physical_catalogs.forget(entry.group_id);
         self.alloc.free(entry.table_name);
         self.alloc.free(entry.schema_json);
         self.alloc.free(entry.indexes_json);
@@ -4074,11 +4077,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         raw_descriptor: descriptor_contract.Descriptor,
         needs_index_catalog: bool,
     ) !Lease {
-        const physical = @import("antfly_local_sources").api_index_metadata.aliases.physicalProjectionIfNeeded(self.alloc, raw_descriptor.indexes_json) catch |err|
+        var physical = self.physical_catalogs.acquire(self.alloc, group_id, raw_descriptor.indexes_json) catch |err|
             return if (err == error.OutOfMemory) error.RaftApplyWriterUnavailable else err;
-        defer if (physical) |bytes| self.alloc.free(bytes);
+        defer physical.deinit();
         var descriptor = raw_descriptor;
-        descriptor.indexes_json = physical orelse raw_descriptor.indexes_json;
+        descriptor.indexes_json = physical.bytes;
 
         if (!self.mutex.tryLock()) return error.RaftApplyWriterUnavailable;
         const initial = self.tryAcquireWarmApplyLocked(group_id, table_name, descriptor, needs_index_catalog);
@@ -4160,10 +4163,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         residency: Residency,
         controls: ReadControls,
     ) !Lease {
-        const physical = try @import("antfly_local_sources").api_index_metadata.aliases.physicalProjectionIfNeeded(self.alloc, raw_descriptor.indexes_json);
-        defer if (physical) |bytes| self.alloc.free(bytes);
+        var physical = try self.physical_catalogs.acquire(self.alloc, group_id, raw_descriptor.indexes_json);
+        defer physical.deinit();
         var descriptor = raw_descriptor;
-        descriptor.indexes_json = physical orelse raw_descriptor.indexes_json;
+        descriptor.indexes_json = physical.bytes;
 
         const exclusive = admission != .shared;
         if (!self.mutex.tryLock()) return error.StorageKernelOwnerTransitionRequired;
@@ -8512,6 +8515,9 @@ test "source owner privacy progress keeps writer and apply leases warm" {
         var applied = try source.acquireDescriptorOnce(1, "docs", path, descriptor, .shared, .resident, .{ .historical_raft_apply = true });
         defer applied.deinit();
         try std.testing.expectEqual(writer.entry, applied.entry);
+        var warm_apply = try source.acquireApplyOnlyWithCatalog(1, "docs", descriptor, false);
+        defer warm_apply.deinit();
+        try std.testing.expectEqual(writer.entry, warm_apply.entry);
         try std.testing.expect(!writer.entry.retired);
         try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
     }
@@ -8519,4 +8525,57 @@ test "source owner privacy progress keeps writer and apply leases warm" {
     descriptor.indexes_json = try privacy.replaceResource(a, descriptor.indexes_json, resource);
     try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", path, descriptor, .shared, .resident, .{}));
     try std.testing.expect(writer.entry.retired);
+}
+
+// A warm cut must remain usable even when no new allocation can succeed.
+// Retained leases also outlive eviction and a failed replacement build.
+test "source owner privacy projection caches exact cuts without warm allocations" {
+    const Cache = @import("owner_catalog_projection.zig").Cache;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var cache: Cache = .{};
+    defer cache.deinit(alloc);
+    const raw = "{\"_privacy\":{\"generation\":1,\"coverage\":{},\"scans\":[]}}";
+    var first = try cache.acquire(alloc, 1, raw);
+    defer first.deinit();
+    const before = failing.alloc_index;
+    failing.fail_index = before;
+    for (0..32) |_| {
+        var hit = try cache.acquire(alloc, 1, raw);
+        defer hit.deinit();
+        try std.testing.expectEqual(first.entry, hit.entry);
+        try std.testing.expectEqualStrings(first.bytes, hit.bytes);
+    }
+    try std.testing.expectEqual(before, failing.alloc_index);
+    try std.testing.expectError(error.OutOfMemory, cache.acquire(alloc, 1, "{\"_privacy\":{\"generation\":2}}"));
+    failing.fail_index = std.math.maxInt(usize);
+    // Progress changes preserve the projection; semantic changes do not.
+    var progress = try cache.acquire(alloc, 1, "{\"_privacy\":{\"generation\":1,\"coverage\":{\"retry\":1},\"scans\":[]}}");
+    defer progress.deinit();
+    try std.testing.expectEqualStrings(first.bytes, progress.bytes);
+    var changed = try cache.acquire(alloc, 1, "{\"_privacy\":{\"generation\":2,\"future_fence\":1}}");
+    defer changed.deinit();
+    try std.testing.expect(!std.mem.eql(u8, first.bytes, changed.bytes));
+    for (2..66) |group| {
+        var cut = try cache.acquire(alloc, group, raw);
+        cut.deinit();
+    }
+    // A broad shard working set must not evict warm groups.
+    const after_growth = failing.alloc_index;
+    failing.fail_index = after_growth;
+    var warm = try cache.acquire(alloc, 2, raw);
+    warm.deinit();
+    try std.testing.expectEqual(after_growth, failing.alloc_index);
+    failing.fail_index = std.math.maxInt(usize);
+    cache.forget(1);
+    try std.testing.expectEqualStrings("{\"_privacy\":{\"generation\":1}}", first.bytes);
+    // Contention never waits for the cache: the returned cut owns its data.
+    try std.testing.expect(cache.mutex.tryLock());
+    var uncached = cache.acquire(alloc, 1, raw) catch |err| {
+        cache.mutex.unlock();
+        return err;
+    };
+    cache.mutex.unlock();
+    defer uncached.deinit();
+    try std.testing.expectEqualStrings(first.bytes, uncached.bytes);
 }

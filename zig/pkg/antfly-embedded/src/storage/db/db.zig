@@ -111689,6 +111689,59 @@ test "db automatic dense repair bootstraps missing coverage metadata" {
     try std.testing.expectEqualStrings("doc:a", search_result.hits[0].id);
 }
 
+test "db quarantined dense bootstrap repairs single chunk artifact sources" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "\"embedding_name\":\"model\"", "\"sources\":[{\"artifact\":\"model\"}]" }) |source| {
+        var directory = try TestDirectory.init("quarantined-chunk-source");
+        defer directory.cleanup();
+        var embedder = GateDenseEmbedder{ .allowed_successes = .init(1000) };
+        const config = try std.fmt.allocPrint(alloc, "{{\"field\":\"embedding\",\"dims\":3,{s}}}", .{source});
+        defer alloc.free(config);
+        const cfg: types.IndexConfig = .{ .name = "dense_idx", .kind = .dense_vector, .coverage_generation = 7, .config_json = config };
+        var vector_count: u64 = 0;
+        {
+            var db = try openLegacyDenseTestDB(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .ttl_cleanup = .{ .enabled = false }, .enrichment = .{ .dense_embedder = embedder.interface() } });
+            defer db.close();
+            try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 8 });
+            try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "text", .source_artifact_name = "chunks", .expected_dims = 3 });
+            try db.addIndex(cfg);
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega\"}" }}, .sync_level = .full_index });
+            try db.runUntilIdle();
+            vector_count = db.core.index_manager.denseIndex(cfg.name).?.index.stats().active_count;
+            try std.testing.expect(vector_count > 1);
+            try std.testing.expectEqual(@as(?u64, vector_count), try denseTargetCountForIndexContext(db.async_context, cfg.name));
+            // Source outcomes count documents; this source emits many vectors.
+            var read = try db.core.store.beginReadTxn();
+            const authority = try @import("artifact_publication.zig").authority(&read);
+            read.abort();
+            for ([_][]const u8{ "produced", "skipped", "terminal_failed" }, 0..) |tag, i| {
+                const key = try @import("artifact_coverage_epoch.zig").counter(alloc, authority, cfg.name, cfg.coverage_generation, tag);
+                defer alloc.free(key);
+                var bytes: [8]u8 = undefined;
+                try db.core.store.put(key, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, if (i == 0) 1 else 0));
+            }
+        }
+        const dense_path = try std.fmt.allocPrintSentinel(alloc, "{s}/indexes/{s}", .{ directory.path(), cfg.name }, 0);
+        defer alloc.free(dense_path);
+        {
+            var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path, .{ .dims = 3, .storage_backend = .lsm }, .{});
+            try hbc.markPublishedGenerationIncompleteForTest();
+            hbc.close();
+        }
+        var reopened = try openLegacyDenseTestDB(alloc, directory.path(), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .ttl_cleanup = .{ .enabled = false }, .enrichment = .{ .dense_embedder = embedder.interface() } });
+        defer reopened.close();
+        try std.testing.expect(reopened.core.index_manager.denseIndex(cfg.name) == null);
+        try std.testing.expectEqualStrings("IncompleteBulkPublish", reopened.core.index_manager.loadFailure(cfg.name).?);
+        try std.testing.expectEqual(@as(?u64, vector_count), try denseTargetCountForIndexContext(reopened.async_context, cfg.name));
+        const inference_before = embedder.total_requests.load(.acquire);
+        _ = try reopened.discoverRecoverableStartupIndexFailures(alloc, 1);
+        const repair_id = (try reopened.indexRepairIdForIndex(alloc, cfg.name)) orelse return error.TestUnexpectedResult;
+        try std.testing.expect((try reopened.advanceIndexRepairIntent(alloc, repair_id, .{})).repaired);
+        try std.testing.expectEqual(vector_count, reopened.core.index_manager.denseIndex(cfg.name).?.index.stats().active_count);
+        try std.testing.expectEqual(inference_before, embedder.total_requests.load(.acquire));
+    }
+}
+
 test "db quarantined dense bootstrap tracks concurrent insert update and delete" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
