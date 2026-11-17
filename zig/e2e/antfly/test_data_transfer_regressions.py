@@ -372,6 +372,29 @@ def test_lite_server_backup_roundtrip_under_connection_root(
                 )
                 assert failure.returncode != 0
                 sidecar.write_bytes(captured)
+            elif schema_version:
+                manifest = json.loads(
+                    (root / f"export-{format}-metadata.json").read_bytes()
+                )
+                shard = root / manifest["shards"][0]["snapshot_path"]
+                extra = shard / "unexpected"
+                extra.write_bytes(b"not present in the captured tree")
+                rejected = tmp_path / "damaged-native.afb"
+                failure = cli(
+                    "backup",
+                    "--export-existing",
+                    "--backup-id",
+                    f"export-{format}",
+                    "--location",
+                    root.as_uri(),
+                    "--out",
+                    rejected,
+                    check=False,
+                )
+                assert failure.returncode != 0
+                assert "BackupArtifactIntegrityMismatch" in failure.stderr
+                assert not rejected.exists()
+                extra.unlink()
             cli(
                 "restore",
                 "--input",

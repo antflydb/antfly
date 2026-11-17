@@ -272,8 +272,19 @@ fn writeBundleFromLocalBackup(
     backup_id: []const u8,
     output_path: []const u8,
 ) !void {
+    if (std.Io.Dir.cwd().statFile(io, output_path, .{})) |_| {
+        return error.PathAlreadyExists;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
     const backup_root = try backups_api.parseFileLocation(location_uri);
-    var manifest = try backups_api.readManifest(allocator, backup_root, backup_id);
+    const local_backups = @import("antfly_local_sources").api_local_backups;
+    const source_manifest_path = try backups_api.metadataPath(allocator, backup_root, backup_id);
+    defer allocator.free(source_manifest_path);
+    const source_manifest_bytes = try cli.readFileAlloc(io, allocator, source_manifest_path, backups_api.max_backup_manifest_bytes);
+    defer allocator.free(source_manifest_bytes);
+    var manifest = try local_backups.parseTableBackupManifest(allocator, source_manifest_bytes, backup_id);
     defer manifest.deinit(allocator);
     // The authorized backup endpoint binds the logical request to an immutable
     // physical identity. Preserve that identity in the bundle; a logical name
@@ -292,7 +303,22 @@ fn writeBundleFromLocalBackup(
     const metadata_path = try std.fmt.allocPrint(allocator, "{s}-metadata.json", .{backup_id});
     defer allocator.free(metadata_path);
     try selected.append(allocator, metadata_path);
-    for (manifest.shards) |shard| try selected.append(allocator, shard.snapshot_path);
+    const verified_trees = try allocator.alloc(backup_bundle_io.VerifiedNativeTree, manifest.shards.len);
+    defer allocator.free(verified_trees);
+    for (manifest.shards, verified_trees) |shard, *verified| {
+        try selected.append(allocator, shard.snapshot_path);
+        const path = try std.fs.path.join(allocator, &.{ backup_root, shard.snapshot_path });
+        defer allocator.free(path);
+        var identity = std.crypto.hash.sha2.Sha256.init(.{});
+        var actual = try local_backups.directoryArtifactIntegrityAllocWithIdentity(allocator, io, path, &identity);
+        defer actual.deinit(allocator);
+        if (actual.size_bytes != shard.artifact_size_bytes or !std.mem.eql(u8, actual.sha256, shard.artifact_sha256))
+            return error.BackupArtifactIntegrityMismatch;
+        verified.path = shard.snapshot_path;
+        identity.final(&verified.stat_digest);
+    }
+    var manifest_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source_manifest_bytes, &manifest_digest, .{});
 
     if (std.fs.path.dirname(output_path)) |parent| try fs_paths.createDirPathPortable(io, parent);
     var nonce: [16]u8 = undefined;
@@ -313,7 +339,7 @@ fn writeBundleFromLocalBackup(
         backup_root,
         selected.items,
         &writer.interface,
-        .{ .backup_id = backup_id, .table_name = manifest.table_name },
+        .{ .backup_id = backup_id, .table_name = manifest.table_name, .verified_trees = verified_trees, .verified_manifest = .{ .path = metadata_path, .sha256 = manifest_digest } },
     );
     try writer.end();
     try file.sync(io);
@@ -336,6 +362,15 @@ fn publishPortableBackup(
     const companion = try std.json.Stringify.valueAlloc(allocator, manifest.*, .{});
     defer allocator.free(companion);
     if (companion.len > backups_api.max_backup_manifest_bytes) return error.BackupManifestTooLarge;
+    // Fail before staging the archive when an incompatible companion already
+    // exists. Publication repeats the comparison in case another export wins.
+    if (cli.readFileAlloc(io, allocator, companion_path, backups_api.max_backup_manifest_bytes)) |existing| {
+        defer allocator.free(existing);
+        if (!std.mem.eql(u8, existing, companion)) return error.PathAlreadyExists;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
     const nonce_hex = std.fmt.bytesToHex(nonce, .lower);

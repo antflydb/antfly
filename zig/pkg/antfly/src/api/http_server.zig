@@ -21717,9 +21717,14 @@ pub const ApiHttpServer = struct {
             const owned = cloneTableNamesAlloc(op_alloc, &.{name}) catch return error.InternalFailure;
             owned_table_names = owned;
             break :single owned;
-        } else if (req.table_names) |values|
-            values
-        else blk: {
+        } else if (req.table_names) |values| blk: {
+            const names = resolveClusterRestoreSelectionAlloc(op_alloc, &manifest, values) catch |err| return switch (err) {
+                error.InvalidRequest => error.InvalidRequest,
+                else => error.InternalFailure,
+            };
+            owned_table_names = names;
+            break :blk names;
+        } else blk: {
             const names = tableNamesFromClusterManifestAlloc(op_alloc, &manifest) catch return error.InternalFailure;
             owned_table_names = names;
             break :blk names;
@@ -26939,7 +26944,7 @@ fn clusterPortableForeignKeyRestoreGuarded(
             const entry = backups_api.findClusterTable(manifest, name) orelse return error.InvalidBackupRequest;
             var table = try backups_api.readManifestFromLocationWithArtifactBackupId(alloc, location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id);
             defer table.deinit(alloc);
-            if (!std.mem.eql(u8, table.table_name, name)) return error.BackupIntegrityFailure;
+            if (!std.mem.eql(u8, table.table_name, entry.name)) return error.BackupIntegrityFailure;
             if (try portableForeignKeyRestoreGuarded(alloc, &table, false)) return true;
         }
     } else {
@@ -28371,6 +28376,26 @@ fn tableNamesFromAdminSnapshotAlloc(
         initialized += 1;
     }
     return names;
+}
+
+/// Requests use public names, while cohort proofs and artifact manifests bind
+/// storage names. Resolve once before handing the selection to the executor.
+fn resolveClusterRestoreSelectionAlloc(alloc: std.mem.Allocator, manifest: *const backups_api.ClusterBackupManifest, selected: []const []const u8) ![][]u8 {
+    if (selected.len > restore_jobs.max_cluster_tables_per_job) return error.InvalidRequest;
+    var names: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (names.items) |name| alloc.free(name);
+        names.deinit(alloc);
+    }
+    try names.ensureTotalCapacity(alloc, selected.len);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(alloc);
+    for (selected) |name| {
+        const entry = backups_api.findClusterTable(manifest, name) orelse return error.InvalidRequest;
+        if ((try seen.getOrPut(alloc, entry.name)).found_existing) return error.InvalidRequest;
+        names.appendAssumeCapacity(try alloc.dupe(u8, entry.name));
+    }
+    return try names.toOwnedSlice(alloc);
 }
 
 fn tableNamesFromClusterManifestAlloc(

@@ -3722,6 +3722,7 @@ def _cluster_restore_modes(backup_api, *, concurrent_observers=False):
                 backup_id=backup_id,
                 location=location,
                 restore_mode="overwrite",
+                table_names=[table_a, table_b],
             )
             assert overwrite_restore["status"] == "completed", overwrite_restore
             assert overwrite_restore["committed_table_count"] == 2, overwrite_restore

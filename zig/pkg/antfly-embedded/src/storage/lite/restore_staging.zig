@@ -597,10 +597,7 @@ fn stagePortableFile(
     const pinned = try std.Io.Dir.cwd().openFile(io, scratch, .{});
     defer pinned.close(io);
     const manifest = if (detached) |original| blk: {
-        const Validate = struct {
-            fn visit(_: void, _: backup_codec.BlockType, _: []const u8) !void {}
-        };
-        _ = try portable_backup.inspectPortableFileBlocks(allocator, io, pinned, inspection_options, {}, Validate.visit);
+        try portable_backup.validatePortableFileWithLimits(allocator, io, pinned, inspection_options);
         detached = null;
         break :blk original;
     } else blk: {
