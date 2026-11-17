@@ -79,8 +79,12 @@ fn size(a: A, value: anytype) !u64 {
 /// images(arena, state, header, authored_key, before_value, after_value, request).
 /// images must use these historical values, never a current-row lookup.
 pub fn Provider(comptime Policy: type) type {
+    return ProviderFor(native_root.Adapter, Policy);
+}
+
+pub fn ProviderFor(comptime Root: type, comptime Policy: type) type {
     return struct {
-        root: *native_root.Adapter,
+        root: *Root,
         policy: *Policy,
         raw_bytes_limit: u32 = page_types.max_source_bytes,
         const Self = @This();
@@ -127,7 +131,7 @@ pub fn Provider(comptime Policy: type) type {
                 }
                 if (raw_events > 1024) return error.ChangefeedResynchronizationRequired;
             }
-            var page = try self.root.read(a, state, before, try self.nowSeconds(request), raw_events, self.raw_bytes_limit);
+            var page = try self.root.readWithContext(a, state, before, try self.nowSeconds(request), raw_events, self.raw_bytes_limit, request);
             defer page.deinit();
             const header = page.header orelse {
                 if (original != null) return error.ChangefeedResynchronizationRequired;

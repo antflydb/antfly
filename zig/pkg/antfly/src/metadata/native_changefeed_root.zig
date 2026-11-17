@@ -128,6 +128,13 @@ pub const Adapter = struct {
         try self.renew(state);
         return self.source.nativeHistoryPage(a, .{ .reference = ref, .after = .{ .sequence = position.sequence, .event = position.event }, .now_seconds = now, .max_events = max_events, .max_bytes = max_bytes });
     }
+    pub fn readWithContext(self: *Adapter, a: A, state: control.State, cursor: Digest, now: u64, max_events: u32, max_bytes: u32, request: anytype) !root_page.Page {
+        try request.ensureActive();
+        var page = try self.read(a, state, cursor, now, max_events, max_bytes);
+        errdefer page.deinit();
+        try request.ensureActive();
+        return page;
+    }
     /// Physical collection is bounded and follows the shared native ACK floor,
     /// including after the last consumer has been closed. It returns no rows.
     pub fn collect(self: *Adapter, state: control.State, max_frames: u8) !u8 {
@@ -146,5 +153,71 @@ pub const Adapter = struct {
             .grant = value.grant_sequence,
         } });
         return .{ .release_root = .{ .namespace = self.namespace, .ownership_epoch = value.ownership_epoch, .proof = control.hash(.{ .domain = "antfly:native-feed-release:v1", .id = state.id, .epoch = state.epoch, .authority = state.authority, .sequence = state.authority_sequence, .namespace = self.namespace, .grant = value.grant_sequence }) } };
+    }
+};
+
+// The caller captures this complete route vector after authorizing the live
+// request. Routed reads never create or renew leases. Their native grant must
+// already be durable, and the owner revalidates the route and grant.
+pub const Routed = struct {
+    const roots = @import("../api/history_roots.zig");
+    const Context = @import("antfly_local_sources").api_operation.RequestContext;
+
+    namespace: control.Namespace,
+    source: roots.Source,
+    captured: *const roots.Captured,
+
+    pub fn init(source: roots.Source, captured: *const roots.Captured) !Routed {
+        if (captured.roots.len != 1) return error.ChangefeedCapabilityUnsupported;
+        return .{ .namespace = captured.roots[0].namespace, .source = source, .captured = captured };
+    }
+
+    pub fn validateScope(self: *Routed, state: control.State) !control.Table {
+        try state.validate();
+        const definition = state.definition orelse return error.ChangefeedConflict;
+        if (definition.start != .now or definition.events != 1 or definition.tables.len != 1)
+            return error.ChangefeedCapabilityUnsupported;
+        const table = definition.tables[0];
+        if (table.contract != .native_document) return error.ChangefeedCapabilityUnsupported;
+        const selected = try self.captured.find(self.namespace);
+        if (selected.fence.table_id != table.table_id or !same(selected.table_binding, table.binding))
+            return error.ChangefeedResynchronizationRequired;
+        if (state.roots.len != 1 or !same(state.roots[0].namespace, self.namespace) or
+            state.roots[0].ownership_epoch != 1 or state.roots[0].released or state.roots[0].snapshot != null)
+            return error.ChangefeedResynchronizationRequired;
+        return table;
+    }
+
+    pub fn readWithContext(self: *Routed, a: A, state: control.State, cursor: Digest, now: u64, max_events: u32, max_bytes: u32, request: Context) !root_page.Page {
+        try request.ensureActive();
+        _ = try self.validateScope(state);
+        if (state.phase != .streaming) return error.ChangefeedResynchronizationRequired;
+        if (now == 0 or now >= state.expires_at) return error.ChangefeedLeaseExpired;
+        const root = state.roots[0];
+        if (root.consumer_epoch == 0) return error.ChangefeedResynchronizationRequired;
+        const selected = try self.captured.find(self.namespace);
+        const positions = try state.rootsAt(a, cursor);
+        defer a.free(positions);
+        const after = positions[0].delivered;
+        var page = try self.source.pages.read(a, selected.fence, selected.table_name, .{
+            .version = 1,
+            .request = .{
+                .reference = .{
+                    .namespace = self.namespace,
+                    .authority = state.authority,
+                    .consumer = state.consumerId(),
+                    .epoch = root.consumer_epoch,
+                    .grant = root.grant_sequence,
+                    .definition = state.definition.?.identity(),
+                },
+                .after = .{ .sequence = after.sequence, .event = after.event },
+                .now_seconds = now,
+                .max_events = max_events,
+                .max_bytes = max_bytes,
+            },
+        }, request);
+        errdefer page.deinit();
+        try request.ensureActive();
+        return page;
     }
 };

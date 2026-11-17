@@ -45084,6 +45084,43 @@ fn consumerTests() type {
                     try std.testing.expect(feed_state.value.roots[0].pending_control == null);
                     try std.testing.expectEqualDeep(settled_driver.settlement.?, feed_state.value.roots[0].last_control.?);
                 }
+                const RoutedFeedHarness = struct {
+                    const Provider = @import("../metadata/native_changefeed_delivery.zig");
+                    const Context = antfly.public_api.operation.RequestContext;
+                    const Policy = struct {
+                        pub fn authorize(_: *@This(), state: feed_control.State, _: Context) !void {
+                            if (state.definition == null or !std.mem.allEqual(u8, &state.definition.?.owner, 1))
+                                return error.Forbidden;
+                        }
+                        pub fn nowSeconds(_: *@This(), _: Context) !u64 {
+                            return 100;
+                        }
+                        pub fn images(_: *@This(), _: std.mem.Allocator, _: feed_control.State, _: anytype, _: []const u8, before: ?std.json.Value, after: ?std.json.Value, _: Context) !Provider.Images {
+                            return .{ .before = .{ .row = before }, .after = .{ .row = after } };
+                        }
+                    };
+                    noinline fn run(allocator: std.mem.Allocator, svc: *feed_fixture.Service, root_source: @import("../api/history_roots.zig").Source) !void {
+                        try svc.mutate(allocator, .{ .seal = .{ .cut = @splat(7) } });
+                        var state = try svc.load(allocator);
+                        defer state.deinit();
+                        var discovered = try root_source.capture(allocator, state.value.definition.?, .{});
+                        defer discovered.deinit();
+                        const Routed = @import("../metadata/native_changefeed_root.zig").Routed;
+                        var root_adapter = try Routed.init(root_source, &discovered);
+                        var policy: Policy = .{};
+                        var provider: Provider.ProviderFor(Routed, Policy) = .{ .root = &root_adapter, .policy = &policy };
+                        const feed_delivery = @import("../metadata/changefeed_delivery.zig");
+                        var pulled = try feed_delivery.pull(svc, &provider, allocator, svc.id, state.value.latest_cursor, .{}, Context{});
+                        defer pulled.deinit();
+                        try std.testing.expectEqualStrings("{\"version\":1,\"events\":[],\"transaction\":null}", pulled.body);
+                        var replayed = try feed_delivery.pull(svc, &provider, allocator, svc.id, state.value.latest_cursor, .{}, Context{});
+                        defer replayed.deinit();
+                        try std.testing.expect(replayed.replayed);
+                        try std.testing.expectEqual(pulled.cursor, replayed.cursor);
+                    }
+                };
+                metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
+                try RoutedFeedHarness.run(a, &feed_svc, origin.historyRootsSource());
                 const final_driver_index = blk: {
                     lockAtomic(&server.data_raft_mutex);
                     defer server.data_raft_mutex.unlock();
