@@ -2707,6 +2707,11 @@ pub const Owner = struct {
             const retired = self.retired.items[i];
             const retained = retained: {
                 if (retired.query_borrows > 0 or retired.maintenance_references != 0 or retired.allocator_verification_references != 0 or retired.lane_pins.load(.acquire) != 0) break :retained true;
+                // A maintenance turn forwards its snapshot's writes to the
+                // root that was current when each write began
+                // (`resolveWriterStore`), outside the gate; keep every
+                // retired root alive until no turn is running.
+                if (self.maintenance_activity.count != 0) break :retained true;
                 for (self.connections.items) |connection| {
                     // attach moves this connection's registry onto the current
                     // root. Inspect its actual owner during query resume too.
@@ -9042,4 +9047,53 @@ test "capi native writer authority W6 plain reads take no writer lease and run w
     // With the foreign writer gone, nothing in this process holds the lease.
     var probe = try native.lockWriterPathWithIo(a, io, path);
     probe.close();
+}
+
+test "capi native retired roots outlive an active maintenance turn" {
+    // A maintenance turn forwards its snapshot's writes to the current root
+    // outside the gate. A refresh that retires that root mid-turn must not
+    // free it until the turn ends, or the forwarded write runs on freed memory.
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("retired-roots-outlive-maintenance");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    {
+        var seed = try native.NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
+        seed.close();
+    }
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, false);
+    const id = try api.publishHandle(wrapper);
+    defer api.antfly_db_close(id);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    if (owner.worker) |worker| worker.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("doc"), .value = .fromSlice("{\"text\":\"written\"}"), .is_delete = false }};
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(id, &writes, writes.len, null, 0, 0, 0));
+
+    var lease = try connection.acquire();
+    defer {
+        lease.close();
+        connection.gate.mutex.unlock(io);
+    }
+    const previous = owner.current.?;
+    // A held maintenance reference forces the next refresh to replace it.
+    previous.maintenance_references += 1;
+    const replacement = try owner.refresh();
+    previous.maintenance_references -= 1;
+    try std.testing.expect(replacement != previous);
+
+    owner.maintenance_activity.begin();
+    owner.collectRetired();
+    try std.testing.expectEqual(@as(usize, 1), owner.retired.items.len);
+    owner.maintenance_activity.finish(io);
+    owner.collectRetired();
+    try std.testing.expectEqual(@as(usize, 0), owner.retired.items.len);
 }
