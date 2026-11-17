@@ -71,6 +71,7 @@ pub const OwnedReplicatedBatch = struct {
 /// A retention command has no document batch, including an empty one. Callers
 /// must select its ordered control path explicitly before accessing row work.
 pub const OwnedApplyEntry = union(enum) {
+    source_legacy_terminal: @import("source_legacy_terminal_entry.zig").Owned,
     batch: OwnedReplicatedBatch,
     history_control: @import("history_control_entry.zig").Owned,
     source_plan: @import("source_plan_entry.zig").Owned,
@@ -85,6 +86,7 @@ pub const OwnedApplyEntry = union(enum) {
             .source_scope_control => |*value| value.deinit(),
             .source_retirement => |*value| value.deinit(),
             .source_producer_closure => |*value| value.deinit(),
+            .source_legacy_terminal => |*value| value.deinit(),
         }
         self.* = undefined;
     }
@@ -182,6 +184,11 @@ pub fn decodeForApply(alloc: std.mem.Allocator, payload: []const u8) !OwnedApply
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidReplicatedBatch;
+    if (parsed.value.object.contains("source_legacy_terminal")) {
+        const legacy = @import("source_legacy_terminal_entry.zig");
+        if (payload.len > legacy.max_bytes) return error.InvalidReplicatedBatch;
+        return .{ .source_legacy_terminal = try legacy.decodeValue(alloc, parsed.value) };
+    }
     if (parsed.value.object.contains("source_producer_closure")) {
         const closure = @import("source_producer_closure_entry.zig");
         if (payload.len > closure.max_bytes) return error.InvalidReplicatedBatch;
@@ -214,7 +221,7 @@ fn decodeBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedRepli
     if (value != .object) return error.InvalidReplicatedBatch;
     const root = value.object;
     if (root.contains("source_owner")) return error.UnsupportedRaftBatchProtocolVersion;
-    if (root.contains("history_control") or root.contains("source_plan") or root.contains("source_scope_control") or root.contains("source_retirement") or root.contains("source_producer_closure")) return error.UnsupportedRaftBatchProtocolVersion;
+    if (root.contains("source_legacy_terminal") or root.contains("history_control") or root.contains("source_plan") or root.contains("source_scope_control") or root.contains("source_retirement") or root.contains("source_producer_closure")) return error.UnsupportedRaftBatchProtocolVersion;
     const table_value = root.get("table") orelse return error.InvalidReplicatedBatch;
     if (table_value != .string) return error.InvalidReplicatedBatch;
     const batch_value = root.get("batch") orelse return error.InvalidReplicatedBatch;

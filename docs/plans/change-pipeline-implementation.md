@@ -7791,3 +7791,54 @@ history suite passed 18 cases in the preceding combined run. Final contract and
 whitespace checks passed (`source-legacy-terminal-receipt-final-contract-check.log`).
 This qualifies atomic local outcomes, not a managed Raft proposal, authenticated
 read-only outcome recovery, source ACK, migration drainage or full issue completion.
+
+### Activated Raft apply for original terminal legacy recovery
+
+Data profile 47 adds a separate source_legacy_terminal envelope carrying the
+frozen physical descriptor, full original owner and bounded record proof. Strict
+encoding/decoding requires the complete owner/descriptor/command material and
+rejects stripped tags, missing generations, mixed controls and generic row
+interpretation. The applying decoder and topology projection require native
+ownership and the durable protocol floor before dispatch. Native apply consumes
+the retained applied/rejected/superseded outcome, preserving semantic rejection
+in the actual Raft waiter instead of treating it as a document success.
+
+A new native fixture runs after the existing producer closure/drainage checks.
+It verifies both apply/projection rejection before profile 47, rejection without
+a native delegate, a real barrier, durable missing-record rejection, lost native
+reply after commit with exact-entry replay, continued progress to the next
+rejected command and explicit old-receipt supersession. Document-apply counters
+must remain unchanged. No old fixture/protocol expectations are weakened.
+
+Initial qualification passed 15 local and 36 wire/control cases, but the selected
+native apply case exposed a domain error gap: canonical original-record lookup
+returned raw storage NotFound rather than TxnNotFound, bypassing durable semantic
+rejection. The reader now normalizes only that missing transaction-record lookup;
+other storage failures remain untouched. An explicit real-store missing-record
+case was added. Final native apply/store qualification is running
+(`source-legacy-terminal-raft-apply-final-test.log`); contract checks passed
+(`source-legacy-terminal-raft-contract-check.log`). This is an applying-path
+milestone. Managed proposal, qualified read-only outcome recovery, authenticated
+recovery transport, original pending decisions, global drainage and every full
+issue requirement remain open.
+
+Final applying-path qualification passed both selected linked source-plan/scope
+cases and all 18 store/history cases, zero skips/failures/leaks
+(`source-legacy-terminal-raft-apply-final-test.log`). The selected native staging
+fixture reaches the new helper: pre-activation and missing-native dispatch are
+rejected, barrier 47 applies, a missing original record durably rejects, lost
+native confirmation is recovered on exact replay, the next command advances and
+the older receipt is superseded. Document apply progression is unchanged. The
+new strict envelope passed within 36 wire/control cases; 15 local cases passed.
+Final contract/whitespace checks passed
+(`source-legacy-terminal-raft-final-contract-check.log`). Existing history/live
+proposer regression qualification is running because the advertised maximum
+protocol changed (`source-legacy-terminal-raft-history-regression.log`).
+
+Existing native history/live proposer regressions passed six local and 46 linked
+cases, zero skips/failures/leaks
+(`source-legacy-terminal-raft-history-regression.log`). Protocol-47 advertisement
+did not change the earlier explicit producer/control floors or their original
+checks. This qualifies the applying path and durable rejection replay only;
+managed proposal, qualified read-only outcome recovery and the complete original
+issue acceptance remain required.

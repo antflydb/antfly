@@ -1249,7 +1249,7 @@ pub const TxnManager = struct {
         var read = try self.store.beginRead();
         defer read.abort();
         _ = (try @import("source_producer_policy.zig").Store.read(self.alloc, &read, proof.root)) orelse return error.SourcePendingWork;
-        const raw = try read.get(&makeRecordKey(proof.transaction_id));
+        const raw = read.get(&makeRecordKey(proof.transaction_id)) catch |err| return if (err == error.NotFound) error.TxnNotFound else err;
         if (!std.mem.eql(u8, &completion.bytesDigest(raw), &proof.record_digest)) return error.SourceTransactionIdentityConflict;
         const record = try decodeRecord(raw);
         if (record.status == .pending or record.ordinary_producer or record.source_scope != null or record.finalized_at == 0 or (record.status == .committed and record.commit_version == 0)) return error.SourceOutcomeUnresolved;
@@ -6880,6 +6880,9 @@ test "transaction source purpose closed legacy terminal recovery preserves origi
     const pending: LegacyTerminalResolution = .{ .root = root, .transaction_id = page.items[0].transaction_id, .record_digest = page.items[0].record_digest };
     try std.testing.expectError(error.SourceOutcomeUnresolved, manager.resolveClosedLegacyTerminal(pending, .{}));
     var commit: LegacyTerminalResolution = .{ .root = root, .transaction_id = page.items[1].transaction_id, .record_digest = page.items[1].record_digest };
+    var absent = commit;
+    absent.transaction_id = @splat(239);
+    try std.testing.expectError(error.TxnNotFound, manager.resolveClosedLegacyTerminal(absent, .{}));
     var forged = commit;
     forged.record_digest[0] ^= 1;
     try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.resolveClosedLegacyTerminal(forged, .{}));

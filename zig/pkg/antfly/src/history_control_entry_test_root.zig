@@ -20,6 +20,7 @@ test {
     _ = @import("data/source_scope_entry.zig");
     _ = @import("data/source_retirement_entry.zig");
     _ = @import("data/source_producer_closure_entry.zig");
+    _ = @import("data/source_legacy_terminal_entry.zig");
     _ = @import("data/source_scope_http_wire.zig");
     _ = @import("api/source_scope_control_operations.zig");
     _ = @import("api/source_producer_closure_operations.zig");
