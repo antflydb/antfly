@@ -297,6 +297,13 @@ const SourceRetirement = struct {
     already_fenced: bool,
 };
 
+/// Internal recovery of an already durable terminal decision. This can never
+/// decide pending work: the native writer rechecks the exact original record.
+pub const LegacyTerminalResolution = struct {
+    root: source_scope.Basis,
+    transaction_id: TxnId,
+    record_digest: [32]u8,
+};
 pub const ResolutionExtraBatch = struct {
     source_scope_cut: ?source_scope.Cut = null,
     /// Private ordered retirement receipt, staged after scope resolution in the
@@ -1231,12 +1238,38 @@ pub const TxnManager = struct {
         _ = try self.resolveIntentsWithExtraBatch(txn_id, status, timestamp, .{});
     }
 
+    /// Resume only an original, already durable terminal decision after
+    /// producer closure. Callers cannot choose COMMIT/ABORT or its version.
+    /// Pending coordinator decisions require a separate qualified protocol.
+    pub fn resolveClosedLegacyTerminal(self: *TxnManager, proof: LegacyTerminalResolution, extra: ResolutionExtraBatch) !ResolutionOutcome {
+        if (extra.source_retirement != null or extra.source_scope != null or extra.source_purpose != null) return error.InvalidSourceAdmission;
+        var read = try self.store.beginRead();
+        defer read.abort();
+        _ = (try @import("source_producer_policy.zig").Store.read(self.alloc, &read, proof.root)) orelse return error.SourcePendingWork;
+        const raw = try read.get(&makeRecordKey(proof.transaction_id));
+        if (!std.mem.eql(u8, &completion.bytesDigest(raw), &proof.record_digest)) return error.SourceTransactionIdentityConflict;
+        const record = try decodeRecord(raw);
+        if (record.status == .pending or record.ordinary_producer or record.source_scope != null or record.finalized_at == 0 or (record.status == .committed and record.commit_version == 0)) return error.SourceOutcomeUnresolved;
+        return self.resolveIntentsWithExtraBatchInternal(proof.transaction_id, record.status, if (record.status == .committed) record.commit_version else record.finalized_at, extra, proof);
+    }
+
     pub fn resolveIntentsWithExtraBatch(
         self: *TxnManager,
         txn_id: TxnId,
         status: TxnStatus,
         timestamp: u64,
         extra_batch: ResolutionExtraBatch,
+    ) !ResolutionOutcome {
+        return self.resolveIntentsWithExtraBatchInternal(txn_id, status, timestamp, extra_batch, null);
+    }
+
+    fn resolveIntentsWithExtraBatchInternal(
+        self: *TxnManager,
+        txn_id: TxnId,
+        status: TxnStatus,
+        timestamp: u64,
+        extra_batch: ResolutionExtraBatch,
+        legacy_terminal: ?LegacyTerminalResolution,
     ) !ResolutionOutcome {
         if (extra_batch.source_retirement) |ordered| {
             const proof = try ordered.command.proof();
@@ -1337,7 +1370,7 @@ pub const TxnManager = struct {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
             }
             if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0 or extra_batch.source_retirement != null) {
-                try self.applyBatchWithParticipant(completion_writes.items, extra_batch.completion_deletes, null, null, null, null, extra_batch.source_retirement);
+                try self.applyBatchWithParticipant(completion_writes.items, extra_batch.completion_deletes, null, null, null, null, extra_batch.source_retirement, legacy_terminal);
             }
             return .{
                 .applied = false,
@@ -1395,7 +1428,7 @@ pub const TxnManager = struct {
             try completion_deletes.append(self.alloc, &schema_lease_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-            try self.applyBatchWithParticipant(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, extra_batch.source_scope_cut, extra_batch.source_retirement);
+            try self.applyBatchWithParticipant(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, extra_batch.source_scope_cut, extra_batch.source_retirement, legacy_terminal);
             return .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -1550,7 +1583,7 @@ pub const TxnManager = struct {
         }
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyBatchWithParticipant(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, extra_batch.source_scope_cut, extra_batch.source_retirement);
+        try self.applyBatchWithParticipant(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, extra_batch.source_scope_cut, extra_batch.source_retirement, legacy_terminal);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -3187,10 +3220,10 @@ pub const TxnManager = struct {
 
     const ReservationChange = struct { previous: u64, next: u64 };
     fn applyBatchWithReservation(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange) !void {
-        return self.applyBatchWithParticipant(writes, deletes, replay, reservation, null, null, null);
+        return self.applyBatchWithParticipant(writes, deletes, replay, reservation, null, null, null, null);
     }
 
-    fn applyBatchWithParticipant(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, scope_cut: ?source_scope.Cut, source_retirement: ?SourceRetirement) !void {
+    fn applyBatchWithParticipant(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, scope_cut: ?source_scope.Cut, source_retirement: ?SourceRetirement, legacy_terminal: ?LegacyTerminalResolution) !void {
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
         if (participant) |observer| try batch.setCommitParticipant(observer);
@@ -3216,7 +3249,21 @@ pub const TxnManager = struct {
             }
             if (producer_closed != null) {
                 // Plain/legacy records cannot acquire authority after closure.
-                if (next_record.source_scope == null and !next_record.ordinary_producer) return error.SourcePendingWork;
+                if (next_record.source_scope == null and !next_record.ordinary_producer) {
+                    const proof = legacy_terminal orelse return error.SourcePendingWork;
+                    const id: TxnId = write.key[records_prefix.len..][0..16].*;
+                    if (!std.mem.eql(u8, &id, &proof.transaction_id) or !std.meta.eql(producer_closed.?.root, proof.root)) return error.SourceTransactionIdentityConflict;
+                    const original_bytes = previous_bytes orelse return error.SourceOutcomeUnresolved;
+                    if (!std.mem.eql(u8, &completion.bytesDigest(original_bytes), &proof.record_digest)) return error.SourceTransactionIdentityConflict;
+                    var original = try decodeRecord(original_bytes);
+                    if (original.status == .pending or original.ordinary_producer or original.source_scope != null or original.finalized_at == 0 or (original.status == .committed and original.commit_version == 0)) return error.SourceOutcomeUnresolved;
+                    // Resolution may retire intents and advance only their
+                    // replay marker, preserving every original decision field.
+                    original.intents_resolved = next_record.intents_resolved;
+                    original.intents_resolved_known = next_record.intents_resolved_known;
+                    original.replay_sequence = next_record.replay_sequence;
+                    if (!std.meta.eql(original, next_record) or !next_record.intents_resolved_known or !next_record.intents_resolved) return error.SourceTransactionIdentityConflict;
+                }
                 if (next_record.ordinary_producer) {
                     const id: TxnId = write.key[records_prefix.len..][0..16].*;
                     const admission_key = makeSidecarKey(completion_admission_prefix, id);
@@ -6783,4 +6830,96 @@ test "transaction source purpose closed legacy recovery inventory is bounded and
     // initial cursor must inspect the prefix itself rather than prefix+zero.
     try manager.putValue(records_prefix, raw);
     try std.testing.expectError(error.InvalidTxnRecord, manager.legacyRecoveryPage(a, root, null, 256));
+}
+
+test "transaction source purpose closed legacy terminal recovery preserves original decisions and effects" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-legacy-terminal");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    const owner: completion.RoutedOwner = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .table_binding = @splat(2), .root_generation = 0, .group_id = 2, .topology_epoch = 1 };
+    const root = try source_scope.Basis.fromOwner(owner);
+    const policy = @import("source_producer_policy.zig");
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        for ([_]u8{ 1, 2, 3 }) |byte| {
+            const id: TxnId = @splat(byte);
+            try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 10, 11, &.{}, true, true);
+            if (byte == 1) continue;
+            try manager.writeIntents(id, &.{.{ .key = if (byte == 2) "commit-row" else "abort-row", .value = "original" }}, &.{});
+            // Fixture models the historic crash window: original decision
+            // persisted, prepared intents not yet retired.
+            var record = try manager.loadTransactionRecord(id);
+            record.status = if (byte == 2) .committed else .aborted;
+            record.commit_version = if (byte == 2) 30 else 0;
+            record.finalized_at = 31;
+            const encoded = try manager.encodeRecord(record);
+            defer a.free(encoded);
+            try manager.putValue(&makeRecordKey(id), if (byte == 3) encoded[0..txn_record_v5_size] else encoded);
+        }
+        var batch = try store.beginWriteTxn();
+        errdefer batch.abort();
+        _ = try policy.Store.close(a, &batch, root, .{ .term = 1, .index = 7 });
+        try batch.commit();
+    }
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    var page = try manager.legacyRecoveryPage(a, root, null, 256);
+    defer page.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), page.items.len);
+    try std.testing.expect(!page.items[2].intents_resolved_known);
+    const pending: LegacyTerminalResolution = .{ .root = root, .transaction_id = page.items[0].transaction_id, .record_digest = page.items[0].record_digest };
+    try std.testing.expectError(error.SourceOutcomeUnresolved, manager.resolveClosedLegacyTerminal(pending, .{}));
+    var commit: LegacyTerminalResolution = .{ .root = root, .transaction_id = page.items[1].transaction_id, .record_digest = page.items[1].record_digest };
+    var forged = commit;
+    forged.record_digest[0] ^= 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.resolveClosedLegacyTerminal(forged, .{}));
+    forged = commit;
+    forged.root.root_generation += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, manager.resolveClosedLegacyTerminal(forged, .{}));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.resolveIntentsWithExtraBatchInternal(commit.transaction_id, .committed, 30, .{}, forged));
+    forged = commit;
+    forged.record_digest[0] ^= 1;
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.resolveIntentsWithExtraBatchInternal(commit.transaction_id, .committed, 30, .{}, forged));
+    try std.testing.expectError(error.DecisionConflict, manager.resolveIntentsWithExtraBatchInternal(commit.transaction_id, .aborted, 99, .{}, commit));
+    try std.testing.expectError(error.SourcePendingWork, manager.resolveIntentsWithExtraBatch(commit.transaction_id, .committed, 30, .{}));
+    try std.testing.expect(try manager.hasIntents(commit.transaction_id));
+    _ = try manager.resolveClosedLegacyTerminal(commit, .{});
+    const commit_key = try internal_keys.documentKeyAlloc(a, "commit-row");
+    defer a.free(commit_key);
+    const abort_key = try internal_keys.documentKeyAlloc(a, "abort-row");
+    defer a.free(abort_key);
+    const value = try manager.getAlloc(a, commit_key);
+    defer a.free(value);
+    try std.testing.expectEqualStrings("original", value);
+    const resolved = try manager.loadTransactionRecord(commit.transaction_id);
+    try std.testing.expectEqual(TxnStatus.committed, resolved.status);
+    try std.testing.expectEqual(@as(u64, 30), resolved.commit_version);
+    try std.testing.expectEqual(@as(u64, 31), resolved.finalized_at);
+    try std.testing.expect(resolved.intents_resolved and !try manager.hasIntents(commit.transaction_id));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.resolveClosedLegacyTerminal(commit, .{}));
+    // Re-read current state for an explicit idempotent terminal retry. It must
+    // not reapply the original row over a newer value.
+    const resolved_bytes = try manager.getAlloc(a, &makeRecordKey(commit.transaction_id));
+    defer a.free(resolved_bytes);
+    commit.record_digest = completion.bytesDigest(resolved_bytes);
+    try manager.putValue(commit_key, "newer");
+    try std.testing.expect(!(try manager.resolveClosedLegacyTerminal(commit, .{})).applied);
+    const newer = try manager.getAlloc(a, commit_key);
+    defer a.free(newer);
+    try std.testing.expectEqualStrings("newer", newer);
+    const abort: LegacyTerminalResolution = .{ .root = root, .transaction_id = page.items[2].transaction_id, .record_digest = page.items[2].record_digest };
+    _ = try manager.resolveClosedLegacyTerminal(abort, .{});
+    try std.testing.expectError(error.NotFound, manager.getAlloc(a, abort_key));
+    try std.testing.expect(!try manager.hasIntents(abort.transaction_id));
+    var remaining = try manager.legacyRecoveryPage(a, root, null, 256);
+    defer remaining.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), remaining.items.len);
+    try std.testing.expectEqualDeep(pending.transaction_id, remaining.items[0].transaction_id);
 }

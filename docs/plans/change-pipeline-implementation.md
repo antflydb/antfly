@@ -7581,3 +7581,44 @@ seeks the record prefix itself; continuation still resumes strictly after the
 last full ID. An injected short-prefix record fails closed. The complete 17-case
 store/history suite passed again, zero skips/failures/leaks
 (`source-legacy-recovery-inventory-key-test.log`); whitespace checks passed.
+
+### Original terminal legacy resolution under closure (native primitive)
+
+TxnManager.resolveClosedLegacyTerminal now resumes an already durable original
+terminal record after physical producer closure. It derives decision and version
+from the canonical record rather than accepting a replacement COMMIT/ABORT.
+The request binds physical closure basis, transaction ID and exact record digest.
+Pending records, ordinary/scoped producers and incomplete terminal versions are
+unresolved. No external coordinator decision is inferred from this local record.
+
+The final native writer rechecks the same closure root and original record digest
+before any effects. It accepts only intent-resolution knowledge and replay-marker
+progression; every original decision/provenance field must remain identical.
+Generic closure guards remain unchanged. A separate private resolution argument
+carries this authorization, preserving ResolutionExtraBatch and the ordinary
+maintenance callback layout. Terminal retries cannot reapply old row effects,
+and a stale digest requires explicit state recovery.
+
+Real-store qualification constructs the historic durable-decision/unresolved-
+intent crash window before closure, reopens, and resumes original COMMIT/ABORT.
+Tests cover rejection of pending decisions, stale digest/root both before dispatch
+and inside the final writer, decision conflict, blocked generic resolution,
+original version/finalization preservation, v5 terminal resolution without a
+resolution-known bit, intent retirement and newer-row preservation on retry.
+The 18-case history/store suite passed after correcting a fixture read to use the
+physical document namespace. Qualification is rerunning after isolating the
+private argument (`source-legacy-terminal-resolution-private-path-test.log`).
+Contract checks run in `source-legacy-terminal-resolution-contract-check.log`.
+
+This primitive is not yet a production ordered recovery endpoint. DB materialized
+commit integration, activated Raft command/ABI/route wiring, pending original
+coordinator decision recovery, migration cohort completeness and first-strict
+activation remain required. No drain, ACK, source activation or full issue
+completion is claimed.
+
+Final private-path qualification passed all 18 selected store/history cases,
+zero skips/failures/leaks. The broader docstore/transaction regression suite also
+passed all 141 cases, zero skips/failures/leaks
+(`source-legacy-terminal-resolution-regression-test.log`). Contract and whitespace
+checks passed. No callback layout, native ABI, public route or first-strict gate
+changed in this primitive milestone.
