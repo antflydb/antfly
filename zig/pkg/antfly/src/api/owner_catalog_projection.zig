@@ -81,12 +81,11 @@ pub const Cache = struct {
     pub fn acquire(self: *Cache, alloc: std.mem.Allocator, group: u64, raw: []const u8) !Lease {
         if (!aliases.mayContainOwnerControls(raw)) return .{ .bytes = raw };
         // Raft apply never waits for projection construction or cache admission.
-        if (self.mutex.tryLock()) {
-            const hit = self.findLocked(group, raw);
-            if (hit) |entry| entry.retain();
-            self.mutex.unlock();
-            if (hit) |entry| return entry.lease();
-        }
+        if (!self.mutex.tryLock()) return error.CatalogProjectionBusy;
+        const cached = self.findLocked(group, raw);
+        if (cached) |entry| entry.retain();
+        self.mutex.unlock();
+        if (cached) |entry| return entry.lease();
         const raw_copy = try alloc.dupe(u8, raw);
         errdefer alloc.free(raw_copy);
         const physical = try aliases.physicalProjectionIfNeeded(alloc, raw_copy);

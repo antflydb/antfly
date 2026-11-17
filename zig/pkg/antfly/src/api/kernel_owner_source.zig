@@ -4078,7 +4078,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         needs_index_catalog: bool,
     ) !Lease {
         var physical = self.physical_catalogs.acquire(self.alloc, group_id, raw_descriptor.indexes_json) catch |err|
-            return if (err == error.OutOfMemory) error.RaftApplyWriterUnavailable else err;
+            return if (err == error.OutOfMemory or err == error.CatalogProjectionBusy) error.RaftApplyWriterUnavailable else err;
         defer physical.deinit();
         var descriptor = raw_descriptor;
         descriptor.indexes_json = physical.bytes;
@@ -4163,7 +4163,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         residency: Residency,
         controls: ReadControls,
     ) !Lease {
-        var physical = try self.physical_catalogs.acquire(self.alloc, group_id, raw_descriptor.indexes_json);
+        var physical = self.physical_catalogs.acquire(self.alloc, group_id, raw_descriptor.indexes_json) catch |err|
+            return if (err == error.CatalogProjectionBusy) error.StorageKernelOwnerTransitionRequired else err;
         defer physical.deinit();
         var descriptor = raw_descriptor;
         descriptor.indexes_json = physical.bytes;
@@ -8569,13 +8570,11 @@ test "source owner privacy projection caches exact cuts without warm allocations
     failing.fail_index = std.math.maxInt(usize);
     cache.forget(1);
     try std.testing.expectEqualStrings("{\"_privacy\":{\"generation\":1}}", first.bytes);
-    // Contention never waits for the cache: the returned cut owns its data.
+    // Contended admission yields without waiting or reparsing a warm cut.
     try std.testing.expect(cache.mutex.tryLock());
-    var uncached = cache.acquire(alloc, 1, raw) catch |err| {
-        cache.mutex.unlock();
-        return err;
-    };
+    const before_contention = failing.alloc_index;
+    const contended = cache.acquire(alloc, 2, raw);
     cache.mutex.unlock();
-    defer uncached.deinit();
-    try std.testing.expectEqualStrings(first.bytes, uncached.bytes);
+    try std.testing.expectError(error.CatalogProjectionBusy, contended);
+    try std.testing.expectEqual(before_contention, failing.alloc_index);
 }
