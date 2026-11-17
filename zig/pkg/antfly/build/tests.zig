@@ -2191,6 +2191,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const api_http_runtime_default_filters = [_][]const u8{
         "backup cohort admission waits for producer drain",
+        "backup preparation preserves interruption errors",
+        "external lake read refresh hints coalesce",
         "admission routing",
         "native memory",
         "httpx internal control routes call typed operations directly",
