@@ -36437,7 +36437,7 @@ pub const DB = struct {
                 index_options.covered_rebuilding_index = entry.config.name;
             }
             index_options.allow_primary_snapshot = options.allow_primary_snapshot and
-                (allow_primary_snapshot or (rebuilding and try denseIndexSourceCoverageComplete(self.async_context, entry)));
+                (allow_primary_snapshot or (rebuilding and (try denseIndexSourceCoverage(self.async_context, entry)).permitsRepair()));
             const result = try self.core.index_manager.publishVectorBlockBaseForEntryOnlineReported(entry, index_options);
             published += result.published;
             deferred = deferred or result.deferred;
@@ -62753,7 +62753,7 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
 fn denseCorpusCoverageAllowsPrimarySnapshot(ctx: *AsyncContext) !bool {
     for (ctx.index_manager.dense_indexes.items) |*entry| {
         if (entry.index.leann != null) continue;
-        if (!try denseIndexSourceCoverageComplete(ctx, entry)) return false;
+        if (try denseIndexSourceCoverage(ctx, entry) == .pending) return false;
     }
     return true;
 }
@@ -62762,25 +62762,36 @@ fn denseCorpusCoverageAllowsPrimarySnapshot(ctx: *AsyncContext) !bool {
 // may emit many chunks, and a provider can pause between small output batches.
 // Use the current incarnation's terminal source outcomes to admit expensive
 // primary scans, independently of native WAL/query eligibility.
-fn denseIndexSourceCoverageComplete(ctx: *AsyncContext, entry: *const index_manager_mod.IndexManager.DenseIndex) !bool {
+const DenseSourceCoverage = enum {
+    authored,
+    unknown,
+    pending,
+    complete,
+
+    fn permitsRepair(self: @This()) bool {
+        return self == .authored or self == .complete;
+    }
+};
+
+fn denseIndexSourceCoverage(ctx: *AsyncContext, entry: *const index_manager_mod.IndexManager.DenseIndex) !DenseSourceCoverage {
     // Authored vectors have no producer to finish. Their exact physical
     // cardinality is validated by publication, independently of counters
     // which may exist for source census/coverage accounting.
-    if (entry.external or entry.managed_direct_field) return true;
+    if (entry.external or entry.managed_direct_field) return .authored;
     const config = entry.config;
     const generation = internal_keys.derivedCoverageGenerationForConfig(config.coverage_generation, config.config_json);
     const counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, config.name, generation, ctx.index_manager.byte_range, ctx);
     const present: u2 = @as(u2, @intFromBool(counts.produced != null)) +
         @as(u2, @intFromBool(counts.skipped != null)) +
         @as(u2, @intFromBool(counts.terminal_failed != null));
-    // Authored/external and legacy projections may have no producer outcomes.
-    // Preserve their existing repair path; the first generated outcome creates
-    // the complete tuple and subsequent partial batches must wait.
-    if (present == 0) return true;
+    // Missing legacy counters also describe an unobserved new producer.
+    // Keep the legacy corpus path, but absence must never grant the per-index
+    // repair exception while another producer has known pending work.
+    if (present == 0) return .unknown;
     if (present != 3) return error.InvalidDerivedCoverageCounter;
     const successful = std.math.add(u64, counts.produced.?, counts.skipped.?) catch return error.InvalidDerivedCoverageCounter;
     const terminal = std.math.add(u64, successful, counts.terminal_failed.?) catch return error.InvalidDerivedCoverageCounter;
-    return if (counts.source_total) |total| terminal == total else false;
+    return if (counts.source_total) |total| if (terminal == total) .complete else .pending else .pending;
 }
 
 const DenseTargetCoverage = enum { all_sources, materialized };
@@ -63911,7 +63922,7 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
             .covered_rebuilding_index = entry.config.name,
             .only_index = entry.config.name,
             .allow_primary_snapshot = allow_primary_snapshot or
-                (checkpoint.status == .rebuilding and try denseIndexSourceCoverageComplete(ctx, entry)),
+                (checkpoint.status == .rebuilding and (try denseIndexSourceCoverage(ctx, entry)).permitsRepair()),
         });
         if (!manager.vectorBlockReadyForDenseEntryAtSequence(entry, sequence, expected)) {
             pending = true;
@@ -119079,7 +119090,24 @@ test "db online vector repair completes independently of partial sibling coverag
             _ = try db.publishVectorBlockBasesOnlineReported(.{ .only_index = "A" });
         }
         try std.testing.expectEqual(before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
-        try db.core.store.put(produced_key, internal_keys.encodeDerivedCoverageOutcomeCount(&produced_value, 2));
+        // Missing counters are not proof of completion. In particular a
+        // newly admitted producer must not acquire the repair exception.
+        for ([_][]const u8{ "produced", "skipped", "terminal_failed" }) |tag| {
+            const key = try @import("artifact_coverage_epoch.zig").counter(a, authority, "A", db.core.index_manager.coverageGenerationForIndex("A").?, tag);
+            defer a.free(key);
+            try db.core.store.delete(key);
+        }
+        if (native_round) {
+            _ = try nativeProjectionMaintenanceRound(db.async_context);
+        } else {
+            _ = try db.publishVectorBlockBasesOnlineReported(.{ .only_index = "A" });
+        }
+        try std.testing.expectEqual(before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
+        for ([_][]const u8{ "produced", "skipped", "terminal_failed" }, 0..) |tag, i| {
+            const key = try @import("artifact_coverage_epoch.zig").counter(a, authority, "A", db.core.index_manager.coverageGenerationForIndex("A").?, tag);
+            defer a.free(key);
+            try db.core.store.put(key, internal_keys.encodeDerivedCoverageOutcomeCount(&produced_value, if (i == 0) 2 else 0));
+        }
         if (native_round) {
             _ = try nativeProjectionMaintenanceRound(db.async_context);
         } else {
