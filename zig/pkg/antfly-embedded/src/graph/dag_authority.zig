@@ -344,9 +344,13 @@ pub const Storage = struct {
     pub fn activateNewIncarnation(txn: anytype, id: Digest, epoch: u64) !void {
         var state = try load(txn, id);
         if (state.owner_epoch != epoch) return error.GraphConstraintOwnerChanged;
-        if (state.phase == .active) return;
+        if (state.phase == .active) {
+            try Contributions.requireActivationCertificate(txn, id, null);
+            return;
+        }
         if (state.phase != .validating or state.revision != 0) return error.GraphConstraintNotReady;
         try requireEmptyLedger(txn, id);
+        try Contributions.saveActivationCertificate(txn, id, null);
         state.phase = .active;
         try save(txn, state);
     }
@@ -361,6 +365,7 @@ pub const Storage = struct {
         try requireEmptyPrefix(&cursor, &(receipt_prefix.* ++ suffix));
         try requireEmptyPrefix(&cursor, &proofKey(id));
         try requireEmptyPrefix(&cursor, &Contributions.activationKey(id));
+        try requireEmptyPrefix(&cursor, &Contributions.activationCertificateKey(id));
         try requireEmptyPrefix(&cursor, &TransactionParticipant.key(id));
     }
 
@@ -957,12 +962,50 @@ pub const Contributions = struct {
             !std.mem.eql(u8, raw[@sizeOf(Digest)..], after)) return error.GraphConstraintRevisionChanged;
     }
 
+    const ActivationProof = struct { snapshot: Digest, after: []const u8 };
+    const certificate_prefix = "\x00\x00__metadata__:dag-activation-certificate:";
+
+    fn activationCertificateKey(id: Digest) [certificate_prefix.len + @sizeOf(Digest)]u8 {
+        return certificate_prefix.* ++ id;
+    }
+
+    fn activationCertificate(id: Digest, proof: ?ActivationProof) [33]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly/dag-activation-certificate/v1");
+        hash.update(&id);
+        const kind: u8 = if (proof != null) 1 else 0;
+        hash.update(&.{kind});
+        if (proof) |value| {
+            hash.update(&value.snapshot);
+            hashBytes(&hash, value.after);
+        }
+        return [1]u8{kind} ++ hash.finalResult();
+    }
+
+    fn saveActivationCertificate(txn: anytype, id: Digest, proof: ?ActivationProof) !void {
+        try txn.put(&activationCertificateKey(id), &activationCertificate(id, proof));
+    }
+
+    fn requireActivationCertificate(txn: anytype, id: Digest, proof: ?ActivationProof) !void {
+        const raw = txn.get(&activationCertificateKey(id)) catch |err| {
+            if (err == error.NotFound) return error.GraphConstraintNotReady;
+            return err;
+        };
+        if (raw.len != 33 or raw[0] > 1) return error.InvalidDagAuthority;
+        if (!std.mem.eql(u8, raw, &activationCertificate(id, proof))) return error.GraphConstraintRevisionChanged;
+    }
+
     /// Call only after the fenced snapshot reader has certified end of input
     /// at this exact cursor. Publish the catalog's enforcing state in the same
     /// transaction or through its authoritative terminal decision.
     pub fn finishActivation(txn: anytype, id: Digest, epoch: u64, snapshot: Digest, after: []const u8) !void {
-        var state = try activationState(txn, id, epoch);
+        var state = try Storage.load(txn, id);
+        if (state.owner_epoch != epoch) return error.GraphConstraintOwnerChanged;
+        const proof: ActivationProof = .{ .snapshot = snapshot, .after = after };
+        if (state.phase == .active) return requireActivationCertificate(txn, id, proof);
+        if (state.phase != .validating or state.revision != 0) return error.GraphConstraintNotReady;
         try requireActivationCursor(txn, id, snapshot, after);
+        try saveActivationCertificate(txn, id, proof);
         try txn.delete(&activationKey(id));
         state.phase = .active;
         try Storage.save(txn, state);
@@ -1443,6 +1486,10 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     const last_cursor = (try Contributions.activationCursor(alloc, &txn, existing_id, 2, versions)).?;
     defer alloc.free(last_cursor);
     try Contributions.finishActivation(&txn, existing_id, 2, versions, last_cursor);
+    try Contributions.finishActivation(&txn, existing_id, 2, versions, last_cursor);
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, Contributions.finishActivation(&txn, existing_id, 2, versions, first_cursor));
+    try std.testing.expectError(error.GraphConstraintRevisionChanged, Storage.activateNewIncarnation(&txn, existing_id, 2));
+    try Storage.activateNewIncarnation(&txn, id, epoch);
     _ = try Storage.begin(&txn, existing_id, 2, 0, testAttempt(7));
 
     try Storage.retire(&txn, id, epoch);
