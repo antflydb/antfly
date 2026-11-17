@@ -1365,8 +1365,11 @@ pub const TracingCompute = struct {
         }
         const target = Shape.init(shape.dtype, logical[0..dims.len]);
         if (target.numElements() == null or target.numElements() != shape.numElements()) return error.InvalidShape;
+        // Retention owns another handle, not another value or publication.
+        // Preserve exact donor identity so resident KV consumers share banks.
+        if (target.eq(shape)) return tc.makeHandleExact(source);
         var builder = Builder.init(tc.getGraphMut());
-        return tc.makeHandle(try builder.reshape(source, target));
+        return tc.makeHandleExact(try builder.reshape(source, target));
     }
 
     fn reshape2dOp(ctx: *anyopaque, input: CT, rows: usize, cols: usize) anyerror!CT {
@@ -2155,6 +2158,9 @@ test "model program F32 residual preserves small BF16 branch updates" {
     _ = try tracer.markOutput(residual);
     _ = try tracer.markOutput(try tracing.residualScale(residual, two));
     _ = try tracer.markOutput((try tracing.residualAddScale(residual, increment, two)).?);
+    const small = try tracing.residualAdd(one, increment);
+    _ = try tracer.markOutput((try tracing.retainImmutableTensor(small, a)).?);
+    _ = try tracer.markOutput((try tracing.cloneTensorShape(small, &.{ 1, 1 })).?);
     const native = @import("../ops/native_compute.zig");
     var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
     var compute = native.NativeCompute.init(a, &store, null);
@@ -2162,7 +2168,7 @@ test "model program F32 residual preserves small BF16 branch updates" {
     const backend = compute.computeBackend();
     var result = try @import("interpreter.zig").execute(a, tracer.getGraph(), &backend, .{});
     defer result.deinit(&backend);
-    const expected = [_]f32{ 1, 1.015625, 2.03125, 2.033203125 };
+    const expected = [_]f32{ 1, 1.015625, 2.03125, 2.033203125, 1.0009765625, 1.0009765625 };
     for (result.outputs, expected) |output, value| {
         const values = try backend.toFloat32(output, a);
         defer a.free(values);

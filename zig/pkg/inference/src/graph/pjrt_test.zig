@@ -1176,3 +1176,47 @@ test "PJRT resident decoder caches attention and recurrent history transactional
         }
     };
 }
+
+test "PJRT resident decoder retains one bank per immutable shared donor" {
+    if (comptime !build_options.enable_pjrt) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var client = try initClient();
+    defer client.deinit();
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_]bool{ false, true }) |bf16| {
+        var tracer = @import("tracing_compute.zig").TracingCompute.init(a);
+        defer tracer.deinit();
+        tracer.precision = if (bf16) .bf16 else .f32;
+        tracer.resident_decoder = true;
+        const tracing = tracer.backend();
+        var donors = try @import("../execution/forward_kv_reuse.zig").Scope.init(a, &tracing, 1, null);
+        defer donors.deinit();
+        const q = try tracing.fromFloat32Shape(&@as([8]f32, @splat(0)), &.{ 2, 4 });
+        const k = try tracing.fromFloat32Shape(&@as([4]f32, @splat(0)), &.{ 2, 2 });
+        const v = try tracing.fromFloat32Shape(&.{ 2, 4, 6, 8 }, &.{ 2, 2 });
+        var context = ops_mod.AttentionContext{ .total_sequence_len = 2, .query_sequence_len = 2, .kv_sequence_len = 2, .forward_kv_reuse = donors.context() };
+        const donor = try tracing.gqaPagedAttention(q, k, v, null, context, 1, 2, 1, 2);
+        context.skip_kv_write = true;
+        const consumer = try tracing.gqaPagedAttention(q, q, q, null, context, 1, 2, 1, 2);
+        _ = try tracer.markOutput(try tracing.add(donor, consumer));
+        var graph = tracer.extractGraph();
+        defer graph.deinit();
+        const executable = try ResidentFixture.compile(a, &graph, &cb, &client, true, bf16);
+        defer executable.partitionExecutor().deinitExecutor();
+        const inputs = try a.alloc(?CT, graph.nodeCount());
+        defer a.free(inputs);
+        @memset(inputs, null);
+        // Exactly one donor pair; retention must not create extra banks under
+        // a reshape or an otherwise redundant BF16 publication node.
+        var state = @import("pjrt_decoder_state.zig").State{ .allocator = a, .capacity = 8, .admitted_bytes = 2 * 8 * 2 * @sizeOf(f32) };
+        defer state.deinit();
+        const actual = try state.run(executable, &cb, inputs, 2, 2, a, null);
+        defer a.free(actual);
+        try std.testing.expectEqual(@as(usize, 2), state.buffers.len);
+        try std.testing.expectEqual(@as(usize, 2), state.position);
+        for ([_]f32{ 4, 8, 4, 8, 8, 12, 8, 12 }, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-5);
+    }
+}
