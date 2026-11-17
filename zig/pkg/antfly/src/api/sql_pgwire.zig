@@ -523,6 +523,130 @@ pub const CatalogRetainedStream = struct {
     catalog_resolver: CatalogReplicationPublication,
     policy: LiveReplicationPublication,
 
+    publication_worker: ?*PublicationWorker = null,
+    publication_group: std.Io.Group = .init,
+
+    const PublicationWorker = struct {
+        const upload = @import("../metadata/pg_spool_upload.zig");
+        const producer = @import("../metadata/pg_retained_transaction.zig");
+        const allocator = std.heap.smp_allocator;
+
+        host: *CatalogRetainedStream,
+        arena: std.heap.ArenaAllocator,
+        credential: Credential,
+        session: control.pg_slot.Session,
+        source: @import("history_roots.zig").Source,
+        context: operation.RequestContext,
+        canceled: std.atomic.Value(bool) = .init(false),
+        finished: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *PublicationWorker) void {
+            defer self.finished.store(true, .release);
+            self.drive() catch |err| {
+                self.failure = err;
+            };
+        }
+
+        const CleanupRegistry = struct {
+            storage: Registry,
+            policy: *LiveReplicationPublication,
+            session: control.pg_slot.Session,
+
+            pub fn artifactStore(self: CleanupRegistry, scope: control.pg_slot.spool_control.Scope, context: operation.RequestContext) !@import("../serverless/artifacts/store.zig").ArtifactStore {
+                return self.storage.artifactStore(scope, context);
+            }
+
+            pub fn authorizeCleanup(self: CleanupRegistry, state: control.State, context: operation.RequestContext) !void {
+                try self.policy.authorize(state, self.policy.expected, context);
+                const slot = state.slot orelse return error.ChangefeedResynchronizationRequired;
+                try slot.verifySession(self.session, try self.policy.nowSeconds(context));
+            }
+        };
+
+        fn drive(self: *PublicationWorker) !void {
+            const host = self.host;
+            var admission = try host.catalog_resolver.server.acquireSqlExecution(false);
+            defer admission.release();
+            const identity: ReplicationIdentity = .{ .context = &self.credential, .read = Adapter.replicationIdentity };
+            var resolver = host.catalog_resolver;
+            resolver.identity = identity;
+            var policy = host.policy;
+            policy.allocator = allocator;
+            policy.identity = identity;
+            policy.resolver = resolver.resolver();
+            const cleanup_registry: CleanupRegistry = .{ .storage = host.registry, .policy = &policy, .session = self.session };
+            const cleanup = try @import("../metadata/pg_spool_cleanup.zig").cleanup(host.service, cleanup_registry, allocator, host.id, .{}, self.context);
+            switch (cleanup.status) {
+                .checkpointed, .collected => return,
+                .idle, .waiting, .retained => {},
+            }
+            var selected: LiveReplicationPublication.Upload = .{ .owner = &policy };
+            var transaction: producer.Producer(LiveReplicationPublication.Upload) = .{
+                .policy = &selected,
+                .allocator = allocator,
+                .source = self.source,
+                .byte_limit = @import("history_page_operations.zig").pages.max_source_bytes,
+            };
+            _ = try upload.drive(host.service, host.registry, &transaction, allocator, host.id, self.session, .{ .require_shared = host.config.require_shared }, self.context);
+        }
+
+        fn deinit(self: *PublicationWorker) void {
+            std.crypto.secureZero(u8, &self.credential.verifier_mac);
+            self.arena.deinit();
+            allocator.destroy(self);
+        }
+    };
+
+    pub fn schedulePublication(self: *CatalogRetainedStream, session: control.pg_slot.Session, request_value: wire.Request) !void {
+        const source = self.catalog_resolver.server.cfg.native_history_roots orelse return;
+        // Only the native credential callback can provide an isolated
+        // verifier snapshot. Embedded replication hosts own their producer.
+        if (self.policy.identity.read != &Adapter.replicationIdentity) return;
+        const io = self.policy.io;
+        if (self.publication_worker) |previous| {
+            if (!previous.finished.load(.acquire)) return;
+            try self.publication_group.await(io);
+            const failure = previous.failure;
+            previous.deinit();
+            self.publication_worker = null;
+            if (failure) |err| switch (err) {
+                error.ChangefeedConflict, error.ChangefeedBackpressure, error.MetadataMutationOutcomeUnknown, error.ReadUnavailable, error.SqlWriteCapacityUnavailable, error.DeadlineExceeded, error.Canceled, error.Cancelled => {},
+                else => return err,
+            };
+        }
+        var context = try Bridge.metadataContext(request_value);
+        const worker = try PublicationWorker.allocator.create(PublicationWorker);
+        errdefer PublicationWorker.allocator.destroy(worker);
+        worker.arena = std.heap.ArenaAllocator.init(PublicationWorker.allocator);
+        errdefer worker.arena.deinit();
+        const a = worker.arena.allocator();
+        const credential: *Credential = @ptrCast(@alignCast(self.policy.identity.context));
+        try credential.validate();
+        worker.credential = credential.*;
+        errdefer std.crypto.secureZero(u8, &worker.credential.verifier_mac);
+        worker.credential.username = try a.dupe(u8, credential.username);
+        worker.credential.principal = try a.dupe(u8, credential.principal);
+        worker.credential.trusted_identity = try http.cloneCatalogIdentity(a, credential.trusted_identity);
+        worker.credential.trusted_issuer = if (credential.trusted_issuer) |issuer| try a.dupe(u8, issuer) else null;
+        worker.host = self;
+        worker.source = source;
+        worker.session = session;
+        worker.finished = .init(false);
+        worker.canceled = .init(false);
+        worker.failure = null;
+        // The CopyBoth callback has a short transport budget. Artifact I/O
+        // has its own bounded deadline and is canceled when the stream closes.
+        context.deadline_ns = @import("antfly_platform").time.monotonicNs() +| 15 * std.time.ns_per_s;
+        context.cancellation = operation.CancellationToken.fromAtomic(&worker.canceled);
+        worker.context = context;
+        self.publication_group.concurrent(io, PublicationWorker.run, .{worker}) catch {
+            worker.deinit();
+            return;
+        };
+        self.publication_worker = worker;
+    }
+
     pub fn open(slots: CatalogReplicationSlots, registry: Registry, config: retained.Config, a: std.mem.Allocator, start: wire.replication_commands.Start, request_value: wire.Request) !wire.ReplicationStream {
         const context = try Bridge.metadataContext(request_value);
         const service = if (slots.server.source.changefeeds) |*port| port else return error.UnsupportedReplicationMode;
@@ -554,6 +678,8 @@ pub const CatalogRetainedStream = struct {
         self.id = state.value.id;
         self.actor = actor;
         self.config = config;
+        self.publication_worker = null;
+        self.publication_group = .init;
         self.policy = .{ .allocator = retained_alloc, .io = request_value.io, .identity = slots.identity, .resolver = self.catalog_resolver.resolver(), .expected = expected };
         return Bridge.Bridge(CatalogRetainedStream).open(self, a, request_value, start);
     }
@@ -588,6 +714,12 @@ pub const CatalogRetainedStream = struct {
     }
 
     pub fn closed(self: *CatalogRetainedStream, owner: *retained.Owner) void {
+        if (self.publication_worker) |worker| {
+            worker.canceled.store(true, .release);
+            self.publication_group.cancel(self.policy.io);
+            worker.deinit();
+            self.publication_worker = null;
+        }
         owner.release(self.service, self, self.allocator, closeContext()) catch |err| {
             std.log.warn("logical slot lease release deferred: {s}", .{@errorName(err)});
         };

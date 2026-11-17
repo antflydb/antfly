@@ -69,6 +69,8 @@ pub fn Bridge(comptime Host: type) type {
         fn poll(raw: *anyopaque, a: std.mem.Allocator, request: backend.Request, after: backend.pgoutput.Lsn, maximum: u32) !backend.ReplicationPoll {
             const self: *Self = @ptrCast(@alignCast(raw));
             if (self.pages != 0) return error.InvalidResult;
+            if (comptime @hasDecl(Host, "schedulePublication"))
+                try self.host.schedulePublication(self.owner.session, request);
             const req = try self.host.request(request);
             var page = try self.owner.poll(self.host.service, self.host.registry, self.host, a, @backingInt(after), maximum, req);
             defer page.deinit();
