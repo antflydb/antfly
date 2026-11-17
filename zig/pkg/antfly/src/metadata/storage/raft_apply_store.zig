@@ -15363,6 +15363,46 @@ pub const RaftApplyStore = struct {
             else => err,
         };
     }
+    /// The service establishes ReadIndex before calling. Every captured field,
+    /// including the actual applied index and activated decoder, shares one read.
+    pub fn captureSourceScope(self: *RaftApplyStore, a: std.mem.Allocator, query: @import("../source_scope_capture.zig").Query) !@import("../source_scope_capture.zig").Snapshot {
+        const capture = @import("../source_scope_capture.zig");
+        try query.validate();
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        const applied = try durableAppliedIndexTxn(&txn, query.metadata_group_id);
+        if (applied < query.minimum_applied_index) return error.ReadUnavailable;
+        var buffer: [256]u8 = undefined;
+        const incarnation_raw = txn.get(try metadataIncarnationKeyForGroup(&buffer, query.metadata_group_id)) catch |err| switch (err) {
+            error.NotFound => return error.InvalidMetadataIncarnation,
+            else => return err,
+        };
+        const incarnation = (try decodeMetadataIncarnationRecord(incarnation_raw)).incarnation;
+        if (!std.meta.eql(incarnation, query.metadata_incarnation)) return error.InvalidMetadataIncarnation;
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const activation_raw = txn.get(try topologyActivationKeyForGroup(&buffer, query.metadata_group_id)) catch |err| switch (err) {
+            error.NotFound => return error.TableTopologyProtocolUpgradeRequired,
+            else => return err,
+        };
+        var activation = try std.json.parseFromSlice(topology_protocol.Activation, temporary, activation_raw, .{ .ignore_unknown_fields = false });
+        defer activation.deinit();
+        if (!std.meta.eql(activation.value.incarnation, incarnation) or activation.value.version > topology_protocol.current_version or activation.value.member_count == 0 or std.mem.allEqual(u8, &activation.value.membership_fingerprint, 0)) return error.TableTopologyProtocolUpgradeRequired;
+        const table_raw = txn.get(try tableKeyForGroup(&buffer, query.metadata_group_id, query.actor_table_id)) catch |err| switch (err) {
+            error.NotFound => return error.SourceBindingConflict,
+            else => return err,
+        };
+        const table = try decodeTableRecord(temporary, table_raw);
+        const state_raw = txn.get(try source_control.keyForGroup(&buffer, query.metadata_group_id, query.actor_table_id, query.source_id)) catch |err| switch (err) {
+            error.NotFound => return error.SourceBindingConflict,
+            else => return err,
+        };
+        var state = try source_control.parse(temporary, state_raw);
+        defer state.deinit();
+        return capture.capture(a, query, applied, incarnation, activation.value.version, state.value, table.replication_sources_json);
+    }
+
     fn applySourceControlTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         var parsed_write = try source_control.parseWrite(self.alloc, bytes);
         defer parsed_write.deinit();
@@ -46005,4 +46045,8 @@ test "metadata source control artifact debt survives reopening and keeps table r
 
 test "metadata source control scoped lifecycle pins idle bindings through reopen and snapshot" {
     try @import("source_scope_mode_test.zig").run(std.testing.allocator);
+}
+
+test "metadata source control scope capture binds one actual applied snapshot and lifecycle phase" {
+    try @import("source_scope_capture_test.zig").run(std.testing.allocator);
 }

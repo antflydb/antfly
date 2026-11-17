@@ -4849,3 +4849,51 @@ retirement endpoints, the stronger data-Raft activation profile, real native
 closure proofs and worker/ACK integration remain required. No native ABI shape
 was changed or data-scope capability advertised by this metadata-only step.
 The full issue contracts remain active and neither issue / draft PR is complete.
+
+### Applied metadata source-scope capture and absent-scope fencing
+
+`RaftApplyStore.captureSourceScope` now reads the actual durable applied index,
+metadata incarnation, activated decoder record, actor table definition and
+source-control state from one native read transaction. It requires the caller's
+minimum applied index, exact incarnation, valid decoder-104 activation and an
+enabled native scope-fencing actor with its original checkpoint authority.
+The resulting owned capture derives the immutable native scope spec from stored
+state, records active/closing/retired phase and actor revision, copies the
+checkpoint table name, and retains pending token/sequence, transaction, purpose,
+reservation and distinct delivery/artifact commitments. No parsed state or read
+transaction buffer escapes the capture.
+
+Binding additionally requires an active actor and the live source definition;
+closing and retirement expose separate gates. `source_scope_capture.readOnService`
+establishes the service's qualified linearizable read before accessing the
+projected store, rejects metadata-group mismatches before reading, and withholds
+and frees the owned capture on cancellation. Captured facts/cuts are explicitly
+not caller-manufactured authority or a substitute for the service's ReadIndex
+and native control-owner qualification.
+
+Native `Store.closeAbsent` covers a scope whose earlier bind has not arrived.
+After independently qualified closing/retired metadata capture, it advances the
+root's monotonic metadata floor and strict policy without creating a domain
+record or consuming a domain charge. Earlier active-actor bind captures cannot
+recreate the absent scope. An existing domain takes its normal close/drain path;
+this operation cannot erase it or overwrite a newer entry.
+
+Qualification: final `source-control-test -j2` completed with exit zero
+(`source-scope-capture-final-test.log`), including all 11 metadata storage and
+discovery cases, the source model/delivery cases and decoder service checks.
+The new separate fixture projects actual committed metadata entries, verifies
+captured cuts and pending identities, rejects missing activation/future cuts/
+wrong incarnation/source, observes closing/retired gates, installs a snapshot
+and confirms the same spec, cut and phase. A service wrapper fixture verifies
+read-before-capture ordering, pre-read group/cancellation rejection and cleanup
+on cancellation after capture. Nine direct scope/checkpoint tests passed
+(`source-scope-absent-close-test.log`), including absence fencing, no domain
+allocation, queued old-bind rejection, preserving existing domains and monotonic
+floor/idempotence. Source-catalog, engine-error, OpenAPI, formatting and diff
+checks passed with zero reported skips/failures/leaks.
+
+This closes the same-snapshot metadata provenance gap below the service boundary.
+Private transport/routing, physical ordered scope control and native observation,
+legacy-source migration qualification, stronger data activation, source worker
+integration and coordinator-before-BEGIN closure retirement remain outstanding.
+The full issue goals and draft PR remain active and unfinished.

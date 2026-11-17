@@ -338,6 +338,20 @@ pub const Store = struct {
         const record = try requireRecord(a, txn, root, slot.reference.domain);
         try record.prepareAllowed(slot);
     }
+    /// A qualified closing/retired actor cut also fences an original bind that
+    /// has not arrived yet. No per-domain tombstone or budget charge is needed:
+    /// active-actor bind captures necessarily precede the closing metadata cut.
+    pub fn closeAbsent(a: std.mem.Allocator, txn: anytype, root: Basis, spec: Spec, cut: MetadataCut) !u64 {
+        try spec.validate();
+        try cut.require(root);
+        if (spec.checkpoint_owner.metadata_group_id != root.metadata_group_id or !same(spec.checkpoint_owner.metadata_incarnation, root.metadata_incarnation)) return error.SourceCheckpointConflict;
+        var header = try readHeader(a, txn, root);
+        if (try readRecord(a, txn, spec.domain()) != null) return error.SourcePendingWork;
+        header.strict = true;
+        header.metadata_floor = @max(header.metadata_floor, cut.index);
+        try writeHeader(a, txn, header);
+        return header.metadata_floor;
+    }
     pub fn close(a: std.mem.Allocator, txn: anytype, root: Basis, domain: Digest, expected_spec: Spec, cut: MetadataCut, applied: Cut) !Record {
         var record = try requireRecord(a, txn, root, domain);
         if (!same(record.spec, expected_spec)) return error.SourceCheckpointConflict;
@@ -517,4 +531,30 @@ test "scope store persists drain and retirement floor across reloads" {
     try std.testing.expectError(error.SourceCheckpointConflict, Store.enter(a, &txn, root, slot, root));
     cut.index = 10;
     try std.testing.expectError(error.SourceCheckpointConflict, Store.bind(a, &txn, root, spec, cut));
+}
+
+test "scope absent closure fences queued old binding without allocating domain tombstones" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var txn: TestTxn = .{};
+    defer txn.deinit();
+    const root: Basis = .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".*, .namespace = @splat(1), .root_generation = 0, .group_id = 2 };
+    const spec: Spec = .{ .actor_table_id = 3, .source_id = @splat(4), .generation = 1, .binding = @splat(5), .checkpoint_owner = root };
+    const closing: MetadataCut = .{ .group_id = 1, .incarnation = root.metadata_incarnation, .index = 11 };
+    try std.testing.expectEqual(@as(u64, 11), try Store.closeAbsent(a, &txn, root, spec, closing));
+    try std.testing.expectEqual(@as(usize, 1), txn.map.count());
+    const header = try Store.readHeader(a, &txn, root);
+    try std.testing.expect(header.strict);
+    try std.testing.expectEqual(@as(u16, 0), header.domains);
+    try std.testing.expect((try Store.readRecord(a, &txn, spec.domain())) == null);
+    var old = closing;
+    old.index = 10;
+    try std.testing.expectError(error.SourceCheckpointConflict, Store.bind(a, &txn, root, spec, old));
+    var another = spec;
+    another.source_id = @splat(6);
+    _ = try Store.bind(a, &txn, root, another, closing);
+    try std.testing.expectError(error.SourcePendingWork, Store.closeAbsent(a, &txn, root, another, closing));
+    try std.testing.expectEqual(@as(u64, 11), try Store.closeAbsent(a, &txn, root, spec, old));
+    try std.testing.expectEqual(@as(u16, 1), (try Store.readHeader(a, &txn, root)).domains);
 }
