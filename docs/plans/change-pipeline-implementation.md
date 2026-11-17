@@ -7574,3 +7574,10 @@ progression, legacy prepared intent retention, digest equality, terminal v5
 unknown-resolution inclusion and modern unresolved-terminal inclusion. The
 existing closed ingress still rejects attempted ABORT and retains its intent.
 Whitespace checks passed. No drainage or full issue completion is claimed.
+
+A final cursor audit found that starting at prefix+zero could bypass malformed
+short keys sorting before every complete transaction ID. Initial discovery now
+seeks the record prefix itself; continuation still resumes strictly after the
+last full ID. An injected short-prefix record fails closed. The complete 17-case
+store/history suite passed again, zero skips/failures/leaks
+(`source-legacy-recovery-inventory-key-test.log`); whitespace checks passed.

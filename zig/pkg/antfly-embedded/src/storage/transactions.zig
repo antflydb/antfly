@@ -1682,7 +1682,7 @@ pub const TxnManager = struct {
         var bytes: usize = 0;
         var last = after;
         const start = if (after) |id| makeRecordKey(id) else makeRecordKey(@splat(0));
-        var entry = try cursor.seekAtOrAfter(&start);
+        var entry = try cursor.seekAtOrAfter(if (after != null) &start else records_prefix);
         if (after != null) if (entry) |kv| {
             if (std.mem.eql(u8, kv.key, &start)) entry = try cursor.next();
         };
@@ -6777,5 +6777,10 @@ test "transaction source purpose closed legacy recovery inventory is bounded and
     try std.testing.expectEqual(@as(usize, 4), all.items.len);
     try std.testing.expectEqual(@as(u64, 7), all.closure.first_closed_at.index);
     try manager.putValue(&makeRecordKey(@splat(3)), "corrupt");
+    try std.testing.expectError(error.InvalidTxnRecord, manager.legacyRecoveryPage(a, root, null, 256));
+    try manager.putValue(&makeRecordKey(@splat(3)), raw);
+    // A malformed short key sorts before every full transaction ID. The
+    // initial cursor must inspect the prefix itself rather than prefix+zero.
+    try manager.putValue(records_prefix, raw);
     try std.testing.expectError(error.InvalidTxnRecord, manager.legacyRecoveryPage(a, root, null, 256));
 }
