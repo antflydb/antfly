@@ -26084,6 +26084,19 @@ pub const DB = struct {
         return .{ .root = query.root, .cut = position, .quota = try source_plan_control.storage.readQuota(txn, query.root), .status = if (query.spec) |spec| try source_plan_control.storage.inspect(self.alloc, txn, query.root, spec) else null };
     }
 
+    /// The serving owner establishes and revalidates ReadIndex and the complete
+    /// catalog owner. Native identity, real apply cut and registry share a read.
+    pub fn sourceScopeObservation(self: *DB, query: @import("../source_scope_control.zig").Query) !@import("../source_scope_control.zig").Observation {
+        if (comptime storage_engine.enabled) return storage_engine.call("sourceScopeObservation", .{ self, query });
+        try query.validate();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = query.owner.namespace, .generation = query.owner.root_generation, .fence = query.owner.digest() });
+        const cut = try orderedHistoryReadCut(&txn, query.minimum_applied_index);
+        return @import("../source_scope_control.zig").observe(self.alloc, &txn, query, .{ .term = cut.term, .index = cut.index });
+    }
+
     /// Serving Raft owners establish ReadIndex before this snapshot is opened.
     /// A native root may return sequence zero before its first staging write.
     /// The serving owner establishes and revalidates ReadIndex and the full

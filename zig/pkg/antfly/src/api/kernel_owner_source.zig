@@ -1823,10 +1823,11 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     const source_plan_http = @import("../data/source_plan_http_wire.zig");
-    const SourcePlanReadKind = enum { observation, chunk, outcome, checkpoint };
+    const SourcePlanReadKind = enum { observation, chunk, outcome, checkpoint, scope };
     fn SourcePlanReadInput(comptime kind: SourcePlanReadKind) type {
         return switch (kind) {
             .observation => source_plan_http.ObserveRequest,
+            .scope => @import("antfly_local_sources").storage_source_scope_control.Query,
             .checkpoint => @import("antfly_local_sources").storage_source_checkpoint_read.Request,
             .chunk => source_plan_http.ChunkRequest,
             .outcome => source_plan_http.ControlRequest,
@@ -1835,10 +1836,14 @@ pub const ProvisionedKernelOwnerSource = struct {
     fn SourcePlanReadResult(comptime kind: SourcePlanReadKind) type {
         return switch (kind) {
             .observation => source_plan_http.control.Observation,
+            .scope => @import("antfly_local_sources").storage_source_scope_control.Observation,
             .checkpoint => @import("antfly_local_sources").storage_source_checkpoint_read.Reply,
             .chunk => source_plan_http.control.Read,
             .outcome => source_plan_http.control.Outcome,
         };
+    }
+    pub fn sourceScopeObservationRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_scope_control.Query) !@import("antfly_local_sources").storage_source_scope_control.Observation {
+        return self.sourcePlanReadRouted(a, fence, table, .scope, request);
     }
     pub fn sourceCheckpointObservationRouted(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").storage_source_checkpoint_read.Request) !@import("antfly_local_sources").storage_source_checkpoint_read.Reply {
         return self.sourcePlanReadRouted(a, fence, table, .checkpoint, request);
@@ -1858,7 +1863,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             try request.validate(a);
             if (request.operation != .recover) return error.InvalidSourcePlanWire;
         } else try request.validate();
-        const expected = request.source_owner;
+        const expected = if (kind == .scope) request.owner else request.source_owner;
         const group = fence.route.group_id;
         if (expected.group_id != group) return error.TopologyChanged;
         const context = try platformDeadlineContext(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
@@ -1876,7 +1881,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (proof.incarnation == 0 or proof.term == 0 or proof.applied_index == 0) return error.ReadUnavailable;
         const minimum = switch (kind) {
             .observation => request.query.minimum_applied_index,
-            .checkpoint => request.minimum_applied_index,
+            .checkpoint, .scope => request.minimum_applied_index,
             .chunk => request.request.query.minimum_applied_index,
             .outcome => request.receipt.?.index,
         };
@@ -1889,6 +1894,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.validateRoutedRead(a, fence, group, table);
         const result = switch (kind) {
             .observation => try lease.owner().sourcePlanObservation(a, table, request.query),
+            .scope => try lease.owner().sourceScopeObservation(a, table, request),
             .checkpoint => try lease.owner().sourceCheckpointObservation(a, table, request),
             .chunk => try lease.owner().sourcePlanChunk(a, table, request.request),
             .outcome => try lease.owner().sourcePlanOutcome(a, table, .{ .command = request.command, .entry = request.receipt.?, .minimum_applied_index = minimum }),

@@ -4972,3 +4972,35 @@ completed successfully, including nine schema-fragment tests. An initial fixture
 parameter shadowing error was corrected before the final green run. Native owner,
 ordered apply, RPC integration and actual legacy-drain qualification remain the
 next required integration work; this is not a completed production feature.
+
+### Native scope observation across the compiled owner boundary
+
+The native DB, compiled storage-engine VTable, opaque storage-owner C ABI and
+client now expose `sourceScopeObservation`. The native owner validates physical
+namespace/generation and durable Raft authority, then reads actual applied cut,
+registry header and requested domain record from one read transaction. The routed
+owner wrapper establishes/revalidates leader ReadIndex and complete catalog owner
+before and after that read. Engine descriptor is now 56 and storage-owner ABI 109;
+API kernel ABI remains 29 and the data decoder maximum remains 39. This read does
+not advertise a new mutating scope envelope, a legacy drain gate or standalone
+native sequence semantics.
+
+Validation: the final recovered `history-control-apply-test` exited 0, all 13 tests
+passed with zero skips/failures/leaks (`source-scope-owner-native-recovered-test.log`).
+The real native/Raft fixture observes absence on a legacy root without enabling
+strict mode, repeats that qualified read, rejects a changed original root,
+withholds a requested future cut and honors cancellation. A bounded fixture retry
+handles only transient `ReadUnavailable` from the real ReadIndex try-lock; future
+cut refusal is still checked as `StorageReadTemporarilyUnavailable`. The initial
+fixture incorrectly selected the forwarding node's nonexistent storage owner;
+that was corrected to pass the actual native owner explicitly. An intervening
+build lost cached libc/object files; a normal regenerated build restored them
+and passed. Existing source-catalog, engine-error and OpenAPI contract checks had
+already exited 0 for the native changes.
+
+Still required: actual bound/closing scope observations through ordered controls,
+private HTTP observation transport (an unreferenced ingress adapter draft is not
+that integration), qualified metadata lifecycle transport and real first-bind
+worker handover, original-coordinator retirement transport, all root lifecycle
+coverage and the rest of the full issue scope. The above is native read
+qualification, not complete destination or changefeed qualification.

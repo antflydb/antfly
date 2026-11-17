@@ -44899,7 +44899,7 @@ fn consumerTests() type {
                     try std.testing.expectEqual(@as(usize, 2), late_fence.validations);
                 }
                 const SourceCompletion = struct {
-                    noinline fn run(source_alloc: std.mem.Allocator, origin_server: *DataServer, source_binding: @import("../api/completion_plan.zig").completion.RoutedOwner, source_fence: antfly.metadata_api.CatalogRouteFence, source_participant: @import("../api/completion_participant.zig").Port) !void {
+                    noinline fn run(source_alloc: std.mem.Allocator, origin_server: *DataServer, source_binding: @import("../api/completion_plan.zig").completion.RoutedOwner, source_fence: antfly.metadata_api.CatalogRouteFence, source_participant: @import("../api/completion_participant.zig").Port, native_owner: anytype) !void {
                         const source_plans = @import("../api/completion_plan.zig");
                         const source_native_types = antfly.db.types;
                         const source_id: [16]u8 = @splat(116);
@@ -44959,10 +44959,11 @@ fn consumerTests() type {
                         }
                         origin_server.remote_metadata.?.control_read_generation_at_ms = origin_server.remote_metadata.?.awakeMs();
                         try @import("../api/source_checkpoint_native_test.zig").verify(source_alloc, origin_server.sourceCheckpointObservationPort(), source_fence, .{ .version = 1, .source_owner = source_binding, .transaction_id = source_id, .command = source_prepare.transaction.?.prepare.source_checkpoint.?, .minimum_applied_index = 1 });
+                        try @import("../api/source_scope_native_test.zig").verify(source_alloc, native_owner, source_fence, source_binding);
                     }
                 };
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
-                try SourceCompletion.run(a, origin, current_owner, route.fence().?, remote_participant);
+                try SourceCompletion.run(a, origin, current_owner, route.fence().?, remote_participant, server.kernel_owner_source.?);
                 const HostedAdmission = struct {
                     noinline fn run(alloc: std.mem.Allocator, endpoint_uri: []const u8, source_catalog: antfly.public_api.table_catalog.CatalogSource, executor: antfly.common.http.RequestExecutor, root_path: []const u8, credential: []const u8) !void {
                         const Router = struct {
