@@ -3073,24 +3073,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         budget: table_catalog.RoutingBudget,
     ) !LoadedDescriptor {
-        return self.loadDescriptorFromCatalog(alloc, group_id, table_name, budget, self.catalog);
+        return self.loadDescriptorForAdmission(alloc, group_id, table_name, budget, false);
     }
 
-    fn loadDescriptorFromCatalog(
+    fn loadDescriptorForAdmission(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
         budget: table_catalog.RoutingBudget,
-        catalog: table_catalog.CatalogSource,
+        refresh: bool,
     ) !LoadedDescriptor {
-        var projection = (try table_catalog.tableGroupDescriptorProjectionControlled(
-            alloc,
-            catalog,
-            table_name,
-            group_id,
-            budget,
-        )) orelse return error.TableNotFound;
+        var projection = (if (refresh)
+            try table_catalog.refreshTableGroupDescriptor(alloc, self.catalog, table_name, group_id, budget)
+        else
+            try table_catalog.tableGroupDescriptorProjectionControlled(alloc, self.catalog, table_name, group_id, budget)) orelse return error.TableNotFound;
         errdefer projection.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         return .{
@@ -3159,11 +3156,9 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !Lease {
         try controls.check();
         const budget = controls.catalogBudget(self.catalog);
-        var catalog = self.catalog;
-        var refreshed_vtable = self.catalog.vtable.*;
         var refreshed = false;
         while (true) {
-            var descriptor = try self.loadDescriptorFromCatalog(self.alloc, group_id, table_name, budget, catalog);
+            var descriptor = try self.loadDescriptorForAdmission(self.alloc, group_id, table_name, budget, refreshed);
             defer descriptor.deinit(self.alloc);
             try controls.check();
             return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, descriptor.readControls(controls)) catch |err| {
@@ -3171,8 +3166,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 // Nothing has reached the owner. Refresh the rejected physical
                 // contract once through its authoritative point projection;
                 // never replay a storage operation or reset the request budget.
-                refreshed_vtable.table_routing_snapshot = self.catalog.vtable.linearizable_table_routing_snapshot orelse return err;
-                catalog.vtable = &refreshed_vtable;
+                if (self.catalog.vtable.linearizable_table_routing_snapshot == null) return err;
                 refreshed = true;
                 continue;
             };
@@ -7890,6 +7884,7 @@ test "owner descriptor admission refreshes stale point captures once before exec
         captures: usize = 0,
         confirmations: usize = 0,
         keep_stale: bool = false,
+        missing: bool = false,
         cancel: bool = false,
         canceled: std.atomic.Value(bool) = .init(false),
         const old_tables = [_]@import("../metadata/table_manager.zig").TableRecord{.{ .table_id = 1, .name = "docs", .schema_json = "{}", .indexes_json = "{\"old\":{}}" }};
@@ -7907,7 +7902,9 @@ test "owner descriptor admission refreshes stale point captures once before exec
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.confirmations += 1;
             if (self.cancel) self.canceled.store(true, .release);
-            return snapshot(if (self.keep_stale) 41 else 42, !self.keep_stale);
+            var result = snapshot(if (self.keep_stale) 41 else 42, !self.keep_stale);
+            if (self.missing) result.ranges = &.{};
+            return result;
         }
         fn freeRouting(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
         fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
@@ -7915,8 +7912,8 @@ test "owner descriptor admission refreshes stale point captures once before exec
         }
         fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
-    for (0..3) |mode| {
-        var fixture: Fixture = .{ .keep_stale = mode == 1, .cancel = mode == 2 };
+    for (0..4) |mode| {
+        var fixture: Fixture = .{ .keep_stale = mode == 1, .cancel = mode == 2, .missing = mode == 3 };
         var source = Source.init(std.testing.allocator, "/unused", .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .table_routing_snapshot = Fixture.capture, .linearizable_table_routing_snapshot = Fixture.confirm, .free_routing_snapshot = Fixture.freeRouting } }, read_gate.alreadyReadSafeBarrier());
         defer source.entries.deinit(std.testing.allocator);
         defer source.physical_catalogs.deinit(std.testing.allocator);
@@ -7944,7 +7941,7 @@ test "owner descriptor admission refreshes stale point captures once before exec
             defer lease.deinit();
             try std.testing.expect(lease.entry == &entry);
         } else {
-            try std.testing.expectError(if (mode == 1) error.StorageKernelOwnerStaleDescriptor else error.Canceled, source.acquireWithControls(2, "docs", controls));
+            try std.testing.expectError(if (mode == 1) error.StorageKernelOwnerStaleDescriptor else if (mode == 2) error.Canceled else error.TableNotFound, source.acquireWithControls(2, "docs", controls));
         }
         try std.testing.expectEqual(@as(usize, 1), fixture.captures);
         try std.testing.expectEqual(@as(usize, 1), fixture.confirmations);

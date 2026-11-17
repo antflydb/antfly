@@ -61,7 +61,8 @@ def _wait_for_native_indexes_ready(raw, call, debug_logs, name, text, after=None
         )
         return response
 
-    probe()
+    if after is not None:
+        probe()
     while True:
         # Pending queries can hold coherent-read admission for seconds.
         # Poll published readiness while the owner builds, then confirm

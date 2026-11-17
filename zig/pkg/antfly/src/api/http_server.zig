@@ -19651,16 +19651,32 @@ pub const ApiHttpServer = struct {
                 },
             };
             trace.enter(.cohort_preparation);
+            var freeze_retry_ms: u32 = 25;
             while (true) {
-                switch (cohort_session.?.prepareSlice() catch |err| return trace.internal(err) catch |zig017_err| {
-                    zig017_return_error = zig017_err;
-                    return zig017_err;
-                }) {
-                    .ready => break,
-                    .advanced => {},
-                    .waiting => backup_io.sleep(.fromMilliseconds(10), .awake) catch |err| return trace.internal(err) catch |zig017_err| {
+                if (lease_heartbeat.lost.load(.acquire))
+                    return trace.internal(error.BackupAttemptLeaseLost) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
+                    };
+                const preparation = cohort_session.?.prepareSlice() catch |err| return trace.internal(err) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                };
+                switch (preparation) {
+                    .ready => break,
+                    .advanced => freeze_retry_ms = 25,
+                    .waiting, .waiting_for_producers => {
+                        const delay_ms: u32 = if (preparation == .waiting_for_producers) freeze_retry_ms else 10;
+                        const remaining_ms = operation_request.remainingTimeoutMs() catch |err| return trace.internal(err) catch |zig017_err| {
+                            zig017_return_error = zig017_err;
+                            return zig017_err;
+                        };
+                        const sleep_ns = @as(u64, @min(delay_ms, remaining_ms orelse delay_ms)) * std.time.ns_per_ms;
+                        sleepNsCancellable(backup_io, sleep_ns, operation_request.cancellation) catch |err| return trace.internal(err) catch |zig017_err| {
+                            zig017_return_error = zig017_err;
+                            return zig017_err;
+                        };
+                        if (preparation == .waiting_for_producers) freeze_retry_ms = @min(250, freeze_retry_ms * 2);
                     },
                 }
             }

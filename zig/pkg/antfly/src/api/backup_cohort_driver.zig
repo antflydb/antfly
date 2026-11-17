@@ -192,7 +192,7 @@ pub fn Session(comptime Source: type) type {
             };
         }
 
-        pub const Preparation = enum { advanced, waiting, ready };
+        pub const Preparation = enum { advanced, waiting, waiting_for_producers, ready };
 
         // Recovery may retry failed actions frequently. Keep diagnostics
         // process-bounded, and never log row data or repository credentials.
@@ -216,7 +216,7 @@ pub fn Session(comptime Source: type) type {
                         // Producer-bearing owners drain pending publication
                         // before installing the freeze. Keep this durable
                         // phase and its exact idempotent fence while they do.
-                        error.IntegrityTopologyBusy => return .waiting,
+                        error.IntegrityTopologyBusy => return .waiting_for_producers,
                         else => return err,
                     };
                     try self.next(.draining, null);
@@ -324,7 +324,7 @@ test "backup cohort admission waits for producer drain without advancing or repl
     write_vtable.batch = Fake.batch;
     var session: Session(*Fake) = .{ .alloc = a, .source = &fake, .read = undefined, .write = .{ .ptr = &fake, .vtable = &write_vtable }, .request = .{}, .parsed = try std.json.parseFromSlice(cohort.Job, a, json, .{}), .seal_capacity = &.{}, .plan_digest = @splat(4) };
     defer session.deinit();
-    try std.testing.expectEqual(.waiting, try session.prepareSlice());
+    try std.testing.expectEqual(.waiting_for_producers, try session.prepareSlice());
     try std.testing.expectEqual(@as(u64, 1), session.parsed.value.revision);
     try std.testing.expectEqual(.freezing, session.parsed.value.state.phase);
     try std.testing.expectEqual(@as(usize, 0), fake.checkpoints);
