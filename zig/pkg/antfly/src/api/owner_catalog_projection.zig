@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Immutable physical catalog cuts retained at descriptor admission. Exact raw
+//! Immutable physical catalog cuts retained after owner admission. Exact raw
 //! bytes are the cache key: progress changes can reuse an owner, but no semantic
 //! or unknown field can be hidden by a digest collision or stale observation.
 const std = @import("std");
@@ -92,23 +92,29 @@ pub const Cache = struct {
         errdefer if (physical) |bytes| alloc.free(bytes);
         const fresh = try alloc.create(Entry);
         fresh.* = .{ .alloc = alloc, .group = group, .raw = raw_copy, .physical = physical };
-        // A contended cache is optional. Return an independently owned cut
-        // instead of blocking the committed-entry progress driver.
-        if (!self.mutex.tryLock()) return fresh.lease();
-        if (self.findLocked(group, raw)) |hit| {
-            hit.retain();
+        // Cold cuts belong only to the caller until owner admission succeeds.
+        // Failed or cancelled acquisition cannot grow retained cache state.
+        return fresh.lease();
+    }
+
+    /// Called only after successful admission, while the owner registry is
+    /// locked. Retirement uses that same registry lock before forget(), so a
+    /// late cold caller cannot resurrect a retired group's cache membership.
+    /// Cache admission is optional and must not fail the admitted operation.
+    pub fn retainAdmitted(self: *Cache, alloc: std.mem.Allocator, lease: *const Lease) void {
+        const fresh = lease.entry orelse return;
+        if (!self.mutex.tryLock()) return;
+        const previous = self.entries.get(fresh.group);
+        if (previous == fresh) {
             self.mutex.unlock();
-            fresh.release();
-            return hit.lease();
+            return;
         }
-        const previous = self.entries.get(group);
-        self.entries.put(alloc, group, fresh) catch {
+        self.entries.put(alloc, fresh.group, fresh) catch {
             self.mutex.unlock();
-            return fresh.lease();
+            return;
         };
-        fresh.retain(); // Cache and returned lease each own one reference.
+        fresh.retain();
         self.mutex.unlock();
         if (previous) |entry| entry.release();
-        return fresh.lease();
     }
 };
