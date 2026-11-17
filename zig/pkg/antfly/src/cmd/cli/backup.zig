@@ -212,6 +212,7 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
             cli.argumentError("unsupported backup format: {s}", .{selected_format});
         }
         const bid = opts.backup_id orelse cli.argumentError("--backup-id is required", .{});
+        if (opts.bundle_out) |output_path| try ensureExportPathAvailable(io, output_path);
         try client.backupTable(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection, .format = selected_format });
         if (opts.bundle_out) |output_path|
             try writeBundleFromLocalBackup(allocator, io, opts.location, bid, output_path);
@@ -265,6 +266,15 @@ fn validateClusterBackupResult(status: []const u8, tables: []const antfly_client
     if (!std.mem.eql(u8, expected, "completed")) return error.ClusterBackupIncomplete;
 }
 
+fn ensureExportPathAvailable(io: std.Io, output_path: []const u8) !void {
+    if (std.Io.Dir.cwd().statFile(io, output_path, .{ .follow_symlinks = false })) |_| {
+        return error.PathAlreadyExists;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+}
+
 fn writeBundleFromLocalBackup(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -272,12 +282,7 @@ fn writeBundleFromLocalBackup(
     backup_id: []const u8,
     output_path: []const u8,
 ) !void {
-    if (std.Io.Dir.cwd().statFile(io, output_path, .{})) |_| {
-        return error.PathAlreadyExists;
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
+    try ensureExportPathAvailable(io, output_path);
     const backup_root = try backups_api.parseFileLocation(location_uri);
     const local_backups = @import("antfly_local_sources").api_local_backups;
     const source_manifest_path = try backups_api.metadataPath(allocator, backup_root, backup_id);

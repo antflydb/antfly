@@ -15,6 +15,7 @@
 
 """Public CLI transfer boundaries must agree on catalogs, identities and paths."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -296,6 +297,26 @@ def test_lite_server_backup_roundtrip_under_connection_root(
             (root / "promoted").as_uri(),
         )
         expect_docs("promoted")
+        blocked_output = tmp_path / "occupied.afb"
+        blocked_output.symlink_to(tmp_path / "missing-target")
+        conflict = cli(
+            "backup",
+            "--table",
+            "from_file",
+            "--backup-id",
+            "blocked-output",
+            "--connection",
+            "bk",
+            "--location",
+            root.as_uri(),
+            "--out",
+            blocked_output,
+            "--url",
+            server.url,
+            check=False,
+        )
+        assert conflict.returncode != 0 and "PathAlreadyExists" in conflict.stderr
+        assert not (root / "blocked-output-metadata.json").exists()
         for format in ("portable", "native"):
             if format == "native":
                 alias = requests.put(
@@ -339,6 +360,13 @@ def test_lite_server_backup_roundtrip_under_connection_root(
             if format == "portable":
                 sidecar = output.with_name(output.name + ".manifest.json")
                 captured = sidecar.read_bytes()
+                report = json.loads(cli("backup", "inspect", "--input", output).stdout)
+                assert report["completeness"]["scan_complete"]
+                assert report["source"]["catalog_source"] == "companion"
+                assert (
+                    report["source"]["catalog_sha256"]
+                    == hashlib.sha256(captured).hexdigest()
+                )
                 output.unlink()
                 cli(
                     "backup",
@@ -355,6 +383,12 @@ def test_lite_server_backup_roundtrip_under_connection_root(
                 modified = json.loads(captured)
                 modified["shards"][0]["artifact_sha256"] = "0" * 64
                 sidecar.write_text(json.dumps(modified))
+                report = json.loads(cli("backup", "inspect", "--input", output).stdout)
+                assert not report["completeness"]["scan_complete"]
+                assert (
+                    report["completeness"]["failure_code"]
+                    == "artifact_integrity_mismatch"
+                )
                 failure = cli(
                     "restore",
                     "--input",

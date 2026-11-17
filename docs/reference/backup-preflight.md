@@ -29,6 +29,10 @@ connection and catalog-scope flags are not accepted. The draft
 - `report_version` and `inspector_version` identify the contract and analysis.
 - `source` contains representation, format version, bytes, and SHA-256 of the
   original input. The digest is published only after a complete stable scan.
+  For portable input, `source.catalog_source` identifies the archive or its
+  verified companion manifest. `source.catalog_sha256` binds the exact
+  companion bytes used in the assessment. A companion must agree with the
+  archive size and digest or the report is incomplete.
 - `completeness` distinguishes traversal, dependency analysis, and dependency
   counts. Unknown expressions make analysis and dependency counts incomplete.
   Source failures have a stable `failure_code`, not a raw exception or path.

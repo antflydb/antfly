@@ -115,6 +115,7 @@ pub fn inspectInputJsonAllocWithLiteInspector(allocator: Allocator, input_path: 
             error.SourceFileChanged => "source_changed",
             error.WriterLocked => "source_busy",
             error.BackupBaseRequired => "base_required",
+            error.BackupArtifactIntegrityMismatch => "artifact_integrity_mismatch",
             error.UnsupportedLiteInspectionLayout, error.StandaloneLiteCatalogRequiresApi => "unsupported_lite_layout",
             error.UnsupportedReplicationInspection => "unsupported_replication_source",
             else => "input_uninspectable",
@@ -198,7 +199,14 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
         }
         if (!native) {
             report.format = "portable";
-            _ = try inspectPortableCatalogs(allocator, io, source, options, report, .{});
+            var companion = try readPortableCompanion(allocator, input_path, initial.size, &digest, &report.catalog_sha256);
+            defer if (companion) |*manifest| manifest.deinit(allocator);
+            report.catalog_source = if (companion != null) "companion" else "archive";
+            const catalogs: InspectionCatalogs = if (companion) |manifest|
+                .{ .indexes_json = manifest.indexes_json, .replication_sources_json = manifest.replication_sources_json }
+            else
+                .{};
+            _ = try inspectPortableCatalogs(allocator, io, source, options, report, catalogs);
         }
     } else return error.InvalidMagic;
     if (!backups_api.localArtifactStatsEqual(initial, try source.stat(io))) return error.SourceFileChanged;
@@ -628,15 +636,13 @@ fn stagePortableFile(
     };
 }
 
-/// Server exports carry the original table manifest alongside the portable
-/// payload. Match the exact captured shard before using its public catalog.
-fn detachedPortableManifest(
+/// Verify the companion against the exact portable bytes inspected or staged.
+fn readPortableCompanion(
     allocator: Allocator,
     path: []const u8,
-    table_name: []const u8,
-    backup_id: []const u8,
-    snapshot_path: []const u8,
-    integrity: backups_api.ArtifactIntegrity,
+    size_bytes: u64,
+    sha256: []const u8,
+    companion_digest: ?*?preflight.Digest,
 ) !?backups_api.TableBackupManifest {
     const manifest_path = try std.fmt.allocPrint(allocator, "{s}.manifest.json", .{path});
     defer allocator.free(manifest_path);
@@ -651,10 +657,24 @@ fn detachedPortableManifest(
     var manifest = try backups_api.parseTableBackupManifest(allocator, bytes, header.value.backup_id);
     errdefer manifest.deinit(allocator);
     if (manifest.format != .portable or manifest.shards.len != 1) return error.BackupArtifactFormatMismatch;
-    const shard = &@constCast(manifest.shards)[0];
-    if (shard.artifact_size_bytes != integrity.size_bytes or !std.mem.eql(u8, shard.artifact_sha256, integrity.sha256))
+    const shard = manifest.shards[0];
+    if (shard.artifact_size_bytes != size_bytes or !std.mem.eql(u8, shard.artifact_sha256, sha256))
         return error.BackupArtifactIntegrityMismatch;
+    if (companion_digest) |output| output.* = preflight.hash(bytes);
+    return manifest;
+}
 
+fn detachedPortableManifest(
+    allocator: Allocator,
+    path: []const u8,
+    table_name: []const u8,
+    backup_id: []const u8,
+    snapshot_path: []const u8,
+    integrity: backups_api.ArtifactIntegrity,
+) !?backups_api.TableBackupManifest {
+    var manifest = (try readPortableCompanion(allocator, path, integrity.size_bytes, integrity.sha256, null)) orelse return null;
+    errdefer manifest.deinit(allocator);
+    const shard = &@constCast(manifest.shards)[0];
     const owned_table = try allocator.dupe(u8, table_name);
     errdefer allocator.free(owned_table);
     const owned_id = try allocator.dupe(u8, backup_id);

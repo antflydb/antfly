@@ -11288,13 +11288,38 @@ pub fn findClusterTable(
     manifest: *const ClusterBackupManifest,
     table_name: []const u8,
 ) ?*const ClusterTableBackupEntry {
+    const domain = @import("antfly_local_sources").system_catalog_domain;
+    const explicit_target = if (std.mem.startsWith(u8, table_name, domain.target_key_prefix))
+        domain.Target.parse(table_name) catch return null
+    else
+        null;
+    var match: ?*const ClusterTableBackupEntry = null;
     for (manifest.tables) |*table| {
-        if (std.mem.eql(u8, table.name, table_name)) return table;
-        if (table.catalog_target) |target| {
-            if (target.isDefault() and std.mem.eql(u8, target.table, table_name)) return table;
-        }
+        const matches = std.mem.eql(u8, table.name, table_name) or if (table.catalog_target) |target|
+            if (explicit_target) |explicit|
+                std.mem.eql(u8, target.database, explicit.database) and std.mem.eql(u8, target.namespace, explicit.namespace) and std.mem.eql(u8, target.table, explicit.table)
+            else if (target.isDefault())
+                std.mem.eql(u8, target.table, table_name)
+            else
+                clusterBackupDisplayNameMatches(target, table_name)
+        else
+            false;
+        if (!matches) continue;
+        // Dotted public display names can collide with literal names or
+        // another display name. The caller must use an exact identity then.
+        if (match != null) return null;
+        match = table;
     }
-    return null;
+    return match;
+}
+
+fn clusterBackupDisplayNameMatches(target: @import("antfly_local_sources").system_catalog_domain.Target, name: []const u8) bool {
+    var rest = name;
+    for ([_][]const u8{ target.database, target.namespace }) |part| {
+        if (rest.len <= part.len or !std.mem.startsWith(u8, rest, part) or rest[part.len] != '.') return false;
+        rest = rest[part.len + 1 ..];
+    }
+    return std.mem.eql(u8, target.table, rest);
 }
 
 pub const createTableRequestFromManifest = @import("antfly_local_sources").api_local_backups.createTableRequestFromManifest;

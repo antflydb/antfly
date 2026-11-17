@@ -93,6 +93,8 @@ pub const Report = struct {
     format_version: u32 = 0,
     source_sha256: ?Digest = null,
     source_bytes: u64 = 0,
+    catalog_source: ?[]const u8 = null,
+    catalog_sha256: ?Digest = null,
     scan_complete: bool = false,
     analysis_complete: bool = true,
     counts_complete: bool = false,
@@ -167,7 +169,7 @@ pub const Report = struct {
         return std.json.Stringify.valueAlloc(self.allocator, .{
             .report_version = report_version,
             .inspector_version = inspector_version,
-            .source = .{ .format = self.format, .format_version = self.format_version, .size_bytes = self.source_bytes, .sha256 = if (self.source_sha256) |*d| d[0..] else null },
+            .source = .{ .catalog_source = self.catalog_source, .catalog_sha256 = if (self.catalog_sha256) |*d| d[0..] else null, .format = self.format, .format_version = self.format_version, .size_bytes = self.source_bytes, .sha256 = if (self.source_sha256) |*d| d[0..] else null },
             .completeness = .{ .scan_complete = self.scan_complete, .dependency_analysis_complete = self.analysis_complete, .counts_complete = self.counts_complete, .failure_code = self.failure_code },
             .inventory = .{ .documents = self.documents, .metadata_records = self.metadata_records, .artifact_records = self.artifact_records, .shards = self.shards, .requirements = self.requirements.items },
             .destination = .{ .capabilities_sha256 = if (dest_digest) |*d| d[0..] else null, .supplied = destination != null },

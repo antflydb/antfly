@@ -407,6 +407,7 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
             backup_id="catalog-cluster",
             location=location,
             restore_mode="fail_if_exists",
+            table_names=[literal, f"{database}.public.{literal}"],
         )
         assert restored["committed_table_count"] == 2
         for index, path in enumerate(paths):
