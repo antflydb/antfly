@@ -5038,3 +5038,35 @@ bootstrap/exported snapshot, slots and bounded retention, typed pgoutput, schema
 history, publication, privacy, reconnect, root lifecycle, server/node/HA failures
 and inbound-to-Native/Lake-to-outbound pipelines. Those remain mandatory scope;
 the PostgreSQL baseline is an independent control, not a replacement for them.
+
+### Authenticated native scope observation RPC
+
+The private `/groups/{group_id}/tables/{table_name}/source-scope/observe-v1` path now
+runs through a typed callback port, internal-service authentication, immutable
+catalog route qualification, bounded HTTP client/handler, eligible-leader routing,
+and the existing native ReadIndex wrapper. Request and reply limits are 8 KiB;
+strict reply decoding validates original owner/domain/minimum cut and all durable
+registry invariants. Missing route acknowledgement, wrong media type, an outcome
+ambiguity marker, corrupt or oversized reply and lost transport all fail without
+producing an observation. Reads have no mutation retry/replay authority.
+
+API kernel ABI is now 30 because its configuration includes the new callback;
+engine descriptor 56, storage-owner ABI 109 and data decoder maximum 39 are
+unchanged. Production data server configuration installs the port only for the
+supported linked Raft profile. The internal OpenAPI path/server are regenerated.
+
+Validation: `history-control-apply-test` exited 0, all 16 tests passed with zero
+skips/failures/leaks (`source-scope-rpc-native-test.log`). The native fixture now
+reads the scope from its forwarding node through the real signed HTTP service and
+native owner, repeats it, and tests cancellation. The directly qualified native
+read still checks wrong-root and future-cut refusal. Dedicated executed tests
+`source scope ingress qualifies owner routes and rejects forged or cancelled
+observations` and `source scope HTTP client rejects unqualified forged expired
+and ambiguous read replies` cover admission and response failure boundaries and
+one transport attempt. Source-catalog, engine-error and OpenAPI checks also exited
+0, including all nine schema fragment tests and generated provenance checks.
+
+The metadata lifecycle wire draft remains unreferenced/unverified and is not part
+of this RPC milestone. Fresh qualified metadata capture transport, actual mutating
+scope controls and original-coordinator retirement RPCs, genuine legacy-worker
+handover and all remaining end-to-end issue requirements are still required.

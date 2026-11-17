@@ -1907,6 +1907,7 @@ pub const AntflyApiHandler = struct {
         inline for (.{
             .{ routes.source_plan_control_suffix, internalSourcePlanControl },
             .{ routes.source_plan_observe_suffix, internalSourcePlanObserve },
+            .{ routes.source_scope_observe_suffix, internalSourceScopeObserve },
             .{ routes.source_checkpoint_observe_suffix, internalSourceCheckpointObserve },
             .{ routes.source_plan_chunk_suffix, internalSourcePlanChunk },
         }) |route| {
@@ -4212,6 +4213,9 @@ pub const AntflyApiHandler = struct {
     fn internalSourcePlanControl(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.internalSourcePlan(ctx, .control);
     }
+    fn internalSourceScopeObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSourcePlan(ctx, .scope);
+    }
     fn internalSourceCheckpointObserve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.internalSourcePlan(ctx, .checkpoint);
     }
@@ -4221,7 +4225,7 @@ pub const AntflyApiHandler = struct {
     fn internalSourcePlanChunk(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.internalSourcePlan(ctx, .chunk);
     }
-    fn internalSourcePlan(self: *AntflyApiHandler, ctx: *httpx.Context, comptime kind: enum { control, observe, chunk, checkpoint }) !httpx.Response {
+    fn internalSourcePlan(self: *AntflyApiHandler, ctx: *httpx.Context, comptime kind: enum { control, observe, chunk, checkpoint, scope }) !httpx.Response {
         const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
         var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
         defer identity.deinit(self.api_server.alloc);
@@ -4230,7 +4234,7 @@ pub const AntflyApiHandler = struct {
         defer params.deinit(ctx.allocator);
         const operations = @import("source_plan_operations.zig");
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing source plan request");
-        const maximum = if (kind == .checkpoint) @import("source_checkpoint_operations.zig").wire.max_request_bytes else operations.wire.max_bytes;
+        const maximum = if (kind == .scope) @import("source_scope_operations.zig").wire.max_bytes else if (kind == .checkpoint) @import("source_checkpoint_operations.zig").wire.max_request_bytes else operations.wire.max_bytes;
         if (body.len > maximum) return textResponse(ctx, 413, "source recovery request exceeds byte limit");
         switch (kind) {
             .control => {
@@ -4238,6 +4242,7 @@ pub const AntflyApiHandler = struct {
                 if (!result.confirmed()) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
                 return ctx.json(result);
             },
+            .scope => return ctx.json(@import("source_scope_operations.zig").execute(self.api_server.cfg.native_source_scope_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
             .checkpoint => return ctx.json(@import("source_checkpoint_operations.zig").execute(self.api_server.cfg.native_source_checkpoint_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
             .observe => return ctx.json(operations.executeObserve(self.api_server.cfg.native_source_plan_observe, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, false)),
             .chunk => {

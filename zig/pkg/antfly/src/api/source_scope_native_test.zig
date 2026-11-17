@@ -57,3 +57,15 @@ fn readQualified(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRo
     }
     return error.TestReadFenceUnavailable;
 }
+
+pub fn verifyRouted(a: std.mem.Allocator, port: @import("source_scope_operations.zig").Port, fence: metadata.CatalogRouteFence, source_owner: @FieldType(completion.Intent, "owner")) !void {
+    const query: wire.Query = .{ .version = 1, .owner = source_owner, .domain = @splat(71), .minimum_applied_index = 1 };
+    const observed = try port.read(a, fence, "docs", query, .{});
+    try observed.validate(query);
+    try std.testing.expect(observed.record == null);
+    try std.testing.expect(!observed.header.strict);
+    const again = try port.read(a, fence, "docs", query, .{});
+    try std.testing.expectEqualDeep(observed.header, again.header);
+    var cancelled: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectError(error.Canceled, port.read(a, fence, "docs", query, .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) }));
+}

@@ -132,6 +132,17 @@ pub fn parseObserveNativeSourcePlanBody(allocator: std.mem.Allocator, body: []co
     return std.json.parseFromSlice(types.NativeSourcePlanObserveRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Read bounded source scope state at a qualified native cut
+pub const ObserveNativeSourceScopePathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for observeNativeSourceScope.
+pub fn parseObserveNativeSourceScopeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourceScopeQuery) {
+    return std.json.parseFromSlice(types.NativeSourceScopeQuery, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for createHAReplicationStreamingSlot.
 pub fn parseCreateHAReplicationStreamingSlotBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyCreateReplicationSlotRequest) {
     return std.json.parseFromSlice(types.StandbyCreateReplicationSlotRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -171,6 +182,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/chunk-v1", .operation_id = "readNativeSourcePlanChunk", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/control-v1", .operation_id = "controlNativeSourcePlan", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/observe-v1", .operation_id = "observeNativeSourcePlan", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-scope/observe-v1", .operation_id = "observeNativeSourceScope", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/standby/replication/identify", .operation_id = "identifyHAReplicationSystem", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/standby/replication/slots", .operation_id = "createHAReplicationStreamingSlot", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/standby/replication/start", .operation_id = "startHAReplication", .request_body = .buffered, .streaming_response = false },
@@ -200,6 +212,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "readNativeSourcePlanChunk")) @compileError("ServerRouter: Impl missing required method 'readNativeSourcePlanChunk'");
         if (!@hasDecl(Impl, "controlNativeSourcePlan")) @compileError("ServerRouter: Impl missing required method 'controlNativeSourcePlan'");
         if (!@hasDecl(Impl, "observeNativeSourcePlan")) @compileError("ServerRouter: Impl missing required method 'observeNativeSourcePlan'");
+        if (!@hasDecl(Impl, "observeNativeSourceScope")) @compileError("ServerRouter: Impl missing required method 'observeNativeSourceScope'");
         if (!@hasDecl(Impl, "identifyHAReplicationSystem")) @compileError("ServerRouter: Impl missing required method 'identifyHAReplicationSystem'");
         if (!@hasDecl(Impl, "createHAReplicationStreamingSlot")) @compileError("ServerRouter: Impl missing required method 'createHAReplicationStreamingSlot'");
         if (!@hasDecl(Impl, "startHAReplication")) @compileError("ServerRouter: Impl missing required method 'startHAReplication'");
@@ -227,6 +240,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/groups/:group_id/tables/:table_name/source-plan/chunk-v1", httpx.Handler.bind(self.impl, readNativeSourcePlanChunk));
             try server.post("/groups/:group_id/tables/:table_name/source-plan/control-v1", httpx.Handler.bind(self.impl, controlNativeSourcePlan));
             try server.post("/groups/:group_id/tables/:table_name/source-plan/observe-v1", httpx.Handler.bind(self.impl, observeNativeSourcePlan));
+            try server.post("/groups/:group_id/tables/:table_name/source-scope/observe-v1", httpx.Handler.bind(self.impl, observeNativeSourceScope));
             try server.get("/standby/replication/identify", httpx.Handler.bind(self.impl, identifyHAReplicationSystem));
             try server.post("/standby/replication/slots", httpx.Handler.bind(self.impl, createHAReplicationStreamingSlot));
             try server.post("/standby/replication/start", httpx.Handler.bind(self.impl, startHAReplication));
@@ -327,6 +341,14 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.observeNativeSourcePlan(ctx, group_id, table_name);
         }
 
+        /// Read bounded source scope state at a qualified native cut
+        /// POST /groups/{group_id}/tables/{table_name}/source-scope/observe-v1
+        fn observeNativeSourceScope(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.observeNativeSourceScope(ctx, group_id, table_name);
+        }
+
         /// Identify this primary replication system
         /// GET /standby/replication/identify
         fn identifyHAReplicationSystem(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -367,6 +389,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn readNativeSourcePlanChunk(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn controlNativeSourcePlan(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn observeNativeSourcePlan(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn observeNativeSourceScope(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn identifyHAReplicationSystem(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createHAReplicationStreamingSlot(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn startHAReplication(self: *Impl, ctx: *httpx.Context) !httpx.Response
