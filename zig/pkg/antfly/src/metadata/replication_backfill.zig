@@ -250,8 +250,12 @@ pub const SnapshotBackfillRunner = struct {
         table: metadata_table_manager.TableRecord,
         source_ordinal: u32,
         start_offset: usize,
-        existing_status: ?metadata_table_manager.ReplicationSourceStatusRecord,
+        existing_status_input: ?metadata_table_manager.ReplicationSourceStatusRecord,
     ) !BackfillSummary {
+        // A sink may replace/free its prior row on the first status update.
+        // Retain every original resume field until the entire run returns.
+        const existing_status: ?metadata_table_manager.ReplicationSourceStatusRecord = if (existing_status_input) |status| try metadata_table_manager.cloneReplicationSourceStatus(self.alloc, status) else null;
+        defer if (existing_status) |status| metadata_table_manager.freeReplicationSourceStatus(self.alloc, status);
         var progress_offset = start_offset;
         var progress_snapshot_checkpoint = std.ArrayListUnmanaged(u8).empty;
         defer progress_snapshot_checkpoint.deinit(self.alloc);
@@ -2453,7 +2457,7 @@ fn applyReplicationSnapshotRowsRequired(
     writes: []const db_mod.types.BatchWrite,
     sync_level: db_mod.types.SyncLevel,
 ) !void {
-    try requireReplicationCommitComplete(try write_source.commitBatch(alloc, &.{.{ .table_name = table_name, .writes = writes }}, sync_level));
+    try requireReplicationCommitComplete(try write_source.commitBatch(alloc, &.{.{ .table_name = table_name, .source_producer = .legacy_cdc, .writes = writes }}, sync_level));
 }
 
 fn requireReplicationCommitComplete(outcome: ?transaction_contract.CommitOutcome) !void {
@@ -2499,6 +2503,7 @@ fn applyReplicationTransaction(
     defer alloc.free(requests);
     for (effects, requests) |effect, *request| request.* = .{
         .table_name = effect.table_name,
+        .source_producer = .legacy_cdc,
         .transforms = effect.transforms,
         .deletes = effect.deletes,
     };
@@ -3727,6 +3732,7 @@ test "metadata snapshot backfill stops before apply when its work permit is revo
         .registry = &registry,
         .write_source = .{
             .ptr = &state,
+            .supports_transaction_producers = true,
             .vtable = &.{ .batch = State.batch, .commit_batch = comptime testSingleTableCommit(State.batch) },
         },
         .work_permit = .{
@@ -4857,6 +4863,7 @@ test "metadata replication backfill routes matching snapshot rows to target tabl
         fn source(self: *@This()) table_writes_api.TableWriteSource {
             return .{
                 .ptr = self,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_batch = comptime testSingleTableCommit(batch),
@@ -6198,6 +6205,7 @@ test "metadata replication backfill production round entry point rotates across 
 
     const write_source = table_writes_api.TableWriteSource{
         .ptr = &AcceptAllWriteSource.sentinel,
+        .supports_transaction_producers = true,
         .vtable = &.{
             .batch = AcceptAllWriteSource.batch,
             .commit_batch = comptime testSingleTableCommit(AcceptAllWriteSource.batch),
@@ -6491,6 +6499,7 @@ test "metadata replication backfill round persists the cursor past a source that
 
     const write_source = table_writes_api.TableWriteSource{
         .ptr = &AcceptAllWriteSource.sentinel,
+        .supports_transaction_producers = true,
         .vtable = &.{
             .batch = AcceptAllWriteSource.batch,
             .commit_batch = comptime testSingleTableCommit(AcceptAllWriteSource.batch),
@@ -7007,6 +7016,7 @@ test "metadata replication backfill durably retries interrupted exact cutover ow
         .registry = &registry,
         .write_source = .{
             .ptr = &NullWriteSource.sentinel,
+            .supports_transaction_producers = true,
             .vtable = &.{ .batch = NullWriteSource.batch, .commit_batch = comptime testSingleTableCommit(NullWriteSource.batch) },
         },
     };
@@ -7113,7 +7123,9 @@ fn testSingleTableCommit(comptime batch_callback: anytype) @FieldType(table_writ
         fn commit(ptr: *anyopaque, a: Allocator, tables: []const transaction_contract.TableCommitRequest, sync_level: db_mod.types.SyncLevel) !?transaction_contract.CommitOutcome {
             if (tables.len != 1) return error.UnsupportedReplicationRoute;
             const table = tables[0];
+            try std.testing.expectEqual(.legacy_cdc, table.source_producer);
             _ = (try batch_callback(ptr, a, table.table_name, .{
+                .source_producer = table.source_producer,
                 .writes = table.writes,
                 .deletes = table.deletes,
                 .transforms = table.transforms,
@@ -7161,6 +7173,7 @@ test "metadata replication stream compiles route leave enter and key changes as 
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             try std.testing.expectEqual(@as(usize, 2), tables.len);
+            for (tables) |table| try std.testing.expectEqual(.legacy_cdc, table.source_producer);
             try std.testing.expectEqualStrings("premium", tables[0].table_name);
             try std.testing.expectEqualStrings("old", tables[0].deletes[0]);
             try std.testing.expectEqualStrings("free", tables[1].table_name);
@@ -7177,13 +7190,13 @@ test "metadata replication stream compiles route leave enter and key changes as 
         }
     };
     var destination: Destination = .{};
-    const writer: table_writes_api.TableWriteSource = .{ .ptr = &destination, .vtable = &.{ .batch = Destination.batch, .commit_batch = Destination.commit } };
+    const writer: table_writes_api.TableWriteSource = .{ .ptr = &destination, .supports_transaction_producers = true, .vtable = &.{ .batch = Destination.batch, .commit_batch = Destination.commit } };
     const summary = try applyReplicationTransaction(a, writer, "source", &.{change}, config, .write);
     try std.testing.expectEqual(@as(usize, 1), summary.writes_applied);
     try std.testing.expectEqual(@as(usize, 1), summary.deletes_applied);
     try std.testing.expectEqual(@as(usize, 1), destination.calls);
     const unsupported: table_writes_api.TableWriteSource = .{ .ptr = &destination, .vtable = &.{ .batch = Destination.batch } };
-    try std.testing.expectError(error.UnsupportedReplicationRoute, applyReplicationTransaction(a, unsupported, "source", &.{change}, config, .write));
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, applyReplicationTransaction(a, unsupported, "source", &.{change}, config, .write));
     change.before_complete = false;
     try std.testing.expectError(error.ReplicationProjectionIncomplete, applyReplicationTransaction(a, writer, "source", &.{change}, config, .write));
     try std.testing.expectEqual(@as(usize, 1), destination.calls);
@@ -7311,7 +7324,7 @@ test "metadata replication stream resumes complete durable transactions while de
     var runner: StreamingReplicationRunner = .{
         .alloc = alloc,
         .registry = &registry,
-        .write_source = .{ .ptr = &state, .vtable = &.{ .batch = State.batch, .commit_batch = comptime testSingleTableCommit(State.batch) } },
+        .write_source = .{ .ptr = &state, .supports_transaction_producers = true, .vtable = &.{ .batch = State.batch, .commit_batch = comptime testSingleTableCommit(State.batch) } },
     };
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 11,
@@ -7722,6 +7735,7 @@ test "metadata replication stream routes matching rows to target tables" {
         fn source(self: *@This()) table_writes_api.TableWriteSource {
             return .{
                 .ptr = self,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = batch,
                     .commit_batch = comptime testSingleTableCommit(batch),
@@ -8182,6 +8196,7 @@ test "metadata replication stream coordinator waits for snapshot completion and 
             .registry = &registry,
             .write_source = .{
                 .ptr = &NullSource.sentinel,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = NullSource.batch,
                     .commit_batch = comptime testSingleTableCommit(NullSource.batch),
@@ -8447,6 +8462,7 @@ test "metadata replication stream coordinator recovers after transient polling f
             .registry = &registry,
             .write_source = .{
                 .ptr = &NullSource.sentinel,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = NullSource.batch,
                     .commit_batch = comptime testSingleTableCommit(NullSource.batch),
@@ -8706,6 +8722,7 @@ test "metadata replication stream production round entry point rotates across th
         .registry = &registry,
         .write_source = .{
             .ptr = &NullSource.sentinel,
+            .supports_transaction_producers = true,
             .vtable = &.{
                 .batch = NullSource.batch,
                 .commit_batch = comptime testSingleTableCommit(NullSource.batch),
@@ -8943,6 +8960,7 @@ test "metadata replication stream coordinator marks missing slot as terminal fai
             .registry = &registry,
             .write_source = .{
                 .ptr = &NullSource.sentinel,
+                .supports_transaction_producers = true,
                 .vtable = &.{
                     .batch = NullSource.batch,
                     .commit_batch = comptime testSingleTableCommit(NullSource.batch),
@@ -9582,6 +9600,7 @@ test "metadata replication stream snapshot rows require complete atomic destinat
             try std.testing.expectEqual(.write, sync_level);
             try std.testing.expectEqual(@as(usize, 1), tables.len);
             try std.testing.expectEqualStrings("docs", tables[0].table_name);
+            try std.testing.expectEqual(.legacy_cdc, tables[0].source_producer);
             try std.testing.expectEqual(@as(usize, 2), tables[0].writes.len);
             try std.testing.expectEqualStrings("one", tables[0].writes[0].key);
             try std.testing.expectEqualStrings("{\"v\":2}", tables[0].writes[1].value);
@@ -9590,7 +9609,7 @@ test "metadata replication stream snapshot rows require complete atomic destinat
     };
     const a = std.testing.allocator;
     var fake: Fake = .{};
-    const source: table_writes_api.TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.raw, .commit_batch = Fake.commit } };
+    const source: table_writes_api.TableWriteSource = .{ .ptr = &fake, .supports_transaction_producers = true, .vtable = &.{ .batch = Fake.raw, .commit_batch = Fake.commit } };
     const writes = [_]db_mod.types.BatchWrite{ .{ .key = "one", .value = "{\"v\":1}" }, .{ .key = "two", .value = "{\"v\":2}" } };
     try applyReplicationSnapshotRowsRequired(a, source, "docs", &writes, .write);
     inline for (.{ "propagation_pending", "visibility_pending", "visibility_retry_pending", "visibility_repair_required" }) |field| {
@@ -9599,6 +9618,6 @@ test "metadata replication stream snapshot rows require complete atomic destinat
         try std.testing.expectError(error.SourceOutcomeUnresolved, applyReplicationSnapshotRowsRequired(a, source, "docs", &writes, .write));
     }
     const unsupported: table_writes_api.TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.raw } };
-    try std.testing.expectError(error.UnsupportedReplicationRoute, applyReplicationSnapshotRowsRequired(a, unsupported, "docs", &writes, .write));
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, applyReplicationSnapshotRowsRequired(a, unsupported, "docs", &writes, .write));
     try std.testing.expectEqual(@as(usize, 5), fake.calls);
 }

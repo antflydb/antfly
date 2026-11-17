@@ -7092,3 +7092,35 @@ remain 117/37/65/45/105/89; no callback layout or wire format changed. This enab
 producer-preserving bound whole commits on qualified native roots, not source
 handover or source-granted retained-history admission. Production ingress
 assignment and all original acceptance remain open.
+
+### Explicit legacy snapshot/stream ingress origin
+
+Production legacy replication snapshot rows and complete stream transactions now
+set `legacy_cdc` on every table destination request. The class is assigned by
+the trusted legacy ingress path, independent of provider payload or missing
+source purpose. Reviewed destinations retain it through row batching or full
+transaction phases; unsupported/unreviewed writers fail before mutation.
+Test adapters explicitly opt in, assert the incoming class and retain it when
+forwarding batches. Snapshot and multi-table stream tests check the class;
+existing complete propagation/visibility requirements still precede checkpoints.
+This does not manufacture source admission, source ACK or successful handover.
+
+The first source suite reached its coordinator-resume case and crashed while
+copying a freed 17-byte resume string. Isolated execution and LLDB reproduced
+the invalid read. A sink can replace/free its previous status row during the
+run while `runTableSourceInner` still references original cutover fields. The
+runner now owns a full incoming status clone until return, including error and
+handover paths, rather than retaining caller-owned status strings. The existing
+coordinator resume/handover case exercises that lifetime and passed afterward.
+
+Final verification passed (`source-legacy-producer-ingress-final-test.log`): all
+30 CDC/checkpoint cases, four Lake/source cases and 12 supporting local cases,
+zero failures, skips or leaks. This includes source transfer after effects/poll,
+snapshot cutover and checkpoint-preserving failures. Source-catalog,
+engine-error, OpenAPI and `git diff --check` passed
+(`source-legacy-producer-ingress-final-contract-check.log`). No layout or format
+changed; versions remain owner/API/engine/data/metadata/failure
+117/37/65/45/105/89. Public ordinary ingress, special mutation provenance,
+qualified global legacy drainage/closure, source-granted destination integration
+and all original retained/public history, bootstrap, retention, pgoutput and
+actual Antfly existing-client acceptance remain open.
