@@ -75,7 +75,13 @@ pub const Cache = struct {
 
     fn findLocked(self: *Cache, group: u64, raw: []const u8) ?*Entry {
         const entry = self.entries.get(group) orelse return null;
-        return if (std.mem.eql(u8, entry.raw, raw)) entry else null;
+        if (std.mem.eql(u8, entry.raw, raw)) return entry;
+        // Warm restore descriptors carry the admitted physical catalog.
+        // Reuse its exact bytes without replacing the original cache key.
+        if (entry.physical) |physical| {
+            if (std.mem.eql(u8, physical, raw)) return entry;
+        }
+        return null;
     }
 
     pub fn acquire(self: *Cache, alloc: std.mem.Allocator, group: u64, raw: []const u8) !Lease {

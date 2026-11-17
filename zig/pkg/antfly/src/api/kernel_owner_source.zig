@@ -8659,11 +8659,15 @@ test "source owner privacy projection caches exact cuts without warm allocations
     cache.retainAdmitted(alloc, &first);
     const before = failing.alloc_index;
     failing.fail_index = before;
+    try std.testing.expect(!std.mem.eql(u8, raw, first.bytes));
     for (0..32) |_| {
-        var hit = try cache.acquire(alloc, 1, raw);
-        defer hit.deinit();
-        try std.testing.expectEqual(first.entry, hit.entry);
-        try std.testing.expectEqualStrings(first.bytes, hit.bytes);
+        for ([_][]const u8{ raw, first.bytes }) |descriptor_catalog| {
+            var hit = try cache.acquire(alloc, 1, descriptor_catalog);
+            defer hit.deinit();
+            try std.testing.expectEqual(first.entry, hit.entry);
+            try std.testing.expectEqualStrings(first.bytes, hit.bytes);
+            cache.retainAdmitted(alloc, &hit);
+        }
     }
     try std.testing.expectEqual(before, failing.alloc_index);
     try std.testing.expectError(error.OutOfMemory, cache.acquire(alloc, 1, "{\"_privacy\":{\"generation\":2}}"));
