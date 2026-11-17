@@ -213,6 +213,64 @@ pub const Source = struct {
 const MetadataClient = @import("changefeed_metadata.zig").Client;
 const enrollment = @import("../metadata/root_control_driver.zig");
 
+/// Propagate whole-frame client ACKs through receipt-qualified owner controls.
+/// Partial-frame cursors can be durable without moving the native floor.
+pub fn flushAcknowledged(client: *MetadataClient, policy: anytype, a: A, confirmed: control.State, root: Root, request: Context) !bool {
+    const target = confirmed.roots[try confirmed.rootIndex(root.namespace)].acknowledged.sequence;
+    for (0..4) |_| {
+        const bytes = try client.readChangefeedState(a, confirmed.id, request);
+        defer a.free(bytes);
+        var parsed = try control.parse(a, bytes);
+        defer parsed.deinit();
+        const state = parsed.value;
+        try policy.authorizeRoot(state, root.namespace, request);
+        if (state.epoch != confirmed.epoch or !std.meta.eql(state.authority, confirmed.authority) or state.phase != .streaming)
+            return error.ChangefeedResynchronizationRequired;
+        const item = state.roots[try state.rootIndex(root.namespace)];
+        const reference: @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Reference = .{
+            .namespace = root.namespace,
+            .authority = state.authority,
+            .consumer = state.consumerId(),
+            .epoch = item.consumer_epoch,
+            .grant = item.grant_sequence,
+            .definition = state.definition.?.identity(),
+        };
+        if (item.reclaimed_through >= target) {
+            if (target == item.start) return false;
+            try policy.validateRoot(state, root.namespace, root.fence, root.table_name, request);
+            // Collection operates on the owner's shared ACK floor. Retrying a
+            // lost reply can collect another bounded page, without changing a
+            // cursor or deleting history still pinned by any consumer.
+            const command: @import("history_control_operations.zig").wire.Request = .{
+                .version = 1,
+                .operation = .submit,
+                .command = .{ .reclaim = .{ .reference = reference, .max_frames = 32 } },
+            };
+            const result = try policy.source.controls.execute(a, root.fence, root.table_name, command, request);
+            try result.validate(command);
+            if (!result.confirmed()) return error.MetadataMutationOutcomeUnknown;
+            if (result.outcome.? == .rejected) return result.outcome.?.rejected.asError();
+            if (result.outcome.? != .applied) return error.ChangefeedResynchronizationRequired;
+            return result.outcome.?.applied.reclaimed_frames == command.command.reclaim.max_frames;
+        }
+        if (item.pending_control != null) {
+            try driveRoot(client, policy, a, state, root.namespace, request);
+            continue;
+        }
+        const command: @import("history_control_operations.zig").wire.Request = .{
+            .version = 1,
+            .operation = .submit,
+            .command = .{ .acknowledge = .{
+                .reference = reference,
+                .previous = item.reclaimed_through,
+                .next = target,
+            } },
+        };
+        try prepareRoot(client, policy, a, state.id, root, command, request);
+    }
+    return error.MetadataMutationOutcomeUnknown;
+}
+
 /// Persist or drive the next step of an exact enrollment. The caller owns
 /// the complete root plan and decides when its cut can be sealed.
 pub fn enrollRoot(client: *MetadataClient, policy: anytype, a: A, state: control.State, root: Root, policy_revision: u64, context: Context) !void {

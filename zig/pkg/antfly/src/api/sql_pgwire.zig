@@ -524,6 +524,7 @@ pub const CatalogRetainedStream = struct {
     policy: LiveReplicationPublication,
 
     publication_worker: ?*PublicationWorker = null,
+    collected_history_sequence: ?u64 = null,
     publication_group: std.Io.Group = .init,
 
     const PublicationWorker = struct {
@@ -564,6 +565,53 @@ pub const CatalogRetainedStream = struct {
             }
         };
 
+        const HistoryPolicy = struct {
+            source: @import("history_roots.zig").Source,
+            selected: CleanupRegistry,
+            io: std.Io,
+
+            pub fn authorizeRoot(self: *HistoryPolicy, state: control.State, _: control.Namespace, context_value: operation.RequestContext) !void {
+                try self.selected.authorizeCleanup(state, context_value);
+            }
+
+            pub fn validateRoot(self: *HistoryPolicy, state: control.State, namespace: control.Namespace, fence: @import("../metadata/api.zig").CatalogRouteFence, table: []const u8, context_value: operation.RequestContext) !void {
+                try self.source.validate(allocator, state, namespace, fence, table, context_value);
+            }
+
+            pub fn newAttempt(self: *HistoryPolicy, _: control.State, _: control.Namespace, context_value: operation.RequestContext) !control.Id {
+                var id: control.Id = undefined;
+                while (true) {
+                    try context_value.ensureActive();
+                    self.io.random(&id);
+                    if (!std.mem.allEqual(u8, &id, 0)) return id;
+                }
+            }
+
+            pub fn context(_: *HistoryPolicy, value: operation.RequestContext) !operation.RequestContext {
+                return value;
+            }
+        };
+
+        fn reclaimHistory(self: *PublicationWorker, selected: CleanupRegistry) !void {
+            const host = self.host;
+            var client: @import("changefeed_metadata.zig").Client = .{ .port = host.service.* };
+            const bytes = try client.readChangefeedState(allocator, host.id, self.context);
+            defer allocator.free(bytes);
+            var observed = try control.parse(allocator, bytes);
+            defer observed.deinit();
+            const state = observed.value;
+            try selected.authorizeCleanup(state, self.context);
+            if (state.roots.len != 1) return error.ChangefeedCapabilityUnsupported;
+            const root = state.roots[0];
+            const target = root.acknowledged.sequence;
+            if (target == root.start or host.collected_history_sequence == target) return;
+            var captured = try self.source.capture(allocator, state.definition.?, self.context);
+            defer captured.deinit();
+            var history_policy: HistoryPolicy = .{ .source = self.source, .selected = selected, .io = selected.policy.io };
+            const more = try @import("history_roots.zig").flushAcknowledged(&client, &history_policy, allocator, state, try captured.find(root.namespace), self.context);
+            if (!more) host.collected_history_sequence = target;
+        }
+
         fn drive(self: *PublicationWorker) !void {
             const host = self.host;
             var admission = try host.catalog_resolver.server.acquireSqlExecution(false);
@@ -576,6 +624,7 @@ pub const CatalogRetainedStream = struct {
             policy.identity = identity;
             policy.resolver = resolver.resolver();
             const cleanup_registry: CleanupRegistry = .{ .storage = host.registry, .policy = &policy, .session = self.session };
+            try self.reclaimHistory(cleanup_registry);
             const cleanup = try @import("../metadata/pg_spool_cleanup.zig").cleanup(host.service, cleanup_registry, allocator, host.id, .{}, self.context);
             switch (cleanup.status) {
                 .checkpointed, .collected => return,
@@ -679,6 +728,7 @@ pub const CatalogRetainedStream = struct {
         self.actor = actor;
         self.config = config;
         self.publication_worker = null;
+        self.collected_history_sequence = null;
         self.publication_group = .init;
         self.policy = .{ .allocator = retained_alloc, .io = request_value.io, .identity = slots.identity, .resolver = self.catalog_resolver.resolver(), .expected = expected };
         return Bridge.Bridge(CatalogRetainedStream).open(self, a, request_value, start);

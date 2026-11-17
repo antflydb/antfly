@@ -162,7 +162,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
     var confirmed = try delivery.acknowledge(&client, &provider, a, selection.id, selection.after, internal);
     defer confirmed.deinit();
     var driver_policy: RootPolicy = .{ .access = policy, .io = api.inferenceIo(), .source = source, .allocator = a };
-    try flushAcknowledged(&client, &driver_policy, a, confirmed.value, captured.roots[0], internal);
+    _ = try source_api.flushAcknowledged(&client, &driver_policy, a, confirmed.value, captured.roots[0], internal);
     return .{ .acknowledged = confirmed.value.acknowledged_cursor };
 }
 
@@ -229,61 +229,6 @@ const RootPolicy = struct {
         return request;
     }
 };
-
-/// Propagate whole-frame client ACKs through receipt-qualified owner controls.
-/// Partial-frame cursors can be durable without moving the native floor.
-fn flushAcknowledged(client: *config.Client, policy: *RootPolicy, a: A, confirmed: control.State, root: source_api.Root, request: Context) !void {
-    const target = confirmed.roots[try confirmed.rootIndex(root.namespace)].acknowledged.sequence;
-    for (0..4) |_| {
-        var parsed = try load(client, a, confirmed.id, request);
-        defer parsed.deinit();
-        const state = parsed.value;
-        try policy.access.?.authorize(state, request);
-        if (state.epoch != confirmed.epoch or !same(state.authority, confirmed.authority) or state.phase != .streaming)
-            return error.ChangefeedResynchronizationRequired;
-        const item = state.roots[try state.rootIndex(root.namespace)];
-        const reference: local.api_local_table_writes.table_write_source.history_consumer.Reference = .{
-            .namespace = root.namespace,
-            .authority = state.authority,
-            .consumer = state.consumerId(),
-            .epoch = item.consumer_epoch,
-            .grant = item.grant_sequence,
-            .definition = state.definition.?.identity(),
-        };
-        if (item.reclaimed_through >= target) {
-            if (target == item.start) return;
-            try policy.validateRoot(state, root.namespace, root.fence, root.table_name, request);
-            // Collection operates on the owner's shared ACK floor. Retrying a
-            // lost reply can collect another bounded page, without changing a
-            // cursor or deleting history still pinned by any consumer.
-            const command: @import("history_control_operations.zig").wire.Request = .{
-                .version = 1,
-                .operation = .submit,
-                .command = .{ .reclaim = .{ .reference = reference, .max_frames = 32 } },
-            };
-            const result = try policy.source.controls.execute(a, root.fence, root.table_name, command, request);
-            try result.validate(command);
-            if (!result.confirmed()) return error.MetadataMutationOutcomeUnknown;
-            if (result.outcome.? == .rejected) return result.outcome.?.rejected.asError();
-            return;
-        }
-        if (item.pending_control != null) {
-            try source_api.driveRoot(client, policy, a, state, root.namespace, request);
-            continue;
-        }
-        const command: @import("history_control_operations.zig").wire.Request = .{
-            .version = 1,
-            .operation = .submit,
-            .command = .{ .acknowledge = .{
-                .reference = reference,
-                .previous = item.reclaimed_through,
-                .next = target,
-            } },
-        };
-        try source_api.prepareRoot(client, policy, a, state.id, root, command, request);
-    }
-    return error.MetadataMutationOutcomeUnknown;
-}
 
 fn load(client: *config.Client, a: A, id: control.Id, request: Context) !control.Parsed {
     const bytes = try client.readChangefeedState(a, id, request);
