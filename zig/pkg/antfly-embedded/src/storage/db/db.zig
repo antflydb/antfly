@@ -10066,6 +10066,8 @@ pub const DB = struct {
         lane: background_runtime_mod.DurableJobLane,
         owner_id: u64,
     ) void {
+        ctx.index_manager.artifact_cleanup_lane = lane;
+        ctx.index_manager.artifact_cleanup_owner_id = owner_id;
         @import("cleanup_job_owner.zig").schedule(.{
             .ptr = ctx,
             .state = &ctx.index_manager.artifact_cleanup_state,
@@ -10075,12 +10077,40 @@ pub const DB = struct {
             .closing = &ctx.background_closing,
             .advance = advanceArtifactCleanup,
             .name = "generated-artifact",
+            .on_give_up = onGeneratedArtifactCleanupGiveUp,
         });
+    }
+
+    /// `cleanup_job_owner.drain` gives up (and never resubmits on its own)
+    /// once one run exhausts its 8-attempt budget, regardless of whether
+    /// `advance`'s failures were ever going to clear -- see its own doc
+    /// comment; that unconditional stop is the deliberate fix for a prior
+    /// liveness bug (a truly permanent `advance` failure resubmitting
+    /// forever). But "exhausted 8 attempts" is not the same thing as
+    /// "permanent": a dependency rate limit or other bounded burst of
+    /// transient failures can easily outlast one run without ever being
+    /// unrecoverable. Resubmit a bounded number of additional rounds here
+    /// (each its own fresh 8-attempt budget) before truly stopping, so this
+    /// differs from the fixed bug only in being finite -- a genuinely
+    /// permanent failure still stops for good, just after more total
+    /// attempts instead of looping forever.
+    const max_generated_artifact_cleanup_giveup_rounds: u32 = 4;
+    fn onGeneratedArtifactCleanupGiveUp(ptr: *anyopaque, _: anyerror) void {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        const rounds = ctx.index_manager.artifact_cleanup_giveup_rounds.fetchAdd(1, .acq_rel) + 1;
+        if (rounds > max_generated_artifact_cleanup_giveup_rounds) return;
+        const lane = ctx.index_manager.artifact_cleanup_lane orelse return;
+        scheduleGeneratedArtifactCleanupContext(ctx, lane, ctx.index_manager.artifact_cleanup_owner_id);
     }
 
     fn advanceArtifactCleanup(ptr: *anyopaque) !@import("cleanup_job_owner.zig").Advance {
         const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-        return try advanceGeneratedArtifactCleanupContext(ctx, null);
+        const result = try advanceGeneratedArtifactCleanupContext(ctx, null);
+        // A successful advance (even mid-burst, interleaved with failures)
+        // demonstrates forward progress; reset the give-up bookkeeping so
+        // an unrelated later burst gets its own full round budget.
+        ctx.index_manager.artifact_cleanup_giveup_rounds.store(0, .release);
+        return result;
     }
 
     const retired_index_artifact_repair_cleanup_page_size: usize = 64;
@@ -14511,6 +14541,8 @@ pub const DB = struct {
     /// Cheap generation, replay, and cardinality checks run first so routine
     /// lag avoids a tree walk. The validation read transaction is stable while
     /// foreground writes continue through the ordinary derived stream.
+    const operator_validation_replay_wait_ns: u64 = 2 * std.time.ns_per_s;
+
     fn validateOperatorDenseGenerationForOnlineRebuild(
         self: *DB,
         alloc: Allocator,
@@ -18263,7 +18295,22 @@ pub const DB = struct {
             var durable_entry = try self.loadIndexRepairEntryById(alloc, repair_id);
             defer durable_entry.deinit(alloc);
             if (durable_entry.intent.trigger == .operator_generation_validation) {
-                switch (try self.validateOperatorDenseGenerationForOnlineRebuild(alloc, cfg, options)) {
+                var validation = try self.validateOperatorDenseGenerationForOnlineRebuild(alloc, cfg, options);
+                if (validation == .replay_pending) {
+                    // The failure this repair settles is already durable, but
+                    // the async executor may not have replayed past it yet.
+                    // Drive this index's replay to the current target once,
+                    // bounded, instead of deferring the forced repair to a
+                    // turn nothing schedules.
+                    const clock = self.backend_runtime.monotonicClock();
+                    const index_names = [_][]const u8{cfg.name};
+                    _ = self.waitForCurrentIndexTargets(&index_names, clock.nowRealtimeNs() +| operator_validation_replay_wait_ns) catch |err| switch (err) {
+                        error.EnrichmentWaitTimeout, error.EnrichmentWaitCanceled => {},
+                        else => return err,
+                    };
+                    validation = try self.validateOperatorDenseGenerationForOnlineRebuild(alloc, cfg, options);
+                }
+                switch (validation) {
                     .online_safe => try self.updateIndexRepairIntent(alloc, repair_id, .{
                         .trigger = .operator_generation_rebuild,
                         .replace_last_error = true,
@@ -85592,6 +85639,34 @@ test "producer readiness cached graph relations survive metadata overwrite and r
     try std.testing.expectEqual(@as(usize, 2), fake.extractor_calls);
 }
 
+test "producer readiness non-graph asset skips reextraction across an unrelated metadata edit" {
+    // Sibling of the graph test above: a plain asset enrichment that no
+    // graph index consumes keeps the narrower, declared-source-only reuse
+    // key (`artifactFeedsGraph` is false here), so an edit to a field the
+    // producer never reads must not force a second extractor call.
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db");
+    defer directory.cleanup();
+    var fake = TestAssetProducer{ .extractor_output = "{\"relations\":[]}" };
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{ .enrichment = .{ .asset_producer = fake.producer() } });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "relations_v1",
+        .kind = .asset,
+        .field = "target_doc",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"extractor\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    for ([_][]const u8{
+        "{\"title\":\"before\",\"target_doc\":\"doc:b\"}",
+        "{\"title\":\"after\",\"target_doc\":\"doc:b\"}",
+    }) |value| {
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = value }}, .sync_level = .enrichments });
+        try db.runUntilIdle();
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+}
+
 test "db graph artifact external node targets return ids without document hydration" {
     const alloc = std.testing.allocator;
 
@@ -119842,6 +119917,46 @@ test "db dense target reads atomic outcome and source coverage snapshot" {
     try std.testing.expectError(error.InvalidDerivedCoverageCounter, denseTargetCountForIndexContext(db.async_context, config.name));
 }
 
+test "db dense target coverage defers for pending source material before any outcome exists" {
+    // Regression guard for the bootstrap-watermark bug fixed in
+    // 3a8e943a48 ("bound native_catalog text staging and dense coverage
+    // bootstrap race"): a fresh artifact-backed dense generation whose
+    // source material already exists, but whose embedder has not even been
+    // scheduled yet, has no outcome rows (produced/skipped/terminal_failed)
+    // and a dense artifact target counter bootstrapped at its trivial
+    // starting value of zero -- indistinguishable, by count alone, from a
+    // genuinely empty range. That must defer ("not yet determined"), never
+    // vacuously match a zero active count and let a watermark advance past
+    // work nobody has done.
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const config: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dense_idx\"}}",
+    };
+    try db.addIndex(config);
+
+    var one: [8]u8 = undefined;
+    std.mem.writeInt(u64, &one, 1, .little);
+    try db.core.store.put(&internal_keys.range_document_count_key, &one);
+    const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, config.name);
+    defer alloc.free(counter_key);
+    const zero: [8]u8 = @splat(0);
+    try db.core.store.put(counter_key, &zero);
+
+    try std.testing.expectEqual(@as(?u64, null), try denseTargetCountForIndexContext(db.async_context, config.name));
+}
+
 test "db artifact dense target prefers current incarnation outcomes over stale name counter" {
     const alloc = std.testing.allocator;
 
@@ -153516,11 +153631,18 @@ test "full_text visibility wait timeout with a live text-merge worker does not h
     try db.batch(.{ .writes = &.{.{ .key = "counter", .value = "{\"body\":\"counter\",\"count\":0}" }}, .sync_level = .write });
     try std.testing.expect(db.text_merge_runtime.?.isStarted());
 
-    // Claim the whole segment budget before the live worker has a chance to
-    // reserve any of it itself (unlike variant 2's manual-mode runtime,
-    // which never races this acquire).
+    // Claim the rest of the segment budget. Unlike variant 2's manual-mode
+    // runtime (which never races this acquire), the live worker notified by
+    // `addWorker`/the batch above already wins the race to index "counter"
+    // into ft_v1's own first segment before this loop's first attempt can
+    // even run -- `acquireProducerPermitWithApplyOwnership`'s admission
+    // check always observes `active_segments >= 1` by then, deterministically,
+    // not just occasionally. Asking for all 12 therefore always overshoots
+    // by exactly that one already-durable segment and times out every one
+    // of the 200 attempts; ask for 11 so admission succeeds whether this
+    // runs before or after the worker's own segment lands.
     var held = held_loop: for (0..200) |_| {
-        break :held_loop db.text_merge_runtime.?.acquireProducerPermit("ft_v1", 12, 0) catch |err| switch (err) {
+        break :held_loop db.text_merge_runtime.?.acquireProducerPermit("ft_v1", 11, 0) catch |err| switch (err) {
             error.TextMergeBackpressureTimeout => {
                 std.Thread.yield() catch {};
                 continue;
@@ -153537,10 +153659,19 @@ test "full_text visibility wait timeout with a live text-merge worker does not h
     // mode) the backpressure timeout can surface either wrapped (primary
     // already committed) or bare (admission blocked before the primary
     // write landed) depending on exactly when the worker's own activity
-    // interleaves with this call; either way the point of this test is
-    // that `close()` afterward must not hang.
+    // interleaves with this call. Holding 11 of ft_v1's 12-segment budget
+    // leaves no room for the worker's own catch-up of this write either, so
+    // the race can also resolve as the worker's bounded recoverable-retry
+    // backoff (`scheduleRecoverableCatchUpRetry`/`catch_up_exhausted`)
+    // giving up first and marking itself permanently failed before this
+    // call's own visibility wait observes the softer, transient error -- a
+    // third legitimate shape of the same underlying backpressure this held
+    // permit models. Only that path logs (the worker's own `std.log.err`
+    // on exhaustion); the other two never do, so the expectation is
+    // declared only once the outcome is known, not unconditionally.
     db.batch(request) catch |err| switch (err) {
         error.CommitVisibilityNotSatisfied, error.TextMergeBackpressureTimeout => {},
+        error.AsyncWorkerFailed => @import("antfly_test_error_logs").expectErrorLogs(1),
         else => return err,
     };
 

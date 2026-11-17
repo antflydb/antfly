@@ -3461,7 +3461,7 @@ test "db pending producer replay parks missing input and wakes on same sequence 
     var capture = TestThreadedRuntimeCapture{};
     capture.apply_admission_error = error.ReplayDocumentNotVisible;
     capture.fail_next_apply_resource_budget.store(true, .monotonic);
-    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, null);
+    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, null, null);
     defer runtime.deinit();
     try runtime.addWorker("text", .{ .name = "text", .kind = .full_text }, 0);
     runtime.notifySequence(1);
@@ -3491,7 +3491,7 @@ test "db pending producer replay parks missing input and wakes on same sequence 
     // A commit racing the failed read retains a scheduled retry and backoff.
     var probe_name = "probe".*;
     var probe: Worker = .{ .runtime = &runtime, .name = &probe_name, .kind = .{ .name = &probe_name, .kind = .full_text }, .applied_sequence = 0, .persisted_sequence = 0, .target_sequence = 1, .notification_epoch = 1 };
-    scheduleRecoverableCatchUpRetry(&probe, error.ReplayDocumentNotVisible);
+    _ = scheduleRecoverableCatchUpRetry(&probe, error.ReplayDocumentNotVisible);
     try std.testing.expect(probe.next_delay_ms != null and probe.next_delay_ms.? > 0);
     try std.testing.expect(probe.retry_not_before_ns > 0);
 }
@@ -3506,7 +3506,7 @@ test "db pending producer replay bounds retries under unrelated commits without 
     defer journal.close();
     try appendTestThreadedRuntimeRecord(&journal, alloc, .{ .sequence = 1, .changed_doc_keys = &.{"missing"}, .target_hints = &.{.full_text} });
     var capture = TestThreadedRuntimeCapture{ .missing_replay_input = true };
-    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, null);
+    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, null, null);
     defer runtime.deinit();
     // Dispatch manually so deadline boundaries are deterministic. The worker
     // remains in the real notification/retention sets, without a timer thread.
