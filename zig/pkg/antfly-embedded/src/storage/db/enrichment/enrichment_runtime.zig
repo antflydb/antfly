@@ -8848,6 +8848,11 @@ const PlatformEnrichmentRuntime = struct {
     pending_scoped_retries: ?PendingScopedRetries = null,
     scoped_retry_pending: bool = false,
     scoped_retry_full: bool = false,
+    /// Produced outputs submitted for ordered publication and not yet seen
+    /// accepted, keyed by their exact producer input. A replay retry before
+    /// the owner applies the publication resubmits these bytes instead of
+    /// invoking the provider again.
+    submitted_outputs: SubmittedOutputs = .{},
     scoped_retry_has_tail: bool = false,
     scoped_retry_wait: bool = false,
     scoped_retry_scan_sequence: u64 = 0,
@@ -9053,6 +9058,7 @@ const PlatformEnrichmentRuntime = struct {
         clearIsolatedFailedIndexes(self);
         self.inference_recovery.deinit(self.alloc);
         if (self.pending_scoped_retries) |*state| state.deinit(self.alloc);
+        self.submitted_outputs.deinit(self.alloc);
         self.ownership.deinit(self.alloc);
         if (self.owns_store) self.store.deinit();
         releaseConfigProviders(self.alloc, &self.config);
@@ -18548,6 +18554,73 @@ fn recordAssetProducerFailure(runtime: *EnrichmentRuntime, window: *GeneratedRep
 /// Publication progress never consumes the slot for a genuine provider retry.
 /// Capture that retry at the failing item, before later siblings change scope.
 /// Control/fatal failures remain immediate at each caller.
+/// Bounded map of submitted ordered outputs (see `submitted_outputs`).
+const SubmittedOutputs = struct {
+    const max_entries: usize = 256;
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: std.AutoHashMapUnmanaged([32]u8, []u8) = .empty,
+
+    fn lock(self: *SubmittedOutputs) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn deinit(self: *SubmittedOutputs, alloc: Allocator) void {
+        var it = self.entries.valueIterator();
+        while (it.next()) |value| alloc.free(value.*);
+        self.entries.deinit(alloc);
+    }
+
+    /// A copy of the output submitted for `key`, if any.
+    fn getAlloc(self: *SubmittedOutputs, alloc: Allocator, key: [32]u8) !?[]u8 {
+        self.lock();
+        defer self.mutex.unlock();
+        const value = self.entries.get(key) orelse return null;
+        return try alloc.dupe(u8, value);
+    }
+
+    fn put(self: *SubmittedOutputs, alloc: Allocator, key: [32]u8, output: []const u8) !void {
+        const owned = try alloc.dupe(u8, output);
+        errdefer alloc.free(owned);
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.entries.fetchRemove(key)) |old| alloc.free(old.value);
+        // Bound memory: a lost entry only costs one extra provider call.
+        if (self.entries.count() >= max_entries) {
+            var it = self.entries.valueIterator();
+            while (it.next()) |value| alloc.free(value.*);
+            self.entries.clearRetainingCapacity();
+        }
+        try self.entries.put(alloc, key, owned);
+    }
+
+    fn remove(self: *SubmittedOutputs, alloc: Allocator, key: [32]u8) void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.entries.fetchRemove(key)) |old| alloc.free(old.value);
+    }
+};
+
+/// Exact producer-input identity of an ordered asset item: the catalog
+/// authority, the token's captured inputs, the output key and the rendered
+/// producer text. Null for unordered (local) items.
+fn submittedOutputKey(item: *AssetProducerBatchItem) !?[32]u8 {
+    const token = if (item.producer_context) |*value| value else return null;
+    const command = try token.command(&.{});
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-submitted-output-v1\x00");
+    hash.update(&command.catalog_digest);
+    var epoch: [8]u8 = undefined;
+    std.mem.writeInt(u64, &epoch, command.authority_epoch, .little);
+    hash.update(&epoch);
+    hash.update(&command.inputDigest());
+    hash.update(item.artifact_key);
+    hash.update(&.{0});
+    hash.update(item.source_text);
+    var key: [32]u8 = undefined;
+    hash.final(&key);
+    return key;
+}
+
 const AssetBatchOutcome = struct {
     retry_error: ?anyerror = null,
     publication_pending: bool = false,
@@ -18563,6 +18636,38 @@ const AssetBatchOutcome = struct {
         if (self.publication_pending) return error.ArtifactPublicationPending;
     }
 };
+
+/// Move items with a submitted-but-unaccepted output to the front and
+/// resubmit those outputs. Returns how many items were served this way.
+fn resubmitPendingAssetOutputs(
+    runtime: *EnrichmentRuntime,
+    items: []AssetProducerBatchItem,
+    window: *GeneratedReplayWindow,
+    scope: *FailureScope,
+    outcome: *AssetBatchOutcome,
+) !usize {
+    var served: usize = 0;
+    for (items, 0..) |*item, index| {
+        const key = (try submittedOutputKey(item)) orelse continue;
+        const cached = (try runtime.submitted_outputs.getAlloc(runtime.alloc, key)) orelse continue;
+        defer runtime.alloc.free(cached);
+        std.mem.swap(AssetProducerBatchItem, &items[served], &items[index]);
+        const current = &items[served];
+        served += 1;
+        scope.enterAsset(current);
+        applyAssetProducerBatchOutput(runtime, current, cached, window) catch |err| {
+            if (err == error.ArtifactPublicationPending) {
+                outcome.publication_pending = true;
+                continue;
+            }
+            if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
+            if (try scope.shouldYield(runtime, err)) {
+                outcome.deferRetry(scope, err);
+            } else try recordAssetProducerFailure(runtime, window, current.*, err, scope.attemptNumber(runtime));
+        };
+    }
+    return served;
+}
 
 fn flushAssetProducerBatchItems(
     runtime: *EnrichmentRuntime,
@@ -18585,11 +18690,17 @@ fn flushAssetProducerBatchItems(
     try producer_lease_guard.start();
     defer producer_lease_guard.stop();
 
-    const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
-    const text_count = try partitionAssetProducerBatchByTransport(runtime.alloc, items);
     var outcome: AssetBatchOutcome = .{};
+    // Items whose output was already submitted for this exact input resubmit
+    // it; only the rest reach a provider.
+    const pending_count = try resubmitPendingAssetOutputs(runtime, items, window, scope, &outcome);
+    if (pending_count == items.len) return outcome.finish();
+    const remaining = items[pending_count..];
+    scope.enterOwned(assetProducerBatchFailureFingerprint(remaining), .{ .assets = remaining });
+    const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+    const text_count = try partitionAssetProducerBatchByTransport(runtime.alloc, remaining);
     if (text_count > 0) {
-        flushTextAssetProducerBatchItems(runtime, producer, items[0..text_count], window, scope) catch |err| {
+        flushTextAssetProducerBatchItems(runtime, producer, remaining[0..text_count], window, scope) catch |err| {
             if (scope.publication_failed) return err;
             if (err == error.ArtifactPublicationPending) {
                 // Ordered acceptance is independent per source. Submit the
@@ -18601,8 +18712,8 @@ fn flushAssetProducerBatchItems(
             }
         };
     }
-    if (text_count < items.len) {
-        const documents = items[text_count..];
+    if (text_count < remaining.len) {
+        const documents = remaining[text_count..];
         scope.enterOwned(assetProducerBatchFailureFingerprint(documents), .{ .assets = documents });
         flushIndexDocumentBatch(runtime, producer, documents, window, scope) catch |err| {
             if (scope.publication_failed) return err;
@@ -19734,7 +19845,16 @@ fn applyAssetProducerBatchOutput(
         // Record the dependency publication for exactly these bytes; every
         // replica promotes it when the ordered publication applies.
         if (item.context_publish) |publish| try recordContextPublishIntent(runtime, item.request.doc_key, requestArtifactName(item.request), publish, validated);
-        return enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, validated);
+        // Until the owner applies it, a replay retry resubmits these bytes
+        // rather than invoking the provider again for the same input.
+        const submitted = try submittedOutputKey(item);
+        if (submitted) |key| try runtime.submitted_outputs.put(runtime.alloc, key, produced);
+        enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, validated) catch |err| {
+            if (err != error.ArtifactPublicationPending) if (submitted) |key| runtime.submitted_outputs.remove(runtime.alloc, key);
+            return err;
+        };
+        if (submitted) |key| runtime.submitted_outputs.remove(runtime.alloc, key);
+        return;
     }
     var writes: std.ArrayListUnmanaged(KVPair) = .empty;
     defer writes.deinit(runtime.alloc);
