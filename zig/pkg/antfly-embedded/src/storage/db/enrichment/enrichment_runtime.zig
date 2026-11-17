@@ -43589,12 +43589,12 @@ fn testOrderedChunkVectorCarry(dense: bool, batching: ChunkVectorBatchTest) !voi
         if (batching == .cancel_first or batching == .cancel_second or batching == .cancel_global) {
             const first = batching != .cancel_second;
             harness.cancel_globally = batching == .cancel_global;
-            if (harness.cancel_globally) runtime.active_provider_guard = .{ .cancellation = .{ .ptr = &harness, .is_cancelled_fn = Harness.isGloballyCancelled } };
+            if (harness.cancel_globally) runtime.config.cancellation = .{ .ptr = &harness, .is_cancelled_fn = Harness.isGloballyCancelled };
             harness.cancel_text = if (first) "hello 00000" else "hello 00032";
             const before = harness.queued.items.len;
             var scope: FailureScope = .{};
             if (harness.cancel_globally) {
-                try std.testing.expectError(error.EnrichmentWaitCanceled, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
+                try std.testing.expectError(error.Cancelled, processChunkedDenseWindow(runtime, &requests, &cache, &window, &scope));
                 try std.testing.expect(harness.globally_cancelled.load(.acquire));
                 try std.testing.expectEqual(before, harness.queued.items.len);
                 return;

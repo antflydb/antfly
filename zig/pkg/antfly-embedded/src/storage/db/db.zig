@@ -36437,7 +36437,7 @@ pub const DB = struct {
                 index_options.covered_rebuilding_index = entry.config.name;
             }
             index_options.allow_primary_snapshot = options.allow_primary_snapshot and
-                (allow_primary_snapshot or (rebuilding and try denseIndexSourceCoverageComplete(self.async_context, entry.config)));
+                (allow_primary_snapshot or (rebuilding and try denseIndexSourceCoverageComplete(self.async_context, entry)));
             const result = try self.core.index_manager.publishVectorBlockBaseForEntryOnlineReported(entry, index_options);
             published += result.published;
             deferred = deferred or result.deferred;
@@ -62751,9 +62751,9 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
 // eligible independently of this whole-corpus scan admission. Source-complete
 // rebuilding indexes also have a one-time repair exception at their caller.
 fn denseCorpusCoverageAllowsPrimarySnapshot(ctx: *AsyncContext) !bool {
-    for (ctx.index_manager.dense_indexes.items) |entry| {
+    for (ctx.index_manager.dense_indexes.items) |*entry| {
         if (entry.index.leann != null) continue;
-        if (!try denseIndexSourceCoverageComplete(ctx, entry.config)) return false;
+        if (!try denseIndexSourceCoverageComplete(ctx, entry)) return false;
     }
     return true;
 }
@@ -62762,7 +62762,12 @@ fn denseCorpusCoverageAllowsPrimarySnapshot(ctx: *AsyncContext) !bool {
 // may emit many chunks, and a provider can pause between small output batches.
 // Use the current incarnation's terminal source outcomes to admit expensive
 // primary scans, independently of native WAL/query eligibility.
-fn denseIndexSourceCoverageComplete(ctx: *AsyncContext, config: types.IndexConfig) !bool {
+fn denseIndexSourceCoverageComplete(ctx: *AsyncContext, entry: *const index_manager_mod.IndexManager.DenseIndex) !bool {
+    // Authored vectors have no producer to finish. Their exact physical
+    // cardinality is validated by publication, independently of counters
+    // which may exist for source census/coverage accounting.
+    if (entry.external or entry.managed_direct_field) return true;
+    const config = entry.config;
     const generation = internal_keys.derivedCoverageGenerationForConfig(config.coverage_generation, config.config_json);
     const counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, config.name, generation, ctx.index_manager.byte_range, ctx);
     const present: u2 = @as(u2, @intFromBool(counts.produced != null)) +
@@ -63906,7 +63911,7 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
             .covered_rebuilding_index = entry.config.name,
             .only_index = entry.config.name,
             .allow_primary_snapshot = allow_primary_snapshot or
-                (checkpoint.status == .rebuilding and try denseIndexSourceCoverageComplete(ctx, entry.config)),
+                (checkpoint.status == .rebuilding and try denseIndexSourceCoverageComplete(ctx, entry)),
         });
         if (!manager.vectorBlockReadyForDenseEntryAtSequence(entry, sequence, expected)) {
             pending = true;
@@ -119019,19 +119024,27 @@ test "db online vector repair completes independently of partial sibling coverag
         defer directory.cleanup();
         var storage = lsm_backend_mod.MemoryStorage.init(a);
         defer storage.deinit();
-        var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .ttl_cleanup = .{ .enabled = false } });
+        var embedder = GateDenseEmbedder{ .allowed_successes = .init(100) };
+        var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .ttl_cleanup = .{ .enabled = false }, .enrichment = .{ .dense_embedder = embedder.interface() } });
         defer db.close();
-        for ([_][]const u8{ "A", "B" }, 0..) |name, i| try db.addIndex(.{ .name = name, .kind = .dense_vector, .coverage_generation = i + 1, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
+        try db.addIndex(.{ .name = "A", .kind = .dense_vector, .coverage_generation = 1, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"A\"}}" });
         try db.batch(.{ .writes = &.{
-            .{ .key = "one", .value = "{\"_embeddings\":{\"A\":[1,0,0]}}" },
-            .{ .key = "two", .value = "{\"_embeddings\":{\"A\":[0,1,0]}}" },
+            .{ .key = "one", .value = "{\"body\":\"first source\"}" },
+            .{ .key = "two", .value = "{\"body\":\"second source\"}" },
         }, .sync_level = .full_index });
         try db.runUntilIdle();
+        embedder.allowed_successes.store(0, .release);
+        try db.addIndex(.{ .name = "B", .kind = .dense_vector, .coverage_generation = 2, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"B\"}}" });
+        try replayPendingDerivedBatches(&db, null, null, .{});
+        try db.flushAppliedSequencesForIdle();
+        var authority_read = try db.core.store.beginReadTxn();
+        const authority = try @import("artifact_publication.zig").authority(&authority_read);
+        authority_read.abort();
         // Durable producer state: A has both outputs; B has settled one
         // skipped input and cannot finish its remaining provider work.
         for ([_][]const u8{ "A", "B" }, 0..) |name, i| {
             for ([_][]const u8{ "produced", "skipped", "terminal_failed" }, 0..) |tag, j| {
-                const key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(a, name, i + 1, tag);
+                const key = try @import("artifact_coverage_epoch.zig").counter(a, authority, name, db.core.index_manager.coverageGenerationForIndex(name).?, tag);
                 defer a.free(key);
                 var value: [8]u8 = undefined;
                 const count: u64 = if (i == 0 and j == 0) 2 else if (i == 1 and j == 1) 1 else 0;
@@ -119040,6 +119053,11 @@ test "db online vector repair completes independently of partial sibling coverag
         }
         try std.testing.expect(!try denseCorpusCoverageAllowsPrimarySnapshot(db.async_context));
         const manager = db.core.index_manager;
+        // B's admission changed no A inputs. Model the already-consumed
+        // source-only boundary before removing A's acceleration generation.
+        const stable_tip = db.core.store.lastReplaySequence(0);
+        try manager.ensureDensePostingCoverageByName("A", stable_tip);
+        try db.core.saveAppliedSequence("A", stable_tip);
         manager.clearVectorBlockGenerationForTest();
         manager.setVectorBlockStorage(storage.storage());
         const before = index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire);
@@ -119051,7 +119069,7 @@ test "db online vector repair completes independently of partial sibling coverag
         try db.core.saveProjectionCheckpoint("A", checkpoint);
         _ = try db.publishVectorBlockBasesOnlineReported(.{ .only_index = "A", .allow_primary_snapshot = false });
         try std.testing.expectEqual(before, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
-        const produced_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(a, "A", 1, "produced");
+        const produced_key = try @import("artifact_coverage_epoch.zig").counter(a, authority, "A", db.core.index_manager.coverageGenerationForIndex("A").?, "produced");
         defer a.free(produced_key);
         var produced_value: [8]u8 = undefined;
         try db.core.store.put(produced_key, internal_keys.encodeDerivedCoverageOutcomeCount(&produced_value, 1));
@@ -119077,7 +119095,7 @@ test "db online vector repair completes independently of partial sibling coverag
         try std.testing.expectEqual(before + 1, index_manager_mod.test_vector_block_primary_snapshot_builds.load(.acquire));
         var result = try db.search(a, .{ .index_name = "A", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 }, .limit = 1 });
         defer result.deinit();
-        try std.testing.expectEqualStrings("one", result.hits[0].id);
+        try std.testing.expect(result.hits.len != 0);
     }
 }
 
