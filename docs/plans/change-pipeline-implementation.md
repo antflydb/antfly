@@ -5843,3 +5843,54 @@ All original scope remains active: durable manifest retention is implemented,
 while production destination/worker integration, real lifecycle handover and
 all-owner release plus the original feeds/bootstrap/retention/pgoutput/actual
 Antfly client qualification acceptance criteria remain unfinished.
+
+### Bounded durable source acceptance receipts
+
+`source_destination_receipt.zig` converts positive checkpoint observations into
+bounded internal metadata receipts. Each receipt binds its original reservation,
+retained manifest digest, complete source reference/token and request-qualified
+checkpoint evidence. It references the retained manifest rather than copying
+routing/chunk metadata into the 8 KiB receipt. Receipt creation leaves metadata's
+committed frontier untouched; acceptance is separate from all-owner completion,
+source ACK, index coverage and retention release.
+
+Decoding binds current applied actor state, original checkpoint authority,
+artifact specification and retained manifest. It remains usable after acceptance
+clears the pending reservation and during garbage cleanup. Exact accepted metadata
+reference plus the artifact ledger's cumulative reclamation floor recognizes
+completed cleanup after newer attempts own the current manifest or replace the
+last-reclaimed identity. A token beyond that proven floor never becomes a
+reclaimed result, even in a structurally valid generic metadata row. No native
+proof or new owner authority is reconstructed after manifest reclamation.
+
+Actor-facing `resolveDelivery` and `admitDelivery` now return these bounded receipts
+from the metadata-bound admission bridge. Closing blocks admission before native
+I/O while positive resolution of original pending work remains available. The
+whole synchronous operation preserves the earliest request/route deadline and
+cancellation through receipt encoding.
+
+Focused tests passed with the maximum 1024-byte checkpoint containing JSON control
+characters (`source-destination-receipt-test.log`). The receipt stays within its
+8 KiB bound, accepted progress does not become committed progress, and cleanup
+recovers after metadata roundtrip, artifact retirement and reclamation. Expanded
+runs additionally cover actor closing/draining and replay across newer pending
+and reclaimed attempts. Final qualification follows below.
+
+These are internal receipt/admission interfaces; successful production source
+activation, destination worker wiring and all-owner release remain unfinished,
+as do all original remaining issue acceptance criteria.
+
+Final `completion-frozen-plan-test history-control-apply-test -Dstrip=true -j1`
+exited 0 (`source-destination-receipt-floor-final-test.log`): all six focused
+tests, 27 selected linked tests and six selected local tests passed, zero
+skips/failures/leaks. This includes the cumulative-floor counterexample and
+idempotent old cleanup while a new attempt is pending and after that attempt
+is reclaimed. Native regression tests remain green; the new receipt/actor
+acceptance scenarios use modeled checkpoint evidence and do not prove a real
+source worker activation or successful scoped BEGIN through production metadata.
+
+Source-catalog, engine-error and OpenAPI checks passed
+(`source-destination-receipt-contract-check.log`), including nine schema fragment
+tests. The receipt is a new versioned opaque internal format; existing Raft,
+metadata and ABI versions are unchanged. No issue is closed, and the full
+original implementation goal remains active.

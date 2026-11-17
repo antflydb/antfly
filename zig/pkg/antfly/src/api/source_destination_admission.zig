@@ -66,6 +66,40 @@ pub const Admission = struct {
     artifacts: destination.Ports,
     checkpoints: checkpoints.Port,
 
+    fn grantFromState(a: A, state: source.State) !Grant {
+        try state.validate();
+        if (!state.scope_fencing or !state.manifest_retention or state.retired) return error.UnsupportedOperation;
+        const pending = state.pending orelse return error.SourcePendingWork;
+        const record = state.artifact_control.?.current orelse return error.SourcePendingWork;
+        return Grant.init(a, state.scope.?, pending, record);
+    }
+    /// Actor-facing result for metadata acceptance. Current applied state gates
+    /// every call; the returned receipt does not advance committed progress.
+    pub fn resolveDelivery(self: Admission, a: A, state: source.State, fence: metadata.CatalogRouteFence, original: Context) !?@import("../metadata/source_delivery.zig").Acceptance {
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
+        try context.ensureActive();
+        var grant = try grantFromState(a, state);
+        defer grant.deinit();
+        const native = (try self.resolve(a, &grant, fence, context)) orelse return null;
+        const result = try @import("source_destination_receipt.zig").accept(a, state, native);
+        errdefer a.free(result.receipt);
+        try context.ensureActive();
+        return result;
+    }
+    pub fn admitDelivery(self: Admission, a: A, state: source.State, fence: metadata.CatalogRouteFence, original: Context) !@import("../metadata/source_delivery.zig").Acceptance {
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
+        try context.ensureActive();
+        if (state.closing) return error.SourcePendingWork;
+        var grant = try grantFromState(a, state);
+        defer grant.deinit();
+        const native = try self.admit(a, &grant, fence, context);
+        const result = try @import("source_destination_receipt.zig").accept(a, state, native);
+        errdefer a.free(result.receipt);
+        try context.ensureActive();
+        return result;
+    }
     pub fn resolve(self: Admission, a: A, grant: *const Grant, fence: metadata.CatalogRouteFence, original: Context) !?Accepted {
         var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
         const context = scope.context();
