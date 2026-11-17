@@ -564,12 +564,19 @@ pub fn loadState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id
 }
 
 pub fn getById(alloc: std.mem.Allocator, txn: anytype, group_id: u64, kind: domain.Kind, id: u64) !?std.json.Parsed(domain.Resource) {
+    return getByIdLimited(alloc, txn, group_id, kind, id, std.math.maxInt(usize));
+}
+
+/// Offline readers bound primary catalog records without requiring the current
+/// version of the rebuildable name indexes.
+pub fn getByIdLimited(alloc: std.mem.Allocator, txn: anytype, group_id: u64, kind: domain.Kind, id: u64, max_bytes: usize) !?std.json.Parsed(domain.Resource) {
     const key = try recordKeyAlloc(alloc, group_id, kind, id);
     defer alloc.free(key);
     const bytes = txn.get(key) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
+    if (bytes.len > max_bytes) return error.PreflightLimitExceeded;
     var parsed = try std.json.parseFromSlice(domain.Resource, alloc, bytes, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
     if (parsed.value.kind != kind or parsed.value.id != id) return error.InvalidCatalogRecord;

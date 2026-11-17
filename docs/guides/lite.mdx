@@ -309,6 +309,44 @@ absent. A page can be empty if its window contains only skipped manifests.
 When a backup's table details exceed the page size, its entry sets
 `table_details_omitted`. Use the backup ID to restore the entire backup.
 
+**Restore data under a trusted definition.** To prepare a standalone file from
+an uploaded standalone Lite table without running that file, use:
+
+```bash
+antfly restore --data-only --input uploaded.aflite --out prepared.aflite \
+  --table docs --definition trusted.json
+```
+
+The caller owns `trusted.json`, which contains `schema` and `indexes` objects.
+The selected table must be in `default.public`, and its authoritative schema
+and indexes must match that definition. Other database/namespace scopes are
+currently unsupported.
+This restricted profile supports document records, the default full-text index,
+and external dense embedding indexes with `name`, `type`, `external: true`,
+`dimension`, and `distance_metric`. It rejects replication sources and stored
+enrichment/resolver definitions. It copies existing finite vectors, including
+partial coverage, and rebuilds indexes locally without inference. Other artifact
+kinds and relational rows are unsupported.
+
+The source is opened read-only through native storage readers. Its server is
+never started, and its system catalogs, credentials, jobs, identities, and
+source-owned index configuration are never installed in the output. The new
+file gets the selected table name and the caller's definition. This is a
+restricted data transfer, not a lossless backup of every database feature.
+
+Success emits a JSON report with source/output SHA-256 hashes, file sizes, and
+document/vector counts. `--out` must be a new path; failure before publication
+leaves an existing file untouched. The caller can validate this prepared file
+and select it using its own generation transaction. This command does not
+contact or overwrite a running server.
+
+Defaults are 512 MiB of input, 1 GiB per expanded portable stream or completed
+output, 250,000 documents, and 16 MiB per document. Use `--max-input-bytes` and
+`--max-expanded-bytes` to change the byte limits. Allow space beside the output
+for both the portable scratch file and the new database. A process interruption
+can leave temporary siblings with `.restore-` in their names; remove these only
+when no restore is using them.
+
 For an offline source inventory and compatibility report, use:
 
 ```bash

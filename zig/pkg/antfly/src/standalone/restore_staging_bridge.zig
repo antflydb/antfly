@@ -183,3 +183,43 @@ pub fn inspectInputJsonAlloc(allocator: std.mem.Allocator, input: []const u8, de
     defer antfly_backup_preflight_free(bytes.ptr, bytes.len);
     return allocator.dupe(u8, bytes);
 }
+
+pub const DataRestoreContext = extern struct {
+    input_ptr: [*]const u8,
+    input_len: usize,
+    output_ptr: [*]const u8,
+    output_len: usize,
+    table_ptr: [*]const u8,
+    table_len: usize,
+    definition_ptr: [*]const u8,
+    definition_len: usize,
+    max_input_bytes: u64,
+    max_expanded_bytes: u64,
+    result_ptr: *?[*]u8,
+    result_len: *usize,
+};
+extern fn antfly_data_restore(context: *const DataRestoreContext) callconv(.c) c_int;
+
+pub fn restoreDataJsonAlloc(allocator: std.mem.Allocator, input: []const u8, output: []const u8, table: []const u8, definition: []const u8, max_input_bytes: u64, max_expanded_bytes: u64) ![]u8 {
+    if (comptime use_direct_implementation) return @import("data_restore.zig").restoreJsonAlloc(allocator, input, output, table, definition, .{ .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes });
+    var ptr: ?[*]u8 = null;
+    var len: usize = 0;
+    const status = antfly_data_restore(&.{
+        .input_ptr = input.ptr,
+        .input_len = input.len,
+        .output_ptr = output.ptr,
+        .output_len = output.len,
+        .table_ptr = table.ptr,
+        .table_len = table.len,
+        .definition_ptr = definition.ptr,
+        .definition_len = definition.len,
+        .max_input_bytes = max_input_bytes,
+        .max_expanded_bytes = max_expanded_bytes,
+        .result_ptr = &ptr,
+        .result_len = &len,
+    });
+    if (status != Status.ok) return if (status == Status.out_of_memory) error.OutOfMemory else error.InvalidBackupRequest;
+    const bytes = (ptr orelse return error.InvalidBackupRequest)[0..len];
+    defer antfly_backup_preflight_free(bytes.ptr, bytes.len);
+    return allocator.dupe(u8, bytes);
+}
