@@ -268,6 +268,7 @@ pub const RecoveryOptions = struct {
 
 pub const TxnSummary = struct {
     ordinary_producer: bool = false,
+    legacy_producer: bool = false,
     source_scope: ?source_scope.Reference = null,
     source_purpose: ?[32]u8 = null,
     txn_id: TxnId,
@@ -342,6 +343,7 @@ pub const ResolutionExtraBatch = struct {
 pub const MutationExtraBatch = struct {
     /// Trusted native ingress only. Never inferred on a replay of an old BEGIN.
     ordinary_producer: bool = false,
+    legacy_producer: bool = false,
     source_scope: ?source_scope.Reference = null,
     completion_owner: ?completion.RoutedOwner = null,
     /// Computed by trusted private PREPARE dispatch over the complete original
@@ -404,6 +406,7 @@ pub const ReplayAppend = struct {
 
 pub const IntentBatch = struct {
     ordinary_producer: bool = false,
+    legacy_producer: bool = false,
     document_revisions: bool = false,
     writes: []docstore.KVPair = &.{},
     deletes: [][]const u8 = &.{},
@@ -436,6 +439,7 @@ pub const IntentBatch = struct {
 
 const TxnRecord = struct {
     ordinary_producer: bool = false,
+    legacy_producer: bool = false,
     source_scope: ?source_scope.Reference = null,
     source_purpose: ?[32]u8 = null,
     document_revisions: bool = false,
@@ -735,7 +739,7 @@ pub const TxnManager = struct {
             };
             if (!qualified) return error.ChangefeedCapabilityUnsupported;
         }
-        if (extra_batch.ordinary_producer and (extra_batch.source_purpose != null or extra_batch.source_scope != null)) return error.SourceTransactionIdentityConflict;
+        if ((extra_batch.ordinary_producer and extra_batch.legacy_producer) or ((extra_batch.ordinary_producer or extra_batch.legacy_producer) and (extra_batch.source_purpose != null or extra_batch.source_scope != null))) return error.SourceTransactionIdentityConflict;
         if (extra_batch.source_purpose) |purpose| if (std.mem.allEqual(u8, &purpose, 0)) return error.SourceTransactionIdentityConflict;
         if (extra_batch.source_scope) |scope| {
             try scope.validate();
@@ -762,7 +766,7 @@ pub const TxnManager = struct {
                 if (!supplied) return TxnError.DecisionConflict;
                 for (extra_batch.deletes) |deleted| if (std.mem.eql(u8, deleted, &completion_key)) return TxnError.DecisionConflict;
             }
-            if (record.ordinary_producer != extra_batch.ordinary_producer or !samePurpose(record.source_purpose, extra_batch.source_purpose) or !sameSourceScope(record.source_scope, extra_batch.source_scope)) return error.SourceTransactionIdentityConflict;
+            if (record.ordinary_producer != extra_batch.ordinary_producer or record.legacy_producer != extra_batch.legacy_producer or !samePurpose(record.source_purpose, extra_batch.source_purpose) or !sameSourceScope(record.source_scope, extra_batch.source_scope)) return error.SourceTransactionIdentityConflict;
             if (record.status != .pending or record.begin_timestamp != timestamp) return TxnError.DecisionConflict;
             if (record.coordinator_known and record.coordinator != coordinator) return TxnError.DecisionConflict;
             if (record.retain_terminal_known and record.retain_terminal != retain_terminal) return TxnError.DecisionConflict;
@@ -792,6 +796,7 @@ pub const TxnManager = struct {
         }
         const record = TxnRecord{
             .ordinary_producer = extra_batch.ordinary_producer,
+            .legacy_producer = extra_batch.legacy_producer,
             .source_purpose = extra_batch.source_purpose,
             .source_scope = extra_batch.source_scope,
             .status = .pending,
@@ -852,12 +857,12 @@ pub const TxnManager = struct {
     }
 
     pub fn completionPrepareScopedStatus(self: *TxnManager, txn_id: TxnId, input_digest: ?[32]u8, source_purpose: ?[32]u8, owner: ?completion.RoutedOwner, scope: ?source_scope.Reference) !?bool {
-        return self.completionPrepareProducerStatus(txn_id, input_digest, source_purpose, owner, scope, false);
+        return self.completionPrepareProducerStatus(txn_id, input_digest, source_purpose, owner, scope, false, false);
     }
 
-    pub fn completionPrepareProducerStatus(self: *TxnManager, txn_id: TxnId, input_digest: ?[32]u8, source_purpose: ?[32]u8, owner: ?completion.RoutedOwner, scope: ?source_scope.Reference, ordinary_producer: bool) !?bool {
+    pub fn completionPrepareProducerStatus(self: *TxnManager, txn_id: TxnId, input_digest: ?[32]u8, source_purpose: ?[32]u8, owner: ?completion.RoutedOwner, scope: ?source_scope.Reference, ordinary_producer: bool, legacy_producer: bool) !?bool {
         var frozen = (try self.getCompletionAdmission(self.alloc, txn_id)) orelse {
-            if (owner != null or ordinary_producer) return error.SourceTransactionIdentityConflict;
+            if (owner != null or ordinary_producer or legacy_producer) return error.SourceTransactionIdentityConflict;
             return null;
         };
         defer frozen.deinit();
@@ -880,7 +885,7 @@ pub const TxnManager = struct {
         defer probe.abort();
         try @import("committed_history.zig").requireCompletionReservation(&probe, namespace[0..24].*, plan);
         const record = try self.loadTransactionRecord(txn_id);
-        if (record.ordinary_producer != ordinary_producer or !samePurpose(record.source_purpose, source_purpose) or !sameSourceScope(record.source_scope, scope)) return error.SourceTransactionIdentityConflict;
+        if (record.ordinary_producer != ordinary_producer or record.legacy_producer != legacy_producer or !samePurpose(record.source_purpose, source_purpose) or !sameSourceScope(record.source_scope, scope)) return error.SourceTransactionIdentityConflict;
         if (record.status != .pending) return TxnError.DecisionConflict;
         return record.prepared_known and record.prepared;
     }
@@ -896,7 +901,7 @@ pub const TxnManager = struct {
         for (intents) |intent| if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
-        if (record.ordinary_producer != extra_batch.ordinary_producer or !samePurpose(record.source_purpose, extra_batch.source_purpose) or !sameSourceScope(record.source_scope, extra_batch.source_scope)) return error.SourceTransactionIdentityConflict;
+        if (record.ordinary_producer != extra_batch.ordinary_producer or record.legacy_producer != extra_batch.legacy_producer or !samePurpose(record.source_purpose, extra_batch.source_purpose) or !sameSourceScope(record.source_scope, extra_batch.source_scope)) return error.SourceTransactionIdentityConflict;
         if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
             var frozen = saved;
             defer frozen.deinit();
@@ -1603,7 +1608,7 @@ pub const TxnManager = struct {
                 writes_initialized += 1;
             }
         }
-        return .{ .ordinary_producer = record.ordinary_producer, .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries, .document_revisions = record.document_revisions };
+        return .{ .ordinary_producer = record.ordinary_producer, .legacy_producer = record.legacy_producer, .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries, .document_revisions = record.document_revisions };
     }
 
     pub fn loadSchemaBinding(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?SchemaBinding {
@@ -1895,6 +1900,7 @@ pub const TxnManager = struct {
             const txn_id = record_entry.key[records_prefix.len..][0..16].*;
             try items.append(alloc, .{
                 .ordinary_producer = record.ordinary_producer,
+                .legacy_producer = record.legacy_producer,
                 .source_purpose = record.source_purpose,
                 .source_scope = record.source_scope,
                 .txn_id = txn_id,
@@ -2651,6 +2657,10 @@ pub const TxnManager = struct {
         if (record.status != .pending or !record.prepared_known or record.prepared or record.intent_revision != 0) return error.SourcePendingWork;
     }
 
+    pub fn isLegacyProducer(self: *TxnManager, txn_id: TxnId) !bool {
+        return (try self.loadTransactionRecord(txn_id)).legacy_producer;
+    }
+
     pub fn isOrdinaryProducer(self: *TxnManager, txn_id: TxnId) !bool {
         return (try self.loadTransactionRecord(txn_id)).ordinary_producer;
     }
@@ -2703,9 +2713,9 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
-        if (record.ordinary_producer and (record.source_purpose != null or record.source_scope != null)) return error.InvalidTxnRecord;
+        if ((record.ordinary_producer and record.legacy_producer) or ((record.ordinary_producer or record.legacy_producer) and (record.source_purpose != null or record.source_scope != null))) return error.InvalidTxnRecord;
         if (record.source_scope != null and (record.source_purpose == null or !record.retain_terminal)) return error.InvalidTxnRecord;
-        const buf = try self.alloc.alloc(u8, if (record.ordinary_producer) txn_record_v10_size else if (record.source_scope != null) txn_record_v9_size else if (record.source_purpose != null) txn_record_v8_size else if (record.document_revisions) txn_record_v7_size else txn_record_v6_size);
+        const buf = try self.alloc.alloc(u8, if (record.ordinary_producer or record.legacy_producer) txn_record_v10_size else if (record.source_scope != null) txn_record_v9_size else if (record.source_purpose != null) txn_record_v8_size else if (record.document_revisions) txn_record_v7_size else txn_record_v6_size);
         buf[0] = @backingInt(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
@@ -2717,9 +2727,11 @@ pub const TxnManager = struct {
         buf[50] = @intFromBool(record.coordinator);
         buf[51] = @intFromBool(record.retain_terminal);
         buf[52] = @intFromBool(record.intents_resolved);
-        if (record.ordinary_producer) {
+        if (record.ordinary_producer or record.legacy_producer) {
             buf[53] = @intFromBool(record.document_revisions);
-            buf[54] = 1; // immutable authenticated ordinary provenance
+            // v10 ordinary remains byte-for-byte stable. Protocol 44 adds
+            // v11 legacy discriminator 2, rejected by earlier decoders.
+            buf[54] = if (record.ordinary_producer) 1 else 2;
         } else if (record.source_purpose) |purpose| {
             buf[53] = @intFromBool(record.document_revisions);
             buf[54] = if (record.source_scope != null) 2 else 1; // scoped or legacy source delivery
@@ -3131,7 +3143,7 @@ pub const TxnManager = struct {
             };
             if (previous_bytes) |bytes| {
                 const previous = try decodeRecord(bytes);
-                if (previous.ordinary_producer != next_record.ordinary_producer) return error.SourceTransactionIdentityConflict;
+                if (previous.ordinary_producer != next_record.ordinary_producer or previous.legacy_producer != next_record.legacy_producer) return error.SourceTransactionIdentityConflict;
             }
             if (producer_closed != null) {
                 // Plain/legacy records cannot acquire authority after closure.
@@ -3155,6 +3167,7 @@ pub const TxnManager = struct {
                     try producer_policy.Store.require(scope_arena.allocator(), &batch, try source_scope.Basis.fromOwner(member.routed_owner.?), .ordinary);
                 }
             }
+            if (next_record.legacy_producer and previous_bytes == null) try source_scope.Store.requireLegacyAllowed(scope_arena.allocator(), &batch);
             if (write.value.len == txn_record_v8_size) {
                 const legacy = try decodeRecord(write.value);
                 if (legacy.status == .pending and legacy.source_purpose != null) {
@@ -3605,9 +3618,10 @@ pub fn completionCoordinatorRecord(raw: []const u8) !@import("history_decision_w
 fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == 0 or raw[0] > @backingInt(TxnStatus.aborted)) return error.InvalidTxnRecord;
     if (raw.len == txn_record_v10_size) {
-        if (raw[53] > 1 or raw[54] != 1) return error.InvalidTxnRecord;
+        if (raw[53] > 1 or (raw[54] != 1 and raw[54] != 2)) return error.InvalidTxnRecord;
         var record = try decodeRecord(raw[0..txn_record_v6_size]);
-        record.ordinary_producer = true;
+        record.ordinary_producer = raw[54] == 1;
+        record.legacy_producer = raw[54] == 2;
         record.document_revisions = raw[53] == 1;
         return record;
     }
@@ -6600,6 +6614,9 @@ test "transaction source purpose ordinary provenance is explicit immutable and r
     corrupt[54] = 0;
     try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(corrupt));
     corrupt[54] = 2;
+    try std.testing.expect((try decodeRecord(corrupt)).legacy_producer);
+    try std.testing.expect(!(try decodeRecord(corrupt)).ordinary_producer);
+    corrupt[54] = 3;
     try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(corrupt));
     corrupt[54] = 1;
     corrupt[53] = 2;

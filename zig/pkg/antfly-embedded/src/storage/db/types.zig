@@ -206,6 +206,7 @@ pub const MergeReplicationCheckpoint = struct {
 pub const TransactionMutation = union(enum) {
     begin: struct {
         ordinary_producer: bool = false,
+        legacy_producer: bool = false,
         txn_id: TxnId,
         begin_timestamp: u64,
         created_at_ns: u64,
@@ -225,6 +226,7 @@ pub const TransactionMutation = union(enum) {
     },
     prepare: struct {
         ordinary_producer: bool = false,
+        legacy_producer: bool = false,
         txn_id: TxnId,
         topology_epoch: u64,
         completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
@@ -1780,6 +1782,7 @@ pub const TransactionIntegrityOperation = @import("relational_integrity_contract
 pub const TransactionIntentRequest = struct {
     /// Trusted private origin. Missing labels on older requests stay absent.
     completion_ordinary_producer: bool = false,
+    completion_legacy_producer: bool = false,
     completion_owner: ?@import("../transaction_completion.zig").RoutedOwner = null,
     /// Trusted digest computed from canonical private PREPARE before native
     /// materialization. A frozen v2 plan rejects omission or substitution.
@@ -1815,7 +1818,7 @@ pub const TransactionIntentRequest = struct {
     integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
 
     pub fn sourcePurpose(self: @This()) !?[32]u8 {
-        if (self.completion_ordinary_producer and (self.completion_owner == null or self.completion_source_purpose != null or self.completion_source_scope != null or self.completion_source_checkpoint != null or self.source_admission != null)) return error.SourceTransactionIdentityConflict;
+        if ((self.completion_ordinary_producer and self.completion_legacy_producer) or ((self.completion_ordinary_producer or self.completion_legacy_producer) and (self.completion_owner == null or self.completion_source_purpose != null or self.completion_source_scope != null or self.completion_source_checkpoint != null or self.source_admission != null))) return error.SourceTransactionIdentityConflict;
         if (self.completion_source_scope) |scope| {
             try scope.validate();
             if (self.completion_source_purpose == null or self.completion_owner == null or self.source_admission != null) return error.InvalidSourceAdmission;
@@ -1849,7 +1852,7 @@ pub const TransactionIntentRequest = struct {
         var request: BatchRequest = .{
             .timestamp_ns = begin_timestamp,
             .sync_level = .write,
-            .transaction = .{ .prepare = .{ .ordinary_producer = self.completion_ordinary_producer, .txn_id = txn_id, .topology_epoch = topology_epoch, .completion_owner = owner, .source_purpose = self.completion_source_purpose, .source_scope = self.completion_source_scope, .source_checkpoint = self.completion_source_checkpoint } },
+            .transaction = .{ .prepare = .{ .ordinary_producer = self.completion_ordinary_producer, .legacy_producer = self.completion_legacy_producer, .txn_id = txn_id, .topology_epoch = topology_epoch, .completion_owner = owner, .source_purpose = self.completion_source_purpose, .source_scope = self.completion_source_scope, .source_checkpoint = self.completion_source_checkpoint } },
         };
         // Compile-time exhaustiveness prevents newly added intent adjuncts
         // from being silently omitted from the frozen canonical input.
@@ -1857,6 +1860,7 @@ pub const TransactionIntentRequest = struct {
             if (comptime std.mem.eql(u8, name, "completion_owner") or
                 std.mem.eql(u8, name, "completion_input_digest") or
                 std.mem.eql(u8, name, "completion_ordinary_producer") or
+                std.mem.eql(u8, name, "completion_legacy_producer") or
                 std.mem.eql(u8, name, "completion_source_purpose") or
                 std.mem.eql(u8, name, "completion_source_scope") or
                 std.mem.eql(u8, name, "completion_source_checkpoint") or

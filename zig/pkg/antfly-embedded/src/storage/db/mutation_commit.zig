@@ -4206,7 +4206,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .ordered_apply_receipt = ordered_receipt,
                     // Original immutable provenance travels with the captured
                     // intent revision, including restart resolution.
-                    .source_producer = if (intents.ordinary_producer) .ordinary else .unlabelled,
+                    .source_producer = if (intents.ordinary_producer) .ordinary else if (intents.legacy_producer) .legacy_cdc else .unlabelled,
                     .durable_rows = &durable_rows,
                     .transaction_resolution = .{
                         .source_purpose = source_purpose,

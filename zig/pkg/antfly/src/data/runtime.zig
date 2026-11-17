@@ -44971,6 +44971,14 @@ fn consumerTests() type {
                         try participant.submit(fixture_alloc, &frozen, 0, fence, .begin, .{});
                         try participant.submit(fixture_alloc, &frozen, 0, fence, .prepare, .{});
                         try participant.submit(fixture_alloc, &frozen, 0, fence, .{ .resolve = .{ .status = .committed, .commit_version = 1001 } }, .{});
+                        const legacy_prepare = try (antfly.db.types.TransactionIntentRequest{ .completion_legacy_producer = true, .completion_owner = current_owner, .writes = &.{.{ .key = "legacy-producer-uncommitted", .value = "{}" }} }).completionBatch(@splat(249), 1000, current_owner.topology_epoch);
+                        var legacy_plan = try @import("../api/completion_plan.zig").Plan.freeze(fixture_alloc, @splat(249), @splat(250), current_owner, &.{.{ .owner = current_owner, .locator = locator, .roles = fixture_completion.Roles.effects, .prepare = legacy_prepare }}, platform_time.realtimeNs());
+                        defer legacy_plan.deinit();
+                        try std.testing.expect(legacy_plan.legacy_producer);
+                        try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_legacy_producer_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(fixture_alloc, try legacy_plan.begin(0)));
+                        try participant.submit(fixture_alloc, &legacy_plan, 0, fence, .begin, .{});
+                        try participant.submit(fixture_alloc, &legacy_plan, 0, fence, .prepare, .{});
+                        try participant.submit(fixture_alloc, &legacy_plan, 0, fence, .{ .resolve = .{ .status = .aborted, .commit_version = 1001 } }, .{});
                         const row: antfly.db.types.BatchRequest = .{ .source_producer = .ordinary, .timestamp_ns = 1002, .document_version_scheme = .revision_v1, .sync_level = .write, .writes = &.{.{ .key = "producer-envelope-row", .value = "{\"origin\":true}" }} };
                         try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_row_producer_protocol_version, try DataServer.requiredRaftBatchProtocolVersion(fixture_alloc, row));
                         _ = (try writer.writer().write(fixture_alloc, .{ .catalog = fence }, 601, "docs", row, .{ .remaining_ms = 5000, .forwards_remaining = 2, .campaign_allowed = false }, .{})) orelse return error.TestUnexpectedResult;
@@ -44982,7 +44990,7 @@ fn consumerTests() type {
                 const plan = frozen.admission;
                 const current_owner = frozen.participants[0].owner;
                 const txn_id = plan.transaction_id;
-                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_row_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_legacy_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
                 const positive_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = txn_id, .owner_fence = current_owner.digest(), .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const positive = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
@@ -45086,10 +45094,10 @@ fn consumerTests() type {
                 try std.testing.expectEqual(.complete, try recovery.run(a, current_owner, route.fence().?, "docs", txn_id, .{}));
                 try server.completionParticipantPort().submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
                 try remote_participant.submit(a, &frozen, 0, route.fence().?, .{ .publish = certificate_bytes }, .{});
-                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_row_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+                try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_legacy_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
                 // An idle root must remain readable after an ordered protocol
                 // barrier, without requiring another document mutation.
-                const idle_barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", @import("../common/data_raft_protocol.zig").batch_row_producer_protocol_version);
+                const idle_barrier = try data_raft_batch.encodeProtocolBarrier(a, "docs", @import("../common/data_raft_protocol.zig").batch_legacy_producer_protocol_version);
                 defer a.free(idle_barrier);
                 const idle_barrier_index = blk: {
                     lockAtomic(&server.data_raft_mutex);
@@ -45398,7 +45406,7 @@ fn consumerTests() type {
             try std.testing.expect(policy_applied.outcome.?.applied.consumer == null);
             const policy_observed = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect_policy = .{ .namespace = namespace, .authority = ref.authority } });
             try std.testing.expectEqualDeep(policy_applied.outcome.?.applied.policy, policy_observed.outcome.?.applied.policy);
-            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_row_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_legacy_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
         }
 
         test "data raft ordered history proposal authority fences term membership and missing owners" {

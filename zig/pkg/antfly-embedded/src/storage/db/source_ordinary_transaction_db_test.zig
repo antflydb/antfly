@@ -34,38 +34,68 @@ pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions
     const admission: completion.Admission = .{ .version = 3, .transaction_id = id, .admission_digest = @splat(244), .coordinator_namespace = owner.namespace, .coordinator_fence = owner.digest(), .participants = &members };
     const encoded = try completion.encodeAdmission(a, admission);
     defer a.free(encoded);
+    const legacy_id: [16]u8 = @splat(245);
+    var legacy_request: @import("types.zig").TransactionIntentRequest = .{ .completion_legacy_producer = true, .document_version_scheme = .revision_v1, .completion_owner = owner, .writes = &.{.{ .key = "legacy-txn-row", .value = "{}" }} };
+    const legacy_input = try wire.completionPrepareInput(a, try legacy_request.completionBatch(legacy_id, 50, owner.topology_epoch));
+    defer a.free(legacy_input);
+    legacy_request.completion_input_digest = completion.preparedInputDigest(owner.namespace, legacy_input);
+    var legacy_member = members[0];
+    legacy_member.input_digest = legacy_request.completion_input_digest;
+    var legacy_admission = admission;
+    legacy_admission.transaction_id = legacy_id;
+    legacy_admission.admission_digest = @splat(246);
+    legacy_admission.participants = &.{legacy_member};
+    const legacy_encoded = try completion.encodeAdmission(a, legacy_admission);
+    defer a.free(legacy_encoded);
     {
         var db = try db_mod.DB.open(a, path, options);
         defer db.close();
-        const grant: @import("../history_consumer.zig").Grant = .{ .namespace = owner.namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1, .limit = 4 * 1024 * 1024 };
+        // Each pending prepared transaction reserves both maximum schema images
+        // as well as its effects. This fixture deliberately retains two at once.
+        const grant: @import("../history_consumer.zig").Grant = .{ .namespace = owner.namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1, .limit = 16 * 1024 * 1024 };
         _ = try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 1 }, false);
-        _ = try db.applyOrderedSourceProducerClosure(owner, .{ .term = 1, .index = 2 }, false);
-        try std.testing.expectError(error.SourcePendingWork, db.beginReplicatedCompletionTransaction(encoded, owner, 100, 101, true, .{ .term = 1, .index = 3 }));
-        _ = try db.beginReplicatedOrdinaryCompletionTransaction(encoded, owner, 100, 101, true, .{ .term = 1, .index = 3 });
-        try std.testing.expectError(error.SourceTransactionIdentityConflict, db.beginReplicatedCompletionTransaction(encoded, owner, 100, 101, true, .{ .term = 1, .index = 3 }));
+        _ = try db.beginReplicatedLegacyCompletionTransaction(legacy_encoded, owner, 50, 51, true, .{ .term = 1, .index = 2 });
+        try db.writeReplicatedTransactionAtOrderedReceipt(legacy_id, legacy_request, .{ .term = 1, .index = 3 });
+        _ = try db.applyOrderedSourceProducerClosure(owner, .{ .term = 1, .index = 4 }, false);
+        try std.testing.expectError(error.SourcePendingWork, db.beginReplicatedCompletionTransaction(encoded, owner, 100, 101, true, .{ .term = 1, .index = 5 }));
+        var new_legacy = legacy_admission;
+        new_legacy.transaction_id = @splat(247);
+        new_legacy.admission_digest = @splat(248);
+        const new_legacy_bytes = try completion.encodeAdmission(a, new_legacy);
+        defer a.free(new_legacy_bytes);
+        try std.testing.expectError(error.SourcePendingWork, db.beginReplicatedLegacyCompletionTransaction(new_legacy_bytes, owner, 50, 51, true, .{ .term = 1, .index = 5 }));
+        try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(new_legacy.transaction_id));
+        _ = try db.beginReplicatedOrdinaryCompletionTransaction(encoded, owner, 100, 101, true, .{ .term = 1, .index = 5 });
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, db.beginReplicatedCompletionTransaction(encoded, owner, 100, 101, true, .{ .term = 1, .index = 5 }));
         var old_prepare = request;
         old_prepare.completion_ordinary_producer = false;
-        try std.testing.expectError(error.SourceTransactionIdentityConflict, db.writeReplicatedTransactionAtOrderedReceipt(id, old_prepare, .{ .term = 1, .index = 4 }));
-        try std.testing.expectEqual(@as(u64, 3), (try db.orderedApplyReceipt()).?.index);
-        try db.writeReplicatedTransactionAtOrderedReceipt(id, request, .{ .term = 1, .index = 4 });
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, db.writeReplicatedTransactionAtOrderedReceipt(id, old_prepare, .{ .term = 1, .index = 6 }));
+        try std.testing.expectEqual(@as(u64, 5), (try db.orderedApplyReceipt()).?.index);
+        try db.writeReplicatedTransactionAtOrderedReceipt(id, request, .{ .term = 1, .index = 6 });
         try std.testing.expect(try db.get(a, "ordinary-txn-row") == null);
     }
     {
         var db = try db_mod.DB.open(a, path, options);
         defer db.close();
+        try std.testing.expectEqual(@import("../transactions.zig").TxnStatus.pending, try db.getTransactionStatus(legacy_id));
+        try std.testing.expect(try db.get(a, "legacy-txn-row") == null);
+        try std.testing.expectError(error.SourcePendingWork, db.resolveReplicatedCompletionTransactionAtOrderedReceipt(legacy_id, .committed, 200, .{ .term = 1, .index = 7 }, null, owner));
+        try std.testing.expectError(error.SourcePendingWork, db.resolveReplicatedCompletionTransactionAtOrderedReceipt(legacy_id, .aborted, 200, .{ .term = 1, .index = 7 }, null, owner));
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, db.beginReplicatedOrdinaryCompletionTransaction(legacy_encoded, owner, 50, 51, true, .{ .term = 1, .index = 7 }));
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, db.beginReplicatedCompletionTransaction(legacy_encoded, owner, 50, 51, true, .{ .term = 1, .index = 7 }));
         var old_prepare = request;
         old_prepare.completion_ordinary_producer = false;
-        try std.testing.expectError(error.SourceTransactionIdentityConflict, db.writeReplicatedTransactionAtOrderedReceipt(id, old_prepare, .{ .term = 1, .index = 5 }));
-        try std.testing.expectEqual(@as(u64, 4), (try db.orderedApplyReceipt()).?.index);
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, db.writeReplicatedTransactionAtOrderedReceipt(id, old_prepare, .{ .term = 1, .index = 7 }));
+        try std.testing.expectEqual(@as(u64, 6), (try db.orderedApplyReceipt()).?.index);
         // Fresh PREPARE retry retains original images and advances only its marker.
-        try db.writeReplicatedTransactionAtOrderedReceipt(id, request, .{ .term = 1, .index = 5 });
-        try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(id, .committed, 200, .{ .term = 1, .index = 6 }, null, owner);
+        try db.writeReplicatedTransactionAtOrderedReceipt(id, request, .{ .term = 1, .index = 7 });
+        try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(id, .committed, 200, .{ .term = 1, .index = 8 }, null, owner);
         const row = (try db.get(a, "ordinary-txn-row")) orelse return error.TestExpectedOrdinaryDocument;
         defer a.free(row);
         try std.testing.expectEqualStrings("{\"value\":1}", row);
-        try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(id, .committed, 200, .{ .term = 1, .index = 6 }, null, owner);
-        try std.testing.expectEqual(@as(u64, 6), (try db.orderedApplyReceipt()).?.index);
-        const resolution = try db.historyResolution(a, .{ .version = 1, .authority = .raft, .namespace = owner.namespace, .transaction_id = id, .owner_fence = owner.digest(), .manifest_digest = (try admission.manifest(200)).digest(), .commit_version = 200, .minimum_applied_index = 6 });
+        try db.resolveReplicatedCompletionTransactionAtOrderedReceipt(id, .committed, 200, .{ .term = 1, .index = 8 }, null, owner);
+        try std.testing.expectEqual(@as(u64, 8), (try db.orderedApplyReceipt()).?.index);
+        const resolution = try db.historyResolution(a, .{ .version = 1, .authority = .raft, .namespace = owner.namespace, .transaction_id = id, .owner_fence = owner.digest(), .manifest_digest = (try admission.manifest(200)).digest(), .commit_version = 200, .minimum_applied_index = 8 });
         try std.testing.expect(resolution.resolution != null);
         try std.testing.expect(resolution.resolution.?.outcome == .effects);
     }

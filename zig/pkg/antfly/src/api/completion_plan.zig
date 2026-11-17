@@ -46,6 +46,7 @@ pub const Plan = struct {
     begin_timestamp: u64,
     created_at_ns: u64,
     ordinary_producer: bool = false,
+    legacy_producer: bool = false,
     source_purpose: ?[32]u8,
     source_scope: ?@import("antfly_local_sources").storage_source_scope.Reference = null,
     source_checkpoint: bool = false,
@@ -68,6 +69,7 @@ pub const Plan = struct {
         const members = try owned.alloc(completion.Participant, inputs.len);
         var begin_timestamp: u64 = 0;
         var ordinary_producer = false;
+        var legacy_producer = false;
         var source_purpose: ?[32]u8 = null;
         var source_scope: ?@import("antfly_local_sources").storage_source_scope.Reference = null;
         var checkpoint_count: usize = 0;
@@ -83,6 +85,7 @@ pub const Plan = struct {
             if (mutation != .prepare) return error.InvalidBatchRequest;
             const vote = mutation.prepare;
             if (i == 0) ordinary_producer = vote.ordinary_producer else if (ordinary_producer != vote.ordinary_producer) return error.SourceTransactionIdentityConflict;
+            if (i == 0) legacy_producer = vote.legacy_producer else if (legacy_producer != vote.legacy_producer) return error.SourceTransactionIdentityConflict;
             if (i == 0) source_purpose = vote.source_purpose else if (!std.meta.eql(source_purpose, vote.source_purpose)) return error.SourceTransactionIdentityConflict;
             if (i == 0) source_scope = vote.source_scope else if (!std.meta.eql(source_scope, vote.source_scope)) return error.SourceTransactionIdentityConflict;
             if (vote.source_scope) |scope| {
@@ -140,7 +143,7 @@ pub const Plan = struct {
             ids[follower] = participant.locator;
             follower += 1;
         }
-        return .{ .arena = arena, .admission = admission, .admission_bytes = encoded, .participants = participants, .participant_ids = ids, .begin_timestamp = begin_timestamp, .created_at_ns = created_at_ns, .ordinary_producer = ordinary_producer, .source_purpose = source_purpose, .source_scope = source_scope, .source_checkpoint = source_checkpoint, .source_checkpoint_receipts = source_checkpoint_receipts };
+        return .{ .arena = arena, .admission = admission, .admission_bytes = encoded, .participants = participants, .participant_ids = ids, .begin_timestamp = begin_timestamp, .created_at_ns = created_at_ns, .ordinary_producer = ordinary_producer, .legacy_producer = legacy_producer, .source_purpose = source_purpose, .source_scope = source_scope, .source_checkpoint = source_checkpoint, .source_checkpoint_receipts = source_checkpoint_receipts };
     }
 
     /// Derive a retry identity from canonical namespace order and the complete
@@ -175,7 +178,7 @@ pub const Plan = struct {
             defer request.deinit(a);
             const mutation = request.req.transaction orelse return error.InvalidBatchRequest;
             if (mutation != .prepare) return error.InvalidBatchRequest;
-            if (mutation.prepare.ordinary_producer != self.ordinary_producer or request.req.timestamp_ns != self.begin_timestamp or request.req.sync_level != .write or request.req.document_version_scheme != .revision_v1 or !std.meta.eql(mutation.prepare.source_purpose, self.source_purpose) or !std.meta.eql(mutation.prepare.source_scope, self.source_scope)) return error.SourcePayloadConflict;
+            if (mutation.prepare.ordinary_producer != self.ordinary_producer or mutation.prepare.legacy_producer != self.legacy_producer or request.req.timestamp_ns != self.begin_timestamp or request.req.sync_level != .write or request.req.document_version_scheme != .revision_v1 or !std.meta.eql(mutation.prepare.source_purpose, self.source_purpose) or !std.meta.eql(mutation.prepare.source_scope, self.source_scope)) return error.SourcePayloadConflict;
             if (!std.mem.eql(u8, &mutation.prepare.txn_id, &self.admission.transaction_id) or mutation.prepare.completion_owner == null or !std.mem.eql(u8, &mutation.prepare.completion_owner.?.digest(), &participant.owner.digest()) or mutation.prepare.topology_epoch != participant.owner.topology_epoch) return error.SourceTransactionIdentityConflict;
             const member = try self.admission.member(participant.owner.namespace);
             if (member.roles & completion.Roles.checkpoint != 0) checkpoints += 1;
@@ -288,7 +291,7 @@ pub const Plan = struct {
         if (index >= self.participants.len) return error.InvalidTxnRecord;
         const owner = self.participants[index].owner;
         try self.admission.requireRoutedOwner(owner);
-        return .{ .sync_level = .write, .transaction = .{ .begin = .{ .ordinary_producer = self.ordinary_producer, .txn_id = self.admission.transaction_id, .begin_timestamp = self.begin_timestamp, .created_at_ns = self.created_at_ns, .topology_epoch = owner.topology_epoch, .retain_terminal = true, .participants = self.participant_ids, .completion_admission = self.admission_bytes, .completion_owner = owner, .source_purpose = self.source_purpose, .source_scope = self.source_scope, .source_checkpoint = self.source_checkpoint, .source_checkpoint_receipts = self.source_checkpoint_receipts } } };
+        return .{ .sync_level = .write, .transaction = .{ .begin = .{ .ordinary_producer = self.ordinary_producer, .legacy_producer = self.legacy_producer, .txn_id = self.admission.transaction_id, .begin_timestamp = self.begin_timestamp, .created_at_ns = self.created_at_ns, .topology_epoch = owner.topology_epoch, .retain_terminal = true, .participants = self.participant_ids, .completion_admission = self.admission_bytes, .completion_owner = owner, .source_purpose = self.source_purpose, .source_scope = self.source_scope, .source_checkpoint = self.source_checkpoint, .source_checkpoint_receipts = self.source_checkpoint_receipts } } };
     }
 
     /// Parsed retry input has independent ownership and can outlive this plan.
@@ -478,6 +481,18 @@ test "source scope ordinary completion frozen plans retain original producer pro
     follower.namespace = @splat(5);
     follower.group_id = 3;
     const unlabelled: Input = .{ .owner = follower, .locator = "table2:00000004:docs:3", .roles = completion.Roles.effects, .prepare = try (types.TransactionIntentRequest{ .completion_owner = follower, .writes = &.{.{ .key = "other", .value = "{}" }} }).completionBatch(id, 100, follower.topology_epoch) };
+    input.prepare.transaction.?.prepare.legacy_producer = true;
+    var legacy = try Plan.freeze(a, id, @splat(4), owner, &.{input}, 101);
+    defer legacy.deinit();
+    const legacy_encoded = try legacy.encodeFrozen(a);
+    defer a.free(legacy_encoded);
+    var legacy_restored = try Plan.restoreFrozen(a, legacy_encoded, try frozenDigest(legacy_encoded));
+    defer legacy_restored.deinit();
+    try std.testing.expect(legacy_restored.legacy_producer and !legacy_restored.ordinary_producer);
+    try std.testing.expect((try legacy_restored.begin(0)).transaction.?.begin.legacy_producer);
+    legacy.legacy_producer = false;
+    try std.testing.expectError(error.SourcePayloadConflict, legacy.encodeFrozen(a));
+    input.prepare.transaction.?.prepare.legacy_producer = false;
     input.prepare.transaction.?.prepare.ordinary_producer = true;
     try std.testing.expectError(error.SourceTransactionIdentityConflict, Plan.freeze(a, id, @splat(4), owner, &.{ input, unlabelled }, 101));
 }

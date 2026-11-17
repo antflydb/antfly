@@ -104,7 +104,9 @@ pub fn applyReplicatedTransactionMutationInternal(
                         _ = try db.beginReplicatedScopedSourceCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, entry, purpose, scope)
                     else
                         _ = try db.beginReplicatedSourceCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, entry, purpose);
-                } else if (begin.ordinary_producer)
+                } else if (begin.legacy_producer)
+                    _ = try db.beginReplicatedLegacyCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, begin.retain_terminal, entry)
+                else if (begin.ordinary_producer)
                     _ = try db.beginReplicatedOrdinaryCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, begin.retain_terminal, entry)
                 else
                     _ = try db.beginReplicatedCompletionTransaction(raw, binding, begin.begin_timestamp, begin.created_at_ns, begin.retain_terminal, entry);
@@ -146,6 +148,7 @@ pub fn applyReplicatedTransactionMutationInternal(
             const namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(db.core.identity_namespace);
             const intents: db_mod.types.TransactionIntentRequest = .{
                 .completion_ordinary_producer = prepare.ordinary_producer,
+                .completion_legacy_producer = prepare.legacy_producer,
                 .completion_owner = prepare.completion_owner,
                 .completion_source_purpose = prepare.source_purpose,
                 .completion_source_scope = prepare.source_scope,

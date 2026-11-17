@@ -340,6 +340,8 @@ pub const VTable = struct {
     resolveReplicatedScopedSourceCompletionTransactionAtOrderedReceipt: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, identity: db.OrderedApplyReceipt, resolved_participant: ?[]const u8, owner: @import("transaction_completion.zig").RoutedOwner, purpose: [32]u8, scope: @import("source_scope.zig").Reference) Outcome(void),
     beginReplicatedCompletionTransaction: *const fn (self: *DB, encoded_plan: []const u8, owner: ?@import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: db.OrderedApplyReceipt) Outcome(@import("transactions.zig").TxnId),
     beginReplicatedOrdinaryCompletionTransaction: *const fn (self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: db.OrderedApplyReceipt) Outcome(@import("transactions.zig").TxnId),
+
+    beginReplicatedLegacyCompletionTransaction: *const fn (self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, retain_terminal: bool, identity: db.OrderedApplyReceipt) Outcome(@import("transactions.zig").TxnId),
     beginReplicatedTransactionScoped: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8) Outcome(@import("transactions.zig").TxnId),
     writeIntents: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, intents: []const @import("transactions.zig").WriteIntent, predicates: []const @import("transactions.zig").VersionPredicate) Outcome(void),
     writeTransaction: *const fn (self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) Outcome(void),
@@ -611,7 +613,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 61 retains immutable ordinary transaction producer provenance.
 /// Version 62 adds explicitly classified ordinary completion BEGIN.
 /// Version 63 preserves row producer provenance through primary materialization.
-pub const descriptor_version: u32 = 63;
+/// Version 64 retains immutable legacy completion transaction origin.
+pub const descriptor_version: u32 = 64;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

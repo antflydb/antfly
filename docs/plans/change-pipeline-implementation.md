@@ -6660,3 +6660,79 @@ successfully (`source-row-producer-gc.log`), preserving active/recent output;
 criterion marked complete by this transport milestone. The full goal remains
 active with trusted ingress/legacy CDC assignment, transaction-origin propagation,
 closure activation/drainage and all other original feature requirements open.
+
+### Explicit legacy completion provenance (verification in progress)
+
+Completion transactions now retain an explicit legacy origin separately from
+ordinary and older unclassified records. The producer record's 55-byte v10
+ordinary encoding remains byte-for-byte stable; protocol 44 adds the v11 legacy
+discriminator 2, which earlier decoders reject. Both provenance flags cannot be
+set together or mixed with source purpose/scope. BEGIN, PREPARE, the atomic record
+writer and prepared-status fast path compare the original stored provenance, so
+retries cannot strip a legacy label or replace it with ordinary classification.
+Captured intent batches and bounded transaction summaries retain the legacy bit;
+primary materialization uses it as legacy CDC admission. Resolution inherits the
+original record rather than accepting a new label.
+
+New `begin_legacy_completion_v1` and `prepare_legacy_completion_v1` phases require
+a true `legacy_producer` marker, full v3 completion membership and the original
+physical owner. Public parsing rejects these private commands. Old phases still
+mean unclassified. Frozen plans bind both provenance flags into the complete
+original input/admission digest and preserve them through artifact restore.
+Downgraded/stripped/false/dual labels fail closed. A new explicitly legacy record
+also checks the native strict-source gate before admission; it cannot enter an
+already strict root. Producer closure refuses new legacy admission and delayed
+legacy PREPARE/COMMIT/ABORT; qualified legacy drainage is still a separate missing
+contract, not inferred from denial or from an empty row result.
+
+Storage engine 64, native owner ABI 114, API kernel 35 and data protocol 44 fence
+the changed layouts/semantics. Metadata 105 and failure 89 are unchanged. The
+coordinator refuses to silently discard an explicit legacy label when retained
+history is unsupported. Production CDC producers are not switched to this mode
+yet: their non-history fallback and transaction routing must preserve that
+classification before it is enabled.
+
+The native DB fixture now begins and prepares an explicitly legacy nonempty
+transaction before closure. Across reopen it must remain pending, its row must
+remain invisible, delayed resolution must not advance an apply marker, and
+ordinary/unclassified BEGIN cannot adopt its original identity. A fresh legacy
+BEGIN after closure must leave no transaction record. The ordinary transaction in
+the same root still prepares and commits after reopen with retained effects.
+The linked authenticated HTTP/Raft fixture submits explicit legacy BEGIN,
+PREPARE and ABORT through an owned frozen plan, then keeps the group floor at 44
+while exercising the older ordinary, row-origin and source checkpoint protocols.
+These are trusted fixture origin/closure inputs, not completed production legacy
+handover or actual Antfly client qualification.
+
+Full generation and source-catalog/engine-error/OpenAPI checks passed
+(`source-legacy-producer-generate.log`,
+`source-legacy-producer-contract-check.log`). All 32 private-wire cases, covering
+both ordinary and legacy provenance, and six local boundary cases passed in the
+ongoing combined run (`source-legacy-producer-test.log`). Native/history/linked
+results follow below. The original full destination, retained history/public
+feeds, bootstrap/retention, pgoutput and actual existing-client acceptance scope
+remains open and active, alongside ingress assignment, non-history fallback,
+closure activation/drainage, special mutation and snapshot/cohort work. First
+strict activation stays closed.
+
+The combined run passed all 32 private-wire cases, six local boundary cases,
+all 16 history cases, and all six local plus 33 linked cases, with zero leaks
+(`source-legacy-producer-test.log`). The actual DB case initially failed
+`HistoryFull`: each prepared transaction reserves two maximum 1 MiB schema images
+plus effect/record overhead, so the prior 4 MiB fixture grant cannot hold both
+pending transactions. The fixture grant was increased to a bounded 16 MiB;
+production accounting/limits were not changed. The focused final native DB run
+passed, zero failures, skips or leaks
+(`source-legacy-producer-native-final-test.log`). It confirms pending legacy
+identity persists across reopen and cannot be stripped/reclassified, while the
+ordinary transaction can finish under the closed policy.
+
+Final source-catalog, engine-error and OpenAPI checks passed
+(`source-legacy-producer-contract-final-check.log`). Guarded cache cleanup passed,
+preserving active/recent output (`source-legacy-producer-gc.log`); 10.3 GiB remained
+free. `git diff --check` passed. No production CDC producer is automatically
+classified by this completion-transport milestone. Native and hosted transaction
+routing, non-history compatibility, trusted public ingress assignment and
+qualified old-work drainage still need implementation before activation. The
+full original objective remains active; no issue acceptance criteria were
+checked off and no issue was closed.
