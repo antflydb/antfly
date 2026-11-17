@@ -34,7 +34,7 @@ pub const Parsed = struct {
         self.* = undefined;
     }
 };
-const Kind = enum { atom, identifier, string, open, close, comma, semicolon, end };
+const Kind = enum { atom, identifier, string, open, close, comma, dot, semicolon, end };
 const Token = struct { kind: Kind, raw: []const u8 = "" };
 fn space(c: u8) bool {
     return std.mem.indexOfScalar(u8, " \t\r\n\x0b\x0c", c) != null;
@@ -55,6 +55,7 @@ const Parser = struct {
     input: []const u8,
     offset: usize = 0,
     look: ?Token = null,
+    qualified_names: bool = false,
     fn next(self: *Parser) !Token {
         if (self.look) |token| {
             self.look = null;
@@ -69,6 +70,7 @@ const Parser = struct {
             '(' => .open,
             ')' => .close,
             ',' => .comma,
+            '.' => if (self.qualified_names) .dot else null,
             ';' => .semicolon,
             else => null,
         };
@@ -89,7 +91,7 @@ const Parser = struct {
         }
         while (self.offset < self.input.len) {
             const b = self.input[self.offset];
-            if (space(b) or std.mem.indexOfScalar(u8, "(),;\"'", b) != null) break;
+            if (space(b) or (self.qualified_names and b == '.') or std.mem.indexOfScalar(u8, "(),;\"'", b) != null) break;
             self.offset += 1;
         }
         return .{ .kind = .atom, .raw = self.input[token_start..self.offset] };
@@ -148,6 +150,72 @@ const Parser = struct {
         if ((try self.next()).kind != .end) return error.PgReplicationSyntax;
     }
 };
+pub const PublicationCommand = struct {
+    pub const Action = enum { create, replace_members, drop };
+    pub const Table = struct { schema: ?[]const u8, name: []const u8 };
+
+    action: Action,
+    name: []const u8,
+    tables: []const Table = &.{},
+    if_exists: bool = false,
+};
+
+pub const ParsedPublication = struct {
+    arena: std.heap.ArenaAllocator,
+    command: PublicationCommand,
+
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+/// SQL publication DDL with explicit table membership. The caller resolves
+/// unqualified names using the current SQL session namespace.
+pub fn parsePublication(a: A, input: []const u8, max_tables: usize) !?ParsedPublication {
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    var p: Parser = .{ .a = arena.allocator(), .input = input, .qualified_names = true };
+    const action: ?PublicationCommand.Action = if (try p.keyword("CREATE"))
+        .create
+    else if (try p.keyword("ALTER"))
+        .replace_members
+    else if (try p.keyword("DROP"))
+        .drop
+    else
+        null;
+    if (action == null or !try p.keyword("PUBLICATION")) {
+        arena.deinit();
+        return null;
+    }
+    if (input.len > max_command_bytes) return error.ProgramLimitExceeded;
+    if (std.mem.indexOfScalar(u8, input, 0) != null or !std.unicode.utf8ValidateSlice(input)) return error.PgReplicationSyntax;
+    var if_exists = false;
+    if (action.? == .drop and try p.keyword("IF")) {
+        try p.need("EXISTS");
+        if_exists = true;
+    }
+    var command: PublicationCommand = .{ .action = action.?, .name = try p.name(), .if_exists = if_exists };
+    if (action.? != .drop) {
+        try p.need(if (action.? == .create) "FOR" else "SET");
+        try p.need("TABLE");
+        var tables: std.ArrayList(PublicationCommand.Table) = .empty;
+        while (true) {
+            if (tables.items.len == max_tables) return error.ProgramLimitExceeded;
+            const first = try p.name();
+            const table: PublicationCommand.Table = if (try p.symbol(.dot))
+                .{ .schema = first, .name = try p.name() }
+            else
+                .{ .schema = null, .name = first };
+            try tables.append(p.a, table);
+            if (!try p.symbol(.comma)) break;
+        }
+        command.tables = tables.items;
+    }
+    try p.finish();
+    return .{ .arena = arena, .command = command };
+}
+
 fn boolean(value: []const u8) !bool {
     if (std.mem.eql(u8, value, "1")) return true;
     if (std.mem.eql(u8, value, "0")) return false;
@@ -404,4 +472,25 @@ test "replication commands bound publication sets and normalize supported startu
 
 test {
     _ = @import("replication_input.zig");
+}
+
+test "publication DDL preserves quoted names and rejects unsupported scopes or trailing commands" {
+    const a = std.testing.allocator;
+    var created = (try parsePublication(a, "CREATE PUBLICATION Feed FOR TABLE Sales.\"Line.Item\", orders;", 2)).?;
+    defer created.deinit();
+    try std.testing.expectEqualStrings("feed", created.command.name);
+    try std.testing.expectEqualStrings("sales", created.command.tables[0].schema.?);
+    try std.testing.expectEqualStrings("Line.Item", created.command.tables[0].name);
+    try std.testing.expect(created.command.tables[1].schema == null);
+    var replaced = (try parsePublication(a, "ALTER PUBLICATION feed SET TABLE public.orders", 1)).?;
+    defer replaced.deinit();
+    try std.testing.expectEqual(PublicationCommand.Action.replace_members, replaced.command.action);
+    var dropped = (try parsePublication(a, "DROP PUBLICATION IF EXISTS feed", 0)).?;
+    defer dropped.deinit();
+    try std.testing.expect(dropped.command.if_exists);
+    try std.testing.expect((try parsePublication(a, "CREATE TABLE x", 0)) == null);
+    try std.testing.expectError(error.ProgramLimitExceeded, parsePublication(a, "CREATE PUBLICATION p FOR TABLE a,b", 1));
+    try std.testing.expectError(error.PgReplicationSyntax, parsePublication(a, "CREATE PUBLICATION p FOR ALL TABLES", 1));
+    try std.testing.expectError(error.PgReplicationSyntax, parsePublication(a, "ALTER PUBLICATION p SET TABLE a WHERE (true)", 1));
+    try std.testing.expectError(error.PgReplicationSyntax, parsePublication(a, "DROP PUBLICATION p; DROP PUBLICATION q", 1));
 }

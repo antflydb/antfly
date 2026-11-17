@@ -29092,8 +29092,7 @@ const RemoteMetadataSource = struct {
         return last_err;
     }
 
-    fn accessChangefeedMetadata(self: *RemoteMetadataSource, a: std.mem.Allocator, action: @import("../api/changefeed_metadata.zig").Action, id: ?@import("../metadata/changefeed_control.zig").Id, write: ?[]const u8, scan: ?@import("../api/changefeed_metadata.zig").ScanRequest, original: antfly.public_api.operation.RequestContext) !std.json.Parsed(@import("../api/changefeed_metadata.zig").Reply) {
-        const feeds = @import("../api/changefeed_metadata.zig");
+    fn accessFencedMetadata(self: *RemoteMetadataSource, a: std.mem.Allocator, original: antfly.public_api.operation.RequestContext, mutation: bool, unbound: anytype) !@TypeOf(unbound).Response {
         var request = original;
         request.deadline_ns = try requestDeadlineOnClock(original, self.awakeNs(), 5 * std.time.ns_per_s);
         request.deadline_io = runtime_io_abi.Borrow.init(&self.io);
@@ -29103,30 +29102,91 @@ const RemoteMetadataSource = struct {
         // identity only; the state endpoint always executes its own strong read.
         const head = try self.fetchHeadWithBudget(budget);
         const incarnation = head.metadata_incarnation orelse return error.MetadataIncarnationUnavailable;
-        const input: feeds.Request = .{ .action = action, .id = id, .write = write, .scan = scan, .metadata_group_id = head.metadata_group_id, .metadata_incarnation = incarnation };
+        var input = unbound;
+        input.bind(head.metadata_group_id, incarnation);
         const first = try self.metadataReadApiIndexForAttemptWithBudget(0, budget);
         var last_error: anyerror = error.MissingMetadataApi;
         // A mutation gets exactly one selected peer. An unknown outcome must
         // return to the durable owner for reconciliation, never peer failover.
-        const attempts = if (action == .mutate) @min(self.base_uris.len, 1) else self.base_uris.len;
+        const attempts = if (mutation) @min(self.base_uris.len, 1) else self.base_uris.len;
         for (0..attempts) |attempt| {
             try request.ensureActive();
             try ensureBudgetActive(budget);
             const index = (first + attempt) % self.base_uris.len;
             var client = self.metadataClient(a);
-            var reply = client.accessChangefeedState(self.base_uris[index], input, request) catch |err| {
-                if (action == .mutate) return err;
+            var reply = input.send(&client, self.base_uris[index], request) catch |err| {
+                if (mutation) return err;
                 try request.ensureActive();
                 if (err == error.OutOfMemory or err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded) return err;
                 last_error = err;
                 continue;
             };
             errdefer reply.deinit();
-            original.ensureActive() catch |err| return if (action == .mutate) error.MetadataMutationOutcomeUnknown else err;
-            self.noteMetadataReadSuccessWithBudget(index, budget) catch |err| return if (action == .mutate) error.MetadataMutationOutcomeUnknown else err;
+            original.ensureActive() catch |err| return if (mutation) error.MetadataMutationOutcomeUnknown else err;
+            self.noteMetadataReadSuccessWithBudget(index, budget) catch |err| return if (mutation) error.MetadataMutationOutcomeUnknown else err;
             return reply;
         }
         return last_error;
+    }
+
+    const FencedChangefeedCall = struct {
+        const feeds = @import("../api/changefeed_metadata.zig");
+        const Response = std.json.Parsed(feeds.Reply);
+        input: feeds.Request,
+
+        fn bind(self: *@This(), group: u64, incarnation: @import("../metadata/changefeed_control.zig").Digest) void {
+            self.input.metadata_group_id = group;
+            self.input.metadata_incarnation = incarnation;
+        }
+
+        fn send(self: @This(), client: *antfly.metadata_http_client.MetadataHttpClient, uri: []const u8, request: antfly.public_api.operation.RequestContext) !Response {
+            return client.accessChangefeedState(uri, self.input, request);
+        }
+    };
+
+    const FencedPublicationCall = struct {
+        const publication = @import("../metadata/pg_publication.zig");
+        const Response = std.json.Parsed(publication.Reply);
+        input: publication.Request,
+
+        fn bind(self: *@This(), group: u64, incarnation: @import("../metadata/changefeed_control.zig").Digest) void {
+            self.input.group = group;
+            self.input.incarnation = incarnation;
+        }
+
+        fn send(self: @This(), client: *antfly.metadata_http_client.MetadataHttpClient, uri: []const u8, request: antfly.public_api.operation.RequestContext) !Response {
+            return client.accessPgPublication(uri, self.input, request);
+        }
+    };
+
+    pub fn accessPgPublication(self: *RemoteMetadataSource, a: std.mem.Allocator, database: @import("../metadata/changefeed_control.zig").Digest, name: []const u8, write: ?@import("../metadata/pg_publication.zig").Write, request: antfly.public_api.operation.RequestContext) !FencedPublicationCall.Response {
+        const call: FencedPublicationCall = .{ .input = .{ .group = 0, .incarnation = @splat(0), .database = database, .name = name, .write = write } };
+        return self.accessFencedMetadata(a, request, write != null, call);
+    }
+
+    pub fn pgPublicationPort(self: *RemoteMetadataSource) FencedPublicationCall.publication.Port {
+        const publication = FencedPublicationCall.publication;
+        const Adapter = struct {
+            fn read(raw: *anyopaque, a: std.mem.Allocator, database: @import("../metadata/changefeed_control.zig").Digest, name: []const u8, request: antfly.public_api.operation.RequestContext) !?std.json.Parsed(publication.Record) {
+                const source: *RemoteMetadataSource = @ptrCast(@alignCast(raw));
+                var reply = try source.accessPgPublication(a, database, name, null, request);
+                if (reply.value.record) |record| return .{ .arena = reply.arena, .value = record };
+                reply.deinit();
+                return null;
+            }
+
+            fn mutate(raw: *anyopaque, a: std.mem.Allocator, write: publication.Write, request: antfly.public_api.operation.RequestContext) !void {
+                const source: *RemoteMetadataSource = @ptrCast(@alignCast(raw));
+                var reply = try source.accessPgPublication(a, write.next.database, write.next.name, write, request);
+                defer reply.deinit();
+            }
+        };
+        return .{ .ptr = self, .read = Adapter.read, .mutate = Adapter.mutate };
+    }
+
+    fn accessChangefeedMetadata(self: *RemoteMetadataSource, a: std.mem.Allocator, action: @import("../api/changefeed_metadata.zig").Action, id: ?@import("../metadata/changefeed_control.zig").Id, write: ?[]const u8, scan: ?@import("../api/changefeed_metadata.zig").ScanRequest, original: antfly.public_api.operation.RequestContext) !std.json.Parsed(@import("../api/changefeed_metadata.zig").Reply) {
+        const call: FencedChangefeedCall = .{ .input = .{ .action = action, .id = id, .write = write, .scan = scan, .metadata_group_id = 0, .metadata_incarnation = @splat(0) } };
+        return self.accessFencedMetadata(a, original, action == .mutate, call);
     }
 
     fn remoteChangefeedRead(ptr: *anyopaque, a: std.mem.Allocator, id: @import("../metadata/changefeed_control.zig").Id, request: antfly.public_api.operation.RequestContext) ![]u8 {
@@ -50963,6 +51023,46 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), stub.calls);
             try std.testing.expectError(error.Canceled, RemoteMetadataSource.remoteOwnerReadiness(&source, request, budget));
             try std.testing.expectEqual(@as(usize, 1), stub.calls);
+        }
+
+        test "remote metadata deadline publication port binds discovery and does not replay uncertain mutations" {
+            const a = std.testing.allocator;
+            const publication = @import("../metadata/pg_publication.zig");
+            const Stub = struct {
+                calls: usize = 0,
+
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, publication.path));
+                    const input = try std.json.parseFromSlice(publication.Request, alloc, request.body, .{});
+                    defer input.deinit();
+                    try std.testing.expectEqual(@as(u64, 42), input.value.group);
+                    try std.testing.expectEqual(@as([32]u8, @splat(7)), input.value.incarnation);
+                    if (input.value.write != null) return error.MetadataMutationOutcomeUnknown;
+                    const reply: publication.Reply = .{
+                        .group = input.value.group,
+                        .incarnation = input.value.incarnation,
+                        .database = input.value.database,
+                        .name = input.value.name,
+                        .record = .{ .database = input.value.database, .name = input.value.name, .owner = @splat(3), .revision = 9 },
+                    };
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, reply, .{}) };
+                }
+            };
+            var stub: Stub = .{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{ "http://one.test", "http://two.test" }, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, std.testing.io);
+            defer source.deinit();
+            source.cached_head = .{ .metadata_group_id = 42, .metadata_incarnation = @splat(7) };
+            source.cached_head_at_ms = source.awakeMs();
+            const port = source.pgPublicationPort();
+            var record = (try port.read(port.ptr, a, @splat(2), "feed", .{})).?;
+            defer record.deinit();
+            try std.testing.expectEqualStrings("feed", record.value.name);
+            try std.testing.expectEqual(@as(u64, 9), record.value.revision);
+            const next: publication.Record = .{ .database = @splat(2), .name = "feed", .owner = @splat(3), .revision = 10 };
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.mutate(port.ptr, a, .{ .expected_revision = 9, .next = next }, .{}));
+            try std.testing.expectEqual(@as(usize, 2), stub.calls);
         }
 
         test "remote table descriptors prefer ordered peers before legacy fallback" {
