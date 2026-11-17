@@ -27,6 +27,8 @@ test {
     _ = @import("api/source_producer_control_operations.zig");
     _ = @import("api/source_legacy_terminal_operations.zig");
     _ = @import("data/source_legacy_terminal_http_wire.zig");
+    _ = @import("data/source_legacy_inventory_http_wire.zig");
+    _ = @import("api/source_legacy_inventory_operations.zig");
     _ = @import("data/source_producer_control_http_wire.zig");
     _ = @import("data/history_control_wire.zig");
     _ = @import("data/raft_batch.zig").consumer_tests;

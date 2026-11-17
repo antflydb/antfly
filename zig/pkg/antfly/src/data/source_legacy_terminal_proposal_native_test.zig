@@ -32,10 +32,33 @@ pub fn run(a: std.mem.Allocator, server: anytype, fence: metadata.CatalogRouteFe
     const before_documents = Harness.documentApplies(server);
     const inventory = local.storage_source_legacy_inventory;
     const inventory_query: inventory.Query = .{ .version = 1, .owner = owner, .after = null, .max_records = 256, .minimum_applied_index = 1 };
-    var work = try server.legacyRecoveryInventoryLocal(a, fence, "docs", inventory_query);
-    defer work.deinit(a);
+    const inventory_request: @import("source_legacy_inventory_http_wire.zig").Request = .{ .version = 1, .request_id = @splat(206), .query = inventory_query };
+    var work_reply = try Harness.inventoryRpc(a, server, fence, inventory_request);
+    defer work_reply.deinit(a);
+    const work = work_reply.observation;
     try work.validate(inventory_query);
-    for (work.page.items) |item| try std.testing.expect(!std.meta.eql(item.transaction_id, command.proof.transaction_id));
+    var pending_digest: ?[32]u8 = null;
+    for (work.page.items) |item| {
+        try std.testing.expect(!std.meta.eql(item.transaction_id, command.proof.transaction_id));
+        if (std.meta.eql(item.transaction_id, @as([16]u8, @splat(247)))) {
+            try std.testing.expect(item.status == .pending and item.prepared_known and item.prepared and item.coordinator_known and item.coordinator);
+            pending_digest = item.record_digest;
+        }
+    }
+    const exact_pending_digest = pending_digest orelse return error.TestExpectedPendingLegacyInventory;
+    var pending_record = try server.historyDecisionPort().read(a, fence, "docs", .{ .version = 1, .owner = owner, .transaction_id = @splat(247), .minimum_applied_index = work.cut.index }, .{});
+    defer pending_record.deinit();
+    try std.testing.expect(pending_record.value.decision != null);
+    try std.testing.expectEqualDeep(exact_pending_digest, pending_record.value.decision.?.record.digest);
+    var continuation = inventory_request;
+    continuation.request_id = @splat(207);
+    continuation.query.after = @splat(247);
+    continuation.query.max_records = 1;
+    continuation.query.minimum_applied_index = work.cut.index;
+    var next_page = try Harness.inventoryRpc(a, server, fence, continuation);
+    defer next_page.deinit(a);
+    try std.testing.expect(next_page.observation.page.scanned_records <= 1);
+    for (next_page.observation.page.items) |item| try std.testing.expect(std.mem.order(u8, &item.transaction_id, &@as([16]u8, @splat(247))) == .gt);
     try std.testing.expectEqual(previous_last, Harness.last(server, owner.group_id));
     var stale_inventory = inventory_query;
     stale_inventory.owner.root_generation += 1;

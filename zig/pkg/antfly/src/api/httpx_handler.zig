@@ -1919,6 +1919,7 @@ pub const AntflyApiHandler = struct {
             .{ routes.source_producer_closure_observe_suffix, internalSourceProducerClosureObserve },
             .{ routes.source_producer_close_suffix, internalSourceProducerClose },
             .{ routes.legacy_terminal_suffix, internalLegacyTerminal },
+            .{ routes.legacy_inventory_suffix, internalLegacyInventory },
             .{ routes.source_checkpoint_observe_suffix, internalSourceCheckpointObserve },
             .{ routes.source_plan_chunk_suffix, internalSourcePlanChunk },
         }) |route| {
@@ -4278,6 +4279,24 @@ pub const AntflyApiHandler = struct {
         const input = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
         const result = operations.execute(self.api_server.cfg.native_source_producer_control, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, true);
         if (result.outcome == null) try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_unknown_v1);
+        const encoded = operations.wire.encodeReply(ctx.allocator, input, result) catch |err| return sourcePlanError(ctx, err, true);
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("Content-Type", "application/json");
+        return ctx.response.body(encoded).build();
+    }
+    fn internalLegacyInventory(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid legacy inventory path");
+        defer params.deinit(ctx.allocator);
+        const operations = @import("source_legacy_inventory_operations.zig");
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing legacy inventory request");
+        if (body.len > operations.wire.max_request_bytes) return textResponse(ctx, 413, "legacy inventory request exceeds byte limit");
+        const input = operations.wire.decodeRequest(ctx.allocator, body) catch |err| return sourcePlanError(ctx, err, true);
+        var result = operations.execute(self.api_server.cfg.native_legacy_inventory, ctx.allocator, params.group_id, params.table_name, body, operationContext(ctx, null)) catch |err| return sourcePlanError(ctx, err, true);
+        defer result.deinit(ctx.allocator);
         const encoded = operations.wire.encodeReply(ctx.allocator, input, result) catch |err| return sourcePlanError(ctx, err, true);
         defer ctx.allocator.free(encoded);
         try ctx.setHeader("Content-Type", "application/json");
@@ -19347,6 +19366,26 @@ test "httpx source legacy terminal refuses missing and invalid authority in lega
             var ctx = httpx.Context.init(alloc, std.testing.io, &request);
             defer ctx.deinit();
             var response = try handler.internalLegacyTerminal(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        }
+    }
+}
+
+test "httpx source legacy inventory refuses missing and invalid authority in legacy mode" {
+    const alloc = std.testing.allocator;
+    for ([_]?[]const u8{ null, "source-scope-auth-test-secret-long-enough" }) |secret| {
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "scope-auth-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        for ([_]?[]const u8{ null, "not-a-valid-service-token" }) |token| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/rows/source-producers/legacy-inventory-v1");
+            defer request.deinit();
+            if (token) |value| try request.setHeader(internal_service_auth.header_name, value);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try handler.internalLegacyInventory(&ctx);
             defer response.deinit();
             try std.testing.expectEqual(@as(u16, 401), response.status.code);
         }

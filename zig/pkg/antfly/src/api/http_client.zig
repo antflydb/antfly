@@ -3164,6 +3164,71 @@ pub const ApiHttpClient = struct {
         return result;
     }
 
+    const LegacyInventoryWire = @import("../data/source_legacy_inventory_http_wire.zig");
+    pub fn fetchGroupLegacyInventory(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, input: LegacyInventoryWire.Request, fence: route_metadata_api.CatalogRouteFence, original: @import("antfly_local_sources").api_operation.RequestContext) !LegacyInventoryWire.Reply {
+        var scope = try @import("history_publication_operations.zig").Scope.init(fence, original);
+        const context = scope.context();
+        try context.ensureActive();
+        if (self.internal_service == null) return error.Unauthorized;
+        try fence.validate();
+        try input.validate();
+        if (group_id == 0 or group_id != fence.route.group_id or table_name.len == 0 or table_name.len > 1024) return error.InvalidCatalogRouteFence;
+        const owner = input.query.owner;
+        const identity = fence.route.identity_namespace;
+        const incarnation = fence.metadata_incarnation orelse return error.InvalidCatalogRouteFence;
+        if (owner.group_id != group_id or owner.metadata_group_id != fence.metadata_group_id or owner.topology_epoch != fence.topology_epoch or
+            !std.mem.eql(u8, &owner.metadata_incarnation, &incarnation) or
+            std.mem.readInt(u64, owner.namespace[0..8], .big) != identity.table_id or
+            std.mem.readInt(u64, owner.namespace[8..16], .big) != identity.shard_id or
+            std.mem.readInt(u64, owner.namespace[16..24], .big) != identity.range_id) return error.InvalidCatalogRouteFence;
+        const table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, table, routes.Routes.legacy_inventory_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try LegacyInventoryWire.encodeRequest(self.alloc, input);
+        defer self.alloc.free(body);
+        const route_json = try std.json.Stringify.valueAlloc(self.alloc, fence, .{});
+        defer self.alloc.free(route_json);
+        if (route_json.len > 16384) return error.InvalidCatalogRouteFence;
+        const timeout = @min(try context.remainingTimeoutMs() orelse route_metadata_api.catalog_route_default_deadline_ms, 5000);
+        var timeout_buffer: [10]u8 = undefined;
+        const timeout_text = try std.fmt.bufPrint(&timeout_buffer, "{d}", .{timeout});
+        var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
+        try context.ensureActive();
+        var response = self.executeRequest(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .headers = &.{
+            .{ .name = route_metadata_api.catalog_route_fence_header, .value = route_json },
+            .{ .name = route_metadata_api.catalog_route_deadline_ms_header, .value = timeout_text },
+        }, .timeout_ms = timeout, .cancellation = &cancellation, .max_response_bytes = LegacyInventoryWire.max_reply_bytes }) catch |err| return switch (err) {
+            error.OutOfMemory, error.Canceled, error.Cancelled, error.DeadlineExceeded => err,
+            else => error.ReadUnavailable,
+        };
+        defer response.deinit(self.alloc);
+        try context.ensureActive();
+        if (response.body.len > LegacyInventoryWire.max_reply_bytes) return error.InvalidRemoteResponse;
+        if (response.status != 200) return switch (response.status) {
+            401 => error.Unauthorized,
+            403 => error.Forbidden,
+            404, 501 => error.ChangefeedCapabilityUnsupported,
+            409 => error.HistoryResynchronizationRequired,
+            503 => error.ReadUnavailable,
+            else => error.InvalidRemoteResponse,
+        };
+        var acknowledgements: usize = 0;
+        for (response.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, route_metadata_api.catalog_route_fence_ack_header)) {
+            acknowledgements += 1;
+        };
+        const ack = response.header(route_metadata_api.catalog_route_fence_ack_header);
+        const content_type = response.header("Content-Type") orelse response.content_type;
+        if (acknowledgements != 1 or ack == null or !std.mem.eql(u8, ack.?, route_metadata_api.catalog_route_fence_ack_value) or
+            content_type == null or !std.ascii.eqlIgnoreCase(content_type.?, "application/json") or response.header(internal_batch_forwarding.outcome_header) != null) return error.InvalidRemoteResponse;
+        var result = try LegacyInventoryWire.decodeReply(self.alloc, input, response.body);
+        errdefer result.deinit(self.alloc);
+        try context.ensureActive();
+        return result;
+    }
+
     const ScopeControlWire = @import("../data/source_scope_http_wire.zig");
     const LegacyTerminalWire = @import("../data/source_legacy_terminal_http_wire.zig");
     const ProducerControlWire = @import("../data/source_producer_control_http_wire.zig");
@@ -8456,6 +8521,77 @@ test "source producer closure HTTP client rejects unqualified forged expired and
             else => error.InvalidRemoteResponse,
         };
         try std.testing.expectError(expected, client.fetchGroupSourceProducerClosureObservation("http://node:8080", 17, "docs", query, fence, .{}));
+        try std.testing.expectEqual(before + 1, fake.calls);
+    }
+}
+
+test "source legacy inventory HTTP client binds queries rejects forged replies and frees cancelled pages" {
+    const a = std.testing.allocator;
+    const wire = @import("../data/source_legacy_inventory_http_wire.zig");
+    const Fake = struct {
+        const Mode = enum { good, wrong_owner, wrong_nonce, future, bad_cursor, missing_ack, duplicate_ack, wrong_type, marker, lost, too_large, resync, cancel };
+        mode: Mode = .good,
+        query: wire.Request,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/source-producers/legacy-inventory-v1"));
+            try std.testing.expectEqual(@as(?usize, wire.max_reply_bytes), request.max_response_bytes);
+            if (self.mode == .lost) return error.ConnectionResetByPeer;
+            var observed = try wire.test_support.reply(alloc, self.query);
+            defer observed.deinit(alloc);
+            if (self.mode == .wrong_owner) observed.observation.owner.root_generation += 1;
+            if (self.mode == .wrong_nonce) observed.request_digest[0] ^= 1;
+            if (self.mode == .future) observed.observation.cut.index -= 1;
+            if (self.mode == .bad_cursor) observed.observation.page.next_after = @splat(0);
+            const body = if (self.mode == .too_large) try alloc.alloc(u8, wire.max_reply_bytes + 1) else try std.json.Stringify.valueAlloc(alloc, observed, .{});
+            defer alloc.free(body);
+            if (self.mode == .too_large) @memset(body, ' ');
+            const Header = @typeInfo(@typeInfo(@TypeOf(http_route_helpers.textResponseWithHeaders)).@"fn".param_types[3].?).pointer.child;
+            var headers: [4]Header = undefined;
+            var count: usize = 0;
+            if (self.mode != .missing_ack) {
+                headers[count] = .{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = route_metadata_api.catalog_route_fence_ack_value };
+                count += 1;
+            }
+            if (self.mode == .duplicate_ack) {
+                headers[count] = .{ .name = route_metadata_api.catalog_route_fence_ack_header, .value = route_metadata_api.catalog_route_fence_ack_value };
+                count += 1;
+            }
+            headers[count] = .{ .name = "Content-Type", .value = if (self.mode == .wrong_type) "text/plain" else "application/json" };
+            count += 1;
+            if (self.mode == .marker) {
+                headers[count] = .{ .name = internal_batch_forwarding.outcome_header, .value = "" };
+                count += 1;
+            }
+            if (self.mode == .cancel) self.cancelled.store(true, .release);
+            return http_route_helpers.textResponseWithHeaders(alloc, if (self.mode == .resync) 409 else 200, body, headers[0..count]);
+        }
+    };
+    const query = wire.test_support.fixture();
+    const fence: route_metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .metadata_incarnation = query.query.owner.metadata_incarnation, .catalog_revision = 1, .table_id = 7, .topology_epoch = 1, .route = .{ .group_id = 17, .range_id = 19, .identity_namespace = .{ .table_id = 7, .shard_id = 17, .range_id = 19 } } };
+    var fake: Fake = .{ .query = query };
+    var client = ApiHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    try std.testing.expectError(error.Unauthorized, client.fetchGroupLegacyInventory("http://node:8080", 17, "docs", query, fence, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    _ = client.withInternalServiceAuth("producer-closure-client-test-secret-long-enough", "producer-closure-test");
+    var observed = try client.fetchGroupLegacyInventory("http://node:8080", 17, "docs", query, fence, .{});
+    defer observed.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), observed.observation.page.items.len);
+    for ([_]Fake.Mode{ .wrong_owner, .wrong_nonce, .future, .bad_cursor, .missing_ack, .duplicate_ack, .wrong_type, .marker, .lost, .too_large, .resync, .cancel }) |mode| {
+        fake.mode = mode;
+        fake.cancelled.store(false, .release);
+        const before = fake.calls;
+        const expected: anyerror = switch (mode) {
+            .wrong_owner, .wrong_nonce, .future, .bad_cursor => error.SourceAdmissionCorrupt,
+            .resync => error.HistoryResynchronizationRequired,
+            .cancel => error.Canceled,
+            .lost => error.ReadUnavailable,
+            else => error.InvalidRemoteResponse,
+        };
+        try std.testing.expectError(expected, client.fetchGroupLegacyInventory("http://node:8080", 17, "docs", query, fence, .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&fake.cancelled) }));
         try std.testing.expectEqual(before + 1, fake.calls);
     }
 }

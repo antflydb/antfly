@@ -8040,3 +8040,76 @@ original terminal recovery regressions passed. Contract checks passed
 (`source-legacy-inventory-native-contracts.log`). This is private bounded work
 discovery, not an all-root scan certificate, pending decision, worker handover,
 strict activation, source acknowledgement or completion of either issue.
+
+### Authenticated routed legacy inventory (in progress)
+
+The internal OpenAPI contract adds legacy-inventory-v1, a private service-only
+read with an 8 KiB request and 270336-byte reply cap. A fresh nonzero nonce and
+canonical full-request digest correlate the complete physical owner, inspection
+limit, strictly-after cursor and minimum applied index. This envelope prevents
+substituting a page from another valid query. Duplicate/unknown fields and
+incomplete nested owner material fail closed. Native page limits remain 256
+inspected records/1 MiB inspected record bytes and a 256 KiB native observation.
+
+The API callback ABI becomes 41. The routed server read reuses current-leader
+selection, bounded control-lane forwarding and frozen ReadIndex native inventory
+qualification. The client requires service authority, exactly one catalog-fence
+ACK, JSON content type and full request/observation validation. Errors,
+resynchronization, outcome-unknown headers and late cancellation return no page.
+Decoded inventory buffers are freed at ingress, transport and serving ownership
+boundaries when qualification fails. This read grants no pending decision,
+coherent all-root drainage, source activation, source ACK or retention release.
+
+The live original-terminal fixture now obtains its work inventory through a
+signed loopback HTTP connection using the actual API kernel and Raft owner,
+while preserving its no-append, stale-owner and cancellation assertions. Local
+adversarial wire/client/ingress tests cover changed nonce/cursor/bounds/cut,
+forged owners/cursors, lost replies, missing/duplicate ACKs, resynchronization,
+byte limits, legacy-auth rejection and owned-page cleanup. Generation and native
+qualification remain in progress.
+
+Initial transport qualification exposed an unqualified type name in the nested
+live-fixture helper; qualifying its wire import fixed the build. The rerun passed
+6 local apply, 54 linked native/live-Raft, 16 history, 40 envelope/wire and 6
+authentication cases, zero failures/skips/leaks
+(`source-legacy-inventory-http-final-test.log`). Generation and contract checks
+passed (`source-legacy-inventory-http-contracts.log`).
+
+A final live-fixture extension now leaves an actual legacy BEGIN/PREPARE at
+transaction 247 before closure, obtains its pending/coordinator/prepared flags
+through the signed inventory route, compares its digest to an independently
+qualified native decision read and requests a new nonce/cursor-bounded page
+strictly after that record. The original resolved ABORT at transaction 249 stays
+omitted from work discovery. All reads must leave the Raft log unchanged and
+cannot decide the pending record. This stronger positive-work transport check is
+running (`source-legacy-inventory-http-work-test.log`).
+
+The positive-work extension initially prepared its fixture too early and hit the
+real HistoryPreparedTransactionsPresent guard during later policy configuration
+(`source-legacy-inventory-http-work-test.log`). The guard is preserved. Original
+legacy BEGIN/PREPARE now runs through the trusted completion participant after
+policy setup and before closure, which is the intended ordering for this test.
+The pending record is never decided by inventory. The reordered positive check
+is running in `source-legacy-inventory-http-positive-test.log`.
+
+The reordered positive fixture encountered one availability-error mismatch in
+its broad run: ReadUnavailable versus expected StorageReadTemporarilyUnavailable
+(`source-legacy-inventory-http-positive-test.log`). The exact unchanged compiled
+live fixture passed in isolation (`source-legacy-inventory-http-positive-replay.log`).
+The complete final-source rerun then passed all 54 linked native/HTTP/live-Raft,
+6 local apply, 16 history, 40 wire/envelope and 6 authentication cases, zero
+failures/skips/leaks (`source-legacy-inventory-http-qualified-test.log`, exit 0).
+The positive fixture actually found prepared/coordinator pending record 247,
+matched its digest to a separately qualified decision read, resumed strictly
+after it with a fresh nonce and bounded scan, and left the log unchanged. No
+availability assertion was weakened. Final contract checks passed
+(`source-legacy-inventory-http-final-contracts.log`).
+
+Authenticated inventory is now usable alongside original terminal submit/recover;
+this does not complete the recovery coordinator, pending decision authority,
+physical cohort lifecycle/handover or first strict activation. Public native
+HTTP/SQL delivery, bootstrap/retention, pgoutput, destination integration,
+actual Antfly CDC-client qualification and intersection/benchmark acceptance
+remain open. Outbound delivery can proceed independently of remaining legacy
+migration, using the retained committed-history boundary. Both issues remain
+open and PR 1700 remains draft.

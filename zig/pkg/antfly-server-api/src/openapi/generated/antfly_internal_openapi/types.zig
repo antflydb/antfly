@@ -827,6 +827,117 @@ pub const NativeHistoryRetirement = struct {
     grant: u64,
 };
 
+pub const NativeLegacyInventoryItem = struct {
+    transaction_id: NativeHistoryConsumerId,
+    record_digest: NativeHistoryDigest,
+    status: []const u8,
+    prepared: bool,
+    prepared_known: bool,
+    coordinator: bool,
+    coordinator_known: bool,
+    intents_resolved: bool,
+    intents_resolved_known: bool,
+};
+
+pub const NativeLegacyInventoryObservation = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    cut: NativeHistoryPublicationCut,
+    page: NativeLegacyInventoryPage,
+};
+
+pub const NativeLegacyInventoryPage = struct {
+    closure: NativeSourceProducerClosureState,
+    items: []const NativeLegacyInventoryItem,
+    scanned_records: i64,
+    next_after: ?NativeHistoryConsumerId,
+    reached_end: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "closure", "closure", false },
+        .{ "items", "items", false },
+        .{ "scanned_records", "scanned_records", false },
+        .{ "next_after", "next_after", false },
+        .{ "reached_end", "reached_end", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("closure");
+        try jw.write(self.closure);
+        try jw.objectField("items");
+        try jw.write(self.items);
+        try jw.objectField("scanned_records");
+        try jw.write(self.scanned_records);
+        try jw.objectField("next_after");
+        try jw.write(self.next_after);
+        try jw.objectField("reached_end");
+        try jw.write(self.reached_end);
+        try jw.endObject();
+    }
+};
+
+pub const NativeLegacyInventoryQuery = struct {
+    version: i64,
+    owner: NativeHistoryPublicationOwner,
+    after: ?NativeHistoryConsumerId,
+    max_records: i64,
+    minimum_applied_index: u64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "owner", "owner", false },
+        .{ "after", "after", false },
+        .{ "max_records", "max_records", false },
+        .{ "minimum_applied_index", "minimum_applied_index", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        try jw.objectField("after");
+        try jw.write(self.after);
+        try jw.objectField("max_records");
+        try jw.write(self.max_records);
+        try jw.objectField("minimum_applied_index");
+        try jw.write(self.minimum_applied_index);
+        try jw.endObject();
+    }
+};
+
+pub const NativeLegacyInventoryReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    observation: NativeLegacyInventoryObservation,
+};
+
+pub const NativeLegacyInventoryRequest = struct {
+    version: i64,
+    request_id: NativeHistoryConsumerId,
+    query: NativeLegacyInventoryQuery,
+};
+
 /// Trusted native recovery derives the original decision/version from the matching durable terminal record. It never decides pending work.
 pub const NativeLegacyTerminalCommand = struct {
     version: i64,

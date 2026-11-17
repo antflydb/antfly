@@ -43,7 +43,8 @@ pub const StatusDetail = error_abi.Detail;
 // Version 38 includes the qualified producer-closure observation port.
 // Version 39 includes the producer-close submission callback.
 // Version 40 includes authenticated original-terminal recovery callbacks.
-pub const abi_version: u32 = 40;
+// Version 41 includes authenticated bounded legacy inventory reads.
+pub const abi_version: u32 = 41;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

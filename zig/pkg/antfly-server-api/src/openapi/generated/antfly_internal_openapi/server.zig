@@ -148,6 +148,17 @@ pub fn parseCloseNativeSourceProducersBody(allocator: std.mem.Allocator, body: [
     return std.json.parseFromSlice(types.NativeSourceProducerCloseRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Read bounded original legacy work at a qualified physical cut
+pub const ReadNativeLegacyInventoryPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for readNativeLegacyInventory.
+pub fn parseReadNativeLegacyInventoryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeLegacyInventoryRequest) {
+    return std.json.parseFromSlice(types.NativeLegacyInventoryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Submit original terminal legacy recovery or read its exact outcome
 pub const ControlNativeLegacyTerminalPathParams = struct {
     group_id: []const u8,
@@ -244,6 +255,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/control-v1", .operation_id = "controlNativeSourcePlan", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/observe-v1", .operation_id = "observeNativeSourcePlan", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-producers/close-v1", .operation_id = "closeNativeSourceProducers", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-producers/legacy-inventory-v1", .operation_id = "readNativeLegacyInventory", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-producers/legacy-terminal-v1", .operation_id = "controlNativeLegacyTerminal", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-producers/observe-v1", .operation_id = "observeNativeSourceProducerClosure", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-retirement/control-v1", .operation_id = "controlNativeSourceRetirement", .request_body = .buffered, .streaming_response = false },
@@ -280,6 +292,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "controlNativeSourcePlan")) @compileError("ServerRouter: Impl missing required method 'controlNativeSourcePlan'");
         if (!@hasDecl(Impl, "observeNativeSourcePlan")) @compileError("ServerRouter: Impl missing required method 'observeNativeSourcePlan'");
         if (!@hasDecl(Impl, "closeNativeSourceProducers")) @compileError("ServerRouter: Impl missing required method 'closeNativeSourceProducers'");
+        if (!@hasDecl(Impl, "readNativeLegacyInventory")) @compileError("ServerRouter: Impl missing required method 'readNativeLegacyInventory'");
         if (!@hasDecl(Impl, "controlNativeLegacyTerminal")) @compileError("ServerRouter: Impl missing required method 'controlNativeLegacyTerminal'");
         if (!@hasDecl(Impl, "observeNativeSourceProducerClosure")) @compileError("ServerRouter: Impl missing required method 'observeNativeSourceProducerClosure'");
         if (!@hasDecl(Impl, "controlNativeSourceRetirement")) @compileError("ServerRouter: Impl missing required method 'controlNativeSourceRetirement'");
@@ -314,6 +327,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/groups/:group_id/tables/:table_name/source-plan/control-v1", httpx.Handler.bind(self.impl, controlNativeSourcePlan));
             try server.post("/groups/:group_id/tables/:table_name/source-plan/observe-v1", httpx.Handler.bind(self.impl, observeNativeSourcePlan));
             try server.post("/groups/:group_id/tables/:table_name/source-producers/close-v1", httpx.Handler.bind(self.impl, closeNativeSourceProducers));
+            try server.post("/groups/:group_id/tables/:table_name/source-producers/legacy-inventory-v1", httpx.Handler.bind(self.impl, readNativeLegacyInventory));
             try server.post("/groups/:group_id/tables/:table_name/source-producers/legacy-terminal-v1", httpx.Handler.bind(self.impl, controlNativeLegacyTerminal));
             try server.post("/groups/:group_id/tables/:table_name/source-producers/observe-v1", httpx.Handler.bind(self.impl, observeNativeSourceProducerClosure));
             try server.post("/groups/:group_id/tables/:table_name/source-retirement/control-v1", httpx.Handler.bind(self.impl, controlNativeSourceRetirement));
@@ -433,6 +447,14 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.closeNativeSourceProducers(ctx, group_id, table_name);
         }
 
+        /// Read bounded original legacy work at a qualified physical cut
+        /// POST /groups/{group_id}/tables/{table_name}/source-producers/legacy-inventory-v1
+        fn readNativeLegacyInventory(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.readNativeLegacyInventory(ctx, group_id, table_name);
+        }
+
         /// Submit original terminal legacy recovery or read its exact outcome
         /// POST /groups/{group_id}/tables/{table_name}/source-producers/legacy-terminal-v1
         fn controlNativeLegacyTerminal(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -515,6 +537,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn controlNativeSourcePlan(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn observeNativeSourcePlan(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn closeNativeSourceProducers(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn readNativeLegacyInventory(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn controlNativeLegacyTerminal(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn observeNativeSourceProducerClosure(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn controlNativeSourceRetirement(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response

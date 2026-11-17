@@ -498,7 +498,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const history_control_entry_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/history_control_entry_test_root.zig"), .target = target, .optimize = optimize });
     test_imports.configure(b, history_control_entry_mod, true, true);
     history_control_entry_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
-    const history_control_entry_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{ "history control entry", "source producer closure entry", "source legacy terminal", "source producer closure ingress", "source producer control", "history root control outcome", "history root control driver", "history root control observation", "history root discovery", "history feed metadata port", "raft batch", "raft protocol barrier", "ordered artifact merge adoption" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const history_control_entry_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{ "history control entry", "source producer closure entry", "source legacy terminal", "source legacy inventory", "source producer closure ingress", "source producer control", "history root control outcome", "history root control driver", "history root control observation", "history root discovery", "history feed metadata port", "raft batch", "raft protocol barrier", "ordered artifact merge adoption" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const source_plan_entry_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{"source plan entry"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("source-plan-entry-test", "Verify activated frozen-owner source plan Raft envelopes").dependOn(&b.addRunArtifact(source_plan_entry_tests).step);
     const source_scope_entry_tests = b.addTest(.{ .root_module = history_control_entry_mod, .filters = &.{"source scope entry"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
@@ -2541,7 +2541,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "prefixUpperBoundAlloc",
     };
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
-    const source_scope_http_auth_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "httpx source scope control", "httpx source producer closure observe", "httpx source producer control", "httpx source legacy terminal" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const source_scope_http_auth_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "httpx source scope control", "httpx source producer closure observe", "httpx source producer control", "httpx source legacy terminal", "httpx source legacy inventory" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("source-scope-http-auth-test", "Verify lifecycle RPC service authentication and conservative unknown outcomes").dependOn(&addFilteredTestRunArtifact(b, source_scope_http_auth_tests).step);
     const resolver_adjudication_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
