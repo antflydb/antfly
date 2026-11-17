@@ -61,7 +61,7 @@ pub const Recovery = struct {
         budget.cancellation = context.cancellation;
         var session = try catalog_api.RoutingSession.initWithBudget(a, self.catalog, budget);
         defer session.deinit();
-        const fence = try route(&session, job.owner, job.coordinator_locator, budget, context);
+        const fence = try routeRetainedOwner(&session, job.owner, job.coordinator_locator, budget, context);
         const locator = local.api_local_transaction_contract.parseParticipantRef(job.coordinator_locator) orelse return error.InvalidParticipant;
         return self.runBound(a, job.owner, fence, locator.table_name, job.transaction_id, job, context);
     }
@@ -106,7 +106,7 @@ pub const Recovery = struct {
         const fences = try a.alloc(metadata.CatalogRouteFence, admission.participants.len);
         defer a.free(fences);
         for (admission.participants, fences) |member, *fence| {
-            fence.* = try route(&session, try admission.recoveryOwner(member.namespace), member.locator, budget, context);
+            fence.* = try routeRetainedOwner(&session, try admission.recoveryOwner(member.namespace), member.locator, budget, context);
         }
         if (decision.record.status == .aborted) {
             for (fences, 0..) |fence, index| {
@@ -166,7 +166,7 @@ pub const Recovery = struct {
     }
 };
 
-fn route(session: *catalog_api.RoutingSession, owner: completion.RoutedOwner, locator_bytes: []const u8, budget: catalog_api.RoutingBudget, context: Context) !metadata.CatalogRouteFence {
+pub fn routeRetainedOwner(session: *catalog_api.RoutingSession, owner: completion.RoutedOwner, locator_bytes: []const u8, budget: catalog_api.RoutingBudget, context: Context) !metadata.CatalogRouteFence {
     try context.ensureActive();
     try owner.validate();
     const locator = local.api_local_transaction_contract.parseParticipantRef(locator_bytes) orelse return error.InvalidParticipant;
@@ -228,6 +228,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         visibility_errors: [2]?anyerror = .{ null, null },
         visibility_calls: [2]usize = .{ 0, 0 },
         decision_reads: usize = 0,
+        capture_epoch_delta: u64 = 0,
         cancelled: std.atomic.Value(bool) = .init(false),
         cancel_final_read: bool = false,
         follower_reads: usize = 0,
@@ -235,7 +236,8 @@ test "data raft ordered history completion recovery retains guard checkpoints an
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const index: usize = @intCast(input_fence.route.group_id - 9);
             if (self.unsupported_owners[index]) return error.ChangefeedCapabilityUnsupported;
-            const owner = self.admission.participants[index].routed_owner.?;
+            var owner = self.admission.participants[index].routed_owner.?;
+            owner.topology_epoch += self.capture_epoch_delta;
             return .{ .owner = owner, .observation = try @import("history_owner_operations.zig").wire.Reply.init(.{ .owner = owner }, .{ .term = 1, .index = 8 }, self.retention_limit_bytes) };
         }
         fn acquire(ptr: *anyopaque, budget: catalog_api.RoutingBudget, authoritative: bool) !*catalog_api.RoutingGeneration {
@@ -414,6 +416,47 @@ test "data raft ordered history completion recovery retains guard checkpoints an
         .{ .table_name = "docs", .group_id = 9, .topology_epoch = owners[0].topology_epoch, .intent = .{} },
         .{ .table_name = "docs", .group_id = 10, .topology_epoch = owners[1].topology_epoch, .intent = .{} },
     };
+    // Preparation freezes complete input before any destination mutation.
+    // Checkpoint authority, rather than namespace order, fixes the coordinator.
+    const preparation_reads = fake.decision_reads;
+    const preparation_writes = fake.resolves;
+    const preparation_publications = fake.publishes;
+    const scope_ref: local.storage_source_scope.Reference = .{ .domain = @splat(31), .binding = @splat(32), .generation = 2, .token = 4, .sequence = 1 };
+    var source_inputs = normal_inputs;
+    for (&source_inputs, 0..) |*input, index| input.intent = .{
+        .completion_owner = owners[index],
+        .completion_source_purpose = @splat(33),
+        .completion_source_scope = scope_ref,
+    };
+    source_inputs[1].intent.completion_source_checkpoint = .{ .binding = scope_ref.binding, .purpose = @splat(33), .sequence = 1, .checkpoint = "initial", .accepted_at_ns = 11, .receipt_window = 3 };
+    var prepared = (try coordinator.prepare(a, admission.transaction_id, 10, &source_inputs, .{})).?;
+    defer prepared.deinit();
+    try std.testing.expectEqualDeep(owners[1], try prepared.plan.admission.recoveryOwner(prepared.plan.admission.coordinator_namespace));
+    try std.testing.expectEqualDeep(scope_ref, prepared.plan.source_scope.?);
+    const encoded_prepared = try prepared.plan.encodeFrozen(a);
+    defer a.free(encoded_prepared);
+    var restored_prepared = try plan_mod.Plan.restoreFrozen(a, encoded_prepared, try plan_mod.frozenDigest(encoded_prepared));
+    defer restored_prepared.deinit();
+    try std.testing.expectEqualDeep(scope_ref, restored_prepared.source_scope.?);
+    try std.testing.expectEqual(preparation_reads, fake.decision_reads);
+    try std.testing.expectEqual(preparation_writes, fake.resolves);
+    try std.testing.expectEqual(preparation_publications, fake.publishes);
+    var reopened_prepared = try coordinator.restorePrepared(a, encoded_prepared, try plan_mod.frozenDigest(encoded_prepared), .{});
+    defer reopened_prepared.deinit();
+    try std.testing.expectEqual(prepared.coordinator_index, reopened_prepared.coordinator_index);
+    try std.testing.expectEqualDeep(prepared.plan.admission.digest(), reopened_prepared.plan.admission.digest());
+    try std.testing.expectEqualDeep(scope_ref, reopened_prepared.plan.source_scope.?);
+    try std.testing.expectEqual(preparation_reads, fake.decision_reads);
+    try std.testing.expectEqual(preparation_writes, fake.resolves);
+    fake.capture_epoch_delta = 1;
+    try std.testing.expectError(error.TopologyChanged, coordinator.restorePrepared(a, encoded_prepared, try plan_mod.frozenDigest(encoded_prepared), .{}));
+    fake.capture_epoch_delta = 0;
+    try std.testing.expectEqual(preparation_reads, fake.decision_reads);
+    try std.testing.expectEqual(preparation_writes, fake.resolves);
+    source_inputs[1].intent.completion_owner.?.topology_epoch += 1;
+    try std.testing.expectError(error.SourceBindingConflict, coordinator.prepare(a, admission.transaction_id, 10, &source_inputs, .{}));
+    try std.testing.expectEqual(preparation_reads, fake.decision_reads);
+    try std.testing.expectEqual(preparation_writes, fake.resolves);
     const writes_before_visibility = fake.resolves;
     const incomplete_visibility = (try coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{})).?;
     try std.testing.expect(!incomplete_visibility.propagation_pending);
@@ -424,7 +467,9 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectEqual(writes_before_visibility, fake.resolves);
     const publications_after_completion = fake.publishes;
     fake.visibility_errors = .{ null, null };
-    const visible = (try coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{})).?;
+    var ordinary_prepared = (try coordinator.prepare(a, admission.transaction_id, 10, &normal_inputs, .{})).?;
+    defer ordinary_prepared.deinit();
+    const visible = try coordinator.commitPrepared(a, &ordinary_prepared, 20, .full_index, .{});
     try std.testing.expect(!visible.propagation_pending);
     try std.testing.expect(!visible.visibility_pending);
     try std.testing.expect(!visible.visibility_retry_pending);
@@ -439,6 +484,7 @@ test "data raft ordered history completion recovery retains guard checkpoints an
     try std.testing.expectError(error.ChangefeedCapabilityUnsupported, coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{}));
     fake.unsupported_owners[0] = true;
     try std.testing.expectEqual(@as(?admission_mod.Result, null), try coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{}));
+    try std.testing.expectError(error.ChangefeedCapabilityUnsupported, coordinator.prepare(a, admission.transaction_id, 10, &source_inputs, .{}));
     fake.unsupported_owners = .{ false, false };
     fake.retention_limit_bytes = 1;
     try std.testing.expectError(error.HistoryTooLarge, coordinator.commit(a, admission.transaction_id, 10, 20, &normal_inputs, .full_index, .{}));

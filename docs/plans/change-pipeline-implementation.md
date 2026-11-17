@@ -5568,3 +5568,52 @@ service tests also passed, with zero reported failures or leaks. This is an
 internal adapter-contract change; no persisted format or runtime ABI changes.
 The original destination, retained history, public feeds, bootstrap/retention,
 pgoutput and actual Antfly client qualification scope remains open.
+
+### Separate distributed plan preparation from admission
+
+The completion coordinator now exposes owned read-only `prepare`,
+`restorePrepared` and `commitPrepared` operations. Existing ordinary commit uses
+those same operations. This lets source delivery retain the complete original
+plan before beginning native admission, rather than invoking the ordinary
+commit path while planning. Prepared routes own their table names; the ordinary
+commit result keeps its previous borrowed-input name lifetime.
+
+Preparation freezes canonical complete input, captures and validates every
+qualified owner, checks reservation capacity, and performs no decision lookup or
+participant mutation. A source checkpoint supplies the coordinator role even
+when it sorts after effects participants by namespace. Participant arrays stay
+in canonical namespace order, with a separate coordinator index used for the
+terminal decision. Caller-specified owners are compared with fresh observations
+and never silently overwritten. A source-owned transaction without history
+capability fails instead of returning the ordinary legacy fallback.
+
+Restoration reads only retained frozen bytes and fresh qualified owner/routing
+observations. It never recompiles provider effects or substitutes current owners.
+The existing retained-owner route validator is shared with terminal recovery.
+Topology/root identity conflicts retain the old authority and fail closed; this
+does not implement archived-root routing across structural transitions.
+
+This interface is a prerequisite for the production distributed source adapter;
+it does not yet wire PostgreSQL workers through metadata reservation, retained
+artifact transfer, hidden checkpoint provisioning or lifecycle handover. Those
+and all remaining original issue acceptance criteria remain unfinished.
+
+The split preparation/restore integration run passed all 27 selected linked
+tests (`completion-prepared-admission-final-test.log`), zero skips/failures/leaks.
+The source-catalog, engine-error and OpenAPI checks also passed
+(`completion-prepared-admission-contract-check.log`), including nine schema
+fragment tests. A further changed-topology regression initially expected
+SourceBindingConflict, but the qualified owner port rejects the mismatched epoch
+earlier with TopologyChanged. The assertion now requires that exact boundary
+error and checks that no decision lookup or participant write occurred. Final
+qualification of that additional regression follows below.
+
+Final `history-control-apply-test -Dstrip=true -j1` exited 0
+(`completion-prepared-admission-owner-final-test.log`): all 27 selected linked
+tests and six selected local tests passed, zero skips/failures/leaks. This
+includes exact topology-drift rejection during restoration, scoped checkpoint
+coordinator selection, no-write preparation/restoration, frozen-byte reopening,
+explicit prepared admission, owner substitution rejection and refusing source
+fallback when every owner lacks retained-history capability. The original
+public-feed/bootstrap/retention/pgoutput/client qualification scope is unchanged
+and remains unfinished.

@@ -43,16 +43,30 @@ pub const Result = struct {
         if (err == error.EnrichmentWorkerFailed) self.visibility_repair_required = true else self.visibility_retry_pending = true;
     }
 };
+const Route = struct { owner: completion.RoutedOwner, fence: metadata.CatalogRouteFence, table_name: []const u8, retention_limit_bytes: u64 };
+const Captured = struct { input: plan_mod.Input, fence: metadata.CatalogRouteFence, table_name: []const u8, retention_limit_bytes: u64 };
+/// An owned, read-only admission preparation. Source delivery retains the encoded
+/// plan before invoking commitPrepared; preparation itself issues no writes.
+pub const Prepared = struct {
+    arena: std.heap.ArenaAllocator,
+    plan: plan_mod.Plan,
+    routes: []const Route,
+    coordinator_index: usize,
+    pub fn deinit(self: *Prepared) void {
+        self.plan.deinit();
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
 pub const Coordinator = struct {
     owners: @import("history_owner_operations.zig").Port,
     recovery: @import("completion_recovery.zig").Recovery,
 
     /// Null means every root explicitly lacks retained-history capability.
-    /// A mixed transaction is rejected before BEGIN; enabled roots must never
-    /// silently re-enter the legacy protocol and lose their completion proof.
-    pub fn commit(self: Coordinator, a: A, transaction_id: [16]u8, begin_timestamp: u64, commit_version: u64, inputs: []const Input, sync_level: types.SyncLevel, original: Context) !?Result {
+    /// Mixed capability is rejected before BEGIN. Callers can persist the frozen
+    /// artifact and metadata reservation between preparation and admission.
+    pub fn prepare(self: Coordinator, a: A, transaction_id: [16]u8, begin_timestamp: u64, inputs: []const Input, original: Context) !?Prepared {
         if (inputs.len == 0) return null;
-        if (commit_version <= begin_timestamp) return error.InvalidTxnRecord;
         var context = try original.platformDeadline();
         context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s);
         try context.ensureActive();
@@ -62,9 +76,8 @@ pub const Coordinator = struct {
         var session = try catalog_api.RoutingSession.initWithBudget(a, self.recovery.catalog, budget);
         defer session.deinit();
         var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
+        errdefer arena.deinit();
         const scratch = arena.allocator();
-        const Captured = struct { input: plan_mod.Input, fence: metadata.CatalogRouteFence, table_name: []const u8, retention_limit_bytes: u64 };
         var captured: std.ArrayList(Captured) = .empty;
         var unsupported: usize = 0;
         for (inputs) |input| {
@@ -94,16 +107,22 @@ pub const Coordinator = struct {
                 else => return err,
             };
             var intent = input.intent;
+            if (intent.completion_owner) |expected| if (!std.meta.eql(expected, qualified.owner)) return error.SourceBindingConflict;
             intent.completion_owner = qualified.owner;
             const request = try intent.completionBatch(transaction_id, begin_timestamp, input.topology_epoch);
             const locator = try local.api_local_transaction_contract.participantIdForGroup(scratch, input.table_name, input.group_id);
             var roles: u8 = 0;
             if (request.writes.len != 0 or request.deletes.len != 0 or request.transforms.len != 0 or request.graph_writes.len != 0 or request.graph_deletes.len != 0 or request.integrity.len != 0 or request.integrity_commands.len != 0 or request.relational_activation != null or request.relational_retirement != null or request.relational_index_maintenance != null) roles |= completion.Roles.effects;
             if (request.predicates.len != 0 or request.range_guards.len != 0) roles |= completion.Roles.guards;
+            if (intent.completion_source_checkpoint != null) roles |= completion.Roles.checkpoint;
             if (roles == 0) roles = completion.Roles.guards;
-            try captured.append(scratch, .{ .input = .{ .owner = qualified.owner, .locator = locator, .roles = roles, .prepare = request }, .fence = fence, .table_name = input.table_name, .retention_limit_bytes = qualified.observation.retention_limit_bytes });
+            try captured.append(scratch, .{ .input = .{ .owner = qualified.owner, .locator = locator, .roles = roles, .prepare = request }, .fence = fence, .table_name = try scratch.dupe(u8, input.table_name), .retention_limit_bytes = qualified.observation.retention_limit_bytes });
         }
-        if (unsupported == inputs.len) return null;
+        if (unsupported == inputs.len) {
+            for (inputs) |input| if (input.intent.completion_source_purpose != null or input.intent.completion_source_scope != null or input.intent.completion_source_checkpoint != null or input.intent.source_admission != null) return error.ChangefeedCapabilityUnsupported;
+            arena.deinit();
+            return null;
+        }
         if (unsupported != 0) return error.ChangefeedCapabilityUnsupported;
         std.mem.sort(Captured, captured.items, {}, struct {
             fn less(_: void, left: Captured, right: Captured) bool {
@@ -112,12 +131,80 @@ pub const Coordinator = struct {
         }.less);
         const frozen_inputs = try scratch.alloc(plan_mod.Input, captured.items.len);
         for (captured.items, frozen_inputs) |item, *input| input.* = item.input;
-        const coordinator = captured.items[0];
+        var coordinator_index: usize = 0;
+        for (captured.items, 0..) |item, index| if (item.input.roles & completion.Roles.checkpoint != 0) {
+            coordinator_index = index;
+            break;
+        };
+        const coordinator = captured.items[coordinator_index];
         var plan = try plan_mod.Plan.freezeDerived(a, transaction_id, coordinator.input.owner, frozen_inputs, @import("antfly_platform").time.realtimeNs());
-        defer plan.deinit();
+        errdefer plan.deinit();
         const reservation = try plan.admission.reservationBytes(plan.admission_bytes.len);
         for (captured.items) |item| if (reservation > item.retention_limit_bytes) return error.HistoryTooLarge;
-        const query: @import("history_decision_operations.zig").Request = .{ .version = 1, .owner = coordinator.input.owner, .transaction_id = transaction_id, .minimum_applied_index = 1 };
+        const routes = try scratch.alloc(Route, captured.items.len);
+        for (captured.items, routes) |item, *route| route.* = .{ .owner = item.input.owner, .fence = item.fence, .table_name = item.table_name, .retention_limit_bytes = item.retention_limit_bytes };
+        try context.ensureActive();
+        return .{ .arena = arena, .plan = plan, .routes = routes, .coordinator_index = coordinator_index };
+    }
+
+    /// Reopen retained bytes without rebuilding effects or changing any owner.
+    /// Current routing supplies transport authority only; every original owner
+    /// must still match a fresh qualified observation before admission.
+    pub fn restorePrepared(self: Coordinator, a: A, bytes: []const u8, digest: completion.Digest, original: Context) !Prepared {
+        var context = try original.platformDeadline();
+        context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s);
+        try context.ensureActive();
+        var plan = try plan_mod.Plan.restoreFrozen(a, bytes, digest);
+        errdefer plan.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const scratch = arena.allocator();
+        var budget = self.recovery.catalog.budget(null);
+        budget.deadline_ns = budget.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io });
+        budget.cancellation = context.cancellation;
+        var session = try catalog_api.RoutingSession.initWithBudget(a, self.recovery.catalog, budget);
+        defer session.deinit();
+        const routes = try scratch.alloc(Route, plan.participants.len);
+        var coordinator_index: ?usize = null;
+        const reservation = try plan.admission.reservationBytes(plan.admission_bytes.len);
+        for (plan.participants, routes, 0..) |participant, *route, index| {
+            const fence = try @import("completion_recovery.zig").routeRetainedOwner(&session, participant.owner, participant.locator, budget, context);
+            const locator = local.api_local_transaction_contract.parseParticipantRef(participant.locator) orelse return error.InvalidParticipant;
+            const qualified = try self.owners.read(scratch, fence, locator.table_name, .{ .version = 1, .expected_table_binding = participant.owner.table_binding }, context);
+            if (!std.meta.eql(qualified.owner, participant.owner)) return error.SourceBindingConflict;
+            if (reservation > qualified.observation.retention_limit_bytes) return error.HistoryTooLarge;
+            route.* = .{ .owner = participant.owner, .fence = fence, .table_name = try scratch.dupe(u8, locator.table_name), .retention_limit_bytes = qualified.observation.retention_limit_bytes };
+            if (std.mem.eql(u8, &participant.owner.namespace, &plan.admission.coordinator_namespace)) coordinator_index = index;
+        }
+        try context.ensureActive();
+        return .{ .arena = arena, .plan = plan, .routes = routes, .coordinator_index = coordinator_index orelse return error.InvalidParticipant };
+    }
+
+    pub fn commit(self: Coordinator, a: A, transaction_id: [16]u8, begin_timestamp: u64, commit_version: u64, inputs: []const Input, sync_level: types.SyncLevel, original: Context) !?Result {
+        if (commit_version <= begin_timestamp) return error.InvalidTxnRecord;
+        var prepared = (try self.prepare(a, transaction_id, begin_timestamp, inputs, original)) orelse return null;
+        defer prepared.deinit();
+        var result = try self.commitPrepared(a, &prepared, commit_version, sync_level, original);
+        // Preserve commit's borrowed-input name contract after Prepared dies.
+        for (inputs) |input| if (input.group_id == result.coordinator_group_id and std.mem.eql(u8, input.table_name, result.coordinator_table_name)) {
+            result.coordinator_table_name = input.table_name;
+            return result;
+        };
+        return error.InvalidParticipant;
+    }
+
+    /// Admit the original qualified plan, without consulting rows or rebuilding
+    /// input. Expired captured route leases fail at the participant port.
+    pub fn commitPrepared(self: Coordinator, a: A, prepared: *const Prepared, commit_version: u64, sync_level: types.SyncLevel, original: Context) !Result {
+        const plan = &prepared.plan;
+        if (commit_version <= plan.begin_timestamp or prepared.routes.len != plan.participants.len or prepared.routes.len == 0 or prepared.coordinator_index >= prepared.routes.len) return error.InvalidTxnRecord;
+        const captured = prepared.routes;
+        const coordinator = captured[prepared.coordinator_index];
+        const transaction_id = plan.admission.transaction_id;
+        var context = try original.platformDeadline();
+        context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s);
+        try context.ensureActive();
+        const query: @import("history_decision_operations.zig").Request = .{ .version = 1, .owner = coordinator.owner, .transaction_id = transaction_id, .minimum_applied_index = 1 };
         var observed = try self.recovery.decisions.read(a, coordinator.fence, coordinator.table_name, query, context);
         defer observed.deinit();
         if (observed.value.decision) |existing| {
@@ -131,18 +218,18 @@ pub const Coordinator = struct {
             // Every owner, complete payload, and quota reservation size has
             // been checked before the first mutation. Unknown results leave
             // retained recovery ownership; no phase is retried in this pass.
-            for (captured.items, 0..) |item, index| self.recovery.participants.submit(a, &plan, index, item.fence, .begin, context) catch return error.CommitDecisionUnknown;
-            for (captured.items, 0..) |item, index| self.recovery.participants.submit(a, &plan, index, item.fence, .prepare, context) catch return error.CommitDecisionUnknown;
-            self.recovery.participants.submit(a, &plan, 0, coordinator.fence, .{ .resolve = .{ .status = .committed, .commit_version = commit_version } }, context) catch return error.CommitDecisionUnknown;
+            for (captured, 0..) |item, index| self.recovery.participants.submit(a, plan, index, item.fence, .begin, context) catch return error.CommitDecisionUnknown;
+            for (captured, 0..) |item, index| self.recovery.participants.submit(a, plan, index, item.fence, .prepare, context) catch return error.CommitDecisionUnknown;
+            self.recovery.participants.submit(a, plan, prepared.coordinator_index, coordinator.fence, .{ .resolve = .{ .status = .committed, .commit_version = commit_version } }, context) catch return error.CommitDecisionUnknown;
         }
         const wants_visibility = switch (sync_level) {
             .full_text, .enrichments, .full_index => true,
             .propose, .write => false,
         };
-        const outcome = self.recovery.run(a, coordinator.input.owner, coordinator.fence, coordinator.table_name, transaction_id, context) catch {
-            return .{ .coordinator_group_id = coordinator.input.owner.group_id, .coordinator_table_name = coordinator.table_name, .propagation_pending = true, .visibility_pending = wants_visibility, .visibility_retry_pending = wants_visibility };
+        const outcome = self.recovery.run(a, coordinator.owner, coordinator.fence, coordinator.table_name, transaction_id, context) catch {
+            return .{ .coordinator_group_id = coordinator.owner.group_id, .coordinator_table_name = coordinator.table_name, .propagation_pending = true, .visibility_pending = wants_visibility, .visibility_retry_pending = wants_visibility };
         };
-        var result: Result = .{ .coordinator_group_id = coordinator.input.owner.group_id, .coordinator_table_name = coordinator.table_name, .propagation_pending = outcome != .complete };
+        var result: Result = .{ .coordinator_group_id = coordinator.owner.group_id, .coordinator_table_name = coordinator.table_name, .propagation_pending = outcome != .complete };
         if (!wants_visibility) return result;
         if (outcome != .complete) {
             result.visibilityFailure(error.CommitPropagationIncomplete);
@@ -164,7 +251,7 @@ pub const Coordinator = struct {
             result.visibilityFailure(error.SourceTransactionIdentityConflict);
             return result;
         }
-        for (captured.items, 0..) |item, index| {
+        for (captured, 0..) |item, index| {
             self.recovery.participants.submitRetained(a, query.binding(), committed.value, index, item.fence, .{ .visibility = sync_level }, context) catch |err| result.visibilityFailure(err);
         }
         return result;
