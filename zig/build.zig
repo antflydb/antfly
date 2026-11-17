@@ -847,6 +847,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(&@import("build_support/focused_tests.zig").addDagTests(b, target, optimize).step);
+    @import("build_support/focused_tests.zig").addDagBench(b, target, optimize);
     unit_test_step.dependOn(&run_documents_tests.step);
     unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);

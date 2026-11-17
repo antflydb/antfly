@@ -68,6 +68,23 @@ pub fn addPagingTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize:
     return run;
 }
 
+pub fn addDagTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Step.Run {
+    const tests = b.addTest(.{ .name = "dag-constraint-tests", .root_module = module(b, "pkg/antfly-embedded/src/graph/dag_test.zig", target, optimize), .max_rss = 1024 * 1024 * 1024 });
+    const run = b.addRunArtifact(tests);
+    run.step.max_rss = 128 * 1024 * 1024;
+    b.step("dag-constraint-test", "Run bounded DAG validation and authority protocol tests").dependOn(&run.step);
+    return run;
+}
+
+pub fn addDagBench(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) void {
+    const root = module(b, "bench/graph/dag_validation_bench.zig", target, optimize);
+    root.addImport("dag_validation", module(b, "pkg/antfly-embedded/src/graph/dag_validation.zig", target, optimize));
+    const executable = b.addExecutable(.{ .name = "antfly-dag-validation-bench", .root_module = root, .max_rss = 1024 * 1024 * 1024 });
+    const run = b.addRunArtifact(executable);
+    run.step.max_rss = 256 * 1024 * 1024;
+    b.step("dag-constraint-bench", "Measure in-memory DAG validation cost on deep, wide and replacement inputs").dependOn(&run.step);
+}
+
 pub fn build(b: *std.Build) void {
     defer platform_build.finalizeMacosSdk(b);
     const target = b.standardTargetOptions(.{});
@@ -75,6 +92,8 @@ pub fn build(b: *std.Build) void {
     const all = b.step("test", "Run focused mutation and aggregation plans without constructing the product graph");
     b.default_step = all;
     all.dependOn(&addPagingTests(b, target, optimize).step);
+    all.dependOn(&addDagTests(b, target, optimize).step);
+    addDagBench(b, target, optimize);
     const plans = b.step("mutation-plan-test", "Run concrete mutation and transform read plans");
     inline for (.{ "transform_read_plan", "mutation_plan" }) |name| {
         const tests = b.addTest(.{ .name = name ++ "-tests", .root_module = module(b, "pkg/antfly-embedded/src/storage/db/" ++ name ++ ".zig", target, optimize), .max_rss = 1024 * 1024 * 1024 });
