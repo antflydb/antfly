@@ -109,22 +109,24 @@ pub const Port = struct {
     pub fn sealSlot(self: Port, a: A, write: control.Write, now: u64, context: Context) !control.SlotStart {
         try write.validate();
         if (write.mutation != .seal or write.mutation.seal.slot == null or now == 0) return error.InvalidChangefeed;
-        const uncertain = blk: {
-            self.mutate(a, write, context) catch |err| {
-                if (err == error.MetadataMutationOutcomeUnknown) break :blk true;
-                return err;
-            };
-            break :blk false;
+        self.mutate(a, write, context) catch |err| {
+            if (err != error.MetadataMutationOutcomeUnknown) return err;
         };
-        const bytes = self.read(a, write.id, context) catch |err| {
-            if (uncertain) return error.MetadataMutationOutcomeUnknown;
-            return err;
-        };
+        // The seal may have committed. Any failure to construct the exact
+        // acknowledgement must retain the inspect-before-retry outcome.
+        return self.readSlotStart(a, write, now, context) catch return error.MetadataMutationOutcomeUnknown;
+    }
+
+    /// Read-only recovery for the original authorized seal, including after
+    /// reconnect. No mutation is issued on this path.
+    pub fn readSlotStart(self: Port, a: A, original: control.Write, now: u64, context: Context) !control.SlotStart {
+        try original.validate();
+        if (original.mutation != .seal or original.mutation.seal.slot == null or now == 0) return error.InvalidChangefeed;
+        const bytes = try self.read(a, original.id, context);
         defer a.free(bytes);
         var observed = try control.parse(a, bytes);
         defer observed.deinit();
-        if (uncertain and observed.value.phase == .enrolling and observed.value.epoch == write.expected_epoch and observed.value.revision == write.expected_revision) return error.MetadataMutationOutcomeUnknown;
-        return control.recoverSlotStart(observed.value, write, now);
+        return control.recoverSlotStart(observed.value, original, now);
     }
 
     /// Apply the authorized drop once. An uncertain response is resolved by
@@ -283,16 +285,20 @@ pub const test_support = if (@import("builtin").is_test) struct {
             state: control.State,
             sealed: control.State,
             commit: bool = true,
+            acknowledge: bool = false,
+            read_unavailable: bool = false,
             mutations: usize = 0,
 
             fn read(raw: *anyopaque, allocator: A, _: control.Id, _: Context) anyerror![]u8 {
                 const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.read_unavailable) return error.ReadUnavailable;
                 return control.encode(allocator, self.state);
             }
             fn mutate(raw: *anyopaque, _: A, _: control.Write, _: Context) anyerror!void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 self.mutations += 1;
                 if (self.commit) self.state = self.sealed;
+                if (self.acknowledge) return;
                 return error.MetadataMutationOutcomeUnknown;
             }
         };
@@ -308,18 +314,28 @@ pub const test_support = if (@import("builtin").is_test) struct {
         try std.testing.expectEqualStrings("qualified-snapshot", created.rows[0][2].string);
         try std.testing.expect(created.mutation_outcome == .committed);
         try std.testing.expectEqual(@as(usize, 2), fake.mutations);
+        const original_start = try port.readSlotStart(a, write, 101, context);
+        try std.testing.expectEqual(configuration.consistent_lsn, original_start.consistent_lsn);
+        try std.testing.expectEqual(sealed.latest_cursor, original_start.cursor);
+        try std.testing.expectEqual(@as(usize, 2), fake.mutations);
+        fake.acknowledge = true;
+        fake.read_unavailable = true;
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.sealSlot(a, write, 101, context));
+        try std.testing.expectEqual(@as(usize, 3), fake.mutations);
+        fake.acknowledge = false;
+        fake.read_unavailable = false;
         var drop = write;
         drop.expected_revision = sealed.revision;
         drop.mutation = .{ .slot = .{ .drop = .{ .database = configuration.database, .name = configuration.name, .now = 102 } } };
         fake.sealed = try drop.apply(scratch, sealed, 5);
         fake.commit = false;
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.dropSlot(a, drop, context));
-        try std.testing.expectEqual(@as(usize, 3), fake.mutations);
+        try std.testing.expectEqual(@as(usize, 4), fake.mutations);
         fake.commit = true;
         const dropped = try commands.drop(port, a, .{ .drop_slot = .{ .slot = configuration.name, .wait = false } }, drop, context);
         try std.testing.expectEqualStrings("DROP_REPLICATION_SLOT", dropped.command_tag);
         try std.testing.expect(dropped.mutation_outcome == .committed);
-        try std.testing.expectEqual(@as(usize, 4), fake.mutations);
+        try std.testing.expectEqual(@as(usize, 5), fake.mutations);
         try std.testing.expectEqual(control.Phase.closing, fake.state.phase);
         var stale = drop;
         stale.expected_epoch += 1;
