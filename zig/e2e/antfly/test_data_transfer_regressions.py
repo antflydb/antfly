@@ -99,9 +99,10 @@ def test_lite_server_backup_roundtrip_under_connection_root(tmp_path, schema_ver
             if vector.status_code == 503:
                 return False
             assert vector.ok, vector.text
-            assert vector.json()["responses"][0]["hits"]["hits"][0]["_id"] == "a", (
-                vector.text
-            )
+            hits = vector.json()["responses"][0]["hits"]["hits"]
+            if not hits:
+                return False
+            assert hits[0]["_id"] == "a", vector.text
             sparse = requests.post(
                 server.api_url + f"/tables/{table}/query",
                 json={
@@ -116,9 +117,10 @@ def test_lite_server_backup_roundtrip_under_connection_root(tmp_path, schema_ver
             if sparse.status_code == 503:
                 return False
             assert sparse.ok, sparse.text
-            assert sparse.json()["responses"][0]["hits"]["hits"][0]["_id"] == "a", (
-                sparse.text
-            )
+            hits = sparse.json()["responses"][0]["hits"]["hits"]
+            if not hits:
+                return False
+            assert hits[0]["_id"] == "a", sparse.text
             return True
 
         wait_until(ready, timeout_s=60, interval_s=0.1)
@@ -197,7 +199,7 @@ def test_lite_server_backup_roundtrip_under_connection_root(tmp_path, schema_ver
                 {
                     "name": "sparse_vectors",
                     "kind": "sparse_vector",
-                    "config_json": json.dumps({"field": "embedding"}),
+                    "config_json": json.dumps({"field": "embedding", "external": True}),
                 }
             )
         )

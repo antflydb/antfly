@@ -238,13 +238,17 @@ pub fn publicTableIndexesJsonAlloc(alloc: Allocator, stored: []const u8, destina
             if (config.object.contains("generator") or config.object.contains("embedder")) return error.UnsupportedEmbeddedLiteIndex;
             const artifact_backed = config.object.contains("sources") or config.object.contains("embedding_name");
             if (!artifact_backed) {
-                // Sparse external lowering stores only the vector field (and
-                // optional execution/coverage policy), unlike dense lowering.
-                // With neither a producer nor an artifact source this is the
-                // native external sparse representation.
+                // Released sparse external lowering omitted the external
+                // marker. Recognize its implicit field for compatibility;
+                // current producers persist the marker explicitly.
                 if (config.object.get("external")) |external| {
                     if (external != .bool or !external.bool) return error.UnsupportedEmbeddedLiteIndex;
-                } else if (!sparse or !config.object.contains("field")) return error.UnsupportedEmbeddedLiteIndex;
+                } else {
+                    const field = config.object.get("field") orelse return error.UnsupportedEmbeddedLiteIndex;
+                    // Released server lowering used this exact implicit field.
+                    // Other native direct-field indexes have no public inverse.
+                    if (!sparse or field != .string or !std.mem.eql(u8, field.string, "embedding")) return error.UnsupportedEmbeddedLiteIndex;
+                }
                 try config.object.put(arena, "external", .{ .bool = true });
             }
             _ = config.object.orderedRemove("field");

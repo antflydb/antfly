@@ -7930,6 +7930,9 @@ test "public catalog translation preserves runtime config and incarnation" {
     try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,
         \\{"dense":{"kind":"dense_vector","config_json":"{\"field\":\"embedding\",\"dims\":2}"}}
     , .table_restore));
+    try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,
+        \\{"sparse":{"kind":"sparse_vector","config_json":"{\"field\":\"body\"}"}}
+    , .table_restore));
     try std.testing.expectEqualStrings("graph", public.value.object.get("links").?.object.get("type").?.string);
     try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,
         \\{"vectors":{"kind":"dense_vector","config_json":"{\"external\":true,\"dims\":2}"}}
