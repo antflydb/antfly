@@ -284,8 +284,9 @@ filename. You can also restore directly from the original repository with
 can still be opened in Lite to access its data.
 
 When selecting tables from a cluster backup, use the `selector` in
-`backup --list --output json` under `table_selectors` if display names
-collide. Pass it unchanged to `restore --tables`.
+`backup --list --output json` under `table_selectors`. Pass it unchanged to
+`restore --tables` for the same backup. Selectors work for tables with
+ambiguous display names, commas, or surrounding whitespace.
 
 For an offline source inventory and compatibility report, use:
 

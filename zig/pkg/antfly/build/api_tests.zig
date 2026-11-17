@@ -671,6 +671,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "remote backup metadata reads are size bounded",
             "remote backup key joins canonicalize only the prefix boundary",
             "cluster backup list uses top-level remote manifests without recursing into payloads",
+            "cluster backup selectors resolve raw and display collisions without CLI delimiters",
             "incomplete cluster backup attempts do not hide committed backups",
             "cluster backup list defers artifact validation to restore admission",
             "cluster backup list canonicalizes trailing prefix through s3 protocol",

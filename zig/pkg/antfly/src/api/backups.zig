@@ -219,9 +219,13 @@ pub fn isArtifactIntegrityError(err: anyerror) bool {
 pub const default_backup_list_limit: usize = 100;
 pub const max_backup_list_limit: usize = 1000;
 
+// Leave room for the JSON envelope and cursor within the CLI HTTP body limit.
+const backup_list_items_byte_budget = 64 * 1024 * 1024;
+
 pub const BackupListOptions = struct {
     limit: usize = default_backup_list_limit,
     cursor: ?[]const u8 = null,
+    items_byte_budget: usize = backup_list_items_byte_budget,
 };
 
 pub const BackupListPage = struct {
@@ -10563,7 +10567,7 @@ fn clusterManifestMatchesAttemptMarker(
         manifest.completed_table_count != marker.tables.len)
         return false;
     for (marker.tables) |attempt_table| {
-        const committed_table = findClusterTable(manifest, attempt_table.name) orelse
+        const committed_table = findClusterTableByStorageName(manifest, attempt_table.name) orelse
             return false;
         if (!std.mem.eql(u8, committed_table.table_backup_id, attempt_table.table_backup_id))
             return false;
@@ -10930,8 +10934,9 @@ fn backupInfoFromManifest(alloc: std.mem.Allocator, manifest: *const ClusterBack
         for (table_selectors[0..initialized_selectors]) |entry| alloc.free(entry.selector);
         alloc.free(table_selectors);
     }
-    for (manifest.tables, tables, table_selectors) |table, name, *entry| {
-        entry.* = .{ .name = name, .selector = try alloc.dupe(u8, table.name) };
+    const salt = clusterSelectorSalt(manifest);
+    for (tables, table_selectors, 0..) |name, *entry, i| {
+        entry.* = .{ .name = name, .selector = try std.fmt.allocPrint(alloc, "{s}{d}/{s}/{d}", .{ cluster_selector_prefix, salt, manifest.backup_id, i }) };
         initialized_selectors += 1;
     }
     const backup_id = try alloc.dupe(u8, manifest.backup_id);
@@ -10949,6 +10954,28 @@ fn backupInfoFromManifest(alloc: std.mem.Allocator, manifest: *const ClusterBack
         .location = owned_location,
         .antfly_version = version,
     };
+}
+
+fn appendBackupListInfo(
+    alloc: std.mem.Allocator,
+    infos: *std.ArrayListUnmanaged(BackupInfo),
+    remaining_bytes: *usize,
+    manifest: *const ClusterBackupManifest,
+    location: []const u8,
+) !bool {
+    const info = try backupInfoFromManifest(alloc, manifest, location);
+    var buffer: [1024]u8 = undefined;
+    var sink = std.Io.Writer.Discarding.init(&buffer);
+    sink.writer.print("{f}", .{std.json.fmt(info, .{ .emit_null_optional_fields = false })}) catch unreachable;
+    const cost = sink.fullCount() + 1; // Include a separator for each entry.
+    if (cost > remaining_bytes.*) {
+        freeBackupInfo(alloc, info);
+        if (infos.items.len == 0) return error.BackupManifestTooLarge;
+        return false;
+    }
+    remaining_bytes.* -= @intCast(cost);
+    infos.appendAssumeCapacity(info);
+    return true;
 }
 
 pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, location: []const u8, options: BackupListOptions) !BackupListPage {
@@ -11001,7 +11028,7 @@ pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, loc
         try retainSmallestBackupId(alloc, &backup_ids, options.limit + 1, entry.name);
     }
     std.mem.sort([]u8, backup_ids.items, {}, backupIdLessThan);
-    const has_more = backup_ids.items.len > options.limit;
+    var has_more = backup_ids.items.len > options.limit;
     if (has_more) alloc.free(backup_ids.pop().?);
 
     var infos = std.ArrayListUnmanaged(BackupInfo).empty;
@@ -11010,6 +11037,7 @@ pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, loc
         infos.deinit(alloc);
     }
     try infos.ensureTotalCapacity(alloc, backup_ids.items.len);
+    var remaining_bytes = options.items_byte_budget;
     for (backup_ids.items) |manifest_name| {
         const backup_id = backupIdFromClusterMetadataKey(manifest_name);
         var manifest = readClusterManifest(alloc, backup_root, backup_id) catch |err| {
@@ -11022,7 +11050,10 @@ pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, loc
         };
         defer manifest.deinit(alloc);
         if (manifest.format_version != cluster_format_version) continue;
-        infos.appendAssumeCapacity(try backupInfoFromManifest(alloc, &manifest, location));
+        if (!try appendBackupListInfo(alloc, &infos, &remaining_bytes, &manifest, location)) {
+            has_more = true;
+            break;
+        }
     }
     const next_cursor = if (has_more and infos.items.len > 0) try alloc.dupe(u8, infos.items[infos.items.len - 1].backup_id) else null;
     errdefer if (next_cursor) |cursor| alloc.free(cursor);
@@ -11209,6 +11240,7 @@ pub fn listClusterBackupsFromOpenedLocation(
         infos.deinit(alloc);
     }
     try infos.ensureTotalCapacity(alloc, options.limit);
+    var remaining_bytes = options.items_byte_budget;
 
     var continuation_token: ?[]u8 = null;
     defer if (continuation_token) |token| alloc.free(token);
@@ -11278,7 +11310,10 @@ pub fn listClusterBackupsFromOpenedLocation(
                 has_more = true;
                 break;
             }
-            infos.appendAssumeCapacity(try backupInfoFromManifest(alloc, &manifest, location_uri));
+            if (!try appendBackupListInfo(alloc, &infos, &remaining_bytes, &manifest, location_uri)) {
+                has_more = true;
+                break;
+            }
         }
 
         if (has_more) break;
@@ -11301,18 +11336,71 @@ pub fn listClusterBackupsFromOpenedLocation(
     return .{ .backups = try infos.toOwnedSlice(alloc), .next_cursor = next_cursor };
 }
 
-pub fn findClusterTable(
+const cluster_selector_prefix = "@antfly/restore/";
+
+fn clusterSelectorParts(name: []const u8) ?struct { salt: usize, suffix: []const u8 } {
+    if (!std.mem.startsWith(u8, name, cluster_selector_prefix)) return null;
+    const suffix = name[cluster_selector_prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, suffix, '/') orelse return null;
+    const salt = std.fmt.parseInt(usize, suffix[0..slash], 10) catch return null;
+    return .{ .salt = salt, .suffix = suffix[slash + 1 ..] };
+}
+
+fn clusterSelectorSalt(manifest: *const ClusterBackupManifest) usize {
+    // Scoped display names start with a catalog identifier. Raw names and
+    // default display names can occupy any selector prefix.
+    const salt_count = 2 * max_cluster_backup_attempt_tables + 1;
+    var available: std.StaticBitSet(salt_count) = .full;
+    for (manifest.tables) |table| {
+        if (clusterSelectorParts(table.name)) |parts| {
+            if (parts.salt < salt_count) available.unset(parts.salt);
+        }
+        if (table.catalog_target) |target| {
+            if (target.isDefault()) {
+                if (clusterSelectorParts(target.table)) |parts| {
+                    if (parts.salt < salt_count) available.unset(parts.salt);
+                }
+            }
+        }
+    }
+    return available.findFirstSet().?;
+}
+
+pub fn findClusterTableByStorageName(
+    manifest: *const ClusterBackupManifest,
+    name: []const u8,
+) ?*const ClusterTableBackupEntry {
+    for (manifest.tables) |*table| {
+        if (std.mem.eql(u8, table.name, name)) return table;
+    }
+    return null;
+}
+
+pub const ClusterTableSelection = struct {
+    manifest: *const ClusterBackupManifest,
+    salt: ?usize = null,
+
+    pub fn find(self: *ClusterTableSelection, table_name: []const u8) ?*const ClusterTableBackupEntry {
+        if (clusterSelectorParts(table_name)) |parts| {
+            if (self.salt == null) self.salt = clusterSelectorSalt(self.manifest);
+            if (parts.salt == self.salt.?) {
+                const slash = std.mem.indexOfScalar(u8, parts.suffix, '/') orelse return null;
+                if (!std.mem.eql(u8, parts.suffix[0..slash], self.manifest.backup_id)) return null;
+                const ordinal = std.fmt.parseInt(usize, parts.suffix[slash + 1 ..], 10) catch return null;
+                return if (ordinal < self.manifest.tables.len) &self.manifest.tables[ordinal] else null;
+            }
+        }
+        return findClusterTableByPublicName(self.manifest, table_name);
+    }
+};
+
+pub fn findClusterTableByPublicName(
     manifest: *const ClusterBackupManifest,
     table_name: []const u8,
 ) ?*const ClusterTableBackupEntry {
-    // Exact storage selectors are authoritative. Human-readable names are
-    // considered only when no exact selector matches.
-    for (manifest.tables) |*table| {
-        if (std.mem.eql(u8, table.name, table_name)) return table;
-    }
     const domain = @import("antfly_local_sources").system_catalog_domain;
     const explicit_target = if (std.mem.startsWith(u8, table_name, domain.target_key_prefix))
-        domain.Target.parse(table_name) catch return null
+        domain.Target.parse(table_name) catch null
     else
         null;
     var match: ?*const ClusterTableBackupEntry = null;
@@ -11326,13 +11414,44 @@ pub fn findClusterTable(
                 clusterBackupDisplayNameMatches(target, table_name)
         else
             false;
-        if (!matches) continue;
+        if (!matches and !std.mem.eql(u8, table.name, table_name)) continue;
         // Dotted public display names can collide with literal names or
         // another display name. The caller must use an exact identity then.
         if (match != null) return null;
         match = table;
     }
     return match;
+}
+
+test "cluster backup selectors resolve raw and display collisions without CLI delimiters" {
+    const alloc = std.testing.allocator;
+    const entries = [_]ClusterTableBackupEntry{
+        .{ .name = "tenant.public.docs", .table_backup_id = "legacy" },
+        .{ .name = "physical-docs", .table_backup_id = "scoped", .catalog_target = .{ .database = "tenant", .table = "docs" } },
+        .{ .name = " , padded ", .table_backup_id = "padded" },
+        .{ .name = "@antfly/restore/0/snapshot/0", .table_backup_id = "raw-prefix" },
+        .{ .name = "physical-prefix", .table_backup_id = "display-prefix", .catalog_target = .{ .table = "@antfly/restore/1/snapshot/0" } },
+    };
+    const manifest: ClusterBackupManifest = .{
+        .backup_id = "snapshot",
+        .timestamp = "",
+        .location = "file:///backups",
+        .antfly_version = "",
+        .tables = &entries,
+    };
+    const info = try backupInfoFromManifest(alloc, &manifest, manifest.location);
+    defer freeBackupInfo(alloc, info);
+    var selection: ClusterTableSelection = .{ .manifest = &manifest };
+    try std.testing.expect(selection.find("tenant.public.docs") == null);
+    try std.testing.expect(findClusterTableByStorageName(&manifest, "tenant.public.docs") == &entries[0]);
+    try std.testing.expect(selection.find(entries[3].name) == &entries[3]);
+    try std.testing.expect(selection.find(entries[4].catalog_target.?.table) == &entries[4]);
+    try std.testing.expect(selection.find("@antfly/restore/2/other-backup/0") == null);
+    try std.testing.expectEqualStrings(" , padded ", info.table_selectors[2].name);
+    for (info.table_selectors, entries[0..]) |item, *entry| {
+        try std.testing.expect(std.mem.indexOfAny(u8, item.selector, " ,\t\r\n") == null);
+        try std.testing.expect(selection.find(item.selector) == entry);
+    }
 }
 
 fn clusterBackupDisplayNameMatches(target: @import("antfly_local_sources").system_catalog_domain.Target, name: []const u8) bool {
@@ -12963,6 +13082,23 @@ test "cluster backup list uses top-level remote manifests without recursing into
     const second_json = try encodeBackupListResponse(std.testing.allocator, &second);
     defer std.testing.allocator.free(second_json);
     try std.testing.expect(std.mem.indexOf(u8, second_json, "next_cursor") == null);
+
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| std.testing.allocator.free(value);
+    for ([_][]const u8{ "prod-snap-2", "prod-snap-3", "prod-snap" }, 0..) |id, i| {
+        var page = try listClusterBackupsFromOpenedLocation(std.testing.allocator, &location, "s3://bucket/backups/prod", .{
+            .limit = 10,
+            .items_byte_budget = 350,
+            .cursor = cursor,
+        });
+        defer page.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), page.backups.len);
+        try std.testing.expectEqualStrings(id, page.backups[0].backup_id);
+        if (cursor) |value| std.testing.allocator.free(value);
+        cursor = page.next_cursor;
+        page.next_cursor = null;
+        try std.testing.expect((cursor == null) == (i == 2));
+    }
 }
 
 test "incomplete cluster backup attempts do not hide committed backups" {
@@ -17639,6 +17775,23 @@ test "filesystem backup listing is bounded and cursor stable" {
     try std.testing.expectEqual(@as(usize, 1), second.backups.len);
     try std.testing.expectEqualStrings("prod-snap", second.backups[0].backup_id);
     try std.testing.expectEqual(@as(?[]u8, null), second.next_cursor);
+
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |value| alloc.free(value);
+    for ([_][]const u8{ "prod-snap-2", "prod-snap-3", "prod-snap" }, 0..) |id, i| {
+        var page = try listClusterBackups(alloc, root, "file:///backups", .{
+            .limit = 10,
+            .items_byte_budget = 350,
+            .cursor = cursor,
+        });
+        defer page.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), page.backups.len);
+        try std.testing.expectEqualStrings(id, page.backups[0].backup_id);
+        if (cursor) |value| alloc.free(value);
+        cursor = page.next_cursor;
+        page.next_cursor = null;
+        try std.testing.expect((cursor == null) == (i == 2));
+    }
 }
 
 test "native backup directory copy preserves nested files" {

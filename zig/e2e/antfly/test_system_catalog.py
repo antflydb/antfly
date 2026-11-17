@@ -16,6 +16,7 @@
 """System catalog identity, placement, and qualified restore regressions."""
 
 import json
+import subprocess
 import tempfile
 import threading
 import uuid
@@ -25,6 +26,7 @@ from urllib.parse import quote
 
 import pytest
 import requests
+from conftest import E2E_BACKUP_CONNECTION
 from helpers import wait_until
 
 
@@ -378,7 +380,7 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
     api = backup_api
     database = "archive_" + uuid.uuid4().hex[:12]
     api.post(f"/databases/{database}", {})
-    literal = "sales/archive.v1"
+    literal = " sales/archive.v1, west "
     display_collision = f"{database}.public.{literal}"
     paths = [
         "/tables/" + quote(literal, safe=""),
@@ -416,13 +418,31 @@ def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
         # cache of existing bindings.
         for path in paths:
             api.delete(path)
-        restored = api.cluster_restore(
-            backup_id="catalog-cluster",
-            location=location,
-            restore_mode="fail_if_exists",
-            table_names=[literal, *collisions],
+        command = subprocess.run(
+            [
+                api._server.binary,
+                "--no-agent",
+                "restore",
+                "--backup-id",
+                "catalog-cluster",
+                "--connection",
+                E2E_BACKUP_CONNECTION,
+                "--location",
+                location,
+                "--url",
+                api._server.url,
+                "--mode",
+                "fail_if_exists",
+                "--tables",
+                ",".join(item["selector"] for item in selectors),
+                "--wait",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
-        assert restored["committed_table_count"] == 3
+        assert command.returncode == 0, command.stderr + api.debug_logs()
+        assert json.loads(command.stdout)["committed_table_count"] == 3
         for index, path in enumerate(paths):
             assert api.get(path + "/documents/doc") == {"scope": index}
     for path in paths:

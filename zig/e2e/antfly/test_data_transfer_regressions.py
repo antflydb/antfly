@@ -414,6 +414,25 @@ def test_lite_server_backup_roundtrip_under_connection_root(
                     report["compatibility"]["restore_blocker"]
                     == "unsupported_schema_migration"
                 )
+                migration_target = root / "migration-blocked"
+                failure = cli(
+                    "restore",
+                    "--input",
+                    output,
+                    "--table",
+                    "migration_blocked",
+                    "--connection",
+                    "bk",
+                    "--location",
+                    migration_target.as_uri(),
+                    "--url",
+                    server.url,
+                    "--wait",
+                    check=False,
+                )
+                assert failure.returncode != 0
+                assert "finish the migration on the source server" in failure.stderr
+                assert not migration_target.exists()
                 modified = json.loads(captured)
                 modified["shards"][0]["artifact_sha256"] = "0" * 64
                 sidecar.write_text(json.dumps(modified))

@@ -203,7 +203,7 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
             defer if (companion) |*manifest| manifest.deinit(allocator);
             report.catalog_source = if (companion != null) "companion" else "archive";
             if (companion) |manifest| {
-                if (manifest.read_schema_json.len != 0)
+                if (portableCompanionHasActiveMigration(&manifest))
                     report.restore_blocker = "unsupported_schema_migration";
             }
             const catalogs: InspectionCatalogs = if (companion) |manifest|
@@ -668,6 +668,10 @@ fn readPortableCompanion(
     return manifest;
 }
 
+fn portableCompanionHasActiveMigration(manifest: *const backups_api.TableBackupManifest) bool {
+    return manifest.read_schema_json.len != 0;
+}
+
 fn detachedPortableManifest(
     allocator: Allocator,
     path: []const u8,
@@ -678,6 +682,7 @@ fn detachedPortableManifest(
 ) !?backups_api.TableBackupManifest {
     var manifest = (try readPortableCompanion(allocator, path, integrity.size_bytes, integrity.sha256, null)) orelse return null;
     errdefer manifest.deinit(allocator);
+    if (portableCompanionHasActiveMigration(&manifest)) return error.UnsupportedBackupMigrationState;
     const shard = &@constCast(manifest.shards)[0];
     const owned_table = try allocator.dupe(u8, table_name);
     errdefer allocator.free(owned_table);
