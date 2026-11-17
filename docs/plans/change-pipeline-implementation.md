@@ -5658,3 +5658,55 @@ tests. No persisted format, protocol or runtime ABI changes are introduced.
 Production destination callback/worker wiring and the original remaining
 history/public-feed/bootstrap/retention/pgoutput/client qualification scope
 remain unfinished; both issues stay open.
+
+### Retained destination plan manifest and native artifact handoff
+
+`source_destination_plan.zig` now owns the frozen source plan bytes and a bounded,
+versioned recovery manifest. The manifest pins the original checkpoint authority,
+actual captured coordinator, source reference/token/sequence, checkpoint command,
+transaction and admission identities, begin/commit versions, native artifact
+epoch, full checksum, frozen digest and per-chunk hashes. Construction qualifies
+the quota observation against the exact coordinator root; native BEGIN still
+owns the atomic capacity decision. Metadata delivery input carries the original
+checkpoint authority, the exact scope reference and the matching artifact grant.
+Canonical encoded manifest and returned metadata fields must agree.
+
+Recovery strictly parses the metadata-pinned manifest digest, validates the native
+artifact grant, loads only a sealed/accepted ledger record through the existing
+qualified transfer ports, and verifies every payload chunk and complete frozen
+admission. Provider rows, current schema and new routing never reconstruct the
+plan. The shared pure owner/fence check is used both at HTTP ingress and when
+building the retained transfer. A manifest grants no metadata reservation, native
+seal, source lifecycle registration, transaction commitment or source ACK.
+
+Focused `completion-frozen-plan-test -Dstrip=true -j1` passed all four selected
+tests (`source-destination-manifest-transfer-test.log`), zero skips/failures/leaks.
+The new test uses a multi-chunk real frozen effect, loses the native seal reply,
+recovers the seal without mutation, refuses loading before the metadata seal,
+and restores the original plan after the original owned plan is destroyed.
+It rejects wrong routes, forged quota roots, exhausted capacity, substituted
+scope tokens/transaction IDs/checkpoints, changed bytes, mismatched metadata
+encodings and unknown manifest fields. Real owner/HTTP qualification follows.
+
+The production source actor/destination callback, legacy handover, lifecycle
+cohort registration/retirement, checkpoint root provisioning and all original
+public feed/bootstrap/retention/pgoutput/client qualification work remain open.
+
+Real `history-control-apply-test -Dstrip=true -j1` exited 0
+(`source-destination-manifest-native-test.log`): all 27 selected linked tests
+and six selected local tests passed, zero skips/failures/leaks. The existing
+forwarding-node/authenticated HTTP/native owner fixture now constructs and
+transfers a scoped destination manifest through production ports, refuses
+loading on native seal alone, restores its original admission/checkpoint input
+from a locally granted sealed artifact ledger, and verifies that the complete
+qualified observation/cut is unchanged by loading. Artifact reclamation is
+qualified separately afterward. The fixture's ledger and retirement grants are
+local test inputs, not evidence of a real metadata source actor transition or
+successful source lifecycle activation/admission.
+
+Source-catalog, engine-error and OpenAPI checks passed
+(`source-destination-manifest-contract-check.log`), including nine schema
+fragment tests. No existing wire format, Raft profile or ABI changes are needed
+for this versioned opaque source manifest. Production destination callback and
+worker integration, real lifecycle handover and the full remaining original
+acceptance criteria remain open.

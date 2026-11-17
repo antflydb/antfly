@@ -20,6 +20,15 @@ const operation = local.api_operation;
 const metadata = @import("../metadata/api.zig");
 const Owner = local.storage_transaction_completion.RoutedOwner;
 const A = std.mem.Allocator;
+/// Pure qualification shared by parsed HTTP ingress and retained plan routing.
+pub fn requireFence(owner: Owner, fence: metadata.CatalogRouteFence) !void {
+    owner.validate() catch return error.InvalidCatalogRouteFence;
+    try fence.validate();
+    const identity = fence.route.identity_namespace;
+    const incarnation = fence.metadata_incarnation orelse return error.InvalidCatalogRouteFence;
+    if (owner.metadata_group_id != fence.metadata_group_id or !std.mem.eql(u8, &owner.metadata_incarnation, &incarnation) or owner.topology_epoch != fence.topology_epoch or owner.group_id != fence.route.group_id or
+        std.mem.readInt(u64, owner.namespace[0..8], .big) != identity.table_id or std.mem.readInt(u64, owner.namespace[8..16], .big) != identity.shard_id or std.mem.readInt(u64, owner.namespace[16..24], .big) != identity.range_id) return error.InvalidCatalogRouteFence;
+}
 pub const Scope = struct {
     parsed: std.json.Parsed(metadata.CatalogRouteFence),
     fence: metadata.CatalogRouteFence,
@@ -29,11 +38,8 @@ pub const Scope = struct {
         var parsed = try std.json.parseFromSlice(metadata.CatalogRouteFence, a, context.catalog_route_fence_json, .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" });
         errdefer parsed.deinit();
         var fence = parsed.value;
-        try fence.validate();
-        const identity = fence.route.identity_namespace;
-        const incarnation = fence.metadata_incarnation orelse return error.InvalidCatalogRouteFence;
-        if (owner.metadata_group_id != fence.metadata_group_id or !std.mem.eql(u8, &owner.metadata_incarnation, &incarnation) or owner.topology_epoch != fence.topology_epoch) return error.InvalidCatalogRouteFence;
-        if (fence.route.group_id != group or owner.group_id != group or std.mem.readInt(u64, owner.namespace[0..8], .big) != identity.table_id or std.mem.readInt(u64, owner.namespace[8..16], .big) != identity.shard_id or std.mem.readInt(u64, owner.namespace[16..24], .big) != identity.range_id) return error.InvalidCatalogRouteFence;
+        try requireFence(owner, fence);
+        if (fence.route.group_id != group) return error.InvalidCatalogRouteFence;
         fence.admission_deadline_ns = context.deadline_ns;
         fence.admission_deadline_io = context.deadline_io;
         fence.admission_cancellation = context.cancellation;

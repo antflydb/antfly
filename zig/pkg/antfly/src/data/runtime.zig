@@ -60857,5 +60857,6 @@ const SourcePlanHttpFixture = struct {
         artifact_record.phase = .garbage;
         artifact_record.retirement = @splat(216);
         try std.testing.expect((try transfer.reclaim(a2, artifact_record, .{})) != null);
+        try @import("../api/source_destination_native_test.zig").verify(a2, origin_server, fence, original_owner);
     }
 };
