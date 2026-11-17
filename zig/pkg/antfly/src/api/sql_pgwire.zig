@@ -50,6 +50,7 @@ test "SQL NUMERIC public result descriptors parse through generated OpenAPI cont
 pub const Listener = struct {
     alloc: std.mem.Allocator,
     adapter: Adapter,
+    replication: ?CatalogReplicationFactory = null,
     server: @import("../pgwire/server.zig").Server,
 
     pub fn start(api: *http.ApiHttpServer, config: @import("antfly_local_sources").common_config.Config.PgwireConfig) !*Listener {
@@ -60,6 +61,11 @@ pub const Listener = struct {
         errdefer api.owner_alloc.destroy(self);
         self.alloc = api.owner_alloc;
         self.adapter = .{ .server = api };
+        self.replication = null;
+        if (config.replication_publication) |name| {
+            self.replication = try CatalogReplicationFactory.configured(api, io, name);
+            self.adapter.native_replication = self.replication.?.factory();
+        }
         self.server = try @import("../pgwire/server.zig").start(self.alloc, .{
             .io = io,
             .backend = self.adapter.backend(),
@@ -336,24 +342,32 @@ pub const CatalogReplicationSlots = struct {
     identity: ReplicationIdentity,
     database_name: []const u8,
     database: control.Digest,
+    system_identifier: u64,
 
     pub fn open(server: *http.ApiHttpServer, identity: ReplicationIdentity, a: std.mem.Allocator, database_name: []const u8, context: operation.RequestContext) !CatalogReplicationSlots {
         var authenticated = try identity.read(identity.context, a);
         defer authenticated.deinit(a);
         _ = try @import("changefeed_public.zig").durableOwner(authenticated);
-        const database = try readDatabase(server, a, database_name, context);
-        return .{ .server = server, .identity = identity, .database_name = database_name, .database = database };
+        const cut = try readDatabaseCut(server, a, database_name, context);
+        const cluster = control.hash(.{ .domain = "antfly:pg-system-identity:v1", .group = cut.metadata_group_id, .incarnation = cut.metadata_incarnation });
+        const system = @max(1, std.mem.readInt(u64, cluster[0..8], .big));
+        return .{ .server = server, .identity = identity, .database_name = database_name, .database = publicationDatabaseKey(cut), .system_identifier = system };
     }
 
     fn readDatabase(server: *http.ApiHttpServer, a: std.mem.Allocator, name: []const u8, context: operation.RequestContext) !control.Digest {
+        return publicationDatabaseKey(try readDatabaseCut(server, a, name, context));
+    }
+
+    fn readDatabaseCut(server: *http.ApiHttpServer, a: std.mem.Allocator, name: []const u8, context: operation.RequestContext) !domain.PublicationCatalogCut {
         try domain.validateName(name);
         const request: domain.ResolveMany = .{ .publication_database = name, .include_query_definitions = true };
         const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = request });
         defer a.free(bytes);
         const resolved = try std.json.parseFromSlice(domain.ResolvedMany, a, bytes, .{});
         defer resolved.deinit();
-        const cut = try resolved.value.requirePublicationCut(request);
-        return publicationDatabaseKey(cut);
+        var cut = try resolved.value.requirePublicationCut(request);
+        cut.bindings = &.{};
+        return cut;
     }
 
     pub fn readOwned(self: CatalogReplicationSlots, a: std.mem.Allocator, name: []const u8, context: operation.RequestContext) !control.Parsed {
@@ -838,6 +852,7 @@ pub const CatalogReplicationFactory = struct {
     registry: CatalogRetainedStream.Registry,
     stream_config: CatalogRetainedStream.retained.Config = .{},
     bootstrap: Bootstrap,
+    publication: ?[]const u8 = null,
 
     pub const System = struct {
         id: u64,
@@ -851,7 +866,42 @@ pub const CatalogReplicationFactory = struct {
         create: *const fn (*anyopaque, CatalogReplicationSlots, std.mem.Allocator, pg.Create, wire.Request, operation.RequestContext) anyerror!wire.Result,
     };
 
+    fn configured(api: *http.ApiHttpServer, io: std.Io, publication: []const u8) !CatalogReplicationFactory {
+        if (api.cfg.pgwire_replication != null or api.source.changefeeds == null or api.source.pg_publications == null or
+            api.cfg.native_history_roots == null) return error.ChangefeedCapabilityUnsupported;
+        var key_buffer: [256]u8 = undefined;
+        _ = try publication_metadata.key(&key_buffer, 1, @splat(1), publication);
+        const shared = api.cfg.deployment_mode != .standalone;
+        const store = if (api.cfg.document_artifact_store) |configured_store| configured_store else blk: {
+            if (shared) return error.PgSpoolStorageUnsupported;
+            const files = if (api.document_artifact_files) |*value| value else return error.PgSpoolStorageUnsupported;
+            break :blk try files.spoolArtifactStore(.{});
+        };
+        const registry: CatalogRetainedStream.Registry = .{ .store = store, .io = io };
+        try registry.requireAvailable(shared, operation.RequestContext{});
+        return .{
+            .server = api,
+            .registry = registry,
+            .stream_config = .{ .require_shared = shared },
+            .bootstrap = .{ .ptr = undefined, .identify = identifyNative, .create = createNative },
+            .publication = publication,
+        };
+    }
+
+    fn identifyNative(_: *anyopaque, slots: CatalogReplicationSlots, _: std.mem.Allocator, context: operation.RequestContext) !System {
+        try context.ensureActive();
+        // Slot LSNs are local to the slot. There is no database-wide WAL
+        // position to advertise before the client selects one.
+        return .{ .id = slots.system_identifier, .timeline = 1, .position = @fromBackingInt(0) };
+    }
+
+    fn createNative(raw: *anyopaque, slots: CatalogReplicationSlots, a: std.mem.Allocator, command: pg.Create, request: wire.Request, context: operation.RequestContext) !wire.Result {
+        const self: *CatalogReplicationFactory = @ptrCast(@alignCast(raw));
+        return CatalogSlotEnrollment.create(slots, a, &.{self.publication.?}, command, request, context);
+    }
+
     pub fn factory(self: *CatalogReplicationFactory) ReplicationFactory {
+        if (self.publication != null) self.bootstrap.ptr = self;
         return .{ .context = self, .open_fn = Session.open };
     }
 
@@ -940,9 +990,14 @@ pub const CatalogReplicationFactory = struct {
 
 pub const Adapter = struct {
     server: *http.ApiHttpServer,
+    native_replication: ?ReplicationFactory = null,
 
     pub fn backend(self: *Adapter) wire.Backend {
-        return .{ .context = self, .vtable = if (self.server.cfg.pgwire_replication != null) &replication_backend else &sql_backend };
+        return .{ .context = self, .vtable = if (self.replicationFactory() != null) &replication_backend else &sql_backend };
+    }
+
+    fn replicationFactory(self: *Adapter) ?ReplicationFactory {
+        return self.native_replication orelse self.server.cfg.pgwire_replication;
     }
 
     const sql_backend: wire.Backend.VTable = .{
@@ -971,7 +1026,7 @@ pub const Adapter = struct {
 
     fn openReplication(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !wire.ReplicationSession {
         const self: *Adapter = @ptrCast(@alignCast(raw));
-        const factory = self.server.cfg.pgwire_replication orelse return error.UnsupportedReplicationMode;
+        const factory = self.replicationFactory() orelse return error.UnsupportedReplicationMode;
         const credential: *Credential = @ptrCast(@alignCast(identity.context));
         try request.check();
         try credential.validate();
@@ -3544,6 +3599,21 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         var page = try stream.poll(stream.context, a, authority.request, stream.initial_lsn, 1024);
         defer page.deinit();
         try std.testing.expect(page.chunk == null);
+        server.cfg = .{
+            .deployment_mode = .standalone,
+            .native_history_roots = .{ .catalog = undefined, .controls = undefined, .pages = undefined, .grants = undefined },
+            .document_artifact_store = spool_store,
+        };
+        var native_factory = try CatalogReplicationFactory.configured(server, std.testing.io, "feed");
+        adapter.native_replication = native_factory.factory();
+        const configured_backend = adapter.backend();
+        const native_session = try configured_backend.vtable.open_replication_session.?(configured_backend.context, a, .{ .context = credential, .release = Credential.release }, authority.request);
+        defer native_session.close(native_session.context);
+        const native_system = try native_session.command(native_session.context, alloc, authority.request, .identify_system);
+        try std.testing.expectEqual(slots.system_identifier, try std.fmt.parseInt(u64, native_system.rows[0][0].string, 10));
+        try std.testing.expectEqualStrings("0/0", native_system.rows[0][2].string);
+        server.cfg.deployment_mode = .distributed;
+        try std.testing.expectError(error.PgSpoolStorageUnsupported, CatalogReplicationFactory.configured(server, std.testing.io, "feed"));
     }
     try std.testing.expect(fixture.slot_state.slot.?.session == null);
     _ = try executePublication(server, alloc, &authority, .{ .action = .drop, .name = "feed" });

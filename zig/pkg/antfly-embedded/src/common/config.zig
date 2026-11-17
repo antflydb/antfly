@@ -130,6 +130,9 @@ pub const Config = struct {
         bind_port: u16 = 5432,
         max_connections: u16 = 32,
         externally_protected_transport: bool = false,
+        /// Publication selected at slot creation for native no-snapshot mode.
+        /// START_REPLICATION must request the same bound publication.
+        replication_publication: ?[]const u8 = null,
     };
 
     pub const BackupConfig = struct {
@@ -936,7 +939,7 @@ pub const Config = struct {
         errdefer kernel_jit.deinit(alloc);
         var pgwire: ?PgwireConfig = null;
         if (root.get("pgwire")) |value| {
-            try validateObjectMemberFields(root, "pgwire", &.{ "enabled", "bind_host", "bind_port", "max_connections", "externally_protected_transport" });
+            try validateObjectMemberFields(root, "pgwire", &.{ "enabled", "bind_host", "bind_port", "max_connections", "externally_protected_transport", "replication_publication" });
             const object = switch (value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
@@ -949,15 +952,29 @@ pub const Config = struct {
                 else => return error.InvalidConfig,
             } else null;
             if (host) |name| if (name.len == 0 or name.len > 253) return error.InvalidConfig;
+            const publication = if (object.get("replication_publication")) |name| switch (name) {
+                .string => |string| string,
+                else => return error.InvalidConfig,
+            } else null;
+            if (publication) |name| {
+                if (name.len == 0 or name.len > 63 or !std.unicode.utf8ValidateSlice(name) or std.mem.indexOfScalar(u8, name, 0) != null)
+                    return error.InvalidConfig;
+            }
+            const owned_publication = if (publication) |name| try alloc.dupe(u8, name) else null;
+            errdefer if (owned_publication) |name| alloc.free(name);
             pgwire = .{
                 .enabled = try optionalBoolField(object, "enabled") orelse false,
                 .bind_port = @intCast(port),
                 .max_connections = @intCast(connections_count),
                 .externally_protected_transport = try optionalBoolField(object, "externally_protected_transport") orelse false,
                 .bind_host = if (host) |name| try alloc.dupe(u8, name) else null,
+                .replication_publication = owned_publication,
             };
         }
-        errdefer if (pgwire) |wire| if (wire.bind_host) |host| alloc.free(host);
+        errdefer if (pgwire) |wire| {
+            if (wire.bind_host) |host| alloc.free(host);
+            if (wire.replication_publication) |publication| alloc.free(publication);
+        };
         return .{
             .pgwire = pgwire,
             .connectors = connectors,
@@ -1231,7 +1248,10 @@ pub const Config = struct {
     }
 
     pub fn deinit(self: *Config) void {
-        if (self.pgwire) |wire| if (wire.bind_host) |host| self.registry.allocator.free(host);
+        if (self.pgwire) |wire| {
+            if (wire.bind_host) |host| self.registry.allocator.free(host);
+            if (wire.replication_publication) |publication| self.registry.allocator.free(publication);
+        }
         if (self.tls) |*tls| tls.deinit(self.registry.allocator);
         if (self.cors) |*cors| cors.deinit(self.registry.allocator);
         self.metadata.deinit(self.registry.allocator);
@@ -3965,13 +3985,14 @@ test "common config parses the hot_standby section and the deprecated ha alias" 
 
 test "common config parses bounded pgwire listener policy" {
     var config = try Config.parseFromSlice(std.testing.allocator,
-        \\{"pgwire":{"enabled":true,"bind_host":"127.0.0.1","bind_port":15432,"max_connections":8}}
+        \\{"pgwire":{"enabled":true,"bind_host":"127.0.0.1","bind_port":15432,"max_connections":8,"replication_publication":"changes"}}
     );
     defer config.deinit();
     try std.testing.expect(config.pgwire.?.enabled);
     try std.testing.expectEqualStrings("127.0.0.1", config.pgwire.?.bind_host.?);
     try std.testing.expectEqual(@as(u16, 15432), config.pgwire.?.bind_port);
     try std.testing.expect(!config.pgwire.?.externally_protected_transport);
+    try std.testing.expectEqualStrings("changes", config.pgwire.?.replication_publication.?);
     for ([_][]const u8{
         \\{"pgwire":{"max_connections":0}}
         ,
