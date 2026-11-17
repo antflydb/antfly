@@ -4557,6 +4557,22 @@ pub fn storageOwnerReplicatedBatchAtRaftEntryJson(
     return .ok;
 }
 
+pub fn storageOwnerTimestampedBatchAtRaftEntry(owner: ?*anyopaque, request: *const kernel_owner_abi.TimestampedBatchAtRaftEntryRequest) callconv(.c) kernel_owner_abi.Status {
+    const entry = request.entry;
+    if (entry.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (entry._reserved0 != 0 or entry.raft_term == 0 or entry.raft_index == 0 or request.committed_at_ns <= 0 or
+        entry.request_json.len == 0 or entry.request_json.len > 16 * 1024 * 1024 or
+        !borrowedBytesValid(entry.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, entry.table_name) orelse return .invalid_argument;
+    var parsed = batch_api.parseInternalBatchRequest(handle.alloc, entry.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    defer parsed.deinit(handle.alloc);
+    handle.db.applyOrderedTimestampedMutation(parsed.req, .{ .term = entry.raft_term, .index = entry.raft_index }, request.committed_at_ns, true) catch |err| {
+        return storageOwnerStatusFromError(@import("../storage/server_db_adapter.zig").normalizeOrderedApplyError(err));
+    };
+    return .ok;
+}
+
 const source_plan_wire = @import("antfly_local_sources").storage_source_plan_wire;
 const source_plan_control = source_plan_wire.control;
 fn sourcePlanInputStatus(err: anyerror) kernel_owner_abi.Status {

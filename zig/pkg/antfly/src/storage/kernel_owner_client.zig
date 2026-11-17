@@ -579,6 +579,13 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn timestampedBatchAtRaftEntry(self: *Owner, table: []const u8, batch_json: []const u8, term: u64, index: u64, committed_at_ns: i64) !void {
+        try statusToError(abi.antfly_storage_owner_timestamped_batch_at_raft_entry(self.handle, &.{
+            .entry = .{ .table_name = .fromSlice(table), .request_json = .fromSlice(batch_json), .raft_term = term, .raft_index = index },
+            .committed_at_ns = committed_at_ns,
+        }));
+    }
+
     pub fn replicatedBatchAtRaftEntryJson(
         self: *Owner,
         table_name: []const u8,

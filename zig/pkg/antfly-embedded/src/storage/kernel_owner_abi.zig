@@ -45,7 +45,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 120 adds apply-only original terminal legacy resolution.
 // Version 121 returns durable original-terminal recovery outcomes.
 // Version 122 adds read-only original-terminal outcome observations.
-pub const abi_version: u32 = 123;
+pub const abi_version: u32 = 124;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1113,6 +1113,13 @@ pub const ReplicatedBatchAtRaftEntryRequest = extern struct {
     raft_term: u64 = 0,
     raft_index: u64 = 0,
 };
+
+pub const TimestampedBatchAtRaftEntryRequest = extern struct {
+    entry: ReplicatedBatchAtRaftEntryRequest = .{},
+    committed_at_ns: i64 = 0,
+};
+
+pub extern fn antfly_storage_owner_timestamped_batch_at_raft_entry(owner: ?*anyopaque, request: *const TimestampedBatchAtRaftEntryRequest) callconv(.c) Status;
 
 /// Metadata-authorized hidden-child control on a native owner. This is a
 /// local operation receipt, never a data-Raft entry or source watermark.

@@ -115,6 +115,16 @@ test "storage owner legacy terminal resolution crosses native ABI and survives r
         var native = try client.Owner.open(open);
         defer native.deinit();
         try checkInventory(&native, a, command.owner, 4, true);
+        const batch = try local.api_internal_batch.encodeBatchRequest(a, .{
+            .source_producer = .ordinary,
+            .writes = &.{.{ .key = "timed", .value = "{}" }},
+        });
+        defer a.free(batch);
+        const commit_time = 1_700_000_000_000_000_000;
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_timestamped_batch_at_raft_entry(null, &.{ .entry = .{ .version = abi.abi_version - 1 } }));
+        try std.testing.expectError(error.InvalidArgument, native.timestampedBatchAtRaftEntry("docs", batch, 1, 5, 0));
+        try native.timestampedBatchAtRaftEntry("docs", batch, 1, 5, commit_time);
+        try native.timestampedBatchAtRaftEntry("docs", batch, 1, 5, commit_time);
     }
     {
         var db = try db_mod.DB.open(a, path, options);
@@ -122,7 +132,10 @@ test "storage owner legacy terminal resolution crosses native ABI and survives r
         const row = (try db.get(a, "recovered")) orelse return error.TestExpectedOrdinaryDocument;
         defer a.free(row);
         try std.testing.expectEqualStrings("{\"value\":1}", row);
-        try std.testing.expectEqual(@as(u64, 4), (try db.orderedApplyReceipt()).?.index);
+        const timed = (try db.get(a, "timed")) orelse return error.TestExpectedOrdinaryDocument;
+        defer a.free(timed);
+        try std.testing.expectEqualStrings("{}", timed);
+        try std.testing.expectEqual(@as(u64, 5), (try db.orderedApplyReceipt()).?.index);
         try std.testing.expectEqual(local.storage_transactions.TxnStatus.pending, try db.getTransactionStatus(pending_id));
     }
 }
