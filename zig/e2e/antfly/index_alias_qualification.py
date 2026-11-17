@@ -140,6 +140,7 @@ def exercise_swaps(session, base, table, *, rounds=8, failover=None):
     """Keep independent query and write loops active across acknowledged A/B/A."""
     stop = Event()
     observations = Counter()
+    observed = {name: Event() for name in INDEXES}
     availability = Counter()
     admission = Counter()
     write_admission = Counter()
@@ -147,10 +148,18 @@ def exercise_swaps(session, base, table, *, rounds=8, failover=None):
 
     def read():
         # Session connection pools are not shared across worker threads.
-        with requests.Session() as reader:
-            reader.auth = session.auth
-            while not stop.is_set():
-                observations[query(reader, base, table, availability)] += 1
+        try:
+            with requests.Session() as reader:
+                reader.auth = session.auth
+                while not stop.is_set():
+                    target = query(reader, base, table, availability)
+                    observations[target] += 1
+                    observed[target].set()
+        finally:
+            # Wake the coordinator on failure too; Future.result() below must
+            # surface the reader's original error instead of a coverage timeout.
+            for witness in observed.values():
+                witness.set()
 
     def write():
         nonlocal writes
@@ -207,6 +216,7 @@ def exercise_swaps(session, base, table, *, rounds=8, failover=None):
             previous = "space_a"
             for turn in range(rounds):
                 for target in ("space_b", "space_a"):
+                    observed[target].clear()
                     identity = f"swap-{turn}-{target}"
                     result = swap(
                         session, base, table, target, identity, previous, admission
@@ -214,6 +224,14 @@ def exercise_swaps(session, base, table, *, rounds=8, failover=None):
                     assert result["previous_index"] == previous, result
                     # A query started after the acknowledged swap must use it.
                     assert query(session, base, table) == target
+                    # Hold this acknowledged target until the independent
+                    # reader has witnessed it. Otherwise quick A/B/A swaps can
+                    # all fall between its reads, making coverage scheduler-
+                    # dependent despite every query being correct. Ingestion
+                    # continues during this event-driven rendezvous.
+                    assert observed[target].wait(timeout=60), observations
+                    if readers.done():
+                        readers.result()
                     previous = target
                 if failover is not None and turn == rounds // 2:
                     failover()

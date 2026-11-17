@@ -80,8 +80,10 @@ pub fn capture(db: anytype, output: A, document: []const u8, name: []const u8) !
         .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s,
     };
     try scan_budget.check();
-    if (document.len > limits.identity_bytes or name.len > limits.identity_bytes) return error.ResourceBudgetExceeded;
+    // Inspection budgets apply only to this optional dense-index view. A
+    // missing asset must remain absent for every otherwise legal document ID.
     const entry = db.core.index_manager.denseIndex(name) orelse return null;
+    if (document.len > limits.identity_bytes or name.len > limits.identity_bytes) return error.ResourceBudgetExceeded;
     const backing = scratchAllocator(output);
     var arena = std.heap.ArenaAllocator.init(backing);
     var owned = true;
