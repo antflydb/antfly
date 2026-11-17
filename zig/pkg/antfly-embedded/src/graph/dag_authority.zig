@@ -269,3 +269,157 @@ test "DAG authority codec rejects every single byte corruption and invalid state
     state.phase = .validating;
     try std.testing.expectError(error.GraphConstraintNotReady, state.begin(1, 0, testAttempt(1)));
 }
+
+/// Storage operations for the ordered domain owner. The caller supplies a
+/// serialized write transaction and aborts it on any error. Acceptance effects
+/// and resolution must be staged in that same transaction.
+pub const Storage = struct {
+    const state_prefix = "\x00\x00__metadata__:dag-state:";
+    const receipt_prefix = "\x00\x00__metadata__:dag-receipt:";
+
+    fn stateKey(id: Digest) [state_prefix.len + 64]u8 {
+        return state_prefix.* ++ std.fmt.bytesToHex(id, .lower);
+    }
+
+    fn receiptKey(id: Digest, attempt_id: Digest) [receipt_prefix.len + 128]u8 {
+        return receipt_prefix.* ++ std.fmt.bytesToHex(id, .lower) ++ std.fmt.bytesToHex(attempt_id, .lower);
+    }
+
+    pub fn load(txn: anytype, id: Digest) !State {
+        const state = try State.decode(try txn.get(&stateKey(id)));
+        if (!std.mem.eql(u8, &state.domain, &id)) return error.InvalidDagAuthority;
+        return state;
+    }
+
+    pub fn create(txn: anytype, id: Digest, epoch: u64) !void {
+        const key = stateKey(id);
+        if (txn.get(&key)) |_| {
+            return error.GraphConstraintAlreadyExists;
+        } else |err| if (err != error.NotFound) return err;
+        try save(txn, .{ .domain = id, .owner_epoch = epoch });
+    }
+
+    fn save(txn: anytype, state: State) !void {
+        try txn.put(&stateKey(state.domain), &try state.encode());
+    }
+
+    pub const Begin = union(enum) { reserved: Token, terminal: Receipt };
+
+    pub fn begin(txn: anytype, id: Digest, epoch: u64, revision: u64, attempt: Attempt) !Begin {
+        var state = try load(txn, id);
+        if (state.owner_epoch != epoch) return error.GraphConstraintOwnerChanged;
+        if (try readReceipt(txn, id, attempt)) |receipt| return .{ .terminal = receipt };
+        const token = try state.begin(epoch, revision, attempt);
+        try save(txn, state);
+        return .{ .reserved = token };
+    }
+
+    pub fn validated(txn: anytype, token: Token) !void {
+        var state = try load(txn, token.domain);
+        try state.validated(token);
+        try save(txn, state);
+    }
+
+    pub fn takeover(txn: anytype, id: Digest, expected_epoch: u64, new_epoch: u64) !void {
+        var state = try load(txn, id);
+        try state.takeover(expected_epoch, new_epoch);
+        try save(txn, state);
+    }
+
+    pub fn resolve(txn: anytype, token: Token, outcome: Outcome) !Receipt {
+        var state = try load(txn, token.domain);
+        if (state.owner_epoch != token.owner_epoch) return error.GraphConstraintOwnerChanged;
+        if (try readReceipt(txn, token.domain, token.attempt)) |receipt| {
+            if (receipt.outcome != outcome) return error.GraphConstraintAttemptConflict;
+            return receipt;
+        }
+        const receipt = try state.resolve(token, outcome);
+        var raw: [89]u8 = undefined;
+        @memcpy(raw[0..16], &token.attempt.transaction);
+        @memcpy(raw[16..48], &token.attempt.candidate);
+        raw[48] = switch (outcome) {
+            .accepted => 1,
+            .semantic_rejection => 2,
+            .aborted => 3,
+        };
+        std.mem.writeInt(u64, raw[49..57], receipt.revision, .little);
+        const key = receiptKey(token.domain, token.attempt.id);
+        receiptChecksum(&key, raw[0..57], raw[57..89]);
+        try txn.put(&key, &raw);
+        try save(txn, state);
+        return receipt;
+    }
+
+    fn receiptChecksum(key: []const u8, value: []const u8, out: *Digest) void {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(key);
+        hash.update(value);
+        out.* = hash.finalResult();
+    }
+
+    fn readReceipt(txn: anytype, id: Digest, attempt: Attempt) !?Receipt {
+        const key = receiptKey(id, attempt.id);
+        const raw = txn.get(&key) catch |err| {
+            if (err == error.NotFound) return null;
+            return err;
+        };
+        if (raw.len != 89) return error.InvalidDagAuthority;
+        var checksum: Digest = undefined;
+        receiptChecksum(&key, raw[0..57], &checksum);
+        if (!std.mem.eql(u8, &checksum, raw[57..89])) return error.InvalidDagAuthority;
+        if (!std.mem.eql(u8, raw[0..16], &attempt.transaction) or
+            !std.mem.eql(u8, raw[16..48], &attempt.candidate)) return error.GraphConstraintAttemptConflict;
+        return .{
+            .domain = id,
+            .attempt = attempt,
+            .revision = std.mem.readInt(u64, raw[49..57], .little),
+            .outcome = switch (raw[48]) {
+                1 => .accepted,
+                2 => .semantic_rejection,
+                3 => .aborted,
+                else => return error.InvalidDagAuthority,
+            },
+        };
+    }
+};
+
+test "DAG storage terminal receipts fence replay and changed payloads" {
+    const Txn = struct {
+        state: ?[State.encoded_len]u8 = null,
+        receipt: ?[89]u8 = null,
+
+        fn get(self: *@This(), key: []const u8) ![]const u8 {
+            if (std.mem.startsWith(u8, key, Storage.state_prefix)) {
+                if (self.state) |*raw| return raw;
+            } else if (self.receipt) |*raw| return raw;
+            return error.NotFound;
+        }
+
+        fn put(self: *@This(), key: []const u8, raw: []const u8) !void {
+            if (std.mem.startsWith(u8, key, Storage.state_prefix)) {
+                self.state = raw[0..State.encoded_len].*;
+            } else {
+                self.receipt = raw[0..89].*;
+            }
+        }
+    };
+    var txn: Txn = .{};
+    const state = testState();
+    try Storage.create(&txn, state.domain, 1);
+    try std.testing.expectError(error.GraphConstraintAlreadyExists, Storage.create(&txn, state.domain, 1));
+    try Storage.save(&txn, state);
+    const token = (try Storage.begin(&txn, state.domain, 1, 0, testAttempt(1))).reserved;
+    try Storage.validated(&txn, token);
+    try Storage.takeover(&txn, state.domain, 1, 2);
+    try std.testing.expectError(error.GraphConstraintOwnerChanged, Storage.resolve(&txn, token, .accepted));
+    const recovered = try Storage.load(&txn, state.domain);
+    const current = (try recovered.recoveryToken(2)).?;
+    const receipt = try Storage.resolve(&txn, current, .accepted);
+    try std.testing.expectEqualDeep(receipt, try Storage.resolve(&txn, current, .accepted));
+    try std.testing.expectEqualDeep(receipt, (try Storage.begin(&txn, state.domain, 2, 0, testAttempt(1))).terminal);
+    var conflicting = testAttempt(1);
+    conflicting.candidate = @splat(2);
+    try std.testing.expectError(error.GraphConstraintAttemptConflict, Storage.begin(&txn, state.domain, 2, 1, conflicting));
+    txn.receipt.?[0] ^= 1;
+    try std.testing.expectError(error.InvalidDagAuthority, Storage.begin(&txn, state.domain, 2, 1, testAttempt(1)));
+}
