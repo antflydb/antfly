@@ -20,17 +20,19 @@ from uuid import uuid4
 
 from helpers import wait_until
 from test_auth import AUTH_BOOTSTRAP_PASSWORD, _basic_auth
+from test_auth import auth_api as auth_api
 from test_privacy_indexed_activation import (
     policy,
     redacted,
 )
 
 
-pytest_plugins = ("test_auth", "test_privacy_indexed_activation")
+from test_privacy_indexed_activation import privacy_provider as privacy_provider
 
 
 def test_protected_tenant_serves_a_during_held_b_and_rolls_back(
-    auth_api, privacy_provider
+    auth_api,
+    privacy_provider,  # noqa: F811 -- imported pytest fixtures
 ):
     api = auth_api
     endpoint, calls, behavior, _ = privacy_provider
