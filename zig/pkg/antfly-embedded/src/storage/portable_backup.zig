@@ -2994,7 +2994,10 @@ pub fn inspectPortableFileBlocks(
         .options = options,
     };
     defer reader.inner.deinit(alloc);
-    try validatePortableImportReader(alloc, &reader, .{ .cancellation = options.cancellation });
+    // Inspection carries no destination authority. Accept only the same
+    // informational cohort proofs allowed by unpublished uncoordinated import;
+    // constraint schemas and admission records remain rejected by the reader.
+    try validatePortableImportReader(alloc, &reader, .{ .cancellation = options.cancellation, .detach_uncoordinated_cohort = true });
     const fingerprint = try reader.verifiedFingerprint();
     try reader.reset(alloc);
     if (options.metadata_first) {
@@ -6084,6 +6087,29 @@ test "portable standalone import detaches informational cohort without granting 
     };
     const bytes = try proof.encode();
     const entry: backup_codec.KeyValueEntry = .{ .key = cohort_proof_key, .value = &bytes };
+    // Exercise the first validation pass as well as the visitor decoder: both
+    // must accept informational proofs without granting constraint authority.
+    var archive_bytes: ArrayList(u8) = .empty;
+    defer archive_bytes.deinit(alloc);
+    try backup_codec.writeHeader(&archive_bytes, alloc, .{ .format_version = backup_codec.legacy_format_version, .flags = 0, .created_at_ns = 0, .backup_id = @splat(0), .table_count = 1, .shard_count = 1 });
+    const payload = try backup_codec.encodeKeyValueBatch(alloc, &.{entry});
+    defer alloc.free(payload);
+    try backup_codec.writeBlock(&archive_bytes, alloc, .metadata_batch, payload);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "cohort.afb", .{ .read = true });
+    defer file.close(std.testing.io);
+    try file.writePositionalAll(std.testing.io, archive_bytes.items, 0);
+    try file.sync(std.testing.io);
+    const Visitor = struct {
+        seen: bool = false,
+        fn visit(self: *@This(), _: backup_codec.BlockType, _: []const u8) !void {
+            self.seen = true;
+        }
+    };
+    var visitor: Visitor = .{};
+    _ = try inspectPortableFileBlocks(alloc, std.testing.io, file, .{}, &visitor, Visitor.visit);
+    try std.testing.expect(visitor.seen);
     var ordinary: PortableArchiveValidation = .{ .format_version = 2 };
     defer ordinary.deinit(alloc);
     try std.testing.expectError(error.CoordinatedConstraintPortableBackupUnsupported, validateMetadataEntries(alloc, &.{entry}, &ordinary));

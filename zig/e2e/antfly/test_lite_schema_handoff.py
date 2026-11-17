@@ -301,7 +301,7 @@ def test_embedded_text_segments_survive_standalone_adoption(tmp_path):
                 assert hits["total"]["value"] == count, response.text
             return True
 
-        wait_until(ready, timeout_s=60)
+        assert wait_until(ready, timeout_s=60), server.log_path.read_text()[-20000:]
         failed = False
     finally:
         server.stop(test_failed=failed)

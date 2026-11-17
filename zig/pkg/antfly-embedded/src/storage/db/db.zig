@@ -41343,6 +41343,7 @@ pub const DB = struct {
             .import_derived_indexes = true,
             .embedding_source_fields = options.embedding_source_fields,
             .unpublished_staging = true,
+            .detach_uncoordinated_cohort = true,
             .cancellation = options.cancellation,
         });
         portable_backup.validateCompleteDatabaseImageAlloc(alloc, self.core.store) catch |err| switch (err) {
