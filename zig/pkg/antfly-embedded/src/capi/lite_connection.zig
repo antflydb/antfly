@@ -824,6 +824,41 @@ const PathGate = struct {
     sql_preparation: @import("../sql/preparation_admission.zig").PreparationAdmission = .{},
     references: usize = 1,
     owners: std.ArrayList(*Owner) = .empty,
+
+    /// True while some writer-mode `Owner` sharing this gate (any
+    /// `Connection` to the same path -- including a different Owner than
+    /// the caller's own, per `compatible`'s own open-mode split) currently
+    /// holds this process's one cross-process writer lease through its
+    /// `WriterLane`, whether actively checked out mid-call or merely
+    /// parked between writes (lite-writer-authority.md W2 keeps that
+    /// lease's kernel lock open while parked, so back-to-back writers
+    /// skip the kernel round trip).
+    ///
+    /// Lets a reader's legacy (non-region) kernel lock attempt -- taken
+    /// only when `shared_lock_region.Region.open` itself reports the
+    /// region unusable for this call, e.g. a stale `db_inode` stamp left
+    /// by a vacuum's generation swap racing this process's own still-live
+    /// region peer (`ensureNoLivePeer`'s own doc comment) -- tell a
+    /// same-process self-collision apart from a genuinely foreign
+    /// writer's. Only the kernel can see the former as a lock conflict;
+    /// in-process state is the only way to know it is not one.
+    ///
+    /// Caller holds `self.mutex` (`acquirePathLeaseAssumeLocked`'s own
+    /// precondition); this takes each candidate `Owner`'s own
+    /// `writer_lane.mutex` in turn, never nested with another one, so it
+    /// cannot cycle against `WriterLane.checkout`'s own sequential (never
+    /// nested) hold of the two mutexes.
+    fn hasLocalWriterLease(self: *PathGate) bool {
+        const io = h.handleLockIo();
+        for (self.owners.items) |owner| {
+            if (!h.liteOpenModeCanWrite(owner.options.open_mode)) continue;
+            owner.writer_lane.mutex.lockUncancelable(io);
+            const held = owner.writer_lane.checked_out or owner.writer_lane.parked != null;
+            owner.writer_lane.mutex.unlock(io);
+            if (held) return true;
+        }
+        return false;
+    }
 };
 var registry_mutex: std.Io.Mutex = .init;
 var gates: std.StringHashMapUnmanaged(*PathGate) = .empty;
@@ -4366,6 +4401,28 @@ pub const Connection = struct {
                 // polling rather than making the deadline unbounded.
                 error.FileNotFound, error.ConcurrencyUnavailable => {
                     if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| hook.notify(hook.ptr);
+                },
+                // The fast region path above claims no exclusion from a
+                // writer at all, but its own legacy fallback (engaged only
+                // when the region itself is unusable for this call) takes
+                // a real kernel `.shared` lock, which can collide with
+                // this *same* process's own writer lease: `WriterLane`
+                // keeps that lease's kernel lock open while parked between
+                // writes, indistinguishable at the kernel level from a
+                // foreign writer's hold. A reader needs no actual
+                // exclusion from a same-process writer either (copy-on-
+                // write, same reasoning as the fast path's own doc
+                // comment), so this is never a real conflict -- only a
+                // genuinely foreign writer's lock is. `hasLocalWriterLease`
+                // tells the two apart; the self-collision case resolves at
+                // once, with no kernel lock ever taken, exactly like the
+                // fast path's own `.file = null` lease. See
+                // lite-writer-authority.md: a read-only handle in this
+                // process must never be blocked by this process's own
+                // parked writer lease.
+                error.FileBusy, error.WouldBlock => {
+                    if (self.gate.hasLocalWriterLease()) return self.owner.withReadRegistrationBatch(.{ .io_impl = undefined, .borrowed_io = io, .file = null });
+                    return err;
                 },
                 else => return err,
             }
@@ -8232,6 +8289,64 @@ test "capi native fresh readonly connection takes a stable snapshot after vacuum
     var snapshot_out: h.capi.Buffer = .{};
     defer api.antfly_buffer_free_zero(&snapshot_out);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_lite_copy_stable_snapshot_json(reader_id, snapshot_path, false, &snapshot_out));
+}
+
+// Regression (lite_cgo_test.go "snapshot with open transaction", flaky
+// `ANTFLY_BUSY: ... FileBusy`): a zero-`busy_timeout_ms` snapshot copy
+// (`antfly_lite_copy_stable_snapshot_file_json` -> `antfly_lite_open_readonly`,
+// exactly what the Go SDK's `CopyStableSnapshotFile` uses, with no way to
+// configure a nonzero timeout) used to fail outright while a *different*,
+// writer-mode connection to the same path had an open (begun, written,
+// never committed or rolled back) transaction. The preceding test's own
+// doc comment traces the same underlying chain (a stale `db_inode` stamp
+// on the region sidecar after a generation swap forces the legacy flock
+// fallback, which self-conflicts with this process's own parked
+// `WriterLane` lease) and records that `Store.reopenRegionAfterGenerationSwap`
+// closes it "the moment nothing in this process still holds the retired
+// generation" -- but an open transaction's own root reference is exactly
+// such a holder, so that eager reopen never fires here, and the stale
+// stamp (now compounded by a *second* generation swap: this test runs
+// both `antfly_lite_compact_json` and `antfly_lite_vacuum_json`, as the Go
+// test does) survives long enough for a zero-timeout reader to collide
+// with it. Fixed by `PathGate.hasLocalWriterLease`: a reader's legacy
+// fallback that collides with a kernel lock this process's own writer
+// lane holds (checked out or merely parked between writes) resolves at
+// once instead of ever treating that self-collision as busy -- see its
+// own doc comment, and `acquirePathLeaseAssumeLocked`'s reader branch
+// where it is consulted.
+test "capi native readonly snapshot copy with zero timeout ignores a same-process open transaction" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("open-txn-snapshot-fresh-reader", 1000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+
+    var compact_out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&compact_out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_lite_compact_json(fixture.id, &compact_out));
+
+    var vacuum_out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&vacuum_out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_lite_vacuum_json(fixture.id, &vacuum_out));
+
+    // Begin and write a transaction on the writer connection, and leave it
+    // open (never committed, never rolled back) -- exactly the Go test's
+    // own setup, which is what pins the retired generation and keeps
+    // `reopenRegionAfterGenerationSwap`'s eager reopen from ever running.
+    const open_txn_id: [16]u8 = .{ 0x6f, 0x70, 0x65, 0x6e, 0x2d, 0x74, 0x78, 0x6e, 0, 0, 0, 0, 0, 0, 0, 1 };
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_begin_transaction_with_id(fixture.id, &open_txn_id, 0, null, 0));
+    const pending_write = [_]h.capi.WriteIntent{.{ .key = .fromSlice("doc:pending"), .value = .fromSlice("{\"text\":\"pending open-transaction write\"}"), .is_delete = false }};
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_write_transaction(fixture.id, &open_txn_id, &pending_write, pending_write.len, null, 0));
+
+    // Mirrors the Go SDK's `CopyStableSnapshotFile`: opens its own
+    // zero-`busy_timeout_ms` readonly handle on `fixture.path` internally,
+    // then takes the snapshot through it -- never the writer's own handle.
+    const snapshot_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}-open-txn-snapshot.aflite", .{fixture.path}, 0);
+    defer std.testing.allocator.free(snapshot_path);
+    const path_c = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}", .{fixture.path}, 0);
+    defer std.testing.allocator.free(path_c);
+    var snapshot_out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free_zero(&snapshot_out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_lite_copy_stable_snapshot_file_json(path_c, snapshot_path, false, &snapshot_out));
 }
 
 // Regression: `WriterLane.checkout`'s cold path marks the lane checked out
