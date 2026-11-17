@@ -118,7 +118,7 @@ pub fn validateEncodedWrite(bytes: []const u8) !void {
 
 const Context = @import("antfly_local_sources").api_operation.RequestContext;
 
-fn requireAuthority(request: Context) !void {
+pub fn requireAuthority(request: Context) !void {
     try request.ensureActive();
     const principal = request.principal orelse return error.Forbidden;
     if (principal.kind != .internal or !std.mem.eql(u8, principal.subject, "pg-publication-maintenance"))

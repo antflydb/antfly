@@ -28000,6 +28000,7 @@ const RemoteMetadataSource = struct {
             .ptr = self,
             .routing = self.catalogSource().routingSource() catch unreachable,
             .changefeeds = .{ .ptr = self, .read_fn = remoteChangefeedRead, .mutate_fn = remoteChangefeedMutate, .authority_fn = remoteChangefeedAuthority },
+            .pg_publications = self.pgPublicationPort(),
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
                 .table_record = remoteTableRecord,
@@ -29160,6 +29161,7 @@ const RemoteMetadataSource = struct {
     };
 
     pub fn accessPgPublication(self: *RemoteMetadataSource, a: std.mem.Allocator, database: @import("../metadata/changefeed_control.zig").Digest, name: []const u8, write: ?@import("../metadata/pg_publication.zig").Write, request: antfly.public_api.operation.RequestContext) !FencedPublicationCall.Response {
+        try FencedPublicationCall.publication.requireAuthority(request);
         const call: FencedPublicationCall = .{ .input = .{ .group = 0, .incarnation = @splat(0), .database = database, .name = name, .write = write } };
         return self.accessFencedMetadata(a, request, write != null, call);
     }
@@ -51055,13 +51057,15 @@ fn consumerTests() type {
             defer source.deinit();
             source.cached_head = .{ .metadata_group_id = 42, .metadata_incarnation = @splat(7) };
             source.cached_head_at_ms = source.awakeMs();
-            const port = source.pgPublicationPort();
-            var record = (try port.read(port.ptr, a, @splat(2), "feed", .{})).?;
+            const port = source.statusSource().pg_publications orelse return error.TestUnexpectedResult;
+            try std.testing.expectError(error.Forbidden, port.read(port.ptr, a, @splat(2), "feed", .{}));
+            const context: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "pg-publication-maintenance" } };
+            var record = (try port.read(port.ptr, a, @splat(2), "feed", context)).?;
             defer record.deinit();
             try std.testing.expectEqualStrings("feed", record.value.name);
             try std.testing.expectEqual(@as(u64, 9), record.value.revision);
             const next: publication.Record = .{ .database = @splat(2), .name = "feed", .owner = @splat(3), .revision = 10 };
-            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.mutate(port.ptr, a, .{ .expected_revision = 9, .next = next }, .{}));
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, port.mutate(port.ptr, a, .{ .expected_revision = 9, .next = next }, context));
             try std.testing.expectEqual(@as(usize, 2), stub.calls);
         }
 

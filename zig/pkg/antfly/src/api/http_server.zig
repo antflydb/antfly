@@ -2063,6 +2063,7 @@ pub const StatusSource = struct {
     /// optional callbacks.
     routing: ?table_catalog.CatalogRoutingSource = null,
     changefeeds: ?@import("changefeed_metadata.zig").Port = null,
+    pg_publications: ?@import("../metadata/pg_publication.zig").Port = null,
 
     pub const VTable = struct {
         supports_query_definitions: bool = false,
@@ -3187,6 +3188,7 @@ pub const StatusSource = struct {
             .vtable = &comptime makeHttpServiceVTable(),
             .routing = table_catalog.CatalogSource.fromMetadataHttpService(svc).routingSource() catch unreachable,
             .changefeeds = @import("changefeed_metadata.zig").Port.fromService(svc),
+            .pg_publications = @import("../metadata/pg_publication.zig").Port.fromService(svc),
         };
     }
 
@@ -3196,6 +3198,7 @@ pub const StatusSource = struct {
             .vtable = &comptime makeServiceVTable(metadata_service.MetadataService),
             .routing = table_catalog.CatalogSource.fromMetadataService(svc).routingSource() catch unreachable,
             .changefeeds = @import("changefeed_metadata.zig").Port.fromService(svc),
+            .pg_publications = @import("../metadata/pg_publication.zig").Port.fromService(svc),
         };
     }
 
