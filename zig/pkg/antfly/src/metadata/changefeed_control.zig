@@ -21,7 +21,7 @@ const A = std.mem.Allocator;
 pub const Id = [16]u8;
 pub const Digest = [32]u8;
 pub const Namespace = [24]u8;
-pub const protocol_version: u16 = 106;
+pub const protocol_version: u16 = 107;
 pub const root_intent = @import("root_control_intent.zig");
 pub const pg_slot = @import("pg_slot.zig");
 pub const max_tables = 64;
@@ -388,7 +388,7 @@ pub const Mutation = union(enum) {
     enroll: struct { namespace: Namespace, ownership_epoch: u64, grant_sequence: u64, consumer_epoch: u64, start: u64, snapshot: ?Snapshot = null },
     rebind: struct { namespace: Namespace, previous: u64, next: u64, proof: Digest },
     refresh_grant: struct { namespace: Namespace, previous: u64 },
-    seal: struct { cut: Digest },
+    seal: struct { cut: Digest, slot: ?pg_slot.Configuration = null },
     issue: Delivery,
     acknowledge: Digest,
     reclaimed: struct { namespace: Namespace, consumer_epoch: u64, previous: u64, next: u64 },
@@ -424,7 +424,10 @@ pub const Mutation = union(enum) {
             },
             .refresh_grant => |value| if (!nz(value.namespace) or value.previous == 0) return error.InvalidChangefeed,
             .rebind => |value| if (!nz(value.namespace) or value.previous == 0 or value.next <= value.previous or !nz(value.proof)) return error.InvalidChangefeed,
-            .seal => |value| if (!nz(value.cut)) return error.InvalidChangefeed,
+            .seal => |value| {
+                if (!nz(value.cut)) return error.InvalidChangefeed;
+                if (value.slot) |configuration| try configuration.validate();
+            },
             .issue => |value| {
                 if (!validProviderContext(value.provider_context)) return error.InvalidChangefeed;
                 if (value.sequence == 0 or !nz(value.before) or !nz(value.cursor) or !nz(value.authority) or value.issued_at == 0 or value.advances.len > max_advances) return error.InvalidChangefeed;
@@ -684,6 +687,11 @@ pub const Mutation = union(enum) {
                 next.phase = if (state.definition.?.start == .snapshot_then_changes) .bootstrap else .streaming;
                 next.latest_cursor = hash(.{ .domain = "antfly:changefeed-cut:v1", .id = state.id, .epoch = state.epoch, .authority = state.authority, .definition = state.definition.?.identity(), .cut = sealed.cut });
                 next.acknowledged_cursor = next.latest_cursor;
+                if (sealed.slot) |configuration| {
+                    try slotDefinition(state.definition.?);
+                    if (!equal(state.id, pg_slot.feedId(configuration.database, configuration.name))) return error.ChangefeedConflict;
+                    next.slot = try pg_slot.State.initializeAt(configuration.database, configuration.name, next.acknowledged_cursor, configuration.byte_limit, configuration.consistent_lsn);
+                }
             },
             .issue => |delivery| {
                 if (state.phase != .streaming and state.phase != .bootstrap) return error.ChangefeedResynchronizationRequired;
@@ -1398,8 +1406,10 @@ fn testSlotStateAt(a: A, lsn: u64) !State {
     var state = try step(a, .{}, .{ .create = .{ .id = id, .definition = definition, .now = 100, .expires_at = 1000 } });
     state = try step(a, state, .{ .plan_roots = &.{.{ .namespace = testNamespace(7), .ownership_epoch = 1 }} });
     state = try step(a, state, .{ .enroll = .{ .namespace = testNamespace(7), .ownership_epoch = 1, .grant_sequence = state.roots[0].grant_sequence, .consumer_epoch = 6, .start = 10 } });
-    state = try step(a, state, .{ .seal = .{ .cut = @splat(7) } });
-    state = try step(a, state, .{ .slot = .{ .configure = .{ .database = @splat(1), .name = "slot", .consistent_lsn = lsn } } });
+    const configuration: pg_slot.Configuration = .{ .database = @splat(1), .name = "slot", .consistent_lsn = lsn };
+    state = try step(a, state, .{ .seal = .{ .cut = @splat(7), .slot = configuration } });
+    try std.testing.expectEqual(state.acknowledged_cursor, state.slot.?.mapped_cursor);
+    try std.testing.expectEqual(lsn, state.slot.?.confirmed_lsn);
     return step(a, state, .{ .slot = .{ .acquire = .{ .actor = @splat(2), .expected = 0, .now = 100, .expires = 150 } } });
 }
 test "changefeed logical slot confirms native ACK atomically and fences ordinary acknowledgements" {

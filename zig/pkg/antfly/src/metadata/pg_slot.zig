@@ -78,8 +78,19 @@ pub fn bindingAlloc(a: A, names: []const []const u8, projection: Digest) !Bindin
     try value.validate();
     return value;
 }
+pub const Configuration = struct {
+    database: Digest,
+    name: []const u8,
+    byte_limit: u64 = max_pending_bytes,
+    consistent_lsn: u64 = 1,
+
+    pub fn validate(self: Configuration) !void {
+        if (!nz(self.database) or !validName(self.name) or self.consistent_lsn == 0 or self.byte_limit < 47 or self.byte_limit > max_pending_bytes) return error.InvalidChangefeed;
+    }
+};
+
 pub const Mutation = union(enum) {
-    configure: struct { database: Digest, name: []const u8, byte_limit: u64 = max_pending_bytes, consistent_lsn: u64 = 1 },
+    configure: Configuration,
     acquire: struct { actor: Id, expected: u64, now: u64, expires: u64 },
     release: struct { session: Session, now: u64 },
     issue: struct { session: Session, now: u64, transaction: Prepared },
@@ -94,9 +105,7 @@ pub const Mutation = union(enum) {
     checkpoint_spool_cleanup: struct { id: u64, storage: Digest, expected: u64, progress: spool_control.Cleanup },
     pub fn validate(self: Mutation) !void {
         switch (self) {
-            .configure => |v| {
-                if (!nz(v.database) or !validName(v.name) or v.byte_limit < 47 or v.byte_limit > max_pending_bytes) return error.InvalidChangefeed;
-            },
+            .configure => |configuration| try configuration.validate(),
             .acquire => |v| if (!nz(v.actor) or v.now == 0 or v.expires <= v.now or v.expires - v.now > max_session_seconds) return error.InvalidChangefeed,
             .issue => |v| {
                 try v.transaction.validate();
