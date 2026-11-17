@@ -236,13 +236,24 @@ pub fn publicTableIndexesJsonAlloc(alloc: Allocator, stored: []const u8, destina
             // is no lossless public inverse. Artifact and external consumers
             // retain their authoritative vectors and can be translated exactly.
             if (config.object.contains("generator") or config.object.contains("embedder")) return error.UnsupportedEmbeddedLiteIndex;
+            const external_value = config.object.get("external");
+            const external = if (external_value) |v| v == .bool and v.bool else false;
+            if (external) {
+                // The primary vector backend materializes a native self-reference
+                // for external vectors. It is not a public enrichment producer.
+                if (config.object.get("embedding_name")) |name| {
+                    if (name != .string or !std.mem.eql(u8, name.string, entry.key_ptr.*)) return error.UnsupportedEmbeddedLiteIndex;
+                    _ = config.object.orderedRemove("embedding_name");
+                }
+                if (config.object.contains("sources")) return error.UnsupportedEmbeddedLiteIndex;
+            }
             const artifact_backed = config.object.contains("sources") or config.object.contains("embedding_name");
             if (!artifact_backed) {
                 // Released sparse external lowering omitted the external
                 // marker. Recognize its implicit field for compatibility;
                 // current producers persist the marker explicitly.
-                if (config.object.get("external")) |external| {
-                    if (external != .bool or !external.bool) return error.UnsupportedEmbeddedLiteIndex;
+                if (config.object.get("external")) |marker| {
+                    if (marker != .bool or !marker.bool) return error.UnsupportedEmbeddedLiteIndex;
                 } else {
                     const field = config.object.get("field") orelse return error.UnsupportedEmbeddedLiteIndex;
                     // Released server lowering used this exact implicit field.

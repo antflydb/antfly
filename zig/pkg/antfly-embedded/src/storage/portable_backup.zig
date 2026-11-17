@@ -7941,7 +7941,7 @@ test "public catalog translation preserves runtime config and incarnation" {
     defer a.free(again);
     try std.testing.expectEqualStrings(translated, again);
     const vectors = try publicTableIndexesJsonAlloc(a,
-        \\{"dense":{"kind":"dense_vector","config_json":"{\"dims\":2,\"metric\":\"l2_squared\",\"external\":true,\"field\":\"embedding\"}"},"sparse":{"kind":"sparse_vector","config_json":"{\"field\":\"embedding\"}"},"links":{"kind":"graph","config_json":"{}"}}
+        \\{"dense":{"kind":"dense_vector","config_json":"{\"dims\":2,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"dense\",\"field\":\"embedding\"}"},"sparse":{"kind":"sparse_vector","config_json":"{\"field\":\"embedding\"}"},"links":{"kind":"graph","config_json":"{}"}}
     , .table_restore);
     defer a.free(vectors);
     var public = try std.json.parseFromSlice(std.json.Value, a, vectors, .{});
@@ -7951,6 +7951,14 @@ test "public catalog translation preserves runtime config and incarnation" {
     try std.testing.expectEqual(@as(i64, 2), dense.get("dimension").?.integer);
     try std.testing.expectEqualStrings("l2_squared", dense.get("distance_metric").?.string);
     try std.testing.expect(dense.get("field") == null);
+    try std.testing.expect(dense.get("embedding_name") == null);
+    const backed = try publicTableIndexesJsonAlloc(a,
+        \\{"backed":{"kind":"dense_vector","config_json":"{\"dims\":2,\"embedding_name\":\"producer\"}"}}
+    , .table_restore);
+    defer a.free(backed);
+    var backed_public = try std.json.parseFromSlice(std.json.Value, a, backed, .{});
+    defer backed_public.deinit();
+    try std.testing.expectEqualStrings("producer", backed_public.value.object.get("backed").?.object.get("embedding_name").?.string);
     try std.testing.expect(public.value.object.get("sparse").?.object.get("sparse").?.bool);
     try std.testing.expect(public.value.object.get("sparse").?.object.get("external").?.bool);
     try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, publicTableIndexesJsonAlloc(a,

@@ -509,12 +509,12 @@ pub fn indexConfigsEqual(alloc: std.mem.Allocator, a: db_mod.types.IndexConfig, 
     // Native catalogs and public lowering may serialize the same configuration
     // differently. Formatting must never retire an unchanged vector producer:
     // retirement also removes its authoritative embedding artifacts.
-    if (vector) return vectorIndexConfigsEqual(alloc, a.kind, a.config_json, b.config_json);
+    if (vector) return vectorIndexConfigsEqual(alloc, a.kind, a.name, a.config_json, b.config_json);
     if (a.kind == .algebraic) return algebraicIndexConfigsEqual(alloc, a.config_json, b.config_json);
     return false;
 }
 
-fn vectorIndexConfigsEqual(alloc: std.mem.Allocator, kind: db_mod.types.IndexKind, a_json: []const u8, b_json: []const u8) !bool {
+fn vectorIndexConfigsEqual(alloc: std.mem.Allocator, kind: db_mod.types.IndexKind, index_name: []const u8, a_json: []const u8, b_json: []const u8) !bool {
     var a = try std.json.parseFromSlice(std.json.Value, alloc, a_json, .{});
     defer a.deinit();
     var b = try std.json.parseFromSlice(std.json.Value, alloc, b_json, .{});
@@ -527,7 +527,20 @@ fn vectorIndexConfigsEqual(alloc: std.mem.Allocator, kind: db_mod.types.IndexKin
         try normalizeLegacySparseExternalConfig(a.arena.allocator(), &a.value);
         try normalizeLegacySparseExternalConfig(b.arena.allocator(), &b.value);
     }
+    normalizeExternalVectorSelfReference(&a.value, index_name);
+    normalizeExternalVectorSelfReference(&b.value, index_name);
     return jsonValuesEqualIgnoringTopLevelEnrichments(a.value, b.value, false);
+}
+
+fn normalizeExternalVectorSelfReference(value: *std.json.Value, index_name: []const u8) void {
+    if (value.* != .object or value.object.contains("sources")) return;
+    const external = value.object.get("external") orelse return;
+    if (external != .bool or !external.bool) return;
+    const name = value.object.get("embedding_name") orelse return;
+    // The native primary-vector backend writes the index's own name explicitly;
+    // public external definitions use that same name implicitly.
+    if (name == .string and std.mem.eql(u8, name.string, index_name))
+        _ = value.object.orderedRemove("embedding_name");
 }
 
 fn normalizeLegacySparseExternalConfig(alloc: std.mem.Allocator, value: *std.json.Value) !void {

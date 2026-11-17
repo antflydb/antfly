@@ -3912,6 +3912,11 @@ test "table provisioner preserves vector incarnations across JSON formatting" {
         desired.config_json = "{\"field\":\"embedding\"}";
         try std.testing.expectEqual(kind == .sparse_vector, try indexConfigsEqual(alloc, original, desired));
         desired.config_json = "{\"external\":true,\"field\":\"embedding\"}";
+        desired.config_json = "{\"external\":true,\"field\":\"embedding\",\"embedding_name\":\"vectors\"}";
+        try std.testing.expect(try indexConfigsEqual(alloc, original, desired));
+        desired.config_json = "{\"external\":true,\"field\":\"embedding\",\"embedding_name\":\"other\"}";
+        try std.testing.expect(!try indexConfigsEqual(alloc, original, desired));
+        desired.config_json = "{\"external\":true,\"field\":\"embedding\"}";
         desired.coverage_generation += 1;
         try std.testing.expect(!try indexConfigsEqual(alloc, original, desired));
         desired.coverage_generation = original.coverage_generation;
