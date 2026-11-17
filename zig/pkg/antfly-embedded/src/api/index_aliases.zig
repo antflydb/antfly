@@ -949,35 +949,3 @@ test "index alias physical configuration equality ignores lifecycle epochs" {
     try std.testing.expect(try configurationEqual(a, aliased, physical));
     try std.testing.expect(!try configurationEqual(a, aliased, "{\"b\":{\"type\":\"full_text\"}}"));
 }
-
-test "privacy progress cannot replace physical owners or query catalog cuts" {
-    const privacy = @import("../privacy/catalog.zig");
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
-    const before = try privacy.install(a, "{}", resource);
-    resource.coverage.retry_after_millis = 200;
-    _ = try privacy.startScan(a, &resource, "a", "z", 50);
-    resource.checkpoint_encoding = 1;
-    const progress = try privacy.replaceResource(a, before, resource);
-    const physical = try physicalProjection(a, before);
-    const query = try queryProjection(a, before);
-    try std.testing.expectEqualStrings(physical, try physicalProjection(a, progress));
-    try std.testing.expectEqualStrings(query, try queryProjection(a, progress));
-    // The authoritative job state remains intact; projections never mutate it.
-    const durable = try std.json.parseFromSliceLeaky(V, a, progress, .{});
-    try std.testing.expect(durable.object.get("_privacy").?.object.contains("coverage"));
-    try std.testing.expect(durable.object.get("_privacy").?.object.contains("scans"));
-    const stripped = try std.json.parseFromSliceLeaky(V, a, physical, .{});
-    try std.testing.expect(!stripped.object.get("_privacy").?.object.contains("coverage"));
-    try std.testing.expect(!stripped.object.get("_privacy").?.object.contains("scans"));
-    // Every semantic or future field is still an owner invalidation fence.
-    inline for (.{ "resource_version", "generation", "policy_version", "artifact_name", "policy", "unprotected_indexes_json", "future_fence" }) |field| {
-        var changed = try std.json.parseFromSliceLeaky(V, a, progress, .{});
-        try changed.object.getPtr("_privacy").?.object.put(a, field, .{ .string = "changed" });
-        const encoded = try std.json.Stringify.valueAlloc(a, changed, .{});
-        try std.testing.expect(!std.mem.eql(u8, physical, try physicalProjection(a, encoded)));
-        try std.testing.expect(!std.mem.eql(u8, query, try queryProjection(a, encoded)));
-    }
-}

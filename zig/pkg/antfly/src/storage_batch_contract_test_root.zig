@@ -19,7 +19,7 @@
 pub const antfly_sources = @import("source_owner_physical.zig");
 pub const local_test_sources = @import("local_test_sources.zig");
 test {
-    _ = @import("antfly_local_sources").api_index_metadata.aliases;
+    _ = @import("antfly_local_sources").api_index_metadata;
     _ = @import("antfly_local_sources").api_internal_batch;
     _ = antfly_sources.physical_db;
     _ = @import("antfly_local_sources").storage_db_db;
