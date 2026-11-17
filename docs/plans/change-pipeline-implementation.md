@@ -6448,3 +6448,63 @@ closed producer policy. Guarded `make gc` completed successfully
 21.3 GiB remained free. `git diff --check` passed. These results qualify the
 engine-60 transaction guard only; they do not qualify legacy drainage or complete
 the original feature set.
+
+### Immutable ordinary transaction provenance
+
+Native transaction records now distinguish trusted ordinary BEGIN from every
+older unclassified encoding. The separate 55-byte v10 record stores the ordinary
+producer discriminator and the pinned document revision scheme; the v0-v9
+encodings retain their existing interpretation. Invalid discriminator and revision
+bytes are rejected. Native BEGIN takes an explicit private `ordinary_producer`
+flag, forbids combining it with source purpose/scope, and compares it on retries
+and PREPARE. A retry cannot upgrade an old unclassified record or downgrade a
+classified one. The atomic record writer independently refuses any provenance
+change against the prior stored record.
+
+After physical producer closure, an ordinary record requires its retained v3
+completion admission, exact transaction ID, local namespace, coordinator role and
+original routed physical owner to match that closed root. This is checked in the
+same native writer as the transaction record, credits, intents and markers.
+Resolution inherits the stored provenance rather than accepting a caller label.
+Captured intent batches carry the immutable flag, so DB materialization preserves
+it together with the original revision during restart resolution. Bounded
+transaction summaries expose the retained classification for later qualified
+census work. Native engine descriptor 61 reflects the changed storage semantics
+and internal type layout; owner ABI 111, API kernel 32, data 41, metadata 105 and
+failure 89 are unchanged at this step.
+
+The real NativeKV closure fixture now preserves an unclassified completion
+transaction from before closure and refuses a classified retry after closure. It
+rejects an ordinary admission for a changed root generation without creating the
+record, admits a correctly bound ordinary participant, refuses an unlabelled
+PREPARE, prepares with the original classification, reopens the store, and commits
+without a new caller label. The captured intent batch and terminal summary retain
+the original flag. The focused codec test rejects malformed v10 encodings and
+proves older bytes remain unclassified. This fixture commits an empty prepared
+ordinary transaction; nonempty production DB/Raft/HTTP qualification still needs
+the full ingress transport.
+
+`source-scope-native-control-test docstore-history-test -Dstrip=true -j1` passed:
+one compiled-engine DB case and all 16 history/transaction cases, zero failures,
+skips or leaks (`source-ordinary-transaction-test.log`). Generation and linked
+verification follow below.
+
+This storage foundation does not attach ordinary labels to existing internal
+requests. Explicit ingress, HTTP forwarding, frozen plan and Raft profile plumbing
+still must preserve absent labels on older requests. Every special mutation,
+producer closure RPC/Raft activation, qualified legacy resolution/drainage and
+snapshot/cohort transfer remain outstanding, and first-strict activation stays
+closed. The original destination adapter, public feeds, bootstrap/retention,
+pgoutput, actual Antfly client qualification and remaining end-to-end acceptance
+requirements remain open under the full active goal.
+
+Full generation completed successfully (`source-ordinary-transaction-generate.log`)
+and only the two unrelated model-explorer outputs were discarded. Source catalog,
+engine errors and OpenAPI checks passed
+(`source-ordinary-transaction-contract-check.log`). Final linked engine-61
+verification passed all six local cases and all 30 linked control cases with zero
+failures, skips or leaks (`source-ordinary-transaction-linked-test.log`). Guarded
+cache cleanup completed successfully, preserving active/recent build output and
+leaving 19.4 GiB free (`source-ordinary-transaction-gc.log`). `git diff --check`
+passed. Both source and changefeed issues were re-read and remain open with their
+original acceptance criteria; none is discharged by this storage-only milestone.

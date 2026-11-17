@@ -267,6 +267,7 @@ pub const RecoveryOptions = struct {
 };
 
 pub const TxnSummary = struct {
+    ordinary_producer: bool = false,
     source_scope: ?source_scope.Reference = null,
     source_purpose: ?[32]u8 = null,
     txn_id: TxnId,
@@ -339,6 +340,8 @@ pub const ResolutionExtraBatch = struct {
 /// transaction metadata transition. Raft apply uses this to fence the exact log
 /// entry without a crash window between the transaction and its replay marker.
 pub const MutationExtraBatch = struct {
+    /// Trusted native ingress only. Never inferred on a replay of an old BEGIN.
+    ordinary_producer: bool = false,
     source_scope: ?source_scope.Reference = null,
     completion_owner: ?completion.RoutedOwner = null,
     /// Computed by trusted private PREPARE dispatch over the complete original
@@ -400,6 +403,7 @@ pub const ReplayAppend = struct {
 };
 
 pub const IntentBatch = struct {
+    ordinary_producer: bool = false,
     document_revisions: bool = false,
     writes: []docstore.KVPair = &.{},
     deletes: [][]const u8 = &.{},
@@ -431,6 +435,7 @@ pub const IntentBatch = struct {
 };
 
 const TxnRecord = struct {
+    ordinary_producer: bool = false,
     source_scope: ?source_scope.Reference = null,
     source_purpose: ?[32]u8 = null,
     document_revisions: bool = false,
@@ -484,6 +489,8 @@ const txn_record_v6_size = 53;
 const txn_record_v7_size = 54;
 const txn_record_v8_size = 87;
 const txn_record_v9_size = txn_record_v8_size + source_scope.Reference.encoded_len;
+// Separate exact-size encoding keeps every older record unclassified.
+const txn_record_v10_size = txn_record_v7_size + 1;
 
 // ============================================================================
 // TxnManager
@@ -728,6 +735,7 @@ pub const TxnManager = struct {
             };
             if (!qualified) return error.ChangefeedCapabilityUnsupported;
         }
+        if (extra_batch.ordinary_producer and (extra_batch.source_purpose != null or extra_batch.source_scope != null)) return error.SourceTransactionIdentityConflict;
         if (extra_batch.source_purpose) |purpose| if (std.mem.allEqual(u8, &purpose, 0)) return error.SourceTransactionIdentityConflict;
         if (extra_batch.source_scope) |scope| {
             try scope.validate();
@@ -754,7 +762,7 @@ pub const TxnManager = struct {
                 if (!supplied) return TxnError.DecisionConflict;
                 for (extra_batch.deletes) |deleted| if (std.mem.eql(u8, deleted, &completion_key)) return TxnError.DecisionConflict;
             }
-            if (!samePurpose(record.source_purpose, extra_batch.source_purpose) or !sameSourceScope(record.source_scope, extra_batch.source_scope)) return error.SourceTransactionIdentityConflict;
+            if (record.ordinary_producer != extra_batch.ordinary_producer or !samePurpose(record.source_purpose, extra_batch.source_purpose) or !sameSourceScope(record.source_scope, extra_batch.source_scope)) return error.SourceTransactionIdentityConflict;
             if (record.status != .pending or record.begin_timestamp != timestamp) return TxnError.DecisionConflict;
             if (record.coordinator_known and record.coordinator != coordinator) return TxnError.DecisionConflict;
             if (record.retain_terminal_known and record.retain_terminal != retain_terminal) return TxnError.DecisionConflict;
@@ -783,6 +791,7 @@ pub const TxnManager = struct {
             return;
         }
         const record = TxnRecord{
+            .ordinary_producer = extra_batch.ordinary_producer,
             .source_purpose = extra_batch.source_purpose,
             .source_scope = extra_batch.source_scope,
             .status = .pending,
@@ -883,7 +892,7 @@ pub const TxnManager = struct {
         for (intents) |intent| if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
-        if (!samePurpose(record.source_purpose, extra_batch.source_purpose) or !sameSourceScope(record.source_scope, extra_batch.source_scope)) return error.SourceTransactionIdentityConflict;
+        if (record.ordinary_producer != extra_batch.ordinary_producer or !samePurpose(record.source_purpose, extra_batch.source_purpose) or !sameSourceScope(record.source_scope, extra_batch.source_scope)) return error.SourceTransactionIdentityConflict;
         if (try self.getCompletionAdmission(self.alloc, txn_id)) |saved| {
             var frozen = saved;
             defer frozen.deinit();
@@ -1590,7 +1599,7 @@ pub const TxnManager = struct {
                 writes_initialized += 1;
             }
         }
-        return .{ .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries, .document_revisions = record.document_revisions };
+        return .{ .ordinary_producer = record.ordinary_producer, .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries, .document_revisions = record.document_revisions };
     }
 
     pub fn loadSchemaBinding(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?SchemaBinding {
@@ -1881,6 +1890,7 @@ pub const TxnManager = struct {
             const record = try decodeRecord(record_entry.value);
             const txn_id = record_entry.key[records_prefix.len..][0..16].*;
             try items.append(alloc, .{
+                .ordinary_producer = record.ordinary_producer,
                 .source_purpose = record.source_purpose,
                 .source_scope = record.source_scope,
                 .txn_id = txn_id,
@@ -2685,8 +2695,9 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
+        if (record.ordinary_producer and (record.source_purpose != null or record.source_scope != null)) return error.InvalidTxnRecord;
         if (record.source_scope != null and (record.source_purpose == null or !record.retain_terminal)) return error.InvalidTxnRecord;
-        const buf = try self.alloc.alloc(u8, if (record.source_scope != null) txn_record_v9_size else if (record.source_purpose != null) txn_record_v8_size else if (record.document_revisions) txn_record_v7_size else txn_record_v6_size);
+        const buf = try self.alloc.alloc(u8, if (record.ordinary_producer) txn_record_v10_size else if (record.source_scope != null) txn_record_v9_size else if (record.source_purpose != null) txn_record_v8_size else if (record.document_revisions) txn_record_v7_size else txn_record_v6_size);
         buf[0] = @backingInt(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
@@ -2698,7 +2709,10 @@ pub const TxnManager = struct {
         buf[50] = @intFromBool(record.coordinator);
         buf[51] = @intFromBool(record.retain_terminal);
         buf[52] = @intFromBool(record.intents_resolved);
-        if (record.source_purpose) |purpose| {
+        if (record.ordinary_producer) {
+            buf[53] = @intFromBool(record.document_revisions);
+            buf[54] = 1; // immutable authenticated ordinary provenance
+        } else if (record.source_purpose) |purpose| {
             buf[53] = @intFromBool(record.document_revisions);
             buf[54] = if (record.source_scope != null) 2 else 1; // scoped or legacy source delivery
             @memcpy(buf[55..87], &purpose);
@@ -3102,12 +3116,36 @@ pub const TxnManager = struct {
         // Inspect original records before staging any replacement record bytes.
         for (writes) |write| {
             if (write.key.len != records_prefix.len + 16 or !std.mem.startsWith(u8, write.key, records_prefix)) continue;
+            const next_record = try decodeRecord(write.value);
+            const previous_bytes = batch.get(write.key) catch |err| switch (@as(anyerror, err)) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (previous_bytes) |bytes| {
+                const previous = try decodeRecord(bytes);
+                if (previous.ordinary_producer != next_record.ordinary_producer) return error.SourceTransactionIdentityConflict;
+            }
             if (producer_closed != null) {
-                const record = try decodeRecord(write.value);
-                // A plain/legacy record cannot acquire new authority by writing
-                // after closure. Explicit ordinary transaction ingress is still
-                // required; never infer it from intent contents or txn identity.
-                if (record.source_scope == null) return error.SourcePendingWork;
+                // Plain/legacy records cannot acquire authority after closure.
+                if (next_record.source_scope == null and !next_record.ordinary_producer) return error.SourcePendingWork;
+                if (next_record.ordinary_producer) {
+                    const id: TxnId = write.key[records_prefix.len..][0..16].*;
+                    const admission_key = makeSidecarKey(completion_admission_prefix, id);
+                    var supplied: ?[]const u8 = null;
+                    for (writes) |candidate| if (std.mem.eql(u8, candidate.key, &admission_key)) {
+                        if (supplied != null) return error.InvalidTxnRecord;
+                        supplied = candidate.value;
+                    };
+                    var parsed = try completion.parseAdmission(scope_arena.allocator(), supplied orelse try batch.get(&admission_key));
+                    defer parsed.deinit();
+                    const admission = parsed.value.admission;
+                    if (admission.version != 3 or !std.mem.eql(u8, &admission.transaction_id, &id)) return error.InvalidTxnRecord;
+                    const namespace = try batch.get(&internal_keys.identity_namespace_key);
+                    if (namespace.len != 24) return error.InvalidTxnRecord;
+                    const member = try admission.member(namespace[0..24].*);
+                    if (next_record.coordinator != std.mem.eql(u8, namespace, &admission.coordinator_namespace)) return error.InvalidParticipant;
+                    try producer_policy.Store.require(scope_arena.allocator(), &batch, try source_scope.Basis.fromOwner(member.routed_owner.?), .ordinary);
+                }
             }
             if (write.value.len == txn_record_v8_size) {
                 const legacy = try decodeRecord(write.value);
@@ -3558,6 +3596,13 @@ pub fn completionCoordinatorRecord(raw: []const u8) !@import("history_decision_w
 
 fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == 0 or raw[0] > @backingInt(TxnStatus.aborted)) return error.InvalidTxnRecord;
+    if (raw.len == txn_record_v10_size) {
+        if (raw[53] > 1 or raw[54] != 1) return error.InvalidTxnRecord;
+        var record = try decodeRecord(raw[0..txn_record_v6_size]);
+        record.ordinary_producer = true;
+        record.document_revisions = raw[53] == 1;
+        return record;
+    }
     if (raw.len == txn_record_v9_size) {
         if (raw[53] > 1 or raw[54] != 2 or std.mem.allEqual(u8, raw[55..87], 0)) return error.InvalidTxnRecord;
         var record = try decodeRecord(raw[0..txn_record_v6_size]);
@@ -6522,4 +6567,42 @@ test "transaction source purpose retirement fences delayed BEGIN across real sto
     cleanupTestDir(path);
     defer cleanupTestDir(path);
     try @import("source_scope_retirement_native_test.zig").run(a, path);
+}
+
+test "transaction source purpose ordinary provenance is explicit immutable and rejects corrupt encodings" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "txn-ordinary-producer");
+    defer a.free(path);
+    cleanupTestDir(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    const id: TxnId = @splat(240);
+    const extra: MutationExtraBatch = .{ .ordinary_producer = true };
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(id, 10, 11, &.{}, true, true, extra);
+    const raw = try manager.getAlloc(a, &makeRecordKey(id));
+    defer a.free(raw);
+    try std.testing.expectEqual(@as(usize, txn_record_v10_size), raw.len);
+    try std.testing.expect((try decodeRecord(raw)).ordinary_producer);
+    try std.testing.expect(!(try decodeRecord(raw[0..txn_record_v6_size])).ordinary_producer);
+    const corrupt = try a.dupe(u8, raw);
+    defer a.free(corrupt);
+    corrupt[54] = 0;
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(corrupt));
+    corrupt[54] = 2;
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(corrupt));
+    corrupt[54] = 1;
+    corrupt[53] = 2;
+    try std.testing.expectError(error.InvalidTxnRecord, decodeRecord(corrupt));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 10, 11, &.{}, true, true));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.writeIntentsExtraBatch(id, &.{}, &.{}, .{}));
+    try manager.writeIntentsExtraBatch(id, &.{}, &.{}, extra);
+    _ = try manager.resolveIntentsWithExtraBatch(id, .aborted, 20, .{});
+    try std.testing.expect((try manager.loadTransactionRecord(id)).ordinary_producer);
+    const legacy: TxnId = @splat(241);
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(legacy, 10, 11, &.{}, true, true);
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(legacy, 10, 11, &.{}, true, true, extra));
+    try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(@splat(242), 10, 11, &.{}, true, true, .{ .ordinary_producer = true, .source_purpose = @splat(1) }));
 }

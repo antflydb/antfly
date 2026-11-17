@@ -35,6 +35,16 @@ pub fn run(a: std.mem.Allocator, path: [:0]const u8, root: scope.Basis, original
         defer store.close();
         try apply(a, &store, root, .unlabelled, "before");
         {
+            const transactions = @import("transactions.zig");
+            const completion = @import("transaction_completion.zig");
+            var manager = try transactions.TxnManager.init(a, &store);
+            defer manager.deinit();
+            var member = try original.observation.decision.?.admission.admission.member(root.namespace);
+            member.roles = completion.Roles.effects;
+            const admission: completion.Admission = .{ .version = 3, .transaction_id = @splat(238), .admission_digest = @splat(239), .coordinator_namespace = member.namespace, .coordinator_fence = member.owner_fence, .participants = &.{member} };
+            try manager.initTransactionWithCompletionAdmission(admission, 5, 6, true, .{});
+        }
+        {
             var failed = try store.beginWriteTxn();
             defer failed.abort();
             _ = try policy.Store.close(a, &failed, root, entry);
@@ -105,6 +115,37 @@ pub fn run(a: std.mem.Allocator, path: [:0]const u8, root: scope.Basis, original
             try std.testing.expectEqual(transactions.TxnStatus.aborted, try manager.getTransactionStatus(admission.transaction_id));
         }
         {
+            const transactions = @import("transactions.zig");
+            const completion = @import("transaction_completion.zig");
+            var manager = try transactions.TxnManager.init(a, &store);
+            defer manager.deinit();
+            var member = try original.observation.decision.?.admission.admission.member(root.namespace);
+            member.roles = completion.Roles.effects;
+            const admission: completion.Admission = .{ .version = 3, .transaction_id = @splat(236), .admission_digest = @splat(237), .coordinator_namespace = member.namespace, .coordinator_fence = member.owner_fence, .participants = &.{member} };
+            const extra: transactions.MutationExtraBatch = .{ .ordinary_producer = true, .completion_owner = member.routed_owner, .completion_input_digest = member.input_digest };
+            var old_admission = admission;
+            old_admission.transaction_id = @splat(238);
+            old_admission.admission_digest = @splat(239);
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.initTransactionWithCompletionAdmission(old_admission, 5, 6, true, extra));
+            var wrong_member = member;
+            wrong_member.routed_owner.?.root_generation += 1;
+            wrong_member.owner_fence = wrong_member.routed_owner.?.digest();
+            var wrong_admission = admission;
+            wrong_admission.participants = &.{wrong_member};
+            wrong_admission.coordinator_fence = wrong_member.owner_fence;
+            try std.testing.expectError(error.HistoryResynchronizationRequired, manager.initTransactionWithCompletionAdmission(wrong_admission, 50, 51, true, extra));
+            try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(admission.transaction_id));
+            try manager.initTransactionWithCompletionAdmission(admission, 50, 51, true, extra);
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.initTransactionWithCompletionAdmission(admission, 50, 51, true, .{}));
+            var no_label = extra;
+            no_label.ordinary_producer = false;
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, manager.writeIntentsExtraBatch(admission.transaction_id, &.{}, &.{}, no_label));
+            try manager.writeIntentsExtraBatch(admission.transaction_id, &.{}, &.{}, extra);
+            var captured = try manager.collectIntentBatch(a, admission.transaction_id);
+            defer captured.deinit(a);
+            try std.testing.expect(captured.ordinary_producer);
+        }
+        {
             var corrupt = try store.beginWriteTxn();
             defer corrupt.abort();
             try corrupt.put(policy.key, "{}");
@@ -119,5 +160,26 @@ pub fn run(a: std.mem.Allocator, path: [:0]const u8, root: scope.Basis, original
             try corrupt.put(policy.key, oversized);
             try std.testing.expectError(error.SourceAdmissionCorrupt, policy.Store.require(a, &corrupt, root, .ordinary));
         }
+    }
+    {
+        var store = try DocStore.open(a, path.ptr, .{});
+        defer store.close();
+        const transactions = @import("transactions.zig");
+        var manager = try transactions.TxnManager.init(a, &store);
+        defer manager.deinit();
+        var captured = try manager.collectIntentBatch(a, @splat(236));
+        defer captured.deinit(a);
+        try std.testing.expect(captured.ordinary_producer);
+        // Resolution inherits the original record; no caller label is needed.
+        _ = try manager.resolveIntentsWithExtraBatch(@splat(236), .committed, 60, .{});
+        try std.testing.expectEqual(transactions.TxnStatus.committed, try manager.getTransactionStatus(@splat(236)));
+        const page = try manager.listTransactionsPage(a, null, 64);
+        defer a.free(page.items);
+        var found = false;
+        for (page.items) |item| if (std.mem.eql(u8, &item.txn_id, &@as(transactions.TxnId, @splat(236)))) {
+            try std.testing.expect(item.ordinary_producer);
+            found = true;
+        };
+        try std.testing.expect(found);
     }
 }
