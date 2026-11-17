@@ -6350,6 +6350,10 @@ const AssetProducerBatchItem = struct {
     producer_context: ?@import("../artifact_producer_context.zig").Token = null,
     /// Captured context dependencies published atomically with the output.
     context_publish: ?*ContextPublish = null,
+    /// Output already produced for exactly this input (matching skip state),
+    /// e.g. on the local path before ordered authority was installed. The
+    /// ordered flush publishes it instead of invoking the provider again.
+    retained_output: ?[]u8 = null,
 
     fn asRequest(self: *const @This()) asset_producer_mod.Request {
         return .{
@@ -6448,6 +6452,7 @@ fn freeAssetProducerBatchItem(alloc: Allocator, item: AssetProducerBatchItem) vo
     alloc.free(item.artifact_key);
     alloc.free(item.state_key);
     alloc.free(item.state_value);
+    if (item.retained_output) |value| alloc.free(value);
 }
 
 fn clearAssetProducerBatchItems(
@@ -17795,6 +17800,16 @@ fn processAsset(
     const state_value = try assetStateValueAlloc(runtime.alloc, source_text, source_parts_json, request.producer_json);
     var state_value_owned = true;
     defer if (state_value_owned) runtime.alloc.free(state_value);
+    var retained_output: ?[]u8 = null;
+    defer if (retained_output) |value| runtime.alloc.free(value);
+    if (context != null and !@import("../../../privacy/document.zig").isArtifactName(artifact_name) and
+        @import("../../../privacy/document.zig").consumerPolicyVersion(artifact_name) == null and
+        try shouldSkipAssetProducer(runtime, state_key, state_value))
+    {
+        // The stored output was produced for this exact input before ordered
+        // authority existed; publish it rather than produce it again.
+        retained_output = try storeGetOptionalAllocWithRetry(runtime, key);
+    }
     if (context == null and try shouldSkipAssetProducer(runtime, state_key, state_value)) {
         const existing = try storeGetOptionalAllocWithRetry(runtime, key);
         if (existing) |value| {
@@ -17846,7 +17861,9 @@ fn processAsset(
         .state_value = state_value,
         .producer_context = context,
         .context_publish = context_publish,
+        .retained_output = retained_output,
     }, scope);
+    retained_output = null;
     context_publish = null;
     context_owned = false;
     config_json_owned = false;
@@ -18674,7 +18691,11 @@ fn resubmitPendingAssetOutputs(
     var served: usize = 0;
     for (items, 0..) |*item, index| {
         const key = (try submittedOutputKey(item)) orelse continue;
-        const cached = (try runtime.submitted_outputs.getAlloc(runtime.alloc, key)) orelse continue;
+        const cached = (try runtime.submitted_outputs.getAlloc(runtime.alloc, key)) orelse retained: {
+            const value = item.retained_output orelse continue;
+            item.retained_output = null;
+            break :retained value;
+        };
         defer runtime.alloc.free(cached);
         std.mem.swap(AssetProducerBatchItem, &items[served], &items[index]);
         const current = &items[served];
