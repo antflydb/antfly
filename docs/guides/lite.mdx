@@ -272,7 +272,10 @@ before exporting.
 
 Portable server exports write a companion manifest named
 `<archive>.manifest.json`. Keep it next to the archive when transferring the
-files. Server restore checks that the manifest's shard size and SHA-256 match
+files. If export stops after the server backup completes, resume it locally
+with `antfly backup --export-existing --backup-id <id> --location <file-uri>
+--out <archive>`. An identical companion left by the interrupted export can
+be reused. Server restore checks that the manifest's shard size and SHA-256 match
 the archive before using the public catalog. For an older detached server
 export, copy the original `<backup-id>-metadata.json` to that companion
 filename. You can also restore directly from the original repository with

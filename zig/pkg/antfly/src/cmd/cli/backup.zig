@@ -74,6 +74,7 @@ const BackupArgs = struct {
     url: ?[]const u8 = null,
     output: ?[]const u8 = null,
     bundle_out: ?[]const u8 = null,
+    export_existing: bool = false,
     connection: ?[]const u8 = null,
     location_explicit: bool = false,
     list_backups: bool = false,
@@ -167,7 +168,6 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         printBackupUsage();
         return;
     }
-    const connection = opts.connection orelse cli.argumentError("--connection is required", .{});
     validateBackupArgs(opts) catch |err| switch (err) {
         error.BackupLocationRequired => cli.argumentError("--location is required", .{}),
         error.InvalidBackupListLimit => cli.argumentError("--limit must be between 1 and {d}", .{max_backup_list_limit}),
@@ -176,6 +176,13 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         else => cli.argumentError("invalid backup arguments", .{}),
     };
 
+    if (opts.export_existing) {
+        try writeBundleFromLocalBackup(allocator, io, opts.location, opts.backup_id.?, opts.bundle_out.?);
+        try cli.output.acknowledge("backup");
+        return;
+    }
+
+    const connection = opts.connection orelse cli.argumentError("--connection is required", .{});
     if (opts.url) |value| try client.setBaseUrl(value);
 
     if (opts.list_backups) {
@@ -530,6 +537,8 @@ fn parseBackupArgs(args: *std.process.Args.Iterator) !BackupArgs {
             out.output = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--out")) {
             out.bundle_out = try nextRequired(args);
+        } else if (std.mem.eql(u8, arg, "--export-existing")) {
+            out.export_existing = true;
         } else if (std.mem.eql(u8, arg, "--list")) {
             out.list_backups = true;
         } else if (std.mem.eql(u8, arg, "--limit")) {
@@ -583,6 +592,16 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
 
 fn validateBackupArgs(opts: BackupArgs) !void {
     if (!opts.location_explicit) return error.BackupLocationRequired;
+    if (opts.export_existing) {
+        if (opts.backup_id == null or opts.bundle_out == null or opts.table_name != null or
+            opts.tables_str != null or opts.list_backups or opts.list_limit_explicit or
+            opts.list_cursor != null or opts.format != null or opts.url != null or
+            opts.connection != null or opts.output != null or
+            !std.mem.startsWith(u8, opts.location, "file://")) return error.UnsupportedBundleOutput;
+        try backups_api.validateBackupId(opts.backup_id.?);
+        return;
+    }
+
     if (opts.table_name != null and opts.tables_str != null) return error.ConflictingTableSelection;
     if (opts.list_backups and (opts.table_name != null or opts.tables_str != null or opts.backup_id != null or opts.format != null or opts.bundle_out != null))
         return error.ConflictingBackupListArguments;
@@ -661,7 +680,8 @@ pub const usage =
     \\  file:// paths are absolute and must be inside the connection root.
     \\  Table and cluster backups default to the portable format.
     \\  Backup listing returns one page and includes next_cursor when more results remain.
-    \\  `--out` packages a portable or native backup from a shared file:// location as a self-contained AFB2 artifact.
+    \\  Portable exports also write <archive>.manifest.json. Keep both files together.
+    \\  Resume local export: antfly backup --export-existing --backup-id <id> --location <file-uri> --out <path>
     \\  Use `antfly lite backup <db.aflite> --out <backup.afb>` for a local portable AFB2 artifact.
     \\
 ;

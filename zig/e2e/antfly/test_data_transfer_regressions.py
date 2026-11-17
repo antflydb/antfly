@@ -339,6 +339,19 @@ def test_lite_server_backup_roundtrip_under_connection_root(
             if format == "portable":
                 sidecar = output.with_name(output.name + ".manifest.json")
                 captured = sidecar.read_bytes()
+                output.unlink()
+                cli(
+                    "backup",
+                    "--export-existing",
+                    "--backup-id",
+                    f"export-{format}",
+                    "--location",
+                    root.as_uri(),
+                    "--out",
+                    output,
+                )
+                assert sidecar.read_bytes() == captured
+                assert output.stat().st_size > 0
                 modified = json.loads(captured)
                 modified["shards"][0]["artifact_sha256"] = "0" * 64
                 sidecar.write_text(json.dumps(modified))
