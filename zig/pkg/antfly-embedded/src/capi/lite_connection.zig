@@ -199,9 +199,14 @@ pub const PreparedPublication = struct {
 
     fn commit(ptr: *anyopaque, batch: GeneratedBatch, promotions: Promotions, deletes: []const []const u8, guards: SourceGuards, fence: ?WriteFence) !@typeInfo(@typeInfo(std.meta.Child(@FieldType(PublicationPort, "commit"))).@"fn".return_type.?).error_union.payload {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const io = h.handleLockIo();
-        self.owner.gate.mutex.lockUncancelable(io);
-        defer self.owner.gate.mutex.unlock(io);
+        // `database.publishPreparedGeneratedBatch` below writes through the
+        // same store `Owner.enterMaintenanceWriter` gates, and so reenters
+        // that same admission for `self.snapshot_root`. Route through it
+        // directly instead of a separate, uncoordinated `gate.mutex` hold --
+        // see `acquireStore`'s own doc comment for why that deadlocks the
+        // nested call against this one's own hold.
+        try Owner.enterMaintenanceWriter(self.snapshot_root, .primary);
+        defer Owner.leaveMaintenanceWriter(self.snapshot_root);
         if (self.owner.stopping.load(.acquire)) return error.Canceled;
         self.owner.publication_stats.attempts +|= 1;
         self.owner.publication_stats.generated_attempts +|= 1;
@@ -209,10 +214,8 @@ pub const PreparedPublication = struct {
             self.owner.publication_stats.refused +|= 1;
             self.owner.publication_stats.generated_refused +|= 1;
         }
-        var lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
         const held_from = nowNs();
         defer MaintenanceHoldSites.record(&self.owner.publication_stats.maintenance_hold_sites.generated_commit, held_from);
-        defer lease.close();
         const database = try self.current();
         // Namespace and catalog are stable under the owner fence. The native
         // writer validates the captured source digests/incarnations and lease
@@ -226,12 +229,13 @@ pub const PreparedPublication = struct {
     }
 
     pub fn publishPromotions(self: *@This(), allocator: std.mem.Allocator, entries: []const @import("../storage/db/runtime_callbacks.zig").EntityUpsert) !void {
-        const io = h.handleLockIo();
-        self.owner.gate.mutex.lockUncancelable(io);
-        defer self.owner.gate.mutex.unlock(io);
+        // `entity_sink.upsertBatch` below writes through the same store
+        // `Owner.enterMaintenanceWriter` gates -- see `acquireStore`'s own
+        // doc comment for why a separate, uncoordinated `gate.mutex` hold
+        // here would deadlock that nested call against this one's own.
+        try Owner.enterMaintenanceWriter(self.snapshot_root, .primary);
+        defer Owner.leaveMaintenanceWriter(self.snapshot_root);
         if (self.owner.stopping.load(.acquire)) return error.Canceled;
-        var lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
-        defer lease.close();
         // Validate source namespace/catalog and replacement generation before
         // opening destination intents. Foreground recovery cannot observe or
         // abandon an in-flight preparation while this fence is held.
@@ -243,7 +247,6 @@ pub const PreparedPublication = struct {
 
     const HeldStore = struct {
         publication: *PreparedPublication,
-        path_lease: native.PathWriterLock,
         database: *h.db_mod.DB,
         refusal_recorded: bool = false,
         held_from: i96 = 0,
@@ -252,9 +255,10 @@ pub const PreparedPublication = struct {
             const held: *@This() = @ptrCast(@alignCast(ptr));
             const p = held.publication;
             p.refreshSnapshotCheckpoint();
-            held.path_lease.close();
             MaintenanceHoldSites.record(&p.owner.publication_stats.maintenance_hold_sites.generated_store, held.held_from);
-            p.owner.gate.mutex.unlock(h.handleLockIo());
+            // Matches the `Owner.enterMaintenanceWriter` admission `acquireStore`
+            // took below -- see that call site's own doc comment.
+            Owner.leaveMaintenanceWriter(p.snapshot_root);
             alloc.destroy(held);
         }
 
@@ -439,9 +443,20 @@ pub const PreparedPublication = struct {
 
     fn acquireStore(ptr: *anyopaque, fence: ?WriteFence, now_ms: u64) !StoreLease {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const io = h.handleLockIo();
-        self.owner.gate.mutex.lockUncancelable(io);
-        errdefer self.owner.gate.mutex.unlock(io);
+        // This lease's whole point is that the caller then writes through
+        // the returned store directly (`StoreLease.store.beginWrite`), which
+        // independently reenters writer admission for `self.snapshot_root`
+        // through the exact same `Owner.enterMaintenanceWriter` below. A
+        // separate, uncoordinated `self.owner.gate.mutex.lockUncancelable`
+        // here (as this used to do) would hold that non-reentrant queued
+        // mutex across the nested call's own attempt to acquire it --
+        // deadlocking this call against itself (capi "detached maintenance
+        // publishes through native storage admission" regression). Routing
+        // through `enterMaintenanceWriter` instead establishes
+        // `root.maintenance_writer_references`, which is exactly what lets
+        // that nested reentry see admission already held and skip the queue.
+        try Owner.enterMaintenanceWriter(self.snapshot_root, .primary);
+        errdefer Owner.leaveMaintenanceWriter(self.snapshot_root);
         if (self.owner.stopping.load(.acquire)) return error.Canceled;
         self.owner.publication_stats.attempts +|= 1;
         self.owner.publication_stats.generated_attempts +|= 1;
@@ -449,8 +464,6 @@ pub const PreparedPublication = struct {
             self.owner.publication_stats.refused +|= 1;
             self.owner.publication_stats.generated_refused +|= 1;
         }
-        var lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
-        errdefer lease.close();
         const database = try self.current();
         if (fence) |expected| {
             var ownership = try ProducerLease.init(alloc, database.core.store, expected.lease_key);
@@ -461,7 +474,7 @@ pub const PreparedPublication = struct {
         }
         if (database.enrichment_runtime == null) try database.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
         const held = try alloc.create(HeldStore);
-        held.* = .{ .publication = self, .path_lease = lease, .database = database, .held_from = nowNs() };
+        held.* = .{ .publication = self, .database = database, .held_from = nowNs() };
         return .{ .store = database.enrichment_runtime.?.store, .ptr = held, .release = HeldStore.release, .guard_key = HeldStore.guardKey };
     }
 
@@ -2084,6 +2097,36 @@ pub const Owner = struct {
     current: ?*h.Handle = null,
     retired: std.ArrayList(*h.Handle) = .empty,
     maintenance_snapshot: ?*h.Handle = null,
+    /// Non-null for the duration of a hosted/non-independent `maintenanceTurn`
+    /// (one whose `root` is `self.current` itself, not a separate detached
+    /// snapshot): the generation whose `maintenance_references` this very
+    /// turn incremented. A generated producer's publication callback
+    /// (`PreparedPublication.current`/`.acquireStore`) reenters `refresh`
+    /// from inside that same turn, under the same `gate.mutex`, so it can
+    /// never race its own in-flight work -- the nonzero reference it sees on
+    /// `current` is its own, not a concurrent user's. `refreshOrTurnBusy`'s
+    /// reuse fast paths compare against this to tell that case apart from a
+    /// genuinely different, still-active maintenance reference that must
+    /// still force a reopen.
+    maintenance_turn_root: ?*h.Handle = null,
+    /// Set by `enterMaintenanceWriter`, under `gate.mutex`, only while its
+    /// own nested `acquireMaintenancePathLeaseAssumeLocked`/
+    /// `tryWriterLeaseAssumeLocked` call is admitting a write for a root
+    /// that *is* `self.current` (hosted/non-independent `maintenanceTurn`,
+    /// where they are the same object, not a detached snapshot). That
+    /// nested call's own lease handoff would otherwise call
+    /// `ensureDurableForReuse` on `self.current`'s store to wait out a
+    /// drive "on another thread" (`ensureDurableForReuse`'s own doc
+    /// comment) -- but here the in-flight drive is THIS SAME call's own
+    /// outer frame, on this same thread, not a foreign one (e.g. a derived
+    /// index catch-up's `Store.applyMutationGroup`, itself mid-`commit_
+    /// draining`, reentering writer admission for the index artifacts it
+    /// is producing). Waiting on it is a self-deadlock, not a race to
+    /// guard against: there is only one `NativeFile` instance here, and
+    /// its own commit cannot be "concurrent" with the call it is nested
+    /// inside of. `WriterLane.borrowLease`/`tryWriterLeaseAssumeLocked`
+    /// check this to skip exactly (and only) that one redundant wait.
+    skip_reuse_drain: bool = false,
     maintenance_table_cursor: usize = 0,
     maintenance_round_pending: bool = false,
     /// A maintenance turn's writes landed on the current root's store
@@ -2314,10 +2357,21 @@ pub const Owner = struct {
             // a sibling connection on their own: every fast path here must
             // also agree on this logical watermark before reusing `current`.
             const sequence_unchanged = probe.committedSequence() == file.committedSequence();
+            // A hosted/non-independent `maintenanceTurn` sets `root` to
+            // `self.current` itself and bumps *its own* `maintenance_references`
+            // for the turn's duration (see that field's own doc comment). A
+            // generated producer's publication callback reenters `refresh`
+            // from inside that same turn, under the same `gate.mutex`, to
+            // republish against the live generation -- never concurrently
+            // with the reference it is itself holding. Treat that one
+            // self-held reference as if it were absent; a reference any
+            // other caller holds on `current` still forces a reopen below.
+            const maintenance_references_clear = current.maintenance_references == 0 or
+                (current == self.maintenance_turn_root and current.maintenance_references == 1);
             // An uncertain publication can fail before writing anything, so an
             // unchanged header does not prove the runtime is reusable: reopen
             // to reconcile from durable state.
-            if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and std.meta.eql(probe.header, file.header)) {
+            if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and std.meta.eql(probe.header, file.header)) {
                 if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 return current;
@@ -2334,8 +2388,10 @@ pub const Owner = struct {
             // prove no primary/index root moved; that is sufficient on a
             // non-redo file, which has no logical watermark separate from
             // the physical one for `sequence_unchanged` to protect.
-            if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
-                try file.runtimeMetadataUnchanged(&probe) and try loadedIndexInputsUnchanged(current, file, &probe))
+            const fast2_metadata_unchanged = try file.runtimeMetadataUnchanged(&probe);
+            const fast2_index_unchanged = try loadedIndexInputsUnchanged(current, file, &probe);
+            if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and maintenance_references_clear and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
+                fast2_metadata_unchanged and fast2_index_unchanged)
             {
                 // Lease bookkeeping and unpublished shadow files do not change
                 // a serving runtime. Reopening it would publish another lease
@@ -3009,6 +3065,10 @@ pub const Owner = struct {
             return error.EnrichmentWaitCanceled;
         };
         if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
+        // See `skip_reuse_drain`'s own doc comment: this admission is for
+        // `self.current` itself only in the hosted/non-independent case.
+        self.skip_reuse_drain = self.current == root;
+        defer self.skip_reuse_drain = false;
         var lease = (if (scope == .reclamation) self.tryWriterLeaseAssumeLocked() else self.acquireMaintenancePathLeaseAssumeLocked()) catch |err| switch (err) {
             error.FileBusy, error.WouldBlock => return error.EnrichmentWaitCanceled,
             else => return err,
@@ -3686,6 +3746,13 @@ pub const Owner = struct {
         clock.mark(&self.publication_stats.maintenance_hold_sites.capture_steps.publication_catalog_ns);
         var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (catalog) |*proof| proof else null, .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .root_catalog_read = if (root_catalog_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
         root.maintenance_references += 1;
+        // Only meaningful when `root == self.current` (the hosted/
+        // non-independent path): marks the one reference this turn itself
+        // holds, so a generated producer's publication callback reentering
+        // `refresh` from inside this same turn (see that field's own doc
+        // comment) does not mistake its own reference for a concurrent
+        // user's and force a needless reopen.
+        self.maintenance_turn_root = root;
         self.maintenance_activity.begin();
         root.maintenance_owner = self;
         root.maintenance_publication = &publication;
@@ -3803,6 +3870,7 @@ pub const Owner = struct {
         store.writer_admission = null;
         root.maintenance_owner = null;
         root.maintenance_references -= 1;
+        if (self.maintenance_turn_root == root) self.maintenance_turn_root = null;
         self.maintenance_activity.finish(io);
         if (independent) inheritReclamationTelemetry(self.current.?.owned_lite_backend.?.native_docstore.?, store);
         if (!independent and self.current != root) {
