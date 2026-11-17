@@ -47,6 +47,10 @@ connection and catalog-scope flags are not accepted. The draft
   The file itself is not copied into the report.
 - `compatibility.verdict` is `compatible`, `blocked`, or `unknown`.
   Each requirement has a stable reason code and remediation.
+  `compatibility.restore_blocker` identifies a known format or restore-path
+  limitation even when no destination capability file was supplied. A
+  portable companion that carries an active schema migration reports
+  `unsupported_schema_migration` for independent restore.
 
 The default library limits are 64 GiB input, 128 GiB scratch/expansion admission,
 4,096 selectors and requirement groups, 16 MiB per metadata key or value,

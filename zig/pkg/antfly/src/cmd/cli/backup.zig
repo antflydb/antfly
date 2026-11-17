@@ -212,7 +212,14 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
             cli.argumentError("unsupported backup format: {s}", .{selected_format});
         }
         const bid = opts.backup_id orelse cli.argumentError("--backup-id is required", .{});
-        if (opts.bundle_out) |output_path| try ensureExportPathAvailable(io, output_path);
+        if (opts.bundle_out) |output_path| {
+            try ensureExportPathAvailable(io, output_path);
+            if (std.mem.eql(u8, selected_format, "portable")) {
+                const companion_path = try std.fmt.allocPrint(allocator, "{s}.manifest.json", .{output_path});
+                defer allocator.free(companion_path);
+                try ensureExportPathAvailable(io, companion_path);
+            }
+        }
         try client.backupTable(tbl, .{ .backup_id = bid, .location = opts.location, .connection = connection, .format = selected_format });
         if (opts.bundle_out) |output_path|
             try writeBundleFromLocalBackup(allocator, io, opts.location, bid, output_path);

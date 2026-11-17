@@ -283,6 +283,10 @@ filename. You can also restore directly from the original repository with
 --location <repository-uri>`. An archive whose public definition is unavailable
 can still be opened in Lite to access its data.
 
+When selecting tables from a cluster backup, use the `selector` in
+`backup --list --output json` under `table_selectors` if display names
+collide. Pass it unchanged to `restore --tables`.
+
 For an offline source inventory and compatibility report, use:
 
 ```bash

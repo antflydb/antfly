@@ -202,6 +202,10 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
             var companion = try readPortableCompanion(allocator, input_path, initial.size, &digest, &report.catalog_sha256);
             defer if (companion) |*manifest| manifest.deinit(allocator);
             report.catalog_source = if (companion != null) "companion" else "archive";
+            if (companion) |manifest| {
+                if (manifest.read_schema_json.len != 0)
+                    report.restore_blocker = "unsupported_schema_migration";
+            }
             const catalogs: InspectionCatalogs = if (companion) |manifest|
                 .{ .indexes_json = manifest.indexes_json, .replication_sources_json = manifest.replication_sources_json }
             else

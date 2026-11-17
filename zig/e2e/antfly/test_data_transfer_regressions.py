@@ -317,6 +317,30 @@ def test_lite_server_backup_roundtrip_under_connection_root(
         )
         assert conflict.returncode != 0 and "PathAlreadyExists" in conflict.stderr
         assert not (root / "blocked-output-metadata.json").exists()
+        blocked_companion = tmp_path / "blocked-companion.afb"
+        blocked_companion.with_name(
+            blocked_companion.name + ".manifest.json"
+        ).write_text("occupied")
+        conflict = cli(
+            "backup",
+            "--table",
+            "from_file",
+            "--backup-id",
+            "blocked-companion",
+            "--connection",
+            "bk",
+            "--location",
+            root.as_uri(),
+            "--out",
+            blocked_companion,
+            "--url",
+            server.url,
+            check=False,
+        )
+        assert conflict.returncode != 0 and "PathAlreadyExists" in conflict.stderr
+        assert not (root / "blocked-companion-metadata.json").exists()
+        assert not blocked_companion.exists()
+
         for format in ("portable", "native"):
             if format == "native":
                 alias = requests.put(
@@ -380,6 +404,16 @@ def test_lite_server_backup_roundtrip_under_connection_root(
                 )
                 assert sidecar.read_bytes() == captured
                 assert output.stat().st_size > 0
+                migrating = json.loads(captured)
+                migrating["read_schema_json"] = migrating["schema_json"]
+                sidecar.write_text(json.dumps(migrating))
+                report = json.loads(cli("backup", "inspect", "--input", output).stdout)
+                assert report["completeness"]["scan_complete"]
+                assert report["compatibility"]["verdict"] == "blocked"
+                assert (
+                    report["compatibility"]["restore_blocker"]
+                    == "unsupported_schema_migration"
+                )
                 modified = json.loads(captured)
                 modified["shards"][0]["artifact_sha256"] = "0" * 64
                 sidecar.write_text(json.dumps(modified))

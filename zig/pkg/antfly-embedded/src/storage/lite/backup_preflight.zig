@@ -99,6 +99,7 @@ pub const Report = struct {
     analysis_complete: bool = true,
     counts_complete: bool = false,
     failure_code: ?[]const u8 = null,
+    restore_blocker: ?[]const u8 = null,
     documents: u64 = 0,
     metadata_records: u64 = 0,
     artifact_records: u64 = 0,
@@ -159,7 +160,7 @@ pub const Report = struct {
         const destination: ?Destination = if (parsed) |p| p.value else null;
         var evaluations: std.ArrayListUnmanaged(Evaluation) = .empty;
         defer evaluations.deinit(self.allocator);
-        var verdict: Verdict = if (!self.scan_complete or !self.analysis_complete or destination == null) .unknown else .compatible;
+        var verdict: Verdict = if (self.restore_blocker != null) .blocked else if (!self.scan_complete or !self.analysis_complete or destination == null) .unknown else .compatible;
         for (self.requirements.items) |*r| {
             const e = evaluate(r, destination);
             try evaluations.append(self.allocator, e);
@@ -173,7 +174,7 @@ pub const Report = struct {
             .completeness = .{ .scan_complete = self.scan_complete, .dependency_analysis_complete = self.analysis_complete, .counts_complete = self.counts_complete, .failure_code = self.failure_code },
             .inventory = .{ .documents = self.documents, .metadata_records = self.metadata_records, .artifact_records = self.artifact_records, .shards = self.shards, .requirements = self.requirements.items },
             .destination = .{ .capabilities_sha256 = if (dest_digest) |*d| d[0..] else null, .supplied = destination != null },
-            .compatibility = .{ .verdict = verdict, .evaluations = evaluations.items },
+            .compatibility = .{ .verdict = verdict, .restore_blocker = self.restore_blocker, .evaluations = evaluations.items },
         }, .{});
     }
 };

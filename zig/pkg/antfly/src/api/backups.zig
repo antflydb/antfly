@@ -1955,10 +1955,16 @@ pub const ClusterTableRestoreStatus = struct {
     @"error": ?[]const u8 = null,
 };
 
+pub const BackupTableSelector = struct {
+    name: []const u8,
+    selector: []const u8,
+};
+
 pub const BackupInfo = struct {
     backup_id: []const u8,
     timestamp: []const u8,
     tables: []const []const u8,
+    table_selectors: []const BackupTableSelector = &.{},
     location: []const u8,
     antfly_version: []const u8,
 };
@@ -10918,6 +10924,16 @@ fn backupInfoFromManifest(alloc: std.mem.Allocator, manifest: *const ClusterBack
         tables[i] = if (table.catalog_target) |target| try target.displayNameAlloc(alloc) else try alloc.dupe(u8, table.name);
         initialized_tables += 1;
     }
+    const table_selectors = try alloc.alloc(BackupTableSelector, manifest.tables.len);
+    var initialized_selectors: usize = 0;
+    errdefer {
+        for (table_selectors[0..initialized_selectors]) |entry| alloc.free(entry.selector);
+        alloc.free(table_selectors);
+    }
+    for (manifest.tables, tables, table_selectors) |table, name, *entry| {
+        entry.* = .{ .name = name, .selector = try alloc.dupe(u8, table.name) };
+        initialized_selectors += 1;
+    }
     const backup_id = try alloc.dupe(u8, manifest.backup_id);
     errdefer alloc.free(backup_id);
     const timestamp = try alloc.dupe(u8, manifest.timestamp);
@@ -10929,6 +10945,7 @@ fn backupInfoFromManifest(alloc: std.mem.Allocator, manifest: *const ClusterBack
         .backup_id = backup_id,
         .timestamp = timestamp,
         .tables = tables,
+        .table_selectors = table_selectors,
         .location = owned_location,
         .antfly_version = version,
     };
@@ -11288,6 +11305,11 @@ pub fn findClusterTable(
     manifest: *const ClusterBackupManifest,
     table_name: []const u8,
 ) ?*const ClusterTableBackupEntry {
+    // Exact storage selectors are authoritative. Human-readable names are
+    // considered only when no exact selector matches.
+    for (manifest.tables) |*table| {
+        if (std.mem.eql(u8, table.name, table_name)) return table;
+    }
     const domain = @import("antfly_local_sources").system_catalog_domain;
     const explicit_target = if (std.mem.startsWith(u8, table_name, domain.target_key_prefix))
         domain.Target.parse(table_name) catch return null
@@ -11295,7 +11317,7 @@ pub fn findClusterTable(
         null;
     var match: ?*const ClusterTableBackupEntry = null;
     for (manifest.tables) |*table| {
-        const matches = std.mem.eql(u8, table.name, table_name) or if (table.catalog_target) |target|
+        const matches = if (table.catalog_target) |target|
             if (explicit_target) |explicit|
                 std.mem.eql(u8, target.database, explicit.database) and std.mem.eql(u8, target.namespace, explicit.namespace) and std.mem.eql(u8, target.table, explicit.table)
             else if (target.isDefault())
@@ -12069,6 +12091,8 @@ pub fn freeBackupInfo(alloc: std.mem.Allocator, info: BackupInfo) void {
     alloc.free(@constCast(info.backup_id));
     alloc.free(@constCast(info.timestamp));
     for (info.tables) |table| alloc.free(@constCast(table));
+    for (info.table_selectors) |entry| alloc.free(entry.selector);
+    alloc.free(info.table_selectors);
     alloc.free(info.tables);
     alloc.free(@constCast(info.location));
     alloc.free(@constCast(info.antfly_version));
