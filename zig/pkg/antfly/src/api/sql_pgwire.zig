@@ -185,14 +185,19 @@ pub const ReplicationPublication = struct {
     database: feed.Digest,
     publications: []const []const u8,
     members: []const Member,
+    publication_revisions: []const feed.Digest = &.{},
 
     pub fn binding(self: ReplicationPublication) !slot.Binding {
         if (std.mem.allEqual(u8, &self.database, 0) or self.members.len == 0 or self.members.len > feed.max_tables)
             return error.InvalidChangefeed;
         try publication.validateMembers(self.members);
+        if (self.publication_revisions.len != 0 and self.publication_revisions.len != self.publications.len) return error.InvalidChangefeed;
         const value: slot.Binding = .{
             .publications = self.publications,
-            .projection = feed.hash(.{ .domain = "antfly:pgoutput-publication-projection:v1", .database = self.database, .members = self.members }),
+            .projection = if (self.publication_revisions.len == 0)
+                feed.hash(.{ .domain = "antfly:pgoutput-publication-projection:v1", .database = self.database, .members = self.members })
+            else
+                feed.hash(.{ .domain = "antfly:pgoutput-publication-projection:v2", .database = self.database, .members = self.members, .revisions = self.publication_revisions }),
         };
         try value.validate();
         return value;
@@ -243,6 +248,81 @@ pub const ReplicationPublication = struct {
         }
         if (filled != count) return error.ChangefeedResynchronizationRequired;
         return .{ .oid = member.oid, .namespace = member.namespace, .name = member.name, .identity = member.identity, .key_ordinals = ordinals };
+    }
+};
+
+/// Resolve durable publications against the current catalog and credential.
+pub const CatalogReplicationPublication = struct {
+    const domain = @import("antfly_local_sources").system_catalog_domain;
+
+    server: *http.ApiHttpServer,
+    identity: ReplicationIdentity,
+    database_name: []const u8,
+
+    pub fn resolver(self: *@This()) LiveReplicationPublication.Resolver {
+        return .{ .ptr = self, .resolve = resolveOpaque };
+    }
+
+    fn resolveOpaque(raw: *anyopaque, a: std.mem.Allocator, database: publication_control.Digest, names: []const []const u8, context: operation.RequestContext) !ReplicationPublication {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.resolve(a, database, names, context);
+    }
+
+    pub fn resolve(self: *@This(), a: std.mem.Allocator, database: publication_control.Digest, names: []const []const u8, context: operation.RequestContext) !ReplicationPublication {
+        try context.ensureActive();
+        const port = self.server.source.pg_publications orelse return error.UnsupportedReplicationMode;
+        const sorted = try publication_control.pg_slot.bindingAlloc(a, names, @splat(1));
+        var identity = try self.identity.read(self.identity.context, a);
+        defer identity.deinit(a);
+        var maintenance = context;
+        maintenance.principal = .{ .kind = .internal, .subject = "pg-publication-maintenance" };
+
+        var records: [wire.replication_commands.max_publications]std.json.Parsed(publication_metadata.Record) = undefined;
+        var loaded: usize = 0;
+        defer for (records[0..loaded]) |*record| record.deinit();
+        const revisions = try a.alloc(publication_control.Digest, sorted.publications.len);
+        var members: std.ArrayList(publication_metadata.Member) = .empty;
+        for (sorted.publications, revisions) |name, *revision| {
+            const record = (try port.read(port.ptr, a, database, name, maintenance)) orelse return error.ChangefeedResynchronizationRequired;
+            records[loaded] = record;
+            loaded += 1;
+            if (!std.meta.eql(record.value.database, database) or !std.mem.eql(u8, record.value.name, name)) return error.ChangefeedCorrupt;
+            const current = record.value.members orelse return error.ChangefeedResynchronizationRequired;
+            revision.* = publication_control.hash(record.value);
+            for (current) |member| {
+                for (members.items) |prior| {
+                    if (prior.table.table_id != member.table.table_id) continue;
+                    if (!std.meta.eql(publication_control.hash(prior), publication_control.hash(member))) return error.ChangefeedResynchronizationRequired;
+                    break;
+                } else {
+                    if (members.items.len == publication_control.max_tables) return error.ChangefeedCapabilityUnsupported;
+                    try members.append(a, member);
+                }
+            }
+        }
+        std.mem.sort(publication_metadata.Member, members.items, {}, publicationMemberLess);
+        const targets = try a.alloc(domain.Target, members.items.len);
+        for (members.items, targets) |member, *target| target.* = .{ .database = self.database_name, .namespace = member.namespace, .table = member.name };
+        const request: domain.ResolveMany = .{ .targets = targets, .publication_database = self.database_name, .include_query_definitions = true };
+        const response = try self.server.source.systemCatalog(a, context, .{ .resolve_many = request });
+        const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, response, .{ .allocate = .alloc_always });
+        const cut = try resolved.requirePublicationCut(request);
+        if (!std.meta.eql(publicationDatabaseKey(cut), database)) return error.ChangefeedResynchronizationRequired;
+        const current = resolvePublicationMembers(self.server, a, identity, context, targets, resolved, cut) catch |err| switch (err) {
+            error.TableNotFound => return error.ChangefeedResynchronizationRequired,
+            else => return err,
+        };
+        if (!std.meta.eql(publication_control.hash(members.items), publication_control.hash(current))) return error.ChangefeedResynchronizationRequired;
+
+        // Two linearizable passes bracket the catalog validation. A revision
+        // can only advance, so a match proves the same publication set at it.
+        for (sorted.publications, revisions) |name, revision| {
+            var check = (try port.read(port.ptr, a, database, name, maintenance)) orelse return error.ChangefeedResynchronizationRequired;
+            defer check.deinit();
+            if (!std.meta.eql(publication_control.hash(check.value), revision)) return error.ChangefeedResynchronizationRequired;
+        }
+        try context.ensureActive();
+        return .{ .database = database, .publications = sorted.publications, .members = current, .publication_revisions = revisions };
     }
 };
 
@@ -1267,7 +1347,7 @@ fn executePublication(
     const response = try server.source.systemCatalog(a, context, .{ .resolve_many = request });
     const resolved_catalog = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, response, .{ .allocate = .alloc_always });
     const cut = try resolved_catalog.requirePublicationCut(request);
-    const database_key = publication_control.hash(.{ .domain = "antfly:pg-publication-database:v1", .group = cut.metadata_group_id, .incarnation = cut.metadata_incarnation, .database = cut.database_id });
+    const database_key = publicationDatabaseKey(cut);
     var maintenance = context;
     maintenance.principal = .{ .kind = .internal, .subject = "pg-publication-maintenance" };
     var previous = try port.read(port.ptr, a, database_key, command.name, maintenance);
@@ -1294,6 +1374,14 @@ fn executePublication(
         .next = .{ .database = database_key, .name = command.name, .owner = owner, .revision = std.math.add(u64, revision, 1) catch return error.ProgramLimitExceeded, .members = members },
     }, maintenance);
     return .{ .command_tag = tag, .mutation_outcome = .committed };
+}
+
+fn publicationDatabaseKey(cut: @import("antfly_local_sources").system_catalog_domain.PublicationCatalogCut) publication_control.Digest {
+    return publication_control.hash(.{ .domain = "antfly:pg-publication-database:v1", .group = cut.metadata_group_id, .incarnation = cut.metadata_incarnation, .database = cut.database_id });
+}
+
+fn publicationMemberLess(_: void, lhs: publication_metadata.Member, rhs: publication_metadata.Member) bool {
+    return lhs.table.table_id < rhs.table.table_id;
 }
 
 fn resolvePublicationMembers(
@@ -1336,18 +1424,14 @@ fn resolvePublicationMembers(
         member.* = .{
             .table = .{ .table_id = table.table_id, .binding = binding.?, .contract = .native_relational, .policy_revision = 1 },
             .permission_name = name,
-            .namespace = target.namespace,
-            .name = target.table,
+            .namespace = try a.dupe(u8, target.namespace),
+            .name = try a.dupe(u8, target.table),
             .oid = std.math.cast(u32, table.table_id) orelse return error.ChangefeedCapabilityUnsupported,
             .identity = if (keys.len != 0) .default else .full,
             .key_columns = keys,
         };
     }
-    std.mem.sort(publication_metadata.Member, members, {}, struct {
-        fn less(_: void, lhs: publication_metadata.Member, rhs: publication_metadata.Member) bool {
-            return lhs.table.table_id < rhs.table.table_id;
-        }
-    }.less);
+    std.mem.sort(publication_metadata.Member, members, {}, publicationMemberLess);
     try publication_metadata.validateMembers(members);
     return members;
 }
@@ -2929,8 +3013,22 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
     try std.testing.expectEqualStrings("CREATE PUBLICATION", result.command_tag);
     try std.testing.expectEqualStrings("id", fixture.record.?.members.?[0].key_columns[0]);
     try std.testing.expectError(error.PgPublicationAlreadyExists, executePublication(server, alloc, &authority, create));
+    var resolver: CatalogReplicationPublication = .{
+        .server = server,
+        .database_name = "default",
+        .identity = .{ .context = credential, .read = Adapter.replicationIdentity },
+    };
+    const database = fixture.record.?.database;
+    const live = resolver.resolver();
+    const before = try live.resolve(live.ptr, alloc, database, &.{"feed"}, .{});
+    try std.testing.expectEqualStrings("docs", before.members[0].name);
+    const replaced = try executePublication(server, alloc, &authority, .{ .action = .replace_members, .name = create.name, .tables = create.tables });
+    try std.testing.expectEqualStrings("ALTER PUBLICATION", replaced.command_tag);
+    const after = try live.resolve(live.ptr, alloc, database, &.{"feed"}, .{});
+    try std.testing.expect(!std.meta.eql((try before.binding()).identity(), (try after.binding()).identity()));
     _ = try executePublication(server, alloc, &authority, .{ .action = .drop, .name = "feed" });
     try std.testing.expect(fixture.record.?.members == null);
     _ = try executePublication(server, alloc, &authority, .{ .action = .drop, .name = "feed", .if_exists = true });
-    try std.testing.expectEqual(@as(usize, 2), fixture.writes);
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, live.resolve(live.ptr, alloc, database, &.{"feed"}, .{}));
+    try std.testing.expectEqual(@as(usize, 3), fixture.writes);
 }
