@@ -708,6 +708,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "legacy quarantine equivalence rejects a borrowed marker digest",
             "stale cluster backup attempt preserves aggregate referenced artifacts",
             "filesystem backup listing is bounded and cursor stable",
+            "legacy cluster restore pins child manifests under an unchanged aggregate",
             "native backup directory copy preserves nested files",
             "native artifact verification consistently rejects empty directories",
             "native verification receipt rejects membership changes after exact pass",

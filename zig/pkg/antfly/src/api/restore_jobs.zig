@@ -39,6 +39,9 @@ const max_cluster_failure_details: usize = 8;
 const max_cluster_failure_table_name_bytes: usize = 256;
 const max_cluster_failure_error_bytes: usize = 256;
 const restore_job_format_version: u32 = 4;
+// Workers that only understand v4 must reject these rows instead of
+// checkpointing a job while dropping its source binding.
+const pinned_restore_job_format_version: u32 = 5;
 pub const restore_retry_min_ms: u64 = 100;
 pub const restore_retry_max_ms: u64 = 5_000;
 
@@ -142,6 +145,7 @@ pub const JobState = struct {
 pub const ClusterRestoreBinding = struct {
     manifest_sha256: []const u8,
     selected_ordinals: ?[]const u16 = null,
+    children_sha256: ?[]const u8 = null,
 };
 
 pub const StartRequest = struct {
@@ -624,7 +628,7 @@ pub const Store = struct {
                 if (self.jobs.count() >= max_retained_restore_jobs) return error.RestoreJobCapacityExceeded;
                 const encoded = if (parsed.value.phase == .running) blk: {
                     const recovered = try encode(self.alloc, .{
-                        .format_version = restore_job_format_version,
+                        .format_version = parsed.value.format_version,
                         .job_id = parsed.value.job_id,
                         .enqueue_sequence = parsed.value.enqueue_sequence,
                         .dispatch_sequence = parsed.value.dispatch_sequence,
@@ -924,7 +928,7 @@ pub const Store = struct {
         if (self.jobs.count() >= max_retained_restore_jobs) return error.RestoreJobCapacityExceeded;
         const encoded = if (parsed.value.phase == .running) blk: {
             const recovered = try encode(self.alloc, .{
-                .format_version = restore_job_format_version,
+                .format_version = parsed.value.format_version,
                 .job_id = parsed.value.job_id,
                 .enqueue_sequence = parsed.value.enqueue_sequence,
                 .dispatch_sequence = parsed.value.dispatch_sequence,
@@ -1077,7 +1081,7 @@ pub const Store = struct {
                     const dispatch_sequence = try self.allocateDispatchSequenceLocked();
                     const now = nowMillis();
                     const reauthorized = try encode(alloc, .{
-                        .format_version = restore_job_format_version,
+                        .format_version = parsed.value.format_version,
                         .job_id = parsed.value.job_id,
                         .enqueue_sequence = parsed.value.enqueue_sequence,
                         .dispatch_sequence = dispatch_sequence,
@@ -1145,7 +1149,7 @@ pub const Store = struct {
         self.next_enqueue_sequence = enqueue_sequence + 1;
         const dispatch_sequence = try self.allocateDispatchSequenceLocked();
         var encoded = try encode(alloc, .{
-            .format_version = restore_job_format_version,
+            .format_version = if (req.cluster_binding == null) restore_job_format_version else pinned_restore_job_format_version,
             .job_id = job_id,
             .enqueue_sequence = enqueue_sequence,
             .dispatch_sequence = dispatch_sequence,
@@ -2099,7 +2103,7 @@ pub const Store = struct {
             (update.staging_resolution orelse current.staging_resolution) == .published)
             return error.RestoreStagingResolutionPending;
         const next: JobState = .{
-            .format_version = restore_job_format_version,
+            .format_version = current.format_version,
             .job_id = current.job_id,
             .enqueue_sequence = current.enqueue_sequence,
             .dispatch_sequence = update.dispatch_sequence orelse current.dispatch_sequence,
@@ -2535,8 +2539,10 @@ fn validateStartRequest(req: StartRequest) !void {
 
 fn validClusterRestoreBinding(scope: Scope, source_kind: SourceKind, names: ?[]const []const u8, binding: ?ClusterRestoreBinding) bool {
     const value = binding orelse return true;
-    if (value.manifest_sha256.len != 64) return false;
-    for (value.manifest_sha256) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return false;
+    if (!validRestoreDigest(value.manifest_sha256)) return false;
+    if (value.children_sha256) |digest| {
+        if (scope != .cluster or !validRestoreDigest(digest)) return false;
+    }
     const ordinals = value.selected_ordinals orelse return scope == .cluster and names == null;
     switch (scope) {
         .table => if (source_kind != .cluster_cohort or ordinals.len != 1) return false,
@@ -2547,6 +2553,12 @@ fn validClusterRestoreBinding(scope: Scope, source_kind: SourceKind, names: ?[]c
         if (ordinal >= max_cluster_tables_per_job or seen.isSet(ordinal)) return false;
         seen.set(ordinal);
     }
+    return true;
+}
+
+fn validRestoreDigest(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return false;
     return true;
 }
 
@@ -2717,7 +2729,11 @@ fn stagingNeedsExecution(state: JobState) bool {
 }
 
 fn validateProgressState(state: JobState) !void {
-    if (state.format_version != restore_job_format_version) return error.UnsupportedRestoreJobFormat;
+    switch (state.format_version) {
+        restore_job_format_version => if (state.cluster_binding != null) return error.UnsupportedRestoreJobFormat,
+        pinned_restore_job_format_version => if (state.cluster_binding == null) return error.CorruptRestoreJobStore,
+        else => return error.UnsupportedRestoreJobFormat,
+    }
     if (state.rewrite_progress.owner > 4096) return error.CorruptRestoreJobStore;
     if ((state.staging_owner_phase != 255 and state.staging_owner_phase > 6) or state.staging_owner_cursor > 8192 or state.staging_failure.len > 128 or state.staging_validation_phase > 2 or state.staging_validation_owner > 4096 or state.staging_attempt_id > state.attempt_id or
         (state.staging_attempt_id == 0 and state.staging_resolution != .active) or
@@ -4846,6 +4862,13 @@ test "restore runtime store persists checkpoints and requeues interrupted work" 
     defer alloc.free(recovered);
     var parsed = try std.json.parseFromSlice(JobState, alloc, recovered, .{});
     defer parsed.deinit();
+    try std.testing.expectEqual(pinned_restore_job_format_version, parsed.value.format_version);
+    var wrong_version = parsed.value;
+    wrong_version.format_version = restore_job_format_version;
+    try std.testing.expectError(error.UnsupportedRestoreJobFormat, validateProgressState(wrong_version));
+    var missing_binding = parsed.value;
+    missing_binding.cluster_binding = null;
+    try std.testing.expectError(error.CorruptRestoreJobStore, validateProgressState(missing_binding));
     const recovered_binding = parsed.value.cluster_binding.?;
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", recovered_binding.manifest_sha256);
     try std.testing.expectEqualSlices(u16, &.{ 2, 1 }, recovered_binding.selected_ordinals.?);

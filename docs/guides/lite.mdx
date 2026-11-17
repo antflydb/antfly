@@ -289,6 +289,9 @@ When selecting tables from a cluster backup, use the `selector` in
 ambiguous display names, commas, or surrounding whitespace. If a literal table
 name has the same format as a selector, use the listed selector for that table.
 
+New cluster restore jobs use a durable format that requires workers with
+manifest binding support. Older workers reject these records during recovery.
+
 For paginated backup listings, keep following `next_cursor` until it is
 absent. A page can be empty if its window contains only skipped manifests.
 

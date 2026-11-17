@@ -432,11 +432,24 @@ pub const FileReader = struct {
     /// Bound logical output before allocating it; stored bytes retain the
     /// format's independent framing limit.
     pub fn readBlockLimited(self: *FileReader, alloc: Allocator, max_bytes: usize) !Block {
+        return self.readFrame(alloc, max_bytes, null);
+    }
+
+    /// Native bundle frames are uncompressed. Check their framing before
+    /// reserving a payload buffer or performing any payload I/O.
+    pub fn readPlainBlock(self: *FileReader, alloc: Allocator, kind: BlockType, max_bytes: usize) !Block {
+        return self.readFrame(alloc, max_bytes, kind);
+    }
+
+    fn readFrame(self: *FileReader, alloc: Allocator, max_bytes: usize, plain_kind: ?BlockType) !Block {
         const limit = @min(max_bytes, self.max_block_bytes);
         var env: [6]u8 = undefined;
         try self.readExact(&env);
         const block_type: BlockType = @fromBackingInt(@intCast(env[0]));
         const flags = env[1];
+        if (plain_kind) |expected| {
+            if (block_type != expected or flags != 0) return error.InvalidBackupManifest;
+        }
         const payload_len = std.mem.readInt(u32, env[2..6], .little);
         if (payload_len > max_block_payload_bytes) return error.BackupBlockTooLarge;
         if (flags & block_flag_compressed == 0 and payload_len > limit) return error.BackupExpansionLimitExceeded;
@@ -1695,6 +1708,21 @@ test "bounded block readers reject stored payload before allocation and accept e
     const from_file = try reader.readBlock(a);
     defer a.free(from_file.payload);
     try std.testing.expectEqualStrings("payload", from_file.payload);
+
+    // The input carries only the envelope. Reject it without trying to
+    // allocate or read the claimed native metadata payload.
+    var env: [6]u8 = .{ @backingInt(BlockType.blob_header), 0, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, env[2..6], 64 * 1024 * 1024, .little);
+    try file.writePositionalAll(io, &env, 0);
+    reader = FileReader.init(io, file, env.len);
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, reader.readPlainBlock(bounded.allocator(), .blob_header, 4096));
+    try std.testing.expectEqual(@as(u64, env.len), reader.pos);
+    reader = FileReader.init(io, file, env.len);
+    try std.testing.expectError(error.InvalidBackupManifest, reader.readPlainBlock(bounded.allocator(), .blob_chunk, 4096));
+    env[1] = block_flag_compressed;
+    try file.writePositionalAll(io, &env, 0);
+    reader = FileReader.init(io, file, env.len);
+    try std.testing.expectError(error.InvalidBackupManifest, reader.readPlainBlock(bounded.allocator(), .blob_header, 4096));
 }
 
 test "backup preflight borrowed key value reader validates complete batches without allocation" {

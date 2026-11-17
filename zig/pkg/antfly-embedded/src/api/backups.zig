@@ -2019,33 +2019,35 @@ pub fn readManifestFromLocationWithArtifactBackupId(
     backup_id: []const u8,
     artifact_backup_id: []const u8,
 ) !TableBackupManifest {
+    return readManifestFromLocationWithDigest(alloc, location, backup_id, artifact_backup_id, null);
+}
+
+pub const TableManifestDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+pub fn readManifestFromLocationWithDigest(
+    alloc: std.mem.Allocator,
+    location: *BackupLocation,
+    backup_id: []const u8,
+    artifact_backup_id: []const u8,
+    digest: ?*TableManifestDigest,
+) !TableBackupManifest {
     try validateBackupId(artifact_backup_id);
-    switch (location.*) {
-        .file => |backup_root| {
+    const body = switch (location.*) {
+        .file => |backup_root| blk: {
             const path = try metadataPath(alloc, backup_root, backup_id);
             defer alloc.free(path);
-            const body = try readFileAbsoluteAlloc(alloc, path, max_backup_manifest_bytes);
-            defer alloc.free(body);
-            return try parseTableBackupManifestWithArtifactBackupId(
-                alloc,
-                body,
-                backup_id,
-                artifact_backup_id,
-            );
+            break :blk try readFileAbsoluteAlloc(alloc, path, max_backup_manifest_bytes);
         },
-        .remote => |*store| {
+        .remote => |*store| blk: {
             const suffix = try metadataPath(alloc, "", backup_id);
             defer alloc.free(suffix);
-            const body = try store.readBytesAllocLimited(alloc, trimLeftSlash(suffix), max_backup_manifest_bytes);
-            defer alloc.free(body);
-            return parseTableBackupManifestWithArtifactBackupId(
-                alloc,
-                body,
-                backup_id,
-                artifact_backup_id,
-            );
+            break :blk try store.readBytesAllocLimited(alloc, trimLeftSlash(suffix), max_backup_manifest_bytes);
         },
-    }
+    };
+    defer alloc.free(body);
+    const manifest = try parseTableBackupManifestWithArtifactBackupId(alloc, body, backup_id, artifact_backup_id);
+    if (digest) |out| std.crypto.hash.sha2.Sha256.hash(body, out, .{});
+    return manifest;
 }
 
 pub fn parseTableBackupManifest(

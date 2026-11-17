@@ -169,7 +169,7 @@ pub fn readNativeObjectAlloc(
     var reader = backup_codec.FileReader.init(io, source, source_size - bundle.trailer_size);
     reader.pos = trailer.footer_offset;
     reader.max_block_bytes = expected_footer_size;
-    const footer_block = try reader.readBlock(alloc);
+    const footer_block = try reader.readPlainBlock(alloc, .footer_index, expected_footer_size);
     defer alloc.free(footer_block.payload);
     if (footer_block.block_type != .footer_index or footer_block.payload.len != expected_footer_size or reader.hasRemaining() or
         std.mem.readInt(u32, footer_block.payload[0..index_count_bytes], .little) != manifest.blobs.len)
@@ -184,7 +184,7 @@ pub fn readNativeObjectAlloc(
 
     reader = backup_codec.FileReader.init(io, source, trailer.footer_offset);
     reader.pos = entry.header_offset;
-    const header_block = try reader.readBlock(alloc);
+    const header_block = try reader.readPlainBlock(alloc, .blob_header, bundle.max_blob_header_bytes);
     defer alloc.free(header_block.payload);
     if (header_block.block_type != .blob_header) return error.InvalidBackupManifest;
     var header = try bundle.decodeBlobHeader(alloc, header_block.payload);
@@ -202,7 +202,7 @@ pub fn readNativeObjectAlloc(
     errdefer alloc.free(body);
     var offset: usize = 0;
     while (offset < body.len) {
-        const block = try reader.readBlock(alloc);
+        const block = try reader.readPlainBlock(alloc, .blob_chunk, bundle.blob_chunk_prefix_bytes + @min(bundle.native_chunk_target_bytes, body.len - offset));
         defer alloc.free(block.payload);
         if (block.block_type != .blob_chunk) return error.InvalidNativeFileChunk;
         const chunk = try bundle.decodeBlobChunk(block.payload);

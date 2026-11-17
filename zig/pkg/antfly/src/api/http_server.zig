@@ -13477,6 +13477,51 @@ pub const ApiHttpServer = struct {
         );
     }
 
+    fn readLegacyRestoreChild(expected: ?*const backups_api.TableManifestDigest, alloc: std.mem.Allocator, location: *backups_api.BackupLocation, backup_id: []const u8, artifact_backup_id: []const u8) !backups_api.TableBackupManifest {
+        const binding = expected orelse return backups_api.readManifestFromLocationWithArtifactBackupId(alloc, location, backup_id, artifact_backup_id);
+        var digest: backups_api.TableManifestDigest = undefined;
+        var manifest = try backups_api.readManifestFromLocationWithDigest(alloc, location, backup_id, artifact_backup_id, &digest);
+        errdefer manifest.deinit(alloc);
+        if (!std.mem.eql(u8, &digest, binding)) return error.BackupArtifactIntegrityMismatch;
+        return manifest;
+    }
+
+    const LegacyRestoreChildren = struct {
+        bindings: []backups_api.TableManifestDigest,
+        digest: [64]u8,
+        foreign_keys_guarded: bool,
+    };
+
+    fn bindLegacyRestoreChildren(
+        self: *ApiHttpServer,
+        location: *backups_api.BackupLocation,
+        manifest: *const backups_api.ClusterBackupManifest,
+        ordinals: ?[]const u16,
+        cancellation: api_operation.CancellationToken,
+    ) !LegacyRestoreChildren {
+        const count = if (ordinals) |selected| selected.len else manifest.tables.len;
+        const bindings = try self.alloc.alloc(backups_api.TableManifestDigest, count);
+        errdefer self.alloc.free(bindings);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly.legacy-restore-children.v1\x00");
+        var guarded = false;
+        for (bindings, 0..) |*binding, index| {
+            try cancellation.check();
+            const ordinal = if (ordinals) |selected| selected[index] else index;
+            if (ordinal >= manifest.tables.len) return error.BackupArtifactIntegrityMismatch;
+            const entry = manifest.tables[ordinal];
+            var child = try backups_api.readManifestFromLocationWithDigest(self.alloc, location, entry.table_backup_id, entry.artifact_backup_id orelse entry.table_backup_id, binding);
+            defer child.deinit(self.alloc);
+            if (!std.mem.eql(u8, child.table_name, entry.name)) return error.BackupArtifactIntegrityMismatch;
+            // Both accepted manifest envelopes declare their artifact SHA-256
+            // and size. Preserve this guarantee if adding a legacy decoder.
+            if (child.artifact_integrity_mode != .declared) return error.BackupIntegrityMissing;
+            if (!guarded) guarded = try portableForeignKeyRestoreGuarded(self.alloc, &child, self.cfg.allow_unverified_portable_fk_restore_for_tests);
+            hash.update(binding);
+        }
+        return .{ .bindings = bindings, .digest = std.fmt.bytesToHex(hash.finalResult(), .lower), .foreign_keys_guarded = guarded };
+    }
+
     fn restoreOwnedTableWithLifecycle(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -13486,13 +13531,15 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         restore_lifecycle_already_active: bool,
         replace_existing: bool,
+        expected_child: ?*const backups_api.TableManifestDigest,
         verification_cache: ?*backups_api.ArtifactVerificationCache,
         destination_authorization_fingerprint: []const u8,
         destination_authorization_principal: []const u8,
         cancellation: api_operation.CancellationToken,
     ) !OwnedRestoreOutcome {
         try cancellation.check();
-        var manifest = backups_api.readManifestFromLocationWithArtifactBackupId(
+        var manifest = readLegacyRestoreChild(
+            expected_child,
             self.alloc,
             backup_location,
             backup_id,
@@ -13906,6 +13953,7 @@ pub const ApiHttpServer = struct {
             false,
             false,
             null,
+            null,
             destination_authorization_fingerprint,
             destination_authorization_principal,
             cancellation,
@@ -13921,6 +13969,7 @@ pub const ApiHttpServer = struct {
         artifact_backup_id: []const u8,
         restore_lifecycle_already_active: bool,
         replace_existing: bool,
+        expected_child: ?*const backups_api.TableManifestDigest,
         verification_cache: ?*backups_api.ArtifactVerificationCache,
         destination_authorization_fingerprint: []const u8,
         destination_authorization_principal: []const u8,
@@ -13929,7 +13978,7 @@ pub const ApiHttpServer = struct {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
             try cancellation.check();
-            const outcome = self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, artifact_backup_id, restore_lifecycle_already_active, replace_existing, verification_cache, destination_authorization_fingerprint, destination_authorization_principal, cancellation) catch |err| switch (err) {
+            const outcome = self.restoreOwnedTableWithLifecycle(table_name, backup_location, source_location, backup_id, artifact_backup_id, restore_lifecycle_already_active, replace_existing, expected_child, verification_cache, destination_authorization_fingerprint, destination_authorization_principal, cancellation) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
                     if (attempt + 1 >= 3) return err;
                     if (!replace_existing and (self.tableExists(table_name) catch false)) {
@@ -21778,9 +21827,23 @@ pub const ApiHttpServer = struct {
         };
         if (table_names.len > restore_jobs.max_cluster_tables_per_job) return error.InvalidRequest;
 
-        if (manifest.cohort_json.len == 0 and
-            (clusterPortableForeignKeyRestoreGuarded(op_alloc, location, &manifest, table_names, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch return error.InvalidRequest))
-            return error.PortableForeignKeyRestoreUnavailable;
+        const legacy_children = if (req.admitted_children_sha256) |expected| blk: {
+            if (manifest.cohort_json.len != 0) return error.BackupIntegrityFailure;
+            const children = self.bindLegacyRestoreChildren(location, &manifest, req.admitted_table_ordinals, repair_cancellation) catch |err| switch (err) {
+                error.Canceled => return error.Cancelled,
+                else => return mapClusterRestoreRepositoryError(err),
+            };
+            errdefer op_alloc.free(children.bindings);
+            if (!std.mem.eql(u8, expected, &children.digest)) return error.BackupIntegrityFailure;
+            if (children.foreign_keys_guarded) return error.PortableForeignKeyRestoreUnavailable;
+            break :blk children.bindings;
+        } else null;
+        defer if (legacy_children) |children| op_alloc.free(children);
+        if (manifest.cohort_json.len == 0 and legacy_children == null) {
+            if (req.admitted_manifest_sha256 != null) return error.BackupIntegrityFailure;
+            if (clusterPortableForeignKeyRestoreGuarded(op_alloc, location, &manifest, table_names, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch return error.InvalidRequest)
+                return error.PortableForeignKeyRestoreUnavailable;
+        }
 
         if (manifest.cohort_json.len != 0) {
             const restore = cancellation orelse return error.MethodNotAllowed;
@@ -21873,6 +21936,7 @@ pub const ApiHttpServer = struct {
             const cluster_table = backups_api.findClusterTableByStorageName(&manifest, source_name).?;
             const table_backup_id = cluster_table.table_backup_id;
             const artifact_backup_id = cluster_table.artifact_backup_id orelse table_backup_id;
+            const expected_child = if (legacy_children) |children| &children[i] else null;
 
             // published_table_ranges is a durable publication checkpoint. On a
             // resumed attempt, do not republish or reject the table merely
@@ -21919,7 +21983,8 @@ pub const ApiHttpServer = struct {
             // Overwrite publication is local and generation-aware. New-table
             // restores may delegate to metadata in distributed deployments.
             if (!is_overwrite and !self.cfg.deployment_mode.isStandalone()) {
-                var table_manifest = backups_api.readManifestFromLocationWithArtifactBackupId(
+                var table_manifest = readLegacyRestoreChild(
+                    expected_child,
                     op_alloc,
                     location,
                     table_backup_id,
@@ -22101,12 +22166,13 @@ pub const ApiHttpServer = struct {
             }
 
             const replace_existing = is_overwrite and (self.tableExists(table_name) catch |err| return metadataAccessFailure(err));
-            var authorized_manifest = backups_api.readManifestFromLocationWithArtifactBackupId(
+            var authorized_manifest = readLegacyRestoreChild(
+                expected_child,
                 op_alloc,
                 location,
                 table_backup_id,
                 artifact_backup_id,
-            ) catch return error.InvalidRequest;
+            ) catch |err| return mapClusterRestoreRepositoryError(err);
             defer authorized_manifest.deinit(op_alloc);
             const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
                 op_alloc,
@@ -22132,6 +22198,7 @@ pub const ApiHttpServer = struct {
                 artifact_backup_id,
                 cluster_table.catalog_target != null,
                 replace_existing,
+                expected_child,
                 &verification_cache,
                 if (destination_authorization_principal.len > 0)
                     destination_authorization_fingerprint
@@ -25506,7 +25573,15 @@ pub const ApiHttpServer = struct {
             else
                 null;
             defer if (selected) |names| freeOwnedTableNames(self.alloc, names);
-            const guarded = clusterPortableForeignKeyRestoreGuarded(self.alloc, &location, &manifest, selected, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch
+            var children_digest: [64]u8 = undefined;
+            const guarded = if (manifest.cohort_json.len == 0) blk: {
+                const children = self.bindLegacyRestoreChildren(&location, &manifest, ordinals, .none) catch |err|
+                    return try contextualJsonErrorResponse(self.alloc, if (err == error.BackupManifestTooLarge) 413 else 400, "invalid table backup manifest or artifacts");
+                defer self.alloc.free(children.bindings);
+                children_digest = children.digest;
+                start_request.cluster_binding.?.children_sha256 = &children_digest;
+                break :blk children.foreign_keys_guarded;
+            } else clusterPortableForeignKeyRestoreGuarded(self.alloc, &location, &manifest, selected, self.cfg.allow_unverified_portable_fk_restore_for_tests) catch
                 return try contextualJsonErrorResponse(self.alloc, 400, "invalid relational backup declarations");
             admission = self.restore_job_store.startRecoverableGuarded(self.alloc, start_request, !guarded) catch |err|
                 return try restoreJobStartErrorResponse(self.alloc, err);
@@ -25986,6 +26061,7 @@ pub const ApiHttpServer = struct {
                 .table_names = state.table_names,
                 .admitted_manifest_sha256 = if (state.cluster_binding) |binding| binding.manifest_sha256 else null,
                 .admitted_table_ordinals = if (state.cluster_binding) |binding| binding.selected_ordinals else null,
+                .admitted_children_sha256 = if (state.cluster_binding) |binding| binding.children_sha256 else null,
                 .restore_mode = state.restore_mode,
             }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                 if (restoreJobErrorIsRetryable(err)) {
@@ -55919,6 +55995,49 @@ test "distributed restore verifies Go portable artifact bytes before metadata pu
         &manifest,
         null,
     ));
+}
+
+test "legacy cluster restore pins child manifests under an unchanged aggregate" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    var child = borrowedTestRestoreManifest("docs-backup", "docs");
+    try writeTestRestoreManifestAndArtifact(alloc, root, &child);
+    var aggregate = try backups_api.createClusterManifest(alloc, "daily", "file:///archive", &.{.{
+        .name = "docs",
+        .table_backup_id = "docs-backup",
+    }});
+    defer aggregate.deinit(alloc);
+    try backups_api.writeClusterManifest(alloc, root, &aggregate);
+    var before = try backups_api.readClusterManifest(alloc, root, "daily");
+    defer before.deinit(alloc);
+    var location: backups_api.BackupLocation = .{ .file = root };
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = undefined, .vtable = &.{ .status = Fake.status } }, null, null);
+    defer server.deinit();
+    const pinned = try server.bindLegacyRestoreChildren(&location, &before, null, .none);
+    defer alloc.free(pinned.bindings);
+
+    child.description = "replacement under the same ID";
+    const path = try backups_api.metadataPath(alloc, root, child.backup_id);
+    defer alloc.free(path);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, child, .{ .emit_null_optional_fields = false });
+    defer alloc.free(bytes);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    var after = try backups_api.readClusterManifest(alloc, root, "daily");
+    defer after.deinit(alloc);
+    try std.testing.expectEqual(before.persisted_sha256, after.persisted_sha256);
+    const fresh = try server.bindLegacyRestoreChildren(&location, &after, &.{0}, .none);
+    defer alloc.free(fresh.bindings);
+    try std.testing.expect(!std.mem.eql(u8, &pinned.digest, &fresh.digest));
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, ApiHttpServer.readLegacyRestoreChild(&pinned.bindings[0], alloc, &location, child.backup_id, child.backup_id));
 }
 
 test "owned restore verifies declared artifact identity instead of accepting staged bytes" {

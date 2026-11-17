@@ -61,6 +61,7 @@ pub const ClusterRestoreRequest = struct {
     /// Private durable admission pin. Never accepted from public JSON.
     admitted_manifest_sha256: ?[]const u8 = null,
     admitted_table_ordinals: ?[]const u16 = null,
+    admitted_children_sha256: ?[]const u8 = null,
 };
 
 pub const format_version = @import("antfly_local_sources").api_local_backups.format_version;
@@ -2221,6 +2222,8 @@ pub const writeManifestToLocationWithIoAndCancellation = @import("antfly_local_s
 pub const readManifestFromLocation = @import("antfly_local_sources").api_local_backups.readManifestFromLocation;
 
 pub const readManifestFromLocationWithArtifactBackupId = @import("antfly_local_sources").api_local_backups.readManifestFromLocationWithArtifactBackupId;
+pub const TableManifestDigest = @import("antfly_local_sources").api_local_backups.TableManifestDigest;
+pub const readManifestFromLocationWithDigest = @import("antfly_local_sources").api_local_backups.readManifestFromLocationWithDigest;
 
 pub fn manifestExistsAtLocation(alloc: std.mem.Allocator, location: *BackupLocation, backup_id: []const u8) !bool {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
