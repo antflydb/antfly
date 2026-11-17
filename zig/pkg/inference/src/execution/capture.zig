@@ -35,6 +35,7 @@ pub const Forward = struct {
     resident_capacity: usize = 0,
     resident_initial: bool = false,
     precision: @import("precision.zig").Policy = .f32,
+    residual_storage: @import("precision.zig").ResidualStorage = .activation,
     /// Public output ABI names retained by the model, independent of cache entries.
     output_names: []const []const u8 = &.{},
     /// Static, model-owned names for authored stages with distinct phase ABIs.
@@ -70,6 +71,7 @@ pub fn specializationKey(forward: Forward, inputs: []const Input) ![32]u8 {
     hash.update(std.mem.asBytes(&forward.resident_capacity));
     hash.update(&.{@intFromBool(forward.resident_initial)});
     hash.update(&.{@backingInt(forward.precision)});
+    hash.update(&.{@backingInt(forward.residual_storage)});
     for (inputs) |input| {
         const shape = try inputShape(input.tensor);
         const name_len = input.tensor.name.len;
@@ -90,6 +92,7 @@ pub fn trace(allocator: std.mem.Allocator, forward: Forward, inputs: []const Inp
     defer tracer.deinit();
     tracer.require_resident_outputs = true;
     tracer.precision = forward.precision;
+    tracer.residual_storage = forward.residual_storage;
     tracer.resident_decoder = forward.resident_capacity != 0;
     var bindings: std.ArrayList(program.Binding) = .empty;
     defer bindings.deinit(allocator);
@@ -221,6 +224,9 @@ test "model program precision participates in specialization identity" {
     var context: u8 = 0;
     var forward = Forward{ .context = &context, .fingerprint = 0, .run = TestForward.run };
     const strict = try specializationKey(forward, &.{});
+    forward.residual_storage = .f32;
+    try std.testing.expect(!std.mem.eql(u8, &strict, &try specializationKey(forward, &.{})));
+    forward.residual_storage = .activation;
     forward.precision = .bf16;
     try std.testing.expect(!std.mem.eql(u8, &strict, &try specializationKey(forward, &.{})));
 }

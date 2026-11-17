@@ -26,7 +26,7 @@ pub fn geometry(config: Config, rows: usize, keys: usize) !@import("../backends/
 }
 
 pub fn resolve(config: *Config) capture.Forward {
-    return .{ .context = config, .fingerprint = 6, .output_names = &.{"logits"}, .validate = validate, .run = run };
+    return .{ .context = config, .fingerprint = 7, .output_names = &.{"logits"}, .validate = validate, .run = run };
 }
 
 const Inputs = struct {

@@ -6232,7 +6232,7 @@ fn finishGemmaDenseNoPleFfnTail(
         try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
         try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_post", layer, ffn_out, hidden_size);
         if (config.hasPle() or !branchGemma4LayerOutputScaleDebug()) {
-            break :residual_blk try cb.add(ffn_out, sa_out);
+            break :residual_blk try cb.residualAdd(ffn_out, sa_out);
         }
         break :residual_blk try addLayerOutputScaledBranch(cb, allocator, config, ffn_out, sa_out, total, hidden_size, layer);
     };
@@ -6555,7 +6555,7 @@ fn decoderBlockImpl(
             false;
         const attn_out = try qwen35LinearAttentionWithResidual(cb, allocator, config, normed, batch, query_seq_len, layer, decode_context, &name_buf, if (fuse_residual) hidden else null);
         defer if (!fuse_residual) freeTensorWithCleanup(cb, attn_out, raw_overrides.cleanup);
-        const attn_res = if (fuse_residual) attn_out else try cb.add(attn_out, hidden);
+        const attn_res = if (fuse_residual) attn_out else try cb.residualAdd(attn_out, hidden);
         errdefer freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
 
         compute_region_scope.deinit();
@@ -6573,7 +6573,7 @@ fn decoderBlockImpl(
         defer freeTensorWithCleanup(cb, ffn_out, raw_overrides.cleanup);
         debug_timing_stats.ffn_nanos += @intCast(monotonicNowNs() - ffn_started_at);
 
-        const result = try cb.add(ffn_out, attn_res);
+        const result = try cb.residualAdd(ffn_out, attn_res);
         freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
         try dumpLayerLastRowStats(cb, allocator, layer, result, hidden_size);
         return result;
@@ -7267,7 +7267,7 @@ fn decoderBlockImpl(
                 defer if (attn_post != proj) freeTensorWithCleanup(cb, attn_post, raw_overrides.cleanup);
                 try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-post", attn_post, hidden_size);
                 try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_post", layer, attn_post, hidden_size);
-                break :blk_sa_out try cb.add(attn_post, hidden);
+                break :blk_sa_out try cb.residualAdd(attn_post, hidden);
             };
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "attn-residual", sa_out, hidden_size);
             try maybeCaptureActivationTrace(trace_sink, cb, allocator, "attn_residual", layer, sa_out, hidden_size);
@@ -7356,7 +7356,7 @@ fn decoderBlockImpl(
                     defer if (combined_normed != combined) freeTensorWithCleanup(cb, combined_normed, raw_overrides.cleanup);
                     try maybeDumpGatedLayerStageStats(cb, allocator, layer, "a4b-combined-post", combined_normed, hidden_size);
                     break :blk_parallel_post if (config.hasPle() or !use_branch_output_scale)
-                        try cb.add(combined_normed, sa_out)
+                        try cb.residualAdd(combined_normed, sa_out)
                     else
                         try addLayerOutputScaledBranch(cb, allocator, config, combined_normed, sa_out, total, hidden_size, layer);
                 };
@@ -7427,7 +7427,7 @@ fn decoderBlockImpl(
                     try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
                     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_post", layer, ffn_out, hidden_size);
                     if (config.hasPle() or !branchGemma4LayerOutputScaleDebug()) {
-                        break :residual_blk try cb.add(ffn_out, sa_out);
+                        break :residual_blk try cb.residualAdd(ffn_out, sa_out);
                     }
                     break :residual_blk try addLayerOutputScaledBranch(cb, allocator, config, ffn_out, sa_out, total, hidden_size, layer);
                 }
@@ -7442,7 +7442,7 @@ fn decoderBlockImpl(
                 defer if (ffn_out != ffn_out_raw) freeTensorWithCleanup(cb, ffn_out, raw_overrides.cleanup);
                 try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-post", ffn_out, hidden_size);
                 try maybeCaptureActivationTrace(trace_sink, cb, allocator, "ffn_post", layer, ffn_out, hidden_size);
-                break :residual_blk try cb.add(ffn_out, sa_out);
+                break :residual_blk try cb.residualAdd(ffn_out, sa_out);
             };
             freeTensorWithCleanup(cb, sa_out, raw_overrides.cleanup);
             try maybeDumpGatedLayerStageStats(cb, allocator, layer, "ffn-residual", ffn_residual, hidden_size);
@@ -7469,7 +7469,7 @@ fn decoderBlockImpl(
         }
 
         // Residual
-        break :blk try cb.add(proj, hidden);
+        break :blk try cb.residualAdd(proj, hidden);
     };
     var attn_res_owned = true;
     errdefer if (attn_res_owned) freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
@@ -7523,7 +7523,7 @@ fn decoderBlockImpl(
                 defer freeTensorWithCleanup(cb, fused, raw_overrides.cleanup);
                 const fallback_ffn = try feedForwardWithCleanup(cb, allocator, config, ffn_normed, total, layer, &name_buf, decode_context, raw_overrides.cleanup);
                 defer freeTensorWithCleanup(cb, fallback_ffn, raw_overrides.cleanup);
-                const fallback_residual = try cb.add(fallback_ffn, attn_res);
+                const fallback_residual = try cb.residualAdd(fallback_ffn, attn_res);
                 defer freeTensorWithCleanup(cb, fallback_residual, raw_overrides.cleanup);
                 try maybeDebugTensorLastRowDiff(cb, allocator, "dense_ffn_compare", fused, fallback_residual, hidden_size);
             }
@@ -7630,7 +7630,7 @@ fn decoderBlockImpl(
     const result = if (ffn_out_includes_residual) blk: {
         free_ffn_out = false;
         break :blk ffn_out;
-    } else try cb.add(ffn_out, attn_res);
+    } else try cb.residualAdd(ffn_out, attn_res);
     errdefer freeTensorWithCleanup(cb, result, raw_overrides.cleanup);
     freeTensorWithCleanup(cb, attn_res, raw_overrides.cleanup);
     attn_res_owned = false;
@@ -8149,7 +8149,7 @@ fn applyQwen3VlDeepstack(
     const shape = [_]i32{ @intCast(total_rows), @intCast(hidden_size) };
     const update = try cb.fromFloat32Shape(dense, &shape);
     defer cb.free(update);
-    return cb.add(hidden, update);
+    return cb.residualAdd(hidden, update);
 }
 
 fn decoderLayerEvalStride(config: Config, decode_context: ?*const DecodeContext) usize {
@@ -8709,7 +8709,7 @@ fn qwen35OutputProjection(cb: *const ComputeBackend, core: CT, weight: CT, resid
         }
         const projected = try cb.linearNoBias(core, weight, rows, in_dim, hidden);
         defer cb.free(projected);
-        return cb.add(projected, prior);
+        return cb.residualAdd(projected, prior);
     }
     return cb.linearNoBias(core, weight, rows, in_dim, hidden);
 }
@@ -13325,7 +13325,7 @@ pub fn applyLayerOutputScale(
         // creates a spurious graph output and, via the fused_to_float32
         // pass-through, aliases the weight handle — causing use-after-free
         // when ExecutionResult.deinit frees the output.
-        const result = try cb.multiply(hidden, scale_w);
+        const result = try cb.residualScale(hidden, scale_w);
         cb.free(scale_w);
         cb.free(hidden);
         return result;
@@ -13335,7 +13335,7 @@ pub fn applyLayerOutputScale(
         // GPU path: keep the scalar multiply on device. Downloading the scalar
         // every layer to check for ~1.0 introduces synchronization in the hot
         // path and is more expensive than the multiply we would skip.
-        const result = try cb.multiply(hidden, scale_w);
+        const result = try cb.residualScale(hidden, scale_w);
         cb.free(scale_w);
         cb.free(hidden);
         return result;
@@ -13369,23 +13369,23 @@ pub fn addLayerOutputScaledBranch(
     hidden_size: usize,
     layer: usize,
 ) !CT {
-    if (config.family == .gemma and disableGemma4LayerOutputScaleDebug()) return cb.add(branch, residual);
+    if (config.family == .gemma and disableGemma4LayerOutputScaleDebug()) return cb.residualAdd(branch, residual);
 
-    const scale_w = (try getLayerOutputScaleWeight(cb, config, layer)) orelse return cb.add(branch, residual);
+    const scale_w = (try getLayerOutputScaleWeight(cb, config, layer)) orelse return cb.residualAdd(branch, residual);
     defer cb.free(scale_w);
 
-    if (try cb.addMultiplyScalarTensor(branch, residual, scale_w)) |scaled| return scaled;
+    if (try cb.residualAddScale(branch, residual, scale_w)) |scaled| return scaled;
 
     if (cb.vtable.reshape2d != null or cb.kind() == .graph) {
         const branch_scaled = try cb.multiply(branch, scale_w);
         defer cb.free(branch_scaled);
-        return try cb.add(branch_scaled, residual);
+        return try cb.residualAdd(branch_scaled, residual);
     }
 
     const scale_data = try cb.toFloat32(scale_w, allocator);
     defer allocator.free(scale_data);
     const scale_val = scale_data[0];
-    if (std.math.approxEqAbs(f32, scale_val, 1.0, 1e-6)) return cb.add(branch, residual);
+    if (std.math.approxEqAbs(f32, scale_val, 1.0, 1e-6)) return cb.residualAdd(branch, residual);
 
     const branch_data = try cb.toFloat32(branch, allocator);
     defer allocator.free(branch_data);
@@ -13701,7 +13701,7 @@ pub fn applyPle(
         }
         if (try cb.rmsNormAddTensor(projected, post_norm_w, hidden, hidden_size, config.norm_eps)) |residual| {
             defer cb.free(residual);
-            return try cb.multiply(residual, scale);
+            return try cb.residualScale(residual, scale);
         }
     } else if (try cb.rmsNormAddTensor(projected, post_norm_w, hidden, hidden_size, config.norm_eps)) |fused| {
         return fused;
@@ -13712,12 +13712,12 @@ pub fn applyPle(
 
     // 5. Residual add, then optional whole-layer output scale.
     if (output_scale) |scale| {
-        const residual = try cb.add(hidden, normed);
+        const residual = try cb.residualAdd(hidden, normed);
         defer cb.free(residual);
-        return try cb.multiply(residual, scale);
+        return try cb.residualScale(residual, scale);
     }
 
-    const result = try cb.add(hidden, normed);
+    const result = try cb.residualAdd(hidden, normed);
     return result;
 }
 

@@ -2764,7 +2764,16 @@ pub const ComputeBackend = struct {
         trainingBackward: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
     };
 
+    pub const ResidualOperation = union(enum) {
+        add: struct { lhs: CT, rhs: CT },
+        scale: struct { input: CT, scalar: CT },
+        add_scale: struct { lhs: CT, rhs: CT, scalar: CT },
+    };
+
     pub const VTable = struct {
+        /// Semantic residual publication; omitted by native providers to retain
+        /// their existing tuned add/scale operations.
+        residual: ?*const fn (ctx: *anyopaque, request: ResidualOperation) anyerror!CT = null,
         regions: Regions = .{},
         backendKind: *const fn (ctx: *anyopaque) BackendKind,
         kernels: ?*const KernelBackend = null,
@@ -5191,6 +5200,21 @@ pub const ComputeBackend = struct {
 
     pub fn concat(self: *const ComputeBackend, a: CT, b: CT, total: usize, dim_a: usize, dim_b: usize) !CT {
         return self.vtable.concat(self.ptr, a, b, total, dim_a, dim_b);
+    }
+
+    pub fn residualAdd(self: *const ComputeBackend, a: CT, b: CT) !CT {
+        if (self.vtable.residual) |f| return self.observeBackendEntry(.add, f, .{ self.ptr, ResidualOperation{ .add = .{ .lhs = a, .rhs = b } } });
+        return self.add(a, b);
+    }
+
+    pub fn residualScale(self: *const ComputeBackend, input: CT, scalar: CT) !CT {
+        if (self.vtable.residual) |f| return f(self.ptr, .{ .scale = .{ .input = input, .scalar = scalar } });
+        return self.multiply(input, scalar);
+    }
+
+    pub fn residualAddScale(self: *const ComputeBackend, a: CT, b: CT, scalar: CT) !?CT {
+        if (self.vtable.residual) |f| return f(self.ptr, .{ .add_scale = .{ .lhs = a, .rhs = b, .scalar = scalar } });
+        return self.addMultiplyScalarTensor(a, b, scalar);
     }
 
     pub fn add(self: *const ComputeBackend, a: CT, b: CT) !CT {

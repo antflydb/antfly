@@ -1652,6 +1652,11 @@ const HostOutputAdmission = struct {
 /// Resolved semantic/execution metadata, copied with session handles. Optional
 /// wrappers preserve this value rather than rediscovering concrete vtables.
 pub const ModelContract = struct {
+    /// Immutable execution qualification. Session
+    /// wrappers retain this descriptor without rediscovering an opaque provider.
+    pub const DecoderCache = struct {
+        automatic: bool = false,
+    };
     pub const Task = enum { generic, classifier, extractor };
     pub const Embedding = struct {
         family: enum { encoder, last_token_decoder, gemma2 } = .encoder,
@@ -1668,6 +1673,7 @@ pub const ModelContract = struct {
     task: ?Task = null,
     /// Borrowed architecture semantics, preserved by session wrappers.
     decoder_config: ?*const @import("../models/gpt.zig").Config = null,
+    decoder_cache: DecoderCache = .{},
     embedding: ?Embedding = null,
     resolved: bool = false,
     padding: enum { declared, batch_max } = .declared,
@@ -6747,6 +6753,7 @@ test "resident preparation retains model owner and published policy through wrap
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expect(published.ptr == self.published_ptr);
             try std.testing.expect(published.model_contract.resident_text_embeddings);
+            try std.testing.expect(published.model_contract.decoder_cache.automatic);
             try std.testing.expect(published.generation_workspace != null);
             try (control orelse return error.MissingControl).check();
             self.calls += 1;
@@ -6762,7 +6769,7 @@ test "resident preparation retains model owner and published policy through wrap
     const wrapped = Session{
         .ptr = &wrapper,
         .vtable = undefined,
-        .model_contract = .{ .resident_text_embeddings = true },
+        .model_contract = .{ .resident_text_embeddings = true, .decoder_cache = .{ .automatic = true } },
         .generation_workspace = &workspace,
         .resident_preparation = .{ .ptr = &probe, .prepare = Probe.prepare },
     };

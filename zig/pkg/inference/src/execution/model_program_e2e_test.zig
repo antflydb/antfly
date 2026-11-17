@@ -867,9 +867,10 @@ const DecoderQualification = struct {
     const control = @import("../execution_control.zig").InferenceExecutionControl{ .native_call_policy = .in_process };
 
     fn options(precision: factory.PjrtSessionOptions.Precision) !factory.PjrtSessionOptions {
-        const physical = platform.env.getenv("ANTFLY_PJRT_DECODER_DEVICE_BYTES") orelse return .{ .task_override = .generic, .memory_policy = .cpu, .precision = precision };
+        const gemm = if (platform.env.getenv("ANTFLY_PJRT_DECODER_GEMM")) |value| std.meta.stringToEnum(@FieldType(factory.PjrtSessionOptions, "gemm"), value) orelse return error.InvalidPjrtGemm else .provider_default;
+        const physical = platform.env.getenv("ANTFLY_PJRT_DECODER_DEVICE_BYTES") orelse return .{ .task_override = .generic, .memory_policy = .cpu, .precision = precision, .gemm = gemm };
         const capacity = platform.env.getenv("ANTFLY_PJRT_DECODER_CAPACITY_BYTES") orelse return error.MissingPjrtCapacity;
-        return .{ .task_override = .generic, .precision = precision, .memory_policy = .{ .cuda = .{
+        return .{ .task_override = .generic, .precision = precision, .gemm = gemm, .memory_policy = .{ .cuda = .{
             .device_bytes = try std.fmt.parseInt(usize, physical, 10),
             .capacity_bytes = try std.fmt.parseInt(usize, capacity, 10),
             .unified_memory = platform.env.getenvBool("ANTFLY_PJRT_DECODER_UNIFIED_MEMORY"),
@@ -934,6 +935,14 @@ test "model program resident decoder qualifies context boundaries and longer con
     };
     var failures: usize = 0;
     for (starts[0..if (stress) @as(usize, 6) else 4], 0..) |first, case| {
+        if (platform.env.getenv("ANTFLY_PJRT_DECODER_CONTEXTS")) |requested| {
+            var selected = false;
+            var it = std.mem.splitScalar(u8, requested, ',');
+            while (it.next()) |value| if ((try std.fmt.parseInt(usize, value, 10)) == first) {
+                selected = true;
+            };
+            if (!selected) continue;
+        }
         const encoded = try tokenizer.tokenizer().encode(a, documents[case % documents.len]);
         defer a.free(encoded);
         const history = try a.alloc(i64, first + steps);

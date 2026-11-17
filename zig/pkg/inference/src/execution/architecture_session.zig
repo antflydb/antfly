@@ -407,6 +407,7 @@ pub const PjrtExecutionProfile = struct {
     platform: enum { cpu, cuda, other },
     precision: @import("precision.zig").Policy,
     gemm: @import("precision.zig").Gemm,
+    residual_storage: @import("precision.zig").ResidualStorage = .activation,
 };
 
 fn openHostSession(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride, preparation: HostSessionOptions) !Session {
@@ -494,6 +495,7 @@ fn prepareLoadedHostSession(allocator: std.mem.Allocator, model_path: []const u8
         const platform_name = try impl.backend_data.pjrt.client.?.platformName();
         impl.backend_data.pjrt.platform = if (std.ascii.eqlIgnoreCase(platform_name, "cpu") or std.ascii.eqlIgnoreCase(platform_name, "host")) .cpu else if (std.ascii.eqlIgnoreCase(platform_name, "cuda")) .cuda else .other;
         impl.backend_data.pjrt.parameters = @import("../graph/pjrt_parameters.zig").Store.init(allocator, &impl.backend_data.pjrt.client.?);
+        impl.backend_data.pjrt.residual_storage = if (impl.arch_config == .gpt and impl.backend_data.pjrt.platform == .cuda and preparation.pjrt_precision == .bf16) .f32 else .activation;
     }
     const host_data = switch (preparation.backend) {
         .native => &impl.backend_data.native,
@@ -602,7 +604,7 @@ pub fn getPjrtExecutionProfile(session: Session) ?PjrtExecutionProfile {
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     if (self.backend_type != .pjrt) return null;
     const data = &self.backend_data.pjrt;
-    return .{ .device_kind = data.device_kind, .platform = data.platform, .precision = data.precision, .gemm = data.gemm };
+    return .{ .device_kind = data.device_kind, .platform = data.platform, .precision = data.precision, .gemm = data.gemm, .residual_storage = data.residual_storage };
 }
 
 pub fn getPjrtSpecializationCount(session: Session) ?usize {
@@ -2847,6 +2849,7 @@ const GpuHostedData = if (false or build_options.enable_metal) gpu_hosted_store_
 /// PJRT backend data: weights are stored and served via the native backend,
 /// while the PJRT client is used for compiled partition execution.
 const PjrtData = struct {
+    residual_storage: @import("precision.zig").ResidualStorage = .activation,
     parameters: if (build_options.enable_pjrt) ?@import("../graph/pjrt_parameters.zig").Store else void = if (build_options.enable_pjrt) null else {},
     device_kind: []const u8 = "",
     precision: @import("precision.zig").Policy = .f32,
@@ -7164,6 +7167,10 @@ fn archSessionHandle(impl: *ArchSession) Session {
         .model_contract = .{
             .task = impl.task,
             .decoder_config = if (impl.arch_config == .gpt) &impl.arch_config.gpt else null,
+            .decoder_cache = if (comptime build_options.enable_pjrt) if (impl.backend_type == .pjrt and impl.backend_data.pjrt.client != null)
+                @import("resident_decoder.zig").profileFor(&impl.backend_data.pjrt)
+            else
+                .{} else .{},
             .padding = if (encoder or impl.arch_config == .deberta or impl.arch_config == .gliner) .batch_max else .declared,
             .normalized_text_host_output_width = if (impl.backend_type == .cuda and impl.arch_config == .embedding_gemma2 and impl.task == .generic)
                 (if (impl.arch_config.embedding_gemma2.resident) |cfg| cfg.outputDim() else null)
@@ -7630,6 +7637,7 @@ fn archRunCachedDecoder(ptr: *anyopaque, state: *@import("resident_decoder.zig")
     if (self.backend_type != .pjrt or self.arch_config != .gpt or state.failed) return error.UnsupportedResidentDecode;
     var forward = @import("decoder_frontend.zig").resolve(&self.arch_config.gpt);
     forward.precision = self.backend_data.pjrt.precision;
+    forward.residual_storage = self.backend_data.pjrt.residual_storage;
     forward.resident_capacity = state.capacity;
     forward.resident_initial = state.position == 0;
     const declared = try allocator.alloc(@import("capture.zig").Input, inputs.len);
@@ -8174,7 +8182,10 @@ fn runCapturedProgram(self: *ArchSession, inputs: []const Tensor, allocator: std
     var forward = (try handle.model_programs.?.get(stage)) orelse return error.UnsupportedModelProgram;
     // Authored graphs declare their arithmetic dtypes explicitly, including
     // F32 task heads behind a BF16 encoder. Traced programs use session policy.
-    if (forward.author == null) forward.precision = self.backend_data.pjrt.precision;
+    if (forward.author == null) {
+        forward.precision = self.backend_data.pjrt.precision;
+        forward.residual_storage = self.backend_data.pjrt.residual_storage;
+    }
     const client = if (comptime build_options.enable_pjrt) if (self.backend_data.pjrt.client) |*value| @as(*anyopaque, @ptrCast(value)) else return error.MissingPjrtClient else return error.PjrtNotEnabled;
     const declared = try allocator.alloc(@import("capture.zig").Input, inputs.len);
     defer allocator.free(declared);

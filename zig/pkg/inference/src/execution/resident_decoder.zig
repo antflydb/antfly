@@ -9,6 +9,7 @@ const Resident = if (enabled) @import("../graph/pjrt_decoder_state.zig").State e
 const Session = @import("../backends/session.zig").Session;
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const Config = @import("../models/gpt.zig").Config;
+const DecoderCache = @import("../backends/session.zig").ModelContract.DecoderCache;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
 /// Capability selection happens before allocation or execution. Automatic mode
@@ -19,7 +20,14 @@ pub fn select(source: Session, requested: ?bool) !bool {
     const supported = enabled and source.backend() == .pjrt and source.vtable.runCachedDecoder != null and
         (if (source.model_contract.decoder_config) |cfg| supports(cfg.*) else false);
     if (requested == true and !supported) return error.UnsupportedResidentDecode;
+    if (supported and requested == null and !source.model_contract.decoder_cache.automatic) return false;
     return supported;
+}
+
+/// Qualification follows immutable arithmetic policy and survives session wrappers.
+pub fn profileFor(profile: anytype) DecoderCache {
+    return .{ .automatic = profile.precision == .f32 or profile.platform == .cpu or
+        (profile.platform == .cuda and profile.residual_storage == .f32) };
 }
 
 pub fn supports(cfg: Config) bool {
@@ -213,4 +221,18 @@ test "resident decoder capability rejects unsupported state layouts before execu
     cfg.num_key_value_heads = 0;
     cfg.num_kv_shared_layers = cfg.num_hidden_layers + 1;
     try std.testing.expect(!supports(cfg));
+}
+
+test "resident decoder automatic selection excludes unqualified reduced precision" {
+    var profile = struct { platform: enum { cpu, cuda, other }, precision: @import("precision.zig").Policy, residual_storage: @import("precision.zig").ResidualStorage = .activation }{ .platform = .cpu, .precision = .bf16 };
+    try std.testing.expect(profileFor(profile).automatic);
+    profile.platform = .cuda;
+    try std.testing.expect(!profileFor(profile).automatic);
+    profile.residual_storage = .f32;
+    try std.testing.expect(profileFor(profile).automatic);
+    profile.precision = .f32;
+    try std.testing.expect(profileFor(profile).automatic);
+    profile.platform = .other;
+    profile.precision = .bf16;
+    try std.testing.expect(!profileFor(profile).automatic);
 }

@@ -97,6 +97,7 @@ pub const TracingCompute = struct {
     /// Shared program capture cannot observe provisional host values.
     require_resident_outputs: bool = false,
     precision: @import("../execution/precision.zig").Policy = .f32,
+    residual_storage: @import("../execution/precision.zig").ResidualStorage = .activation,
     resident_decoder: bool = false,
 
     const RuntimeInput = struct {
@@ -286,6 +287,7 @@ pub const TracingCompute = struct {
         .tanh_act = &tanhActOp,
         .concat = &concatOp,
         .add = &addOp,
+        .residual = &residualOp,
         .addMultiplyScalarTensor = &addMultiplyScalarTensorOp,
         .scaledDotProductAttention = &sdpaOp,
         .causalSelfAttention = &causalSelfAttentionOp,
@@ -917,6 +919,17 @@ pub const TracingCompute = struct {
     }
 
     // ── Element-wise binary ───────────────────────────────────────────
+
+    fn residualOp(ctx: *anyopaque, request: ComputeBackend.ResidualOperation) anyerror!CT {
+        const tc = fromCtx(ctx);
+        var builder = Builder.init(tc.getGraphMut());
+        const id = switch (request) {
+            .add => |op| try builder.elemAdd(nodeIdFromCT(op.lhs), nodeIdFromCT(op.rhs)),
+            .scale => |op| try builder.elemMultiply(nodeIdFromCT(op.input), nodeIdFromCT(op.scalar)),
+            .add_scale => |op| try builder.addMulScalar(nodeIdFromCT(op.lhs), nodeIdFromCT(op.rhs), nodeIdFromCT(op.scalar)),
+        };
+        return if (tc.residual_storage == .f32) tc.makeHandleExact(id) else tc.makeHandle(id);
+    }
 
     fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
         var tc = fromCtx(ctx);
@@ -2119,4 +2132,40 @@ test "capture reads only bounded immutable checkpoint metadata" {
     const transformed = try cb.multiply(weight, weight);
     defer cb.free(transformed);
     try std.testing.expectError(error.HostReadbackDuringCapture, cb.toFloat32(transformed, a));
+}
+
+// BF16 increments smaller than a residual ULP must survive until normalization.
+test "model program F32 residual preserves small BF16 branch updates" {
+    const a = std.testing.allocator;
+    var tracer = TracingCompute.init(a);
+    defer tracer.deinit();
+    tracer.precision = .bf16;
+    tracer.residual_storage = .f32;
+    const tracing = tracer.backend();
+    const one = try tracing.fromFloat32Shape(&.{1}, &.{1});
+    const increment = try tracing.fromFloat32Shape(&.{1.0 / 1024.0}, &.{1});
+    const two = try tracing.fromFloat32Shape(&.{2}, &.{1});
+    var ordinary = one;
+    var residual = one;
+    for (0..16) |_| {
+        ordinary = try tracing.add(ordinary, increment);
+        residual = try tracing.residualAdd(residual, increment);
+    }
+    _ = try tracer.markOutput(ordinary);
+    _ = try tracer.markOutput(residual);
+    _ = try tracer.markOutput(try tracing.residualScale(residual, two));
+    _ = try tracer.markOutput((try tracing.residualAddScale(residual, increment, two)).?);
+    const native = @import("../ops/native_compute.zig");
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    var result = try @import("interpreter.zig").execute(a, tracer.getGraph(), &backend, .{});
+    defer result.deinit(&backend);
+    const expected = [_]f32{ 1, 1.015625, 2.03125, 2.033203125 };
+    for (result.outputs, expected) |output, value| {
+        const values = try backend.toFloat32(output, a);
+        defer a.free(values);
+        try std.testing.expectEqual(value, values[0]);
+    }
 }

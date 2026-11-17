@@ -8,3 +8,6 @@ pub const Policy = enum { f32, bf16 };
 
 /// Provider schedule is independent of tensor storage/publication precision.
 pub const Gemm = enum { provider_default, vendor, vendor_deterministic };
+
+/// Residual accumulation is independent of BF16 branch publication.
+pub const ResidualStorage = enum { activation, f32 };
