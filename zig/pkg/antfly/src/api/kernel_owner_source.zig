@@ -1828,7 +1828,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         command: @import("antfly_local_sources").storage_source_producer_policy.LegacyTerminalCommand,
         raft_term: u64,
         raft_index: u64,
-    ) !void {
+    ) !@import("antfly_local_sources").storage_source_legacy_terminal_ordered.Outcome {
         try command.validate();
         if (self.online_source_authority != .raft) return error.HistoryAuthorityRequired;
         if (command.owner.group_id != group_id) return error.HistoryResynchronizationRequired;

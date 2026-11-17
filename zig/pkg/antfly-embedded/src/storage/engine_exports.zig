@@ -940,9 +940,8 @@ fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) engine.Outcome
 fn applyOrderedCommittedMutationWithProducer(self: *DB, request: types.BatchRequest, producer: @import("source_producer_policy.zig").Producer, identity: db.OrderedApplyReceipt, bypass: bool) engine.Outcome(void) {
     return .{ .value = self.applyOrderedCommittedMutationWithProducer(request, producer, identity, bypass) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
-fn resolveOrderedClosedLegacyTerminal(self: *DB, owner: @import("transaction_completion.zig").RoutedOwner, proof: @import("transactions.zig").LegacyTerminalResolution, entry: db.OrderedApplyReceipt) engine.Outcome(void) {
-    self.resolveOrderedClosedLegacyTerminal(owner, proof, entry) catch |err| return .{ .failure = .init(@errorName(err)) };
-    return .{ .value = {} };
+fn resolveOrderedClosedLegacyTerminal(self: *DB, owner: @import("transaction_completion.zig").RoutedOwner, proof: @import("transactions.zig").LegacyTerminalResolution, entry: db.OrderedApplyReceipt) engine.Outcome(@import("source_legacy_terminal_ordered.zig").Outcome) {
+    return .{ .value = self.resolveOrderedClosedLegacyTerminal(owner, proof, entry) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn applyOrderedSourceProducerClosure(self: *DB, owner: @import("transaction_completion.zig").RoutedOwner, entry: db.OrderedApplyReceipt, bypass: bool) engine.Outcome(@import("source_producer_policy.zig").Closure) {

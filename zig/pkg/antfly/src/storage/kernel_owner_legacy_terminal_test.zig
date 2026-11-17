@@ -58,25 +58,34 @@ test "storage owner legacy terminal resolution crosses native ABI and survives r
     {
         var native = try client.Owner.open(open);
         defer native.deinit();
-        try std.testing.expectError(error.SourceOutcomeUnresolved, native.orderedLegacyTerminalResolution(a, "docs", pending, 1, 3));
+        const rejected = try native.orderedLegacyTerminalResolution(a, "docs", pending, 1, 3);
+        try std.testing.expect(rejected == .rejected and rejected.rejected == .unresolved);
         var wrong = command;
         wrong.owner.group_id += 1;
         wrong.proof.root.group_id += 1;
         try std.testing.expectError(error.HistoryResynchronizationRequired, native.orderedLegacyTerminalResolution(a, "docs", wrong, 1, 3));
-        try native.orderedLegacyTerminalResolution(a, "docs", command, 1, 3);
-        try native.orderedLegacyTerminalResolution(a, "docs", command, 1, 3);
+        const committed = try native.orderedLegacyTerminalResolution(a, "docs", command, 1, 4);
+        try std.testing.expect(committed == .applied and committed.applied.kind == .committed and committed.applied.timestamp == 200);
+        try std.testing.expectEqualDeep(committed, try native.orderedLegacyTerminalResolution(a, "docs", command, 1, 4));
     }
     {
         var native = try client.Owner.open(open);
         defer native.deinit();
-        try native.orderedLegacyTerminalResolution(a, "docs", command, 1, 3);
+        const reopened = try native.orderedLegacyTerminalResolution(a, "docs", command, 1, 4);
+        try std.testing.expect(reopened == .applied and reopened.applied.kind == .committed and reopened.applied.timestamp == 200);
+        try std.testing.expect(try native.orderedLegacyTerminalResolution(a, "docs", pending, 1, 3) == .superseded);
+        var forged = command;
+        forged.proof.record_digest[0] ^= 1;
+        try std.testing.expectError(error.ConflictingOrderedApplyReceipt, native.orderedLegacyTerminalResolution(a, "docs", forged, 1, 4));
+        var response: abi.OwnedBytes = .{ .len = 99 };
         var request: abi.ReplicatedBatchAtRaftEntryRequest = .{ .version = abi.abi_version - 1 };
-        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_ordered_legacy_terminal_resolution(null, &request));
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_ordered_legacy_terminal_resolution(null, &request, &response));
+        try std.testing.expectEqual(@as(usize, 0), response.len);
         request.version = abi.abi_version;
         request.raft_term = 1;
-        request.raft_index = 4;
+        request.raft_index = 5;
         request.request_json.len = policy.max_legacy_terminal_command_bytes + 1;
-        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_ordered_legacy_terminal_resolution(null, &request));
+        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_ordered_legacy_terminal_resolution(null, &request, &response));
     }
     {
         var db = try db_mod.DB.open(a, path, options);
@@ -84,7 +93,7 @@ test "storage owner legacy terminal resolution crosses native ABI and survives r
         const row = (try db.get(a, "recovered")) orelse return error.TestExpectedOrdinaryDocument;
         defer a.free(row);
         try std.testing.expectEqualStrings("{\"value\":1}", row);
-        try std.testing.expectEqual(@as(u64, 3), (try db.orderedApplyReceipt()).?.index);
+        try std.testing.expectEqual(@as(u64, 4), (try db.orderedApplyReceipt()).?.index);
         try std.testing.expectEqual(local.storage_transactions.TxnStatus.pending, try db.getTransactionStatus(pending_id));
     }
 }

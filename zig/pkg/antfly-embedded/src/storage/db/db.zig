@@ -27724,22 +27724,71 @@ pub const DB = struct {
 
     /// Private activated ordered recovery of an already durable local legacy
     /// decision. This never chooses a pending transaction's outcome.
-    pub fn resolveOrderedClosedLegacyTerminal(self: *DB, owner: @import("../transaction_completion.zig").RoutedOwner, proof: transactions_mod.LegacyTerminalResolution, entry: OrderedApplyReceipt) !void {
+    pub fn resolveOrderedClosedLegacyTerminal(self: *DB, owner: @import("../transaction_completion.zig").RoutedOwner, proof: transactions_mod.LegacyTerminalResolution, entry: OrderedApplyReceipt) !@import("../source_legacy_terminal_ordered.zig").Outcome {
         if (comptime storage_engine.enabled) return storage_engine.call("resolveOrderedClosedLegacyTerminal", .{ self, owner, proof, entry });
-        try owner.validate();
-        try proof.validate();
-        if (!std.meta.eql(proof.root, try @import("../source_scope.zig").Basis.fromOwner(owner)) or entry.term == 0 or entry.index == 0) return error.InvalidSourceAdmission;
+        const ordered = @import("../source_legacy_terminal_ordered.zig");
+        const command: ordered.policy.LegacyTerminalCommand = .{ .version = 1, .owner = owner, .proof = proof };
+        try command.validate();
+        if (entry.term == 0 or entry.index == 0) return error.InvalidSourceAdmission;
         try self.requireSourcePlanAvailable();
+        const root: source_plan_control.storage.Root = .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() };
+        const cut: @import("../source_scope.zig").Cut = .{ .term = entry.term, .index = entry.index };
         {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            _ = try self.requireSourcePlanRoot(&read, .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() });
+            _ = try self.requireSourcePlanRoot(&read, root);
+            _ = (try ordered.policy.Store.read(self.alloc, &read, proof.root)) orelse return error.SourcePendingWork;
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
-                .already_applied => return,
+                .already_applied => return ordered.replay(self.alloc, &read, command, cut),
                 .apply => {},
             }
         }
-        try local_mutation.resolveClosedLegacyTerminalInternal(self, proof, entry, owner);
+        var rejection: ?ordered.Rejection = null;
+        if (self.core.closedLegacyTerminalDecision(proof)) |decision| {
+            const outcome: ordered.Outcome = .{ .applied = .{ .kind = if (decision.status == .committed) .committed else .aborted, .timestamp = decision.timestamp } };
+            const bytes = try ordered.encodeRecord(self.alloc, command, cut, outcome);
+            defer self.alloc.free(bytes);
+            local_mutation.resolveClosedLegacyTerminalInternal(self, proof, entry, owner, .{ .key = ordered.receipt_key, .value = bytes }) catch |err| {
+                rejection = ordered.Rejection.fromError(err) orelse return err;
+            };
+        } else |err| rejection = ordered.Rejection.fromError(err) orelse return err;
+        if (rejection) |reason| {
+            // Only deterministic semantic failures become durable outcomes.
+            // No attempted effects survived their failed native writer.
+            var admission = self.core.snapshot_admission.acquireMutation();
+            defer admission.release();
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const disposition = try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry);
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            _ = try self.requireSourcePlanRoot(&txn, root);
+            _ = (try ordered.policy.Store.read(self.alloc, &txn, proof.root)) orelse return error.SourcePendingWork;
+            switch (disposition) {
+                .already_applied => {
+                    const recovered = try ordered.replay(self.alloc, &txn, command, cut);
+                    txn.abort();
+                    return recovered;
+                },
+                .apply => {},
+            }
+            const outcome: ordered.Outcome = .{ .rejected = reason };
+            const bytes = try ordered.encodeRecord(self.alloc, command, cut, outcome);
+            defer self.alloc.free(bytes);
+            var marker_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+            const marker = orderedApplyReceiptWrite(entry, &marker_bytes);
+            try txn.put(ordered.receipt_key, bytes);
+            try txn.put(marker.key, marker.value);
+            try txn.commit();
+            return outcome;
+        }
+        // A concurrent exact replay can return from preparation without this
+        // call writing. Recover only the bound durable outcome, never infer it.
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        _ = try self.requireSourcePlanRoot(&read, root);
+        _ = try orderedHistoryReadCut(&read, entry.index);
+        return ordered.replay(self.alloc, &read, command, cut);
     }
 
     /// Ordered resolution with the original physical participant authority.

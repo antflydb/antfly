@@ -1197,7 +1197,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // the same terminal batch before Raft advances this entry.
                     var raft_marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
                     const completion_writes: []const docstore_mod.KVPair = if (opts.ordered_apply_receipt) |identity|
-                        &.{orderedApplyReceiptWrite(identity, &raft_marker_value_buf)}
+                        if (resolution.legacy_outcome_write) |outcome| &.{ orderedApplyReceiptWrite(identity, &raft_marker_value_buf), outcome } else &.{orderedApplyReceiptWrite(identity, &raft_marker_value_buf)}
                     else
                         &.{};
                     const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatchAndLegacy(
@@ -3230,7 +3230,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .expected_intent_revision = resolution.expected_intent_revision,
                         .known_intent_keys = resolution.intent_keys,
                         .skip_all_intent_application = relationalColumns(self) != null,
-                        .completion_writes = if (ordered_apply_receipt_write) |write| &.{write} else &.{},
+                        .completion_writes = if (ordered_apply_receipt_write) |write| if (resolution.legacy_outcome_write) |outcome| &.{ write, outcome } else &.{write} else &.{},
                         .resolved_participant = resolution.resolved_participant,
                     },
                     resolution.legacy_terminal,
@@ -4087,15 +4087,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             preparation: *PreparedRowAllocator,
             source_scope: ?@import("../source_scope.zig").Reference,
         ) !void {
-            return resolveTransactionIntentsPreparedScopedWithLegacy(self, txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, source_purpose, completion_owner, preparation, source_scope, null);
+            return resolveTransactionIntentsPreparedScopedWithLegacy(self, txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, source_purpose, completion_owner, preparation, source_scope, null, null);
         }
 
-        pub fn resolveClosedLegacyTerminalInternal(self: anytype, proof: transactions_mod.LegacyTerminalResolution, receipt: OrderedApplyReceipt, owner: @import("../transaction_completion.zig").RoutedOwner) !void {
+        pub fn resolveClosedLegacyTerminalInternal(self: anytype, proof: transactions_mod.LegacyTerminalResolution, receipt: OrderedApplyReceipt, owner: @import("../transaction_completion.zig").RoutedOwner, outcome_write: docstore_mod.KVPair) !void {
             const decision = try S.ownerField(self, "core").*.closedLegacyTerminalDecision(proof);
             var preparation: RequestPreparationContext = undefined;
             preparation.init(self);
             defer preparation.deinit();
-            resolveTransactionIntentsPreparedScopedWithLegacy(self, proof.transaction_id, decision.status, decision.timestamp, .write, .none, receipt, null, null, owner, &preparation.guard, null, proof) catch |err| return preparation.mapError(err);
+            resolveTransactionIntentsPreparedScopedWithLegacy(self, proof.transaction_id, decision.status, decision.timestamp, .write, .none, receipt, null, null, owner, &preparation.guard, null, proof, outcome_write) catch |err| return preparation.mapError(err);
         }
 
         fn resolveTransactionIntentsPreparedScopedWithLegacy(
@@ -4112,6 +4112,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             preparation: *PreparedRowAllocator,
             source_scope: ?@import("../source_scope.zig").Reference,
             legacy_terminal: ?transactions_mod.LegacyTerminalResolution,
+            legacy_outcome_write: ?docstore_mod.KVPair,
         ) !void {
             const alloc = preparation.allocator();
             // Ordered apply must never await work whose publication needs a
@@ -4136,7 +4137,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .already_applied => return,
                         .apply => {},
                     }
-                    break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
+                    break :blk if (legacy_outcome_write) |outcome| &.{ orderedApplyReceiptWrite(identity, &marker_value_buf), outcome } else &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
                 } else &.{};
                 _ = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatchAndLegacy(
                     txn_id,
@@ -4189,7 +4190,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             },
                             .apply => {},
                         }
-                        break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
+                        break :blk if (legacy_outcome_write) |outcome| &.{ orderedApplyReceiptWrite(identity, &marker_value_buf), outcome } else &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
                     } else &.{};
                     if (comptime @import("builtin").is_test) if (test_before_primary_commit) |hook| {
                         test_before_primary_commit = null;
@@ -4251,6 +4252,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .durable_rows = &durable_rows,
                     .transaction_resolution = .{
                         .legacy_terminal = legacy_terminal,
+                        .legacy_outcome_write = legacy_outcome_write,
                         .source_purpose = source_purpose,
                         .source_scope = source_scope,
                         .completion_owner = completion_owner,

@@ -7734,3 +7734,60 @@ retains pending decisions, rejects wrong-group input, recognizes exact replay,
 reopens twice and verifies the row/actual marker afterward. Physical handoff
 reopen remains passing. Whitespace checks passed. No production proposal,
 authenticated recovery RPC, drainage or strict activation is claimed.
+
+### Atomic ordered outcomes for terminal legacy recovery (in progress)
+
+Native owner ABI 121 and engine descriptor 68 return a typed recovery outcome
+instead of a void completion. A new private source_legacy_terminal_ordered
+contract keeps one checksummed, bounded receipt per physical root. It binds the
+complete command fingerprint, physical closure basis and actual entry term/index.
+Applied outcomes retain the original decision kind and commit/finalization
+version. Known semantic rejections retain an explicit reason. Supersession
+certifies neither recovery nor failure; exact-position command/term mismatch is
+an error. Allocation/storage/corrupt-record failures are not converted into
+semantic rejections.
+
+The receipt is allocated before original effects and travels through abort,
+empty-COMMIT and materialized-COMMIT completion writes. Resolved intents, retained
+history, replay/index effects, receipt and actual apply marker therefore share
+one native commit. Deterministic rejected commands persist only their receipt and
+marker under the apply fence. Physical-owner qualification precedes this write;
+stale physical roots do not receive forged local outcomes. After a successful
+preparation call the DB recovers the exact durable receipt rather than inferring
+success from a marker or an idempotent early return.
+
+The C ABI returns bounded typed JSON; the native client and provisioned apply
+wrapper preserve applied/rejected/superseded outcomes. Source catalogs include
+the new lightweight contract in both applicable compilation profiles. Existing
+DB/native fixtures now give rejected commands their own ordered entries, verify
+rejection replay, reject another command at an applied position, preserve row
+history and explicitly treat an overwritten old receipt as superseded. Unit
+coverage exercises receipt binding, rejection, supersession and corruption.
+Qualification is running (`source-legacy-terminal-receipt-test.log`); contract
+checks passed (`source-legacy-terminal-receipt-contract-check.log`). No managed
+proposal/Raft envelope, recovery HTTP route, pending original decision resolution,
+legacy-drain certificate or full issue completion is claimed.
+
+The first receipt qualification passed two physical-owner cases, one actual
+compiled-engine source-scope DB case, 15 local cases, 35 wire/control cases and
+18 store/history cases, zero skips/failures/leaks
+(`source-legacy-terminal-receipt-test.log`). A follow-up audit tightened receipt
+admission: the exact stored closure basis must match before initial dispatch and
+inside rejection staging, so another cohort cannot replace the qualified root's
+receipt. Rejection staging reads the current marker under the apply fence before
+opening its write transaction. Tests now explicitly assert applied kind/version,
+replay equality, native supersession and exact-command mismatch, rather than
+merely inspecting recovered row values. A valid-JSON record mutation with its
+old checksum must fail checksum validation. Final qualification is running
+(`source-legacy-terminal-receipt-final-test.log`).
+
+Final receipt qualification passed two physical-owner cases, one selected actual
+compiled-engine DB case, 15 local cases and 35 wire/control cases, zero
+skips/failures/leaks (`source-legacy-terminal-receipt-final-test.log`). Explicit
+applied decision/version, replay equality, durable rejection, native supersession,
+exact-position command mismatch and valid-JSON checksum tampering all pass.
+Another closure cohort cannot replace the original receipt. The original store/
+history suite passed 18 cases in the preceding combined run. Final contract and
+whitespace checks passed (`source-legacy-terminal-receipt-final-contract-check.log`).
+This qualifies atomic local outcomes, not a managed Raft proposal, authenticated
+read-only outcome recovery, source ACK, migration drainage or full issue completion.
