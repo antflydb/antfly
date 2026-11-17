@@ -327,7 +327,8 @@ pub var test_inject_index_open_error: ?anyerror = null;
 pub var test_inject_index_removal_cleanup_error: ?anyerror = null;
 pub var test_inject_generated_artifact_cleanup_error: ?anyerror = null;
 pub var test_generated_artifact_cleanup_failures_remaining: std.atomic.Value(u32) = .init(0);
-pub var test_vector_block_primary_snapshot_builds: usize = 0;
+pub var test_vector_block_primary_snapshot_builds: std.atomic.Value(usize) = .init(0);
+pub const test_vector_block_native_merge_builds = &vector_block_store_mod.test_native_base_build_attempts;
 pub var test_before_vector_block_primary_snapshot_build: ?struct {
     ctx: *anyopaque,
     call: *const fn (*anyopaque) anyerror!void,
@@ -5156,7 +5157,7 @@ pub const IndexManager = struct {
     }
 
     pub fn ensureVectorBlockBaseAtAppliedSequence(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
-        return self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(name, applied_sequence, false);
+        return self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(name, applied_sequence, false, true);
     }
 
     fn vectorBlockUsesDesiredEncoding(self: *IndexManager) bool {
@@ -5175,7 +5176,7 @@ pub const IndexManager = struct {
         return true;
     }
 
-    fn ensureVectorBlockBaseAtAppliedSequenceWithEncoding(self: *IndexManager, name: []const u8, applied_sequence: u64, require_storage_encoding: bool) !void {
+    fn ensureVectorBlockBaseAtAppliedSequenceWithEncoding(self: *IndexManager, name: []const u8, applied_sequence: u64, require_storage_encoding: bool, allow_primary_snapshot: bool) !void {
         if (self.vector_block_storage == null) return;
         const converting = require_storage_encoding and !self.vectorBlockUsesDesiredEncoding();
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
@@ -5247,6 +5248,12 @@ pub const IndexManager = struct {
         // sequence-mismatched native state falls through to the pinned primary
         // snapshot repair path below.
         if (!converting and try self.compactVectorBlockGenerationAtStableTip(entry, applied_sequence)) return;
+
+        // A gap in provider work is not a completed corpus. Keep exact
+        // fallback available while producers fill it, and permit native WAL
+        // reuse/compaction above, without rescanning all primary artifacts
+        // after every partial output batch.
+        if (!allow_primary_snapshot) return error.VectorBlockSourceCoveragePending;
 
         // Only one snapshot builder may reserve the next immutable generation.
         // Ordinary WAL appends continue under vector_block_build_mu while the
@@ -5369,7 +5376,7 @@ pub const IndexManager = struct {
         if (builtin.is_test) if (test_before_vector_block_primary_snapshot_build) |hook|
             try hook.call(hook.ctx);
         const started = platform_time.monotonicNs();
-        if (builtin.is_test) test_vector_block_primary_snapshot_builds += 1;
+        if (builtin.is_test) _ = test_vector_block_primary_snapshot_builds.fetchAdd(1, .monotonic);
         std.log.debug(
             "shared vector-block primary snapshot build started index={s} generation={} sequence={} vectors={}",
             .{ entry.config.name, generation, applied_sequence, entry.index.stats().active_count },
@@ -12220,6 +12227,10 @@ pub const IndexManager = struct {
         /// clean marker still require the final source/identity revalidation.
         covered_rebuilding_index: ?[]const u8 = null,
         only_index: ?[]const u8 = null,
+        /// The owning DB has terminal outcomes for the source corpus. False
+        /// still permits exact native WAL reuse and compaction; only the
+        /// corpus-wide primary repair scan is deferred.
+        allow_primary_snapshot: bool = true,
         /// Recurring work debounces quiet gaps in streaming input; explicit
         /// repair handoffs may immediately attempt their committed boundary.
         require_quiescence: bool = true,
@@ -12293,10 +12304,11 @@ pub const IndexManager = struct {
                 self.vector_block_stable_tip_index.store(0, .release);
                 self.vector_block_stable_tip_finalizing.store(false, .release);
             };
-            self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(entry.config.name, sequence, options.require_storage_encoding) catch |err| switch (err) {
+            self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(entry.config.name, sequence, options.require_storage_encoding, options.allow_primary_snapshot) catch |err| switch (err) {
                 error.PostingCheckpointSequenceMismatch,
                 error.VectorBlockSnapshotAdvancedWithoutWal,
                 error.VectorBlockGenerationReservationLost,
+                error.VectorBlockSourceCoveragePending,
                 => {
                     deferred = true;
                     continue;
@@ -39436,7 +39448,7 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"embedding_name\":\"source_vectors\",\"external\":true}",
     };
-    test_vector_block_primary_snapshot_builds = 0;
+    test_vector_block_primary_snapshot_builds.store(0, .release);
     try manager.add(&store, cfg);
 
     const entry = manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
@@ -39444,7 +39456,7 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
     try std.testing.expect(entry.index.experimentalPostingWalAuthoritative());
     try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
     try std.testing.expectEqual(@as(?u64, snapshot_sequence), entry.index.experimentalPostingDurableAppliedSequence());
-    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds);
+    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds.load(.acquire));
     const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:1", "source_vectors");
     defer alloc.free(artifact_key);
     const artifact = try store.get(alloc, artifact_key);
@@ -39489,9 +39501,9 @@ test "fresh native dense backfill extends a shared vector generation without a s
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
     };
-    test_vector_block_primary_snapshot_builds = 0;
+    test_vector_block_primary_snapshot_builds.store(0, .release);
     try manager.addManaged(&store, first, null);
-    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds);
+    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds.load(.acquire));
     const document_key = try internal_keys.documentKeyAlloc(alloc, "doc:shared");
     defer alloc.free(document_key);
     try store.put(document_key, "{\"embedding\":[3.0,4.0]}");
@@ -39501,9 +39513,9 @@ test "fresh native dense backfill extends a shared vector generation without a s
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
     };
-    test_vector_block_primary_snapshot_builds = 0;
+    test_vector_block_primary_snapshot_builds.store(0, .release);
     try manager.add(&store, second);
-    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds);
+    try std.testing.expectEqual(@as(usize, 0), test_vector_block_primary_snapshot_builds.load(.acquire));
     try std.testing.expect(manager.vectorBlockReadyForDenseIndex(second.name));
     try std.testing.expectError(
         error.InvalidFreshDenseVectorCaptureCapability,

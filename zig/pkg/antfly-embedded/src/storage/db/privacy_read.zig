@@ -331,15 +331,14 @@ pub fn requireConsumersPublishedWithBudget(db: anytype, a: A, req: @import("type
             if (selected.count() != 0 and !selected.contains(name)) continue;
             found_consumers += 1;
             if (budget) |b| try b.consume(entry.config.config_json.len);
-            if (!local and selected.count() != 0) {
-                const names = try db.core.index_manager.artifactSourceNamesForIndexAlloc(scratch, name);
-                try sources.appendSlice(scratch, names);
-            }
+            const names = try db.core.index_manager.artifactSourceNamesForIndexAlloc(scratch, name);
+            if (!local and selected.count() != 0) try sources.appendSlice(scratch, names);
             if (local and !try db.privacyLocalIndexSourcesCompleteWithBudget(scratch, &read, name, entry.config.kind, plan.plan(), budget)) return error.IndexRebuilding;
             if (db.core.index_manager.loadFailure(name) != null) return error.IndexRebuilding;
             var applied = try db.core.loadAppliedSequence(scratch, name);
             if (db.executor.appliedSequence(name)) |live| applied = @max(applied, live);
-            const target = try db.managedIndexReplayTargetSequence(scratch, name, entry.config.kind, applied);
+            const target = (try @import("derived/replay_source.zig").artifactTargetAtCut(scratch, &read, names, applied, budget)) orelse
+                try db.managedIndexReplayTargetSequence(scratch, name, entry.config.kind, applied);
             if (applied < target) return error.IndexRebuilding;
             const checkpoint = try db.core.loadProjectionCheckpoint(scratch, name);
             if (checkpoint.status != .clean or checkpoint.config_hash != @import("types.zig").indexConfigHash(entry.config)) return error.IndexRebuilding;
