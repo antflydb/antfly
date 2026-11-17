@@ -40,7 +40,7 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 39;
+pub const batch_protocol_version: u16 = 40;
 /// Frozen completion BEGIN and owner/input-fenced PREPARE require durable
 /// activation across every applying member before proposal or native apply.
 pub const batch_completion_admission_protocol_version: u16 = 31;
@@ -62,6 +62,8 @@ pub const batch_source_checkpoint_protocol_version: u16 = 37;
 pub const batch_source_checkpoint_receipts_protocol_version: u16 = 38;
 /// Version 39 retains and fences original source scope/attempt identity.
 pub const batch_source_attempt_protocol_version: u16 = 39;
+/// Version 40 dispatches source-scope bind/close/drop through the ordered owner.
+pub const batch_source_scope_control_protocol_version: u16 = 40;
 fn hasSourceScope(value: anytype) bool {
     if (comptime !@hasField(@TypeOf(value), "source_scope")) return false;
     return value.source_scope != null;

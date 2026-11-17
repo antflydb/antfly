@@ -5354,3 +5354,85 @@ exposure and durable rejection recovery, hidden checkpoint/cohort lifecycle,
 complete Native/Lake destination integration, public history/bootstrap/retention,
 typed production pgoutput, actual Antfly existing-client qualification and all
 original recovery/performance criteria remain mandatory and incomplete.
+
+### Activated source-scope lifecycle Raft envelope and native dispatch
+
+Version 40 adds a distinct source-scope bind/close/drop envelope. It preserves the
+full original source owner and physical storage descriptor, validates their
+namespace/root-generation agreement and the bounded metadata-authorized command,
+and rejects mixed/unknown payloads. Ordinary row-batch decoding rejects this
+control, including when batch is null; it never fabricates an empty row write.
+The projection store requires both a native delegate and the persisted v40
+barrier. Native apply independently checks group and activated floor before
+calling the descriptor-pinned owner ABI. Deterministic outcomes are retained at
+the actual entry, and an expired result remains SourceOutcomeUnresolved.
+
+The current advertised maximum becomes 40 only with this decoder, projection and
+native handler present. Scoped BEGIN/PREPARE/RESOLVE remain profile 39; legacy
+source-pin profile 12 is unchanged. Retirement does not silently inherit the new
+lifecycle envelope and is still an explicit outstanding integration requirement.
+
+The focused source-scope envelope and existing history-control entry suites
+exited 0 (`source-scope-raft-entry-test.log`). They exercise activation, immutable
+owner/descriptor binding, ordinary decoder refusal and duplicate/mixed payload
+rejection. Repository source-catalog, engine-error and OpenAPI checks exited 0
+(`source-scope-raft-control-contract-check.log`). A real linked native apply
+regression is in progress: it extends the existing source-plan fixture to v40
+activation and response-loss retry of a SourcePendingWork receipt, without
+inventing document history. Its command is trusted test input, not evidence of
+production metadata authorization or genuine legacy handover. Terminal results
+follow below.
+
+Leader proposal authorization, private lifecycle RPC, genuine old-worker drain,
+ordered retirement DB/transport/rejection handling and hidden checkpoint/cohort
+lifecycle remain incomplete. So do the original full destination, retained and
+public history, bootstrap/retention, typed production pgoutput, actual Antfly
+existing-client qualification and recovery/performance requirements. Both issues
+remain open and the implementation PR remains draft.
+
+The native state-machine regression passed
+(`source-scope-raft-native-retry-test.log`). It proves v40 activation gating,
+projection/native ordering, a committed native rejection receipt before an
+injected response loss, no shared applied/token completion before retry, exact
+retry yielding the original SourcePendingWork, and no document-apply effects.
+The helper's initial import/type and local-name compilation errors were fixed
+before that passing run.
+
+Leader-local submission now accepts an Intent, not a caller metadata cut. It
+obtains fresh signed metadata capture, qualifies exact binding/lifecycle phase,
+then uses the existing membership/term-fenced protocol preflight, all-applying-
+member activation and routed write admission to submit the dedicated command.
+Every known accepted result carries the exact captured Command and actual Raft
+receipt, so later read-only recovery preserves its fingerprint. Metadata endpoint
+failover is read-only, uses no cached source snapshot and shares one bounded
+platform deadline across every attempt. The leader wrapper also shares its
+five-second total budget with metadata capture and proposal. Corrupt, denied or
+phase-conflicting captures do not authorize another proposal.
+
+The remote authorizer fixture verifies unsupported-endpoint failover, fresh cuts
+10 then 11 on repeated calls, exact Intent preservation, closing-source bind
+rejection, corrupt correlation rejection and cancellation before transport.
+The actual linked Raft fixture also instantiates the new leader submission
+wrapper and rejects a wrong-group intent before metadata access or proposal.
+These tests do not claim a successful real metadata-host-to-data-leader control
+submission or worker handover; that end-to-end qualification remains required.
+
+Final `source-plan-apply-test history-control-apply-test -Dstrip=true -j1` exited
+0 (`source-scope-raft-proposal-final-test.log`): the two native apply/authorizer
+tests and all 21 linked history/scope tests passed, with no skips/failures/leaks.
+An earlier combined run caught a future-cut test racing the read barrier: it saw
+ReadUnavailable contention before the qualified future-cut check. The helper
+now retries only ReadUnavailable, preserving the exact required future-cut
+failure and never treating storage unavailability as success.
+
+Engine descriptor 57, owner ABI 110, API kernel 30 and metadata protocol 104 are
+unchanged by the Raft lifecycle/proposal implementation. Data profile 40 covers
+these lifecycle controls; attempt identity remains 39 and legacy source pins 12.
+Private lifecycle RPC, genuine legacy handover/physical-root cohort lifecycle,
+ordered attempt retirement transport/rejection recovery and every remaining
+original destination/history/bootstrap/retention/pgoutput/client acceptance
+criterion are still incomplete. Neither issue can be closed on this evidence.
+
+Final repository contract checks also exited 0 after the deadline and contention
+fixes (`source-scope-raft-proposal-final-contract-check.log`), including all nine
+schema fragment tests and generated/provenance checks.

@@ -50,17 +50,7 @@ fn verifyOutcome(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRo
     // This command is only a recovery query, not metadata authorization or a
     // proposed mutation. The real root has no ordered control receipt yet.
     const recovery: ordered.Recovery = .{ .command = .{ .version = 1, .intent = .{ .version = 1, .owner = source_owner, .spec = .{ .actor_table_id = 7, .source_id = @splat(72), .generation = 1, .binding = @splat(73), .checkpoint_owner = try wire.scope.Basis.fromOwner(source_owner) }, .minimum_metadata_index = 1, .action = .bind }, .metadata_cut = .{ .group_id = source_owner.metadata_group_id, .incarnation = source_owner.metadata_incarnation, .index = 1 } }, .entry = cut, .minimum_applied_index = cut.index };
-    for (0..1000) |_| {
-        const outcome = owner.sourceScopeOutcomeRouted(a, fence, "docs", recovery) catch |err| switch (err) {
-            error.ReadUnavailable => {
-                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
-                continue;
-            },
-            else => return err,
-        };
-        try std.testing.expect(outcome == .superseded);
-        break;
-    } else return error.TestReadFenceUnavailable;
+    try std.testing.expect(try readOutcomeQualified(a, owner, fence, recovery) == .superseded);
     // Instantiate the trusted apply wrapper and its typed ABI client, but do
     // not invent an ordered entry in this live Raft group. Wrong-group calls
     // must fail before acquiring an owner or attempting mutation dispatch.
@@ -72,12 +62,25 @@ fn verifyOutcome(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRo
     try std.testing.expectError(error.TopologyChanged, owner.sourceScopeOutcomeRouted(a, fence, "docs", changed));
     var future = recovery;
     future.minimum_applied_index += 1000000;
-    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, owner.sourceScopeOutcomeRouted(a, fence, "docs", future));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, readOutcomeQualified(a, owner, fence, future));
     var cancelled: std.atomic.Value(bool) = .init(true);
     var cancelled_fence = fence;
     cancelled_fence.admission_cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled);
     try std.testing.expectError(error.Canceled, owner.sourceScopeOutcomeRouted(a, cancelled_fence, "docs", recovery));
 }
+fn readOutcomeQualified(a: std.mem.Allocator, owner: anytype, fence: metadata.CatalogRouteFence, recovery: @import("antfly_local_sources").storage_source_scope_ordered.Recovery) !@import("antfly_local_sources").storage_source_scope_ordered.Outcome {
+    for (0..1000) |_| {
+        return owner.sourceScopeOutcomeRouted(a, fence, "docs", recovery) catch |err| switch (err) {
+            error.ReadUnavailable => {
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    }
+    return error.TestReadFenceUnavailable;
+}
+
 fn verifyControlGuards() !void {
     const abi = @import("kernel_owner_abi");
     var request: abi.ReplicatedBatchAtRaftEntryRequest = .{ .version = abi.abi_version - 1, .raft_term = 1, .raft_index = 1 };
@@ -121,4 +124,10 @@ pub fn verifyRouted(a: std.mem.Allocator, port: @import("source_scope_operations
     try std.testing.expectEqualDeep(observed.header, again.header);
     var cancelled: std.atomic.Value(bool) = .init(true);
     try std.testing.expectError(error.Canceled, port.read(a, fence, "docs", query, .{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) }));
+}
+
+pub fn verifySubmission(a: std.mem.Allocator, server: anytype, fence: metadata.CatalogRouteFence, source_owner: @FieldType(completion.Intent, "owner")) !void {
+    var intent: wire.Intent = .{ .version = 1, .owner = source_owner, .spec = .{ .actor_table_id = 7, .source_id = @splat(72), .generation = 1, .binding = @splat(73), .checkpoint_owner = try wire.scope.Basis.fromOwner(source_owner) }, .minimum_metadata_index = 1, .action = .bind };
+    intent.owner.group_id += 1;
+    try std.testing.expectError(error.HistoryResynchronizationRequired, server.submitSourceScopeIntentLocal(a, fence, "docs", intent));
 }
