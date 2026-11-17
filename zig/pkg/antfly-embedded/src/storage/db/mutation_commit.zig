@@ -3242,7 +3242,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             } else blk: {
                 if (durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null)
                     S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
-                try S.ownerField(self, "core").*.store.putBatchWithNativeHistoryTime(
+                try S.ownerField(self, "core").*.store.putBatchWithHistoryTime(
                     S.ownerField(self, "backend_runtime").*.io(),
                     write_buffers.store_writes.items,
                     write_buffers.delete_keys.items,
@@ -3252,7 +3252,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (opts.ordered_apply_receipt == null and opts.replication_applied_lsn_marker == null)
                         std.math.cast(i64, S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs()) orelse 0
                     else
-                        0,
+                        opts.ordered_history_commit_time_ns,
                 );
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };

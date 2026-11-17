@@ -142,6 +142,13 @@ pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions
         try std.testing.expect(after_abort.caught_up and after_abort.events.len == 0);
         try std.testing.expectEqualDeep(page.next, after_abort.next);
     }
+    const timestamped: @import("types.zig").BatchRequest = .{
+        .source_producer = .ordinary,
+        .timestamp_ns = 9,
+        .writes = &.{.{ .key = "timestamped", .value = "{}" }},
+    };
+    const timestamp_entry: db_mod.OrderedApplyReceipt = .{ .term = 1, .index = 11 };
+    const commit_clock = 1_700_000_000_000_000_000;
     {
         var db = try db_mod.DB.open(a, path, options);
         defer db.close();
@@ -160,6 +167,23 @@ pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions
         const row = (try db.get(a, "legacy-commit")) orelse return error.TestExpectedReopenedLegacyRow;
         defer a.free(row);
         try std.testing.expect(try db.get(a, "legacy-abort") == null);
+        try std.testing.expectError(error.InvalidBatchRequest, db.applyOrderedTimestampedMutation(timestamped, timestamp_entry, 0, false));
+        try db.applyOrderedTimestampedMutation(timestamped, timestamp_entry, commit_clock, false);
+    }
+    {
+        var db = try db_mod.DB.open(a, path, options);
+        defer db.close();
+        try db.applyOrderedTimestampedMutation(timestamped, timestamp_entry, commit_clock, false);
+        var previous = try db.orderedHistoryPage(a, .{ .reference = reference, .after = .{}, .now_seconds = 1 }, 11);
+        defer previous.deinit();
+        var page = try db.orderedHistoryPage(a, .{ .reference = reference, .after = previous.next, .now_seconds = 1 }, 11);
+        defer page.deinit();
+        try std.testing.expectEqual(@as(i64, 0), previous.header.?.committed_at_ns);
+        try std.testing.expectEqual(@as(i64, commit_clock), page.header.?.committed_at_ns);
+        try std.testing.expectEqualDeep(timestamp_entry, (try db.orderedApplyReceipt()).?);
+        var end = try db.orderedHistoryPage(a, .{ .reference = reference, .after = page.next, .now_seconds = 1 }, 11);
+        defer end.deinit();
+        try std.testing.expect(end.caught_up and end.events.len == 0);
     }
 }
 

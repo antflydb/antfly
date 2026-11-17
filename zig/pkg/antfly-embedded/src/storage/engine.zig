@@ -291,6 +291,7 @@ pub const VTable = struct {
     runPrimaryLsmMaintenanceStepBestEffort: *const fn (self: *DB) Outcome(bool),
     runDueLsmObsoleteReclaimUntilIdle: *const fn (self: *DB, max_steps: usize) Outcome(usize),
     applyOrderedCommittedMutation: *const fn (self: *DB, request: types.BatchRequest, identity: db.OrderedApplyReceipt, bypass_write_gate: bool) Outcome(void),
+    applyOrderedTimestampedMutation: *const fn (*DB, types.BatchRequest, db.OrderedApplyReceipt, i64, bool) Outcome(void),
     applyOrderedCommittedMutationWithProducer: *const fn (*DB, types.BatchRequest, @import("source_producer_policy.zig").Producer, db.OrderedApplyReceipt, bool) Outcome(void),
     resolveOrderedClosedLegacyTerminal: *const fn (*DB, @import("transaction_completion.zig").RoutedOwner, @import("transactions.zig").LegacyTerminalResolution, db.OrderedApplyReceipt) Outcome(@import("source_legacy_terminal_ordered.zig").Outcome),
     applyOrderedSourceProducerClosure: *const fn (*DB, @import("transaction_completion.zig").RoutedOwner, db.OrderedApplyReceipt, bool) Outcome(@import("source_producer_policy.zig").Closure),
@@ -625,7 +626,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 67 adds original terminal legacy resolution under physical closure.
 /// Version 68 returns atomically retained legacy resolution outcomes.
 /// Version 69 adds snapshot-bound read-only legacy recovery outcomes.
-pub const descriptor_version: u32 = 71;
+pub const descriptor_version: u32 = 72;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

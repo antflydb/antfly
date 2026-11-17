@@ -937,6 +937,9 @@ fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) engine.Outcome
     return .{ .value = self.runDueLsmObsoleteReclaimUntilIdle(max_steps) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn applyOrderedTimestampedMutation(self: *DB, request: types.BatchRequest, identity: db.OrderedApplyReceipt, committed_at_ns: i64, bypass: bool) engine.Outcome(void) {
+    return .{ .value = self.applyOrderedTimestampedMutation(request, identity, committed_at_ns, bypass) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn applyOrderedCommittedMutationWithProducer(self: *DB, request: types.BatchRequest, producer: @import("source_producer_policy.zig").Producer, identity: db.OrderedApplyReceipt, bypass: bool) engine.Outcome(void) {
     return .{ .value = self.applyOrderedCommittedMutationWithProducer(request, producer, identity, bypass) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

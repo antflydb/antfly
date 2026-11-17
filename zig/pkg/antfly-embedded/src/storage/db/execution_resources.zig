@@ -1121,6 +1121,7 @@ pub const BatchExecutionOptions = struct {
     replication_applied_lsn_marker: ?u64 = null,
     online_source_applied_index: ?u64 = null,
     ordered_apply_receipt: ?OrderedApplyReceipt = null,
+    ordered_history_commit_time_ns: i64 = 0,
     /// Trusted native ingress classification; missing old transport stays unlabelled.
     source_producer: @import("../source_producer_policy.zig").Producer = .unlabelled,
     /// Metadata-authorized native hidden-child receipt identity. Never

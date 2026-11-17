@@ -7850,6 +7850,22 @@ pub const DB = struct {
         });
     }
 
+    /// Apply a root-local row mutation with the exact clock from the ordered
+    /// entry. Only a protocol-qualified native owner may select this entry point.
+    pub fn applyOrderedTimestampedMutation(self: *DB, request: types.BatchRequest, identity: OrderedApplyReceipt, committed_at_ns: i64, bypass_write_gate: bool) anyerror!void {
+        if (comptime storage_engine.enabled) return storage_engine.call("applyOrderedTimestampedMutation", .{ self, request, identity, committed_at_ns, bypass_write_gate });
+        if (committed_at_ns <= 0 or request.transaction != null or request.source_producer != .ordinary) return error.InvalidBatchRequest;
+        if (request.graph_endpoint_cleanup and !request.graph_endpoint_cleanup_planned) return error.InvalidBatchRequest;
+        try self.batchInternal(request, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_replication_write_gate = bypass_write_gate,
+            .ordered_apply_receipt = identity,
+            .ordered_history_commit_time_ns = committed_at_ns,
+            .source_producer = .ordinary,
+        });
+    }
+
     pub fn recoverOrderedSourceAdmission(self: *DB, request: types.BatchRequest, identity: OrderedApplyReceipt, bypass_write_gate: bool) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("recoverOrderedSourceAdmission", .{ self, request, identity, bypass_write_gate });
         try self.applyOnlineSourceBatch(request, .{
