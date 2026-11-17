@@ -2354,6 +2354,23 @@ pub const DBCore = struct {
         commit_version: u64,
         extra_batch: transactions_mod.ResolutionExtraBatch,
     ) !transactions_mod.ResolutionOutcome {
+        return self.resolveTransactionIntentsWithExtraBatchAndLegacy(txn_id, status, commit_version, extra_batch, null);
+    }
+
+    pub fn closedLegacyTerminalDecision(self: *DBCore, proof: transactions_mod.LegacyTerminalResolution) !transactions_mod.TxnManager.LegacyTerminalDecision {
+        const namespace = @import("online_source_contract.zig").namespaceBytes(self.identity_namespace);
+        if (!std.mem.eql(u8, &proof.root.namespace, &namespace) or proof.root.root_generation != self.root_generation) return error.HistoryResynchronizationRequired;
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return manager.closedLegacyTerminalDecision(proof);
+    }
+
+    pub fn resolveTransactionIntentsWithExtraBatchAndLegacy(self: *DBCore, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, extra_batch: transactions_mod.ResolutionExtraBatch, legacy: ?transactions_mod.LegacyTerminalResolution) !transactions_mod.ResolutionOutcome {
+        if (legacy) |proof| {
+            if (!std.mem.eql(u8, &proof.transaction_id, &txn_id)) return error.SourceTransactionIdentityConflict;
+            const decision = try self.closedLegacyTerminalDecision(proof);
+            if (decision.status != status or decision.timestamp != commit_version) return error.SourceTransactionIdentityConflict;
+        }
         var manager = try self.initTxnManager();
         defer manager.deinit();
         if (try manager.getCompletionAdmission(self.alloc, txn_id)) |saved| {
@@ -2365,7 +2382,8 @@ pub const DBCore = struct {
                 if (!std.mem.eql(u8, &binding.namespace, &namespace) or binding.root_generation != self.root_generation) return error.HistoryResynchronizationRequired;
                 try plan.value.admission.requireRoutedOwner(binding);
             } else if (extra_batch.completion_owner != null) return error.ChangefeedCapabilityUnsupported;
-        } else if (extra_batch.completion_owner != null) return error.SourceTransactionIdentityConflict;
+        } else if (extra_batch.completion_owner != null and legacy == null) return error.SourceTransactionIdentityConflict;
+        if (legacy) |proof| return manager.resolveClosedLegacyTerminal(proof, extra_batch);
         return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
     }
 

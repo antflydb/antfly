@@ -7622,3 +7622,67 @@ passed all 141 cases, zero skips/failures/leaks
 (`source-legacy-terminal-resolution-regression-test.log`). Contract and whitespace
 checks passed. No callback layout, native ABI, public route or first-strict gate
 changed in this primitive milestone.
+
+### DB materialized terminal legacy recovery (in progress)
+
+Engine descriptor 67 adds resolveOrderedClosedLegacyTerminal, binding the full
+original routed owner, closure basis, exact record digest and actual ordered
+entry. Its DB wrapper validates the persisted physical root and recognizes exact
+apply replay before re-reading a now-resolved record. The DB commit preparation
+path carries the proof through original intent/schema collection, historical
+row materialization, replay/index effects and atomic final resolution. It keeps
+legacy provenance; the physical intake exception independently validates the
+persisted original terminal decision, and the final writer still rechecks the
+record digest and closure basis. Ordinary recovery callback layout is unchanged.
+
+DBCore also validates the actual namespace/generation and supplied decision/version
+before dispatch. Original retained completion membership continues to require its
+full original owner. Commit and abort markers share their native resolution
+batch. Pending decisions acquire no authority through this path.
+
+A new compiled-engine fixture creates original v3 legacy prepared admissions,
+models the historic durable-decision/unresolved-intent crash window, closes the
+physical root, reopens, then tests stale binding/digest rejection, blocked generic
+resolution, committed row and history-resolution evidence, aborted intent
+retirement, exact-entry replay and another reopen. It runs through the existing
+selected real source-scope DB fixture, not an imported-but-unselected test.
+Qualification is running (`source-legacy-terminal-db-test.log`). Initial contract
+checks require regeneration of the inferred engine error catalogue; that will
+run after the active compiler finishes reading its inputs. No production Raft
+command/RPC or first-strict activation is claimed by this in-progress DB step.
+
+The first DB invocation selected a general transaction target whose declared
+inventory did not contain this fixture; its audit failed before exercising the
+new path. The dedicated source-scope-native-control-test target then passed the
+actual physical source-scope case, including the new nested compiled-engine
+recovery fixture, zero skips/failures/leaks
+(`source-legacy-terminal-db-native-test.log`). Engine error names were regenerated
+for the new fixture diagnostics, and final contract checks passed
+(`source-legacy-terminal-db-final-contract-check.log`).
+
+Qualification now additionally reads the retained committed frame through the
+persisted private consumer lease, checking original transaction identity, decoded
+authored document ID and exact before/after image, then verifies ABORT advances
+no row history. That run also includes all selected store/history transaction
+cases (`source-legacy-terminal-db-frame-test.log`). First-strict activation,
+production decoder-barrier/Raft command/RPC integration and original pending
+coordinator decision recovery remain required.
+
+The direct frame run passed the selected physical compiled-engine case, zero
+skips/failures/leaks (`source-legacy-terminal-db-frame-final-test.log`). Its lease
+reference now unwraps the ordered applied outcome rather than the control Result
+directly; an initial fixture compile diagnosed that union mismatch. The retained
+frame has the original transaction ID, authored key and exact insert image;
+ABORT emits no row history. Qualification additionally tests a complete stale
+owner+proof pair against the physical root and an original still-pending record
+through the new DB entrypoint (`source-legacy-terminal-db-owner-final-test.log`).
+
+Final owner/pending qualification passed the actual selected compiled-engine
+source-scope case, zero skips/failures/leaks. Complete stale-generation evidence
+is rejected by the physical root; original pending work remains pending and does
+not advance the marker. Commit/abort recovery, retained frame checks, replay and
+reopen still pass (`source-legacy-terminal-db-owner-final-test.log`). Selected
+store/history qualification passed 18 cases in the preceding combined run.
+Contract and whitespace checks passed. The managed ordered proposal, compatible
+applying-member barrier, native owner ABI, authenticated transport, global cohort
+drainage and all remaining issue acceptance are still required.

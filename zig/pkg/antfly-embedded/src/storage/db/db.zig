@@ -27722,6 +27722,25 @@ pub const DB = struct {
         );
     }
 
+    /// Private activated ordered recovery of an already durable local legacy
+    /// decision. This never chooses a pending transaction's outcome.
+    pub fn resolveOrderedClosedLegacyTerminal(self: *DB, owner: @import("../transaction_completion.zig").RoutedOwner, proof: transactions_mod.LegacyTerminalResolution, entry: OrderedApplyReceipt) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolveOrderedClosedLegacyTerminal", .{ self, owner, proof, entry });
+        try owner.validate();
+        if (!std.meta.eql(proof.root, try @import("../source_scope.zig").Basis.fromOwner(owner)) or entry.term == 0 or entry.index == 0) return error.InvalidSourceAdmission;
+        try self.requireSourcePlanAvailable();
+        {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try self.requireSourcePlanRoot(&read, .{ .authority = .raft, .namespace = owner.namespace, .generation = owner.root_generation, .fence = owner.digest() });
+            switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+                .already_applied => return,
+                .apply => {},
+            }
+        }
+        try local_mutation.resolveClosedLegacyTerminalInternal(self, proof, entry, owner);
+    }
+
     /// Ordered resolution with the original physical participant authority.
     pub fn resolveReplicatedCompletionTransactionAtOrderedReceipt(
         self: *DB,

@@ -1243,6 +1243,12 @@ pub const TxnManager = struct {
     /// Pending coordinator decisions require a separate qualified protocol.
     pub fn resolveClosedLegacyTerminal(self: *TxnManager, proof: LegacyTerminalResolution, extra: ResolutionExtraBatch) !ResolutionOutcome {
         if (extra.source_retirement != null or extra.source_scope != null or extra.source_purpose != null) return error.InvalidSourceAdmission;
+        const decision = try self.closedLegacyTerminalDecision(proof);
+        return self.resolveIntentsWithExtraBatchInternal(proof.transaction_id, decision.status, decision.timestamp, extra, proof);
+    }
+
+    pub const LegacyTerminalDecision = struct { status: TxnStatus, timestamp: u64 };
+    pub fn closedLegacyTerminalDecision(self: *TxnManager, proof: LegacyTerminalResolution) !LegacyTerminalDecision {
         var read = try self.store.beginRead();
         defer read.abort();
         _ = (try @import("source_producer_policy.zig").Store.read(self.alloc, &read, proof.root)) orelse return error.SourcePendingWork;
@@ -1250,7 +1256,7 @@ pub const TxnManager = struct {
         if (!std.mem.eql(u8, &completion.bytesDigest(raw), &proof.record_digest)) return error.SourceTransactionIdentityConflict;
         const record = try decodeRecord(raw);
         if (record.status == .pending or record.ordinary_producer or record.source_scope != null or record.finalized_at == 0 or (record.status == .committed and record.commit_version == 0)) return error.SourceOutcomeUnresolved;
-        return self.resolveIntentsWithExtraBatchInternal(proof.transaction_id, record.status, if (record.status == .committed) record.commit_version else record.finalized_at, extra, proof);
+        return .{ .status = record.status, .timestamp = if (record.status == .committed) record.commit_version else record.finalized_at };
     }
 
     pub fn resolveIntentsWithExtraBatch(

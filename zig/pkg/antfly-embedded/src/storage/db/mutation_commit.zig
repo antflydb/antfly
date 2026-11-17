@@ -1026,7 +1026,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (row_producer == .scoped_source) return error.InvalidSourceAdmission;
                     break :ordinary row_producer;
                 };
-                try @import("../source_producer_policy.zig").Store.requirePhysical(preparation_alloc, &producer_read, @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace), S.ownerField(self, "core").*.root_generation, producer);
+                if (opts.transaction_resolution != null and opts.transaction_resolution.?.legacy_terminal != null) {
+                    const resolution = opts.transaction_resolution.?;
+                    const proof = resolution.legacy_terminal.?;
+                    if (resolution.source_scope != null or !std.mem.eql(u8, &proof.transaction_id, &resolution.txn_id) or (producer != .unlabelled and producer != .legacy_cdc)) return error.SourceTransactionIdentityConflict;
+                    const decision = try S.ownerField(self, "core").*.closedLegacyTerminalDecision(proof);
+                    if (decision.status != resolution.status or decision.timestamp != resolution.commit_version) return error.SourceTransactionIdentityConflict;
+                } else try @import("../source_producer_policy.zig").Store.requirePhysical(preparation_alloc, &producer_read, @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace), S.ownerField(self, "core").*.root_generation, producer);
             }
 
             var merge_page_value: ?[]u8 = null;
@@ -1194,7 +1200,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         &.{orderedApplyReceiptWrite(identity, &raft_marker_value_buf)}
                     else
                         &.{};
-                    const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
+                    const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatchAndLegacy(
                         resolution.txn_id,
                         resolution.status,
                         resolution.commit_version,
@@ -1208,6 +1214,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             .expected_intent_revision = resolution.expected_intent_revision,
                             .known_intent_keys = resolution.intent_keys,
                         },
+                        resolution.legacy_terminal,
                     );
                     unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
                     if (!opts.bypass_replication_write_gate) try self.flushTransactionReplicationOutbox(resolution.txn_id);
@@ -3207,7 +3214,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try hook.run(hook.ptr);
             };
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
-                const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
+                const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatchAndLegacy(
                     resolution.txn_id,
                     resolution.status,
                     resolution.commit_version,
@@ -3226,6 +3233,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .completion_writes = if (ordered_apply_receipt_write) |write| &.{write} else &.{},
                         .resolved_participant = resolution.resolved_participant,
                     },
+                    resolution.legacy_terminal,
                 );
                 if (outcome.applied) {
                     if (replay_append) |entry| S.ownerField(self, "core").*.store.observeExternalReplayCommit(entry.sequence);
@@ -4079,6 +4087,32 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             preparation: *PreparedRowAllocator,
             source_scope: ?@import("../source_scope.zig").Reference,
         ) !void {
+            return resolveTransactionIntentsPreparedScopedWithLegacy(self, txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, source_purpose, completion_owner, preparation, source_scope, null);
+        }
+
+        pub fn resolveClosedLegacyTerminalInternal(self: anytype, proof: transactions_mod.LegacyTerminalResolution, receipt: OrderedApplyReceipt, owner: @import("../transaction_completion.zig").RoutedOwner) !void {
+            const decision = try S.ownerField(self, "core").*.closedLegacyTerminalDecision(proof);
+            var preparation: RequestPreparationContext = undefined;
+            preparation.init(self);
+            defer preparation.deinit();
+            resolveTransactionIntentsPreparedScopedWithLegacy(self, proof.transaction_id, decision.status, decision.timestamp, .write, .none, receipt, null, null, owner, &preparation.guard, null, proof) catch |err| return preparation.mapError(err);
+        }
+
+        fn resolveTransactionIntentsPreparedScopedWithLegacy(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            source_purpose: ?[32]u8,
+            completion_owner: ?@import("../transaction_completion.zig").RoutedOwner,
+            preparation: *PreparedRowAllocator,
+            source_scope: ?@import("../source_scope.zig").Reference,
+            legacy_terminal: ?transactions_mod.LegacyTerminalResolution,
+        ) !void {
             const alloc = preparation.allocator();
             // Ordered apply must never await work whose publication needs a
             // subsequent Raft entry. The request coordinator owns the derived
@@ -4104,14 +4138,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     }
                     break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
                 } else &.{};
-                _ = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
-                    .source_purpose = source_purpose,
-                    .source_scope = source_scope,
-                    .source_scope_cut = if (ordered_receipt) |entry| .{ .term = entry.term, .index = entry.index } else null,
-                    .completion_owner = completion_owner,
-                    .completion_writes = marker_writes,
-                    .resolved_participant = resolved_participant,
-                }) catch |err| switch (err) {
+                _ = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatchAndLegacy(
+                    txn_id,
+                    status,
+                    commit_version,
+                    .{
+                        .source_purpose = source_purpose,
+                        .source_scope = source_scope,
+                        .source_scope_cut = if (ordered_receipt) |entry| .{ .term = entry.term, .index = entry.index } else null,
+                        .completion_owner = completion_owner,
+                        .completion_writes = marker_writes,
+                        .resolved_participant = resolved_participant,
+                    },
+                    legacy_terminal,
+                ) catch |err| switch (err) {
                     // An abort decision for a participant that was declared but
                     // never enlisted is already satisfied. Treat it as an
                     // idempotent no-op so coordinator recovery can acknowledge it.
@@ -4158,7 +4198,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             return err;
                         };
                     };
-                    const outcome = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
+                    const outcome = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatchAndLegacy(
                         txn_id,
                         status,
                         commit_version,
@@ -4172,6 +4212,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             .expected_intent_revision = intents.revision,
                             .known_intent_keys = intent_keys,
                         },
+                        legacy_terminal,
                     ) catch |err| {
                         S.ownerField(self, "core").*.unlockApply();
                         if (err == error.IntentSnapshotChanged) continue;
@@ -4209,6 +4250,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .source_producer = if (intents.ordinary_producer) .ordinary else if (intents.legacy_producer) .legacy_cdc else .unlabelled,
                     .durable_rows = &durable_rows,
                     .transaction_resolution = .{
+                        .legacy_terminal = legacy_terminal,
                         .source_purpose = source_purpose,
                         .source_scope = source_scope,
                         .completion_owner = completion_owner,

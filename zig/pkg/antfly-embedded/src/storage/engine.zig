@@ -292,6 +292,7 @@ pub const VTable = struct {
     runDueLsmObsoleteReclaimUntilIdle: *const fn (self: *DB, max_steps: usize) Outcome(usize),
     applyOrderedCommittedMutation: *const fn (self: *DB, request: types.BatchRequest, identity: db.OrderedApplyReceipt, bypass_write_gate: bool) Outcome(void),
     applyOrderedCommittedMutationWithProducer: *const fn (*DB, types.BatchRequest, @import("source_producer_policy.zig").Producer, db.OrderedApplyReceipt, bool) Outcome(void),
+    resolveOrderedClosedLegacyTerminal: *const fn (*DB, @import("transaction_completion.zig").RoutedOwner, @import("transactions.zig").LegacyTerminalResolution, db.OrderedApplyReceipt) Outcome(void),
     applyOrderedSourceProducerClosure: *const fn (*DB, @import("transaction_completion.zig").RoutedOwner, db.OrderedApplyReceipt, bool) Outcome(@import("source_producer_policy.zig").Closure),
     recoverOrderedSourceAdmission: *const fn (self: *DB, request: types.BatchRequest, identity: db.OrderedApplyReceipt, bypass_write_gate: bool) Outcome(void),
     batchNativeFkGenerationApply: *const fn (self: *DB, req: types.BatchRequest) Outcome(void),
@@ -619,7 +620,8 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
 /// Version 64 retains immutable legacy completion transaction origin.
 /// Version 65 adds native and applying-entry non-history producer BEGIN.
 /// Version 66 adds snapshot-bound producer closure observations.
-pub const descriptor_version: u32 = 66;
+/// Version 67 adds original terminal legacy resolution under physical closure.
+pub const descriptor_version: u32 = 67;
 pub const Descriptor = extern struct {
     version: u32 = descriptor_version,
     table_layout: native.TypeContract,

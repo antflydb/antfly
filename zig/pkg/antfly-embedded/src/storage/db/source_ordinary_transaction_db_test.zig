@@ -21,6 +21,7 @@ const db_mod = @import("db.zig");
 const completion = @import("../transaction_completion.zig");
 const wire = @import("../../api/batch_internal.zig");
 pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions, owner: completion.RoutedOwner) !void {
+    try @import("source_legacy_terminal_db_test.zig").run(a, parent, options, owner);
     try runNonhistory(a, parent, options);
     const path = try std.fmt.allocPrint(a, "{s}/ordinary-producer", .{parent});
     defer a.free(path);

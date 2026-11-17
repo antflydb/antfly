@@ -1,0 +1,118 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Compiled-engine original terminal legacy recovery and historical effects.
+const std = @import("std");
+const db_mod = @import("db.zig");
+const completion = @import("../transaction_completion.zig");
+const transactions = @import("../transactions.zig");
+const scope = @import("../source_scope.zig");
+const wire = @import("../../api/batch_internal.zig");
+pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions, owner: completion.RoutedOwner) !void {
+    const path = try std.fmt.allocPrint(a, "{s}/legacy-terminal-recovery", .{parent});
+    defer a.free(path);
+    var reference: @import("../history_consumer.zig").Reference = undefined;
+    var proofs: [2]transactions.LegacyTerminalResolution = undefined;
+    var manifests: [2]completion.Digest = undefined;
+    var pending: transactions.LegacyTerminalResolution = undefined;
+    {
+        var db = try db_mod.DB.open(a, path, options);
+        defer db.close();
+        const grant: @import("../history_consumer.zig").Grant = .{ .namespace = owner.namespace, .authority = @splat(1), .sequence = 1, .consumer = @splat(2), .definition = @splat(3), .expires_at_seconds = 1000, .policy_revision = 1, .limit = 16 * 1024 * 1024 };
+        const enrolled = try db.applyOrderedHistoryConsumerControl(.{ .enroll = grant }, .{ .term = 1, .index = 1 }, false);
+        reference = .{ .namespace = grant.namespace, .authority = grant.authority, .consumer = grant.consumer, .epoch = enrolled.applied.consumer.?.epoch, .grant = grant.sequence, .definition = grant.definition };
+        for (0..2) |i| {
+            const id: [16]u8 = @splat(@as(u8, @intCast(221 + i)));
+            var request: @import("types.zig").TransactionIntentRequest = .{ .completion_legacy_producer = true, .document_version_scheme = .revision_v1, .completion_owner = owner, .writes = &.{.{ .key = if (i == 0) "legacy-commit" else "legacy-abort", .value = "{\"value\":1}" }} };
+            const input = try wire.completionPrepareInput(a, try request.completionBatch(id, 100, owner.topology_epoch));
+            defer a.free(input);
+            request.completion_input_digest = completion.preparedInputDigest(owner.namespace, input);
+            const members = [_]completion.Participant{.{ .namespace = owner.namespace, .owner_fence = owner.digest(), .roles = completion.Roles.effects, .input_digest = request.completion_input_digest, .locator = "table2:00000004:docs:2", .routed_owner = owner }};
+            const admission: completion.Admission = .{ .version = 3, .transaction_id = id, .admission_digest = @splat(@as(u8, @intCast(225 + i))), .coordinator_namespace = owner.namespace, .coordinator_fence = owner.digest(), .participants = &members };
+            manifests[i] = (try admission.manifest(200)).digest();
+            const encoded = try completion.encodeAdmission(a, admission);
+            defer a.free(encoded);
+            _ = try db.beginReplicatedLegacyCompletionTransaction(encoded, owner, 100, 101, true, .{ .term = 1, .index = 2 + 2 * i });
+            try db.writeReplicatedTransactionAtOrderedReceipt(id, request, .{ .term = 1, .index = 3 + 2 * i });
+            // Model the legacy decision/effect crash window with its original
+            // canonical record. Only the original decision fields are staged.
+            const key = completion.record_prefix.* ++ id;
+            var read = try db.core.store.beginReadTxn();
+            const raw = try a.dupe(u8, try read.get(&key));
+            read.abort();
+            defer a.free(raw);
+            raw[0] = @intCast(@backingInt(if (i == 0) transactions.TxnStatus.committed else transactions.TxnStatus.aborted));
+            std.mem.writeInt(u64, raw[9..17], if (i == 0) 200 else 0, .little);
+            std.mem.writeInt(u64, raw[25..33], 201, .little);
+            try db.core.store.putBatch(&.{.{ .key = &key, .value = raw }}, &.{});
+            proofs[i] = .{ .root = try scope.Basis.fromOwner(owner), .transaction_id = id, .record_digest = completion.bytesDigest(raw) };
+        }
+        const pending_id: [16]u8 = @splat(230);
+        _ = try db.beginTransactionScoped(pending_id, 100, 101, &.{}, true, true, null);
+        var pending_read = try db.core.store.beginReadTxn();
+        pending = .{ .root = try scope.Basis.fromOwner(owner), .transaction_id = pending_id, .record_digest = completion.bytesDigest(try pending_read.get(&(completion.record_prefix.* ++ pending_id))) };
+        pending_read.abort();
+        _ = try db.applyOrderedSourceProducerClosure(owner, .{ .term = 1, .index = 6 }, false);
+    }
+    {
+        var db = try db_mod.DB.open(a, path, options);
+        defer db.close();
+        var stale = owner;
+        stale.root_generation += 1;
+        try std.testing.expectError(error.InvalidSourceAdmission, db.resolveOrderedClosedLegacyTerminal(stale, proofs[0], .{ .term = 1, .index = 7 }));
+        var stale_proof = proofs[0];
+        stale_proof.root = try scope.Basis.fromOwner(stale);
+        try std.testing.expectError(error.HistoryResynchronizationRequired, db.resolveOrderedClosedLegacyTerminal(stale, stale_proof, .{ .term = 1, .index = 7 }));
+        try std.testing.expectError(error.SourceOutcomeUnresolved, db.resolveOrderedClosedLegacyTerminal(owner, pending, .{ .term = 1, .index = 7 }));
+        var forged = proofs[0];
+        forged.record_digest[0] ^= 1;
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, db.resolveOrderedClosedLegacyTerminal(owner, forged, .{ .term = 1, .index = 7 }));
+        try std.testing.expectError(error.SourcePendingWork, db.resolveReplicatedCompletionTransactionAtOrderedReceipt(proofs[0].transaction_id, .committed, 200, .{ .term = 1, .index = 7 }, null, owner));
+        try std.testing.expectEqual(@as(u64, 6), (try db.orderedApplyReceipt()).?.index);
+        try std.testing.expect(try db.get(a, "legacy-commit") == null);
+        try db.resolveOrderedClosedLegacyTerminal(owner, proofs[0], .{ .term = 1, .index = 7 });
+        const row = (try db.get(a, "legacy-commit")) orelse return error.TestExpectedRecoveredLegacyRow;
+        defer a.free(row);
+        try std.testing.expectEqualStrings("{\"value\":1}", row);
+        try db.resolveOrderedClosedLegacyTerminal(owner, proofs[0], .{ .term = 1, .index = 7 });
+        const resolution = try db.historyResolution(a, .{ .version = 1, .authority = .raft, .namespace = owner.namespace, .transaction_id = proofs[0].transaction_id, .owner_fence = owner.digest(), .manifest_digest = manifests[0], .commit_version = 200, .minimum_applied_index = 7 });
+        try std.testing.expect(resolution.resolution != null and resolution.resolution.?.outcome == .effects);
+        var page = try db.orderedHistoryPage(a, .{ .reference = reference, .after = .{}, .now_seconds = 1 }, 7);
+        defer page.deinit();
+        try std.testing.expectEqualDeep(proofs[0].transaction_id, page.header.?.transaction_id);
+        try std.testing.expectEqual(@as(usize, 1), page.events.len);
+        try std.testing.expect(page.events[0].before == null);
+        try std.testing.expectEqualStrings("{\"value\":1}", page.events[0].after.?);
+        const document_id = try @import("../history_page.zig").documentId(a, page.events[0].key);
+        defer a.free(document_id);
+        try std.testing.expectEqualStrings("legacy-commit", document_id);
+        try db.resolveOrderedClosedLegacyTerminal(owner, proofs[1], .{ .term = 1, .index = 8 });
+        try std.testing.expect(try db.get(a, "legacy-abort") == null);
+        try std.testing.expectEqual(@as(u64, 8), (try db.orderedApplyReceipt()).?.index);
+        try std.testing.expectEqual(transactions.TxnStatus.pending, try db.getTransactionStatus(pending.transaction_id));
+        var after_abort = try db.orderedHistoryPage(a, .{ .reference = reference, .after = page.next, .now_seconds = 1 }, 8);
+        defer after_abort.deinit();
+        try std.testing.expect(after_abort.caught_up and after_abort.events.len == 0);
+        try std.testing.expectEqualDeep(page.next, after_abort.next);
+    }
+    {
+        var db = try db_mod.DB.open(a, path, options);
+        defer db.close();
+        try db.resolveOrderedClosedLegacyTerminal(owner, proofs[1], .{ .term = 1, .index = 8 });
+        const row = (try db.get(a, "legacy-commit")) orelse return error.TestExpectedReopenedLegacyRow;
+        defer a.free(row);
+        try std.testing.expect(try db.get(a, "legacy-abort") == null);
+    }
+}
