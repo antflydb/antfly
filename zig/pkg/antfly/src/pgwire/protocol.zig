@@ -413,7 +413,10 @@ pub const Session = struct {
     }
 
     fn effectiveNamespace(self: *const Session) []const u8 {
-        return if (self.namespace_setting) |*value| value.first() else self.namespace orelse "public";
+        if (self.namespace_setting) |*value| {
+            if (value.len != 0) return value.first();
+        }
+        return self.namespace orelse "public";
     }
 
     fn effectiveSearchPath(self: *const Session) ?commands.SearchPath {
@@ -1130,6 +1133,31 @@ pub const Session = struct {
                 } else {
                     var arena = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena.deinit();
+                    const sql = std.mem.trim(u8, statement, " \t\r\n");
+                    const clear_path = std.ascii.eqlIgnoreCase(sql, "SELECT pg_catalog.set_config('search_path', '', false);");
+                    const directory_mode = std.ascii.eqlIgnoreCase(sql, "SHOW data_directory_mode");
+                    if (self.replication_mode == .logical and self.status == .idle and (clear_path or directory_mode)) {
+                        const owner = self.replication orelse return error.UnsupportedReplicationMode;
+                        const request_value = self.request(statement, &.{}, &.{});
+                        try owner.authorize(owner.context, arena.allocator(), request_value, null);
+                        if (clear_path) self.namespace_setting = .{};
+                        const result: backend.Result = if (clear_path) .{
+                            .columns = &.{.{ .name = "set_config", .type = .string }},
+                            .rows = &.{&.{.{ .string = "" }}},
+                            .command_tag = "SELECT 1",
+                        } else .{
+                            // PostgreSQL tools use this value to set the
+                            // client output umask. Report owner-only access.
+                            .columns = &.{.{ .name = "data_directory_mode", .type = .string }},
+                            .rows = &.{&.{.{ .string = "0700" }}},
+                            .command_tag = "SHOW",
+                        };
+                        try self.rowDescription(result.columns, &.{});
+                        try self.dataResult(result, &.{});
+                        try self.complete(result);
+                        try self.ready();
+                        return;
+                    }
                     if (replication_commands.recognizes(statement)) {
                         if (self.replication_mode != .logical) return error.UnsupportedReplicationMode;
                         var parsed = (try replication_commands.parse(arena.allocator(), statement)) orelse return error.PgReplicationSyntax;

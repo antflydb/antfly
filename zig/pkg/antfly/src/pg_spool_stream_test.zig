@@ -92,8 +92,18 @@ pub fn run(svc: anytype, registry: anytype, clock: u64) !void {
             try req.check();
             if (self.denied) return error.Forbidden;
         }
-        fn command(_: *anyopaque, _: A, _: backend.Request, _: backend.replication_commands.Command) !backend.Result {
-            return error.UnsupportedReplicationMode;
+        fn command(_: *anyopaque, _: A, _: backend.Request, input: backend.replication_commands.Command) !backend.Result {
+            if (input != .identify_system) return error.UnsupportedReplicationMode;
+            return .{
+                .command_tag = "IDENTIFY_SYSTEM",
+                .columns = &.{
+                    .{ .name = "systemid", .type = .string },
+                    .{ .name = "timeline", .type = .integer },
+                    .{ .name = "xlogpos", .type = .string },
+                    .{ .name = "dbname", .type = .string },
+                },
+                .rows = &.{&.{ .{ .string = "719" }, .{ .integer = 1 }, .{ .string = "0/0" }, .{ .string = "db" } }},
+            };
         }
         fn closeSession(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -121,6 +131,26 @@ pub fn run(svc: anytype, registry: anytype, clock: u64) !void {
         defer recovered.deinit();
         try std.testing.expect(recovered.value.slot.?.session == null);
         try std.testing.expectEqual(@as(u64, 1), recovered.value.slot.?.confirmed_lsn);
+    }
+    if (std.testing.environ.getPosix("ANTFLY_TEST_PG_RECVLOGICAL")) |program| {
+        var listener = try server.start(a, .{ .io = std.testing.io, .backend = host.source(), .bind_port = 0, .limits = .{ .replication_keepalive_ms = 50 } });
+        defer listener.deinit();
+        const dsn = try std.fmt.allocPrint(a, "host=127.0.0.1 port={d} dbname=db user=alice password=pw sslmode=disable gssencmode=disable", .{listener.address().getPort()});
+        defer a.free(dsn);
+        const child = try std.process.run(a, std.testing.io, .{
+            .argv = &.{ program, "--dbname", dsn, "--slot", "upload_slot", "--start", "--startpos=0/1", "--endpos=0/69", "--file=-", "--no-loop", "--option=proto_version=1", "--option=publication_names=rows_pub" },
+            .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
+        });
+        defer a.free(child.stdout);
+        defer a.free(child.stderr);
+        if (child.term != .exited or child.term.exited != 0) {
+            std.debug.print("pg_recvlogical failed: {s}\n", .{child.stderr});
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(@as(usize, 109), child.stdout.len);
+        try std.testing.expectEqual(@as(u8, 'B'), child.stdout[0]);
+        try std.testing.expectEqual(@as(u8, 'C'), child.stdout[82]);
+        return;
     }
     // Real CopyBoth reads the actual slot/spool implementation. The wire client
     // intentionally sends no feedback: sending and closing must retain history.
