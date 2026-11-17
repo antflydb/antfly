@@ -6946,3 +6946,34 @@ Original issue acceptance remains open. The next required qualification uses
 multiple physical participants and the actual coordinator path, followed by
 producer ingress assignment and the remaining original destination/history/feed/
 bootstrap/retention/pgoutput/client implementation.
+
+### Immutable producer retry rejection across transaction RPC (in progress)
+
+Generic transaction BEGIN/PREPARE now preserve existing deterministic source
+admission/identity errors through transport-neutral operations, private HTTP
+status/body and the HTTP client. Existing source error/status contracts are
+reused; no new error identifiers, schema, layout or protocol version is added.
+A typed immutable identity rejection at coordinator BEGIN now returns directly,
+without probing an older committed record or sending ABORT. A committed status
+alone cannot authorize a request whose producer/capability identity was rejected.
+Ambiguous delivery retains its existing decision-recovery behavior.
+
+The real native HTTP test now attempts both removal and switching of each
+ordinary/legacy origin after COMMIT, requiring a typed identity conflict and
+preservation of the original committed record. The actual coordinator regression
+supplies an identity rejection plus an available older committed status, and
+requires zero status probes, PREPAREs or resolutions. Contract checks passed
+(`source-producer-identity-rpc-contract-check.log`); transaction/native HTTP and
+linked suites are running (`source-producer-identity-rpc-test.log`). Full
+multi-participant non-history qualification remains next; its guard is retained,
+and all original implementation/acceptance scope remains active.
+
+Final identity-retry verification passed
+(`source-producer-identity-rpc-test.log`): 42 local transaction cases, 76
+integration cases including the real authenticated native HTTP rejection checks,
+six local history cases and 37 linked history/control cases; zero failures,
+skips or leaks. The coordinator regression confirmed no status probe or
+resolution after deterministic identity rejection. Contract checks and
+`git diff --check` passed. Versions remain owner 117, API 37, engine 65, data 45,
+metadata 105 and failure 89. No new public API or format was introduced, and
+original acceptance/production ingress activation remains open.

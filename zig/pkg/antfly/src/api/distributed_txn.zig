@@ -1638,6 +1638,12 @@ fn executeMultiTableCommitOnce(
             .restore_staging_scope = participant.restore_staging_scope,
             .restore_staging_plan_id = participant.restore_staging_plan_id,
         }) catch |err| {
+            // An immutable producer/capability mismatch cannot be repaired by
+            // observing an older committed record with this transaction ID.
+            if (@import("source_transaction_errors.zig").classify(err)) |reason| {
+                abort_on_error = false;
+                return reason;
+            }
             if (options.retain_terminal or err == error.DecisionConflict) {
                 // A stable transaction ID may be retried after the coordinator
                 // durably committed but before the client observed success.
@@ -5839,6 +5845,8 @@ fn consumerTests() type {
             };
 
             const Recorder = struct {
+                reject_origin: bool = false,
+                status_calls: usize = 0,
                 begins: std.ArrayListUnmanaged(u64) = .empty,
                 prepares: std.ArrayListUnmanaged(u64) = .empty,
                 read_only_prepares: usize = 0,
@@ -5876,6 +5884,7 @@ fn consumerTests() type {
 
                 fn begin(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnBeginRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.reject_origin) return error.SourceTransactionIdentityConflict;
                     try std.testing.expectEqual(@as(usize, 2), req.participants.len);
                     try self.begins.append(std.testing.allocator, group_id);
                 }
@@ -5921,8 +5930,10 @@ fn consumerTests() type {
                     });
                 }
 
-                fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
-                    return .pending;
+                fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.status_calls += 1;
+                    return if (self.reject_origin) .committed else .pending;
                 }
 
                 fn acknowledge(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnAcknowledgeRequest) !void {
@@ -5934,6 +5945,14 @@ fn consumerTests() type {
             };
 
             const a = std.testing.allocator;
+            {
+                var rejected: Recorder = .{ .reject_origin = true };
+                defer rejected.deinit(a);
+                try std.testing.expectError(error.SourceTransactionIdentityConflict, executeMultiTableCommitWithOptions(a, FakeCatalog.iface(), rejected.worker(), @splat(29), 100, 101, &.{.{ .table_name = "docs", .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }}, .write, null, .{ .retain_terminal = true }));
+                try std.testing.expectEqual(@as(usize, 0), rejected.status_calls);
+                try std.testing.expectEqual(@as(usize, 0), rejected.prepares.items.len);
+                try std.testing.expectEqual(@as(usize, 0), rejected.resolves.items.len);
+            }
             for ([_]@FieldType(db_mod.types.BatchRequest, "source_producer"){ .ordinary, .legacy_cdc }) |producer| {
                 const labelled = [_]TableCommitRequest{.{ .table_name = "docs", .source_producer = producer, .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }};
                 var routed = try routeCommitParticipants(a, FakeCatalog.iface(), &labelled);

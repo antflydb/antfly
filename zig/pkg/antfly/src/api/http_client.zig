@@ -4061,6 +4061,9 @@ pub const ApiHttpClient = struct {
         if (delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         if (isRetainedPreDecisionPressure(resp)) return error.RetainedEffectsFull;
         if (isTxnPreDecisionNotProposedResponse(resp)) return .not_proposed;
+        if (resp.status == 400 or resp.status == 409) {
+            if (@import("source_transaction_errors.zig").decode(resp.body)) |reason| return reason;
+        }
         if (remoteRelationalRowError(resp.status, resp.body)) |reason| return reason;
         switch (resp.status) {
             200 => return .applied,
@@ -4154,6 +4157,9 @@ pub const ApiHttpClient = struct {
         if (delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         if (isRetainedPreDecisionPressure(resp)) return error.RetainedEffectsFull;
         if (isTxnPreDecisionNotProposedResponse(resp)) return .not_proposed;
+        if (resp.status == 400 or resp.status == 409) {
+            if (@import("source_transaction_errors.zig").decode(resp.body)) |reason| return reason;
+        }
         if (remoteRelationalRowError(resp.status, resp.body)) |reason| return reason;
         switch (resp.status) {
             200 => return .applied,
@@ -8402,6 +8408,12 @@ test "distributed txn producer HTTP preserves native origin and coordinator role
             defer a.free(resolve);
             _ = try client.fetchGroupTxnResolve(base, 2, "docs", resolve);
             try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try db.getTransactionStatus(id));
+            for ([_]@FieldType(db_mod.types.BatchRequest, "source_producer"){ .unlabelled, if (producer == .ordinary) .legacy_cdc else .ordinary }) |changed| {
+                const reclassified = try txn_api.encodeTxnBeginRequest(a, .{ .source_producer = changed, .txn_id = id, .begin_timestamp = 100, .retain_terminal = true, .participants = if (coordinator) &.{own} else &.{ other, own } });
+                defer a.free(reclassified);
+                try std.testing.expectError(error.SourceTransactionIdentityConflict, client.fetchGroupTxnBegin(base, 2, "docs", reclassified));
+                try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try db.getTransactionStatus(id));
+            }
         }
     }
     const row = (try db.get(a, "row")) orelse return error.TestExpectedProducerRow;

@@ -725,6 +725,7 @@ pub const Operations = struct {
             error.MetadataSnapshotUnavailable,
             => return error.GroupLeaderUnavailable,
             else => {
+                if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
                 if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 return error.Internal;
             },
@@ -752,6 +753,7 @@ pub const Operations = struct {
                 error.CatalogRoutingSnapshotTimeout, error.Timeout, error.DeadlineExceeded => return error.PreDecisionDeadlineExceeded,
                 error.Canceled, error.Cancelled => return error.Canceled,
                 else => {
+                    if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
                     if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
                     return error.Internal;
                 },
@@ -785,6 +787,7 @@ pub const Operations = struct {
             error.MetadataSnapshotUnavailable,
             => return error.GroupLeaderUnavailable,
             else => {
+                if (@import("source_transaction_errors.zig").classify(err)) |reason| return reason;
                 // One registry drives Raft terminal results and participant
                 // transport; adding a lifecycle fence must not silently turn
                 // its recoverable typed rejection into an HTTP 500.
