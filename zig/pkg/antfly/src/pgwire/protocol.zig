@@ -2195,6 +2195,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.ProtocolViolation => "08P01",
         error.MetadataMutationOutcomeUnknown, error.CommitDecisionUnknown, error.SourceOutcomeUnresolved => "40003",
         error.ReplicationSlotActive => "55006",
+        error.ReplicationSlotNotFound => "42704",
         error.ChangefeedResynchronizationRequired,
         error.ChangefeedLeaseExpired,
         error.ChangefeedConflict,
