@@ -45309,9 +45309,17 @@ fn consumerTests() type {
                         const item = current.value.roots[0];
                         try std.testing.expectEqual(item.start + 1, item.acknowledged.sequence);
                         try std.testing.expectEqual(item.acknowledged.sequence, item.reclaimed_through);
+                        const before_collect = blk: {
+                            lockAtomic(&node.data_raft_mutex);
+                            defer node.data_raft_mutex.unlock();
+                            break :blk node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index;
+                        };
                         var repeated_ack = try api.execute(http_api, allocator, credential, .{ .id = created.id, .after = pulled.page.cursor }, null, .{});
                         defer repeated_ack.deinit();
                         try std.testing.expectEqual(ack.acknowledged, repeated_ack.acknowledged);
+                        lockAtomic(&node.data_raft_mutex);
+                        defer node.data_raft_mutex.unlock();
+                        try std.testing.expectEqual(before_collect + 1, node.data_raft.?.host.http_host.host.raftStatus(fence.route.group_id).?.last_index);
                     }
                 };
                 {
@@ -45329,6 +45337,9 @@ fn consumerTests() type {
                     const thread = try std.Thread.spawn(.{ .stack_size = 32 * 1024 * 1024 }, Worker.run, .{ &outcome, a, &feed_svc, origin.historyRootsSource(), feed_table, server, route.fence().? });
                     thread.join();
                     try outcome;
+                    var pinned = try origin.historyPagePort().read(a, route.fence().?, "docs", .{ .version = 1, .request = .{ .reference = ref, .after = .{}, .now_seconds = 100 } }, .{});
+                    defer pinned.deinit();
+                    try std.testing.expectEqualStrings("{\"v\":1}", pinned.events[0].after.?);
                 }
                 // Closing must dispatch retirement cleanup rather than cancel
                 // every prepared command solely because the feed is closed.

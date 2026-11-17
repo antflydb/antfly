@@ -220,7 +220,31 @@ fn flushAcknowledged(client: *config.Client, policy: *RootPolicy, a: A, confirme
         if (state.epoch != confirmed.epoch or !same(state.authority, confirmed.authority) or state.phase != .streaming)
             return error.ChangefeedResynchronizationRequired;
         const item = state.roots[try state.rootIndex(root.namespace)];
-        if (item.reclaimed_through >= target) return;
+        const reference: local.api_local_table_writes.table_write_source.history_consumer.Reference = .{
+            .namespace = root.namespace,
+            .authority = state.authority,
+            .consumer = state.consumerId(),
+            .epoch = item.consumer_epoch,
+            .grant = item.grant_sequence,
+            .definition = state.definition.?.identity(),
+        };
+        if (item.reclaimed_through >= target) {
+            if (target == item.start) return;
+            try policy.validateRoot(state, root.namespace, root.fence, root.table_name, request);
+            // Collection operates on the owner's shared ACK floor. Retrying a
+            // lost reply can collect another bounded page, without changing a
+            // cursor or deleting history still pinned by any consumer.
+            const command: @import("history_control_operations.zig").wire.Request = .{
+                .version = 1,
+                .operation = .submit,
+                .command = .{ .reclaim = .{ .reference = reference, .max_frames = 32 } },
+            };
+            const result = try policy.source.controls.execute(a, root.fence, root.table_name, command, request);
+            try result.validate(command);
+            if (!result.confirmed()) return error.MetadataMutationOutcomeUnknown;
+            if (result.outcome.? == .rejected) return result.outcome.?.rejected.asError();
+            return;
+        }
         if (item.pending_control != null) {
             try driveRoot(client, policy, a, state, root.namespace, request);
             continue;
@@ -229,14 +253,7 @@ fn flushAcknowledged(client: *config.Client, policy: *RootPolicy, a: A, confirme
             .version = 1,
             .operation = .submit,
             .command = .{ .acknowledge = .{
-                .reference = .{
-                    .namespace = root.namespace,
-                    .authority = state.authority,
-                    .consumer = state.consumerId(),
-                    .epoch = item.consumer_epoch,
-                    .grant = item.grant_sequence,
-                    .definition = state.definition.?.identity(),
-                },
+                .reference = reference,
                 .previous = item.reclaimed_through,
                 .next = target,
             } },
