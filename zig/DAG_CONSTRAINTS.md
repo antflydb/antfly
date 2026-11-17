@@ -39,8 +39,11 @@ and resolution after authority owner changes. Ordinary transactions keep their
 original record format and skip authority lookups. The hosted coordinator can
 carry an explicitly routed authority participant supplied by the caller. Its
 private HTTP and ordered Raft prepare envelopes have distinct version tags and
-carry binary contribution identifiers. Production graph writers still need to
-derive owner routes and supply authoritative replacements. The authority also stages bounded activation pages into a private
+carry binary contribution identifiers. Prepared graph artifact replay can derive
+canonical per-record replacements for a selected index and edge type after the
+publisher has resolved contenders. The publication coordinator still needs to
+enlist the authority under the source and contender guards, and document-derived
+and explicit writers still need to supply their final contributions. The authority also stages bounded activation pages into a private
 ledger and persists the pinned snapshot and scan cursor atomically with each
 page. The catalog still needs to fence writes, enumerate the stable snapshot
 completely, and certify end of input before the authority becomes active.

@@ -1109,6 +1109,12 @@ pub const PreparedEffects = struct {
     chunk_vector_fence: ?@import("artifact_chunk_vector_publication.zig").Fence = null,
     asset_upstream_fences: []@import("artifact_asset_publication.zig").UpstreamFence = &.{},
     target_hints: ?[]const @import("derived/change_journal.zig").TargetHint = null,
+    /// Derive authority inputs from the authenticated final graph replay
+    /// effects. The caller supplies the constrained index and edge type.
+    pub fn dagReplacements(self: *@This(), index: []const u8, edge_type: []const u8) ![]const @import("../../graph/dag_authority.zig").Contributions.Replacement {
+        return @import("dag_graph_effects.zig").collect(self.arena.allocator(), index, edge_type, self.batch.graph_writes, self.batch.graph_deletes);
+    }
+
     pub fn deinit(self: *@This()) void {
         self.arena.deinit();
         self.* = undefined;

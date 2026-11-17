@@ -142,6 +142,10 @@ test "ordered artifact inventory graph publication validates guards generations 
         try std.testing.expectEqualStrings("owner", result.batch.graph_writes[0].owner);
         try std.testing.expectEqualStrings("entity", result.batch.graph_writes[0].source);
         try std.testing.expect(result.coverage[0].outcome.? == .produced);
+        const replacements = try result.dagReplacements("g", "links");
+        try std.testing.expectEqual(@as(usize, 1), replacements.len);
+        try std.testing.expectEqualStrings("entity", replacements[0].source);
+        try std.testing.expectEqualStrings("target", replacements[0].targets[0]);
     }
     const guards = command.mutation_preconditions;
     command.mutation_preconditions = guards[0..1];
