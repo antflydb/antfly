@@ -27791,6 +27791,24 @@ pub const DB = struct {
         return ordered.replay(self.alloc, &read, command, cut);
     }
 
+    /// Caller first qualifies current ownership and quorum ReadIndex. Native
+    /// closure, receipt and actual applied cut share this read-only snapshot.
+    pub fn legacyTerminalOutcome(self: *DB, query: @import("../source_legacy_terminal_ordered.zig").Query) !@import("../source_legacy_terminal_ordered.zig").Observation {
+        if (comptime storage_engine.enabled) return storage_engine.call("legacyTerminalOutcome", .{ self, query });
+        const ordered = @import("../source_legacy_terminal_ordered.zig");
+        try query.validate();
+        try self.requireSourcePlanAvailable();
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.requireSourcePlanRoot(&txn, .{ .authority = .raft, .namespace = query.owner.namespace, .generation = query.owner.root_generation, .fence = query.owner.digest() });
+        _ = (try ordered.policy.Store.read(self.alloc, &txn, query.command.proof.root)) orelse return error.SourcePendingWork;
+        const cut = try orderedHistoryReadCut(&txn, query.minimum_applied_index);
+        if (cut.term < query.entry.term or (cut.index == query.entry.index and cut.term != query.entry.term)) return error.ConflictingOrderedApplyReceipt;
+        const result: ordered.Observation = .{ .version = 1, .owner = query.owner, .command_digest = try ordered.fingerprint(self.alloc, query.command), .entry = query.entry, .cut = .{ .term = cut.term, .index = cut.index }, .outcome = try ordered.replay(self.alloc, &txn, query.command, query.entry) };
+        try result.validate(self.alloc, query);
+        return result;
+    }
+
     /// Ordered resolution with the original physical participant authority.
     pub fn resolveReplicatedCompletionTransactionAtOrderedReceipt(
         self: *DB,

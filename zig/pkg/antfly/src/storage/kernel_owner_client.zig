@@ -705,6 +705,16 @@ pub const Owner = struct {
         return ordered.decodeOutcome(a, response.bytes(), query.command, query.entry);
     }
 
+    pub fn legacyTerminalOutcome(self: *Owner, a: std.mem.Allocator, table: []const u8, query: @import("antfly_local_sources").storage_source_legacy_terminal_ordered.Query) !@import("antfly_local_sources").storage_source_legacy_terminal_ordered.Observation {
+        const ordered = @import("antfly_local_sources").storage_source_legacy_terminal_ordered;
+        const bytes = try ordered.encodeQuery(a, query);
+        defer a.free(bytes);
+        var response: Response = .{};
+        defer response.deinit();
+        try statusToError(abi.antfly_storage_owner_legacy_terminal_outcome(self.handle, &.{ .table_name = .fromSlice(table), .request_json = .fromSlice(bytes) }, &response.buffer));
+        return ordered.decodeObservation(a, response.bytes(), query);
+    }
+
     pub fn sourceProducerClosureObservation(self: *Owner, a: std.mem.Allocator, table: []const u8, query: @import("antfly_local_sources").storage_source_producer_policy.Query) !@import("antfly_local_sources").storage_source_producer_policy.Observation {
         const wire = @import("antfly_local_sources").storage_source_producer_policy;
         try query.validate();

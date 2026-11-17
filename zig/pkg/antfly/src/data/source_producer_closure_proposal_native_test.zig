@@ -71,6 +71,21 @@ pub fn run(a: std.mem.Allocator, server: anytype, fence: metadata.CatalogRouteFe
     try std.testing.expect(routed_observation.cut.index >= routed_again.entry.index);
     try std.testing.expectEqualDeep(recovered.closure, routed_observation.closure);
 
+    const legacy = local.storage_source_legacy_terminal_ordered;
+    const query: legacy.Query = .{ .version = 1, .owner = owner, .command = .{ .version = 1, .owner = owner, .proof = .{ .root = try local.storage_source_scope.Basis.fromOwner(owner), .transaction_id = @splat(194), .record_digest = @splat(195) } }, .entry = routed_again.entry, .minimum_applied_index = routed_again.entry.index };
+    const before_read = Harness.last(server, owner.group_id);
+    const unknown = try server.recoverLegacyTerminalLocal(a, fence, "docs", query);
+    try unknown.validate(a, query);
+    try std.testing.expect(unknown.outcome == .superseded);
+    try std.testing.expectEqual(before_read, Harness.last(server, owner.group_id));
+    var stale_query = query;
+    stale_query.owner.root_generation += 1;
+    stale_query.command.owner = stale_query.owner;
+    stale_query.command.proof.root.root_generation += 1;
+    try std.testing.expectError(error.TopologyChanged, server.recoverLegacyTerminalLocal(a, fence, "docs", stale_query));
+    try std.testing.expectError(error.Canceled, server.recoverLegacyTerminalLocal(a, cancelled_fence, "docs", query));
+    try std.testing.expectEqual(before_read, Harness.last(server, owner.group_id));
+
     try std.testing.expectEqual(before_documents, Harness.documentApplies(server));
     const registry = try server.sourceScopeObservationPort().read(a, fence, "docs", .{ .version = 1, .owner = owner, .domain = @splat(71), .minimum_applied_index = routed_again.entry.index }, .{});
     try std.testing.expect(!registry.header.strict);

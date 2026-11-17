@@ -19,6 +19,7 @@ const db_mod = @import("db.zig");
 const completion = @import("../transaction_completion.zig");
 const transactions = @import("../transactions.zig");
 const scope = @import("../source_scope.zig");
+const ordered = @import("../source_legacy_terminal_ordered.zig");
 const wire = @import("../../api/batch_internal.zig");
 pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions, owner: completion.RoutedOwner) !void {
     const path = try std.fmt.allocPrint(a, "{s}/legacy-terminal-recovery", .{parent});
@@ -78,6 +79,18 @@ pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions
         const pending_outcome = try db.resolveOrderedClosedLegacyTerminal(owner, pending, .{ .term = 1, .index = 7 });
         try std.testing.expect(pending_outcome == .rejected and pending_outcome.rejected == .unresolved);
         try std.testing.expectEqualDeep(pending_outcome, try db.resolveOrderedClosedLegacyTerminal(owner, pending, .{ .term = 1, .index = 7 }));
+        const pending_query: ordered.Query = .{ .version = 1, .owner = owner, .command = .{ .version = 1, .owner = owner, .proof = pending }, .entry = .{ .term = 1, .index = 7 }, .minimum_applied_index = 7 };
+        const pending_read = try db.legacyTerminalOutcome(pending_query);
+        try std.testing.expectEqualDeep(pending_outcome, pending_read.outcome);
+        try std.testing.expectEqual(@as(u64, 7), pending_read.cut.index);
+        var future = pending_query;
+        future.minimum_applied_index += 1;
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, db.legacyTerminalOutcome(future));
+        var wrong_term = pending_query;
+        wrong_term.entry.term += 1;
+        try std.testing.expectError(error.ConflictingOrderedApplyReceipt, db.legacyTerminalOutcome(wrong_term));
+        try std.testing.expectEqual(@as(u64, 7), (try db.orderedApplyReceipt()).?.index);
+
         var forged = proofs[0];
         forged.record_digest[0] ^= 1;
         var wrong_cohort = owner;
@@ -93,6 +106,11 @@ pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions
         try std.testing.expect(try db.get(a, "legacy-commit") == null);
         const committed = try db.resolveOrderedClosedLegacyTerminal(owner, proofs[0], .{ .term = 1, .index = 9 });
         try std.testing.expect(committed == .applied and committed.applied.kind == .committed and committed.applied.timestamp == 200);
+        const committed_query: ordered.Query = .{ .version = 1, .owner = owner, .command = .{ .version = 1, .owner = owner, .proof = proofs[0] }, .entry = .{ .term = 1, .index = 9 }, .minimum_applied_index = 9 };
+        const committed_read = try db.legacyTerminalOutcome(committed_query);
+        try std.testing.expectEqualDeep(committed, committed_read.outcome);
+        try std.testing.expectEqual(@as(u64, 9), committed_read.cut.index);
+
         try std.testing.expectError(error.ConflictingOrderedApplyReceipt, db.resolveOrderedClosedLegacyTerminal(owner, forged, .{ .term = 1, .index = 9 }));
         const row = (try db.get(a, "legacy-commit")) orelse return error.TestExpectedRecoveredLegacyRow;
         defer a.free(row);
@@ -124,6 +142,14 @@ pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions
         defer db.close();
         _ = try db.resolveOrderedClosedLegacyTerminal(owner, proofs[1], .{ .term = 1, .index = 10 });
         try std.testing.expect(try db.resolveOrderedClosedLegacyTerminal(owner, pending, .{ .term = 1, .index = 7 }) == .superseded);
+        const query: ordered.Query = .{ .version = 1, .owner = owner, .command = .{ .version = 1, .owner = owner, .proof = proofs[1] }, .entry = .{ .term = 1, .index = 10 }, .minimum_applied_index = 10 };
+        const reopened = try db.legacyTerminalOutcome(query);
+        try std.testing.expect(reopened.outcome == .applied and reopened.outcome.applied.kind == .aborted and reopened.outcome.applied.timestamp == 201);
+        var expired = query;
+        expired.command.proof = pending;
+        expired.entry.index = 7;
+        try std.testing.expect((try db.legacyTerminalOutcome(expired)).outcome == .superseded);
+        try std.testing.expectEqual(@as(u64, 10), (try db.orderedApplyReceipt()).?.index);
 
         const row = (try db.get(a, "legacy-commit")) orelse return error.TestExpectedReopenedLegacyRow;
         defer a.free(row);

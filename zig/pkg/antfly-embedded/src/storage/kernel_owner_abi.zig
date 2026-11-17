@@ -44,7 +44,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 119 adds read-only producer closure snapshots.
 // Version 120 adds apply-only original terminal legacy resolution.
 // Version 121 returns durable original-terminal recovery outcomes.
-pub const abi_version: u32 = 121;
+// Version 122 adds read-only original-terminal outcome observations.
+pub const abi_version: u32 = 122;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -2005,6 +2006,7 @@ pub extern fn antfly_storage_owner_ordered_legacy_terminal_resolution(owner: ?*a
 pub extern fn antfly_storage_owner_ordered_source_producer_closure(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_ordered_source_retirement(owner: ?*anyopaque, request: *const ReplicatedBatchAtRaftEntryRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_source_retirement_outcome(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_storage_owner_legacy_terminal_outcome(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_source_producer_closure_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_source_scope_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;
 pub extern fn antfly_storage_owner_source_checkpoint_observation(owner: ?*anyopaque, request: *const JsonOperationRequest, out_response: *OwnedBytes) callconv(.c) Status;

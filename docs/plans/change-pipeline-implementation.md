@@ -7842,3 +7842,50 @@ did not change the earlier explicit producer/control floors or their original
 checks. This qualifies the applying path and durable rejection replay only;
 managed proposal, qualified read-only outcome recovery and the complete original
 issue acceptance remain required.
+
+### Qualified read-only original-terminal outcome recovery (in progress)
+
+Engine descriptor 69 and native owner ABI 122 add legacyTerminalOutcome. The
+bounded version-1 query binds full original owner, exact command/record proof,
+accepted entry and minimum applied index. The observation independently binds
+command fingerprint, entry, owner and actual native applied cut, preserving
+applied/rejected/superseded outcomes. A caller position is a lower read bound,
+not proof of original commitment. Strict codecs reject omitted material owner
+fields, duplicate/unknown fields, forged bindings, stale/inconsistent cuts and
+caller mutation operations.
+
+The DB reads physical identity, source authority, persisted closure basis,
+checksummed receipt and actual marker in one read transaction. It never calls a
+mutation method. Wrong entry terms and future cuts fail explicitly; receipt
+absence/supersession remains unknown. The C ABI bounds/validates query and reply
+and clears output on early failure. Provisioned routing reuses the existing
+frozen quorum ReadIndex capture/validation, complete catalog/descriptor owner
+checks and pre/post cancellation/fencing. DataServer provides a bounded local
+read-recovery entrypoint without proposing a command.
+
+Actual DB/opaque-owner fixtures now recover known rejection, original applied
+versions, supersession and reopened outcomes through read-only APIs and verify
+unchanged markers. The live Raft fixture additionally reads an absent legacy
+receipt after real producer closure, rejects stale/cancelled owners and verifies
+no log append or strict-registry/document progression. An absent receipt is not
+converted into a missing-transaction decision. Codec tests bind owner/command/
+entry/cut and reject mutation fields. Initial DB qualification and contract
+checks passed; remaining native/codec qualification is running
+(`source-legacy-terminal-read-test.log`,
+`source-legacy-terminal-read-contract-check.log`). The live qualified read runs
+next. Managed proposal, authenticated recovery transport, original pending
+coordinator decisions, global handover/drainage and all full issue requirements
+remain open.
+
+Read qualification passed one actual compiled-engine DB case, 16 local cases,
+36 wire/control cases and two physical-owner cases, zero skips/failures/leaks
+(`source-legacy-terminal-read-test.log`). The live routed ReadIndex run passed
+six local and 46 linked cases, zero skips/failures/leaks
+(`source-legacy-terminal-read-routed-test.log`). The selected live fixture reaches
+the new bounded recovery path: absence stays superseded/unknown, stale/cancelled
+owners fail, and Raft last index, document applies, strict registry and existing
+protocol floor remain unchanged. Native/DB reads retain applied versions and
+rejected outcomes, reject future/conflicting cuts and survive reopen without
+advancing markers. Contract and whitespace checks passed. This qualifies the
+read foundation; managed proposal, authenticated recovery transport, global
+handover/drainage and every full issue acceptance remain required.

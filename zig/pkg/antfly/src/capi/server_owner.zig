@@ -4690,6 +4690,21 @@ pub fn storageOwnerSourceRetirementOutcome(owner: ?*anyopaque, request: *const k
     out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
     return .ok;
 }
+pub fn storageOwnerLegacyTerminalOutcome(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    const ordered = @import("antfly_local_sources").storage_source_legacy_terminal_ordered;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved0 != 0 or request.request_json.len == 0 or request.request_json.len > ordered.max_query_bytes or !borrowedBytesValid(request.request_json)) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const query = ordered.decodeQuery(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    if (query.owner.group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.HistoryResynchronizationRequired);
+    const result = handle.db.legacyTerminalOutcome(query) catch |err| return storageOwnerStatusFromError(err);
+    const bytes = ordered.encodeObservation(std.heap.c_allocator, query, result) catch |err| return storageOwnerStatusFromError(err);
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
 pub fn storageOwnerSourceProducerClosureObservation(owner: ?*anyopaque, request: *const kernel_owner_abi.JsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
     const wire = @import("antfly_local_sources").storage_source_producer_policy;
     out.* = .{};

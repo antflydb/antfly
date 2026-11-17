@@ -14060,8 +14060,8 @@ pub const DataServer = struct {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         return self.sourcePlanLocalRead(a, fence, table, .checkpoint, request, context);
     }
-    const SourcePlanReadKind = enum { observe, chunk, checkpoint, scope, producer_closure };
-    fn sourcePlanLocalRead(self: *DataServer, a: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, comptime kind: SourcePlanReadKind, request: if (kind == .observe) SourcePlanHttp.ObserveRequest else if (kind == .scope) ScopeRead.Query else if (kind == .producer_closure) ProducerRead.Query else if (kind == .checkpoint) CheckpointRead.Request else SourcePlanHttp.ChunkRequest, original: antfly.public_api.operation.RequestContext) !(if (kind == .observe) SourcePlanHttp.control.Observation else if (kind == .scope) ScopeRead.Observation else if (kind == .producer_closure) ProducerRead.Observation else if (kind == .checkpoint) CheckpointRead.Reply else SourcePlanHttp.control.Read) {
+    const SourcePlanReadKind = enum { observe, chunk, checkpoint, scope, producer_closure, legacy_terminal };
+    fn sourcePlanLocalRead(self: *DataServer, a: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, comptime kind: SourcePlanReadKind, request: if (kind == .observe) SourcePlanHttp.ObserveRequest else if (kind == .scope) ScopeRead.Query else if (kind == .producer_closure) ProducerRead.Query else if (kind == .legacy_terminal) LegacyRead.Query else if (kind == .checkpoint) CheckpointRead.Request else SourcePlanHttp.ChunkRequest, original: antfly.public_api.operation.RequestContext) !(if (kind == .observe) SourcePlanHttp.control.Observation else if (kind == .scope) ScopeRead.Observation else if (kind == .producer_closure) ProducerRead.Observation else if (kind == .legacy_terminal) LegacyRead.Observation else if (kind == .checkpoint) CheckpointRead.Reply else SourcePlanHttp.control.Read) {
         if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
         const apply = self.data_raft_apply orelse return error.ChangefeedCapabilityUnsupported;
         const owner = apply.kernel_owner_source orelse return error.ChangefeedCapabilityUnsupported;
@@ -14081,6 +14081,7 @@ pub const DataServer = struct {
                 .observe => owner.sourcePlanObservationRouted(a, fence, table, request),
                 .scope => owner.sourceScopeObservationRouted(a, fence, table, request),
                 .producer_closure => owner.sourceProducerClosureObservationRouted(a, fence, table, request),
+                .legacy_terminal => owner.legacyTerminalOutcomeRouted(a, fence, table, request),
                 .checkpoint => owner.sourceCheckpointObservationRouted(a, fence, table, request),
                 .chunk => owner.sourcePlanChunkRouted(a, fence, table, request),
             }) catch |err| switch (err) {
@@ -14095,6 +14096,11 @@ pub const DataServer = struct {
             return result;
         }
     }
+    pub fn recoverLegacyTerminalLocal(self: *DataServer, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, query: LegacyRead.Query) !LegacyRead.Observation {
+        try query.validate();
+        return self.sourcePlanLocalRead(a, fence, table, .legacy_terminal, query, .{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation });
+    }
+
     fn sourcePlanObserveOperation(ptr: *anyopaque, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, request: SourcePlanHttp.ObserveRequest, context: antfly.public_api.operation.RequestContext) !SourcePlanHttp.control.Observation {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         return self.sourcePlanLocalRead(a, fence, table, .observe, request, context);
@@ -14121,6 +14127,7 @@ pub const DataServer = struct {
     const RetirementHttp = @import("source_retirement_http_wire.zig");
     const ScopeRead = @import("antfly_local_sources").storage_source_scope_control;
     const ProducerRead = @import("antfly_local_sources").storage_source_producer_policy;
+    const LegacyRead = @import("antfly_local_sources").storage_source_legacy_terminal_ordered;
     const ProducerControlHttp = @import("source_producer_control_http_wire.zig");
     const CheckpointRead = @import("antfly_local_sources").storage_source_checkpoint_read;
     const NativeControlKind = enum { history, source_plan, source_scope, source_retirement, producer_closure };

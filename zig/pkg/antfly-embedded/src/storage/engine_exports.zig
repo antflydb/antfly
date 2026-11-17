@@ -1203,6 +1203,10 @@ fn orderedSourceRetirementOutcome(self: *DB, query: @import("source_scope_retire
 fn orderedSourceScopeOutcome(self: *DB, recovery: @import("source_scope_ordered.zig").Recovery) engine.Outcome(@import("source_scope_ordered.zig").Outcome) {
     return .{ .value = self.orderedSourceScopeOutcome(recovery) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn legacyTerminalOutcome(self: *DB, query: @import("source_legacy_terminal_ordered.zig").Query) engine.Outcome(@import("source_legacy_terminal_ordered.zig").Observation) {
+    return .{ .value = self.legacyTerminalOutcome(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn sourceProducerClosureObservation(self: *DB, query: @import("source_producer_policy.zig").Query) engine.Outcome(@import("source_producer_policy.zig").Observation) {
     return .{ .value = self.sourceProducerClosureObservation(query) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

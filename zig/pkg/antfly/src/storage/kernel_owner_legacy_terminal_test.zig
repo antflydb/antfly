@@ -19,6 +19,7 @@ const client = @import("kernel_owner_client.zig");
 const local = @import("antfly_local_sources");
 const db_mod = local.storage_db_db;
 const policy = local.storage_source_producer_policy;
+const ordered = local.storage_source_legacy_terminal_ordered;
 const completion = local.api_local_table_writes.table_write_source.history_resolution_wire.completion;
 
 test "storage owner legacy terminal resolution crosses native ABI and survives reopen" {
@@ -73,6 +74,26 @@ test "storage owner legacy terminal resolution crosses native ABI and survives r
         defer native.deinit();
         const reopened = try native.orderedLegacyTerminalResolution(a, "docs", command, 1, 4);
         try std.testing.expect(reopened == .applied and reopened.applied.kind == .committed and reopened.applied.timestamp == 200);
+        const query: ordered.Query = .{ .version = 1, .owner = command.owner, .command = command, .entry = .{ .term = 1, .index = 4 }, .minimum_applied_index = 4 };
+        const observed = try native.legacyTerminalOutcome(a, "docs", query);
+        try std.testing.expectEqualDeep(reopened, observed.outcome);
+        try std.testing.expectEqual(@as(u64, 4), observed.cut.index);
+        try std.testing.expectEqualDeep(observed, try native.legacyTerminalOutcome(a, "docs", query));
+        var future = query;
+        future.minimum_applied_index = 5;
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, native.legacyTerminalOutcome(a, "docs", future));
+        var expired = query;
+        expired.command = pending;
+        expired.entry.index = 3;
+        try std.testing.expect((try native.legacyTerminalOutcome(a, "docs", expired)).outcome == .superseded);
+        var read_request: abi.JsonOperationRequest = .{ .version = abi.abi_version - 1 };
+        var read_response: abi.OwnedBytes = .{ .len = 99 };
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_legacy_terminal_outcome(null, &read_request, &read_response));
+        try std.testing.expectEqual(@as(usize, 0), read_response.len);
+        read_request.version = abi.abi_version;
+        read_request.request_json.len = ordered.max_query_bytes + 1;
+        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_legacy_terminal_outcome(null, &read_request, &read_response));
+
         try std.testing.expect(try native.orderedLegacyTerminalResolution(a, "docs", pending, 1, 3) == .superseded);
         var forged = command;
         forged.proof.record_digest[0] ^= 1;
