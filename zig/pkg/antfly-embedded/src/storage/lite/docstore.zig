@@ -8930,10 +8930,17 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     // scan of real bytes without ever materializing a large document's
     // value just to account for its deletion.
     const charge: u64 = internal_keys.replay_key_len + payload.len;
+    // Loaded once here for the admission check and reused below for the
+    // final charge instead of a second `txn.get` of the same key: nothing
+    // in between writes `journal_credit_ledger_key` (the puts below are to
+    // unrelated replay-journal keys), so the bytes read here are still
+    // exactly what a second read would return.
+    var reserved_ledger: ?internal_keys.JournalCreditLedger = null;
     if (txn.store) |store| {
         const ledger = try loadJournalCreditLedger(txn);
         const admissible = store.journal_credit_capacity_bytes -| store.journal_credit_progress_reserve_bytes;
         if (ledger.bytes + charge > admissible) return error.JournalCreditCapacityExceeded;
+        reserved_ledger = ledger;
     }
 
     // The init marker's value never changes once set; rewriting the same
@@ -8947,7 +8954,7 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     try txn.put(all_key[0..], payload);
 
     if (txn.store != null) {
-        var ledger = try loadJournalCreditLedger(txn);
+        var ledger = reserved_ledger.?;
         ledger = ledger.charged(charge, 1);
         try storeJournalCreditLedger(txn, ledger);
     }
