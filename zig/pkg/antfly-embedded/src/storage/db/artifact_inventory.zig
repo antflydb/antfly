@@ -592,10 +592,10 @@ test "context-source asset enrichments require the execution identity protocol" 
     const alloc = std.testing.allocator;
     const producer_catalog = @import("catalog/enrichment_catalog.zig");
     const generator = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}";
-    const plain = try producer_catalog.serializeCatalog(alloc, &.{.{ .name = "brief", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = generator }});
+    const plain = try producer_catalog.serializeCatalog(alloc, &.{.{ .name = "brief", .kind = .asset, .source_field = "body", .content_type = "text/plain", .producer_json = generator }});
     defer alloc.free(plain);
     try std.testing.expectEqual(@as(u16, 15), try (Catalogs{ .enrichments = plain }).requiredEffectProtocol(alloc));
-    const with_context = try producer_catalog.serializeCatalog(alloc, &.{.{ .name = "brief", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = generator, .context_sources_json = "{\"sources\":{}}" }});
+    const with_context = try producer_catalog.serializeCatalog(alloc, &.{.{ .name = "brief", .kind = .asset, .source_field = "body", .content_type = "text/plain", .producer_json = generator, .context_sources_json = "{\"sources\":{}}" }});
     defer alloc.free(with_context);
     try std.testing.expectEqual(@as(u16, 17), try (Catalogs{ .enrichments = with_context }).requiredEffectProtocol(alloc));
 }
