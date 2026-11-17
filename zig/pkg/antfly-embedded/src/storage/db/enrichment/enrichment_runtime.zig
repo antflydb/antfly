@@ -17447,6 +17447,10 @@ fn processAsset(
     const accepted = if (context) |*value| accepted: {
         var read = try runtime.store.beginProbe();
         defer read.abort();
+        // Acceptance is keyed by the primary source revision, which a
+        // context-source change leaves untouched. A dependent its context
+        // invalidated must be produced again, not settled as accepted.
+        if (try contextRebuildDueTxn(runtime.alloc, &read, request)) break :accepted false;
         break :accepted try value.accepted(runtime.alloc, &read);
     } else false;
     if (accepted) {
@@ -17850,6 +17854,16 @@ const ContextDependencyFence = struct {
 
 /// Register-before-read capture. Returns null when the request already
 /// recorded an explicit failure (budget overflow, missing required input).
+/// Whether `request`'s context dependencies were invalidated (or never
+/// published current) since its last accepted output.
+fn contextRebuildDueTxn(alloc: Allocator, read: anytype, request: enrichment_types.GeneratedEnrichmentRequest) !bool {
+    if (request.context_sources_json.len == 0) return false;
+    var reader = context_dependency_store.TxnReader(@TypeOf(read.*)){ .txn = read };
+    var state = (try context_dependency_store.loadState(alloc, reader.reader(), null, request.doc_key, requestArtifactName(request))) orelse return false;
+    defer state.deinit(alloc);
+    return state.freshness != .current;
+}
+
 fn captureContextSources(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
