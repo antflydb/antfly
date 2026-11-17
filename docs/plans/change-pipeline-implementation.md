@@ -7053,3 +7053,42 @@ new private producer-BEGIN request contract. Native qualification does not
 qualify multi-owner Raft failover, source-root cohorts or production CDC/public
 origin assignment. Bound whole-commit origin support is also still needed before
 standalone CDC ingress can opt in. All original issue acceptance remains open.
+
+### Bound native whole-commit producer support (in progress)
+
+Bound table writers now preserve explicit ordinary/legacy origin through their
+whole-commit transaction path and can opt into that separate interface capability.
+Generic labels cannot mix with intrinsic source admission. The labelled BEGIN
+uses trusted native admission, and PREPARE retains both immutable origin bits.
+Original committed identity is checked before labelled schema revalidation;
+validation failures on a fresh BEGIN still follow the existing authoritative
+ABORT/cleanup path. Older unlabelled/source-admitted behavior remains compatible.
+
+Review also found fields omitted by the existing bound single-batch optimization.
+It now preserves policy identity, schema/relational metadata, restore scope and
+graph mutations, alongside rows/transforms/deletes and producer origin. A strict
+field/default audit diverts specialized commands and unknown non-default fields
+to full transaction phases, rather than silently dropping them. Predicates,
+relational maintenance/integrity commands and source admission retain their
+stronger phase path.
+
+The native two-root test now also exercises bound whole-commit stable IDs for
+both origins, physical row visibility, reopen/retry and origin-switch rejection.
+The shared capability check verifies fast-path metadata/graph preservation and
+specialized-command fallback. Contract checks passed
+(`source-producer-bound-commit-contract-check.log`); transaction/native and linked
+checks are running (`source-producer-bound-commit-test.log`). No source ingress
+assignment or original acceptance is inferred from these prerequisites.
+
+Final bound whole-commit verification passed
+(`source-producer-bound-commit-test.log`): 42 local transaction cases, 78 API
+integration cases, six local history cases and 37 linked history/control cases,
+zero failures, skips or leaks. The native test passed both whole-commit origins,
+original stable-ID retry after physical reopen, row visibility and origin-switch
+rejection. The fast-path audit check passed policy/schema/restore/graph field
+preservation and specialized-command fallback. Contract checks and
+`git diff --check` passed. Existing owner/API/engine/data/metadata/failure versions
+remain 117/37/65/45/105/89; no callback layout or wire format changed. This enables
+producer-preserving bound whole commits on qualified native roots, not source
+handover or source-granted retained-history admission. Production ingress
+assignment and all original acceptance remain open.

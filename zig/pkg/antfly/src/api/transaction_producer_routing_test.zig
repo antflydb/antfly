@@ -81,6 +81,21 @@ pub fn run(a: std.mem.Allocator) !void {
     try std.testing.expect((try phases.txnBeginGroupLocalWithPreDecisionContext(a, 1, "docs", @splat(1), 10, 1, true, &.{"participant"}, .{ .source_producer = .legacy_cdc })) != null);
     try std.testing.expect((try phases.txnPrepareGroupLocal(a, 1, "docs", @splat(1), 1, .{ .completion_legacy_producer = true })) != null);
     try std.testing.expectEqual(before + 2, fake.calls);
+    const fast_table: contract.TableCommitRequest = .{ .table_name = "docs", .source_producer = .legacy_cdc, .schema_version = 3, .row_policy_principal_proof = "proof", .row_policy_database = "database", .row_policy_admitted_at_seconds = 100, .relational_schema_version = 4, .relational_integrity_generation_set = @splat(5), .restore_staging_scope = @splat(6), .restore_staging_plan_id = @splat(7), .graph_deletes = &.{.{ .index_name = "edges", .source = "a", .target = "b", .edge_type = "R", .owner = "owner" }} };
+    const fast = local.api_local_table_writes.boundFastBatchRequest(fast_table, .write).?;
+    try std.testing.expectEqual(fast_table.source_producer, fast.source_producer);
+    try std.testing.expectEqual(fast_table.schema_version, fast.schema_version);
+    try std.testing.expectEqualDeep(fast_table.restore_staging_scope, fast.restore_staging_scope);
+    try std.testing.expectEqualDeep(fast_table.restore_staging_plan_id, fast.restore_staging_plan_id);
+    try std.testing.expectEqualDeep(fast_table.relational_integrity_generation_set, fast.relational_integrity_generation_set);
+    try std.testing.expectEqualStrings(fast_table.row_policy_principal_proof, fast.row_policy_principal_proof);
+    try std.testing.expectEqualDeep(fast_table.graph_deletes, fast.graph_deletes);
+    var full = fast_table;
+    full.predicates = &.{.{ .key = "row", .expected_version = 1 }};
+    try std.testing.expect(local.api_local_table_writes.boundFastBatchRequest(full, .write) == null);
+    full = fast_table;
+    full.relational_repair = true;
+    try std.testing.expect(local.api_local_table_writes.boundFastBatchRequest(full, .write) == null);
     const Wire = struct {
         tables: []const contract.TableCommitRequest,
         pub fn jsonStringify(self: @This(), stream: anytype) !void {

@@ -131,6 +131,20 @@ pub fn run(a: std.mem.Allocator) !void {
             changed.source_producer = if (producer == .ordinary) .legacy_cdc else .ordinary;
             try std.testing.expectError(error.SourceTransactionIdentityConflict, txn.executeMultiTableCommitWithOptions(a, Catalog.source(), adapter.worker(), id, 100, 200 + index, &.{changed}, .write, null, .{ .retain_terminal = true }));
         }
+        for ([_]@FieldType(db_mod.types.BatchRequest, "source_producer"){ .ordinary, .legacy_cdc }, 0..) |producer, index| {
+            const id: db_mod.types.TxnId = @splat(@intCast(70 + index));
+            const key: []const u8 = if (producer == .ordinary) "bound-ordinary" else "bound-legacy";
+            const tables = [_]txn.TableCommitRequest{.{ .table_name = "docs", .source_producer = producer, .writes = &.{.{ .key = key, .value = "{\"v\":1}" }} }};
+            const outcome = (try left.source().commitTransactionWithId(a, id, 300 + index * 2, &tables, .write)).?;
+            try std.testing.expect(outcome == .committed);
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try left_db.getTransactionStatus(id));
+            const row = (try left_db.get(a, key)) orelse return error.TestExpectedProducerRow;
+            defer a.free(row);
+            try std.testing.expectEqualStrings("{\"v\":1}", row);
+            var changed = tables[0];
+            changed.source_producer = if (producer == .ordinary) .legacy_cdc else .ordinary;
+            try std.testing.expectError(error.SourceTransactionIdentityConflict, left.source().commitTransactionWithId(a, id, 300 + index * 2, &.{changed}, .write));
+        }
         const left_row = (try left_db.get(a, "doc:a")) orelse return error.TestExpectedProducerRow;
         defer a.free(left_row);
         const right_row = (try right_db.get(a, "doc:z")) orelse return error.TestExpectedProducerRow;
