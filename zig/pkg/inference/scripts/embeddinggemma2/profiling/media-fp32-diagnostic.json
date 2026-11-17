@@ -1,0 +1,1 @@
+{"purpose":"Additional diagnostic against FP32 truth for the native FP32 media towers. Does not replace or relax the frozen BF16 qualification gates.","min_cosine":0.999,"max_abs":0.01,"wrapper_upstream_max_abs":0.000001}

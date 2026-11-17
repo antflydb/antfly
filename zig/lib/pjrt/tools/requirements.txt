@@ -1,0 +1,13 @@
+# Offline HLO export/reference validation only; the native runner needs no Python.
+# The L4 campaign used torch 2.10.0+cpu from PyTorch's CPU wheel index.
+torch==2.10.0
+transformers==5.23.0
+torchax==0.0.13
+jax==0.10.2
+jaxlib==0.10.2
+numpy==2.4.6
+ml_dtypes==0.6.0
+gguf==0.19.0
+safetensors
+psutil
+nvidia-ml-py
