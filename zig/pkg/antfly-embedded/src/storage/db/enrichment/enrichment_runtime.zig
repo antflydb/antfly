@@ -32090,20 +32090,31 @@ fn finishAcceptedAssetGraph(runtime: *EnrichmentRuntime, request: enrichment_typ
 }
 
 fn enqueueAssetProducerOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, token: *@import("../artifact_producer_context.zig").Token, key: []const u8, payload: ?[]const u8) !void {
-    try enqueueProducerEffects(runtime, token, &.{.{ .family = .document_artifact, .key = key, .value = payload, .source_index = 0 }});
+    // A context-invalidated dependent publishes again at an unchanged source
+    // revision, so an earlier accepted receipt must not settle it.
+    const reproduce = blk: {
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        break :blk try contextRebuildDueTxn(runtime.alloc, &read, request);
+    };
+    try enqueueProducerEffectsWith(runtime, token, &.{.{ .family = .document_artifact, .key = key, .value = payload, .source_index = 0 }}, reproduce);
     // Acceptance can race enqueue, including a deferred provider callback.
     // Consume the accepted bytes, never this callback's uncommitted response.
     try finishAcceptedAssetGraph(runtime, request);
 }
 
 fn enqueueProducerEffects(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation) !void {
+    return enqueueProducerEffectsWith(runtime, token, effects, false);
+}
+
+fn enqueueProducerEffectsWith(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, effects: []const ordered_publication.Mutation, reproduce: bool) !void {
     {
         const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
         var read = try runtime.store.beginProbe();
         defer read.abort();
         try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
         try token.validateInputs(runtime.alloc, &read);
-        if (try token.accepted(runtime.alloc, &read)) return;
+        if (!reproduce and try token.accepted(runtime.alloc, &read)) return;
         try token.validate(runtime.alloc, &read);
     }
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
