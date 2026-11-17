@@ -423,3 +423,117 @@ test "DAG storage terminal receipts fence replay and changed payloads" {
     txn.receipt.?[0] ^= 1;
     try std.testing.expectError(error.InvalidDagAuthority, Storage.begin(&txn, state.domain, 2, 1, testAttempt(1)));
 }
+
+/// Accepted endpoint membership in the authority's ordered store. The caller
+/// reconciles contributor identities before producing these endpoint changes.
+pub const Adjacency = struct {
+    const validation = @import("dag_validation.zig");
+    const prefix = "\x00\x00__metadata__:dag-adjacency:";
+    const A = std.mem.Allocator;
+
+    fn sourcePrefix(alloc: A, id: Digest, source: []const u8) ![]u8 {
+        if (source.len > std.math.maxInt(u32)) return error.GraphConstraintCapacity;
+        var length: [4]u8 = undefined;
+        std.mem.writeInt(u32, &length, @intCast(source.len), .big);
+        return std.mem.concat(alloc, u8, &.{ prefix, &id, &length, source });
+    }
+
+    pub fn stage(alloc: A, txn: anytype, id: Digest, changes: []const validation.Change) !void {
+        for (changes) |change| {
+            const source = try sourcePrefix(alloc, id, change.source);
+            defer alloc.free(source);
+            const key = try std.mem.concat(alloc, u8, &.{ source, change.target });
+            defer alloc.free(key);
+            if (change.present) {
+                try txn.put(key, "");
+            } else {
+                txn.delete(key) catch |err| if (err != error.NotFound) return err;
+            }
+        }
+    }
+
+    pub fn Reader(comptime Txn: type) type {
+        return struct {
+            txn: Txn,
+            domain_id: Digest,
+
+            pub fn next(self: @This(), alloc: A, source: []const u8, after: ?[]const u8, budget: *validation.Budget) !?validation.Row {
+                try budget.consume(.requests, 1);
+                const source_prefix = try sourcePrefix(alloc, self.domain_id, source);
+                var cursor = try self.txn.openCursor();
+                defer cursor.close();
+                var row = try cursor.seekAtOrAfter(after orelse source_prefix);
+                if (after) |previous| {
+                    if (row) |entry| {
+                        if (std.mem.eql(u8, previous, entry.key)) row = try cursor.next();
+                    }
+                }
+                const entry = row orelse return null;
+                if (!std.mem.startsWith(u8, entry.key, source_prefix)) return null;
+                const owned = try alloc.dupe(u8, entry.key);
+                return .{ .key = owned, .target = owned[source_prefix.len..] };
+            }
+        };
+    }
+};
+
+test "DAG adjacency source prefixes distinguish arbitrary binary identifiers" {
+    const alloc = std.testing.allocator;
+    const first = try Adjacency.sourcePrefix(alloc, @splat(7), "a");
+    defer alloc.free(first);
+    const second = try Adjacency.sourcePrefix(alloc, @splat(7), "a\x00b");
+    defer alloc.free(second);
+    const other_domain = try Adjacency.sourcePrefix(alloc, @splat(8), "a");
+    defer alloc.free(other_domain);
+    try std.testing.expect(!std.mem.startsWith(u8, second, first));
+    try std.testing.expect(!std.mem.eql(u8, first, other_domain));
+}
+
+test "DAG adjacency cursor stays inside its source and resumes strictly after a row" {
+    const Txn = struct {
+        const Entry = struct { key: []const u8 };
+        keys: [3][]const u8,
+        const Cursor = struct {
+            keys: [3][]const u8,
+            offset: usize = 0,
+            fn close(_: *@This()) void {}
+            fn next(self: *@This()) !?Entry {
+                if (self.offset == self.keys.len) return null;
+                const key = self.keys[self.offset];
+                self.offset += 1;
+                return .{ .key = key };
+            }
+            fn seekAtOrAfter(self: *@This(), key: []const u8) !?Entry {
+                while (self.offset < self.keys.len and std.mem.order(u8, self.keys[self.offset], key) == .lt) self.offset += 1;
+                return self.next();
+            }
+        };
+        fn openCursor(self: *@This()) !Cursor {
+            return .{ .keys = self.keys };
+        }
+    };
+    const Clock = struct {
+        fn now(_: *anyopaque) u64 {
+            return 0;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const id: Digest = @splat(1);
+    const a = try Adjacency.sourcePrefix(alloc, id, "a");
+    const b = try Adjacency.sourcePrefix(alloc, id, "b");
+    var txn: Txn = .{ .keys = .{
+        try std.mem.concat(alloc, u8, &.{ a, "first" }),
+        try std.mem.concat(alloc, u8, &.{ a, "second" }),
+        try std.mem.concat(alloc, u8, &.{ b, "third" }),
+    } };
+    const reader: Adjacency.Reader(*Txn) = .{ .txn = &txn, .domain_id = id };
+    var budget: Adjacency.validation.Budget = .{ .clock = .{ .context = &txn, .now = Clock.now } };
+    const first = (try reader.next(alloc, "a", null, &budget)).?;
+    const second = (try reader.next(alloc, "a", first.key, &budget)).?;
+    try std.testing.expectEqualStrings("first", first.target);
+    try std.testing.expectEqualStrings("second", second.target);
+    try std.testing.expect(try reader.next(alloc, "a", second.key, &budget) == null);
+    try std.testing.expectEqual(@as(usize, 3), budget.stats.requests);
+}
