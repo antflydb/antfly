@@ -54776,13 +54776,24 @@ test "api http server cluster overwrite restores from read-only repository witho
     };
     defer freeBackupShards(alloc, shards);
 
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    var alias_arena = std.heap.ArenaAllocator.init(alloc);
+    defer alias_arena.deinit();
+    const alias_alloc = alias_arena.allocator();
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, alias_alloc, "{\"queryable\":true}", .{});
+    const alias_indexes = try aliases.put(alias_alloc, tables_api.default_indexes_json, "live", .{
+        .index = "full_text_index_v0",
+        .idempotency_key = "before-overwrite",
+        .require = .queryable,
+    }, ready, 1);
+
     var table_manifest = try backups_api.createManifest(alloc, table_backup_id, .native, &.{
         .table_id = 1,
         .name = "docs",
         .description = "restored docs table",
         .schema_json = "",
         .read_schema_json = "",
-        .indexes_json = tables_api.default_indexes_json,
+        .indexes_json = alias_indexes,
         .replication_sources_json = "[]",
     }, shards);
     defer table_manifest.deinit(alloc);
@@ -54828,6 +54839,7 @@ test "api http server cluster overwrite restores from read-only repository witho
         restore_lifecycle_active: bool = false,
         restore_lifecycle_finished: bool = false,
         expected_backup_id: []const u8,
+        indexes_json: []const u8,
     };
 
     const FakeSource = struct {
@@ -54892,6 +54904,15 @@ test "api http server cluster overwrite restores from read-only repository witho
             try std.testing.expectEqual(@as(u64, 1), replacement.table_id);
             try std.testing.expectEqualStrings("docs", replacement.name);
             try std.testing.expectEqualStrings("restored docs table", replacement.description);
+            var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const original = try std.json.parseFromSliceLeaky(std.json.Value, a, self.state.indexes_json, .{});
+            const resource = original.object.get(aliases.key).?.object.get("live").?;
+            const tag = try aliases.catalogResourceEtag(a, original, resource);
+            try std.testing.expectError(error.IndexAliasPreconditionFailed, aliases.remove(a, replacement.indexes_json, "live", tag));
+            const current = try std.json.parseFromSliceLeaky(std.json.Value, a, replacement.indexes_json, .{});
+            try std.testing.expectEqualStrings("full_text_index_v0", current.object.get(aliases.key).?.object.get("live").?.object.get("index").?.string);
             self.state.definition_replaced = true;
         }
 
@@ -54991,7 +55012,7 @@ test "api http server cluster overwrite restores from read-only repository witho
         }
     };
 
-    var state = State{ .expected_backup_id = table_backup_id };
+    var state = State{ .expected_backup_id = table_backup_id, .indexes_json = alias_indexes };
     var source = FakeSource{ .state = &state };
     var read_source = FakeReads{ .state = &state };
     var write_source = FakeWrites{ .state = &state };

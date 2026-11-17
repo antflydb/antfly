@@ -382,55 +382,6 @@ def test_lite_server_backup_roundtrip_under_connection_root(
                 )
                 assert restored_alias.ok, restored_alias.text
                 assert restored_alias.headers["ETag"] != source_etag
-                if schema_version:
-                    repository = (root / "overwrite").as_uri()
-                    cli(
-                        "backup",
-                        "--tables",
-                        "from_file",
-                        "--backup-id",
-                        "overwrite",
-                        "--connection",
-                        "bk",
-                        "--location",
-                        repository,
-                        "--format",
-                        "native",
-                        "--url",
-                        server.url,
-                    )
-                    cli(
-                        "restore",
-                        "--tables",
-                        "from_file",
-                        "--backup-id",
-                        "overwrite",
-                        "--connection",
-                        "bk",
-                        "--location",
-                        repository,
-                        "--mode",
-                        "overwrite",
-                        "--url",
-                        server.url,
-                        "--wait",
-                    )
-                    stale = requests.delete(
-                        server.api_url + "/tables/from_file/index-aliases/live",
-                        auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
-                        headers={"If-Match": source_etag},
-                        timeout=10,
-                    )
-                    assert stale.status_code == 412, stale.text
-                    current = requests.get(
-                        server.api_url + "/tables/from_file/index-aliases/live",
-                        auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
-                        timeout=10,
-                    )
-                    assert current.ok and current.json()["index"] == "sparse_vectors", (
-                        current.text
-                    )
-                    expect_docs("from_file")
             if format == "portable":
                 restored = tmp_path / "returned.aflite"
                 cli("lite", "restore", output, "--out", restored)
