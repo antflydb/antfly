@@ -3689,6 +3689,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "table provisioner restores local shard data from metadata restore intent",
         "table provisioner restore rejects mismatched doc identity namespace",
         "table provisioner replaces embedding index when metadata incarnation changes",
+        "table provisioner preserves vector incarnations across JSON formatting",
         "table provisioner can admit resolver backfill without draining corpus work",
         "runtime schema progress requires every hosted range",
         "table provisioner accepts target schema index when retained read index has inflated doc count",

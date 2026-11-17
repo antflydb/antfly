@@ -502,11 +502,41 @@ pub fn findIndexConfig(configs: []const db_mod.types.IndexConfig, name: []const 
 
 pub fn indexConfigsEqual(alloc: std.mem.Allocator, a: db_mod.types.IndexConfig, b: db_mod.types.IndexConfig) !bool {
     if (a.kind != b.kind) return false;
+    const vector = a.kind == .dense_vector or a.kind == .sparse_vector;
+    if (vector and a.coverage_generation != b.coverage_generation) return false;
+    if (std.mem.eql(u8, a.config_json, b.config_json)) return true;
     if (a.kind == .full_text) return fullTextIndexConfigsEqual(alloc, a.config_json, b.config_json);
+    // Native catalogs and public lowering may serialize the same configuration
+    // differently. Formatting must never retire an unchanged vector producer:
+    // retirement also removes its authoritative embedding artifacts.
+    if (vector) return vectorIndexConfigsEqual(alloc, a.kind, a.config_json, b.config_json);
     if (a.kind == .algebraic) return algebraicIndexConfigsEqual(alloc, a.config_json, b.config_json);
-    if ((a.kind == .dense_vector or a.kind == .sparse_vector) and
-        a.coverage_generation != b.coverage_generation) return false;
-    return std.mem.eql(u8, a.config_json, b.config_json);
+    return false;
+}
+
+fn vectorIndexConfigsEqual(alloc: std.mem.Allocator, kind: db_mod.types.IndexKind, a_json: []const u8, b_json: []const u8) !bool {
+    var a = try std.json.parseFromSlice(std.json.Value, alloc, a_json, .{});
+    defer a.deinit();
+    var b = try std.json.parseFromSlice(std.json.Value, alloc, b_json, .{});
+    defer b.deinit();
+    if (kind == .sparse_vector) {
+        // Released public sparse lowering omitted this marker for its implicit
+        // embedding field. Preserve that producer's artifacts when its public
+        // definition is lowered by a current server. Explicit direct fields
+        // and explicit external:false keep distinct configuration semantics.
+        try normalizeLegacySparseExternalConfig(a.arena.allocator(), &a.value);
+        try normalizeLegacySparseExternalConfig(b.arena.allocator(), &b.value);
+    }
+    return jsonValuesEqualIgnoringTopLevelEnrichments(a.value, b.value, false);
+}
+
+fn normalizeLegacySparseExternalConfig(alloc: std.mem.Allocator, value: *std.json.Value) !void {
+    if (value.* != .object or value.object.contains("external") or
+        value.object.contains("generator") or value.object.contains("embedder") or
+        value.object.contains("embedding_name") or value.object.contains("sources")) return;
+    const field = value.object.get("field") orelse return;
+    if (field == .string and std.mem.eql(u8, field.string, "embedding"))
+        try value.object.put(alloc, "external", .{ .bool = true });
 }
 
 pub fn indexKindConfigReconcileDeferred(kind: db_mod.types.IndexKind) bool {

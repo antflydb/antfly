@@ -32,8 +32,12 @@ from helpers import wait_until
 pytestmark = pytest.mark.e2e_resource("antfly_process")
 
 
-@pytest.mark.parametrize("schema_version", [0, 3])
-def test_lite_server_backup_roundtrip_under_connection_root(tmp_path, schema_version):
+@pytest.mark.parametrize(
+    "schema_version,legacy_sparse", [(0, False), (3, False), (0, True)]
+)
+def test_lite_server_backup_roundtrip_under_connection_root(
+    tmp_path, schema_version, legacy_sparse
+):
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     root = (tmp_path / "backups").resolve()
     root.mkdir()
@@ -76,12 +80,15 @@ def test_lite_server_backup_roundtrip_under_connection_root(tmp_path, schema_ver
         return result
 
     def expect_docs(table):
+        last = {}
+
         def ready():
             response = requests.post(
                 server.api_url + f"/tables/{table}/query",
                 json={"full_text_search": {"match_all": {}}},
                 timeout=10,
             )
+            last["full_text"] = (response.status_code, response.text)
             if response.status_code in (404, 503):
                 return False
             assert response.ok, response.text
@@ -96,6 +103,7 @@ def test_lite_server_backup_roundtrip_under_connection_root(tmp_path, schema_ver
                 },
                 timeout=10,
             )
+            last["dense"] = (vector.status_code, vector.text)
             if vector.status_code == 503:
                 return False
             assert vector.ok, vector.text
@@ -114,6 +122,7 @@ def test_lite_server_backup_roundtrip_under_connection_root(tmp_path, schema_ver
                 },
                 timeout=10,
             )
+            last["sparse"] = (sparse.status_code, sparse.text)
             if sparse.status_code == 503:
                 return False
             assert sparse.ok, sparse.text
@@ -123,7 +132,9 @@ def test_lite_server_backup_roundtrip_under_connection_root(tmp_path, schema_ver
             assert hits[0]["_id"] == "a", sparse.text
             return True
 
-        wait_until(ready, timeout_s=60, interval_s=0.1)
+        assert wait_until(ready, timeout_s=60, interval_s=0.1), (
+            f"{table}: {json.dumps(last)}"
+        )
         definition = requests.get(server.api_url + f"/tables/{table}", timeout=10)
         assert definition.ok, definition.text
         assert definition.json()["schema"]["version"] == schema_version, definition.text
@@ -199,13 +210,32 @@ def test_lite_server_backup_roundtrip_under_connection_root(tmp_path, schema_ver
                 {
                     "name": "sparse_vectors",
                     "kind": "sparse_vector",
-                    "config_json": json.dumps({"field": "embedding", "external": True}),
+                    "config_json": json.dumps(
+                        {
+                            "field": "embedding",
+                            **({} if legacy_sparse else {"external": True}),
+                        }
+                    ),
                 }
             )
         )
         cli("lite", "index", "create", seed, "--file", index)
         cli("lite", "batch", seed, "--file", batch)
         cli("lite", "run-until-idle", seed)
+        sparse_query = tmp_path / "sparse-query.json"
+        sparse_query.write_text(
+            json.dumps(
+                {
+                    "embeddings": {
+                        "sparse_vectors": {"indices": [10], "values": [1.0]}
+                    },
+                    "indexes": ["sparse_vectors"],
+                    "limit": 1,
+                }
+            )
+        )
+        initial = json.loads(cli("lite", "query", seed, "--file", sparse_query).stdout)
+        assert initial["responses"][0]["hits"]["hits"][0]["_id"] == "a", initial
         portable = tmp_path / "seed.afb"
         cli("lite", "backup", seed, "--out", portable)
         for name, source in [("from_file", seed), ("from_archive", portable)]:
