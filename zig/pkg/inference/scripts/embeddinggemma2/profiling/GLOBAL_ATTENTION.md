@@ -41,6 +41,14 @@ The arithmetic policy has a separate embedding identity. Results produced with
 this BF16 attention schedule must not reuse a pinned identity from another
 schedule merely because their final vectors are close.
 
+Attention GEMM plans use a 64-entry LRU cache. Hits promote the plan; a
+successful first submission replaces the least recently used entry when full.
+The cache lock covers submission and replacement so another caller cannot
+borrow an evicted host descriptor. Device buffers and workspace keep their
+separate stream and graph lifetimes. Capture misses decline before descriptor
+creation or eviction. Unsupported cuBLAS statuses decline to native/cuDNN
+attention; execution and other library errors still propagate.
+
 ## Reproduction
 
 Build from the worktree, retaining its own caches and `zig-out` prefix:
@@ -92,6 +100,66 @@ zig-out/bin/antfly-embeddinggemma2-global-bench \
 zig-out/bin/antfly-embeddinggemma2-global-bench \
   8192 128 evidence/global-concurrent.json none 2
 ```
+
+To exercise a long-lived saturated cache, use the same binary:
+
+```sh
+zig-out/bin/antfly-embeddinggemma2-global-bench \
+  --saturation evidence/global-saturation.json
+```
+
+This operator benchmark retains one context, stream and set of buffers
+throughout. The fresh and saturated phases each own a separate library handle.
+The saturated handle warms 40 distinct 32-token-padded lengths from 512 through
+1760 (including query tails) before its first 8192-token call. This prevents the
+old cache from retaining the target during the fresh phase. Each sample runs
+four global layers.
+The JSON retains the cold sample, two warmups and nine measured samples per
+phase, including synchronized wall time, CUDA-event time, cache hits, misses
+and evictions. Wall time includes host plan discovery. Outputs must stay
+finite and bit-identical before and after saturation. A retained SHA-256
+allows comparison across binaries. Outside the timed samples, the fresh handle
+also captures attention, warms the varied lengths to evict its plans, and
+requires bit-identical graph replay afterward. Compare the same harness
+against the old cache policy to measure the regression; these are operator
+timings rather than full-model or HTTP serving latencies.
+
+### Plan-cache saturation regression (2026-11-17)
+
+NVIDIA L4, driver 580.159.03, cuBLASLt 13.4.0.1, zero library workspace,
+SM89 kernels and Zig 0.17.0 ReleaseFast. Three alternating process rounds per
+arm, with nine measured samples per phase after three excluded samples.
+Each sample executes four 8192-token global layers. Medians pool 27 samples.
+
+| Cache policy | Fresh wall ms | Saturated wall ms | Heuristic selections per warmed saturated sample | Maximum cached plans |
+|---|---:|---:|---:|---:|
+| Original insertion guard | 63.11 | 63.23 | 512 | 64 |
+| LRU replacement | 63.19 | 63.26 | 0 | 64 |
+
+The original policy rediscovers both plans on every tile after saturation.
+LRU discovers two plans on the first target call and reuses them afterward.
+Removing that host work has no meaningful wall-time benefit in this isolated
+L4 campaign; both arms remain around 63 ms. These results do not establish a
+full-model serving latency improvement.
+
+The untimed graph check evicts 88 plans under LRU, including the captured
+attention plans, then replays with bit-identical output. All six processes
+retain the same output hash. The two added fault/saturation regressions fail
+under the original policies and pass with the fixes. All 17 focused tests pass
+in both CUDA and CPU builds, and the CUDA-enabled inference type check passes.
+Separate 513-token masked two-context and 8192-token unmasked operator checks
+also pass the existing FP64 oracle and determinism gates.
+
+To reproduce the old-policy arm, restore the original
+`if (use_cache and self.attention_plans.count() < 64)` insertion guard and remove
+the replacement block, retaining the harness and counters. Save that binary,
+rebuild with LRU, and alternate process runs of the two binaries. The baseline
+used here also restores the original generic status check; no unsupported
+status occurs during GPU measurements.
+
+[Machine-readable results](global-attention-plan-cache-l4.json) retain source
+and binary hashes, timing scope, run order and per-round results. Raw artifacts
+remain under `evidence/pr1732-review/` in the worktree.
 
 These direct timings cover embedding lookup through synchronized normalized
 vector readback. They exclude tokenization, HTTP, model loading and warmup.

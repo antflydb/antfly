@@ -58,6 +58,11 @@ fn worker(data: ?*anyopaque) callconv(.c) ?*anyopaque {
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(A);
     defer A.free(args);
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--saturation")) {
+        const report = try runSaturation();
+        defer A.free(report);
+        return std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[2], .data = report });
+    }
     if (args.len < 4 or args.len > 6) return error.ExpectedSequenceTileOutputMaskWorkers;
     const n = try std.fmt.parseInt(usize, args[1], 10);
     const tile = try std.fmt.parseInt(usize, args[2], 10);
@@ -96,6 +101,163 @@ pub fn main(init: std.process.Init) !void {
         defer A.free(report);
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[3], .data = report });
     } else return error.InvalidWorkerCount;
+}
+
+fn now() !u64 {
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return error.ClockFailed;
+    return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
+}
+
+const SaturationSample = struct {
+    wall_ms: f64,
+    gpu_ms: f64,
+    hits: usize,
+    misses: usize,
+    evictions: usize,
+};
+
+// One context, stream and set of buffers throughout; each phase owns a fresh
+// handle. The saturated handle sees all warm lengths before its first 8192
+// call, so even a non-evicting cache cannot retain that target from warmup.
+fn runSaturation() ![]u8 {
+    const n = 8192;
+    var ctx = try Context.initDefault();
+    defer ctx.deinit();
+    var module = try Encoder.Module.init(&ctx);
+    defer module.deinit(&ctx);
+    const hq = try A.alloc(u16, n * 4 * 512);
+    defer A.free(hq);
+    const hk = try A.alloc(u16, n * 512);
+    defer A.free(hk);
+    const hv = try A.alloc(u16, n * 512);
+    defer A.free(hv);
+    var rng = std.Random.DefaultPrng.init(1732);
+    const random = rng.random();
+    for (hq) |*x| x.* = bf16((random.float(f32) - 0.5) * 0.1);
+    for (hk) |*x| x.* = bf16((random.float(f32) - 0.5) * 0.1);
+    for (hv) |*x| x.* = bf16(random.float(f32) - 0.5);
+    var q = try upload(&ctx, std.mem.sliceAsBytes(hq));
+    defer q.free(&ctx);
+    var k = try upload(&ctx, std.mem.sliceAsBytes(hk));
+    defer k.free(&ctx);
+    var v = try upload(&ctx, std.mem.sliceAsBytes(hv));
+    defer v.free(&ctx);
+    var output = try Buffer.alloc(&ctx, hq.len * 2);
+    defer output.free(&ctx);
+    var scratch = try Buffer.alloc(&ctx, 26 * 1024 * 1024);
+    defer scratch.free(&ctx);
+    var workspace = try Buffer.alloc(&ctx, (@import("antfly_platform").env.getenvUsize("ANTFLY_GLOBAL_BENCH_WORKSPACE_MB") orelse 0) * 1024 * 1024);
+    defer workspace.free(&ctx);
+    const reference = try A.alloc(u16, hq.len);
+    defer A.free(reference);
+    const actual = try A.alloc(u16, hq.len);
+    defer A.free(actual);
+    var lengths: [40]usize = undefined;
+    for (&lengths, 0..) |*length, i| length.* = 512 + i * 32;
+    var samples: [2][12]SaturationSample = undefined;
+    var counts: [2]usize = undefined;
+    var final_counts: [2]usize = undefined;
+    var total_evictions: [2]usize = undefined;
+    var graph_plan_evictions: usize = 0;
+    for (0..2) |phase| {
+        var blas = try Blas.openWithAllocator(A, &ctx);
+        defer blas.deinit();
+        blas.attention_plan_cache_enabled = true;
+        if (phase == 1) {
+            for (lengths) |length| {
+                try Global.execute(&ctx, &module, &blas, output, q, k, v, .{}, length, scratch, workspace, Global.queryTile(length), null);
+            }
+            try ctx.synchronize();
+            if (blas.attention_plans.count() != 64) return error.CacheNotSaturated;
+        }
+        counts[phase] = blas.attention_plans.count();
+        // First sample includes cold discovery. Then two warmups and nine
+        // measured samples, each simulating all four global-attention layers.
+        for (&samples[phase]) |*sample| {
+            const hits = blas.attention_plan_cache_hits;
+            const misses = blas.attention_plan_cache_misses;
+            const evictions = blas.attention_plan_cache_evictions;
+            const start = try now();
+            const pair = try ctx.beginProfileEventPair();
+            for (0..4) |_| try Global.execute(&ctx, &module, &blas, output, q, k, v, .{}, n, scratch, workspace, Global.queryTile(n), null);
+            const gpu_us = try ctx.endProfileEventPairUs(pair);
+            try ctx.synchronize();
+            sample.* = .{
+                .wall_ms = @as(f64, @floatFromInt(try now() - start)) / 1e6,
+                .gpu_ms = @as(f64, @floatFromInt(gpu_us)) / 1000,
+                .hits = blas.attention_plan_cache_hits - hits,
+                .misses = blas.attention_plan_cache_misses - misses,
+                .evictions = blas.attention_plan_cache_evictions - evictions,
+            };
+        }
+        final_counts[phase] = blas.attention_plans.count();
+        total_evictions[phase] = blas.attention_plan_cache_evictions;
+        try output.copyToHost(&ctx, std.mem.sliceAsBytes(if (phase == 0) reference else actual));
+        try ctx.synchronize();
+        if (phase == 0) {
+            // Host descriptor eviction must also preserve already captured
+            // device work. This validation runs outside the timing samples.
+            try ctx.beginStreamCapture(@import("ops/cuda/driver.zig").CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+            var capturing = true;
+            defer if (capturing) {
+                const abandoned = ctx.endStreamCapture() catch null;
+                ctx.destroyGraph(abandoned);
+            };
+            try Global.execute(&ctx, &module, &blas, output, q, k, v, .{}, n, scratch, workspace, Global.queryTile(n), null);
+            const graph = try ctx.endStreamCapture();
+            capturing = false;
+            defer ctx.destroyGraph(graph);
+            const exec = try ctx.instantiateGraph(graph);
+            defer ctx.destroyGraphExec(exec);
+            const evictions = blas.attention_plan_cache_evictions;
+            for (lengths) |length| {
+                try Global.execute(&ctx, &module, &blas, output, q, k, v, .{}, length, scratch, workspace, Global.queryTile(length), null);
+            }
+            graph_plan_evictions = blas.attention_plan_cache_evictions - evictions;
+            try ctx.launchGraph(exec);
+            try output.copyToHost(&ctx, std.mem.sliceAsBytes(actual));
+            try ctx.synchronize();
+            if (!std.mem.eql(u16, reference, actual)) return error.EvictedPlanGraphOutputDrift;
+        }
+    }
+    if (!std.mem.eql(u16, reference, actual)) return error.SaturationOutputDrift;
+    for (actual) |x| if (!std.math.isFinite(float(x))) return error.NonFiniteOutput;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(actual), &digest, .{});
+    const hash = std.fmt.bytesToHex(digest, .lower);
+    var wall_medians: [2]f64 = undefined;
+    var gpu_medians: [2]f64 = undefined;
+    for (0..2) |phase| {
+        var wall: [9]f64 = undefined;
+        var gpu: [9]f64 = undefined;
+        for (samples[phase][3..], 0..) |sample, i| {
+            wall[i] = sample.wall_ms;
+            gpu[i] = sample.gpu_ms;
+        }
+        wall_medians[phase] = median(&wall);
+        gpu_medians[phase] = median(&gpu);
+    }
+    std.debug.print("global MQA saturation: fresh={d}ms saturated={d}ms (wall), fresh={d}ms saturated={d}ms (GPU)\n", .{ wall_medians[0], wall_medians[1], gpu_medians[0], gpu_medians[1] });
+    return std.json.Stringify.valueAlloc(A, .{
+        .device = ctx.info.nameSlice(),
+        .driver_version = ctx.info.driver_version,
+        .sequence = n,
+        .layers_per_sample = 4,
+        .warm_lengths = lengths,
+        .workspace_bytes = workspace.len,
+        .cache_counts_before = counts,
+        .fresh = samples[0],
+        .saturated = samples[1],
+        .wall_median_ms = wall_medians,
+        .gpu_median_ms = gpu_medians,
+        .final_cache_count = final_counts,
+        .total_evictions = total_evictions,
+        .bitwise_equal = true,
+        .graph_plan_evictions = graph_plan_evictions,
+        .graph_replay_bitwise_equal = true,
+        .sha256 = hash,
+    }, .{ .whitespace = .indent_2 });
 }
 fn runCase(n: usize, tile: usize, mask_kind: []const u8) !Result {
     const layout = try Global.Layout.init(n, tile);

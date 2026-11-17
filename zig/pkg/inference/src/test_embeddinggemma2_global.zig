@@ -15,6 +15,7 @@
 
 const std = @import("std");
 test {
+    std.testing.refAllDecls(@import("ops/cuda/cublaslt.zig"));
     std.testing.refAllDecls(@import("ops/cuda/embedding_gemma2_global.zig"));
     std.testing.refAllDecls(@import("ops/cuda/embedding_gemma2_execution.zig"));
     std.testing.refAllDecls(@import("ops/cuda/embedding_gemma2_policy.zig"));
