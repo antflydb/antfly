@@ -6310,7 +6310,12 @@ test "capi SQL maintenance advances every captured full text prefix during stead
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json.ptr.?[0..json.len], .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value.object.get("index_replay_debt").?.array.items.len != 0);
-        try std.testing.expect(parsed.value.object.get("background_publications").?.object.get("rebased").?.integer > 0);
+        // Publications reach the writer while the foreground keeps moving its
+        // tip. (Snapshots now adopt the writer's tip after each forwarded
+        // write instead of being rebased at admission, so `rebased` no
+        // longer measures this; lite-writer-authority.md §4.2.)
+        const publications = parsed.value.object.get("background_publications").?.object;
+        try std.testing.expect(publications.get("attempts").?.integer > publications.get("refused").?.integer);
     }
     try std.testing.expectEqual(@as(usize, 4), append.count);
 }

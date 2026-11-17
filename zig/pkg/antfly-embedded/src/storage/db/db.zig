@@ -6462,7 +6462,8 @@ pub const DB = struct {
         // something. Best-effort: close must still proceed if this fails --
         // see `lite close: final durability sync failed` below for the same
         // tolerance later in this function.
-        if (executor_ready) self.core.syncStore(true) catch |err| {
+        // A read-only open has nothing queued and its store refuses sync.
+        if (executor_ready and !openModeRequiresReadOnlyBackends(self.open_mode)) self.core.syncStore(true) catch |err| {
             std.log.warn("close-time store sync before executor shutdown failed err={s}", .{@errorName(err)});
         };
         // Derived full-text publishers may be asleep in merge backpressure

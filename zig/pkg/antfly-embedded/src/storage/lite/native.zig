@@ -5104,6 +5104,11 @@ pub const PathWriterLock = struct {
     /// owner that may since have closed.
     hold_stats: ?*LeaseTiming = null,
     hold_started_ns: i96 = 0,
+    /// Set on a lease the writer authority lent out
+    /// (lite-writer-authority.md W2): `close` hands the lease back to it
+    /// instead of releasing the cross-process lock, so every existing
+    /// `close` of a lent lease returns it to the one holder.
+    return_to: ?ReturnTo = null,
 
     /// Starts hold accounting for the current holder.
     pub fn startHold(self: *PathWriterLock, stats: *LeaseTiming) void {
@@ -5147,7 +5152,22 @@ pub const PathWriterLock = struct {
         return true;
     }
 
+    pub const ReturnTo = struct {
+        ptr: *anyopaque,
+        give_back: *const fn (*anyopaque, PathWriterLock) void,
+    };
+
     pub fn close(self: *PathWriterLock) void {
+        if (self.return_to) |owner| {
+            if (self.reader_registration_batch) |batch| batch.end();
+            self.reader_registration_batch = null;
+            self.endHold();
+            var lease = self.*;
+            lease.return_to = null;
+            self.* = undefined;
+            owner.give_back(owner.ptr, lease);
+            return;
+        }
         if (self.reader_registration_batch) |batch| batch.end();
         const io = self.borrowed_io orelse self.io_impl.io();
         if (self.file) |f| f.close(io);

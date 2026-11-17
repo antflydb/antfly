@@ -3191,6 +3191,13 @@ pub const Store = struct {
     /// lease at all, or while a maintenance snapshot (a second NativeFile
     /// on the same inode) held the writer and was publishing.
     background_write_admission: ?BackgroundWriteAdmission = null,
+    /// Set on a maintenance snapshot's store (lite-writer-authority.md
+    /// W1, W3): the snapshot computes on its own pinned state, but every
+    /// write it makes -- queued commits and direct store maintenance -- is
+    /// applied by the store `resolve` returns, the owner's one writable
+    /// instance on this inode. The snapshot's own file never begins a
+    /// transaction.
+    write_target: ?WriteTarget = null,
     /// How long `maybeCheckpointRedoLogOnIdleTurn`'s opportunistic fold
     /// (no byte-capacity pressure, `threshold_due` false) waits for
     /// genuine quiet before running, separate from `ride_along_idle_ns`
@@ -4397,6 +4404,13 @@ pub const Store = struct {
     /// open `Txn`/the writer slot -- blocking that same thread on its own,
     /// never-to-be-released hold deadlocked it).
     fn maintainOnceWithCancel(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken, from_background_worker: bool) !void {
+        if (self.forwardedWriter()) |writer| {
+            if (self.writer_admission) |admission| try admission.enter(admission.ptr, .allocator_service);
+            defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+            try writer.maintainOnceWithCancel(force, cancel, from_background_worker);
+            self.adoptWriterTip(writer);
+            return;
+        }
         if (self.read_only) return;
         // External owners also defer requested allocator-format conversion to
         // this detached maintenance turn. Vacuum uses the same short capture
@@ -4852,6 +4866,13 @@ pub const Store = struct {
     }
 
     pub fn vacuumWithCancel(self: *Store, cancel: ?*const @import("../maintenance.zig").CancelToken) !native.VacuumReport {
+        if (self.forwardedWriter()) |writer| {
+            if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
+            defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+            const report = try writer.vacuumWithCancel(cancel);
+            self.adoptWriterTip(writer);
+            return report;
+        }
         // See the matching comment in `maintainOnceWithCancel`: captured
         // before the run, not re-derived from "now" once it returns.
         const vacuum_started = self.maintenance_policy.snapshot();
@@ -5408,6 +5429,10 @@ pub const Store = struct {
     pub const Ticket = struct {
         store: *Store,
         request: *MutationRequest,
+        /// The forwarding store this request came from, if any (see
+        /// `Store.write_target`): it adopts `store`'s tip once the request
+        /// commits.
+        origin: ?*Store = null,
 
         /// Block until this ticket's group is durable (or has failed). The
         /// request is heap-owned by the ticket and freed here; a ticket must
@@ -5486,6 +5511,7 @@ pub const Store = struct {
             self.store.commit_mutex.unlock(io);
             self.store.allocator.destroy(self.request);
             try result;
+            if (self.origin) |origin| origin.adoptWriterTip(self.store);
             return sequence;
         }
     };
@@ -5503,6 +5529,7 @@ pub const Store = struct {
         store: *Store,
         request: *MutationRequest,
         become_leader: bool,
+        origin: ?*Store = null,
 
         /// Drains the queue if this caller is its leader; otherwise a no-op
         /// (another thread, leader of the queue this request joined, will
@@ -5524,7 +5551,7 @@ pub const Store = struct {
         }
 
         pub fn ticket(self: Staged) Ticket {
-            return .{ .store = self.store, .request = self.request };
+            return .{ .store = self.store, .request = self.request, .origin = self.origin };
         }
     };
 
@@ -5536,6 +5563,11 @@ pub const Store = struct {
 
     fn enqueueRequest(self: *Store, plan: MutationPlan, ride_along: bool) !Staged {
         if (self.read_only) return error.ReadOnly;
+        if (self.forwardedWriter()) |writer| {
+            var staged = try writer.enqueueRequest(plan, ride_along);
+            staged.origin = self;
+            return staged;
+        }
         const io = self.file.runtime();
         const request = try self.allocator.create(MutationRequest);
         request.* = .{
@@ -5587,6 +5619,40 @@ pub const Store = struct {
     /// member, so durability stays prefix-ordered. `plan.durable` is
     /// ignored (always treated as non-durable); `plan.context` must stay
     /// valid until the returned ticket resolves.
+    pub const WriteTarget = struct {
+        ptr: *anyopaque,
+        resolve: *const fn (*anyopaque) ?*Store,
+    };
+
+    /// The store this one's writes are applied by, when that is another
+    /// store. See `write_target`.
+    pub fn forwardedWriter(self: *Store) ?*Store {
+        const target = self.write_target orelse return null;
+        const writer = target.resolve(target.ptr) orelse return null;
+        return if (writer == self) null else writer;
+    }
+
+    /// Bring this (forwarding) store's read state up to `writer`'s tip after
+    /// one of its forwarded writes landed there, so the code that made the
+    /// write reads it back. Both instances share the inode's redo overlay,
+    /// so adopting the header and redo sequences is enough. Never holds both
+    /// store locks at once.
+    pub fn adoptWriterTip(self: *Store, writer: *Store) void {
+        lockStoreExclusive(writer);
+        const header = writer.file.header;
+        const redo_sequences: ?[2]u64 = if (writer.file.redo) |redo| .{ redo.durable_sequence, redo.checkpoint_sequence } else null;
+        writer.mutex.unlock();
+        lockStoreExclusive(self);
+        defer self.mutex.unlock();
+        self.file.adoptIndexPublicationHeader(header) catch return;
+        if (redo_sequences) |sequences| if (self.file.redo) |*redo| {
+            redo.durable_sequence = @max(redo.durable_sequence, sequences[0]);
+            redo.checkpoint_sequence = @max(redo.checkpoint_sequence, sequences[1]);
+        };
+        self.assessment_cache = null;
+        self.publishReadCheckpointAssumeLocked();
+    }
+
     pub const BackgroundWriteAdmission = struct {
         ptr: *anyopaque,
         try_enter: *const fn (*anyopaque) bool,
@@ -5846,6 +5912,11 @@ pub const Store = struct {
     pub fn checkpointRedoLog(self: *Store) !void {
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, .allocator_service);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+        if (self.forwardedWriter()) |writer| {
+            try writer.checkpointRedoLog();
+            self.adoptWriterTip(writer);
+            return;
+        }
         lockStoreExclusive(self);
         defer self.mutex.unlock();
         if (self.maintenance_running or self.generation_workspace_active or self.multi_commit_sequence_active or self.file.change_capture != null) return error.FileBusy;
@@ -5860,9 +5931,19 @@ pub const Store = struct {
     /// `maintainOnceWithCancel`'s retirement/reclaim step, which this
     /// mirrors.
     fn maybeCheckpointRedoLogOnIdleTurn(self: *Store) void {
-        if (self.read_only) return;
         if (!self.enterBackgroundWrite()) return;
         defer self.leaveBackgroundWrite();
+        self.foldIdleRedoLog();
+    }
+
+    /// The idle fold itself, for a caller that already holds this
+    /// process's writer lease: the store's own idle turn, or (for a
+    /// lease-managed store, whose own turn never writes, see
+    /// `background_write_admission`) the writer authority before it
+    /// releases an idle lease (lite-writer-authority.md §4.3).
+    pub fn foldIdleRedoLog(self: *Store) void {
+        if (self.read_only) return;
+        if (self.forwardedWriter() != null) return;
         if (self.writer_admission) |admission| admission.enter(admission.ptr, .allocator_service) catch return;
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStoreExclusive(self);
@@ -6172,6 +6253,7 @@ pub const Store = struct {
         if (self.read_only) return error.ReadOnly;
         if (self.writer_admission) |admission| try admission.enter(admission.ptr, .index);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+        if (self.forwardedWriter()) |writer| return writer.syncIndexContents();
         // Exclusive: self.file.sync() below can itself publish a checkpoint
         // (when durable_header is pending), so it must never run during
         // another commit's released sync window -- see `lockStoreExclusive`.
@@ -7218,7 +7300,9 @@ pub const Txn = struct {
             // different `NativeFile` instance on the same inode from
             // beginning its own transaction while this one's commit is
             // still in flight.
-            const admission_store: ?*Store = if (self.staged) |staged| staged.store else if (self.ride_along_ticket) |ticket| ticket.store else null;
+            // The admission was taken on the store this transaction opened on,
+            // which is the forwarding store when its request was forwarded.
+            const admission_store: ?*Store = if (self.staged) |staged| (staged.origin orelse staged.store) else if (self.ride_along_ticket) |ticket| (ticket.origin orelse ticket.store) else null;
             defer if (admission_store) |store| store.releaseAdmissionOnly();
             var sequence: u64 = 0;
             if (self.staged) |staged| {

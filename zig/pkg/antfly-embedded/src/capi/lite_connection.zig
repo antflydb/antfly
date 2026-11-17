@@ -230,7 +230,7 @@ pub const PreparedPublication = struct {
         self.owner.gate.mutex.lockUncancelable(io);
         defer self.owner.gate.mutex.unlock(io);
         if (self.owner.stopping.load(.acquire)) return error.Canceled;
-        var lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
+        var lease = try self.owner.acquireMaintenancePathLeaseAssumeLocked();
         defer lease.close();
         // Validate source namespace/catalog and replacement generation before
         // opening destination intents. Foreground recovery cannot observe or
@@ -1140,6 +1140,9 @@ pub const WriterLane = struct {
     /// that commit. The next local checkout, or `maintainParkedLease`,
     /// drains the store and hands the lease over.
     foreign_release_due: bool = false,
+    /// Set once `Owner.deinit` starts: nothing will hand a parked lease
+    /// off again, so a lent lease's `close` releases it instead.
+    closing: bool = false,
 
     const poll_initial_ns: i96 = 50 * std.time.ns_per_us;
     const poll_max_ns: i96 = 2 * std.time.ns_per_ms;
@@ -1480,6 +1483,180 @@ pub const WriterLane = struct {
         self.mutex.unlock(io);
     }
 
+    pub const MaintenanceCheckout = union(enum) {
+        /// Another holder has the lane checked out.
+        busy,
+        /// The lane is now checked out to the caller; no lease is parked,
+        /// so the caller acquires one and lends it via `lendLease`.
+        fresh,
+        /// The lane is checked out to the caller with its parked lease.
+        parked: native.PathWriterLock,
+        /// Like `parked`, but another process has waited past its fairness
+        /// quantum: the caller drains, releases the lease, and acquires
+        /// a fresh one through the fair queue.
+        overdue: native.PathWriterLock,
+    };
+
+    /// lite-writer-authority.md W2: maintenance checks the lane out like
+    /// any other writer instead of taking its lease around it.
+    pub fn beginMaintenanceCheckout(self: *WriterLane) MaintenanceCheckout {
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.checked_out) return .busy;
+        self.checked_out = true;
+        const lease = self.parked orelse return .fresh;
+        self.parked = null;
+        self.parked_store = null;
+        if (self.foreign_release_due) {
+            self.foreign_release_due = false;
+            return .{ .overdue = lease };
+        }
+        return .{ .parked = lease };
+    }
+
+    /// Marks a lease this lane checked out so its `close` parks it back here.
+    pub fn lendLease(self: *WriterLane, lease: *native.PathWriterLock) void {
+        lease.return_to = .{ .ptr = self, .give_back = returnLease };
+    }
+
+    pub const Borrowed = struct {
+        lease: native.PathWriterLock,
+        source: enum { handoff, uncontended, queued },
+    };
+
+    /// lite-writer-authority.md W2: the one way a caller outside `checkout`
+    /// gets this process's writer lease. Checks the lane out and lends its
+    /// lease, reusing a parked or gate-retained one and acquiring through
+    /// the fair queue only when this process holds none. Caller holds
+    /// `gate`; it is released while another local holder has the lane,
+    /// because a holder on `checkout`'s cold path takes the gate before it
+    /// checks in. `unconditional` waits out a local holder with no
+    /// deadline (see `checkout`); it never bounds a foreign wait.
+    pub fn borrowLease(self: *WriterLane, owner: *Owner, gate: *QueuedMutex, deadline: i96, unconditional: bool, connection: ?*Connection) !Borrowed {
+        const io = h.handleLockIo();
+        var backoff_ns: i96 = poll_initial_ns;
+        while (true) {
+            if (gate.takeRetained()) |held| {
+                var lease = held;
+                // A retained lease is this process's only one. One already
+                // lent keeps its lane checkout; otherwise take the lane.
+                if (lease.return_to == null) switch (self.beginMaintenanceCheckout()) {
+                    .fresh => self.lendLease(&lease),
+                    .busy => {},
+                    .parked, .overdue => |parked| {
+                        var extra = parked;
+                        extra.close();
+                        self.lendLease(&lease);
+                    },
+                };
+                return .{ .lease = lease, .source = .handoff };
+            }
+            switch (self.beginMaintenanceCheckout()) {
+                .parked => |held| {
+                    var lease = held;
+                    self.lendLease(&lease);
+                    if (owner.currentStore()) |store| store.ensureDurableForReuse();
+                    return .{ .lease = lease, .source = .handoff };
+                },
+                .overdue => |held| {
+                    var lease = held;
+                    // Drain only; see `releaseBorrowed`.
+                    if (owner.currentStore()) |store| store.ensureDurableForReuse();
+                    lease.close();
+                    break;
+                },
+                .fresh => break,
+                .busy => {
+                    const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+                    if (!unconditional and remaining <= 0) return error.FileBusy;
+                    const wait_ns = if (unconditional) @min(backoff_ns, poll_max_ns) else @min(backoff_ns, remaining);
+                    const epoch = self.release_epoch.load(.acquire);
+                    gate.unlock(io);
+                    io.futexWaitTimeout(u32, &self.release_epoch.raw, epoch, .{ .duration = .{ .raw = .fromNanoseconds(@intCast(wait_ns)), .clock = .awake } }) catch {};
+                    gate.lockUncancelable(io);
+                    backoff_ns = @min(backoff_ns * 2, poll_max_ns);
+                    if (owner.stopping.load(.acquire)) return error.Canceled;
+                },
+            }
+        }
+        // The lane is checked out to this call and the process holds no
+        // lease: acquire one through the fair queue and lend it.
+        if (comptime h.builtin.is_test) if (connection) |c| if (c.test_path_lease_busy) |hook| {
+            // Tests observe the point where admission would start waiting:
+            // only after a failed attempt with budget left.
+            if (native.lockWriterPathWithIo(alloc, io, c.path)) |got| {
+                var lease = got;
+                if (owner.currentStore()) |store| store.ensureDurableForReuse();
+                self.lendLease(&lease);
+                return .{ .lease = lease, .source = .uncontended };
+            } else |err| {
+                if ((err != error.WouldBlock and err != error.FileBusy) or deadline - std.Io.Clock.awake.now(io).nanoseconds <= 0) {
+                    self.clearCheckedOutByMaintenance();
+                    return if (err == error.WouldBlock) error.FileBusy else err;
+                }
+                hook.notify(hook.ptr);
+            }
+        };
+        var held = native.fairWriterLockWithIo(alloc, io, owner.path_lock_io.io(), owner.path, deadline) catch |err| {
+            self.clearCheckedOutByMaintenance();
+            return err;
+        };
+        if (owner.currentStore()) |store| store.ensureDurableForReuse();
+        self.lendLease(&held);
+        return .{ .lease = held, .source = if (held.contended) .queued else .uncontended };
+    }
+
+    /// Gives a borrowed lease up for good instead of parking it (W5: drained
+    /// first), for a holder about to run long work that must not keep
+    /// other processes out, such as the detached allocator proof walk.
+    /// A lease this lane did not lend is just closed.
+    pub fn releaseBorrowed(self: *WriterLane, owner: *Owner, lease: *native.PathWriterLock) void {
+        const lent = if (lease.return_to) |to| to.ptr == @as(*anyopaque, self) else false;
+        if (!lent) return lease.close();
+        // Drain only: a full `sync` can enter maintenance writer admission,
+        // which takes the gate this caller already holds.
+        if (owner.currentStore()) |store| store.ensureDurableForReuse();
+        lease.return_to = null;
+        lease.close();
+        const io = h.handleLockIo();
+        self.mutex.lockUncancelable(io);
+        self.checked_out = false;
+        self.mutex.unlock(io);
+        self.signalReleased(io);
+    }
+
+    /// `PathWriterLock.ReturnTo.give_back`: a lent lease's `close` parks it
+    /// and checks the lane back in, with the same foreign-fairness rule as
+    /// a foreground `checkin`.
+    fn returnLease(ptr: *anyopaque, lease: native.PathWriterLock) void {
+        const self: *WriterLane = @ptrCast(@alignCast(ptr));
+        const owner: *Owner = @fieldParentPtr("writer_lane", self);
+        const io = h.handleLockIo();
+        const own_pid = antfly_platform.process.currentId() orelse 0;
+        self.mutex.lockUncancelable(io);
+        if (self.closing) {
+            self.checked_out = false;
+            self.mutex.unlock(io);
+            var released = lease;
+            released.close();
+            self.signalReleased(io);
+            return;
+        }
+        const now = std.Io.Clock.awake.now(io).nanoseconds;
+        if (lease.othersWaitingAcrossProcesses(own_pid) and now - lease.acquired_ns >= foreign_fairness_quantum_ns) self.foreign_release_due = true;
+        self.parked = lease;
+        self.parked_since_ns = now;
+        self.parked_store = if (owner.current) |current| current.owned_lite_backend.?.native_docstore else null;
+        self.last_root = owner.current;
+        self.checked_out = false;
+        self.mutex.unlock(io);
+        self.signalReleased(io);
+        // A timed loop wait re-reads the parked-lease timer on its own; a
+        // lease returned by a maintenance turn must not wake another turn.
+        if (owner.loop_may_park.load(.seq_cst)) self.wakeOwnerForParkedLease(io);
+    }
+
     pub fn clearCheckedOutByMaintenance(self: *WriterLane) void {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
@@ -1746,17 +1923,25 @@ pub const WriterLane = struct {
         }
         self.parked = null;
         self.foreign_release_due = false;
+        self.checked_out = true;
         const store = self.parked_store;
         self.parked_store = null;
         self.mutex.unlock(io);
         // Commits staged under this lease (ride-along groups, or a group a
         // writer drives after checking the lane in) must finish before the
-        // lease goes.
+        // lease goes. An idle release also folds the redo log, since the
+        // store's own idle turn never writes (lite-writer-authority.md
+        // §4.3); a foreign handoff skips the fold to keep its turn short.
         if (store) |held_store| {
             held_store.ensureDurableForReuse();
+            if (!foreign_overdue) held_store.foldIdleRedoLog();
             held_store.sync() catch {};
         }
         lease.close();
+        self.mutex.lockUncancelable(io);
+        self.checked_out = false;
+        self.mutex.unlock(io);
+        self.signalReleased(io);
         return null;
     }
 };
@@ -1840,6 +2025,10 @@ pub const Owner = struct {
     path_lock_io: std.Io.Threaded,
     test_maintenance_wait_ns: if (h.builtin.is_test) ?i96 else void = if (h.builtin.is_test) null else {},
     stopping: std.atomic.Value(bool) = .init(false),
+    /// Set while `maintenanceLoop` may sleep with no timeout. Raised before
+    /// the loop reads the lane's parked-lease timer, so a lease parked after
+    /// that read (`WriterLane.returnLease`) sees it and wakes the loop.
+    loop_may_park: std.atomic.Value(bool) = .init(false),
     // One graph walk per owner. Admission waits without the foreground gate;
     // the worker only try-locks under that gate and yields to an active proof.
     allocator_proof_mutex: std.Io.Mutex = .init,
@@ -1897,6 +2086,13 @@ pub const Owner = struct {
     maintenance_snapshot: ?*h.Handle = null,
     maintenance_table_cursor: usize = 0,
     maintenance_round_pending: bool = false,
+    /// A maintenance turn's writes landed on the current root's store
+    /// (lite-writer-authority.md W1/W3: snapshots forward their writes).
+    /// The file is current, but the foreground DB's in-memory runtime
+    /// (catalogs, index manager, derived progress) still reflects the state
+    /// before them, so the next `refresh` replaces the generation instead of
+    /// taking a fast path.
+    foreground_runtime_stale: bool = false,
     maintenance_round_ttl_pending: bool = false,
     maintenance_capture_misses: u8 = 0,
     // Connection-owner lifetime totals, protected by the path gate. They survive
@@ -2121,7 +2317,7 @@ pub const Owner = struct {
             // An uncertain publication can fail before writing anything, so an
             // unchanged header does not prove the runtime is reusable: reopen
             // to reconcile from durable state.
-            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and std.meta.eql(probe.header, file.header)) {
+            if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and std.meta.eql(probe.header, file.header)) {
                 if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 return current;
@@ -2138,7 +2334,7 @@ pub const Owner = struct {
             // prove no primary/index root moved; that is sufficient on a
             // non-redo file, which has no logical watermark separate from
             // the physical one for `sequence_unchanged` to protect.
-            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
+            if (!self.foreground_runtime_stale and current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and (sequence_unchanged or file.redo == null) and
                 try file.runtimeMetadataUnchanged(&probe) and try loadedIndexInputsUnchanged(current, file, &probe))
             {
                 // Lease bookkeeping and unpublished shadow files do not change
@@ -2288,6 +2484,10 @@ pub const Owner = struct {
         // comment): this is `self.current`'s only other reassignment point
         // besides `Owner.create`'s own initial open.
         replacement.owned_lite_backend.?.native_docstore.?.file.lease_managed = true;
+        // The outgoing root's store is the writer (W1): nothing staged on it
+        // may still be draining when it is replaced (W5).
+        if (self.current) |outgoing| if (outgoing.owned_lite_backend.?.native_docstore) |outgoing_store| outgoing_store.ensureDurableForReuse();
+        self.foreground_runtime_stale = false;
         self.current = replacement;
         for (self.connections.items) |connection| {
             connection.current = replacement;
@@ -2624,123 +2824,41 @@ pub const Owner = struct {
         return held;
     }
 
+    fn currentStore(self: *Owner) ?*NativeStore {
+        const current = self.current orelse return null;
+        return current.owned_lite_backend.?.native_docstore;
+    }
+
     /// Caller holds the owner gate. Captures and validated publications need
     /// turns alongside foreground writers, otherwise a continuously occupied
     /// kernel queue prevents index replay from ever acquiring its lease.
     /// Reclamation and detached-proof reacquisition remain nonblocking.
-    ///
-    /// Checks `writer_lane.takeParkedForRoot` right after `takeRetained`,
-    /// before ever falling back to a fresh `fairWriterLockWithIo` call:
-    /// a foreground write just before this one leaves its own lease
-    /// *parked* on the lane (not released -- see `WriterLane.checkin`'s
-    /// own doc comment), and with no other process or in-process waiter
-    /// around to ever trigger that lane's release condition, a fresh
-    /// acquisition attempt here would wait out its own full budget on a
-    /// `writer_holder` this same process is already holding and has no
-    /// other reason to ever let go of -- the region-mode shape of the
-    /// same self-deadlock `takeParkedForStore` already guards the
-    /// regular write path against.
-    ///
-    /// NOTE (perf/lwa-go-busy, fixed by perf/lwa-park-release): the
-    /// same-process self-conflict described here -- `takeParkedForRoot
-    /// (self.current)` missing because a commit just moved `self.current`
-    /// while the lane's own `last_root` lagged, and this call's own
-    /// gate-holding block then waiting out the fresh acquisition's full
-    /// budget with every other admission on this path stuck behind it --
-    /// is now covered by the `takeParkedAnyRoot` fallback below. The
-    /// go-busy attempt additionally dropped `self.gate.mutex` around the
-    /// fresh acquisition fallback and regressed `TestConcurrentCallsOnOneHandle`;
-    /// this fix does not touch the gate at all, only adds the one
-    /// same-process-safe fallback lookup `takeParkedAnyRoot` itself exists
-    /// for (see its own doc comment: the kernel lease is valid regardless
-    /// of which in-memory generation it was parked against -- only the
-    /// lane's own cached root metadata can be stale, never the lease).
+    /// The lease is borrowed from the writer lane (`WriterLane.borrowLease`,
+    /// lite-writer-authority.md W2), so closing it parks it back there.
     fn acquireMaintenancePathLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
         if (self.stopping.load(.acquire)) return error.Canceled;
         const io = h.handleLockIo();
         const stats = &self.publication_stats.maintenance_lease;
-        if (self.gate.mutex.takeRetained()) |held| {
-            var lease = held;
-            stats.recordAcquired(.handoff, 0);
-            wal_trace.recordOp(.maintenance_lease_acquired);
-            lease.startHold(stats);
-            return self.withReadRegistrationBatch(lease);
-        }
-        if (self.writer_lane.takeParkedForRoot(self.current)) |held| {
-            var lease = held;
-            // The foreground write that parked this lease may have staged
-            // ride-along work (enrichment/catalog bookkeeping) still
-            // sitting undriven in the store's own group-commit queue --
-            // nobody drives a ride-along request but a foreground leader,
-            // the idle-flush timer, or this exact barrier (`store
-            // .ensureDurableForReuse`, really just `forceDrainDurable`).
-            // Drain it now, before this lease is handed to maintenance:
-            // without this, that write's own `Ticket.waitSequence` could
-            // still be parked waiting on it, and once its own bounded wait
-            // (`ride_along_idle_ns`) elapses it drives the group itself --
-            // directly mutating `self.file` with no regard for whoever
-            // currently holds the writer lease, racing maintenance's own
-            // concurrent use of the very same file. Draining here, while
-            // nothing else can be concurrently admitted (this call already
-            // holds the owner gate), resolves that write's ticket itself
-            // and leaves nothing for its own wait to ever need to drive.
-            if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
-            stats.recordAcquired(.handoff, 0);
-            wal_trace.recordOp(.maintenance_lease_acquired);
-            lease.startHold(stats);
-            return self.withReadRegistrationBatch(lease);
-        }
-        if (self.writer_lane.takeParkedAnyRoot()) |held| {
-            var lease = held;
-            // `last_root` missed `self.current` above (the rare generation
-            // -swap-while-parked case `takeParkedAnyRoot`'s own doc comment
-            // describes), so there is no root this call can safely drain a
-            // ride-along queue against -- the writer that parked this
-            // lease staged any such work on a generation already
-            // superseded, not on `self.current`. Skip the drain; this is a
-            // same-process handoff either way, never a fresh kernel
-            // acquisition that would otherwise self-conflict with the
-            // lease this exact process is already holding.
-            stats.recordAcquired(.handoff, 0);
-            wal_trace.recordOp(.maintenance_lease_acquired);
-            lease.startHold(stats);
-            return self.withReadRegistrationBatch(lease);
-        }
         const started = std.Io.Clock.awake.now(io).nanoseconds;
-        // Maintenance joins the same FIFO as foreground writers, so a
-        // continuously busy foreground can delay it by at most one round of
-        // queued turns instead of starving it.
         const default_budget = 5 * std.time.ns_per_s;
         const budget = if (h.builtin.is_test) self.test_maintenance_wait_ns orelse default_budget else default_budget;
-        var held = native.fairWriterLockWithIo(alloc, io, self.path_lock_io.io(), self.path, std.Io.Clock.awake.now(io).nanoseconds + budget) catch |err| switch (err) {
-            error.FileBusy => {
+        var borrowed = self.writer_lane.borrowLease(self, &self.gate.mutex, started + budget, false, null) catch |err| {
+            if (err == error.FileBusy) {
                 self.publication_stats.maintenance_queue_timeouts +|= 1;
                 stats.recordBusy(@intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
-                return err;
-            },
-            else => return err,
+            }
+            return err;
         };
-        // perf/lwa-grouped-stall: same drain the handoff branches above
-        // perform before handing their lease to maintenance (see
-        // `ensureDurableForReuse`'s own doc comment: its two callers are
-        // this function and `tryWriterLeaseAssumeLocked`, handing the
-        // lease to a *different*, detached `NativeFile` instance than the
-        // one any ride-along work queued against). A fresh kernel
-        // acquisition still hands the same detached instance a lease
-        // next, so it needs the same drain; this branch was the one case
-        // that skipped it, confirmed live alongside
-        // `refreshIfWriterBaseStale`'s own fix (storage/lite/native.zig)
-        // as part of the grouped-source background-maintenance stall --
-        // handoff never actually fires under this owner's own polling
-        // cadence, so this fresh path is not the rare fallback its name
-        // implies here, it is the *common* one.
-        if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
-        errdefer held.close();
-        stats.recordAcquired(if (held.contended) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+        errdefer borrowed.lease.close();
+        stats.recordAcquired(switch (borrowed.source) {
+            .handoff => .handoff,
+            .uncontended => .uncontended,
+            .queued => .queued,
+        }, if (borrowed.source == .handoff) 0 else @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
         wal_trace.recordOp(.maintenance_lease_acquired);
-        held.startHold(stats);
+        borrowed.lease.startHold(stats);
         if (self.stopping.load(.acquire)) return error.Canceled;
-        return self.withReadRegistrationBatch(held);
+        return self.withReadRegistrationBatch(borrowed.lease);
     }
 
     /// Caller holds the gate. Nonblocking: reuses a lease kept for a queued
@@ -2755,39 +2873,50 @@ pub const Owner = struct {
     /// reclamation turn that a lease sitting right there could serve.
     fn tryWriterLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
         const stats = &self.publication_stats.maintenance_lease;
+        // lite-writer-authority.md W2: like the blocking acquisition, check
+        // the lane out and lend its lease; never take a lease around it.
         var lease = if (self.gate.mutex.takeRetained()) |held| blk: {
+            var retained = held;
+            switch (self.writer_lane.beginMaintenanceCheckout()) {
+                .fresh => self.writer_lane.lendLease(&retained),
+                .busy => {},
+                .parked, .overdue => |parked| {
+                    var extra = parked;
+                    extra.close();
+                    self.writer_lane.lendLease(&retained);
+                },
+            }
             stats.recordAcquired(.handoff, 0);
-            break :blk held;
-        } else if (self.writer_lane.takeParkedForRoot(self.current)) |held| blk: {
-            // See `acquireMaintenancePathLeaseAssumeLocked`'s own doc
-            // comment: drain any ride-along work this lease's parking
-            // writer left undriven before handing it off, so that
-            // write's own `Ticket.waitSequence` never needs to drive the
-            // group itself while this call is concurrently using the
-            // same file.
-            if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
-            stats.recordAcquired(.handoff, 0);
-            break :blk held;
-        } else if (self.writer_lane.takeParkedAnyRoot()) |held| blk: {
-            // Same same-process self-conflict fix as
-            // `acquireMaintenancePathLeaseAssumeLocked`: `last_root`
-            // missed `self.current`, so skip the ride-along drain (no
-            // root here is safe to dereference) but still prefer this
-            // same-process handoff over a fresh, self-conflicting kernel
-            // acquisition attempt.
-            stats.recordAcquired(.handoff, 0);
-            break :blk held;
-        } else blk: {
-            const held = try native.tryFairWriterLockWithIo(alloc, h.handleLockIo(), self.path);
-            // Same drain as the handoff branches above, and
-            // `acquireMaintenancePathLeaseAssumeLocked`'s own fresh-kernel
-            // branch: a fresh acquisition still hands this lease to the
-            // same detached `self.current` instance next, which needs any
-            // still-queued ride-along work on the file physically written
-            // first so its own next commit's sequence check sees it.
-            if (self.current) |current| if (current.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
-            stats.recordAcquired(.uncontended, 0);
-            break :blk held;
+            break :blk retained;
+        } else switch (self.writer_lane.beginMaintenanceCheckout()) {
+            .busy => return error.FileBusy,
+            .parked => |held| blk: {
+                var parked = held;
+                self.writer_lane.lendLease(&parked);
+                if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
+                stats.recordAcquired(.handoff, 0);
+                break :blk parked;
+            },
+            .overdue => |held| {
+                // Another process is overdue: hand the lease over instead
+                // of holding it for nonblocking reclamation.
+                var overdue = held;
+                // Drain only; see `WriterLane.releaseBorrowed`.
+                if (self.currentStore()) |store| store.ensureDurableForReuse();
+                overdue.close();
+                self.writer_lane.clearCheckedOutByMaintenance();
+                return error.FileBusy;
+            },
+            .fresh => blk: {
+                var fresh = native.tryFairWriterLockWithIo(alloc, h.handleLockIo(), self.path) catch |err| {
+                    self.writer_lane.clearCheckedOutByMaintenance();
+                    return err;
+                };
+                if (self.current) |current| if (current.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
+                self.writer_lane.lendLease(&fresh);
+                stats.recordAcquired(.uncontended, 0);
+                break :blk fresh;
+            },
         };
         lease.startHold(stats);
         return lease;
@@ -2893,8 +3022,8 @@ pub const Owner = struct {
         // queuing behind it. Cleared by the matching `errdefer` on any
         // early return below, or by `leaveMaintenanceWriter` at the
         // matching `maintenance_writer_references -> 0` transition.
-        self.writer_lane.markCheckedOutByMaintenance();
-        errdefer self.writer_lane.clearCheckedOutByMaintenance();
+        // The lease is lent by the lane (`lendLease`), which marked the lane
+        // checked out; closing it checks the lane back in.
         const maintenance_store = root.owned_lite_backend.?.native_docstore.?;
         // The lease may have come from a path that did not drain the
         // foreground store (a gate handoff, another root's park, a fresh
@@ -2958,7 +3087,11 @@ pub const Owner = struct {
         }
         // A changed tip invalidates a detached proof. Retry outside the gate
         // instead of falling back to a whole-file scan in this publication.
-        if ((scope == .primary or scope == .index) and !file.free_pages_verified) {
+        // Pages are allocated by the writer (the current root), never by this
+        // snapshot (lite-writer-authority.md W1), so it is the writer's
+        // allocator that must be proven.
+        const writer_file = if (self.current) |current| &current.owned_lite_backend.?.native_docstore.?.file else file;
+        if ((scope == .primary or scope == .index) and !writer_file.free_pages_verified) {
             self.publication_stats.allocator_refusals +|= 1;
             return error.EnrichmentWaitCanceled;
         }
@@ -2983,12 +3116,9 @@ pub const Owner = struct {
         // this lease; waking replay here makes each idle turn schedule itself.
         // Generated and replay publications notify at their commit boundary.
         lease.close();
-        // Pairs with `enterMaintenanceWriter`'s own `markCheckedOutByMaintenance`
-        // call: this lease is fully released (never parked for reuse --
-        // maintenance always closes, see `WriterLane.markCheckedOutByMaintenance`'s
-        // own doc comment), so the lane is no longer busy on its account.
+        // The lease was lent by the writer lane, so closing it above parked
+        // it there and checked the lane back in (lite-writer-authority.md W2).
         root.owned_lite_backend.?.native_docstore.?.writer_held_by_maintenance.store(false, .release);
-        self.writer_lane.clearCheckedOutByMaintenance();
         // Status readers serialize publication_stats under the gate; record
         // before releasing it.
         MaintenanceHoldSites.record(self.publication_stats.maintenance_hold_sites.writer(@fromBackingInt(@intCast(root.maintenance_writer_scope))), root.maintenance_writer_held_from);
@@ -3036,6 +3166,14 @@ pub const Owner = struct {
         const snapshot = self.maintenance_snapshot orelse return false;
         if (snapshot.maintenance_references != 0 or snapshot.allocator_verification_references != 0) return false;
         return file.copyAllocatorRebaseBase(&snapshot.owned_lite_backend.?.native_docstore.?.file);
+    }
+
+    /// `NativeStore.WriteTarget.resolve` for maintenance snapshots: the
+    /// owner's current root store, the one writable instance on this inode.
+    fn resolveWriterStore(ptr: *anyopaque) ?*NativeStore {
+        const self: *Owner = @ptrCast(@alignCast(ptr));
+        const current = self.current orelse return null;
+        return current.owned_lite_backend.?.native_docstore;
     }
 
     fn refreshMaintenanceSnapshot(self: *Owner, foreground: *h.Handle, need_database: bool) !*h.Handle {
@@ -3116,6 +3254,9 @@ pub const Owner = struct {
         snapshot.sql_ddl_recovery_generation = foreground.sql_ddl_recovery_generation;
         const store = snapshot.owned_lite_backend.?.native_docstore.?;
         store.file.reader_coordinator = self.reader_coordinator;
+        // lite-writer-authority.md W1: the snapshot computes on its own
+        // pinned state; its writes are applied by the current root's store.
+        store.write_target = .{ .ptr = self, .resolve = resolveWriterStore };
         if (self.maintenance_snapshot) |old| {
             // Carry the old snapshot's warm, verified ledger as a rebase base,
             // as the serving-runtime refresh does. Otherwise every replacement
@@ -3559,7 +3700,10 @@ pub const Owner = struct {
         database.borrowed_group_source_state = group_state;
         if (run_database) database.async_context.replay_publication = .{ .ptr = &publication, .publish = PreparedPublication.publishReplay };
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
-        lease.close();
+        // The detached work runs without the writer lease; release it so
+        // other processes can write meanwhile (parking would hold it until
+        // this turn ends, since this loop is what releases parked leases).
+        self.writer_lane.releaseBorrowed(self, &lease);
         MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.turn_capture, turn_held_from);
         lease_held = false;
         self.gate.mutex.unlock(io);
@@ -3647,6 +3791,7 @@ pub const Owner = struct {
         self.gate.mutex.lockUncancelable(io);
         defer self.gate.mutex.unlock(io);
         if (maintenance_error) |err| {
+            std.debug.print("DBGMAINT err={s}\n", .{@errorName(err)});
             self.publication_stats.maintenance_errors +|= 1;
             self.publication_stats.last_maintenance_error = @errorName(err);
         } else self.publication_stats.last_maintenance_error = null;
@@ -3664,7 +3809,9 @@ pub const Owner = struct {
             store.read_only = true;
             store.file.read_only = true;
         }
-        const changed = if (independent)
+        const forwarded_writes = independent and !std.meta.eql(maintenance_entry_header, store.file.header);
+        if (forwarded_writes) self.foreground_runtime_stale = true;
+        const changed = forwarded_writes or if (independent)
             !std.meta.eql(self.current.?.owned_lite_backend.?.native_docstore.?.file.header, store.file.header)
         else
             self.current != root;
@@ -3744,7 +3891,10 @@ pub const Owner = struct {
         root.maintenance_owner = self;
         root.maintenance_publication = null;
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
-        lease.close();
+        // The detached work runs without the writer lease; release it so
+        // other processes can write meanwhile (parking would hold it until
+        // this turn ends, since this loop is what releases parked leases).
+        self.writer_lane.releaseBorrowed(self, &lease);
         MaintenanceHoldSites.record(&self.publication_stats.maintenance_hold_sites.storage_turn, turn_held_from);
         lease_held = false;
         self.gate.mutex.unlock(io);
@@ -3791,12 +3941,15 @@ pub const Owner = struct {
             // influencing the wait at all, so an idle Owner goes back to
             // its ordinary demand-driven schedule instead of polling
             // forever on an empty lane.
+            self.loop_may_park.store(true, .seq_cst);
             if (self.maintainParkedWriterLaneMs()) |parked_wait_ms| {
                 next_wait_ms = if (next_wait_ms < 0) parked_wait_ms else @min(next_wait_ms, parked_wait_ms);
             }
             if (next_wait_ms < 0) {
                 self.wake.waitUncancelable(io);
+                self.loop_may_park.store(false, .seq_cst);
             } else {
+                self.loop_may_park.store(false, .seq_cst);
                 self.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(next_wait_ms), .clock = .awake } }) catch {};
             }
             self.wake.reset();
@@ -3980,7 +4133,9 @@ pub const Owner = struct {
             proof_alloc.destroy(reader);
             self.gate.mutex.lockUncancelable(io);
         }
-        lease.*.?.close();
+        // The walk runs without the writer lease: release it rather than
+        // parking it, so other processes can write meanwhile.
+        self.writer_lane.releaseBorrowed(self, &lease.*.?);
         lease.* = null;
         self.gate.mutex.unlock(io);
         if (comptime h.builtin.is_test) if (self.test_after_allocator_capture) |hook| hook.notify(hook.ptr, reader);
@@ -4131,6 +4286,9 @@ pub const Owner = struct {
         // `flock` is per-descriptor, not per-process, so it just queues
         // behind its own abandoned lock forever, eventually timing out
         // with `FileBusy`/`WouldBlock` on every caller that needed it.
+        self.writer_lane.mutex.lockUncancelable(h.handleLockIo());
+        self.writer_lane.closing = true;
+        self.writer_lane.mutex.unlock(h.handleLockIo());
         if (self.writer_lane.parked) |*lease| lease.close();
         self.writer_lane.parked = null;
         if (self.writer_lane.held_lease) |*lease| lease.close();
@@ -4332,52 +4490,30 @@ pub const Connection = struct {
         // permits an immediate acquisition when nobody is queued.
         if (h.liteOpenModeCanWrite(self.options.open_mode)) {
             const stats = &self.owner.publication_stats.foreground_lease;
+            // lite-writer-authority.md W2: borrow the lane's lease. Skipped
+            // only for `checkout`'s own cold path (`acquireForOwnCheckout`),
+            // which already holds the lane and keeps the lease itself.
+            if (!skip_lane_wait) {
+                const started = std.Io.Clock.awake.now(io).nanoseconds;
+                const unconditional = self.admission_deadline_ns == null and self.options.busy_timeout_ms == 0;
+                var borrowed = self.owner.writer_lane.borrowLease(self.owner, &self.gate.mutex, deadline, unconditional, self) catch |err| {
+                    if (err == error.FileBusy) stats.recordBusy(@intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+                    return err;
+                };
+                stats.recordAcquired(switch (borrowed.source) {
+                    .handoff => .handoff,
+                    .uncontended => .uncontended,
+                    .queued => .queued,
+                }, if (borrowed.source == .handoff) 0 else @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+                borrowed.lease.startHold(stats);
+                return self.owner.withReadRegistrationBatch(borrowed.lease);
+            }
             if (self.gate.mutex.takeRetained()) |held| {
                 var lease = held;
                 stats.recordAcquired(.handoff, 0);
                 lease.startHold(stats);
                 return self.owner.withReadRegistrationBatch(lease);
             }
-            // See `WriterLane.takeParkedForStore`'s doc comment: a lease
-            // the lane parked after a lane-managed write's `checkin` is
-            // invisible to `takeRetained()` above. Reclaim it here before
-            // ever attempting a fresh kernel acquisition that would
-            // contend with this same process's own already-held lock.
-            // `waitParkedForStore`, not plain `takeParkedForStore`: if the
-            // lane is still `checked_out` (another local caller mid-
-            // staging, not parked yet), wait for its imminent `checkin`
-            // instead of falling straight through to a fresh acquisition
-            // that would only ever self-conflict with it -- see that
-            // function's own doc comment. Skipped entirely when
-            // `skip_lane_wait` (see `Connection.acquireForOwnCheckout`):
-            // `WriterLane.checkout`'s own cold path is this call's only
-            // caller in that case, and it already knows `parked` is
-            // `null` and `checked_out` is its own -- waiting here would
-            // just be waiting on itself.
-            if (!skip_lane_wait) if (self.owner.writer_lane.waitParkedForStore(self, deadline)) |held| {
-                var lease = held;
-                stats.recordAcquired(.handoff, 0);
-                lease.startHold(stats);
-                return self.owner.withReadRegistrationBatch(lease);
-            };
-            // `waitParkedForStore`'s exact-root match can miss the same way
-            // `acquireMaintenancePathLeaseAssumeLocked`'s own
-            // `takeParkedForRoot` can (see its doc comment, and
-            // `WriterLane.takeParkedAnyRoot`'s): a same-process generation
-            // swap left the lane's `last_root` naming a root this call's
-            // own `self.owner.current` has already moved past. Without
-            // this, the fresh acquisition below self-conflicts with the
-            // lease this exact process is still holding parked, for the
-            // whole of this call's own `busy_timeout_ms` -- observed live
-            // as `TestSQLConformance`/`test_sql_conformance`'s
-            // `dbapi execute` -> `open_cursor` stalling tens of seconds
-            // before failing `FileBusy` on a single-process database.
-            if (!skip_lane_wait) if (self.owner.writer_lane.takeParkedAnyRoot()) |held| {
-                var lease = held;
-                stats.recordAcquired(.handoff, 0);
-                lease.startHold(stats);
-                return self.owner.withReadRegistrationBatch(lease);
-            };
             const started = std.Io.Clock.awake.now(io).nanoseconds;
             if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| {
                 // Tests observe the point where admission would start waiting:
@@ -7216,7 +7352,7 @@ test "capi native allocator proof issue1431 bounded allocator service rebases a 
     try fixture.expectWritten(.batch, true);
 }
 
-test "capi native logical generations maintenance snapshot replacement carries the warm allocator ledger" {
+test "capi native logical generations maintenance snapshot replacement keeps the writer's warm allocator ledger" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("snapshot-ledger-handoff", 1000, .batch);
     defer fixture.deinit();
@@ -7232,34 +7368,36 @@ test "capi native logical generations maintenance snapshot replacement carries t
             return f.connection.owner.refreshMaintenanceSnapshot(f.connection.owner.current.?, false);
         }
     }.run;
+    const writerFile = struct {
+        fn get(o: *Owner) *native.NativeFile {
+            return &o.current.?.owned_lite_backend.?.native_docstore.?.file;
+        }
+    }.get;
+    // lite-writer-authority.md W1: allocator service runs on the one
+    // writable file, so warm that file's ledger under a snapshot's turn.
     const first = try refreshSnapshot(&fixture);
     first.maintenance_owner = owner;
-    // Warm and verify the first snapshot's ledger under allocator service.
     try Owner.enterMaintenanceWriter(first, .allocator_service);
-    _ = try first.owned_lite_backend.?.native_docstore.?.file.reclaimPagesForMaintenanceWithCancel(8, null, true);
+    _ = try writerFile(owner).reclaimPagesForMaintenanceWithCancel(8, null, true);
     Owner.leaveMaintenanceWriter(first);
     first.maintenance_owner = null;
-    const first_file = &first.owned_lite_backend.?.native_docstore.?.file;
-    try std.testing.expect(first_file.free_pages_verified and first_file.ledger != null);
-    const full_loads = first_file.allocator_work.full_loads;
-    const transfers = first_file.allocator_work.cache_transfers;
+    try std.testing.expect(writerFile(owner).free_pages_verified and writerFile(owner).ledger != null);
+    const full_loads = writerFile(owner).allocator_work.full_loads;
 
     // A foreground write moves the tip, so the next capture replaces the
-    // snapshot. Its allocator must rebase the donated ledger, not reload it.
+    // snapshot. The writer's ledger stays warm: no full reload.
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
     const second = try refreshSnapshot(&fixture);
     try std.testing.expect(second != first);
-    const file = &second.owned_lite_backend.?.native_docstore.?.file;
-    try std.testing.expect(file.free_pages_verified);
-    try std.testing.expectEqual(transfers + 1, file.allocator_work.cache_transfers);
-    try std.testing.expectEqual(full_loads, file.allocator_work.full_loads);
+    try std.testing.expect(writerFile(owner).free_pages_verified);
+    try std.testing.expectEqual(full_loads, writerFile(owner).allocator_work.full_loads);
     second.maintenance_owner = owner;
     defer second.maintenance_owner = null;
     try Owner.enterMaintenanceWriter(second, .allocator_service);
-    _ = try file.reclaimPagesForMaintenanceWithCancel(8, null, true);
-    try std.testing.expect((try file.check()).valid);
+    _ = try writerFile(owner).reclaimPagesForMaintenanceWithCancel(8, null, true);
+    try std.testing.expect((try writerFile(owner).check()).valid);
     Owner.leaveMaintenanceWriter(second);
-    try std.testing.expectEqual(full_loads, file.allocator_work.full_loads);
+    try std.testing.expectEqual(full_loads, writerFile(owner).allocator_work.full_loads);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.read));
     try fixture.expectWritten(.batch, true);
 }
