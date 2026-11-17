@@ -161,7 +161,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         return .{ .page = try delivery.pull(&client, &provider, a, selection.id, selection.after, bounds, internal) };
     var confirmed = try delivery.acknowledge(&client, &provider, a, selection.id, selection.after, internal);
     defer confirmed.deinit();
-    var driver_policy: RootPolicy = .{ .access = policy, .source = source, .allocator = a };
+    var driver_policy: RootPolicy = .{ .access = policy, .io = api.inferenceIo(), .source = source, .allocator = a };
     try flushAcknowledged(&client, &driver_policy, a, confirmed.value, captured.roots[0], internal);
     return .{ .acknowledged = confirmed.value.acknowledged_cursor };
 }
@@ -185,18 +185,29 @@ const source_api = @import("history_roots.zig");
 const metadata_api = @import("../metadata/api.zig");
 
 const RootPolicy = struct {
-    access: Policy,
+    access: ?Policy,
+    io: std.Io,
     source: source_api.Source,
     allocator: A,
     closing: bool = false,
 
     pub fn authorizeRoot(self: *@This(), state: control.State, _: control.Namespace, request: Context) !void {
-        if (!self.closing) return self.access.authorize(state, request);
+        if (!self.closing) {
+            var access = self.access orelse return error.Forbidden;
+            return access.authorize(state, request);
+        }
         try request.ensureActive();
-        if (state.phase != .closing or state.slot != null) return error.ChangefeedConflict;
-        var identity = try authenticate(self.access.api, self.access.credential);
-        defer identity.deinit(self.access.api.alloc);
-        try requireOwner(identity, state.definition orelse return error.Forbidden);
+        if ((state.phase != .closing and state.phase != .reset_required) or state.slot != null)
+            return error.ChangefeedConflict;
+        if (self.access) |access| {
+            var identity = try authenticate(access.api, access.credential);
+            defer identity.deinit(access.api.alloc);
+            try requireOwner(identity, state.definition orelse return error.Forbidden);
+        } else {
+            const principal = request.principal orelse return error.Forbidden;
+            if (principal.kind != .internal or !std.mem.eql(u8, principal.subject, "changefeed-maintenance"))
+                return error.Forbidden;
+        }
     }
 
     pub fn validateRoot(self: *@This(), state: control.State, namespace: control.Namespace, fence: metadata_api.CatalogRouteFence, table: []const u8, request: Context) !void {
@@ -205,7 +216,7 @@ const RootPolicy = struct {
 
     pub fn newAttempt(self: *@This(), _: control.State, _: control.Namespace, _: Context) !control.Id {
         var id: control.Id = undefined;
-        self.access.api.inferenceIo().random(&id);
+        self.io.random(&id);
         return id;
     }
 
@@ -222,7 +233,7 @@ fn flushAcknowledged(client: *config.Client, policy: *RootPolicy, a: A, confirme
         var parsed = try load(client, a, confirmed.id, request);
         defer parsed.deinit();
         const state = parsed.value;
-        try policy.access.authorize(state, request);
+        try policy.access.?.authorize(state, request);
         if (state.epoch != confirmed.epoch or !same(state.authority, confirmed.authority) or state.phase != .streaming)
             return error.ChangefeedResynchronizationRequired;
         const item = state.roots[try state.rootIndex(root.namespace)];
@@ -367,16 +378,17 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
     var client: config.Client = .{ .port = meta };
     var policy: RootPolicy = .{
         .access = .{ .api = api, .credential = credential, .table = root.table_name, .filter = filter },
+        .io = api.inferenceIo(),
         .source = source,
         .allocator = a,
     };
-    const now = try policy.access.nowSeconds(internal);
+    const now = try policy.access.?.nowSeconds(internal);
     for (0..8) |_| {
         var parsed = try load(&client, a, id, internal);
         defer parsed.deinit();
         const state = parsed.value;
         if (state.phase == .empty) {
-            try policy.access.authorize(.{ .definition = definition }, internal);
+            try policy.access.?.authorize(.{ .definition = definition }, internal);
             if (try meta.authority(a, internal)) |registered| {
                 if (!same(registered.incarnation, authority)) return error.ChangefeedResynchronizationRequired;
             }
@@ -393,7 +405,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
         }
         if (!same(definition.identity(), state.definition.?.identity()) or !same(authority, state.authority))
             return error.ChangefeedConflict;
-        try policy.access.authorize(state, internal);
+        try policy.access.?.authorize(state, internal);
         if (now >= state.expires_at) return error.ChangefeedLeaseExpired;
         if (state.phase == .streaming) {
             var active = try roots.Routed.init(source, &captured);
@@ -471,47 +483,71 @@ pub fn close(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReque
             continue;
         }
 
-        const item = for (state.roots) |candidate| {
-            if (!candidate.released) break candidate;
-        } else {
-            try change(&client, a, state, .finish_close, internal);
-            continue;
-        };
-        var discovered = try source.capture(a, definition, internal);
-        defer discovered.deinit();
-        const root = try discovered.find(item.namespace);
         var policy: RootPolicy = .{
-            .access = .{ .api = api, .credential = credential, .table = root.table_name, .filter = null },
+            .access = .{ .api = api, .credential = credential, .table = "", .filter = null },
+            .io = api.inferenceIo(),
             .source = source,
             .allocator = a,
             .closing = true,
         };
-        if (item.pending_control) |pending| {
-            if (pending.stage != .prepared) {
-                const observed = try enrollment.reconcile(&client, &policy, source.grants, a, id, item.namespace, internal);
-                if (observed.status == .reconciled) continue;
-                if (observed.status != .unproven) return error.MetadataMutationOutcomeUnknown;
-                try enrollment.prepareRetirementFence(&client, &policy, a, id, item.namespace, internal);
-            } else {
-                const result = try enrollment.drive(&client, &policy, source.controls, a, id, item.namespace, internal);
-                if (result.status != .settled and result.status != .cancelled_prepared)
-                    return result.deferred_error orelse error.MetadataMutationOutcomeUnknown;
-            }
-            continue;
-        }
-        const command: @import("history_control_operations.zig").wire.Request = .{
-            .version = 1,
-            .operation = .submit,
-            .command = .{ .retire = .{
-                .namespace = item.namespace,
-                .authority = state.authority,
-                .consumer = state.consumerId(),
-                .definition = definition.identity(),
-                .sequence = state.authority_sequence,
-                .grant = item.grant_sequence,
-            } },
-        };
-        try prepareRoot(&client, &policy, a, id, root, command, internal);
+        if (!try retireOne(&client, &policy, a, state, internal)) return;
     }
     return error.MetadataMutationOutcomeUnknown;
+}
+
+/// Consume one bounded maintenance step. Only already-invalidated native
+/// feeds qualify, and a reset retains its resynchronization reason.
+pub fn maintainNativeFeed(metadata: config.Port, source: source_api.Source, io: std.Io, a: A, id: control.Id, request: Context) !void {
+    var client: config.Client = .{ .port = metadata };
+    var parsed = try load(&client, a, id, request);
+    defer parsed.deinit();
+    const state = parsed.value;
+    if ((state.phase != .closing and state.phase != .reset_required) or state.slot != null or state.definition.?.start != .now)
+        return;
+    var policy: RootPolicy = .{ .access = null, .io = io, .source = source, .allocator = a, .closing = true };
+    _ = try retireOne(&client, &policy, a, state, request);
+}
+
+fn retireOne(client: *config.Client, policy: *RootPolicy, a: A, state: control.State, request: Context) !bool {
+    const definition = state.definition.?;
+    const item = for (state.roots) |candidate| {
+        if (!candidate.released) break candidate;
+    } else {
+        if (state.phase == .reset_required) return false;
+        try policy.authorizeRoot(state, @splat(0), request);
+        try change(client, a, state, .finish_close, request);
+        return true;
+    };
+    try policy.authorizeRoot(state, item.namespace, request);
+    const source = policy.source;
+    var discovered = try source.capture(a, definition, request);
+    defer discovered.deinit();
+    const root = try discovered.find(item.namespace);
+    if (item.pending_control) |pending| {
+        if (pending.stage != .prepared) {
+            const observed = try enrollment.reconcile(client, policy, source.grants, a, state.id, item.namespace, request);
+            if (observed.status == .reconciled) return true;
+            if (observed.status != .unproven) return error.MetadataMutationOutcomeUnknown;
+            try enrollment.prepareRetirementFence(client, policy, a, state.id, item.namespace, request);
+        } else {
+            const result = try enrollment.drive(client, policy, source.controls, a, state.id, item.namespace, request);
+            if (result.status != .settled and result.status != .cancelled_prepared)
+                return result.deferred_error orelse error.MetadataMutationOutcomeUnknown;
+        }
+        return true;
+    }
+    const command: @import("history_control_operations.zig").wire.Request = .{
+        .version = 1,
+        .operation = .submit,
+        .command = .{ .retire = .{
+            .namespace = item.namespace,
+            .authority = state.authority,
+            .consumer = state.consumerId(),
+            .definition = definition.identity(),
+            .sequence = state.authority_sequence,
+            .grant = item.grant_sequence,
+        } },
+    };
+    try prepareRoot(client, policy, a, state.id, root, command, request);
+    return true;
 }

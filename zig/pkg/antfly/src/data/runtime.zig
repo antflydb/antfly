@@ -5911,6 +5911,9 @@ pub const DataServer = struct {
     background_jobs_mutex: std.atomic.Mutex = .unlocked,
     background_jobs_owner_id: u64 = 0,
     background_jobs_shutdown: std.atomic.Value(bool) = .init(false),
+    changefeed_maintenance_active: std.atomic.Value(bool) = .init(false),
+    changefeed_maintenance_after: ?@import("../metadata/changefeed_control.zig").Id = null,
+    changefeed_maintenance_due_ms: std.atomic.Value(u64) = .init(0),
     // Preparation may own up to 16 MiB per transaction. Bound concurrency as
     // well as queued observation bytes, independent of local shard count.
     completion_recovery_queue: @import("../api/completion_recovery_queue.zig").Queue = .{},
@@ -9964,6 +9967,9 @@ pub const DataServer = struct {
         };
         self.runLeannReplicationRound() catch |err| {
             std.log.warn("leann replication deferred err={s}", .{@errorName(err)});
+        };
+        self.requestChangefeedMaintenance() catch |err| {
+            std.log.warn("changefeed maintenance dispatch deferred err={s}", .{@errorName(err)});
         };
         self.runInitialFkRetirementRound() catch |err| {
             std.log.warn("initial FK retirement maintenance deferred err={s}", .{@errorName(err)});
@@ -24362,6 +24368,61 @@ pub const DataServer = struct {
         job: backend_runtime_mod.Job,
     ) !void {
         try lane.submit(job);
+    }
+
+    fn requestChangefeedMaintenance(self: *DataServer) !void {
+        if (!linked_storage or self.remote_metadata == null or self.data_raft == null or self.background_jobs_shutdown.load(.acquire)) return;
+        const now_ms = self.backgroundMonotonicMs();
+        if (now_ms < self.changefeed_maintenance_due_ms.load(.acquire)) return;
+        if (self.changefeed_maintenance_active.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        errdefer self.changefeed_maintenance_active.store(false, .release);
+        const runtime = try self.ensureBackendRuntime();
+        if (runtime.durable_jobs.executesInline()) {
+            self.changefeed_maintenance_active.store(false, .release);
+            return;
+        }
+        self.changefeed_maintenance_due_ms.store(now_ms +| 1000, .release);
+        try runtime.durable_jobs.submit(.{
+            .owner_id = try self.dataServerBackgroundOwnerId(runtime),
+            .class = .maintenance,
+            .ptr = self,
+            .run = runChangefeedMaintenanceJob,
+            .deinit = deinitChangefeedMaintenanceJob,
+        });
+    }
+
+    fn deinitChangefeedMaintenanceJob(ptr: *anyopaque) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        self.changefeed_maintenance_active.store(false, .release);
+    }
+
+    fn runChangefeedMaintenanceJob(ptr: *anyopaque) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const remote = self.remote_metadata orelse return;
+        const metadata = remote.statusSource().changefeeds orelse return;
+        const io = self.dataRaftIo() orelse return;
+        const request: antfly.public_api.operation.RequestContext = .{
+            .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" },
+            .deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s,
+            .cancellation = .fromAtomic(&self.background_jobs_shutdown),
+        };
+        try request.ensureActive();
+        const now = self.dataRaftRealtimeNs() / std.time.ns_per_s;
+        const page = try remote.scanChangefeedMaintenance(self.alloc, .{ .now = now, .after = self.changefeed_maintenance_after }, request);
+        for (page.items()) |id| {
+            try request.ensureActive();
+            @import("../api/changefeed_public.zig").maintainNativeFeed(metadata, self.historyRootsSource(), io, self.alloc, id, request) catch |err| switch (err) {
+                error.ChangefeedConflict,
+                error.MetadataMutationOutcomeUnknown,
+                error.ChangefeedResynchronizationRequired,
+                error.GroupLeaderUnavailable,
+                error.ReadUnavailable,
+                error.StorageReadTemporarilyUnavailable,
+                => {},
+                else => std.log.warn("changefeed owner maintenance deferred err={s}", .{@errorName(err)}),
+            };
+        }
+        self.changefeed_maintenance_after = page.next;
     }
 
     fn requestAutoBulkFinishBackground(self: *DataServer) !void {
@@ -45350,6 +45411,45 @@ fn consumerTests() type {
                         var deleted = try feed_control.parse(allocator, tombstone);
                         defer deleted.deinit();
                         try std.testing.expectEqual(feed_control.Phase.deleted, deleted.value.phase);
+
+                        const expiring = try api.create(http_api, allocator, credential, "expiring-feed", definition, .{});
+                        const metadata_port = http_api.source.changefeeds.?;
+                        const maintenance: antfly.public_api.operation.RequestContext = .{ .principal = .{ .kind = .internal, .subject = "changefeed-maintenance" } };
+                        const active_bytes = try metadata_port.read(allocator, expiring.id, maintenance);
+                        defer allocator.free(active_bytes);
+                        var active_feed = try feed_control.parse(allocator, active_bytes);
+                        defer active_feed.deinit();
+                        const active_state = active_feed.value;
+                        const active_definition = active_state.definition.?;
+                        try metadata_port.mutate(allocator, .{
+                            .id = expiring.id,
+                            .authority = active_state.authority,
+                            .owner = active_definition.owner,
+                            .authorization = active_definition.authorization,
+                            .expected_revision = active_state.revision,
+                            .expected_epoch = active_state.epoch,
+                            .mutation = .{ .expire = expiring.expires_at },
+                        }, maintenance);
+                        for (0..3) |_| try api.maintainNativeFeed(metadata_port, source, http_api.inferenceIo(), allocator, expiring.id, maintenance);
+                        const reset_bytes = try metadata_port.read(allocator, expiring.id, maintenance);
+                        defer allocator.free(reset_bytes);
+                        var reset = try feed_control.parse(allocator, reset_bytes);
+                        defer reset.deinit();
+                        try std.testing.expectEqual(feed_control.Phase.reset_required, reset.value.phase);
+                        try std.testing.expectEqual(feed_control.Reset.lease_expired, reset.value.reset_reason);
+                        try std.testing.expect(reset.value.roots[0].released);
+                        const expired_grant = try source.grants.read(allocator, fence, table.name, .{
+                            .version = 1,
+                            .identity = .{
+                                .namespace = active_state.roots[0].namespace,
+                                .authority = active_state.authority,
+                                .consumer = active_state.consumerId(),
+                                .definition = active_definition.identity(),
+                                .sequence = active_state.roots[0].grant_sequence,
+                                .policy_revision = active_definition.tables[0].policy_revision,
+                            },
+                        }, maintenance);
+                        try std.testing.expect(expired_grant == .retired);
                     }
                 };
                 {
