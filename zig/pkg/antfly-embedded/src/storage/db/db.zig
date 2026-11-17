@@ -119914,6 +119914,46 @@ test "db dense target reads atomic outcome and source coverage snapshot" {
     try std.testing.expectError(error.InvalidDerivedCoverageCounter, denseTargetCountForIndexContext(db.async_context, config.name));
 }
 
+test "db dense target coverage defers for pending source material before any outcome exists" {
+    // Regression guard for the bootstrap-watermark bug fixed in
+    // 3a8e943a48 ("bound native_catalog text staging and dense coverage
+    // bootstrap race"): a fresh artifact-backed dense generation whose
+    // source material already exists, but whose embedder has not even been
+    // scheduled yet, has no outcome rows (produced/skipped/terminal_failed)
+    // and a dense artifact target counter bootstrapped at its trivial
+    // starting value of zero -- indistinguishable, by count alone, from a
+    // genuinely empty range. That must defer ("not yet determined"), never
+    // vacuously match a zero active count and let a watermark advance past
+    // work nobody has done.
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const config: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dense_idx\"}}",
+    };
+    try db.addIndex(config);
+
+    var one: [8]u8 = undefined;
+    std.mem.writeInt(u64, &one, 1, .little);
+    try db.core.store.put(&internal_keys.range_document_count_key, &one);
+    const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, config.name);
+    defer alloc.free(counter_key);
+    const zero: [8]u8 = @splat(0);
+    try db.core.store.put(counter_key, &zero);
+
+    try std.testing.expectEqual(@as(?u64, null), try denseTargetCountForIndexContext(db.async_context, config.name));
+}
+
 test "db artifact dense target prefers current incarnation outcomes over stale name counter" {
     const alloc = std.testing.allocator;
 
