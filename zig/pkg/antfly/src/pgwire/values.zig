@@ -194,6 +194,76 @@ pub fn encodeCellInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Colu
     }
 }
 
+/// Render an already decoded historical SQL tuple for pgoutput. The caller
+/// supplies the descriptors from the retained schema and owns the arena.
+pub fn encodeReplicationTuple(
+    a: std.mem.Allocator,
+    columns: []const Column,
+    cells: []const @import("backend.zig").Cell,
+    format: u16,
+    byte_limit: usize,
+) ![]const @import("pgoutput.zig").Cell {
+    const output = @import("pgoutput.zig");
+    if (format > 1 or columns.len != cells.len or columns.len > std.math.maxInt(u16)) return error.InvalidResult;
+    if (byte_limit > output.max_message_bytes or byte_limit < 2) return error.ProgramLimitExceeded;
+    const tuple = try a.alloc(output.Cell, columns.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (tuple[0..initialized]) |cell| switch (cell) {
+            .text, .binary => |bytes| a.free(bytes),
+            else => {},
+        };
+        a.free(tuple);
+    }
+    var remaining = byte_limit - 2; // column count
+    for (columns, cells, tuple) |column, cell, *value| {
+        _ = try columnOid(column);
+        if (remaining == 0) return error.ProgramLimitExceeded;
+        remaining -= 1; // tuple cell tag
+        if (cell.sql_null) {
+            value.* = .null;
+        } else {
+            if (remaining < 4) return error.ProgramLimitExceeded;
+            remaining -= 4; // length
+            var bytes: std.Io.Writer.Allocating = .init(a);
+            defer bytes.deinit();
+            try encodeCellInto(a, &bytes.writer, column, format, cell, remaining);
+            if (format == 0 and std.mem.indexOfScalar(u8, bytes.written(), 0) != null) return error.InvalidResult;
+            remaining -= bytes.written().len;
+            const owned = try bytes.toOwnedSlice();
+            value.* = if (format == 0) .{ .text = owned } else .{ .binary = owned };
+        }
+        initialized += 1;
+    }
+    return tuple;
+}
+
+test "pgwire replication tuples preserve exact numeric and distinguish JSON null from SQL NULL" {
+    const backend = @import("backend.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const columns: []const Column = &.{
+        .{ .name = "n", .type = .number, .element_type = .numeric },
+        .{ .name = "j", .type = .json },
+        .{ .name = "missing", .type = .json },
+    };
+    const number = "123456789012345678901234567890.12345678";
+    const cells: []const backend.Cell = &.{
+        .{ .sql_null = false, .value = .{ .string = number } },
+        .{ .sql_null = false, .json_bytes = "null" },
+        .{ .sql_null = true },
+    };
+    const tuple = try encodeReplicationTuple(a, columns, cells, 0, 128);
+    try std.testing.expectEqualStrings(number, tuple[0].text);
+    try std.testing.expectEqualStrings("null", tuple[1].text);
+    try std.testing.expect(tuple[2] == .null);
+    const binary = try encodeReplicationTuple(a, columns, cells, 1, 128);
+    try std.testing.expectEqualSlices(u8, "\x01null", binary[1].binary);
+    try std.testing.expect(binary[0] == .binary and binary[2] == .null);
+    try std.testing.expectError(error.ProgramLimitExceeded, encodeReplicationTuple(std.testing.allocator, columns, cells, 0, 48));
+}
+
 fn encodeColumnUnchecked(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, value: std.json.Value, wire_bytes: usize) !void {
     if (format > 1) return error.UnsupportedResultFormat;
     _ = try columnOid(column);
