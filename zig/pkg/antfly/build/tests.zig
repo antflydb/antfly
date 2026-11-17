@@ -7943,7 +7943,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.authority_invalidation.",
             "storage.db.row_policy_bundle.",
             "storage.db.execution_resources.",
-            "storage.db.privacy_read.",
             "storage.db.restore_staging.",
             "storage.db.restore_staging_contract.",
             "storage.db.restore_generation_admissions.",

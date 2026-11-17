@@ -411,7 +411,6 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_redo_overlay;
     _ = @import("antfly_local_sources").storage_lite_shared_lock_region;
     _ = @import("antfly_local_sources").storage_db_execution_resources;
-    _ = @import("antfly_local_sources").storage_db_privacy_read;
     _ = @import("antfly_local_sources").storage_lite_backend;
     _ = @import("antfly_local_sources").storage_lite_backup_preflight;
     _ = @import("antfly_local_sources").storage_lite_benchmark;
