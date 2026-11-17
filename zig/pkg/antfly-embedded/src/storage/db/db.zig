@@ -36428,11 +36428,11 @@ pub const DB = struct {
             // A complete rebuilding index may repair its missing generation
             // once even while a sibling producer is paused. Healthy recurring
             // maintenance still requires whole-corpus completion before a scan.
-            const checkpoint = self.core.index_manager.denseProjectionCheckpointMetadata(entry.config.name);
+            const checkpoint = index_manager_mod.IndexManager.denseProjectionCheckpointMetadataForEntry(entry);
             const rebuilding = checkpoint != null and checkpoint.?.status == .rebuilding;
             if (self.core.index_manager.repairUnavailable(entry.config.name)) {
                 if (!rebuilding) continue;
-                const expected = (try denseTargetCountForIndexContext(self.async_context, entry.config.name)) orelse continue;
+                const expected = (try denseTargetCountForDenseEntryContext(self.async_context, entry, .all_sources)) orelse continue;
                 if (entry.index.stats().active_count != expected) continue;
                 index_options.covered_rebuilding_index = entry.config.name;
             }
@@ -62803,17 +62803,24 @@ fn denseTargetCountForIndexContextWithCoverage(
     index_name: []const u8,
     coverage: DenseTargetCoverage,
 ) !?u64 {
-    // Inline external vectors have no generated-enrichment incarnation, while
-    // one source document can produce multiple chunk-backed or multi-source
-    // vectors. Their durable artifact counter remains authoritative.
-    if (ctx.index_manager.denseIndex(index_name)) |entry| {
-        if (densePublicationTargetUsesArtifactCounter(entry)) {
-            return try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
-        }
+    const entry = ctx.index_manager.denseIndex(index_name) orelse return null;
+    return denseTargetCountForDenseEntryContext(ctx, entry, coverage);
+}
+
+// Catalog walkers already own a pinned entry; preserve that identity all the
+// way through target accounting instead of resolving its name again.
+fn denseTargetCountForDenseEntryContext(
+    ctx: *AsyncContext,
+    entry: *const index_manager_mod.IndexManager.DenseIndex,
+    coverage: DenseTargetCoverage,
+) !?u64 {
+    const index_name = entry.config.name;
+    if (densePublicationTargetUsesArtifactCounter(entry)) {
+        return try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
     }
-    const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return null;
+    const generation = internal_keys.derivedCoverageGenerationForConfig(entry.config.coverage_generation, entry.config.config_json);
     const coverage_counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
-    return denseTargetCountFromCoverage(ctx, index_name, coverage, coverage_counts);
+    return denseTargetCountFromCoverageForEntry(ctx, index_name, coverage, coverage_counts, entry);
 }
 
 // Keep the explicitly pinned entry point for epoch-transition regressions.
@@ -62839,6 +62846,16 @@ fn denseTargetCountFromCoverage(
     coverage: DenseTargetCoverage,
     coverage_counts: DerivedCoverageCounters,
 ) !?u64 {
+    return denseTargetCountFromCoverageForEntry(ctx, index_name, coverage, coverage_counts, null);
+}
+
+fn denseTargetCountFromCoverageForEntry(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    coverage: DenseTargetCoverage,
+    coverage_counts: DerivedCoverageCounters,
+    pinned_entry: ?*const index_manager_mod.IndexManager.DenseIndex,
+) !?u64 {
     const produced = coverage_counts.produced;
     const skipped = coverage_counts.skipped;
     const terminal_failed = coverage_counts.terminal_failed;
@@ -62850,7 +62867,9 @@ fn denseTargetCountFromCoverage(
         // remain a bootstrap fallback before a fresh incarnation processes its
         // first source. Once any outcome exists, it is the only counter fenced
         // to the current catalog generation.
-        const requires_artifact_coverage = if (ctx.index_manager.get(index_name)) |cfg|
+        const requires_artifact_coverage = if (pinned_entry) |entry|
+            try index_manager_mod.denseConfigRequiresArtifactCoverage(ctx.alloc, entry.config)
+        else if (ctx.index_manager.get(index_name)) |cfg|
             cfg.kind == .dense_vector and try index_manager_mod.denseConfigRequiresArtifactCoverage(ctx.alloc, cfg.*)
         else if (ctx.index_manager.denseIndex(index_name)) |entry|
             denseIndexIsArtifactBacked(entry)
@@ -63904,11 +63923,11 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
     var pending = false;
     for (manager.dense_indexes.items) |*entry| {
         if (ctx.background_closing.load(.acquire)) return false;
-        const checkpoint = manager.denseProjectionCheckpointMetadata(entry.config.name) orelse continue;
+        const checkpoint = index_manager_mod.IndexManager.denseProjectionCheckpointMetadataForEntry(entry) orelse continue;
         if (checkpoint.status != .rebuilding and checkpoint.status != .clean) continue;
-        const expected = (try denseTargetCountForIndexContextWithCoverage(
+        const expected = (try denseTargetCountForDenseEntryContext(
             ctx,
-            entry.config.name,
+            entry,
             if (checkpoint.status == .clean) .materialized else .all_sources,
         )) orelse continue;
         if (entry.index.stats().active_count != expected) continue;
@@ -119017,9 +119036,11 @@ test "db online vector publication visits each catalog entry once" {
         try db.addIndex(.{ .name = name, .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
     }
     try db.runUntilIdle();
+    const checkpoint_lookups = index_manager_mod.test_dense_checkpoint_name_visits.load(.acquire);
     const catalogs = index_manager_mod.test_vector_publication_catalog_visits.load(.acquire);
     const entries = index_manager_mod.test_vector_publication_entry_visits.load(.acquire);
     _ = try db.publishVectorBlockBasesOnlineReported(.{});
+    try std.testing.expectEqual(checkpoint_lookups, index_manager_mod.test_dense_checkpoint_name_visits.load(.acquire));
     // DB dispatches its pinned entries directly; no name-filtered nested walk.
     try std.testing.expectEqual(catalogs, index_manager_mod.test_vector_publication_catalog_visits.load(.acquire));
     try std.testing.expectEqual(entries + 8, index_manager_mod.test_vector_publication_entry_visits.load(.acquire));

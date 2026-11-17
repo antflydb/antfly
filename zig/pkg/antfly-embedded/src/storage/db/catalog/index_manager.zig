@@ -327,6 +327,7 @@ pub var test_inject_index_open_error: ?anyerror = null;
 pub var test_inject_index_removal_cleanup_error: ?anyerror = null;
 pub var test_inject_generated_artifact_cleanup_error: ?anyerror = null;
 pub var test_generated_artifact_cleanup_failures_remaining: std.atomic.Value(u32) = .init(0);
+pub var test_dense_checkpoint_name_visits: std.atomic.Value(usize) = .init(0);
 pub var test_vector_publication_catalog_visits: std.atomic.Value(usize) = .init(0);
 pub var test_vector_publication_entry_visits: std.atomic.Value(usize) = .init(0);
 pub var test_vector_block_primary_snapshot_builds: std.atomic.Value(usize) = .init(0);
@@ -5140,8 +5141,14 @@ pub const IndexManager = struct {
 
     fn ensureVectorBlockBaseAtAppliedSequenceWithEncoding(self: *IndexManager, name: []const u8, applied_sequence: u64, require_storage_encoding: bool, allow_primary_snapshot: bool) !void {
         if (self.vector_block_storage == null) return;
-        const converting = require_storage_encoding and !self.vectorBlockUsesDesiredEncoding();
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        return self.ensureVectorBlockBaseForEntryAtAppliedSequenceWithEncoding(entry, applied_sequence, require_storage_encoding, allow_primary_snapshot);
+    }
+
+    fn ensureVectorBlockBaseForEntryAtAppliedSequenceWithEncoding(self: *IndexManager, entry: *DenseIndex, applied_sequence: u64, require_storage_encoding: bool, allow_primary_snapshot: bool) !void {
+        const name = entry.config.name;
+        if (self.vector_block_storage == null) return;
+        const converting = require_storage_encoding and !self.vectorBlockUsesDesiredEncoding();
         if (!denseIndexUsesVectorBlocks(entry)) return;
         if (entry.index.experimentalPostingDurableAppliedSequence()) |posting_sequence| {
             // A stable source snapshot may legitimately be ahead of the last
@@ -10265,8 +10272,14 @@ pub const IndexManager = struct {
         index_name: []const u8,
     ) ?apply_state.ProjectionCheckpoint {
         const entry = for (self.dense_indexes.items) |*candidate| {
+            if (builtin.is_test) _ = test_dense_checkpoint_name_visits.fetchAdd(1, .monotonic);
             if (std.mem.eql(u8, candidate.config.name, index_name)) break candidate;
         } else return null;
+        return denseProjectionCheckpointMetadataForEntry(entry);
+    }
+
+    /// The caller pins the catalog lifetime of entry. No catalog lookup is needed.
+    pub fn denseProjectionCheckpointMetadataForEntry(entry: *const DenseIndex) ?apply_state.ProjectionCheckpoint {
         // LEANN's file and generic replay checkpoint own its durability;
         // the empty HBC wrapper cannot certify a posting generation.
         if (entry.index.leann != null) return null;
@@ -12267,7 +12280,7 @@ pub const IndexManager = struct {
             self.vector_block_stable_tip_index.store(0, .release);
             self.vector_block_stable_tip_finalizing.store(false, .release);
         };
-        self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(entry.config.name, sequence, options.require_storage_encoding, options.allow_primary_snapshot) catch |err| switch (err) {
+        self.ensureVectorBlockBaseForEntryAtAppliedSequenceWithEncoding(entry, sequence, options.require_storage_encoding, options.allow_primary_snapshot) catch |err| switch (err) {
             error.PostingCheckpointSequenceMismatch,
             error.VectorBlockSnapshotAdvancedWithoutWal,
             error.VectorBlockGenerationReservationLost,
