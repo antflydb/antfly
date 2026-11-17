@@ -15353,6 +15353,9 @@ pub const RaftApplyStore = struct {
     fn applyPgPublicationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         var write = try pg_publication.parseWrite(self.alloc, bytes);
         defer write.deinit();
+        if (write.value.expected_catalog_revision) |revision| {
+            if ((try system_catalog_storage.readMeta(self.alloc, txn, group_id)).revision != revision) return;
+        }
         const next = write.value.next;
         var buffer: [256]u8 = undefined;
         const key = try pg_publication.key(&buffer, group_id, next.database, next.name);
@@ -15370,6 +15373,7 @@ pub const RaftApplyStore = struct {
             var table_buffer: [256]u8 = undefined;
             const raw = (try stagingGet(txn, try tableKeyForGroup(&table_buffer, group_id, member.table.table_id))) orelse return;
             const table = try decodeTableRecord(a, raw);
+            if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, table.table_id)) return;
             if (table.storage.engine != .local or !std.meta.eql(member.table.binding, changefeed_control.tableBinding(table))) return;
         };
         const encoded = try std.json.Stringify.valueAlloc(a, next, .{});

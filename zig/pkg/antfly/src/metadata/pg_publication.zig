@@ -73,6 +73,7 @@ pub const Record = struct {
 
 pub const Write = struct {
     expected_revision: u64,
+    expected_catalog_revision: ?u64 = null,
     next: Record,
 
     pub fn validate(self: Write) !void {

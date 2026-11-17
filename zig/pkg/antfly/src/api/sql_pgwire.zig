@@ -570,6 +570,11 @@ pub const Adapter = struct {
 
     fn openStream(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !?wire.ReadStream {
         const self: *Adapter = @ptrCast(@alignCast(raw));
+        if (try wire.replication_commands.parsePublication(alloc, request.statement, publication_control.max_tables)) |publication| {
+            var parsed = publication;
+            parsed.deinit();
+            return null;
+        }
         var job = StreamJob{ .adapter = self, .alloc = alloc, .credential = @ptrCast(@alignCast(identity.context)), .request = request };
         try job.dispatch();
         return job.opened;
@@ -1236,6 +1241,117 @@ fn validateRequest(request: wire.Request) !void {
     if (request.limit == 0 or request.limit > 4096 or request.parameters.len > 1024) return error.InvalidSqlParameters;
 }
 
+const publication_metadata = @import("../metadata/pg_publication.zig");
+const publication_control = @import("../metadata/changefeed_control.zig");
+const PublicationCommand = wire.replication_commands.PublicationCommand;
+
+fn executePublication(
+    server: *http.ApiHttpServer,
+    a: std.mem.Allocator,
+    authority: *Authority,
+    command: PublicationCommand,
+) !wire.Result {
+    const domain = @import("antfly_local_sources").system_catalog_domain;
+    const port = server.source.pg_publications orelse return error.UnsupportedReplicationMode;
+    const identity = authority.identity.*.?;
+    const owner = try @import("changefeed_public.zig").durableOwner(identity);
+    const context = try authority.context();
+    const database = authority.request.database orelse domain.default_database_name;
+    const namespace = authority.request.namespace orelse domain.default_namespace_name;
+    const targets = try a.alloc(domain.Target, command.tables.len);
+    for (command.tables, targets) |table, *target| {
+        target.* = .{ .database = database, .namespace = table.schema orelse namespace, .table = table.name };
+        try target.validate();
+    }
+    const request: domain.ResolveMany = .{ .targets = targets, .include_query_definitions = true, .publication_database = database };
+    const response = try server.source.systemCatalog(a, context, .{ .resolve_many = request });
+    const resolved_catalog = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, response, .{ .allocate = .alloc_always });
+    const cut = try resolved_catalog.requirePublicationCut(request);
+    const database_key = publication_control.hash(.{ .domain = "antfly:pg-publication-database:v1", .group = cut.metadata_group_id, .incarnation = cut.metadata_incarnation, .database = cut.database_id });
+    var maintenance = context;
+    maintenance.principal = .{ .kind = .internal, .subject = "pg-publication-maintenance" };
+    var previous = try port.read(port.ptr, a, database_key, command.name, maintenance);
+    defer if (previous) |*record| record.deinit();
+    const old = if (previous) |record| record.value else null;
+    if (old) |record| if (!std.meta.eql(record.owner, owner)) return error.Forbidden;
+    const exists = old != null and old.?.members != null;
+    const tag: []const u8 = switch (command.action) {
+        .create => "CREATE PUBLICATION",
+        .replace_members => "ALTER PUBLICATION",
+        .drop => "DROP PUBLICATION",
+    };
+    if (command.action == .create and exists) return error.PgPublicationAlreadyExists;
+    if (command.action != .create and !exists) {
+        if (command.if_exists) return .{ .command_tag = tag };
+        return error.PgPublicationNotFound;
+    }
+    const members = if (command.action == .drop) null else try resolvePublicationMembers(server, a, identity, context, targets, resolved_catalog, cut);
+    const revision = if (old) |record| record.revision else 0;
+    try authority.credential.validate();
+    try port.mutate(port.ptr, a, .{
+        .expected_revision = revision,
+        .expected_catalog_revision = resolved_catalog.revision,
+        .next = .{ .database = database_key, .name = command.name, .owner = owner, .revision = std.math.add(u64, revision, 1) catch return error.ProgramLimitExceeded, .members = members },
+    }, maintenance);
+    return .{ .command_tag = tag, .mutation_outcome = .committed };
+}
+
+fn resolvePublicationMembers(
+    server: *http.ApiHttpServer,
+    a: std.mem.Allocator,
+    identity: http.AuthenticatedIdentity,
+    context: operation.RequestContext,
+    targets: []const @import("antfly_local_sources").system_catalog_domain.Target,
+    resolved_catalog: @import("antfly_local_sources").system_catalog_domain.ResolvedMany,
+    cut: @import("antfly_local_sources").system_catalog_domain.PublicationCatalogCut,
+) ![]const publication_metadata.Member {
+    const names = try a.alloc([]const u8, targets.len);
+    for (targets, names) |target, *name| name.* = try target.resourceNameAlloc(a);
+    try ReplicationIdentity.requireWholeTablesForIdentity(a, identity, names);
+    const members = try a.alloc(publication_metadata.Member, targets.len);
+    for (targets, names, resolved_catalog.tables, cut.bindings, members) |target, name, resolved, binding, *member| {
+        const table = resolved orelse return error.TableNotFound;
+        const definition = table.query_definition.?;
+        if (table.native_service != null or definition.storage_engine != .local) return error.ChangefeedCapabilityUnsupported;
+        var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, definition.schema_json);
+        defer parsed.deinit(a);
+        if (parsed.storage_mode != .relational or parsed.external_base_source != null) return error.ChangefeedCapabilityUnsupported;
+        if (http.hasEffectiveRowFilter(identity, table.name)) return error.Forbidden;
+        const policy = try server.rowPolicyReadProof(a, &identity, context, table.table_id, table.name, target.database, parsed.version);
+        if (policy != null) return error.Forbidden;
+        var keys: []const []const u8 = &.{};
+        if (parsed.unique_constraints) |constraints| for (constraints.value) |constraint| {
+            if (!(constraint.primary orelse false)) continue;
+            const columns = constraint.columns orelse return error.ChangefeedCapabilityUnsupported;
+            const ordered = try a.alloc([]const u8, columns.len);
+            for (columns, ordered) |column, *slot| slot.* = try a.dupe(u8, column);
+            std.mem.sort([]const u8, ordered, {}, struct {
+                fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
+                    return std.mem.order(u8, lhs, rhs) == .lt;
+                }
+            }.less);
+            keys = ordered;
+            break;
+        };
+        member.* = .{
+            .table = .{ .table_id = table.table_id, .binding = binding.?, .contract = .native_relational, .policy_revision = 1 },
+            .permission_name = name,
+            .namespace = target.namespace,
+            .name = target.table,
+            .oid = std.math.cast(u32, table.table_id) orelse return error.ChangefeedCapabilityUnsupported,
+            .identity = if (keys.len != 0) .default else .full,
+            .key_columns = keys,
+        };
+    }
+    std.mem.sort(publication_metadata.Member, members, {}, struct {
+        fn less(_: void, lhs: publication_metadata.Member, rhs: publication_metadata.Member) bool {
+            return lhs.table.table_id < rhs.table.table_id;
+        }
+    }.less);
+    try publication_metadata.validateMembers(members);
+    return members;
+}
+
 const Job = struct {
     adapter: *Adapter,
     alloc: std.mem.Allocator,
@@ -1259,7 +1375,12 @@ const Job = struct {
                 } else {
                     var message_buffer: [256]u8 = undefined;
                     const safe = execution.diagnostic(err);
-                    diagnostic.set(safe.code, execution.diagnosticMessage(err, &message_buffer), null, safe.retryable);
+                    switch (err) {
+                        error.PgReplicationSyntax => diagnostic.set("42601", "Invalid publication statement", null, false),
+                        error.PgPublicationAlreadyExists => diagnostic.set("42710", "Publication already exists", null, false),
+                        error.PgPublicationNotFound => diagnostic.set("42704", "Publication does not exist", null, false),
+                        else => diagnostic.set(safe.code, execution.diagnosticMessage(err, &message_buffer), null, safe.retryable),
+                    }
                 }
             };
             self.failure = err;
@@ -1270,6 +1391,26 @@ const Job = struct {
         try validateRequest(self.request);
         var preparation = self.adapter.server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
         defer preparation.release();
+        if (try wire.replication_commands.parsePublication(self.alloc, self.request.statement, publication_control.max_tables)) |publication| {
+            var parsed = publication;
+            defer parsed.deinit();
+            if (self.request.session_id != null) return error.UnsupportedSqlExecution;
+            if (self.request.parameters.len != 0 or self.request.parameter_types.len != 0 or self.request.parameter_descriptors.len != 0)
+                return error.InvalidSqlParameters;
+            if (self.kind == .describe) {
+                self.description = .{};
+                return;
+            }
+            const server = self.adapter.server;
+            var admission = try server.acquireSqlExecution(true);
+            defer admission.release();
+            preparation.release();
+            var identity: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
+            defer identity.?.deinit(server.alloc);
+            var authority: Authority = .{ .credential = self.credential, .identity = &identity, .request = self.request };
+            self.result = try executePublication(server, self.alloc, &authority, parsed.command);
+            return;
+        }
         var lease = self.adapter.server.sqlPlanCache().acquire(self.adapter.server.sqlPlanCacheIo(), .{
             .statement = self.request.statement,
             .principal = self.credential.principal,
@@ -2697,4 +2838,99 @@ test "SQL pgwire native replication fences publication changes and live credenti
     members[0].oid = 42;
     try manager.setRowFilter("replicator", "docs", "{\"term\":{\"id\":1}}");
     try std.testing.expectError(error.Forbidden, upload_policy.authorize(state, .{}));
+}
+
+test "SQL pgwire native publication DDL uses catalog identity and revision CAS" {
+    const a = std.testing.allocator;
+    const domain = @import("antfly_local_sources").system_catalog_domain;
+    const Fixture = struct {
+        record: ?publication_metadata.Record = null,
+        writes: usize = 0,
+
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+
+        fn catalogCall(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            if (call == .policy_publication_status) return alloc.dupe(u8, "null");
+            const input = call.resolve_many;
+            try std.testing.expectEqualStrings("default", input.publication_database.?);
+            const schema =
+                \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","nullable":false}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"pk","columns":["id"],"primary":true,"timing":"immediate"}]}
+            ;
+            const table: domain.ResolvedTable = .{ .table_id = 71, .name = "physical", .query_definition = .{ .table_id = 71, .schema_json = schema, .read_schema_json = "", .indexes_json = "{}" } };
+            const has_members = input.targets.len != 0;
+            if (has_members) try std.testing.expectEqualStrings("docs", input.targets[0].table);
+            const cut: domain.ResolvedMany = .{
+                .revision = 9,
+                .tables = if (has_members) &.{table} else &.{},
+                .publication_cut = .{ .metadata_group_id = 3, .metadata_incarnation = @splat('1'), .database_id = 1, .bindings = if (has_members) &.{@as([32]u8, @splat(2))} else &.{} },
+            };
+            return std.json.Stringify.valueAlloc(alloc, cut, .{});
+        }
+
+        fn read(raw: *anyopaque, alloc: std.mem.Allocator, database: publication_control.Digest, name: []const u8, context: operation.RequestContext) !?std.json.Parsed(publication_metadata.Record) {
+            try publication_metadata.requireAuthority(context);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const record = self.record orelse return null;
+            try std.testing.expectEqual(record.database, database);
+            try std.testing.expectEqualStrings(record.name, name);
+            const bytes = try std.json.Stringify.valueAlloc(alloc, record, .{});
+            defer alloc.free(bytes);
+            return try publication_metadata.parseRecord(alloc, bytes);
+        }
+
+        fn mutate(raw: *anyopaque, _: std.mem.Allocator, write: publication_metadata.Write, context: operation.RequestContext) !void {
+            try publication_metadata.requireAuthority(context);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try write.validate();
+            try std.testing.expect(write.applies(self.record));
+            try std.testing.expectEqual(@as(?u64, 9), write.expected_catalog_revision);
+            self.record = write.next;
+            self.writes += 1;
+        }
+    };
+    var store = usermgr.MemoryStore.init(a);
+    defer store.deinit();
+    var policies = @import("antfly_casbin").MemoryAdapter.init(a);
+    defer policies.deinit();
+    var manager = try usermgr.UserManager.init(a, store.iface(), try usermgr.initDefaultEnforcer(a, policies.iface()));
+    defer manager.deinit();
+    var permission = try usermgr.Permission.initOwned(a, .table, "docs", .replicate);
+    defer permission.deinit(a);
+    var user = try manager.createUser("replicator", "secret", &.{permission});
+    defer user.deinit(a);
+    const credential = try Credential.authenticate(a, &manager, "replicator", "secret");
+    defer Credential.release(credential, a);
+    var identity: ?http.AuthenticatedIdentity = try credential.identity(a);
+    defer identity.?.deinit(a);
+    var fixture: Fixture = .{};
+    const server = try a.create(http.ApiHttpServer);
+    defer a.destroy(server);
+    server.alloc = a;
+    server.source = .{
+        .ptr = &fixture,
+        .vtable = &.{ .status = Fixture.status, .system_catalog = Fixture.catalogCall },
+        .pg_publications = .{ .ptr = &fixture, .read = Fixture.read, .mutate = Fixture.mutate },
+    };
+    const cancelled: std.atomic.Value(bool) = .init(false);
+    var authority: Authority = .{ .credential = credential, .identity = &identity, .request = .{
+        .statement = "",
+        .limit = 1,
+        .io = std.testing.io,
+        .deadline = std.Io.Clock.Timestamp.now(std.testing.io, .awake).addDuration(.{ .raw = .fromSeconds(5), .clock = .awake }),
+        .cancel_requested = &cancelled,
+    } };
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const alloc = scratch.allocator();
+    const create: PublicationCommand = .{ .action = .create, .name = "feed", .tables = &.{.{ .schema = null, .name = "docs" }} };
+    const result = try executePublication(server, alloc, &authority, create);
+    try std.testing.expectEqualStrings("CREATE PUBLICATION", result.command_tag);
+    try std.testing.expectEqualStrings("id", fixture.record.?.members.?[0].key_columns[0]);
+    try std.testing.expectError(error.PgPublicationAlreadyExists, executePublication(server, alloc, &authority, create));
+    _ = try executePublication(server, alloc, &authority, .{ .action = .drop, .name = "feed" });
+    try std.testing.expect(fixture.record.?.members == null);
+    _ = try executePublication(server, alloc, &authority, .{ .action = .drop, .name = "feed", .if_exists = true });
+    try std.testing.expectEqual(@as(usize, 2), fixture.writes);
 }
