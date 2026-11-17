@@ -361,6 +361,7 @@ pub const Storage = struct {
         try requireEmptyPrefix(&cursor, &(receipt_prefix.* ++ suffix));
         try requireEmptyPrefix(&cursor, &proofKey(id));
         try requireEmptyPrefix(&cursor, &Contributions.activationKey(id));
+        try requireEmptyPrefix(&cursor, &TransactionParticipant.key(id));
     }
 
     fn requireEmptyPrefix(cursor: anytype, prefix: []const u8) !void {
@@ -1041,6 +1042,152 @@ pub const Contributions = struct {
     }
 };
 
+/// Durable prepare payload for an authority participant. Resolution reads
+/// this packet after failover and uses the current owner's recovery token.
+pub const TransactionParticipant = struct {
+    const validation = @import("dag_validation.zig");
+    const A = std.mem.Allocator;
+    const prefix = "\x00\x00__metadata__:dag-prepared:";
+    const magic = "DAGP\x01";
+    const max_packet_bytes = 64 * 1024 * 1024;
+
+    fn key(domain_id: Digest) [prefix.len + 32]u8 {
+        return prefix.* ++ domain_id;
+    }
+
+    pub fn prepare(
+        alloc: A,
+        txn: anytype,
+        token: Token,
+        versions: Digest,
+        replacements: []const Contributions.Replacement,
+        budget: *validation.Budget,
+        witness: *validation.Witness,
+    ) !void {
+        witness.* = .{};
+        try Contributions.prepare(alloc, txn, token, versions, replacements, budget, witness);
+        var memory: validation.Memory = .{ .parent = alloc, .budget = budget };
+        const bounded = memory.allocator();
+        const packet = encode(bounded, versions, replacements, budget) catch |err| {
+            if (err == error.OutOfMemory and memory.denied) {
+                budget.exhausted = .memory;
+                return error.GraphConstraintCapacity;
+            }
+            return err;
+        };
+        defer bounded.free(packet);
+        try txn.put(&key(token.domain), packet);
+    }
+
+    /// The caller authenticates the durable coordinator decision and attaches
+    /// its acknowledgement to the same write transaction. An unknown decision
+    /// must leave the reservation untouched.
+    pub fn resolve(alloc: A, txn: anytype, domain_id: Digest, epoch: u64, attempt: Attempt, outcome: Outcome) !Receipt {
+        const state = try Storage.load(txn, domain_id);
+        if (state.owner_epoch != epoch) return error.GraphConstraintOwnerChanged;
+        if (try Storage.readReceipt(txn, domain_id, attempt)) |receipt| {
+            if (receipt.outcome != outcome) return error.GraphConstraintAttemptConflict;
+            return receipt;
+        }
+        const token = (try state.recoveryToken(epoch)) orelse return error.GraphConstraintAttemptConflict;
+        if (!std.meta.eql(token.attempt, attempt)) return error.GraphConstraintAttemptConflict;
+        const receipt = switch (outcome) {
+            .accepted => blk: {
+                if (!state.pending.?.validated) return error.GraphConstraintNotValidated;
+                const raw = txn.get(&key(domain_id)) catch |err| {
+                    if (err == error.NotFound) return error.GraphConstraintNotValidated;
+                    return err;
+                };
+                if (raw.len > max_packet_bytes) return error.InvalidDagAuthority;
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                const scratch = arena.allocator();
+                var packet: Packet = .{ .remaining = try scratch.dupe(u8, raw) };
+                if (!std.mem.eql(u8, try packet.take(magic.len), magic)) return error.InvalidDagAuthority;
+                const versions = (try packet.take(32))[0..32].*;
+                const replacements = try packet.decode(scratch);
+                break :blk try Contributions.accept(scratch, txn, token, versions, replacements);
+            },
+            .aborted => try Storage.reject(txn, token, .aborted),
+            .semantic_rejection => try Storage.reject(txn, token, .semantic_rejection),
+        };
+        txn.delete(&key(domain_id)) catch |err| if (err != error.NotFound) return err;
+        return receipt;
+    }
+
+    fn append(packet: *std.ArrayList(u8), alloc: A, bytes: []const u8) !void {
+        if (bytes.len > max_packet_bytes -| packet.items.len) return error.GraphConstraintCapacity;
+        try packet.appendSlice(alloc, bytes);
+    }
+
+    fn appendCount(packet: *std.ArrayList(u8), alloc: A, count: usize) !void {
+        var raw: [4]u8 = undefined;
+        std.mem.writeInt(u32, &raw, std.math.cast(u32, count) orelse return error.GraphConstraintCapacity, .big);
+        try append(packet, alloc, &raw);
+    }
+
+    fn appendBytes(packet: *std.ArrayList(u8), alloc: A, bytes: []const u8) !void {
+        try appendCount(packet, alloc, bytes.len);
+        try append(packet, alloc, bytes);
+    }
+
+    fn encode(alloc: A, versions: Digest, replacements: []const Contributions.Replacement, budget: *validation.Budget) ![]u8 {
+        var packet: std.ArrayList(u8) = .empty;
+        errdefer packet.deinit(alloc);
+        try append(&packet, alloc, magic);
+        try append(&packet, alloc, &versions);
+        try appendCount(&packet, alloc, replacements.len);
+        for (replacements) |replacement| {
+            try budget.checkpoint();
+            try append(&packet, alloc, &replacement.owner);
+            try appendBytes(&packet, alloc, replacement.source);
+            try appendCount(&packet, alloc, replacement.targets.len);
+            for (replacement.targets) |target| {
+                try budget.checkpoint();
+                try appendBytes(&packet, alloc, target);
+            }
+        }
+        return packet.toOwnedSlice(alloc);
+    }
+
+    const Packet = struct {
+        remaining: []const u8,
+
+        fn take(self: *Packet, len: usize) ![]const u8 {
+            if (len > self.remaining.len) return error.InvalidDagAuthority;
+            const raw = self.remaining[0..len];
+            self.remaining = self.remaining[len..];
+            return raw;
+        }
+
+        fn count(self: *Packet) !usize {
+            return std.mem.readInt(u32, (try self.take(4))[0..4], .big);
+        }
+
+        fn bytes(self: *Packet) ![]const u8 {
+            const size = try self.count();
+            return self.take(size);
+        }
+
+        fn decode(self: *Packet, alloc: A) ![]Contributions.Replacement {
+            const len = try self.count();
+            if (len > self.remaining.len / 40) return error.InvalidDagAuthority;
+            const replacements = try alloc.alloc(Contributions.Replacement, len);
+            for (replacements) |*replacement| {
+                const owner = (try self.take(32))[0..32].*;
+                const source = try self.bytes();
+                const target_count = try self.count();
+                if (target_count > self.remaining.len / 4) return error.InvalidDagAuthority;
+                const targets = try alloc.alloc([]const u8, target_count);
+                for (targets) |*target| target.* = try self.bytes();
+                replacement.* = .{ .owner = owner, .source = source, .targets = targets };
+            }
+            if (self.remaining.len != 0) return error.InvalidDagAuthority;
+            return replacements;
+        }
+    };
+};
+
 test "DAG adjacency source prefixes distinguish arbitrary binary identifiers" {
     const alloc = std.testing.allocator;
     const first = try Adjacency.sourcePrefix(alloc, @splat(7), "a");
@@ -1232,17 +1379,29 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, id, 1));
     try txn.delete(edge);
     try Storage.activateNewIncarnation(&txn, id, 1);
+    var epoch: u64 = 1;
     for ([_][]const Contributions.Replacement{ &initial, &transfer, &remove }, 0..) |replacements, revision| {
         var attempt = testAttempt(@intCast(revision + 1));
         attempt.candidate = Contributions.candidate(versions, replacements);
-        const token = (try Storage.begin(&txn, id, 1, revision, attempt)).reserved;
+        const token = (try Storage.begin(&txn, id, epoch, revision, attempt)).reserved;
         var budget: Contributions.validation.Budget = .{ .clock = .{ .now = Txn.now, .context = &txn } };
         var witness: Contributions.validation.Witness = .{};
-        try Contributions.prepare(alloc, &txn, token, versions, replacements, &budget, &witness);
+        try TransactionParticipant.prepare(alloc, &txn, token, versions, replacements, &budget, &witness);
         try std.testing.expectError(error.GraphConstraintAttemptConflict, Contributions.accept(alloc, &txn, token, @splat(9), replacements));
-        const receipt = try Contributions.accept(alloc, &txn, token, versions, replacements);
+        if (revision == 0) {
+            try Storage.takeover(&txn, id, epoch, epoch + 1);
+            try std.testing.expectError(error.GraphConstraintOwnerChanged, TransactionParticipant.resolve(alloc, &txn, id, epoch, attempt, .accepted));
+            epoch += 1;
+            const persisted = txn.rows.get(&TransactionParticipant.key(id)).?;
+            const writable: []u8 = @constCast(persisted);
+            writable[0] ^= 1;
+            try std.testing.expectError(error.InvalidDagAuthority, TransactionParticipant.resolve(alloc, &txn, id, epoch, attempt, .accepted));
+            writable[0] ^= 1;
+        }
+        const receipt = try TransactionParticipant.resolve(alloc, &txn, id, epoch, attempt, .accepted);
         try std.testing.expectEqual(revision + 1, receipt.revision);
-        try std.testing.expectEqualDeep(receipt, try Contributions.accept(alloc, &txn, token, versions, replacements));
+        try std.testing.expectEqualDeep(receipt, try TransactionParticipant.resolve(alloc, &txn, id, epoch, attempt, .accepted));
+        try std.testing.expect(!txn.rows.contains(&TransactionParticipant.key(id)));
         try std.testing.expectEqual(revision < 2, txn.rows.contains(edge));
         if (revision == 1) {
             const reverse: []const Contributions.Replacement = &.{
@@ -1250,11 +1409,11 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
             };
             var rejected = testAttempt(9);
             rejected.candidate = Contributions.candidate(versions, reverse);
-            const reverse_token = (try Storage.begin(&txn, id, 1, 2, rejected)).reserved;
-            try std.testing.expectError(error.GraphConstraintBusy, Storage.retire(&txn, id, 1));
+            const reverse_token = (try Storage.begin(&txn, id, epoch, 2, rejected)).reserved;
+            try std.testing.expectError(error.GraphConstraintBusy, Storage.retire(&txn, id, epoch));
             try std.testing.expectError(error.GraphCycle, Contributions.prepare(alloc, &txn, reverse_token, versions, reverse, &budget, &witness));
             try std.testing.expectError(error.GraphConstraintNotValidated, Contributions.accept(alloc, &txn, reverse_token, versions, reverse));
-            _ = try Storage.reject(&txn, reverse_token, .semantic_rejection);
+            _ = try TransactionParticipant.resolve(alloc, &txn, id, epoch, rejected, .semantic_rejection);
         }
     }
     const existing_id: Digest = @splat(2);
@@ -1282,6 +1441,6 @@ test "DAG contribution acceptance persists full manifests and fences owner swaps
     try Contributions.finishActivation(&txn, existing_id, 2, versions, last_cursor);
     _ = try Storage.begin(&txn, existing_id, 2, 0, testAttempt(7));
 
-    try Storage.retire(&txn, id, 1);
-    try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, id, 1));
+    try Storage.retire(&txn, id, epoch);
+    try std.testing.expectError(error.GraphConstraintNotReady, Storage.activateNewIncarnation(&txn, id, epoch));
 }

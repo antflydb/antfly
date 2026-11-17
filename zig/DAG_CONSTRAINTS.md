@@ -31,8 +31,13 @@ effective owner survives. The contribution adapter diffs complete effective
 owner manifests against accepted storage, binds those replacements and producer
 versions to the attempt, and writes the resulting manifests with the terminal
 receipt. Committed replay recomputes the delta at the reserved accepted revision
-without a new admission deadline. Production writers do not yet call these
-adapters. The authority also stages bounded activation pages into a private
+without a new admission deadline. The local transaction manager can prepare
+an ordered set of authority domains atomically with its participant vote.
+It persists a versioned candidate packet and resolves the recorded domains in
+the same batch as the participant decision, including authority-only participants
+and resolution after authority owner changes. Ordinary transactions keep their
+original record format and skip authority lookups. The hosted coordinator and
+production graph writers do not yet supply the authority domains or replacements. The authority also stages bounded activation pages into a private
 ledger and persists the pinned snapshot and scan cursor atomically with each
 page. The catalog still needs to fence writes, enumerate the stable snapshot
 completely, and certify end of input before the authority becomes active.
