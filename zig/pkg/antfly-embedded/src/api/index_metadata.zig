@@ -14,6 +14,7 @@
 // limitations under the License.
 
 //! Facade for the shared native index metadata and storage-name contract.
+const std = @import("std");
 const shared = @import("../system_catalog/index_metadata.zig");
 pub const isReservedEntry = shared.isReservedEntry;
 pub const isOpaqueEntry = shared.isOpaqueEntry;
