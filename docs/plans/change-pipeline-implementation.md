@@ -7455,3 +7455,47 @@ This completes authenticated observation only. Producer-close proposal and
 trusted original-decision drainage remain necessary before first-strict source
 activation, and the original destination/feed/bootstrap/retention/pgoutput/
 existing-client requirements are unchanged.
+
+### Producer closure proposal and state recovery (in progress)
+
+Previous authoritative progress is committed through 829741cebf; the worktree was
+clean at this continuation. The proposer now admits producer closure as a
+separate NativeControlKind through existing membership preflight, activation
+serialization, current-term/membership fencing, routed admission and complete
+physical owner validation. It encodes the dedicated protocol-46 entry and keeps
+the accepted term/index when confirmation is lost. Recovery performs only a
+qualified closure observation at or beyond the accepted index: its result is
+current closure state, not proof that the original proposal committed and not
+an original row-transaction outcome.
+
+The actual Raft submission fixture now retains its original complete owner and
+runs closure after its final row-write checks. New native qualification verifies
+stale-generation/cancelled admission before log append, lost confirmation after
+accepted proposal, read-only recovery without log growth, a preserved original
+first cut on repeated closure, no document apply progression and unchanged
+non-strict source registry. These are real proposals/barriers/ReadIndex reads,
+not synthetic apply-only entries. Qualification is running
+(`source-producer-closure-proposal-test.log`). No new callback layout, native ABI,
+HTTP route or schema is introduced in this proposer milestone. Authenticated
+producer-close RPC, original pending-work drainage, first-strict activation and
+all original full issue acceptance remain required.
+
+The first proposer run passed six local and 40 linked cases, but the extended
+real-Raft fixture failed an existing protocol-floor expectation (expected 44,
+observed 46). The closure helper had been inserted after the first matching
+legacy-floor assertion rather than the final one. Its control changes the floor
+irreversibly, so it now runs after all original row/protocol checks; those
+expectations were preserved. Final native qualification is running
+(`source-producer-closure-proposal-final-test.log`). Contract checks passed
+(`source-producer-closure-proposal-contract-check.log`).
+
+Final producer proposal qualification passed six local and 41 linked native /
+real-Raft cases, zero failures/skips/leaks
+(`source-producer-closure-proposal-final-test.log`). The selected live submission
+fixture reaches the new final closure helper: stale/cancelled submissions do not
+append, real activation advances to profile 46, accepted confirmation loss keeps
+the exact term/index, state recovery appends nothing, repeated closure preserves
+the first cut, no document applies are counted, and the source registry remains
+non-strict. Contract and whitespace checks passed. This qualifies the internal
+proposer/state-recovery foundation only; no authenticated producer-close RPC,
+legacy drainage, source activation or full issue completion is claimed.

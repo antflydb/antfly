@@ -14059,13 +14059,14 @@ pub const DataServer = struct {
     const ScopeRead = @import("antfly_local_sources").storage_source_scope_control;
     const ProducerRead = @import("antfly_local_sources").storage_source_producer_policy;
     const CheckpointRead = @import("antfly_local_sources").storage_source_checkpoint_read;
-    const NativeControlKind = enum { history, source_plan, source_scope, source_retirement };
+    const NativeControlKind = enum { history, source_plan, source_scope, source_retirement, producer_closure };
     fn NativeControlCommand(comptime kind: NativeControlKind) type {
         return switch (kind) {
             .history => @import("antfly_local_sources").api_local_table_writes.table_write_source.history_consumer.Command,
             .source_plan => SourcePlanHttp.ControlRequest,
             .source_scope => ScopeRead.Command,
             .source_retirement => @import("antfly_local_sources").storage_source_scope_retirement.Command,
+            .producer_closure => @import("antfly_local_sources").storage_transaction_completion.RoutedOwner,
         };
     }
     fn NativeControlOutcome(comptime kind: NativeControlKind) type {
@@ -14074,6 +14075,7 @@ pub const DataServer = struct {
             .source_plan => SourcePlanHttp.control.Outcome,
             .source_scope => @import("antfly_local_sources").storage_source_scope_ordered.Outcome,
             .source_retirement => @import("antfly_local_sources").storage_source_scope_retirement_ordered.Recovery,
+            .producer_closure => ProducerRead.Observation,
         };
     }
     fn NativeControlReceipt(comptime kind: NativeControlKind) type {
@@ -14082,6 +14084,7 @@ pub const DataServer = struct {
             .source_plan => SourcePlanHttp.control.Entry,
             .source_scope => ScopeRead.scope.Cut,
             .source_retirement => ScopeRead.scope.Cut,
+            .producer_closure => ScopeRead.scope.Cut,
         };
     }
     fn ControlSubmission(comptime kind: NativeControlKind) type {
@@ -14089,6 +14092,7 @@ pub const DataServer = struct {
     }
     pub const HistorySubmission = ControlSubmission(.history);
     pub const SourcePlanSubmission = ControlSubmission(.source_plan);
+    pub const SourceProducerClosureSubmission = ControlSubmission(.producer_closure);
     pub const SourceScopeSubmission = struct {
         command: ScopeRead.Command,
         entry: ScopeRead.scope.Cut,
@@ -14180,6 +14184,23 @@ pub const DataServer = struct {
         return .{ .command = command, .entry = result.entry, .outcome = result.outcome };
     }
 
+    /// One owner-fenced cumulative intake closure, not a drain certificate.
+    /// Accepted entry identity is retained on lost confirmation. Only a fresh
+    /// qualified observation establishes the current closure state.
+    pub fn submitSourceProducerClosureLocal(self: *DataServer, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, original_owner: @import("antfly_local_sources").storage_transaction_completion.RoutedOwner) !SourceProducerClosureSubmission {
+        try original_owner.validate();
+        try @import("../api/source_owner_scope.zig").requireFence(original_owner, fence);
+        return self.submitNativeControlLocal(a, fence, table, .producer_closure, original_owner);
+    }
+    /// Observation-only recovery; this cannot append a protocol barrier or
+    /// closure command, and does not assert the original proposal committed.
+    pub fn recoverSourceProducerClosureLocal(self: *DataServer, a: std.mem.Allocator, fence: antfly.metadata_api.CatalogRouteFence, table: []const u8, original_owner: @import("antfly_local_sources").storage_transaction_completion.RoutedOwner, receipt: ScopeRead.scope.Cut) !ProducerRead.Observation {
+        try original_owner.validate();
+        try @import("../api/source_owner_scope.zig").requireFence(original_owner, fence);
+        if (receipt.term == 0 or receipt.index == 0) return error.InvalidSourceAdmission;
+        return self.recoverNativeControlLocal(a, fence, table, .producer_closure, original_owner, receipt, receipt.index);
+    }
+
     fn submitNativeControlLocal(self: *DataServer, alloc: std.mem.Allocator, original_fence: antfly.metadata_api.CatalogRouteFence, table_name: []const u8, comptime kind: NativeControlKind, command: NativeControlCommand(kind)) !ControlSubmission(kind) {
         if (comptime !linked_storage) return error.ChangefeedCapabilityUnsupported;
         const raft = self.data_raft orelse return error.ChangefeedCapabilityUnsupported;
@@ -14204,6 +14225,7 @@ pub const DataServer = struct {
             .source_plan => @import("source_plan_entry.zig").required_protocol_version,
             .source_scope => @import("source_scope_entry.zig").required_protocol_version,
             .source_retirement => @import("source_retirement_entry.zig").required_protocol_version,
+            .producer_closure => @import("source_producer_closure_entry.zig").required_protocol_version,
         };
         // Create cache ownership atomically with the hosted-group check, so
         // retirement cannot clean the group just before a stale insertion.
@@ -14246,12 +14268,14 @@ pub const DataServer = struct {
         const expected_identity = fence.route.identity_namespace;
         if (descriptor.identity.table_id != expected_identity.table_id or descriptor.identity.shard_id != expected_identity.shard_id or descriptor.identity.range_id != expected_identity.range_id) return error.HistoryResynchronizationRequired;
         if (comptime kind == .source_plan) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.source_owner, context);
+        if (comptime kind == .producer_closure) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command, context);
         if (comptime kind == .source_scope or kind == .source_retirement) try @import("../api/completion_owner_admission.zig").require(alloc, owner.catalog, table_name, fence, descriptor.view(), command.intent.owner, context);
         const encoded = switch (kind) {
             .history => try @import("history_control_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .history_control = .{ .command = command } }, required),
             .source_plan => try @import("source_plan_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.source_owner, .source_plan = command.command }, required),
             .source_scope => try @import("source_scope_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.intent.owner, .source_scope_control = command }, required),
             .source_retirement => try @import("source_retirement_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command.intent.owner, .source_retirement = command }, required),
+            .producer_closure => try @import("source_producer_closure_entry.zig").encode(alloc, .{ .table = table_name, .protocol = required, .storage_owner = descriptor.view(), .source_owner = command, .source_producer_closure = true }, required),
         };
         defer alloc.free(encoded);
         const durable = try self.durableDataRaftBatchProtocolVersion(group);
@@ -14346,6 +14370,7 @@ pub const DataServer = struct {
                 .history => owner.orderedHistoryOutcomeRouted(alloc, fence, table_name, .{ .command = command, .entry = receipt, .minimum_applied_index = minimum_applied_index }),
                 .source_scope => owner.sourceScopeOutcomeRouted(alloc, fence, table_name, .{ .command = command, .entry = receipt, .minimum_applied_index = minimum_applied_index }),
                 .source_retirement => owner.sourceRetirementOutcomeRouted(alloc, fence, table_name, .{ .command = command, .entry = receipt, .minimum_applied_index = minimum_applied_index }),
+                .producer_closure => owner.sourceProducerClosureObservationRouted(alloc, fence, table_name, .{ .version = 1, .owner = command, .minimum_applied_index = @max(minimum_applied_index, receipt.index) }),
                 .source_plan => blk: {
                     var lookup = command;
                     lookup.operation = .recover;
@@ -44449,6 +44474,7 @@ fn consumerTests() type {
         test "data raft ordered history local submission confirms through real Raft and ReadIndex" {
             if (comptime !linked_storage) return error.SkipZigTest;
             const a = std.testing.allocator;
+            var producer_closure_owner: ?@import("antfly_local_sources").storage_transaction_completion.RoutedOwner = null;
             const Catalog = struct {
                 fn snapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
                     return .{ .status = .{ .metadata_group_id = 1, .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .metrics = .{} }, .tables = @constCast(&[_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data", .schema_json = "{}", .indexes_json = "{}" }}), .ranges = @constCast(&[_]antfly.metadata.table_manager.RangeRecord{.{ .group_id = 601, .table_id = 7, .range_id = 601, .start_key = "", .end_key = null }}), .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
@@ -45082,8 +45108,10 @@ fn consumerTests() type {
                 defer frozen.deinit();
                 const plan = frozen.admission;
                 const current_owner = frozen.participants[0].owner;
+                producer_closure_owner = current_owner;
                 const txn_id = plan.transaction_id;
                 try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_legacy_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+
                 const positive_input: resolution_operations.Request = .{ .version = 1, .authority = .raft, .namespace = namespace, .transaction_id = txn_id, .owner_fence = current_owner.digest(), .manifest_digest = (try plan.manifest(1001)).digest(), .commit_version = 1001, .minimum_applied_index = 1 };
                 metadata_source.control_read_generation_at_ms = metadata_source.awakeMs();
                 const positive = try origin.historyResolutionPort().read(a, route.fence().?, "docs", positive_input, .{});
@@ -45501,6 +45529,21 @@ fn consumerTests() type {
             const policy_observed = try server.submitHistoryControlLocal(a, route.fence().?, "docs", .{ .inspect_policy = .{ .namespace = namespace, .authority = ref.authority } });
             try std.testing.expectEqualDeep(policy_applied.outcome.?.applied.policy, policy_observed.outcome.?.applied.policy);
             try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_legacy_producer_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
+            const ClosureHarness = struct {
+                pub fn last(node: *DataServer, group: u64) u64 {
+                    lockAtomic(&node.data_raft_mutex);
+                    defer node.data_raft_mutex.unlock();
+                    return node.data_raft.?.host.http_host.host.raftStatus(group).?.last_index;
+                }
+                pub fn applied(node: *DataServer, group: u64) u64 {
+                    return node.data_raft_apply.?.appliedIndex(group);
+                }
+                pub fn documentApplies(node: *DataServer) usize {
+                    return node.data_raft_apply.?.test_faults.document_apply_successes;
+                }
+            };
+            try @import("source_producer_closure_proposal_native_test.zig").run(a, server, route.fence().?, producer_closure_owner orelse return error.TestExpectedProducerOwner, DataRequestLifecycleEvent, ClosureHarness);
+            try std.testing.expectEqual(@import("source_producer_closure_entry.zig").required_protocol_version, try projection.raftBatchProtocolVersionForRequest(601));
         }
 
         test "data raft ordered history table producer capability refuses lossy fallback" {
