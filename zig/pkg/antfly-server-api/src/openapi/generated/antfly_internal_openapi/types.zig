@@ -1301,6 +1301,51 @@ pub const NativeSourcePlanStatus = struct {
     reclamation: NativeHistoryDigest,
 };
 
+pub const NativeSourceProducerCloseReply = struct {
+    version: i64,
+    request_digest: NativeHistoryDigest,
+    /// Accepted proposal term/index only; it may remain uncommitted or be overwritten.
+    receipt: ?NativeHistoryPublicationCut,
+    /// Qualified current closure state at or beyond the accepted index. Not an original command outcome, source ACK or drainage certificate.
+    outcome: ?NativeSourceProducerClosureObservation,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "version", "version", false },
+        .{ "request_digest", "request_digest", false },
+        .{ "receipt", "receipt", false },
+        .{ "outcome", "outcome", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("request_digest");
+        try jw.write(self.request_digest);
+        try jw.objectField("receipt");
+        try jw.write(self.receipt);
+        try jw.objectField("outcome");
+        try jw.write(self.outcome);
+        try jw.endObject();
+    }
+};
+
+pub const NativeSourceProducerCloseRequest = struct {
+    version: i64,
+    /// Fresh nonzero per-attempt correlation nonce; never a transaction identity or retry authorization.
+    request_id: []const i64,
+    owner: NativeHistoryPublicationOwner,
+};
+
 /// One native snapshot of actual applied cut and optional producer intake closure. Absence grants no transaction outcome, replay, drainage or source activation authority. Validate the complete owner and minimum cut; source/checkpoint/feed/LSN positions remain distinct.
 pub const NativeSourceProducerClosureObservation = struct {
     version: i64,

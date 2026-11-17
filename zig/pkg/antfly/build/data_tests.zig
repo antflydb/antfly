@@ -40,7 +40,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("source-scope-native-control-test", "Verify physical source scope controls and atomic ordered recovery").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, source_scope_storage_tests, &.{"db ordered source scope"}).step);
     const source_plan_apply_tests = @import("linked_tests.zig").add(b, .{ .name = "source-plan-apply-tests", .root_module = data_runtime_test_mod, .filters = &.{ "data raft source plan", "data raft source scope" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("source-plan-apply-test", "Verify activated frozen source plan native dispatch and lost-result recovery").dependOn(&source_plan_apply_tests.run(b).step);
-    const history_apply_tests = @import("linked_tests.zig").add(b, .{ .name = "ordered-history-apply-tests", .root_module = data_runtime_test_mod, .filters = &.{ "data raft ordered history", "source scope", "source producer closure" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const history_apply_tests = @import("linked_tests.zig").add(b, .{ .name = "ordered-history-apply-tests", .root_module = data_runtime_test_mod, .filters = &.{ "data raft ordered history", "source scope", "source producer closure", "source producer control" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("history-control-apply-test", "Verify native retention completion precedes shared Raft applied publication").dependOn(&history_apply_tests.run(b).step);
     const lib_data_runtime_default_filters = [_][]const u8{
         "data raft ordered history",

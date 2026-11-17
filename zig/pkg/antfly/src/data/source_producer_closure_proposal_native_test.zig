@@ -47,7 +47,7 @@ pub fn run(a: std.mem.Allocator, server: anytype, fence: metadata.CatalogRouteFe
     defer server.data_request_lifecycle_hook = previous_hook;
     const before_documents = Harness.documentApplies(server);
     server.data_request_lifecycle_hook = .{ .ptr = &interruption, .reach_fn = Interrupted.reach };
-    const uncertain = try server.submitSourceProducerClosureLocal(a, fence, "docs", owner);
+    const uncertain = try Harness.submitRpc(a, server, fence, owner, 181);
     server.data_request_lifecycle_hook = previous_hook;
     try std.testing.expect(uncertain.outcome == null);
     try std.testing.expectEqual(interruption.accepted_index.?, uncertain.entry.index);
@@ -66,8 +66,13 @@ pub fn run(a: std.mem.Allocator, server: anytype, fence: metadata.CatalogRouteFe
     const observed = again.outcome orelse return error.TestExpectedQualifiedClosure;
     try std.testing.expect(observed.cut.index >= again.entry.index);
     try std.testing.expectEqualDeep(recovered.closure, observed.closure);
+    const routed_again = try Harness.submitRpc(a, server, fence, owner, 182);
+    const routed_observation = routed_again.outcome orelse return error.TestExpectedRoutedClosureState;
+    try std.testing.expect(routed_observation.cut.index >= routed_again.entry.index);
+    try std.testing.expectEqualDeep(recovered.closure, routed_observation.closure);
+
     try std.testing.expectEqual(before_documents, Harness.documentApplies(server));
-    const registry = try server.sourceScopeObservationPort().read(a, fence, "docs", .{ .version = 1, .owner = owner, .domain = @splat(71), .minimum_applied_index = again.entry.index }, .{});
+    const registry = try server.sourceScopeObservationPort().read(a, fence, "docs", .{ .version = 1, .owner = owner, .domain = @splat(71), .minimum_applied_index = routed_again.entry.index }, .{});
     try std.testing.expect(!registry.header.strict);
     try std.testing.expect(registry.record == null);
 }

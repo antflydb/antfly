@@ -137,6 +137,17 @@ pub fn parseObserveNativeSourcePlanBody(allocator: std.mem.Allocator, body: []co
     return std.json.parseFromSlice(types.NativeSourcePlanObserveRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Submit one owner-fenced cumulative producer intake closure
+pub const CloseNativeSourceProducersPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for closeNativeSourceProducers.
+pub fn parseCloseNativeSourceProducersBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.NativeSourceProducerCloseRequest) {
+    return std.json.parseFromSlice(types.NativeSourceProducerCloseRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Read physical producer intake closure at a qualified native cut
 pub const ObserveNativeSourceProducerClosurePathParams = struct {
     group_id: []const u8,
@@ -221,6 +232,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/chunk-v1", .operation_id = "readNativeSourcePlanChunk", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/control-v1", .operation_id = "controlNativeSourcePlan", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-plan/observe-v1", .operation_id = "observeNativeSourcePlan", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-producers/close-v1", .operation_id = "closeNativeSourceProducers", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-producers/observe-v1", .operation_id = "observeNativeSourceProducerClosure", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-retirement/control-v1", .operation_id = "controlNativeSourceRetirement", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/source-scope/control-v1", .operation_id = "controlNativeSourceScope", .request_body = .buffered, .streaming_response = false },
@@ -255,6 +267,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "readNativeSourcePlanChunk")) @compileError("ServerRouter: Impl missing required method 'readNativeSourcePlanChunk'");
         if (!@hasDecl(Impl, "controlNativeSourcePlan")) @compileError("ServerRouter: Impl missing required method 'controlNativeSourcePlan'");
         if (!@hasDecl(Impl, "observeNativeSourcePlan")) @compileError("ServerRouter: Impl missing required method 'observeNativeSourcePlan'");
+        if (!@hasDecl(Impl, "closeNativeSourceProducers")) @compileError("ServerRouter: Impl missing required method 'closeNativeSourceProducers'");
         if (!@hasDecl(Impl, "observeNativeSourceProducerClosure")) @compileError("ServerRouter: Impl missing required method 'observeNativeSourceProducerClosure'");
         if (!@hasDecl(Impl, "controlNativeSourceRetirement")) @compileError("ServerRouter: Impl missing required method 'controlNativeSourceRetirement'");
         if (!@hasDecl(Impl, "controlNativeSourceScope")) @compileError("ServerRouter: Impl missing required method 'controlNativeSourceScope'");
@@ -287,6 +300,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/groups/:group_id/tables/:table_name/source-plan/chunk-v1", httpx.Handler.bind(self.impl, readNativeSourcePlanChunk));
             try server.post("/groups/:group_id/tables/:table_name/source-plan/control-v1", httpx.Handler.bind(self.impl, controlNativeSourcePlan));
             try server.post("/groups/:group_id/tables/:table_name/source-plan/observe-v1", httpx.Handler.bind(self.impl, observeNativeSourcePlan));
+            try server.post("/groups/:group_id/tables/:table_name/source-producers/close-v1", httpx.Handler.bind(self.impl, closeNativeSourceProducers));
             try server.post("/groups/:group_id/tables/:table_name/source-producers/observe-v1", httpx.Handler.bind(self.impl, observeNativeSourceProducerClosure));
             try server.post("/groups/:group_id/tables/:table_name/source-retirement/control-v1", httpx.Handler.bind(self.impl, controlNativeSourceRetirement));
             try server.post("/groups/:group_id/tables/:table_name/source-scope/control-v1", httpx.Handler.bind(self.impl, controlNativeSourceScope));
@@ -397,6 +411,14 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.observeNativeSourcePlan(ctx, group_id, table_name);
         }
 
+        /// Submit one owner-fenced cumulative producer intake closure
+        /// POST /groups/{group_id}/tables/{table_name}/source-producers/close-v1
+        fn closeNativeSourceProducers(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            return impl.closeNativeSourceProducers(ctx, group_id, table_name);
+        }
+
         /// Read physical producer intake closure at a qualified native cut
         /// POST /groups/{group_id}/tables/{table_name}/source-producers/observe-v1
         fn observeNativeSourceProducerClosure(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -470,6 +492,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn readNativeSourcePlanChunk(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn controlNativeSourcePlan(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn observeNativeSourcePlan(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
+//   fn closeNativeSourceProducers(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn observeNativeSourceProducerClosure(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn controlNativeSourceRetirement(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response
 //   fn controlNativeSourceScope(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8) !httpx.Response

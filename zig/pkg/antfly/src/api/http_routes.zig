@@ -250,6 +250,7 @@ pub const Routes = struct {
     pub const source_retirement_control_suffix = "/source-retirement/control-v1";
     pub const source_scope_observe_suffix = "/source-scope/observe-v1";
     pub const source_producer_closure_observe_suffix = "/source-producers/observe-v1";
+    pub const source_producer_close_suffix = "/source-producers/close-v1";
     pub const source_checkpoint_observe_suffix = "/source-checkpoint/observe-v1";
     pub const source_plan_chunk_suffix = "/source-plan/chunk-v1";
     pub const history_control_suffix = "/history/control-v1";

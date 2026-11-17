@@ -7499,3 +7499,47 @@ the first cut, no document applies are counted, and the source registry remains
 non-strict. Contract and whitespace checks passed. This qualifies the internal
 proposer/state-recovery foundation only; no authenticated producer-close RPC,
 legacy drainage, source activation or full issue completion is claimed.
+
+### Authenticated producer-close RPC (in progress)
+
+Spec-first adds POST /internal/v1/groups/{group_id}/tables/{table_name}/
+source-producers/close-v1. A bounded request carries a fresh nonce and complete
+original physical owner, never a drain flag or caller observation. Its correlated
+reply separates accepted proposal term/index from optional qualified current
+closure state. Receipt does not prove original proposal commitment; positive
+state does not prove drainage, source ACK or strict activation. Recovery uses the
+existing read-only observe endpoint, not an automatic mutation replay.
+
+API ABI 39 fences the callback layout. The authenticated handler, port boundary,
+typed HTTP client and local/remote routing now call the qualified proposer. One
+transport attempt preserves only fully validated receipts; malformed, missing/
+duplicate route acknowledgements, media types, request binding, oversize or lost
+responses remain unknown. Late cancellation clears state while retaining a valid
+accepted position. Request digest allocation is completed before proposal.
+
+The native fixture now obtains its first lost-confirmation submission over real
+signed HTTP against the live Raft owner, then recovers without log growth and
+submits a second positive HTTP close. Existing policy/row tests still precede
+closure. Wire and ingress coverage rejects forged state/route, missing material
+owner fields, caller drainage claims and cancellation; client coverage checks
+single attempts and ambiguity; handler auth remains mandatory in legacy mode.
+Generation passed (`source-producer-control-rpc-generate.log`), unrelated explorer
+artifacts were restored, and qualification is running
+(`source-producer-control-rpc-test.log`). All original drainage, activation,
+destination/feed/bootstrap/retention/pgoutput/client acceptance stays open.
+
+The initial signed native run passed the local/wire and authentication cases,
+but exhausted the parent live-Raft fixture's stack while constructing its
+additional API/IO owner. LLDB identified a roughly 6.4 MiB constructor frame.
+The extra loopback fixture now runs on an explicit 32 MiB worker stack; production
+admission and closure guards are unchanged. Final qualification passed six local
+and 45 linked native cases, zero failures/skips/leaks
+(`source-producer-control-rpc-stack-fix-test.log`). The selected live Raft case
+exercises both signed HTTP submissions, exact accepted receipt preservation after
+lost confirmation, read-only state recovery, immutable first closure cut and
+unchanged document-apply/strict-registry state. Earlier wire/control and handler
+authentication suites passed 13 local plus 35 wire/control and four auth cases.
+Spec generation, source-catalog/engine-error/OpenAPI contract checks and whitespace
+checks passed. This qualifies the authenticated closure transport foundation;
+legacy drainage, first-strict activation and all original full issue acceptance
+remain outstanding.
