@@ -8480,3 +8480,43 @@ test "source owner deferred graph cut state survives capture allocator retiremen
     try std.testing.expect(!state.active);
     try std.testing.expectEqual(@as(usize, 1), state.references.load(.acquire));
 }
+
+test "source owner privacy progress keeps writer and apply leases warm" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path = try std.fmt.allocPrint(a, "{s}/group-1/table-db", .{root});
+    var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    var descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":0}",
+        .indexes_json = try privacy.install(a, "{}", resource),
+    };
+    var writer = try source.acquireDescriptorOnce(1, "docs", path, descriptor, .shared, .resident, .{});
+    defer writer.deinit();
+    resource.coverage.retry_after_millis = 200;
+    _ = try privacy.startScan(a, &resource, "a", "z", 50);
+    descriptor.indexes_json = try privacy.replaceResource(a, descriptor.indexes_json, resource);
+    {
+        var observed = try source.acquireDescriptorOnce(1, "docs", path, descriptor, .shared, .resident, .{});
+        defer observed.deinit();
+        try std.testing.expectEqual(writer.entry, observed.entry);
+        var applied = try source.acquireDescriptorOnce(1, "docs", path, descriptor, .shared, .resident, .{ .historical_raft_apply = true });
+        defer applied.deinit();
+        try std.testing.expectEqual(writer.entry, applied.entry);
+        try std.testing.expect(!writer.entry.retired);
+        try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
+    }
+    resource.resource_version += 1;
+    descriptor.indexes_json = try privacy.replaceResource(a, descriptor.indexes_json, resource);
+    try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(1, "docs", path, descriptor, .shared, .resident, .{}));
+    try std.testing.expect(writer.entry.retired);
+}
