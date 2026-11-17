@@ -1818,7 +1818,7 @@ pub const TransactionIntentRequest = struct {
     integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
 
     pub fn sourcePurpose(self: @This()) !?[32]u8 {
-        if ((self.completion_ordinary_producer and self.completion_legacy_producer) or ((self.completion_ordinary_producer or self.completion_legacy_producer) and (self.completion_owner == null or self.completion_source_purpose != null or self.completion_source_scope != null or self.completion_source_checkpoint != null or self.source_admission != null))) return error.SourceTransactionIdentityConflict;
+        if ((self.completion_ordinary_producer and self.completion_legacy_producer) or ((self.completion_ordinary_producer or self.completion_legacy_producer) and (self.completion_source_purpose != null or self.completion_source_scope != null or self.completion_source_checkpoint != null or self.source_admission != null))) return error.SourceTransactionIdentityConflict;
         if (self.completion_source_scope) |scope| {
             try scope.validate();
             if (self.completion_source_purpose == null or self.completion_owner == null or self.source_admission != null) return error.InvalidSourceAdmission;

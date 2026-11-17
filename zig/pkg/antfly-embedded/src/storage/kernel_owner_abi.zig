@@ -38,7 +38,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 113 fences private row batch producer envelopes.
 // Version 114 fences legacy completion transaction producer layouts.
 // Version 115 fences explicit table transaction origin contracts.
-pub const abi_version: u32 = 115;
+// Version 116 fences native/ordered non-history producer admission.
+pub const abi_version: u32 = 116;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

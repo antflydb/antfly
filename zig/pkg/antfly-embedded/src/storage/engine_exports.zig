@@ -1128,6 +1128,10 @@ fn beginTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, 
     return .{ .value = self.beginTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn beginProducerTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, producer: @import("source_producer_policy.zig").Producer) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginProducerTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, producer) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn beginReplicatedSourceCompletionTransaction(self: *DB, encoded_plan: []const u8, owner: @import("transaction_completion.zig").RoutedOwner, timestamp_ns: u64, created_at_ns: u64, identity: db.OrderedApplyReceipt, purpose: [32]u8) engine.Outcome(@import("transactions.zig").TxnId) {
     return .{ .value = self.beginReplicatedSourceCompletionTransaction(encoded_plan, owner, timestamp_ns, created_at_ns, identity, purpose) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -1153,6 +1157,10 @@ fn beginReplicatedLegacyCompletionTransaction(self: *DB, encoded_plan: []const u
 
 fn beginReplicatedTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8) engine.Outcome(@import("transactions.zig").TxnId) {
     return .{ .value = self.beginReplicatedTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn beginReplicatedProducerTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8, producer: @import("source_producer_policy.zig").Producer) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginReplicatedProducerTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, producer) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn writeIntents(self: *DB, txn_id: @import("transactions.zig").TxnId, intents: []const @import("transactions.zig").WriteIntent, predicates: []const @import("transactions.zig").VersionPredicate) engine.Outcome(void) {

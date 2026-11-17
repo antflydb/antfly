@@ -25650,6 +25650,18 @@ pub const DB = struct {
 
     pub fn beginTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope });
+        return self.beginTransactionProducerInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, .unlabelled);
+    }
+
+    /// Trusted native-only origin admission. Raft owners use the separate
+    /// applying-entry method; an origin label supplies no replication authority.
+    pub fn beginProducerTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, producer: @import("../source_producer_policy.zig").Producer) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginProducerTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, producer });
+        if (producer != .ordinary and producer != .legacy_cdc) return error.InvalidSourceAdmission;
+        return self.beginTransactionProducerInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, producer);
+    }
+
+    fn beginTransactionProducerInternal(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, producer: @import("../source_producer_policy.zig").Producer) !transactions_mod.TxnId {
         // BEGIN records participant metadata without reading or changing user
         // rows. PREPARE retains authenticated policy admission for every row
         // intent. Restore-scoped BEGIN keeps its stronger raw admission gate.
@@ -25661,18 +25673,24 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (producer != .unlabelled) {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try @import("../source_authority.zig").require(&read, .native, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+        }
         if (self.local_execution.restore_staging_required.load(.acquire) or scope != null) {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, scope);
         }
-        return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+        return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
             txn_id,
             timestamp_ns,
             created_at_ns,
             participants,
             coordinator,
             retain_terminal,
+            .{ .ordinary_producer = producer == .ordinary, .legacy_producer = producer == .legacy_cdc },
         );
     }
 
@@ -25786,11 +25804,36 @@ pub const DB = struct {
 
     pub fn beginReplicatedTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope });
+        return self.beginReplicatedTransactionProducerInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, .unlabelled);
+    }
+
+    /// Protocol 45. Actual data-Raft entry, origin and BEGIN metadata commit
+    /// together; no completion admission is invented on a non-history root.
+    pub fn beginReplicatedProducerTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8, producer: @import("../source_producer_policy.zig").Producer) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedProducerTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, producer });
+        if (producer != .ordinary and producer != .legacy_cdc) return error.InvalidSourceAdmission;
+        return self.beginReplicatedTransactionProducerInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, producer);
+    }
+
+    fn beginReplicatedTransactionProducerInternal(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8, producer: @import("../source_producer_policy.zig").Producer) !transactions_mod.TxnId {
         lockApply(self);
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
+        if (producer != .unlabelled) {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            _ = try @import("../source_authority.zig").require(&read, .raft, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+        }
         switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
-            .already_applied => return txn_id,
+            .already_applied => {
+                if (producer != .unlabelled) {
+                    var manager = try self.core.initTxnManager();
+                    defer manager.deinit();
+                    const ordinary = manager.isOrdinaryProducer(txn_id) catch |err| return if (err == error.TxnNotFound) error.SourceOutcomeUnresolved else err;
+                    if (ordinary != (producer == .ordinary) or try manager.isLegacyProducer(txn_id) != (producer == .legacy_cdc)) return error.SourceTransactionIdentityConflict;
+                }
+                return txn_id;
+            },
             .apply => {},
         }
         if (self.local_execution.restore_staging_required.load(.acquire) or scope != null) {
@@ -25807,7 +25850,7 @@ pub const DB = struct {
             participants,
             coordinator,
             retain_terminal,
-            .{ .writes = &.{marker} },
+            .{ .ordinary_producer = producer == .ordinary, .legacy_producer = producer == .legacy_cdc, .writes = &.{marker} },
         );
     }
 

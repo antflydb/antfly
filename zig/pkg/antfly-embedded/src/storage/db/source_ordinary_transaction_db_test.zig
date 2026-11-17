@@ -21,6 +21,7 @@ const db_mod = @import("db.zig");
 const completion = @import("../transaction_completion.zig");
 const wire = @import("../../api/batch_internal.zig");
 pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions, owner: completion.RoutedOwner) !void {
+    try runNonhistory(a, parent, options);
     const path = try std.fmt.allocPrint(a, "{s}/ordinary-producer", .{parent});
     defer a.free(path);
     const id: [16]u8 = @splat(243);
@@ -98,5 +99,34 @@ pub fn run(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions
         const resolution = try db.historyResolution(a, .{ .version = 1, .authority = .raft, .namespace = owner.namespace, .transaction_id = id, .owner_fence = owner.digest(), .manifest_digest = (try admission.manifest(200)).digest(), .commit_version = 200, .minimum_applied_index = 8 });
         try std.testing.expect(resolution.resolution != null);
         try std.testing.expect(resolution.resolution.?.outcome == .effects);
+    }
+}
+
+fn runNonhistory(a: std.mem.Allocator, parent: []const u8, options: db_mod.OpenOptions) !void {
+    const path = try std.fmt.allocPrint(a, "{s}/nonhistory-producer", .{parent});
+    defer a.free(path);
+    const id: [16]u8 = @splat(231);
+    const participants = &.{"table2:00000004:docs:2"};
+    {
+        var db = try db_mod.DB.open(a, path, options);
+        defer db.close();
+        _ = try db.beginReplicatedProducerTransactionScoped(id, 100, 101, participants, true, true, .{ .term = 1, .index = 1 }, null, .ordinary);
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, db.beginReplicatedProducerTransactionScoped(id, 100, 101, participants, true, true, .{ .term = 1, .index = 1 }, null, .legacy_cdc));
+        try db.writeReplicatedTransactionAtOrderedReceipt(id, .{ .completion_ordinary_producer = true, .writes = &.{.{ .key = "nonhistory-row", .value = "{}" }} }, .{ .term = 1, .index = 2 });
+        try std.testing.expectError(error.SourceTransactionIdentityConflict, db.writeReplicatedTransactionAtOrderedReceipt(id, .{ .completion_legacy_producer = true }, .{ .term = 1, .index = 3 }));
+        try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
+    }
+    {
+        var db = try db_mod.DB.open(a, path, options);
+        defer db.close();
+        try db.resolveReplicatedTransactionAtOrderedReceipt(id, .committed, 200, .write, .none, .{ .term = 1, .index = 3 }, null);
+        const row = (try db.get(a, "nonhistory-row")) orelse return error.TestExpectedOrdinaryDocument;
+        defer a.free(row);
+        try std.testing.expectEqualStrings("{}", row);
+        const legacy: [16]u8 = @splat(232);
+        _ = try db.beginReplicatedProducerTransactionScoped(legacy, 300, 301, participants, true, true, .{ .term = 1, .index = 4 }, null, .legacy_cdc);
+        try db.writeReplicatedTransactionAtOrderedReceipt(legacy, .{ .completion_legacy_producer = true, .writes = &.{.{ .key = "aborted-row", .value = "{}" }} }, .{ .term = 1, .index = 5 });
+        try db.resolveReplicatedTransactionAtOrderedReceipt(legacy, .aborted, 400, .write, .none, .{ .term = 1, .index = 6 }, null);
+        try std.testing.expect(try db.get(a, "aborted-row") == null);
     }
 }

@@ -862,7 +862,11 @@ pub const TxnManager = struct {
 
     pub fn completionPrepareProducerStatus(self: *TxnManager, txn_id: TxnId, input_digest: ?[32]u8, source_purpose: ?[32]u8, owner: ?completion.RoutedOwner, scope: ?source_scope.Reference, ordinary_producer: bool, legacy_producer: bool) !?bool {
         var frozen = (try self.getCompletionAdmission(self.alloc, txn_id)) orelse {
-            if (owner != null or ordinary_producer or legacy_producer) return error.SourceTransactionIdentityConflict;
+            if (owner != null) return error.SourceTransactionIdentityConflict;
+            if (ordinary_producer or legacy_producer) {
+                const record = try self.loadTransactionRecord(txn_id);
+                if (record.ordinary_producer != ordinary_producer or record.legacy_producer != legacy_producer) return error.SourceTransactionIdentityConflict;
+            }
             return null;
         };
         defer frozen.deinit();

@@ -118,6 +118,16 @@ pub fn applyReplicatedTransactionMutationInternal(
             // follower tracks itself, making successful cleanup O(N) rather
             // than every participant retrying every other participant.
             const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
+            if (begin.ordinary_producer or begin.legacy_producer) {
+                try @import("antfly_local_sources").api_internal_batch.validateProducerBeginControlRequest(req);
+                if (begin.ordinary_producer and begin.legacy_producer) return error.InvalidBatchRequest;
+                const producer: @import("antfly_local_sources").storage_source_producer_policy.Producer = if (begin.ordinary_producer) .ordinary else .legacy_cdc;
+                if (raft_entry) |entry|
+                    _ = try db.beginReplicatedProducerTransactionScoped(begin.txn_id, begin.begin_timestamp, begin.created_at_ns, durable_participants, coordinator, begin.retain_terminal, entry, req.restore_staging_scope, producer)
+                else
+                    _ = try db.beginProducerTransactionScoped(begin.txn_id, begin.begin_timestamp, begin.created_at_ns, durable_participants, coordinator, begin.retain_terminal, req.restore_staging_scope, producer);
+                return;
+            }
             if (raft_entry) |entry|
                 _ = try db.beginReplicatedTransactionScoped(
                     begin.txn_id,

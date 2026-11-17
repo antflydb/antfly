@@ -6823,3 +6823,53 @@ original issue acceptance criterion is discharged by this routing milestone;
 full native/hosted fallback, producer assignment, qualified closure/drainage and
 all original destination/feed/bootstrap/pgoutput/client requirements remain open
 under the full active objective.
+
+### Non-history producer transaction admission (in progress)
+
+The native BEGIN contract now has distinct trusted native and actual applying
+Raft-entry methods for explicit ordinary/legacy origin without retained-history
+completion. Both retain the origin on the original transaction record; the Raft
+method stages its actual marker with that record and checks origin on replay.
+Native and Raft authority are independently checked against the physical root.
+Existing unlabelled methods remain unlabelled. Retained-history admission is not
+fabricated by either method, and strict closure still requires its original
+qualified completion capability.
+
+Private BEGIN/PREPARE phases now distinguish non-history ordinary/legacy origin
+from completion phases. Required true producer markers reject absence, false,
+old-phase downgrade and accidental promotion into completion authority. Version
+45 gates the non-history phases; completion phases retain versions 42/44.
+Storage engine 65 and owner ABI 116 fence the added native methods; API kernel
+36, metadata 105 and failure 89 are unchanged. Native dispatch preserves the
+original coordinator/follower participant behavior and restore scope.
+
+Added wire adversarial tests and native applying-entry/reopen COMMIT/ABORT
+coverage. Full generation and source-catalog/engine-error/OpenAPI checks passed.
+Initial test compilation found a misspelled source-catalog alias in the added
+protocol test; correction and final qualification are pending. This work does
+not yet enable labelled legacy BEGIN RPC routing or production CDC/public
+producer assignment. All original destination, history, feeds, bootstrap,
+retention, pgoutput and actual Antfly client requirements remain open.
+
+Final non-history verification passed. The protocol check now uses a
+self-contained wire-shape fixture, preserving the control/storage compilation
+boundary; the earlier alias attempts were rejected at compile time. Original
+completion origin tests still require their original 42/44 floors, and both
+non-history origins require 45. Native reopen COMMIT/ABORT passed through the
+compiled engine (`source-nonhistory-producer-linked-final-test.log`: one native
+case). Final restore-aware checks passed
+(`source-nonhistory-producer-restore-final-test.log`): 33 wire cases, six local
+wire/runtime cases, six local history cases and 37 linked history/control cases,
+zero failures, skips or leaks. Non-history BEGIN control validation retains the
+ordinary restore scope/plan envelope and leaves its authority check to the
+native destination; completion BEGIN retains its stronger existing contract.
+Final source-catalog, engine-error and OpenAPI checks passed
+(`source-nonhistory-producer-contract-final-check.log`). Full generation passed
+before final source-only adjustments; only unrelated model-explorer generated
+output was discarded. `git diff --check` passed.
+
+This milestone establishes native/wire primitives, not the complete fallback.
+The next required work carries origin through BEGIN RPC, participant context and
+all provider request reconstruction, qualifies multi-participant non-history
+routing, and only then enables production ingress assignment. First-strict
+activation remains closed and no original issue acceptance box is checked.

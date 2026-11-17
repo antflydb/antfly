@@ -1540,10 +1540,18 @@ fn parseBatchRequestWithOptions(
         if (phase_value != .string or txn_value != .string or txn_value.string.len != 32) return error.InvalidBatchRequest;
         var txn_id: db_mod.types.TxnId = undefined;
         _ = std.fmt.hexToBytes(&txn_id, txn_value.string) catch return error.InvalidBatchRequest;
-        const ordinary_begin = std.mem.eql(u8, phase_value.string, "begin_ordinary_completion_v1");
-        const ordinary_prepare = std.mem.eql(u8, phase_value.string, "prepare_ordinary_completion_v1");
-        const legacy_begin = std.mem.eql(u8, phase_value.string, "begin_legacy_completion_v1");
-        const legacy_prepare = std.mem.eql(u8, phase_value.string, "prepare_legacy_completion_v1");
+        const ordinary_completion_begin = std.mem.eql(u8, phase_value.string, "begin_ordinary_completion_v1");
+        const ordinary_plain_begin = std.mem.eql(u8, phase_value.string, "begin_ordinary_v1");
+        const ordinary_begin = ordinary_completion_begin or ordinary_plain_begin;
+        const ordinary_completion_prepare = std.mem.eql(u8, phase_value.string, "prepare_ordinary_completion_v1");
+        const ordinary_plain_prepare = std.mem.eql(u8, phase_value.string, "prepare_ordinary_v1");
+        const ordinary_prepare = ordinary_completion_prepare or ordinary_plain_prepare;
+        const legacy_completion_begin = std.mem.eql(u8, phase_value.string, "begin_legacy_completion_v1");
+        const legacy_plain_begin = std.mem.eql(u8, phase_value.string, "begin_legacy_v1");
+        const legacy_begin = legacy_completion_begin or legacy_plain_begin;
+        const legacy_completion_prepare = std.mem.eql(u8, phase_value.string, "prepare_legacy_completion_v1");
+        const legacy_plain_prepare = std.mem.eql(u8, phase_value.string, "prepare_legacy_v1");
+        const legacy_prepare = legacy_completion_prepare or legacy_plain_prepare;
         const legacy_phase = legacy_begin or legacy_prepare;
         if (legacy_phase != object.contains("legacy_producer")) return error.InvalidBatchRequest;
         if (legacy_phase) {
@@ -1602,9 +1610,9 @@ fn parseBatchRequestWithOptions(
             if (!std.mem.eql(u8, &checkpoint.purpose, &source_purpose.?)) return error.SourceTransactionIdentityConflict;
             if (source_scope) |scope| if (!std.mem.eql(u8, &scope.binding, &checkpoint.binding) or scope.sequence != checkpoint.sequence) return error.SourceTransactionIdentityConflict;
         }
-        const completion_begin = legacy_begin or ordinary_begin or source_begin or std.mem.eql(u8, phase_value.string, "begin_completion_v1");
+        const completion_begin = legacy_completion_begin or ordinary_completion_begin or source_begin or std.mem.eql(u8, phase_value.string, "begin_completion_v1");
         if (completion_begin != object.contains("completion_admission")) return error.InvalidBatchRequest;
-        const completion_prepare = legacy_prepare or ordinary_prepare or source_prepare or std.mem.eql(u8, phase_value.string, "prepare_completion_v1");
+        const completion_prepare = legacy_completion_prepare or ordinary_completion_prepare or source_prepare or std.mem.eql(u8, phase_value.string, "prepare_completion_v1");
         const completion_resolve = source_resolve or std.mem.eql(u8, phase_value.string, "resolve_completion_v1");
         const completion_publish = std.mem.eql(u8, phase_value.string, "publish_completion_v1");
         if (completion_publish != object.contains("completion_certificate")) return error.InvalidBatchRequest;
@@ -1627,7 +1635,7 @@ fn parseBatchRequestWithOptions(
             transaction_completion_certificate = try alloc.dupe(u8, raw.string);
             break :transaction .{ .publish_completion = .{ .txn_id = txn_id, .completion_owner = binding, .certificate = transaction_completion_certificate.? } };
         }
-        if (std.mem.eql(u8, phase_value.string, "begin") or completion_begin) {
+        if (std.mem.eql(u8, phase_value.string, "begin") or ordinary_plain_begin or legacy_plain_begin or completion_begin) {
             const participants_value = object.get("participants") orelse return error.InvalidBatchRequest;
             if (participants_value != .array or participants_value.array.items.len == 0) return error.InvalidBatchRequest;
             transaction_participants = try alloc.alloc([]const u8, participants_value.array.items.len);
@@ -1643,7 +1651,7 @@ fn parseBatchRequestWithOptions(
                 if (ordinary_begin or legacy_begin) try validateOrdinaryCompletionBegin(alloc, raw.string);
                 transaction_completion_admission = try alloc.dupe(u8, raw.string);
             }
-            if ((ordinary_begin or legacy_begin) and completion_owner == null) return error.InvalidBatchRequest;
+            if ((ordinary_completion_begin or legacy_completion_begin) and completion_owner == null) return error.InvalidBatchRequest;
             break :transaction .{ .begin = .{
                 .ordinary_producer = ordinary_begin,
                 .legacy_producer = legacy_begin,
@@ -1670,9 +1678,9 @@ fn parseBatchRequestWithOptions(
             try completion_owner.?.validate();
             if (completion_owner.?.topology_epoch != try parseInternalU64(object.get("topology_epoch") orelse return error.InvalidBatchRequest)) return error.InvalidBatchRequest;
         }
-        const guarded_prepare = std.mem.eql(u8, phase_value.string, "prepare_ranges_v1") or (completion_prepare and range_guards != null and range_guards.?.value.len != 0);
+        const guarded_prepare = std.mem.eql(u8, phase_value.string, "prepare_ranges_v1") or ((completion_prepare or ordinary_plain_prepare or legacy_plain_prepare) and range_guards != null and range_guards.?.value.len != 0);
         if (guarded_prepare != (range_guards != null and range_guards.?.value.len != 0)) return error.InvalidBatchRequest;
-        if (std.mem.eql(u8, phase_value.string, "prepare") or guarded_prepare or completion_prepare) break :transaction .{ .prepare = .{
+        if (std.mem.eql(u8, phase_value.string, "prepare") or guarded_prepare or ordinary_plain_prepare or legacy_plain_prepare or completion_prepare) break :transaction .{ .prepare = .{
             .ordinary_producer = ordinary_prepare,
             .legacy_producer = legacy_prepare,
             .txn_id = txn_id,
@@ -2483,8 +2491,11 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         try writer.writeAll(",\"_transaction\":{");
         switch (mutation) {
             .begin => |begin| {
-                if ((begin.ordinary_producer and begin.legacy_producer) or ((begin.ordinary_producer or begin.legacy_producer) and (begin.completion_admission == null or begin.completion_owner == null or begin.source_purpose != null or begin.source_scope != null or begin.source_checkpoint or begin.source_checkpoint_receipts))) return error.InvalidBatchRequest;
-                if (begin.ordinary_producer or begin.legacy_producer) try validateOrdinaryCompletionBegin(alloc, begin.completion_admission.?);
+                if ((begin.ordinary_producer and begin.legacy_producer) or ((begin.ordinary_producer or begin.legacy_producer) and ((begin.completion_admission != null and begin.completion_owner == null) or begin.source_purpose != null or begin.source_scope != null or begin.source_checkpoint or begin.source_checkpoint_receipts))) return error.InvalidBatchRequest;
+                if (begin.ordinary_producer or begin.legacy_producer) {
+                    if (begin.completion_admission == null) try validateProducerBeginControlRequest(req);
+                    if (begin.completion_admission) |raw| try validateOrdinaryCompletionBegin(alloc, raw);
+                }
                 try validateSourceCompletionPurpose(begin.source_purpose, begin.completion_owner);
                 if (begin.source_purpose != null and !begin.retain_terminal) return error.InvalidBatchRequest;
                 if (begin.source_checkpoint and begin.source_purpose == null) return error.InvalidBatchRequest;
@@ -2496,7 +2507,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
                 if (begin.completion_admission == null and begin.completion_owner != null) return error.InvalidBatchRequest;
                 const txn_hex = std.fmt.bytesToHex(begin.txn_id, .lower);
                 try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"begin_timestamp\":\"{d}\",\"created_at_ns\":\"{d}\",\"topology_epoch\":\"{d}\",\"retain_terminal\":{},\"participants\":[", .{
-                    if (begin.legacy_producer) "begin_legacy_completion_v1" else if (begin.ordinary_producer) "begin_ordinary_completion_v1" else if (begin.source_scope != null) "begin_source_scope_v1" else if (begin.source_checkpoint_receipts) "begin_source_checkpoint_v2" else if (begin.source_checkpoint) "begin_source_checkpoint_v1" else if (begin.source_purpose != null) "begin_source_completion_v1" else if (begin.completion_admission != null) "begin_completion_v1" else "begin", &txn_hex, begin.begin_timestamp, begin.created_at_ns, begin.topology_epoch, begin.retain_terminal,
+                    if (begin.legacy_producer) (if (begin.completion_admission != null) "begin_legacy_completion_v1" else "begin_legacy_v1") else if (begin.ordinary_producer) (if (begin.completion_admission != null) "begin_ordinary_completion_v1" else "begin_ordinary_v1") else if (begin.source_scope != null) "begin_source_scope_v1" else if (begin.source_checkpoint_receipts) "begin_source_checkpoint_v2" else if (begin.source_checkpoint) "begin_source_checkpoint_v1" else if (begin.source_purpose != null) "begin_source_completion_v1" else if (begin.completion_admission != null) "begin_completion_v1" else "begin", &txn_hex, begin.begin_timestamp, begin.created_at_ns, begin.topology_epoch, begin.retain_terminal,
                 });
                 for (begin.participants, 0..) |participant, i| {
                     if (i != 0) try writer.writeByte(',');
@@ -2517,7 +2528,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
                 }
             },
             .prepare => |prepare| {
-                if ((prepare.ordinary_producer and prepare.legacy_producer) or ((prepare.ordinary_producer or prepare.legacy_producer) and (prepare.completion_owner == null or prepare.source_purpose != null or prepare.source_scope != null or prepare.source_checkpoint != null))) return error.InvalidBatchRequest;
+                if ((prepare.ordinary_producer and prepare.legacy_producer) or ((prepare.ordinary_producer or prepare.legacy_producer) and (prepare.source_purpose != null or prepare.source_scope != null or prepare.source_checkpoint != null))) return error.InvalidBatchRequest;
                 try validateSourceCompletionPurpose(prepare.source_purpose, prepare.completion_owner);
                 if (prepare.source_scope) |scope| {
                     try scope.validate();
@@ -2535,7 +2546,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
                     if (owner.topology_epoch != prepare.topology_epoch) return error.InvalidBatchRequest;
                 }
                 const txn_hex = std.fmt.bytesToHex(prepare.txn_id, .lower);
-                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ if (prepare.legacy_producer) "prepare_legacy_completion_v1" else if (prepare.ordinary_producer) "prepare_ordinary_completion_v1" else if (prepare.source_scope != null) "prepare_source_scope_v1" else if (prepare.source_checkpoint != null and prepare.source_checkpoint.?.receipt_window != 0) "prepare_source_checkpoint_v2" else if (prepare.source_checkpoint != null) "prepare_source_checkpoint_v1" else if (prepare.source_purpose != null) "prepare_source_completion_v1" else if (prepare.completion_owner != null) "prepare_completion_v1" else if (req.range_guards.len != 0) "prepare_ranges_v1" else "prepare", &txn_hex, prepare.topology_epoch });
+                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ if (prepare.legacy_producer) (if (prepare.completion_owner != null) "prepare_legacy_completion_v1" else "prepare_legacy_v1") else if (prepare.ordinary_producer) (if (prepare.completion_owner != null) "prepare_ordinary_completion_v1" else "prepare_ordinary_v1") else if (prepare.source_scope != null) "prepare_source_scope_v1" else if (prepare.source_checkpoint != null and prepare.source_checkpoint.?.receipt_window != 0) "prepare_source_checkpoint_v2" else if (prepare.source_checkpoint != null) "prepare_source_checkpoint_v1" else if (prepare.source_purpose != null) "prepare_source_completion_v1" else if (prepare.completion_owner != null) "prepare_completion_v1" else if (req.range_guards.len != 0) "prepare_ranges_v1" else "prepare", &txn_hex, prepare.topology_epoch });
                 if (prepare.ordinary_producer) try writer.writeAll(",\"ordinary_producer\":true");
                 if (prepare.legacy_producer) try writer.writeAll(",\"legacy_producer\":true");
                 if (prepare.completion_owner) |owner| try writer.print(",\"completion_owner\":{f}", .{std.json.fmt(owner, .{})});
@@ -3983,6 +3994,17 @@ pub fn validateCompletionControlRequest(req: db_mod.types.BatchRequest) !void {
     }
 }
 
+/// Non-history producer BEGIN retains the ordinary restore envelope. Restore
+/// authority is independently checked by the destination, not by this label.
+pub fn validateProducerBeginControlRequest(req: db_mod.types.BatchRequest) !void {
+    const mutation = req.transaction orelse return error.InvalidBatchRequest;
+    if (mutation != .begin or mutation.begin.completion_admission != null or mutation.begin.completion_owner != null) return error.InvalidBatchRequest;
+    var control = req;
+    control.restore_staging_scope = null;
+    control.restore_staging_plan_id = null;
+    try validateCompletionControlRequest(control);
+}
+
 /// A completion BEGIN freezes the same complete participant set at every root.
 /// Recovery order is coordinator first, then canonical namespace order excluding
 /// the coordinator. Unknown phases cannot downgrade to legacy admission.
@@ -4472,4 +4494,42 @@ test "completion begin wire row producer envelope retains explicit labels withou
     var public = try parseBatchRequest(a, "{\"source_producer\":\"ordinary\",\"inserts\":{\"row\":{}}}");
     defer public.deinit(a);
     try std.testing.expectEqual(Producer.unlabelled, public.req.source_producer);
+}
+
+test "completion begin wire nonhistory producer phases cannot downgrade or acquire completion authority" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |legacy| {
+        const begin: db_mod.types.BatchRequest = .{ .transaction = .{ .begin = .{ .txn_id = @splat(17), .begin_timestamp = 100, .created_at_ns = 101, .topology_epoch = 3, .participants = &.{"table2:00000004:docs:2"}, .ordinary_producer = !legacy, .legacy_producer = legacy } } };
+        var scoped = begin;
+        scoped.restore_staging_scope = @splat(21);
+        scoped.restore_staging_plan_id = @splat(22);
+        const scoped_bytes = try encodeBatchRequest(a, scoped);
+        defer a.free(scoped_bytes);
+        var scoped_decoded = try parseInternalBatchRequest(a, scoped_bytes);
+        defer scoped_decoded.deinit(a);
+        try std.testing.expectEqualDeep(scoped.restore_staging_scope, scoped_decoded.req.restore_staging_scope);
+        try std.testing.expectEqualDeep(scoped.restore_staging_plan_id, scoped_decoded.req.restore_staging_plan_id);
+        var invalid_control = begin;
+        invalid_control.deletes = &.{"row"};
+        try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(a, invalid_control));
+        const prepare: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "row", .value = "{}" }}, .transaction = .{ .prepare = .{ .txn_id = @splat(17), .topology_epoch = 3, .ordinary_producer = !legacy, .legacy_producer = legacy } } };
+        for ([_]db_mod.types.BatchRequest{ begin, prepare }, [_][]const u8{ if (legacy) "begin_legacy_v1" else "begin_ordinary_v1", if (legacy) "prepare_legacy_v1" else "prepare_ordinary_v1" }, [_][]const u8{ "begin", "prepare" }) |request, tag, old_tag| {
+            const bytes = try encodeBatchRequest(a, request);
+            defer a.free(bytes);
+            var decoded = try parseInternalBatchRequest(a, bytes);
+            defer decoded.deinit(a);
+            try std.testing.expectEqualDeep(request.transaction, decoded.req.transaction);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(a, bytes));
+            const downgraded = try std.mem.replaceOwned(u8, a, bytes, tag, old_tag);
+            defer a.free(downgraded);
+            try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, downgraded));
+            const stripped = try std.mem.replaceOwned(u8, a, bytes, if (legacy) ",\"legacy_producer\":true" else ",\"ordinary_producer\":true", "");
+            defer a.free(stripped);
+            try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, stripped));
+            const completion_tag = if (std.mem.eql(u8, old_tag, "begin")) (if (legacy) "begin_legacy_completion_v1" else "begin_ordinary_completion_v1") else (if (legacy) "prepare_legacy_completion_v1" else "prepare_ordinary_completion_v1");
+            const promoted = try std.mem.replaceOwned(u8, a, bytes, tag, completion_tag);
+            defer a.free(promoted);
+            try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(a, promoted));
+        }
+    }
 }
