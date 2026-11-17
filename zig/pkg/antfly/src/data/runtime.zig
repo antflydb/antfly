@@ -1249,6 +1249,7 @@ const RaftTableApplyStateMachine = struct {
         history_reply_lost_once_at_index: ?u64 = null,
         source_plan_reply_lost_once_at_index: ?u64 = null,
         source_scope_reply_lost_once_at_index: ?u64 = null,
+        source_retirement_reply_lost_once_at_index: ?u64 = null,
     } else struct {};
 
     const ApplyFailureKey = struct {
@@ -2138,6 +2139,34 @@ const RaftTableApplyStateMachine = struct {
         }
     }
 
+    fn applySourceRetirementForEntry(self: *RaftTableApplyStateMachine, group_id: u64, index: u64, term: u64, control: @import("source_retirement_entry.zig").Entry) !void {
+        try control.validate();
+        if (control.source_owner.group_id != group_id) return error.HistoryResynchronizationRequired;
+        if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+        const projection = self.topology_apply_store orelse return error.StorageKernelOwnerUnavailable;
+        const floor = projection.raftBatchProtocolVersionForRequest(group_id) catch |err| switch (err) {
+            error.SplitSourceProjectionNotReady, error.StorageBusy => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (floor < @import("source_retirement_entry.zig").required_protocol_version) return error.UnsupportedBatchProtocolVersion;
+        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        const outcome = owner.applyPreparedOrderedSourceRetirementGroupLocalAtRaftEntry(self.alloc, group_id, control.table, control.storage_owner, control.source_retirement, term, index) catch |err| switch (err) {
+            error.WriterLocked, error.StorageBusy, error.ResourceBudgetExceeded, error.StorageOwnerAdmissionPending, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (@import("builtin").is_test) if (self.test_faults.source_retirement_reply_lost_once_at_index == index) {
+            self.test_faults.source_retirement_reply_lost_once_at_index = null;
+            return error.RaftApplyWriterUnavailable;
+        };
+        switch (outcome) {
+            .applied => {},
+            .rejected => |reason| self.recordApplyFailure(group_id, index, term, ExpectedApplyFailure.fromError(reason.asError()).?),
+            // The marker proves application, not its old result. Require the
+            // proposer to recover the live lease rather than reporting success.
+            .superseded => self.recordApplyFailure(group_id, index, term, .SourceOutcomeUnresolved),
+        }
+    }
+
     fn publishAppliedReady(
         self: *RaftTableApplyStateMachine,
         group_id: u64,
@@ -2389,6 +2418,12 @@ const RaftTableApplyStateMachine = struct {
             if (entry.entry_type == .normal and data_raft_batch.looksLikeEnvelope(entry.data)) {
                 var applying = try data_raft_batch.decodeForApply(self.alloc, entry.data);
                 defer applying.deinit(self.alloc);
+                if (applying == .source_retirement) {
+                    try self.applySourceRetirementForEntry(group_id, entry.index, entry.term, applying.source_retirement.value());
+                    completed_index = entry.index;
+                    self.advanceRetryApplyCheckpoint(group_id, entry.index, entry.term, true);
+                    continue;
+                }
                 if (applying == .source_scope_control) {
                     try self.applySourceScopeForEntry(group_id, entry.index, entry.term, applying.source_scope_control.value());
                     completed_index = entry.index;
@@ -35949,6 +35984,19 @@ fn consumerTests() type {
                 pub fn index(state: *RaftTableApplyStateMachine) u64 {
                     return state.appliedIndex(601);
                 }
+                pub fn lostRetirementReply(state: *RaftTableApplyStateMachine, entry: raft_engine.core.Entry) !void {
+                    const retirement_before = state.test_faults.document_apply_successes;
+                    const retirement_token = try state.registerApplyOutcomeToken(601, entry.index, entry.term);
+                    defer state.cancelRegisteredApplyOutcome(retirement_token);
+                    state.test_faults.source_retirement_reply_lost_once_at_index = entry.index;
+                    try std.testing.expectError(error.RaftApplyWriterUnavailable, apply(state, entry));
+                    try std.testing.expectEqual(@as(u64, 11), state.appliedIndex(601));
+                    try std.testing.expect(!try state.applyOutcomeReady(retirement_token));
+                    try apply(state, entry);
+                    const retirement_outcome = state.takeRegisteredApplyOutcome(retirement_token).?;
+                    try std.testing.expectEqual(RaftTableApplyStateMachine.ExpectedApplyFailure.SourceCheckpointConflict, retirement_outcome.failed);
+                    try std.testing.expectEqual(retirement_before, state.test_faults.document_apply_successes);
+                }
                 pub fn lostReply(state: *RaftTableApplyStateMachine, entry: raft_engine.core.Entry) !void {
                     const scope_before = state.test_faults.document_apply_successes;
                     const scope_token = try state.registerApplyOutcomeToken(601, entry.index, entry.term);
@@ -35964,6 +36012,7 @@ fn consumerTests() type {
                 }
             };
             try @import("source_scope_apply_native_test.zig").run(a, &sm, &projection, control.storage_owner, routed, ScopeHarness);
+            try @import("source_retirement_apply_native_test.zig").run(a, &sm, &projection, &owner, control.storage_owner, routed, ScopeHarness);
         }
 
         test "data raft ordered history waits for native receipts and preserves rejection outcomes" {

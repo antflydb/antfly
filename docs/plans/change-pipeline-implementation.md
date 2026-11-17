@@ -6044,3 +6044,57 @@ recovery and ABI guard calls. Guarded cache cleanup completed
 (`source-retirement-owner-gc.log`), preserving active/recent outputs. The private
 ordered apply ABI is compiled/exported; successful retirement mutation through a
 real versioned Raft entry is still unqualified and remains required next.
+
+
+### Activated source retirement Raft dispatch
+
+Data protocol 41 adds a distinct source-retirement entry, carrying the complete
+original positive coordinator ABORT command and immutable physical owner
+snapshot. Ordinary document decoding refuses the envelope. Strict decoding
+requires explicit owner/root fields, rejects mixed/duplicate layouts, validates
+positive ABORT/admission membership and bounds the command and complete entry.
+Encoding requires the activated protocol floor. Source-scope lifecycle v40 and
+legacy source-pin protocol 12 retain their separate meanings.
+
+The topology projection delegates retirement without manufacturing document rows,
+history or split deltas, requiring durable v41 activation. Native apply validates
+the activated projection floor and original group, uses an apply-only descriptor
+lease and owner ABI 111/engine 58, and records bounded deterministic rejection as
+its actual entry outcome. Superseded receipts remain unresolved. A test-only
+lost-reply injection occurs after the native commit and before publishing the
+apply outcome; replay must recover the exact durable receipt before advancing
+application progress. No new production endpoint or coordinator-read provenance
+is implied by this dispatch.
+
+The native fixture extends the existing source-plan/scope lifecycle case from
+entry 10 through activation at 11 and retirement at 12. It checks preactivation
+refusal in both projection and native apply, a lost native rejection reply,
+unchanged document-apply counts, exact rejection recovery and rejection of a
+changed coordinator read cut. The missing scope remains missing; first strict
+legacy-worker handover is not bypassed. Coordinator ABORT input is modeled for
+this trusted apply-path qualification; production proposal evidence remains open.
+
+Full generation completed (`source-retirement-raft-generate.log`), with unrelated
+model explorer outputs discarded. Contract checks passed, including schema
+fragments (`source-retirement-raft-contract-check.log`). All 15 retained-history
+tests passed in `source-retirement-raft-test.log`. Initial qualification also
+caught an invalid modeled COMMIT with an ABORT-only zero commit version and a
+nested test constant shadowing an outer token. The fixture now uses a valid
+COMMIT version before asserting refusal, and distinct test-local names. Final
+codec and linked results follow below.
+
+Engine 58, owner ABI 111, API kernel 31, metadata 105 and failure 89 are unchanged.
+Production intent-only retirement submission must still obtain a fresh independent
+coordinator ReadIndex observation, preserve its owned admission for exact recovery,
+and use authenticated transport. All-owner retirement/release and all remaining
+original destination/changefeeds/bootstrap/retention/pgoutput/Antfly CDC client
+requirements remain open; the full goal remains active.
+
+Final `source-scope-entry-test history-control-apply-test -Dstrip=true -j1`
+exited 0 (`source-retirement-raft-retry-test.log`): all three selected codec cases,
+28 linked cases and six linked-suite local cases passed, plus 12 local discovery
+anchors; zero reported skips/failures/leaks. The retirement native helper runs
+inside the existing real source-plan/native-owner apply fixture. Guarded cache
+cleanup completed (`source-retirement-raft-gc.log`). This proves activated trusted
+apply/retry dispatch, not production coordinator observation provenance or end-to-
+end source retirement/release. The full original goal remains active.

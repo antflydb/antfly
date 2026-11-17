@@ -30,6 +30,16 @@ pub const Rejection = enum {
     expired,
     pending,
     backpressure,
+    pub fn asError(self: Rejection) anyerror {
+        return switch (self) {
+            .invalid => error.InvalidSourceAdmission,
+            .scope_changed => error.HistoryResynchronizationRequired,
+            .conflict => error.SourceCheckpointConflict,
+            .expired => error.SourceReceiptExpired,
+            .pending => error.SourcePendingWork,
+            .backpressure => error.SourceAdmissionBackpressure,
+        };
+    }
     pub fn fromError(err: anyerror) ?Rejection {
         return switch (err) {
             error.InvalidSourceAdmission => .invalid,

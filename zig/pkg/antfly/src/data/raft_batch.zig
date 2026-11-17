@@ -75,12 +75,14 @@ pub const OwnedApplyEntry = union(enum) {
     history_control: @import("history_control_entry.zig").Owned,
     source_plan: @import("source_plan_entry.zig").Owned,
     source_scope_control: @import("source_scope_entry.zig").Owned,
+    source_retirement: @import("source_retirement_entry.zig").Owned,
     pub fn deinit(self: *OwnedApplyEntry, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .batch => |*value| value.deinit(alloc),
             .history_control => |*value| value.deinit(),
             .source_plan => |*value| value.deinit(),
             .source_scope_control => |*value| value.deinit(),
+            .source_retirement => |*value| value.deinit(),
         }
         self.* = undefined;
     }
@@ -178,6 +180,11 @@ pub fn decodeForApply(alloc: std.mem.Allocator, payload: []const u8) !OwnedApply
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidReplicatedBatch;
+    if (parsed.value.object.contains("source_retirement")) {
+        const retirement = @import("source_retirement_entry.zig");
+        if (payload.len > retirement.max_bytes) return error.InvalidReplicatedBatch;
+        return .{ .source_retirement = try retirement.decodeValue(alloc, parsed.value) };
+    }
     if (parsed.value.object.contains("source_scope_control")) {
         const scope = @import("source_scope_entry.zig");
         if (payload.len > scope.max_bytes) return error.InvalidReplicatedBatch;
@@ -199,7 +206,7 @@ pub fn decodeForApply(alloc: std.mem.Allocator, payload: []const u8) !OwnedApply
 fn decodeBatchValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedReplicatedBatch {
     if (value != .object) return error.InvalidReplicatedBatch;
     const root = value.object;
-    if (root.contains("history_control") or root.contains("source_plan") or root.contains("source_scope_control")) return error.UnsupportedRaftBatchProtocolVersion;
+    if (root.contains("history_control") or root.contains("source_plan") or root.contains("source_scope_control") or root.contains("source_retirement")) return error.UnsupportedRaftBatchProtocolVersion;
     const table_value = root.get("table") orelse return error.InvalidReplicatedBatch;
     if (table_value != .string) return error.InvalidReplicatedBatch;
     const batch_value = root.get("batch") orelse return error.InvalidReplicatedBatch;
