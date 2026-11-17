@@ -2310,6 +2310,41 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.fkGenerationPublicationDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .changefeed_control => |input| {
+                    const value = handle.store.getChangefeedControl(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .changefeed_authority => {
+                    const value = handle.store.getChangefeedAuthority(a, group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .changefeed_maintenance => |input| {
+                    const value = handle.store.scanChangefeedMaintenance(a, group_id, input.now, input.after) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .source_control => |input| {
+                    const value = handle.store.getSourceControl(a, group_id, input.table_id, input.source_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .legacy_source_intake => |input| {
+                    const value = handle.store.legacyReplicationSourceIntakeAllowed(a, group_id, input.table_id, input.ordinal, input.definition) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .capture_source_scope => |input| {
+                    if (input.metadata_group_id != group_id) break :blk storageOwnerStatusFromError(error.InvalidSourceControl);
+                    var value = handle.store.captureSourceScope(a, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    defer value.deinit(a);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .pg_publication => |input| {
+                    var value = handle.store.getPgPublication(a, group_id, input.database, input.name) catch |err| break :blk storageOwnerStatusFromError(err);
+                    defer if (value) |*parsed| parsed.deinit();
+                    const encoded = if (value) |parsed|
+                        std.json.Stringify.valueAlloc(a, parsed.value, .{}) catch |err| break :blk storageOwnerStatusFromError(err)
+                    else
+                        null;
+                    break :blk metadataProjectionJson(alloc, out_json, encoded);
+                },
                 .fk_generation_publication_source_decision => |input| {
                     const value = handle.store.fkGenerationPublicationSourceDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

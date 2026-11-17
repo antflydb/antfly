@@ -15406,7 +15406,7 @@ pub const RaftApplyStore = struct {
         if (after != null) if (row) |item| {
             if (std.mem.eql(u8, item.key, start)) row = try cursor.next();
         };
-        var scan: changefeed_control.MaintenanceScan = .{};
+        var scan: changefeed_control.MaintenanceScan = .{ .ids = @splat(@splat(0)) };
         var last: ?changefeed_control.Id = null;
         for (0..changefeed_control.MaintenanceScan.limit) |_| {
             const item = row orelse break;

@@ -161,7 +161,7 @@ pub fn execute(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReq
         return .{ .page = try delivery.pull(&client, &provider, a, selection.id, selection.after, bounds, internal) };
     var confirmed = try delivery.acknowledge(&client, &provider, a, selection.id, selection.after, internal);
     defer confirmed.deinit();
-    var driver_policy: RootPolicy = .{ .access = policy, .io = api.inferenceIo(), .source = source, .allocator = a };
+    var driver_policy: RootPolicy(Policy) = .{ .access = policy, .io = api.inferenceIo(), .source = source, .allocator = a };
     _ = try source_api.flushAcknowledged(&client, &driver_policy, a, confirmed.value, captured.roots[0], internal);
     return .{ .acknowledged = confirmed.value.acknowledged_cursor };
 }
@@ -184,52 +184,55 @@ const enrollment = @import("../metadata/root_control_driver.zig");
 const source_api = @import("history_roots.zig");
 const metadata_api = @import("../metadata/api.zig");
 
-const RootPolicy = struct {
-    access: ?Policy,
-    io: std.Io,
-    source: source_api.Source,
-    allocator: A,
-    closing: bool = false,
-    retirement_collected: bool = false,
+fn RootPolicy(comptime Access: type) type {
+    return struct {
+        access: Access,
+        io: std.Io,
+        source: source_api.Source,
+        allocator: A,
+        closing: bool = false,
+        retirement_collected: bool = false,
 
-    pub fn authorizeRoot(self: *@This(), state: control.State, _: control.Namespace, request: Context) !void {
-        if (!self.closing) {
-            var access = self.access orelse return error.Forbidden;
-            return access.authorize(state, request);
+        pub fn authorizeRoot(self: *@This(), state: control.State, _: control.Namespace, request: Context) !void {
+            if (!self.closing) {
+                if (Access == void) return error.Forbidden;
+                return self.access.authorize(state, request);
+            }
+            try request.ensureActive();
+            if (state.phase != .closing and state.phase != .reset_required)
+                return error.ChangefeedConflict;
+            if (Access != void) {
+                if (state.slot != null) return error.Forbidden;
+                const access = self.access;
+                var identity = try authenticate(access.api, access.credential);
+                defer identity.deinit(access.api.alloc);
+                try requireOwner(identity, state.definition orelse return error.Forbidden);
+            } else {
+                const principal = request.principal orelse return error.Forbidden;
+                if (principal.kind != .internal or !std.mem.eql(u8, principal.subject, "changefeed-maintenance"))
+                    return error.Forbidden;
+            }
         }
-        try request.ensureActive();
-        if (state.phase != .closing and state.phase != .reset_required)
-            return error.ChangefeedConflict;
-        if (state.slot != null and self.access != null) return error.Forbidden;
-        if (self.access) |access| {
-            var identity = try authenticate(access.api, access.credential);
-            defer identity.deinit(access.api.alloc);
-            try requireOwner(identity, state.definition orelse return error.Forbidden);
-        } else {
-            const principal = request.principal orelse return error.Forbidden;
-            if (principal.kind != .internal or !std.mem.eql(u8, principal.subject, "changefeed-maintenance"))
-                return error.Forbidden;
+
+        pub fn validateRoot(self: *@This(), state: control.State, namespace: control.Namespace, fence: metadata_api.CatalogRouteFence, table: []const u8, request: Context) !void {
+            try self.source.validate(self.allocator, state, namespace, fence, table, request);
         }
-    }
 
-    pub fn validateRoot(self: *@This(), state: control.State, namespace: control.Namespace, fence: metadata_api.CatalogRouteFence, table: []const u8, request: Context) !void {
-        try self.source.validate(self.allocator, state, namespace, fence, table, request);
-    }
+        pub fn newAttempt(self: *@This(), _: control.State, _: control.Namespace, _: Context) !control.Id {
+            var id: control.Id = undefined;
+            self.io.random(&id);
+            return id;
+        }
 
-    pub fn newAttempt(self: *@This(), _: control.State, _: control.Namespace, _: Context) !control.Id {
-        var id: control.Id = undefined;
-        self.io.random(&id);
-        return id;
-    }
+        pub fn deferRetirementSettlement(self: *const @This()) bool {
+            return self.closing and !self.retirement_collected;
+        }
 
-    pub fn deferRetirementSettlement(self: *const RootPolicy) bool {
-        return self.closing and !self.retirement_collected;
-    }
-
-    pub fn context(_: *@This(), request: Context) !Context {
-        return request;
-    }
-};
+        pub fn context(_: *@This(), request: Context) !Context {
+            return request;
+        }
+    };
+}
 
 fn load(client: *config.Client, a: A, id: control.Id, request: Context) !control.Parsed {
     const bytes = try client.readChangefeedState(a, id, request);
@@ -299,19 +302,19 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
     const authority = try @import("history_policy_provisioning.zig").authority(root.fence);
     const id: control.Id = control.hash(.{ .domain = "antfly:public-changefeed-create:v1", .owner = caller, .key = key })[0..16].*;
     var client: config.Client = .{ .port = meta };
-    var policy: RootPolicy = .{
+    var policy: RootPolicy(Policy) = .{
         .access = .{ .api = api, .credential = credential, .table = root.table_name, .filter = filter },
         .io = api.inferenceIo(),
         .source = source,
         .allocator = a,
     };
-    const now = try policy.access.?.nowSeconds(internal);
+    const now = try policy.access.nowSeconds(internal);
     for (0..8) |_| {
         var parsed = try load(&client, a, id, internal);
         defer parsed.deinit();
         const state = parsed.value;
         if (state.phase == .empty) {
-            try policy.access.?.authorize(.{ .definition = definition }, internal);
+            try policy.access.authorize(.{ .definition = definition }, internal);
             if (try meta.authority(a, internal)) |registered| {
                 if (!same(registered.incarnation, authority)) return error.ChangefeedResynchronizationRequired;
             }
@@ -328,7 +331,7 @@ pub fn create(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedRequ
         }
         if (!same(definition.identity(), state.definition.?.identity()) or !same(authority, state.authority))
             return error.ChangefeedConflict;
-        try policy.access.?.authorize(state, internal);
+        try policy.access.authorize(state, internal);
         if (now >= state.expires_at) return error.ChangefeedLeaseExpired;
         if (state.phase == .streaming) {
             var active = try roots.Routed.init(source, &captured);
@@ -389,7 +392,7 @@ pub fn close(api: *http.ApiHttpServer, a: A, credential: http.AuthenticatedReque
             continue;
         }
 
-        var policy: RootPolicy = .{
+        var policy: RootPolicy(Policy) = .{
             .access = .{ .api = api, .credential = credential, .table = "", .filter = null },
             .io = api.inferenceIo(),
             .source = source,
@@ -414,7 +417,7 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
     const state = parsed.value;
     if ((state.phase != .closing and state.phase != .reset_required) or state.definition.?.start != .now)
         return;
-    var policy: RootPolicy = .{ .access = null, .io = io, .source = source, .allocator = a, .closing = true };
+    var policy: RootPolicy(void) = .{ .access = {}, .io = io, .source = source, .allocator = a, .closing = true };
     if (try retireOne(&client, &policy, a, state, request)) return;
     if (spool_registry) |storage| if (state.slot) |slot| {
         if (slot.spool.records.len != 0) {
@@ -425,7 +428,7 @@ pub fn maintainNativeFeedWithSpool(metadata: config.Port, source: source_api.Sou
     };
 }
 
-fn retireOne(client: *config.Client, policy: *RootPolicy, a: A, state: control.State, request: Context) !bool {
+fn retireOne(client: *config.Client, policy: anytype, a: A, state: control.State, request: Context) !bool {
     const definition = state.definition.?;
     const item = for (state.roots) |candidate| {
         if (!candidate.released) break candidate;

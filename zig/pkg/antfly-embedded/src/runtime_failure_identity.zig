@@ -31,6 +31,12 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_changefeed, .err = error.InvalidChangefeed },
+    .{ .status = .changefeed_corrupt, .err = error.ChangefeedCorrupt },
+    .{ .status = .invalid_source_control, .err = error.InvalidSourceControl },
+    .{ .status = .source_control_corrupt, .err = error.SourceControlCorrupt },
+    .{ .status = .source_binding_conflict, .err = error.SourceBindingConflict },
+    .{ .status = .read_unavailable, .err = error.ReadUnavailable },
     .{ .status = .source_checkpoint_conflict, .err = error.SourceCheckpointConflict },
     .{ .status = .source_transaction_identity_conflict, .err = error.SourceTransactionIdentityConflict },
     .{ .status = .source_already_committed, .err = error.SourceAlreadyCommitted },

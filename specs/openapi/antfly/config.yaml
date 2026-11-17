@@ -351,6 +351,11 @@ components:
           type: boolean
           default: false
           description: Acknowledges that a TLS proxy or authenticated private transport protects a non-loopback listener. Does not enable native TLS.
+        replication_publication:
+          type: string
+          minLength: 1
+          maxLength: 63
+          description: Enables logical replication for the named Antfly publication on installations with retained history and qualified spool storage.
     Config:
       type: object
       properties:

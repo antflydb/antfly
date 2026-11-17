@@ -2273,6 +2273,8 @@ pub const PgwireConfig = struct {
     max_connections: ?i64 = null,
     /// Acknowledges that a TLS proxy or authenticated private transport protects a non-loopback listener. Does not enable native TLS.
     externally_protected_transport: ?bool = null,
+    /// Enables logical replication for the named Antfly publication on installations with retained history and qualified spool storage.
+    replication_publication: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -2281,6 +2283,7 @@ pub const PgwireConfig = struct {
         .{ "bind_port", "bind_port", true },
         .{ "max_connections", "max_connections", true },
         .{ "externally_protected_transport", "externally_protected_transport", true },
+        .{ "replication_publication", "replication_publication", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -2311,6 +2314,10 @@ pub const PgwireConfig = struct {
         }
         if (self.externally_protected_transport) |value| {
             try jw.objectField("externally_protected_transport");
+            try jw.write(value);
+        }
+        if (self.replication_publication) |value| {
+            try jw.objectField("replication_publication");
             try jw.write(value);
         }
         try jw.endObject();

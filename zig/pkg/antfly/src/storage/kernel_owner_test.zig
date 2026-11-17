@@ -5124,6 +5124,44 @@ test "selected owner readiness compiled projections retain independent query con
     }
 }
 
+test "compiled metadata owner projects changefeed and source control reads" {
+    const a = std.testing.allocator;
+    const feed = @import("../metadata/changefeed_control.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    const group = 7304;
+
+    const encoded = try store.getChangefeedControl(a, group, @splat(1));
+    defer a.free(encoded);
+    var state = try feed.parse(a, encoded);
+    defer state.deinit();
+    try std.testing.expectEqual(.empty, state.value.phase);
+    try std.testing.expectEqual(null, try store.getChangefeedAuthority(a, group));
+    const page = try store.scanChangefeedMaintenance(a, group, 1, null);
+    try std.testing.expectEqual(@as(usize, 0), page.items().len);
+    try std.testing.expectEqual(null, page.next);
+    try std.testing.expectError(error.InvalidChangefeed, store.scanChangefeedMaintenance(a, group, 0, null));
+    try std.testing.expectEqual(null, try store.getPgPublication(a, group, @splat(1), "absent"));
+    const source_control = @import("../metadata/source_control.zig");
+    const source_bytes = try store.getSourceControl(a, group, 7, @splat(1));
+    defer a.free(source_bytes);
+    var source_state = try source_control.parse(a, source_bytes);
+    defer source_state.deinit();
+    try std.testing.expectEqual(@as(u64, 0), source_state.value.revision);
+    try std.testing.expect(try store.legacyReplicationSourceIntakeAllowed(a, group, 7, 0, @splat(1)));
+    try std.testing.expectError(error.ReadUnavailable, store.captureSourceScope(a, .{
+        .metadata_group_id = group,
+        .metadata_incarnation = @splat('1'),
+        .actor_table_id = 7,
+        .source_id = @splat(1),
+        .minimum_applied_index = 1,
+    }));
+}
+
 test "compiled ordered history completion scheduling crosses the native maintenance callback" {
     const a = std.testing.allocator;
     const local = @import("antfly_local_sources");

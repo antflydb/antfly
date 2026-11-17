@@ -900,6 +900,12 @@ pub const Status = enum(u32) {
     source_checkpoint_conflict = 940,
     source_transaction_identity_conflict = 941,
     source_already_committed = 942,
+    invalid_changefeed = 943,
+    changefeed_corrupt = 944,
+    invalid_source_control = 945,
+    source_control_corrupt = 946,
+    source_binding_conflict = 947,
+    read_unavailable = 948,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
