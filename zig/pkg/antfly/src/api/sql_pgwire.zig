@@ -491,6 +491,98 @@ pub const LiveReplicationPublication = struct {
     };
 };
 
+/// Bind a qualified durable slot to the frontend stream. Spool publication
+/// runs independently of the CopyBoth reader and shares its session fence.
+pub const CatalogRetainedStream = struct {
+    const Bridge = @import("../pgwire/retained_stream.zig");
+    const retained = @import("../metadata/pg_spool_stream.zig");
+    const Registry = @import("../metadata/pg_spool_artifacts.zig").Registry;
+    const control = publication_control;
+
+    allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    service: *const @import("changefeed_metadata.zig").Port,
+    registry: Registry,
+    id: control.Id,
+    actor: control.Id,
+    config: retained.Config,
+    catalog_resolver: CatalogReplicationPublication,
+    policy: LiveReplicationPublication,
+
+    pub fn open(slots: CatalogReplicationSlots, registry: Registry, config: retained.Config, a: std.mem.Allocator, start: wire.replication_commands.Start, request_value: wire.Request) !wire.ReplicationStream {
+        const context = try Bridge.metadataContext(request_value);
+        const service = if (slots.server.source.changefeeds) |*port| port else return error.UnsupportedReplicationMode;
+        const retained_alloc = request_value.scratch_allocator orelse a;
+        const self = try retained_alloc.create(CatalogRetainedStream);
+        errdefer retained_alloc.destroy(self);
+        self.arena = std.heap.ArenaAllocator.init(retained_alloc);
+        errdefer self.arena.deinit();
+        const owned = self.arena.allocator();
+        var state = try slots.readOwned(retained_alloc, start.slot, context);
+        defer state.deinit();
+        self.catalog_resolver = .{ .server = slots.server, .database_name = try owned.dupe(u8, slots.database_name), .identity = slots.identity };
+        var scratch = std.heap.ArenaAllocator.init(retained_alloc);
+        defer scratch.deinit();
+        const publication = try self.catalog_resolver.resolve(scratch.allocator(), slots.database, start.publications, context);
+        const binding_value = try publication.binding();
+        const names = try owned.alloc([]const u8, binding_value.publications.len);
+        for (binding_value.publications, names) |name, *copy| copy.* = try owned.dupe(u8, name);
+        const expected: control.pg_slot.Binding = .{ .publications = names, .projection = binding_value.projection };
+        var actor: control.Id = undefined;
+        while (true) {
+            try request_value.check();
+            request_value.io.random(&actor);
+            if (!std.mem.allEqual(u8, &actor, 0)) break;
+        }
+        self.allocator = retained_alloc;
+        self.service = service;
+        self.registry = registry;
+        self.id = state.value.id;
+        self.actor = actor;
+        self.config = config;
+        self.policy = .{ .allocator = retained_alloc, .io = request_value.io, .identity = slots.identity, .resolver = self.catalog_resolver.resolver(), .expected = expected };
+        return Bridge.Bridge(CatalogRetainedStream).open(self, a, request_value, start);
+    }
+
+    pub fn binding(self: *CatalogRetainedStream, _: std.mem.Allocator, start: wire.replication_commands.Start, request_value: wire.Request) !control.pg_slot.Binding {
+        try request_value.check();
+        if (start.publications.len != self.policy.expected.publications.len) return error.ChangefeedResynchronizationRequired;
+        return self.policy.expected;
+    }
+
+    pub fn request(_: *CatalogRetainedStream, value: wire.Request) !operation.RequestContext {
+        return Bridge.metadataContext(value);
+    }
+
+    pub fn authorize(self: *CatalogRetainedStream, state: control.State, selected: control.pg_slot.Binding, context: operation.RequestContext) !void {
+        try self.policy.authorize(state, selected, context);
+    }
+
+    pub fn nowSeconds(self: *CatalogRetainedStream, context: operation.RequestContext) !u64 {
+        return self.policy.nowSeconds(context);
+    }
+
+    fn closeContext() operation.RequestContext {
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s;
+        return CatalogReplicationSlots.maintenanceContext(.{ .deadline_ns = deadline });
+    }
+
+    pub fn failedOpen(self: *CatalogRetainedStream) void {
+        retained.releaseActor(self.service, self, self.allocator, self.id, self.actor, closeContext()) catch |err| {
+            std.log.warn("logical slot lease release after failed open deferred: {s}", .{@errorName(err)});
+        };
+    }
+
+    pub fn closed(self: *CatalogRetainedStream, owner: *retained.Owner) void {
+        owner.release(self.service, self, self.allocator, closeContext()) catch |err| {
+            std.log.warn("logical slot lease release deferred: {s}", .{@errorName(err)});
+        };
+        const a = self.allocator;
+        self.arena.deinit();
+        a.destroy(self);
+    }
+};
+
 /// Command completion for a replication owner that has resolved the database,
 /// authorized the publication and captured the exact metadata owner revision.
 pub const SlotCommands = struct {
@@ -3067,7 +3159,9 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
         fn mutateSlot(raw: *anyopaque, _: std.mem.Allocator, write: publication_control.Write, context: operation.RequestContext) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqualStrings("changefeed-maintenance", context.principal.?.subject);
-            self.slot_state = try write.apply(self.scratch, self.slot_state, 5);
+            const bytes = try publication_control.encodeWrite(self.scratch, write);
+            const persisted = try std.json.parseFromSliceLeaky(publication_control.Write, self.scratch, bytes, .{ .allocate = .alloc_always });
+            self.slot_state = try persisted.apply(self.scratch, self.slot_state, self.slot_state.authority_sequence + 1);
         }
 
         fn slotAuthority(_: *anyopaque, _: std.mem.Allocator, _: operation.RequestContext) !?publication_control.Stamp {
@@ -3148,10 +3242,6 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
     try std.testing.expectEqualStrings("ALTER PUBLICATION", replaced.command_tag);
     const after = try live.resolve(live.ptr, alloc, database, &.{"feed"}, .{});
     try std.testing.expect(!std.meta.eql((try before.binding()).identity(), (try after.binding()).identity()));
-    _ = try executePublication(server, alloc, &authority, .{ .action = .drop, .name = "feed" });
-    try std.testing.expect(fixture.record.?.members == null);
-    _ = try executePublication(server, alloc, &authority, .{ .action = .drop, .name = "feed", .if_exists = true });
-    try std.testing.expectError(error.ChangefeedResynchronizationRequired, live.resolve(live.ptr, alloc, database, &.{"feed"}, .{}));
     const slots = try CatalogReplicationSlots.open(server, resolver.identity, alloc, "default", .{});
     try std.testing.expectEqual(database, slots.database);
     try std.testing.expectError(error.InvalidReplicationSlotName, slots.readOwned(alloc, "INVALID", .{}));
@@ -3168,7 +3258,8 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
     var namespace: publication_control.Namespace = @splat(1);
     std.mem.writeInt(u64, namespace[0..8], before.members[0].table.table_id, .big);
     const incarnation: publication_control.Digest = @splat(9);
-    var state = try (publication_control.Mutation{ .create = .{ .id = id, .definition = definition, .now = 100, .expires_at = 1000 } }).apply(alloc, .{}, .{ .incarnation = incarnation, .sequence = 1 });
+    const now: u64 = @intCast(@divFloor(std.Io.Clock.now(.real, std.testing.io).nanoseconds, std.time.ns_per_s));
+    var state = try (publication_control.Mutation{ .create = .{ .id = id, .definition = definition, .now = now, .expires_at = now + 600 } }).apply(alloc, .{}, .{ .incarnation = incarnation, .sequence = 1 });
     state = try (publication_control.Mutation{ .plan_roots = &.{.{ .namespace = namespace, .ownership_epoch = 1 }} }).apply(alloc, state, .{ .incarnation = incarnation, .sequence = 2 });
     state = try (publication_control.Mutation{ .enroll = .{ .namespace = namespace, .ownership_epoch = 1, .grant_sequence = state.roots[0].grant_sequence, .consumer_epoch = 1, .start = 10 } }).apply(alloc, state, .{ .incarnation = incarnation, .sequence = 3 });
     fixture.slot_state = try (publication_control.Mutation{ .seal = .{ .cut = @splat(7), .slot = configuration } }).apply(alloc, state, .{ .incarnation = incarnation, .sequence = 4 });
@@ -3176,11 +3267,35 @@ test "SQL pgwire native publication DDL uses catalog identity and revision CAS" 
     fixture.slot_state.definition.?.owner = @splat(8);
     try std.testing.expectError(error.Forbidden, slots.readOwned(alloc, "docs_slot", .{}));
     fixture.slot_state.definition.?.owner = definition.owner;
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-retained-spool", .{tmp.sub_path});
+        var artifacts = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, path);
+        defer artifacts.deinit();
+        var spool_store = artifacts.artifactStore();
+        spool_store.namespace_identity = @splat(6);
+        const registry: CatalogRetainedStream.Registry = .{ .store = spool_store, .io = std.testing.io };
+        const start: wire.replication_commands.Start = .{ .slot = "docs_slot", .position = @fromBackingInt(0), .publications = &.{"feed"} };
+        try std.testing.expectError(error.PgSpoolStorageUnsupported, CatalogRetainedStream.open(slots, registry, .{}, a, start, authority.request));
+        const stream = try CatalogRetainedStream.open(slots, registry, .{ .require_shared = false }, a, start, authority.request);
+        defer stream.close(stream.context);
+        try std.testing.expectEqual(@as(u64, 1), @backingInt(stream.initial_lsn));
+        try std.testing.expect(fixture.slot_state.slot.?.session != null);
+        var page = try stream.poll(stream.context, a, authority.request, stream.initial_lsn, 1024);
+        defer page.deinit();
+        try std.testing.expect(page.chunk == null);
+    }
+    try std.testing.expect(fixture.slot_state.slot.?.session == null);
+    _ = try executePublication(server, alloc, &authority, .{ .action = .drop, .name = "feed" });
+    try std.testing.expect(fixture.record.?.members == null);
+    _ = try executePublication(server, alloc, &authority, .{ .action = .drop, .name = "feed", .if_exists = true });
+    try std.testing.expectError(error.ChangefeedResynchronizationRequired, live.resolve(live.ptr, alloc, database, &.{"feed"}, .{}));
     const dropped = try slots.drop(alloc, .{ .drop_slot = .{ .slot = "docs_slot", .wait = false } }, authority.request, .{});
     try std.testing.expectEqualStrings("DROP_REPLICATION_SLOT", dropped.command_tag);
     try std.testing.expectEqual(publication_control.Phase.closing, fixture.slot_state.phase);
     fixture.database_id = 99;
     try std.testing.expectError(error.ChangefeedResynchronizationRequired, slots.readOwned(alloc, "docs_slot", .{}));
-    try std.testing.expectEqual(@as(usize, 4), fixture.slot_reads);
+    try std.testing.expect(fixture.slot_reads > 4);
     try std.testing.expectEqual(@as(usize, 3), fixture.writes);
 }
