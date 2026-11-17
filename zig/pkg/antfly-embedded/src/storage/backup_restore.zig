@@ -730,11 +730,17 @@ fn applyManifestNativeRestore(
 
     var generation = try db_mod.native_backup.parseManifestBytes(alloc, raw);
     defer generation.deinit();
-    if (try db_mod.native_backup.declaredGenerationBytes(
-        generation.value(),
-        @intCast(raw.len),
-    ) != shard.artifact_size_bytes) {
-        return error.BackupArtifactIntegrityMismatch;
+    const generation_bytes = try db_mod.native_backup.declaredGenerationBytes(generation.value(), @intCast(raw.len));
+    if (generation_bytes != shard.artifact_size_bytes) {
+        const seal = @import("db/native_backup_seal.zig");
+        const receipt_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shard.snapshot_path, seal.export_receipt_name });
+        defer alloc.free(receipt_path);
+        const receipt = backups_api.readFileFromLocationUsingIoLimited(alloc, io, location, receipt_path, 4096) catch |err| switch (err) {
+            error.FileNotFound, error.BackupManifestTooLarge => return error.BackupArtifactIntegrityMismatch,
+            else => return err,
+        };
+        defer alloc.free(receipt);
+        try seal.validateExportEnvelope(alloc, receipt, generation_bytes, shard.artifact_size_bytes);
     }
 
     const staged_path = staged_generation.path();

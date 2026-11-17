@@ -27,7 +27,7 @@ pub const wal_budget_bytes: u64 = 16 * 1024 * 1024;
 pub const max_files: usize = 100_000;
 pub const manifest_name = "seal.json";
 const digest_name = "seal.sha256";
-const export_receipt_name = "backup-seal-receipt.json";
+pub const export_receipt_name = "backup-seal-receipt.json";
 const ExportReceipt = struct { handle: Handle, bytes: u64 };
 
 /// Serializes pin publication/export/reclamation even after the live catalog
@@ -119,6 +119,23 @@ pub fn recordExport(alloc: Allocator, io: std.Io, root: []const u8, handle: Hand
     var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
     try json.write(ExportReceipt{ .handle = handle, .bytes = bytes }, &stream);
     _ = try backup.writeFileDurable(io, path, output.written());
+}
+
+/// A native generation inventory excludes this coordinator receipt, while the
+/// repository tree digest includes it. Account for exactly this bounded extra
+/// object; this is not seal/admission authorization (coordinated callers still
+/// verify the expected handle through exportedBytes).
+pub fn validateExportEnvelope(alloc: Allocator, encoded: []const u8, generation_bytes: u64, tree_bytes: u64) !void {
+    if (encoded.len > 4096) return error.BackupArtifactIntegrityMismatch;
+    const total = std.math.add(u64, generation_bytes, encoded.len) catch return error.BackupArtifactIntegrityMismatch;
+    if (total != tree_bytes) return error.BackupArtifactIntegrityMismatch;
+    var parsed = std.json.parseFromSlice(ExportReceipt, alloc, encoded, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.BackupArtifactIntegrityMismatch,
+    };
+    defer parsed.deinit();
+    if (parsed.value.bytes != generation_bytes or parsed.value.handle.fence.role != .backup_snapshot or
+        std.mem.allEqual(u8, &parsed.value.handle.digest, 0)) return error.BackupArtifactIntegrityMismatch;
 }
 
 pub fn exportedBytes(alloc: Allocator, io: std.Io, root: []const u8, handle: Handle) !u64 {

@@ -7976,3 +7976,21 @@ test "public catalog translation preserves runtime config and incarnation" {
         \\{"text":3}
     , .table_restore));
 }
+
+test "native backup receipt envelope accounts for only bounded auxiliary bytes" {
+    const a = std.testing.allocator;
+    const seal = @import("db/native_backup_seal.zig");
+    var handle: seal.Handle = .{ .fence = .{ .transition_id = 1, .attempt = 1, .peer_group_id = 9, .owner_group_id = 9, .role = .backup_snapshot, .namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 9 }, .catalog_digest = @splat(3) }, .digest = @splat(4) };
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .handle = handle, .bytes = @as(u64, 1024) }, .{});
+    defer a.free(raw);
+    try seal.validateExportEnvelope(a, raw, 1024, 1024 + raw.len);
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, seal.validateExportEnvelope(a, raw, 1024, 1025 + raw.len));
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, seal.validateExportEnvelope(a, raw, 1023, 1023 + raw.len));
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, seal.validateExportEnvelope(a, "{}", 1024, 1026));
+    handle.digest = @splat(0);
+    const zero = try std.json.Stringify.valueAlloc(a, .{ .handle = handle, .bytes = @as(u64, 1024) }, .{});
+    defer a.free(zero);
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, seal.validateExportEnvelope(a, zero, 1024, 1024 + zero.len));
+    const oversized: [4097]u8 = @splat(0);
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, seal.validateExportEnvelope(a, &oversized, 1024, 1024 + oversized.len));
+}

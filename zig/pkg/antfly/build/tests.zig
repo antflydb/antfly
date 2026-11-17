@@ -979,6 +979,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "portable accepted-generation proof requires a sealed v3 reader and canonical unique scope",
             "portable standalone import detaches informational cohort without granting authority",
             "public catalog translation preserves runtime config and incarnation",
+            "native backup receipt envelope",
             "portable accepted-generation proof page reads only canonical sealed decoder metadata",
             "portable restore validates historical rows with their public schema epoch",
             "portable archive accepts long history with a bounded decoded working set",
