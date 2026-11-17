@@ -1,0 +1,207 @@
+{
+  "date_utc": "2026-11-17",
+  "device": "NVIDIA L4",
+  "nvidia_driver": "580.159.03",
+  "cuda_driver_api_version": 13000,
+  "cublaslt_library": "libcublasLt.so.13.4.0.1",
+  "zig_version": "0.17.0",
+  "build": {
+    "optimize": "ReleaseFast",
+    "cuda": true,
+    "cuda_artifacts": "sm89",
+    "workspace_bytes": 0
+  },
+  "scope": "Isolated packed global MQA operator; synchronized wall and CUDA-event timing; no model, tokenization or HTTP.",
+  "protocol": {
+    "sequence": 8192,
+    "query_tile": 128,
+    "layers_per_sample": 4,
+    "fresh_and_saturated_handles_separate": true,
+    "saturated_warm_lengths": [
+      512,
+      544,
+      576,
+      608,
+      640,
+      672,
+      704,
+      736,
+      768,
+      800,
+      832,
+      864,
+      896,
+      928,
+      960,
+      992,
+      1024,
+      1056,
+      1088,
+      1120,
+      1152,
+      1184,
+      1216,
+      1248,
+      1280,
+      1312,
+      1344,
+      1376,
+      1408,
+      1440,
+      1472,
+      1504,
+      1536,
+      1568,
+      1600,
+      1632,
+      1664,
+      1696,
+      1728,
+      1760
+    ],
+    "process_rounds_per_arm": 3,
+    "samples_per_phase_per_round": 12,
+    "excluded_samples_per_phase_per_round": 3,
+    "run_order": [
+      {
+        "round": 1,
+        "arm": "baseline"
+      },
+      {
+        "round": 1,
+        "arm": "fixed"
+      },
+      {
+        "round": 2,
+        "arm": "fixed"
+      },
+      {
+        "round": 2,
+        "arm": "baseline"
+      },
+      {
+        "round": 3,
+        "arm": "baseline"
+      },
+      {
+        "round": 3,
+        "arm": "fixed"
+      }
+    ]
+  },
+  "baseline_policy": "Restore the original stop-admitting-at-64 insertion guard and remove replacement; retain the same harness and instrumentation. The generic status check is also restored; no unsupported status occurs in these GPU measurements.",
+  "arms": {
+    "baseline": {
+      "binary_sha256": "e33f09039815a532061b894cd137f725ebbde672f6e20cec3d4a5f7f82eebf1b",
+      "phases": {
+        "fresh": {
+          "wall_median_ms": 63.113543,
+          "gpu_median_ms": 63.058,
+          "round_wall_median_ms": [
+            63.037239,
+            63.125207,
+            63.113543
+          ],
+          "cold_heuristic_selections": [
+            2,
+            2,
+            2
+          ],
+          "steady_heuristic_selections_per_sample": [
+            0
+          ]
+        },
+        "saturated": {
+          "wall_median_ms": 63.23226,
+          "gpu_median_ms": 63.173,
+          "round_wall_median_ms": [
+            63.273919,
+            63.218554,
+            63.209316
+          ],
+          "cold_heuristic_selections": [
+            512,
+            512,
+            512
+          ],
+          "steady_heuristic_selections_per_sample": [
+            512
+          ]
+        }
+      },
+      "max_cached_plans": 64,
+      "graph_plan_evictions": [
+        0,
+        0,
+        0
+      ]
+    },
+    "fixed": {
+      "binary_sha256": "54e697ac4f6a2ac2bd5bf002bebd8646da22823b84e7f35781ac5cbe8fc5605a",
+      "phases": {
+        "fresh": {
+          "wall_median_ms": 63.186959,
+          "gpu_median_ms": 63.129,
+          "round_wall_median_ms": [
+            63.175146,
+            63.181411,
+            63.242997
+          ],
+          "cold_heuristic_selections": [
+            2,
+            2,
+            2
+          ],
+          "steady_heuristic_selections_per_sample": [
+            0
+          ]
+        },
+        "saturated": {
+          "wall_median_ms": 63.258481,
+          "gpu_median_ms": 63.154,
+          "round_wall_median_ms": [
+            63.163546,
+            63.194964,
+            63.976335
+          ],
+          "cold_heuristic_selections": [
+            2,
+            2,
+            2
+          ],
+          "steady_heuristic_selections_per_sample": [
+            0
+          ]
+        }
+      },
+      "max_cached_plans": 64,
+      "graph_plan_evictions": [
+        88,
+        88,
+        88
+      ]
+    }
+  },
+  "validation": {
+    "focused_tests_cuda": 17,
+    "focused_tests_cpu": 17,
+    "cuda_inference_typecheck": "pass",
+    "baseline_regression_failures": [
+      "expected CublasLtUnsupported, found CublasLtError",
+      "expected 82 heuristic selections, found 592 after 40 varied lengths and four 8192-token layers"
+    ],
+    "operator_oracle_cases": [
+      "513 tokens, holes mask, two CUDA contexts",
+      "8192 tokens, unmasked, one CUDA context"
+    ],
+    "output_sha256": "cd07d7368cb97172c38ae98934bb7d7958d3a2b8177ca7b6e98ceb3838fe89eb",
+    "all_output_hashes_equal": true,
+    "graph_replay_after_eviction_bitwise_equal": true
+  },
+  "raw_artifacts": "evidence/pr1732-review/",
+  "sources_sha256": {
+    "zig/pkg/inference/src/bench_embeddinggemma2_global.zig": "d4efe6faf72e9d56a182890792e28bbd32c8e1ba9070d30a51bd2913529bd6a6",
+    "zig/pkg/inference/src/ops/cuda/cublaslt.zig": "9c93f5f2e9f9fe509fda56b270f5f8c28ca75aca1bb120bcfc1a379f5a7195ba"
+  },
+  "baseline_source_sha256": "d4c12bf0875a66e9fdf89626703041f31aa84ec781b0e8fdab5a312f398f5af5"
+}
