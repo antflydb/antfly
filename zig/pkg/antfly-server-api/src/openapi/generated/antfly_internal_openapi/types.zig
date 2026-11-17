@@ -1345,6 +1345,9 @@ pub const NativeSourceScopeObservation = struct {
     }
 };
 
+/// Bounded latest-control replay aid, one receipt per physical root. Persist in the same transaction as scope mutation or deterministic rejection and actual ordered apply marker. Not a global all-owner fencing certificate.
+pub const NativeSourceScopeOutcome = std.json.Value;
+
 /// ReadIndex-qualified physical-root scope observation. Absence is not an outcome or replay grant.
 pub const NativeSourceScopeQuery = struct {
     version: i64,
@@ -1408,6 +1411,13 @@ pub const NativeSourceScopeRecord = struct {
         try jw.write(self.closed_at);
         try jw.endObject();
     }
+};
+
+/// Private qualified receipt recovery. Minimum applied index must cover the original entry; the serving owner independently establishes ReadIndex and physical-root identity before reading the bounded receipt.
+pub const NativeSourceScopeRecovery = struct {
+    command: NativeSourceScopeControlCommand,
+    entry: NativeHistoryPublicationCut,
+    minimum_applied_index: u64,
 };
 
 /// Frozen protocol-39 BEGIN/PREPARE reference. Token is the positive source upload/attempt token; sequence is the logical source sequence. Native local retirement floors prevent delayed BEGIN after transaction metadata GC. A reference alone grants no authority.

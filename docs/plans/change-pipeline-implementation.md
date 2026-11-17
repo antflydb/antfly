@@ -4943,3 +4943,32 @@ all-owner fencing/ACK/publication/credit cleanup, and the remaining full-scope
 public feeds/bootstrap/retention/pgoutput/existing-client requirements above. The
 unit reducer gate is a fixture, not production migration qualification. Issues
 #1698/#1639 remain open and PR #1700 remains draft.
+
+### Bounded native scope-control ordered recovery contract
+
+`storage/source_scope_ordered.zig` adds one checksummed latest-control receipt per
+physical root. It binds the exact typed command (including captured metadata cut),
+original immutable root, actual Raft term/index, and applied observation or narrow
+deterministic rejection. Applied results validate the requested bind/close/drop
+postcondition and actual cut. Rejection classification deliberately excludes
+corrupt storage and unexpected/transient failures. Recovery requests require a
+minimum applied index covering the original entry; the eventual serving adapter
+must independently establish ReadIndex and physical-owner authority.
+
+Absent and superseded receipts remain explicit unknown evidence. They authorize
+neither blind mutation replay nor metadata retirement. A newer control replaces
+one fixed receipt key; no per-entry or per-generation journal accumulates. Scope
+mutation/rejection, receipt, and ordinary apply marker must be one native commit;
+this module does not itself supply the native DB transaction or Raft transport.
+
+Validation: direct ordered-scope tests passed all 20 tests. Cases include exact
+rejection recovery, changed-command and changed-term refusal, supersession with a
+single retained key, malformed/corrupt receipt refusal, exact success/actual-cut
+binding, impossible success postcondition refusal, and cross-root generation
+refusal. The final `source-control-test` exited 0 after including these tests;
+metadata storage 11 and service 3 plus discovery suites all passed. Internal
+OpenAPI generation and `source-catalog-check engine-errors-check openapi-check`
+completed successfully, including nine schema-fragment tests. An initial fixture
+parameter shadowing error was corrected before the final green run. Native owner,
+ordered apply, RPC integration and actual legacy-drain qualification remain the
+next required integration work; this is not a completed production feature.
